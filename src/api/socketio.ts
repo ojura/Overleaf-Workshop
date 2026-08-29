@@ -437,6 +437,16 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async applyOtUpdate(docId:string, update:UpdateSchema) {
+        // An update that carries no ops is a no-op — there is nothing for the
+        // server to apply. The alternative connection scheme (SocketIOAlt)
+        // already short-circuits these; the realtime socket must too. Recent
+        // overleaf.com real-time validation rejects an empty-op update outright
+        // (`'applyOtUpdate' rejected: Invalid input`) and then disconnects the
+        // client, after which every following write fails until the window is
+        // reloaded. The genuine Overleaf client never emits an empty op either.
+        if (!update.op?.length) {
+            return;
+        }
         return this.emit('applyOtUpdate', docId, update)
             .then(() => {
                 return;
