@@ -791,6 +791,7 @@
     "lint": "eslint src --ext ts",
     "test": "node ./out/test/runTest.js",
     "test:unit": "tsc -p ./ && mocha \"out/test/**/*.test.js\"",
+    "test:api": "tsc -p ./ && node --test out/test/base.test.js",
     "prepare": "husky install"
   },
   "dependencies": {
