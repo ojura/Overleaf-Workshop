@@ -19,6 +19,7 @@ built_version=$(node -p "require('./package.json').version")
 if [ "$check" = no ]; then
     rm -rf out
     node node_modules/typescript/bin/tsc -p ./
+    node scripts/build-pdf-viewer.mjs
 fi
 
 found=0
@@ -44,6 +45,13 @@ for ext in "$HOME"/.antigravity-ide/extensions/iamhyc.overleaf-workshop-* \
         echo "kept the installed files in $backup"
     fi
     rsync -a --exclude '*.map' --exclude 'test/' out/ "$ext/out/"
+    # the PDF viewers that load in ranges (setting overleaf-workshop.pdfViewer.engine), and the
+    # pdf.js release they run on; the legacy viewer's files stay as installed
+    mkdir -p "$ext/views/pdf-viewer"
+    rsync -a --delete views/pdf-viewer/dist/ "$ext/views/pdf-viewer/dist/"
+    if [ -d views/pdf-viewer/vendor/pdfjs-5.1.91 ]; then
+        rsync -a --delete --exclude '*.map' views/pdf-viewer/vendor/pdfjs-5.1.91/ "$ext/views/pdf-viewer/vendor/pdfjs-5.1.91/"
+    fi
     # package.json from this checkout, keeping the installer's metadata
     node -e '
         const fs = require("fs");

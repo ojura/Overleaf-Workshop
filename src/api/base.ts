@@ -752,7 +752,9 @@ export class BaseAPI {
         };
 
         this.setIdentity(identity);
-        return this.request('POST', `project/${projectId}/compile?auto_compile=true`, body, (res) => {
+        // enable_pdf_caching: the answer lists the pieces of output.pdf that the PDF viewer
+        // can take from earlier builds, as the web editor's compile requests do
+        return this.request('POST', `project/${projectId}/compile?auto_compile=true&enable_pdf_caching=true`, body, (res) => {
             const compile = JSON.parse(res!) as CompileResponseSchema;
             return {compile};
         }, {'X-Csrf-Token': identity.csrfToken}, BaseAPI.compileRequestOptions);

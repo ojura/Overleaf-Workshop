@@ -1,0 +1,17 @@
+{
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "ES2022",
+        "moduleResolution": "bundler",
+        "lib": ["ES2022", "DOM", "DOM.Iterable"],
+        "strict": false,
+        "noEmit": true,
+        "skipLibCheck": true,
+        "baseUrl": ".",
+        "paths": {
+            "@/*": ["overleaf/services/web/frontend/js/*"],
+            "@ol-types/*": ["overleaf/services/web/types/*"]
+        }
+    },
+    "include": ["src/**/*"]
+}

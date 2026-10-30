@@ -516,6 +516,29 @@
           "scope": "machine",
           "markdownDescription": "%configuration.pdfViewer.defaultSpreadMode.markdownDescription%"
         },
+        "overleaf-workshop.pdfViewer.engine": {
+          "type": "string",
+          "enum": [
+            "legacy",
+            "pdfjs",
+            "overleaf"
+          ],
+          "enumDescriptions": [
+            "%configuration.pdfViewer.engine.legacy%",
+            "%configuration.pdfViewer.engine.pdfjs%",
+            "%configuration.pdfViewer.engine.overleaf%"
+          ],
+          "default": "legacy",
+          "scope": "machine",
+          "markdownDescription": "%configuration.pdfViewer.engine.markdownDescription%"
+        },
+        "overleaf-workshop.pdfViewer.pieceCacheSizeMB": {
+          "type": "number",
+          "default": 1024,
+          "minimum": 0,
+          "scope": "machine",
+          "markdownDescription": "%configuration.pdfViewer.pieceCacheSizeMB.markdownDescription%"
+        },
         "overleaf-workshop.invisibleMode.historyRefreshInterval": {
           "type": "number",
           "default": 3,
@@ -792,12 +815,13 @@
     ]
   },
   "scripts": {
-    "download-pdfjs": "download -o views/pdf-viewer/vendor -e https://github.com/mozilla/pdf.js/releases/download/v3.10.111/pdfjs-3.10.111-dist.zip && cd views/pdf-viewer/vendor && patch -p1 < pdfjs-3.10.111-dist.patch",
+    "download-pdfjs": "download -o views/pdf-viewer/vendor/pdfjs-5.1.91 -e https://github.com/mozilla/pdf.js/releases/download/v5.1.91/pdfjs-5.1.91-dist.zip && download -o views/pdf-viewer/vendor -e https://github.com/mozilla/pdf.js/releases/download/v3.10.111/pdfjs-3.10.111-dist.zip && cd views/pdf-viewer/vendor && patch -p1 < pdfjs-3.10.111-dist.patch",
     "download-latex-basics": "download -o data/vendor -s 1 -e https://github.com/jlelong/vscode-latex-basics/archive/refs/tags/v1.5.4.zip",
     "postinstall": "patch-package && npm run download-pdfjs && npm run download-latex-basics",
     "vscode:prepublish": "npm run compile",
     "update-l10n": "npx @vscode/l10n-dev export -o ./l10n ./src",
-    "compile": "tsc -p ./ && cd views/chat-view && npm run build",
+    "compile": "tsc -p ./ && npm run build-pdf-viewer && cd views/chat-view && npm run build",
+    "build-pdf-viewer": "node scripts/build-pdf-viewer.mjs",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
@@ -823,6 +847,7 @@
   "devDependencies": {
     "@commitlint/cli": "^18.4.3",
     "@commitlint/config-conventional": "^18.4.3",
+    "@overleaf/o-error": "^3.4.0",
     "@types/diff-match-patch": "^1.0.34",
     "@types/fuzzysearch": "^1.0.2",
     "@types/mocha": "^10.0.1",
@@ -835,10 +860,12 @@
     "@vscode/l10n-dev": "^0.0.31",
     "@vscode/test-electron": "^2.5.2",
     "download-cli": "^1.1.1",
+    "esbuild": "^0.28.2",
     "eslint": "^8.41.0",
     "husky": "^8.0.3",
     "mocha": "^12.0.1",
     "patch-package": "^8.0.1",
+    "pdfjs-dist": "5.1.91",
     "typescript": "^5.1.3"
   },
   "extensionKind": [

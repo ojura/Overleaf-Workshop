@@ -73,6 +73,21 @@ export interface OutputFileEntity extends FileEntity {
     url: string, // `project/${projectId}/user/${userId}/output/${build}/output/${path}`
     type: string, //output file type (postfix)
     build: string, //build id
+    // for output.pdf, when the compile asked for PDF caching: its size, and the pieces of the
+    // PDF that the download domain serves by their SHA-256 under /content/<contentId>/
+    size?: number,
+    ranges?: Array<{start: number, end: number, hash: string, objectId?: string}>,
+    contentId?: string,
+    createdAt?: string,
+}
+
+/** A build's output.pdf, as Overleaf's PDF viewer loads it: in ranges from the download domain. */
+export interface PdfOutput {
+    /** output.pdf on the download domain, with the query Overleaf's viewer uses */
+    url: string,
+    downloadDomain: string,
+    projectId: string,
+    file: OutputFileEntity,
 }
 
 export interface FolderEntity extends FileEntity {
@@ -1435,6 +1450,28 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
         }
         return Promise.resolve(undefined);
+    }
+
+    /**
+     * The last successful build's output.pdf, to load in ranges as Overleaf's PDF viewer does
+     * (frontend/js/features/pdf-preview/util/output-files.ts); undefined without a build that
+     * the download domain serves, and without output.pdf's size, which the compile response
+     * gives when the compile asked for PDF caching.
+     */
+    pdfOutput(): PdfOutput | undefined {
+        const response = this.lastCompile?.response;
+        const file = response?.status==='success' ? response.outputFiles?.find(f => f.path==='output.pdf') : undefined;
+        if (!file?.build || !file.size || !response?.pdfDownloadDomain) { return undefined; }
+        const query = new URLSearchParams();
+        if (response.compileGroup) { query.set('compileGroup', response.compileGroup); }
+        if (response.clsiServerId) { query.set('clsiserverid', response.clsiServerId); }
+        query.set('enable_pdf_caching', 'true');
+        return {
+            url: `${response.pdfDownloadDomain}${file.url}?${query}`,
+            downloadDomain: response.pdfDownloadDomain,
+            projectId: this.projectId,
+            file,
+        };
     }
 
     /** Download an output file of `response`, a compile of this project with any status. */
