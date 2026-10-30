@@ -792,28 +792,35 @@ export class BaseAPI {
     }
 
     async getFileFromClsi(identity:Identity, url:string, compileGroup:string, clsiServerId?:string, pdfDownloadDomain?:string): Promise<ResponseSchema> {
-        try {
-            // If we have a CDN download domain, construct the full URL with required query params.
-            // The CDN is cross-origin, so we must NOT send web frontend cookies.
-            if (pdfDownloadDomain && clsiServerId) {
+        let cdnError: string | undefined;
+        // If we have a CDN download domain, construct the full URL with required query params.
+        // The CDN is cross-origin, so we must NOT send web frontend cookies.
+        if (pdfDownloadDomain && clsiServerId) {
+            try {
                 const cdnUrl = `${pdfDownloadDomain.replace(/\/+$/, '')}/${url.replace(/^\/+/g, '')}` +
                     `?compileGroup=${encodeURIComponent(compileGroup)}` +
                     `&clsiserverid=${encodeURIComponent(clsiServerId)}` +
                     `&enable_pdf_caching=true`;
                 const content = await this._downloadAbsolute(cdnUrl, false);
                 return { type: 'success', content: new Uint8Array(content) };
+            } catch (error) {
+                // The download domain does not serve every output file: it answered HTTP 503
+                // for output.fdb_latexmk and output.synctex.gz of builds whose other files it served.
+                cdnError = errorMessage(error);
             }
+        }
 
-            // Fallback: download from web frontend (legacy path)
-            url = url.replace(/^\/+/g, '');
+        // The web frontend, which passes the request on to the compile server that made the build.
+        try {
+            const route = url.replace(/^\/+/g, '') + (clsiServerId ? `${url.includes('?') ? '&' : '?'}clsiserverid=${encodeURIComponent(clsiServerId)}` : '');
             this.setIdentity(identity);
-            const content = await this.download(url);
+            const content = await this.download(route);
             return {
                 type: 'success',
                 content: new Uint8Array( content )
             };
         } catch (error) {
-            return {type: 'error', message: errorMessage(error)};
+            return {type: 'error', message: cdnError ? `${cdnError}; from the web server: ${errorMessage(error)}` : errorMessage(error)};
         }
     }
 

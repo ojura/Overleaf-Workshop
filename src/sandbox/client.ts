@@ -32,13 +32,6 @@ class SandboxAPI extends BaseAPI {
         return content.toString('utf8');
     }
 
-    /** An output file through the web server, which passes the request to the compile server `clsiServerId`. */
-    async outputFileViaWeb(identity: Identity, url: string, clsiServerId?: string): Promise<Buffer> {
-        this.setIdentity(identity);
-        const route = url.replace(/^\/+/, '') + (clsiServerId ? `?clsiserverid=${encodeURIComponent(clsiServerId)}` : '');
-        return this.download(route);
-    }
-
     /** A compile as the editor's Recompile button starts it, not an automatic one. */
     async compileProject(identity: Identity, projectId: string, request: CompileRequest) {
         this.setIdentity(identity);
@@ -114,22 +107,14 @@ export class OverleafClient implements ProjectWriter {
         return res.content;
     }
 
-    /**
-     * An output file of a compile: from the download domain, as the extension's PDF viewer
-     * gets it, or else through the web server. The download domain answered HTTP 503 for
-     * output.fdb_latexmk and output.synctex.gz while it served the other files of a build.
-     */
+    /** An output file of a compile, as the extension's PDF viewer gets it. */
     async outputFile(file: OutputFileEntity, response: CompileResult['response']): Promise<Uint8Array> {
         const res = await this.api.getFileFromClsi(this.identity, file.url, response.compileGroup || 'standard',
                                                    response.clsiServerId, response.pdfDownloadDomain);
-        if (res.type === 'success' && res.content) {
-            return res.content;
+        if (res.type !== 'success' || !res.content) {
+            throw new Error(`the download of ${file.path} failed: ${res.message}`);
         }
-        try {
-            return new Uint8Array(await this.api.outputFileViaWeb(this.identity, file.url, response.clsiServerId));
-        } catch (error: any) {
-            throw new Error(`the download of ${file.path} failed: ${res.message}; through the web server: ${error?.message ?? error}`);
-        }
+        return res.content;
     }
 
     /** Clone `projectId` into a new project of this account; returns the new project's id. */
