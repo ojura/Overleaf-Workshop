@@ -22,6 +22,8 @@ function log(message: string) {
 
 /** The sync working on each local folder, by the folder's URI. */
 const folderSyncs = new Map<string, {sync: ReplicaSync, stopped?: Promise<void>}>();
+/** The active providers, so that a compile can wait for their uploads. */
+const providers = new Set<LocalReplicaSCMProvider>();
 
 /**
  * Keeps a local folder in sync with the project, in both directions.
@@ -33,6 +35,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     public readonly iconPath: vscode.ThemeIcon = new vscode.ThemeIcon('folder-library');
 
     private sync?: ReplicaSync;
+    private ready?: Promise<vscode.Disposable[]>;
+    private fullSync?: Promise<void>;
     private reportProgress?: (done: number, total: number) => void;
     private fullSyncRunning = false;
     private running = 0;
@@ -67,6 +71,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         public readonly baseUri: vscode.Uri,
     ) {
         super(vfs, baseUri);
+        providers.add(this);
     }
 
     private static sanitizeProjectFolderName(projectName: string): string {
@@ -138,6 +143,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         } catch (error) {
             return undefined;
         }
+    }
+
+    /** Write `.overleaf/settings.json` of the workspace's local replica. */
+    public static async writeSettings(settings: any): Promise<void> {
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
+        if (workspaceRoot===undefined || workspaceRoot.scheme!=='file') { return; }
+        const settingUri = vscode.Uri.joinPath(workspaceRoot, '.overleaf/settings.json');
+        await vscode.workspace.fs.writeFile(settingUri, Buffer.from(JSON.stringify(settings, null, 4)));
     }
 
     public static async readSettings(): Promise<any | undefined> {
@@ -447,7 +460,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     /** Compare all files on both sides; changes on either side keep syncing whatever happens here. */
-    private async syncAll() {
+    private syncAll(): Promise<void> {
+        this.fullSync = this.runSyncAll();
+        return this.fullSync;
+    }
+
+    private async runSyncAll() {
         const sync = this.sync;
         if (sync===undefined) { return; }
         const retry = vscode.l10n.t('Retry');
@@ -497,12 +515,23 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.report(summary);
     }
 
-    /** Wait until local changes made so far have reached Overleaf, e.g. before compiling. */
+    /**
+     * Wait until local changes made so far have reached Overleaf, e.g. before compiling.
+     * Waits for a full sync that is running, which uploads what changed while the editor was closed.
+     */
     async flush() {
+        if (this.ready===undefined) { return; } // never started, e.g. disabled
+        await this.ready;
+        await this.fullSync;
         const scan = vscode.workspace
             .getConfiguration('overleaf-workshop.localReplica.syncOnFileChange')
             .get<boolean>('enabled', false);
         await this.sync?.flush(scan);
+    }
+
+    /** Wait until the local changes of every replica of `vfs` have reached Overleaf. */
+    static async flushAll(vfs: VirtualFileSystem) {
+        await Promise.all([...providers].filter(provider => provider.vfs===vfs).map(provider => provider.flush()));
     }
 
     private async initWatch() {
@@ -568,6 +597,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.localWatcher.onDidCreate(onLocal),
             this.localWatcher.onDidDelete(onLocal),
             {dispose: () => {
+                providers.delete(this);
                 record.stopped ??= sync.stop();
                 record.stopped.finally(() => {
                     if (folderSyncs.get(key)===record) { folderSyncs.delete(key); }
@@ -599,7 +629,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     get triggers(): Promise<vscode.Disposable[]> {
-        return this.initWatch().then((watches) => {
+        this.ready = this.initWatch();
+        return this.ready.then((watches) => {
             if (this.vfsWatcher!==undefined && this.localWatcher!==undefined) {
                 return [
                     this.vfsWatcher,

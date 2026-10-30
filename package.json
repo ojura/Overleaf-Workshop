@@ -339,6 +339,12 @@
         "category": "%extension.displayName%"
       },
       {
+        "command": "overleaf-workshop.localReplica.toggleCompileNPreview",
+        "title": "%commands.localReplica.toggleCompileNPreview.title%",
+        "enablement": "overleaf-workshop.activate",
+        "category": "%extension.displayName%"
+      },
+      {
         "command": "overleaf-workshop.compileManager.compile",
         "title": "%commands.compileManager.compile.title%",
         "icon": "$(debug-start)",

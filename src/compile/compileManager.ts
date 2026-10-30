@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { RemoteFileSystemProvider, parseUri } from '../core/remoteFileSystemProvider';
+import { RemoteFileSystemProvider, VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import { ROOT_NAME, ELEGANT_NAME, OUTPUT_FOLDER_NAME } from '../consts';
 import { PdfDocument } from '../core/pdfViewEditorProvider';
 import { LatexParser, ErrorSchema } from './compileLogParser';
@@ -114,6 +114,8 @@ class CompileDiagnosticProvider {
 }
 
 export class CompileManager {
+    /** how long a compile waits for a local replica to upload its changes */
+    static uploadWaitMs = 60 * 1000;
     readonly status: vscode.StatusBarItem;
     public inCompiling: boolean = false;
     private diagnosticProvider: CompileDiagnosticProvider;
@@ -155,7 +157,7 @@ export class CompileManager {
         return undefined;
     }
 
-    async update(status: 'success'|'compiling'|'failed'|'alert') {
+    async update(status: 'idle'|'success'|'compiling'|'failed'|'alert') {
         const uri = await CompileManager.check();
         if (uri) {
             this.inCompiling = status === 'compiling';
@@ -164,6 +166,11 @@ export class CompileManager {
                 const compilerName = vfs.getCompiler()?.name || '';
                 this.status.tooltip = new vscode.MarkdownString();
                 switch (status) {
+                    case 'idle':
+                        this.status.text = `${compilerName}`;
+                        this.status.tooltip.appendMarkdown(`\`${rootDocName}\``);
+                        this.status.backgroundColor = undefined;
+                        break;
                     case 'success':
                         this.status.text = `${compilerName}`;
                         this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('Compile Success')}**`);
@@ -202,6 +209,7 @@ export class CompileManager {
         if (uri) {
             this.vfsm.prefetch(uri)
                 .then(async (vfs) => {
+                    await this.waitForLocalReplica(vfs);
                     // Compile the open document as the main document when it has a
                     // \documentclass. For a local replica `uri` is the project folder.
                     const {fileType, fileId} = await vfs._resolveUri(uri);
@@ -245,6 +253,44 @@ export class CompileManager {
                     );
                 });
 
+        }
+    }
+
+    /**
+     * A local replica uploads its changes in the background. Wait for them, so the compile on
+     * Overleaf sees what was just saved, but compile anyway when they take too long.
+     */
+    private async waitForLocalReplica(vfs: VirtualFileSystem) {
+        let timer: NodeJS.Timeout | undefined;
+        const timeout = new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), CompileManager.uploadWaitMs); });
+        try {
+            const res = await Promise.race([LocalReplicaSCMProvider.flushAll(vfs).then(() => 'done' as const), timeout]);
+            if (res==='timeout') {
+                vscode.window.showWarningMessage( vscode.l10n.t('Local changes are still being synced with Overleaf, so the PDF may not include all of them yet.') );
+            }
+        } catch (error) {
+            vscode.window.showWarningMessage( vscode.l10n.t('Some local changes could not be uploaded to Overleaf, so the PDF may not include them: {error}', {error: String((error as Error)?.message ?? error)}) );
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    /** Switch compiling on Overleaf and the PDF preview on or off for the workspace's local replica. */
+    async toggleLocalReplicaCompile() {
+        const setting = await LocalReplicaSCMProvider.readSettings();
+        if (!setting?.uri) {
+            vscode.window.showInformationMessage( vscode.l10n.t('This workspace is not a local replica of an Overleaf project.') );
+            return;
+        }
+        const enabled = setting.enableCompileNPreview!==true;
+        await LocalReplicaSCMProvider.writeSettings({...setting, enableCompileNPreview: enabled});
+        await vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activateCompile`, enabled);
+        if (enabled) {
+            await this.update('idle');
+            vscode.window.showInformationMessage( vscode.l10n.t('Compile and preview are on for this local replica: "Compile Project" compiles it on Overleaf and "View Compiled PDF" shows the result.') );
+        } else {
+            this.status.hide();
+            vscode.window.showInformationMessage( vscode.l10n.t('Compile and preview are off for this local replica.') );
         }
     }
 
@@ -460,6 +506,7 @@ export class CompileManager {
             vscode.commands.registerCommand(`${ROOT_NAME}.compilerManager.settings`, ()=> this.compileSettings()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.setCompiler`, () => this.setCompiler()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.setRootDoc`, () => this.setRootDoc()),
+            vscode.commands.registerCommand(`${ROOT_NAME}.localReplica.toggleCompileNPreview`, () => this.toggleLocalReplicaCompile()),
             // register compile conditions
             vscode.workspace.onDidSaveTextDocument(async (e) => {
                 const uri = await CompileManager.check.bind(this)(e.uri);

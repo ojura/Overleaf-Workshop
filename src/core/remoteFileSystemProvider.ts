@@ -147,6 +147,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     static ownUpdateAckTimeoutMs = 5000;
     private userId: string;
     private isDirty: boolean = true;
+    /** the project has been compiled once since it was opened */
+    private compileStarted: boolean = false;
     private initializing?: Promise<ProjectEntity>;
     private retryConnection: number = 0;
     private retryTimer?: NodeJS.Timeout;
@@ -323,8 +325,12 @@ export class VirtualFileSystem extends vscode.Disposable {
                         triggers: scmCollection.triggers,
                     };
                 }
-                // trigger the first compile
-                vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
+                // Compile when the project is opened. A reconnect, e.g. after the network
+                // dropped or the machine resumed, does not start another compile.
+                if (!this.compileStarted) {
+                    this.compileStarted = true;
+                    vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
+                }
                 return project;
             }).catch((err) => {
                 this.retryConnection += 1;
@@ -754,6 +760,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             parentFolder[key] = (parentFolder[key] as FileEntity[]).filter(e => e.name!==fileName || e._id===res!._id) as any;
         }
         this.insertEntity(parentFolder, res._type, res);
+        this.isDirty = true;
         const inserted = parentFolder[FolderKeys[res._type]]?.find((e:FileEntity) => e._id===res!._id) as FileEntity | undefined;
         if (res._type==='file' && inserted && (inserted as FileRefEntity).hash===undefined) {
             // the hash Overleaf computes for a file: git's blob SHA-1
@@ -969,7 +976,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                                 .filter(x => x) as any;
                 })(),
             };
-            this.isDirty = update.op.length>0;
+            if (update.op.length>0) { this.isDirty = true; }
             if (update.op.length===0) {
                 // nothing to send: the server already holds this content
                 doc.localCache = _content;
@@ -1156,6 +1163,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
             const res = await this.api.deleteEntity(identity, this.projectId, fileType, fileEntity._id);
             if (res.type==='success') {
+                this.isDirty = true;
                 this.removeEntityById(parentFolder, fileType, fileEntity._id, recursive);
                 this.notify([
                     {type: vscode.FileChangeType.Deleted, uri: uri},
@@ -1189,6 +1197,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
             // update local cache
             if (res?.type==='success') {
+                this.isDirty = true;
                 const newEntity = Object.assign(oldPath.fileEntity);
                 newEntity.name = newPath.fileName;
                 this.removeEntity(oldPath.parentFolder, oldPath.fileType, oldPath.fileEntity);
