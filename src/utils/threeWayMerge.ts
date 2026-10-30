@@ -285,13 +285,19 @@ export function threeWayMerge(base: string, local: string, remote: string): Thre
                 baseLines, entry.baseStart, entry.baseEnd, entry.remoteHunks
             );
 
-            result.push('<<<<<<< Local');
-            for (const line of localVersion) { result.push(line); }
-            result.push('=======');
-            for (const line of remoteVersion) { result.push(line); }
-            result.push('>>>>>>> Remote');
-
-            hasConflict = true;
+            if (localVersion.length === remoteVersion.length
+                && localVersion.every((line, i) => line === remoteVersion[i])) {
+                // Both sides made the same change here, e.g. a merge result that was
+                // uploaded but not yet written back locally: nothing to resolve.
+                for (const line of localVersion) { result.push(line); }
+            } else {
+                result.push('<<<<<<< Local');
+                for (const line of localVersion) { result.push(line); }
+                result.push('=======');
+                for (const line of remoteVersion) { result.push(line); }
+                result.push('>>>>>>> Remote');
+                hasConflict = true;
+            }
             baseIdx = entry.baseEnd;
         } else if (entry.kind === 'hunk') {
             // Apply the hunk: skip deleted base lines, add modified lines
