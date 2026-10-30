@@ -29,6 +29,8 @@ import { documentParams, PDFJS } from '../shims/pdf-js';
 import './viewer.css';
 
 const CHUNK_SIZE = 128 * 1024; // PDFJSWrapper's
+/** the zoom step of Overleaf's zoom buttons and keys (pdf-js-viewer.tsx); pdf.js's own is about 1.1 */
+const ZOOM_STEP = 1.25;
 const ScrollMode: Record<string, number> = { vertical: 0, horizontal: 1, wrapped: 2, page: 3 };
 const SpreadMode: Record<string, number> = { none: 0, odd: 1, even: 2 };
 
@@ -97,6 +99,10 @@ function setOptionsWhenTheAppStarts() {
         // The extension host saves the PDF, since the viewer may have only parts of it. The app
         // binds its handlers when it starts, so the method changes now.
         app().downloadOrSave = async () => post({ type: 'download' });
+        // The zoom buttons, the app's zoom keys and the ones above step by Overleaf's factor. The
+        // wheel and pinch zoom call updateZoom themselves, so they keep pdf.js's own steps.
+        app().zoomIn = () => app().updateZoom(null, ZOOM_STEP);
+        app().zoomOut = () => app().updateZoom(null, 1 / ZOOM_STEP);
         const options = (window as any).PDFViewerApplicationOptions;
         const set = (values: Record<string, unknown>) => Object.entries(values).forEach(([name, value]) => options.set(name, value));
         set({
@@ -202,8 +208,13 @@ function untilStopped<T>(job: Job, promise: Promise<T>): Promise<T | undefined> 
     ]);
 }
 
-/** Show a document; a newer one overtakes one that is still loading. */
+/**
+ * Show a document; a newer one overtakes one that is still loading. The extension host sends a
+ * build again when the PDF's tab becomes active, and a build that is in view already stays as it
+ * is, as in the Overleaf viewer.
+ */
 function show(source: { output?: PdfOutput, data?: ArrayBuffer }) {
+    if (source.output && !inFlight && app()?.pdfDocument && rangeLoaded?.url === source.output.url) { return; }
     if (inFlight) { stop(inFlight); }
     const job: Job = { abort: new AbortController() };
     inFlight = job;
