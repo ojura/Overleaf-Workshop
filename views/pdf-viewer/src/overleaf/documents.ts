@@ -50,6 +50,11 @@ export class Documents {
 
     constructor(private readonly wrapper: PDFJSWrapper, private readonly hooks: DocumentHooks) {}
 
+    /** whether a load is under way, whose document will replace the shown one */
+    get loading() {
+        return this.inFlight !== undefined;
+    }
+
     /** Load the build `output` in ranges, unless it is the build shown already. */
     load(output: PdfOutput, force = false) {
         if (!force && !this.inFlight && output.url === this.shownUrl) { return; }

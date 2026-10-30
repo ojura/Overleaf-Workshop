@@ -3,7 +3,7 @@ import '../common/transport';
 import PDFJSWrapper from '@/features/pdf-preview/util/pdf-js-wrapper';
 import { onMessage, post, ready, savedState, saveState, type Position } from '../common/host';
 import { clearError, errorKind, showError } from '../common/banner';
-import { goToCode, listenForDoubleClick, showHighlights } from '../common/synctex';
+import { goToCode, listenForDoubleClick, showHighlights, type SyncBox } from '../common/synctex';
 import { applyTheme, themesFrom, type Theme } from '../common/theme';
 import { Documents } from './documents';
 import { Outline } from './outline';
@@ -31,6 +31,13 @@ let theme: Theme | undefined;
 let initialised = false;
 /** a position to restore once the page is visible again */
 let restorePending = false;
+/**
+ * A forward search that came while the pages were not ready: before the first document's pages
+ * are set up, or during a load, whose swap would clear highlights drawn on the old document. It is
+ * drawn when the next document's pages are set up, if that happens soon.
+ */
+let pendingHighlights: { boxes: SyncBox[], at: number } | undefined;
+const PENDING_HIGHLIGHTS_MS = 30_000;
 
 const errorText = (error: any) => String(error?.message ?? error);
 
@@ -148,6 +155,11 @@ wrapper.eventBus.on('pagesinit', () => {
     container.querySelectorAll('div[data-page-number][role="region"]').forEach(page => page.removeAttribute('role'));
     restorePosition();
     toolbar.setPage(wrapper.viewer.currentPageNumber);
+    // after the restore, so that the highlight's own scrolling wins
+    if (pendingHighlights && Date.now() - pendingHighlights.at < PENDING_HIGHLIGHTS_MS) {
+        showHighlights(wrapper.viewer, pendingHighlights.boxes);
+    }
+    pendingHighlights = undefined;
 });
 wrapper.eventBus.on('scalechanging', ({ scale: value }: { scale: number }) => {
     toolbar.setScale(wrapper.viewer.currentScaleValue ?? String(value), value);
@@ -198,5 +210,9 @@ toolbar.setOutlineOpen(outline.open);
 onMessage('load', (message) => documents.load(message.output));
 onMessage('update', (message) => documents.loadData(message.content));
 onMessage('syncCode', (message) => {
-    if (initialised) { showHighlights(wrapper.viewer, message.content); }
+    if (initialised && !documents.loading) {
+        showHighlights(wrapper.viewer, message.content);
+    } else {
+        pendingHighlights = { boxes: message.content, at: Date.now() };
+    }
 });
