@@ -345,28 +345,70 @@ export class CompileManager {
         }
     }
 
-    async syncCode() {
-        const uri = await CompileManager.check();
-        if (uri && vscode.window.activeTextEditor) {
-            const { identifier, pathParts } = parseUri(uri);
-            const startPoint = vscode.window.activeTextEditor.selection.start;
-            const filePath = pathParts.join('/');
-            const line = startPoint.line;
-            const column = startPoint.character;
-            this.vfsm.prefetch(uri)
-                .then((vfs) => vfs.syncCode(filePath, line, column))
-                .then((res) => {
-                    if (res) {
-                        const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
-                        const webview = pdfViewRecord[identifier][pdfPath].webviewPanel.webview;
-                        // get page
-                        webview.postMessage({
-                            type: 'syncCode',
-                            content: res
-                        });
-                    }
-                });
+    /** The path inside the project of `docUri`: a document of the project, or a file of its local replica. */
+    static async projectPathOf(docUri: vscode.Uri): Promise<string | undefined> {
+        if (docUri.scheme===ROOT_NAME) {
+            return parseUri(docUri).pathParts.join('/');
         }
+        if (docUri.scheme==='file') {
+            const path = await LocalReplicaSCMProvider.uriToPath(docUri); // like '/dir/name.tex'
+            if (path!==undefined && path.startsWith('/') && !path.startsWith('/.overleaf/')) {
+                return path.slice(1);
+            }
+        }
+        return undefined;
+    }
+
+    /**
+     * Where to open `file`, a path inside the project that SyncTeX names: the local replica's
+     * copy when the workspace is a replica of this project and has the file, else the project's.
+     */
+    static async sourceUriOf(projectUri: vscode.Uri, projectId: string, file: string): Promise<vscode.Uri> {
+        const { projectName } = parseUri(projectUri);
+        if (/^output\.[^.]+$/.test(file)) {
+            return projectUri.with({ path: `/${projectName}/${OUTPUT_FOLDER_NAME}/${file}` });
+        }
+        const setting = await LocalReplicaSCMProvider.readSettings();
+        if (setting?.uri && parseUri(vscode.Uri.parse(setting.uri)).projectId===projectId) {
+            const local = await LocalReplicaSCMProvider.pathToUri(`/${file}`);
+            if (local) {
+                try {
+                    await vscode.workspace.fs.stat(local);
+                    return local;
+                } catch {
+                    // not in the replica: open the project's copy
+                }
+            }
+        }
+        return projectUri.with({ path: `/${projectName}/${file}` });
+    }
+
+    async syncCode() {
+        const editor = vscode.window.activeTextEditor;
+        const uri = await CompileManager.check();
+        if (!uri || !editor) { return; }
+        const filePath = await CompileManager.projectPathOf(editor.document.uri);
+        if (!filePath) {
+            vscode.window.showInformationMessage( vscode.l10n.t('This file is not part of the Overleaf project.') );
+            return;
+        }
+        const { identifier } = parseUri(uri);
+        const startPoint = editor.selection.start;
+        const vfs = await this.vfsm.prefetch(uri);
+        // SyncTeX counts lines from 1, as the web editor sends them
+        const res = await vfs.syncCode(filePath, startPoint.line + 1, startPoint.character);
+        if (!res) { return; }
+        const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
+        if (!pdfViewRecord[identifier]?.[pdfPath]) {
+            await this.openPdf();
+            for (let i = 0; i < 50 && !pdfViewRecord[identifier]?.[pdfPath]; i++) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+        }
+        pdfViewRecord[identifier]?.[pdfPath]?.webviewPanel.webview.postMessage({
+            type: 'syncCode',
+            content: res,
+        });
     }
 
     private _revealSelectionInEditor(editor: vscode.TextEditor, targetLine: number, identifier: string) {
@@ -403,13 +445,13 @@ export class CompileManager {
         const uri = await CompileManager.check();
         if (uri) {
             this.vfsm.prefetch(uri)
-                .then((vfs) => vfs.syncPdf(r.page, r.h, r.v))
-                .then((res) => {
-                    if (res) {
-                        const { projectName } = parseUri(uri);
-                        const { file, line, column } = res;
-                        const _file = file.match(/output\.[^\.]+$/) ? `${OUTPUT_FOLDER_NAME}/${file}` : file;
-                        const fileUri = uri.with({ path: `/${projectName}/${_file}` });
+                .then(async (vfs) => {
+                    const res = await vfs.syncPdf(r.page, r.h, r.v);
+                    return res && {res, fileUri: await CompileManager.sourceUriOf(uri, vfs.projectId, res.file)};
+                })
+                .then((found) => {
+                    if (found) {
+                        const { res: { line }, fileUri } = found;
 
                         let viewColumnToUse: vscode.ViewColumn | undefined;
                         const existingEditor = vscode.window.visibleTextEditors.find(

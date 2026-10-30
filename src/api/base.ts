@@ -872,19 +872,30 @@ export class BaseAPI {
         return this.fetchContent(absoluteUrl, headers);
     }
 
-    async proxySyncPdf(identity:Identity, projectId:string, page:number, h:number, v:number, buildId:string) {
+    /**
+     * The source position of point (h, v) on page `page` (from 1) of build `buildId`. The
+     * request names the compile server that made the build, as the web editor's does.
+     */
+    async proxySyncPdf(identity:Identity, projectId:string, page:number, h:number, v:number, buildId:string, clsiServerId?:string) {
         this.setIdentity(identity);
-        const request = `project/${projectId}/sync/pdf?page=${page}&h=${h.toFixed(2)}&v=${v.toFixed(2)}&editorId=${uuidv4()}&buildId=${buildId}`;
-        return this.request('GET', `project/${projectId}/sync/pdf?page=${page}&h=${h.toFixed(2)}&v=${v.toFixed(2)}&editorId=${uuidv4()}&buildId=${buildId}`,
+        const query = new URLSearchParams({page: String(page), h: h.toFixed(2), v: v.toFixed(2), editorId: uuidv4(), buildId});
+        if (clsiServerId) { query.set('clsiserverid', clsiServerId); }
+        return this.request('GET', `project/${projectId}/sync/pdf?${query}`,
                             undefined, (res) => {
                                 const syncPdf = (JSON.parse(res!) as any).code[0] as SyncPdfResponseSchema;
                                 return {syncPdf};
                             });
     }
 
-    async proxySyncCode(identity:Identity, projectId:string, file:string, line:number, column:number, buildId:string) {
+    /**
+     * The PDF positions of `line` and `column` of `file`, a path inside the project. SyncTeX
+     * counts lines from 1, as the web editor sends them (row + 1).
+     */
+    async proxySyncCode(identity:Identity, projectId:string, file:string, line:number, column:number, buildId:string, clsiServerId?:string) {
         this.setIdentity(identity);
-        return this.request('GET', `project/${projectId}/sync/code?file=${file}&line=${line}&column=${column}&editorId=${uuidv4()}&buildId=${buildId}`,
+        const query = new URLSearchParams({file, line: String(line), column: String(column), editorId: uuidv4(), buildId});
+        if (clsiServerId) { query.set('clsiserverid', clsiServerId); }
+        return this.request('GET', `project/${projectId}/sync/code?${query}`,
                             undefined, (res) => {
                                 const syncCode = (JSON.parse(res!) as any).pdf as SyncCodeResponseSchema;
                                 return {syncCode};

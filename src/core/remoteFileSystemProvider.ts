@@ -1495,9 +1495,10 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
+    /** The PDF positions of `line` (from 1) and `column` of `filePath`, a path inside the project. */
     async syncCode(filePath: string, line:number, column:number) {
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-        const res = await this.api.proxySyncCode(identity, this.projectId, filePath, line, column, this.outputBuildId ?? '');
+        const res = await this.api.proxySyncCode(identity, this.projectId, filePath, line, column, this.outputBuildId ?? '', this.clsiServerId);
         if (res.type==='success') {
             return res.syncCode;
         } else {
@@ -1510,7 +1511,7 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     async syncPdf(page:number, h:number, v:number) {
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-        const res = await this.api.proxySyncPdf(identity, this.projectId, page, h, v, this.outputBuildId ?? '');
+        const res = await this.api.proxySyncPdf(identity, this.projectId, page, h, v, this.outputBuildId ?? '', this.clsiServerId);
         if (res.type==='success') {
             return res.syncPdf;
         } else {
