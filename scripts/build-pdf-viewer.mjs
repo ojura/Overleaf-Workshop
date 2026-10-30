@@ -57,6 +57,22 @@ export const standIns = {
     },
 };
 
+/**
+ * For the pdfjs viewer: pdf.js's viewer app has its own copies of the viewer components, and that
+ * viewer uses only PDFJSWrapper's methods on the app's page viewer, not the wrapper's
+ * constructor, which makes the components. So the wrapper's imports of pdfjs-dist's components
+ * and their CSS are left empty there; the CSS would also restyle the app's page.
+ */
+const noViewerComponents = {
+    name: 'no-viewer-components',
+    setup(build) {
+        build.onResolve({ filter: /^pdfjs-dist\/web\/pdf_viewer\.(mjs|css)$/ }, (args) => ({ path: args.path, namespace: 'no-viewer-components' }));
+        build.onLoad({ filter: /.*/, namespace: 'no-viewer-components' }, (args) => args.path.endsWith('.css')
+            ? { contents: '', loader: 'css' }
+            : { contents: 'export const PDFViewer = undefined, EventBus = undefined, PDFLinkService = undefined, LinkTarget = {};', loader: 'js' });
+    },
+};
+
 /** esbuild options shared by the viewers and by the tests that bundle their modules */
 export const bundleOptions = {
     bundle: true,
@@ -71,6 +87,7 @@ export const bundleOptions = {
 };
 
 export const engines = ['pdfjs', 'overleaf'];
+const enginePlugins = { pdfjs: [noViewerComponents], overleaf: [] };
 
 /** The viewers whose page script and page exist in this checkout. */
 export function availableEngines() {
@@ -84,6 +101,7 @@ export async function buildViewers(outdir = path.join(viewerRoot, 'dist')) {
     for (const engine of availableEngines()) {
         await esbuild.build({
             ...bundleOptions,
+            plugins: [...bundleOptions.plugins, ...enginePlugins[engine]],
             entryPoints: [path.join(src, engine, 'main.ts')],
             outfile: path.join(outdir, `${engine}.mjs`),
         });

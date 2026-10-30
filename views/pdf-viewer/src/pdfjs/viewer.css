@@ -1,0 +1,40 @@
+/* The pdfjs viewer's changes to pdf.js's viewer app (vendor/pdfjs-5.1.91/web/viewer.css). */
+
+/* A webview cannot print, open a file chooser for this viewer, or link to a view of the
+   document; annotation editing is off (main.ts). Download stays: the extension host saves
+   the PDF (src/core/pdfViewEditorProvider.ts). */
+#printButton,
+#secondaryPrint,
+#secondaryOpenFile,
+#viewBookmark,
+#viewBookmarkSeparator,
+#editorModeButtons,
+#editorModeSeparator {
+    display: none !important;
+}
+
+/* the extension's buttons in the toolbar: go to the source, and the color theme */
+.extensionButton {
+    width: auto !important;
+    padding: 0 6px !important;
+    font: inherit;
+    white-space: nowrap;
+}
+.extensionButton::before {
+    display: none !important;
+}
+
+/* asks before find downloads a build in full */
+#findConsent {
+    position: fixed; top: 32px; left: 0; right: 0; z-index: 100000;
+    display: flex; gap: 12px; align-items: center; padding: 8px 12px;
+    font: 13px var(--vscode-font-family, sans-serif);
+    color: var(--vscode-notifications-foreground, #000);
+    background: var(--vscode-notifications-background, #f3f3f3);
+    border-bottom: 1px solid var(--vscode-notifications-border, #ccc);
+}
+#findConsent span { flex: 1; }
+#findConsent button {
+    font: inherit; padding: 2px 10px; cursor: pointer; border: none;
+    color: var(--vscode-button-foreground, #fff); background: var(--vscode-button-background, #0e639c);
+}
