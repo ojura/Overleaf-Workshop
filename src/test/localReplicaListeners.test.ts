@@ -56,6 +56,10 @@ function world() {
         },
         createDirectory: async () => {},
         delete: async () => {},
+        rename: async (from: Uri, to: Uri) => {
+            const content = w.localFiles.get(from.path);
+            if (content!==undefined) { w.localFiles.delete(from.path); w.localFiles.set(to.path, content); }
+        },
     };
     const mock = withStubs({
         Uri,
@@ -115,11 +119,16 @@ describe('LocalReplicaSCMProvider when the first sync fails', () => {
         const { w, mock } = world();
         const LocalReplicaSCMProvider = load(mock);
         const origin = new Uri('overleaf-workshop', '/project');
+        // listing the project fails as a DNS lookup does when the network drops
         const vfs = {
-            origin, serverName: 'www.overleaf.com', projectName: 'project',
+            origin, serverName: 'www.overleaf.com', projectName: 'project', projectId: 'p',
             pathToUri: (...parts: string[]) => Uri.joinPath(origin, ...parts),
             getProjectSCMPersist: () => ({ settings: {} }),
             setProjectSCMPersist: () => {},
+            init: async () => { throw new Error('getaddrinfo EAI_AGAIN www.overleaf.com'); },
+            _resolveUri: async () => ({ fileType: undefined, fileEntity: undefined }),
+            createFile: async (uri: Uri) => { w.remoteWrites.push(uri.path); return { _type: 'doc', _id: 'd', name: 'new.tex' }; },
+            documentUpdatesSettled: async () => {},
         };
         const scm = new LocalReplicaSCMProvider(vfs, Uri.file('/home/user/project'));
 
