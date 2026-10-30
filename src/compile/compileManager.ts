@@ -5,6 +5,7 @@ import { PdfDocument } from '../core/pdfViewEditorProvider';
 import { LatexParser, ErrorSchema } from './compileLogParser';
 import { EventBus } from '../utils/eventBus';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
+import { REPLICA_OUTPUT_FOLDER, saveCompileOutputs } from './outputFiles';
 
 // map string level to severity
 const severityMap: Record<string, vscode.DiagnosticSeverity> = {
@@ -121,6 +122,8 @@ export class CompileManager {
     private diagnosticProvider: CompileDiagnosticProvider;
     private compileAsDraft: boolean = false;
     private compileStopOnFirstError: boolean = false;
+    /** the saves of local replica logs, one after another */
+    private outputSaves: Promise<void> = Promise.resolve();
 
     constructor(
         private vfsm: RemoteFileSystemProvider,
@@ -218,7 +221,12 @@ export class CompileManager {
                         const content = new TextDecoder().decode( await vfs.openFile(uri) );
                         rootDocId = RegExp(documentClassRegex).exec(content) ? fileId : undefined;
                     }
-                    return await vfs.compile(force, this.compileAsDraft, this.compileStopOnFirstError, rootDocId);
+                    const res = await vfs.compile(force, this.compileAsDraft, this.compileStopOnFirstError, rootDocId);
+                    if (res!==undefined) {
+                        // not awaited: the PDF and the diagnostics do not wait for the local copies of the logs
+                        this.saveLocalReplicaOutputs(vfs);
+                    }
+                    return res;
                 })
                 .then(async (res) => {
                     switch (res) {
@@ -273,6 +281,26 @@ export class CompileManager {
         } finally {
             clearTimeout(timer);
         }
+    }
+
+    /**
+     * Keep the logs of a local replica's compile in the replica's .overleaf/output folder, so
+     * that editors and tools can read Overleaf's log locally. The replica never syncs that
+     * folder. Saves run one after another, so the folder ends up with the last compile's logs.
+     */
+    private saveLocalReplicaOutputs(vfs: VirtualFileSystem) {
+        const compile = vfs.lastCompile;
+        if (compile===undefined) { return; }
+        this.outputSaves = this.outputSaves.then(async () => {
+            const setting = await LocalReplicaSCMProvider.readSettings();
+            if (!setting?.uri || parseUri(vscode.Uri.parse(setting.uri)).projectId!==vfs.projectId) { return; }
+            const folder = await LocalReplicaSCMProvider.pathToUri(REPLICA_OUTPUT_FOLDER);
+            if (folder?.scheme!=='file') { return; }
+            const summary = await saveCompileOutputs(folder.fsPath, compile, file => vfs.downloadCompileOutput(file, compile.response!));
+            summary.failed.forEach(f => console.warn(`${ELEGANT_NAME}: ${f.path} of the compile was not saved in ${folder.fsPath}: ${f.error}`));
+        }).catch(error => {
+            console.error(`${ELEGANT_NAME}: could not save the compile's logs in ${REPLICA_OUTPUT_FOLDER}:`, error);
+        });
     }
 
     /** Switch compiling on Overleaf and the PDF preview on or off for the workspace's local replica. */

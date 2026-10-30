@@ -1,7 +1,8 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
 import * as DiffMatchPatch from 'diff-match-patch';
-import { BaseAPI, MemberEntity, ProjectSettingsSchema } from '../api/base';
+import { BaseAPI, CompileResponseSchema, MemberEntity, ProjectSettingsSchema } from '../api/base';
+import type { CompileRecord } from '../compile/outputFiles';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
@@ -159,6 +160,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     /** Whether event handlers have been registered on the current socket */
     private handlersRegistered: boolean = false;
     private outputBuildId?: string;
+    /** the last compile on Overleaf, whatever its status */
+    lastCompile?: CompileRecord;
     private compileGroup?: string;
     private clsiServerId?: string;
     private pdfDownloadDomain?: string;
@@ -1240,7 +1243,13 @@ export class VirtualFileSystem extends vscode.Disposable {
                     console.warn(`Unable to resolve root document id '${resolvedRootDocId}' to a path; compiling without explicit rootResourcePath.`);
                 }
             }
+            const startedAt = Date.now();
             const res = await this.api.compile(identity, this.projectId, rootResourcePath, draft, stopOnFirstError);
+            this.lastCompile = {
+                response: res.type==='success' ? res.compile : undefined,
+                message: res.type==='success' ? undefined : res.message,
+                rootResourcePath, startedAt, finishedAt: Date.now(),
+            };
             if (res.type==='success' && res.compile?.status==='success') {
                 // Store CDN download info from the response for subsequent output file requests
                 this.compileGroup = res.compile.compileGroup;
@@ -1256,6 +1265,17 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
         }
         return Promise.resolve(undefined);
+    }
+
+    /** Download an output file of `response`, a compile of this project with any status. */
+    async downloadCompileOutput(file: OutputFileEntity, response: CompileResponseSchema): Promise<Uint8Array> {
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.getFileFromClsi(identity, file.url, response.compileGroup || 'standard',
+                                                   response.clsiServerId, response.pdfDownloadDomain);
+        if (res.type!=='success' || !res.content) {
+            throw new Error(res.message ?? `the download of ${file.path} failed`);
+        }
+        return res.content;
     }
 
     async stopCompile() {
