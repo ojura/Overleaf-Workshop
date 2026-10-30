@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import { Blob } from 'buffer';
 import { v4 as uuidv4 } from 'uuid';
-import { Agent, fetch, FormData } from 'undici';
+import { Agent, Dispatcher, fetch, FormData } from 'undici';
 import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
 
 function errorMessage(error: any): string {
@@ -212,10 +212,25 @@ export interface ResponseSchema {
     settings?: ProjectSettingsSchema;
 }
 
+/** How `BaseAPI.request` sends one request. */
+export interface RequestOptions {
+    /** the undici dispatcher, which sets the time limits; undici's default waits five minutes */
+    dispatcher?: Dispatcher;
+    /** how often to send it again after a network error, a 5xx or a 429 */
+    retries?: number;
+}
+
 export class BaseAPI {
     /** A download fails when the server sends nothing for this long (undici waits five minutes). */
     static downloadIdleTimeoutMs = 60 * 1000;
     private static downloadAgent?: {timeoutMs: number, agent: Agent};
+    /**
+     * How long a compile request may take. Overleaf answers it when the compile is done and
+     * gives it 12 minutes itself (COMPILE_TIMEOUT_MS of its web server), longer than undici's
+     * default of five minutes for the response headers.
+     */
+    static compileRequestTimeoutMs = 15 * 60 * 1000;
+    private static compileAgent?: {timeoutMs: number, agent: Agent};
 
     private url: string;
     private identity?: Identity;
@@ -392,10 +407,11 @@ export class BaseAPI {
         return false;
     }
 
-    protected async request(type:'GET'|'POST'|'PUT'|'DELETE', route:string, body?:FormData|object, callback?: (res?:string)=>object|undefined, extraHeaders?:object ): Promise<ResponseSchema> {
+    protected async request(type:'GET'|'POST'|'PUT'|'DELETE', route:string, body?:FormData|object, callback?: (res?:string)=>object|undefined, extraHeaders?:object, options?: RequestOptions): Promise<ResponseSchema> {
         if (this.identity===undefined) { return Promise.reject(); }
 
-        const MAX_HTTP_RETRIES = 2;
+        const MAX_HTTP_RETRIES = options?.retries ?? 2;
+        const dispatcher = options?.dispatcher;
         let lastError: {statusCode?: number, message?: string} = {};
 
         for (let attempt = 0; attempt <= MAX_HTTP_RETRIES; attempt++) {
@@ -409,7 +425,8 @@ export class BaseAPI {
                                 'Connection': 'keep-alive',
                                 'Cookie': this.identity!.cookies,
                                 ...extraHeaders
-                            }
+                            },
+                            dispatcher,
                         });
                         break;
                     case 'POST':
@@ -426,7 +443,8 @@ export class BaseAPI {
                                 ...content_type,
                                 ...extraHeaders
                             },
-                            body: raw_body
+                            body: raw_body,
+                            dispatcher,
                         });
                         break;
                     case 'PUT':
@@ -439,7 +457,8 @@ export class BaseAPI {
                                 'Cookie': this.identity!.cookies,
                                 'X-Csrf-Token': this.identity!.csrfToken,
                                 ...extraHeaders
-                            }
+                            },
+                            dispatcher,
                         });
                         break;
                 };
@@ -468,7 +487,8 @@ export class BaseAPI {
                     };
                 }
             } catch (err: any) {
-                const errMsg = err?.message || String(err);
+                // with the cause, which says what failed: "fetch failed: Headers Timeout Error"
+                const errMsg = errorMessage(err);
                 if (this.isTransientError(undefined, errMsg) && attempt < MAX_HTTP_RETRIES) {
                     const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000);
                     console.log(`HTTP fetch error on ${route}: ${errMsg}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
@@ -487,6 +507,22 @@ export class BaseAPI {
             type: 'error',
             message: lastError.message || `Request failed after ${MAX_HTTP_RETRIES + 1} attempts`
         };
+    }
+
+    /**
+     * Sends a compile request: with the time limits of `compileRequestTimeoutMs`, and once
+     * only, since a request sent again after an error could start a second compile while
+     * the first one still runs.
+     */
+    protected static get compileRequestOptions(): RequestOptions {
+        const timeoutMs = BaseAPI.compileRequestTimeoutMs;
+        if (BaseAPI.compileAgent?.timeoutMs!==timeoutMs) {
+            BaseAPI.compileAgent = {
+                timeoutMs,
+                agent: new Agent({headersTimeout: timeoutMs, bodyTimeout: timeoutMs}),
+            };
+        }
+        return {dispatcher: BaseAPI.compileAgent.agent, retries: 0};
     }
 
     /**
@@ -719,7 +755,7 @@ export class BaseAPI {
         return this.request('POST', `project/${projectId}/compile?auto_compile=true`, body, (res) => {
             const compile = JSON.parse(res!) as CompileResponseSchema;
             return {compile};
-        }, {'X-Csrf-Token': identity.csrfToken});
+        }, {'X-Csrf-Token': identity.csrfToken}, BaseAPI.compileRequestOptions);
     }
 
     async stopCompile(identity:Identity, projectId:string) {

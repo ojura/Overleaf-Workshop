@@ -45,7 +45,7 @@ class SandboxAPI extends BaseAPI {
         return this.request('POST', `project/${projectId}/compile`, body, (res) => {
             const compile = JSON.parse(res!) as CompileResponseSchema;
             return { compile };
-        }, { 'X-Csrf-Token': identity.csrfToken });
+        }, { 'X-Csrf-Token': identity.csrfToken }, BaseAPI.compileRequestOptions);
     }
 }
 
