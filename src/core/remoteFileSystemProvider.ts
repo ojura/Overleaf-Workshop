@@ -10,7 +10,7 @@ import { EventBus } from '../utils/eventBus';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
 
-const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
+export const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
 export type FileType = 'doc' | 'file' | 'folder' | 'outputs';
 export type FolderKey = 'docs' | 'fileRefs' | 'folders' | 'outputs';
@@ -64,6 +64,7 @@ interface PendingWrite {
 export interface FileRefEntity extends FileEntity {
     linkedFileData: ProjectLinkedFileProvider | UrlLinkedFileProvider | null,
     created: string, //ISO date string
+    hash?: string, //git blob SHA-1 of the content
 }
 
 export interface OutputFileEntity extends FileEntity {
@@ -724,37 +725,45 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    async createFile(uri: vscode.Uri, content:Uint8Array, overwrite?:boolean) {
+    /** Create `uri`, or replace the file there; throws when the server refuses. */
+    async createFile(uri: vscode.Uri, content:Uint8Array, overwrite?:boolean): Promise<FileEntity> {
         const {parentFolder, fileName, fileEntity} = await this._resolveUri(uri);
         if (fileEntity && !overwrite) {
             throw vscode.FileSystemError.FileExists(uri);
         }
 
         let res = undefined;
+        let message = undefined;
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
 
         if (content.length===0) {
             const _res = await this.api.addDoc(identity, this.projectId, parentFolder._id, fileName);
-            if (_res.type==='success') {
-                res = _res.entity;
-            }
+            res = _res.type==='success' ? _res.entity : undefined;
+            message = _res.message;
         } else {
             const parentFolderId = parentFolder._id;
             const _res = await this.api.uploadFile(identity, this.projectId, parentFolderId, fileName, content);
-            if (_res.type==='success' && _res.entity!==undefined) {
-                res = _res.entity;
-            } else {
-                if (_res.message!==undefined) {
-                    vscode.window.showErrorMessage(_res.message);
-                }
-            }
+            res = _res.type==='success' ? _res.entity : undefined;
+            message = _res.message;
         }
-        if (res && res._type) {
-            this.insertEntity(parentFolder, res._type, res);
-            this.notify([
-                {type: vscode.FileChangeType.Created, uri: uri},
-            ]);
+        if (!res || !res._type) {
+            throw vscode.FileSystemError.Unavailable(`${uri.path}: ${message ?? 'the server did not create the file'}`);
         }
+        // An upload replaces the file of the same name; the server's notice of that may come later.
+        for (const key of ['docs', 'fileRefs'] as const) {
+            parentFolder[key] = (parentFolder[key] as FileEntity[]).filter(e => e.name!==fileName || e._id===res!._id) as any;
+        }
+        this.insertEntity(parentFolder, res._type, res);
+        const inserted = parentFolder[FolderKeys[res._type]]?.find((e:FileEntity) => e._id===res!._id) as FileEntity | undefined;
+        if (res._type==='file' && inserted && (inserted as FileRefEntity).hash===undefined) {
+            // the hash Overleaf computes for a file: git's blob SHA-1
+            (inserted as FileRefEntity).hash = require('crypto').createHash('sha1')
+                .update(`blob ${content.byteLength}\0`).update(content).digest('hex');
+        }
+        this.notify([
+            {type: vscode.FileChangeType.Created, uri: uri},
+        ]);
+        return inserted ?? res;
     }
 
     async refreshLinkedFile(uri: vscode.Uri) {
@@ -894,12 +903,14 @@ export class VirtualFileSystem extends vscode.Disposable {
 
         // if non-exists --> create it
         if (!fileType && create) {
-            return this.createFile(uri, content, true);
+            await this.createFile(uri, content, true);
+            return;
         }
 
         // if exists but not doc --> create new
         if (fileType && fileType!=='doc' && create) {
-            return this.createFile(uri, content, overwrite);
+            await this.createFile(uri, content, overwrite);
+            return;
         }
 
         // if exists and is doc --> update
@@ -1087,6 +1098,12 @@ export class VirtualFileSystem extends vscode.Disposable {
         while (doc.sync) { await doc.sync.done; }
     }
 
+    /** Resolves once every document update sent so far is acknowledged by the server or given up. */
+    async documentUpdatesSettled() {
+        const docs = this.root ? this.walk(entity => entity._type==='doc') : [];
+        await Promise.all(docs.map(({entity}) => this.syncSettled(entity as DocumentEntity)));
+    }
+
     private beginSync(doc: DocumentEntity) {
         let release!: () => void;
         const done = new Promise<void>((resolve) => { release = resolve; });
@@ -1129,9 +1146,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 {type: vscode.FileChangeType.Created, uri: uri},
             ]);
         } else {
-            if (res.message!==undefined) {
-                vscode.window.showErrorMessage(res.message);
-            }
+            throw vscode.FileSystemError.Unavailable(`${uri.path}: ${res.message ?? 'the server did not create the folder'}`);
         }
     }
 
@@ -1146,9 +1161,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                     {type: vscode.FileChangeType.Deleted, uri: uri},
                 ]);
             } else {
-                if (res.message!==undefined) {
-                    vscode.window.showErrorMessage(res.message);
-                }
+                throw vscode.FileSystemError.Unavailable(`${uri.path}: ${res.message ?? 'the server did not delete it'}`);
             }
         }
     }
