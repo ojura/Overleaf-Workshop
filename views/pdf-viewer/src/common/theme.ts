@@ -27,18 +27,16 @@ export function themesFrom(init: Pick<InitState, 'colorThemes'>): Theme[] {
 const isPlain = (theme: Theme) => /^(black|#000000)$/i.test(theme.fontColor) && /^(white|#ffffff)$/i.test(theme.bgColor);
 
 /**
- * Draw the pages in `theme`'s colors with pdf.js's page colors: pdf.js maps the colors of each
- * page between the theme's text and background color. That applies to images too, unlike the
- * legacy viewer, which changes only the color of black text and lines.
+ * Draw the pages in `theme`'s colors, as the legacy viewer does. The extension's patch to pdf.js
+ * (vendor/pdfjs-5.1.91-dist.patch) reads globalThis.pdfjsViewerColorTheme whenever it draws a
+ * page: black text and lines outside form XObjects take the theme's text color, and the page's
+ * background the theme's background color. Images and colored content keep their colors, which
+ * pdf.js's own page colors would map too.
  */
 export function applyTheme(viewer: any, theme: Theme) {
-    const colors = isPlain(theme) ? null : { background: theme.bgColor, foreground: theme.fontColor };
-    viewer.pageColors = colors;
-    const pages = viewer.pagesCount ?? 0;
-    for (let i = 0; i < pages; i++) {
-        const view = viewer.getPageView(i);
-        if (view) { view.pageColors = colors; }
-    }
-    viewer.viewer?.style.setProperty('--page-bg-color', colors?.background ?? 'white');
+    (globalThis as any).pdfjsViewerColorTheme = isPlain(theme) ? null : { fontColor: theme.fontColor, bgColor: theme.bgColor };
+    viewer.pageColors = null;
+    viewer.viewer?.style.setProperty('--page-bg-color', isPlain(theme) ? 'white' : theme.bgColor);
+    // draws the pages again, which reads the theme anew
     viewer.refresh?.();
 }

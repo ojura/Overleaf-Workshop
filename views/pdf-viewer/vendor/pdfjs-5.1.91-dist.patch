@@ -1,0 +1,65 @@
+--- a/build/pdf.mjs
++++ b/build/pdf.mjs
+@@ -7241,6 +7241,14 @@
+ const MAX_FONT_SIZE = 100;
+ const EXECUTION_TIME = 15;
+ const EXECUTION_STEPS = 10;
++// Overleaf Workshop's color themes, as in its patch to pdf.js 3.10.111: the viewer page sets
++// globalThis.pdfjsViewerColorTheme = { fontColor, bgColor }, or null for the PDF's own colors.
++// Black text and lines outside form XObjects take fontColor, and the page background bgColor;
++// images and colored content keep their colors.
++function viewerColorTheme() {
++  const theme = globalThis.pdfjsViewerColorTheme;
++  return theme && typeof theme.fontColor === "string" && typeof theme.bgColor === "string" ? theme : null;
++}
+ const MAX_SIZE_TO_COMPILE = 1000;
+ const FULL_CHUNK_HEIGHT = 16;
+ const SCALE_MATRIX = new DOMMatrix();
+@@ -7839,7 +7847,7 @@
+     const width = this.ctx.canvas.width;
+     const height = this.ctx.canvas.height;
+     const savedFillStyle = this.ctx.fillStyle;
+-    this.ctx.fillStyle = background || "#ffffff";
++    this.ctx.fillStyle = background || viewerColorTheme()?.bgColor || "#ffffff";
+     this.ctx.fillRect(0, 0, width, height);
+     this.ctx.fillStyle = savedFillStyle;
+     if (transparency) {
+@@ -7881,6 +7889,13 @@
+         return i;
+       }
+       fnId = fnArray[i];
++      if (fnId === OPS.paintFormXObjectBegin) {
++        this.themeFormDepth = (this.themeFormDepth || 0) + 1;
++      } else if (fnId === OPS.paintFormXObjectEnd) {
++        this.themeFormDepth = Math.max(0, (this.themeFormDepth || 0) - 1);
++      } else if (fnId === OPS.setStrokeRGBColor) {
++        this.themeStroke = !this.themeFormDepth && fnArray.length > 10;
++      }
+       if (fnId !== OPS.dependency) {
+         this[fnId].apply(this, argsArray[i]);
+       } else {
+@@ -8628,6 +8643,10 @@
+       ctx.restore();
+       ctx.strokeStyle = pattern;
+     }
++    const textTheme = simpleFillText && !this.themeFormDepth && ctx.fillStyle === "#000000" ? viewerColorTheme() : null;
++    if (textTheme) {
++      ctx.fillStyle = textTheme.fontColor;
++    }
+     let lineWidth = current.lineWidth;
+     const scale = current.textMatrixScale;
+     if (scale === 0 || lineWidth === 0) {
+@@ -8802,7 +8821,12 @@
+     this.current.patternFill = true;
+   }
+   setStrokeRGBColor(r, g, b) {
+-    this.ctx.strokeStyle = this.current.strokeColor = Util.makeHexColor(r, g, b);
++    let color = Util.makeHexColor(r, g, b);
++    const theme = this.themeStroke && color === "#000000" ? viewerColorTheme() : null;
++    if (theme) {
++      color = theme.fontColor;
++    }
++    this.ctx.strokeStyle = this.current.strokeColor = color;
+     this.current.patternStroke = false;
+   }
+   setStrokeTransparent() {
