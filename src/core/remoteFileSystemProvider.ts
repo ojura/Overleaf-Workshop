@@ -1386,20 +1386,21 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string) {
-        if (force || (this.root && this.isDirty)) {
+    /**
+     * Compile on Overleaf, incrementally: the compile server keeps the previous build's
+     * output, as for the web editor's Recompile. With `fromScratch`, that output is cleared
+     * first, as by "Recompile from scratch": this user's build is deleted, and the compile
+     * sends every file and runs every pass.
+     */
+    async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string, fromScratch:boolean=false) {
+        if (force || fromScratch || (this.root && this.isDirty)) {
             this.isDirty = false;
-            let needCacheClearFirst = false;
-            try{
-                await this.resolve(this.pathToUri(OUTPUT_FOLDER_NAME, "output.log"));
-            }
-            catch (e) {
-                needCacheClearFirst = true;
-            }
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-            // clear cache if needed
-            if (needCacheClearFirst) {
-                await this.api.deleteAuxFiles(identity, this.projectId);
+            if (fromScratch) {
+                const cleared = await this.api.deleteAuxFiles(identity, this.projectId);
+                if (cleared.type!=='success') {
+                    console.warn(`Overleaf Workshop: clearing the compile output failed, compiling anyway: ${cleared.message}`);
+                }
             }
             // compile project
             const resolvedRootDocId = rootDocId ?? this.root?.rootDoc_id ?? null;

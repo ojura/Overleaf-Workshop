@@ -352,6 +352,12 @@
         "category": "%extension.displayName%"
       },
       {
+        "command": "overleaf-workshop.compileManager.recompileFromScratch",
+        "title": "%commands.compileManager.recompileFromScratch.title%",
+        "enablement": "resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile",
+        "category": "%extension.displayName%"
+      },
+      {
         "command": "overleaf-workshop.compileManager.viewPdf",
         "title": "%commands.compileManager.viewPdf.title%",
         "icon": "$(open-preview)",

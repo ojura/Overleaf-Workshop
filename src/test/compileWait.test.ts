@@ -70,7 +70,10 @@ describe('CompileManager with a local replica', () => {
             getRootDocName: () => '/main.tex',
             getCompiler: () => ({ name: 'pdfLaTeX' }),
             _resolveUri: async () => ({ fileType: 'folder', fileId: 'root' }),
-            compile: async () => { events.push('compile'); return undefined; },
+            compile: async (_force: boolean, _draft: boolean, _stop: boolean, _root: string, fromScratch?: boolean) => {
+                events.push(fromScratch ? 'compile from scratch' : 'compile');
+                return undefined;
+            },
         };
         const manager = new CompileManager({ prefetch: async () => vfs });
         return { events, manager };
@@ -85,6 +88,15 @@ describe('CompileManager with a local replica', () => {
         release();
         await settle();
         assert.deepStrictEqual(events, ['flush started', 'flush done', 'compile']);
+    });
+
+    it('clears the compile output on Overleaf only for Recompile from Scratch', async () => {
+        const { events, manager } = setup(async () => {});
+        await manager.compile(true);
+        await settle();
+        await manager.compile(true, true);
+        await settle();
+        assert.deepStrictEqual(events.filter(e => e.startsWith('compile')), ['compile', 'compile from scratch']);
     });
 
     it('compiles anyway when the uploads take too long, and says so', async () => {

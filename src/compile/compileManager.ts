@@ -204,7 +204,7 @@ export class CompileManager {
         return uri;
     }
 
-    async compile(force:boolean=false) {
+    async compile(force:boolean=false, fromScratch:boolean=false) {
         if (this.inCompiling) { return; }
         await vscode.workspace.saveAll(); // save all dirty files
 
@@ -221,7 +221,7 @@ export class CompileManager {
                         const content = new TextDecoder().decode( await vfs.openFile(uri) );
                         rootDocId = RegExp(documentClassRegex).exec(content) ? fileId : undefined;
                     }
-                    const res = await vfs.compile(force, this.compileAsDraft, this.compileStopOnFirstError, rootDocId);
+                    const res = await vfs.compile(force, this.compileAsDraft, this.compileStopOnFirstError, rootDocId, fromScratch);
                     if (res!==undefined) {
                         // not awaited: the PDF and the diagnostics do not wait for the local copies of the logs
                         this.saveLocalReplicaOutputs(vfs);
@@ -494,6 +494,7 @@ export class CompileManager {
             {label: vscode.l10n.t('Setting: Compiler'), description: currentCompiler?.name, },
             {label: vscode.l10n.t('Setting: Main Document'), description: currentRootDoc, },
         ];
+        settingItems.unshift({label: vscode.l10n.t('Recompile from Scratch'), description: vscode.l10n.t('clears the compile output on Overleaf first')});
         if (this.inCompiling) {
             settingItems.unshift({label: vscode.l10n.t('Stop compilation'), description: undefined});
         }
@@ -508,6 +509,9 @@ export class CompileManager {
                 break;
             case vscode.l10n.t('Stop compilation'):
                 this.stopCompile();
+                break;
+            case vscode.l10n.t('Recompile from Scratch'):
+                this.compile(true, true);
                 break;
             case vscode.l10n.t('Compile Mode'):
                 this.compileAsDraft = !this.compileAsDraft;
@@ -528,6 +532,7 @@ export class CompileManager {
             this.status,
             // register compile commands
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.compile`, () => this.compile(true)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.recompileFromScratch`, () => this.compile(true, true)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.viewPdf`, () =>  this.openPdf()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncCode`, () => this.syncCode()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncPdf`, (r) => this.syncPdf(r)),
