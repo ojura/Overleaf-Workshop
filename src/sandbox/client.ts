@@ -32,7 +32,12 @@ class SandboxAPI extends BaseAPI {
         return content.toString('utf8');
     }
 
-    /** A compile as the editor's Recompile button starts it, not an automatic one. */
+    /**
+     * A compile as the editor's Recompile button starts it, not an automatic one. As the editor
+     * and the extension's own compile (BaseAPI.compile) do, it asks for Overleaf's PDF caching:
+     * the response then lists the pieces of output.pdf, which the extension's PDF viewers fetch
+     * from the download domain and keep in their cache.
+     */
     async compileProject(identity: Identity, projectId: string, request: CompileRequest) {
         this.setIdentity(identity);
         const body = {
@@ -42,7 +47,7 @@ class SandboxAPI extends BaseAPI {
             rootResourcePath: request.rootResourcePath,
             stopOnFirstError: request.stopOnFirstError,
         };
-        return this.request('POST', `project/${projectId}/compile`, body, (res) => {
+        return this.request('POST', `project/${projectId}/compile?enable_pdf_caching=true`, body, (res) => {
             const compile = JSON.parse(res!) as CompileResponseSchema;
             return { compile };
         }, { 'X-Csrf-Token': identity.csrfToken }, BaseAPI.compileRequestOptions);

@@ -4,6 +4,7 @@ import * as http from 'http';
 import { AddressInfo } from 'net';
 import { Agent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 import { BaseAPI } from '../api/base';
+import { OverleafClient } from '../sandbox/client';
 
 /** A server that answers each request after `delayMs` with `status` and `body`. */
 async function serve(delayMs: number, status: number, body: string) {
@@ -65,6 +66,28 @@ describe('BaseAPI.compile', () => {
             const res = await new BaseAPI(server.url).compile(identity, 'p1', 'main.tex');
             assert.strictEqual(res.type, 'error');
             assert.strictEqual(server.requests(), 1);
+        } finally { server.close(); }
+    });
+});
+
+describe('OverleafClient.compile (the private-copy tool)', () => {
+    it('asks for Overleaf\'s PDF caching, so that its builds list the pieces of output.pdf', async () => {
+        const urls: string[] = [];
+        const server = http.createServer((req, res) => {
+            urls.push(req.url!);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(answer);
+        });
+        await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+        try {
+            const client = new OverleafClient(`http://127.0.0.1:${(server.address() as AddressInfo).port}/`, identity);
+            const result = await client.compile('p1', { rootResourcePath: 'main.tex', draft: false, stopOnFirstError: false } as any);
+            assert.strictEqual(result.response.status, 'success');
+            const url = new URL(urls[0], 'http://x');
+            assert.strictEqual(url.pathname, '/project/p1/compile');
+            assert.strictEqual(url.searchParams.get('enable_pdf_caching'), 'true');
+            // a compile of the Recompile button, not an automatic one
+            assert.strictEqual(url.searchParams.get('auto_compile'), null);
         } finally { server.close(); }
     });
 });
