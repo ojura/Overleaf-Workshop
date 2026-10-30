@@ -1,0 +1,188 @@
+/*
+ * The page around Overleaf's viewer core. pdf_viewer.css (imported by pdf-js-wrapper.ts) styles
+ * the pages; the rules for .pdfjs-viewer-inner and .page follow Overleaf's
+ * frontend/stylesheets/pages/editor/pdf.scss. The toolbar and outline use VS Code's theme colors.
+ */
+:root {
+    --toolbar-height: 32px;
+    --outline-width: 260px;
+}
+
+html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: var(--vscode-editor-background, #525659);
+    color: var(--vscode-foreground, #cccccc);
+    font-family: var(--vscode-font-family, sans-serif);
+    font-size: var(--vscode-font-size, 13px);
+}
+
+#toolbar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: var(--toolbar-height);
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 0 6px;
+    background: var(--vscode-editorWidget-background, #2d2d30);
+    border-bottom: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
+    z-index: 10;
+    user-select: none;
+}
+
+#toolbar button {
+    height: 24px;
+    min-width: 24px;
+    padding: 0 6px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+}
+
+#toolbar button:hover {
+    background: var(--vscode-toolbar-hoverBackground, rgba(90, 93, 94, 0.31));
+}
+
+#toolbar button[aria-pressed="true"] {
+    background: var(--vscode-toolbar-activeBackground, rgba(99, 102, 103, 0.31));
+}
+
+#toolbar button:focus-visible,
+#toolbar input:focus-visible,
+#toolbar select:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline-offset: -1px;
+}
+
+#toolbar input,
+#toolbar select {
+    height: 22px;
+    box-sizing: border-box;
+    border: 1px solid var(--vscode-input-border, transparent);
+    border-radius: 2px;
+    background: var(--vscode-input-background, #3c3c3c);
+    color: var(--vscode-input-foreground, inherit);
+    font: inherit;
+}
+
+#pageNumber {
+    width: 4.5em;
+    text-align: right;
+    -moz-appearance: textfield;
+}
+
+#pageNumber::-webkit-inner-spin-button,
+#pageNumber::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+#toolbar .numPages {
+    padding: 0 4px;
+    white-space: nowrap;
+    opacity: 0.8;
+}
+
+#toolbar .separator {
+    width: 1px;
+    height: 18px;
+    margin: 0 4px;
+    background: var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
+}
+
+#toolbar .spacer {
+    flex: 1;
+}
+
+#outline {
+    position: absolute;
+    top: var(--toolbar-height);
+    bottom: 0;
+    left: 0;
+    width: var(--outline-width);
+    box-sizing: border-box;
+    overflow: auto;
+    padding: 4px 0;
+    background: var(--vscode-sideBar-background, #252526);
+    border-right: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
+}
+
+#outline[hidden] {
+    display: none;
+}
+
+#outline .outline-item {
+    display: flex;
+    align-items: baseline;
+    padding: 2px 8px 2px calc(4px + var(--depth, 0) * 14px);
+    cursor: pointer;
+    white-space: nowrap;
+    line-height: 20px;
+}
+
+#outline .outline-item:hover {
+    background: var(--vscode-list-hoverBackground, rgba(90, 93, 94, 0.31));
+}
+
+#outline .outline-twisty {
+    flex: none;
+    width: 14px;
+    text-align: center;
+    opacity: 0.8;
+}
+
+#outline .outline-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#outline .outline-empty {
+    padding: 8px 12px;
+    opacity: 0.7;
+}
+
+/* the scroll container of PDFViewer: pdf.js requires it to be absolutely positioned */
+.pdfjs-viewer-inner {
+    position: absolute;
+    top: var(--toolbar-height);
+    left: 0;
+    right: 0;
+    bottom: 0;
+    overflow: auto;
+    outline: none;
+}
+
+body.outline-open .pdfjs-viewer-inner {
+    left: var(--outline-width);
+}
+
+/* as pdf.scss: keep a minimum height while a new document's pages are set up */
+.pdfjs-viewer-inner .pdfViewer {
+    min-height: 100%;
+}
+
+.pdfjs-viewer-inner .page {
+    box-sizing: content-box;
+    margin: 8px auto;
+    border: none;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+}
+
+.pdfjs-viewer-inner .canvasWrapper > canvas {
+    background: white;
+}
+
+/* avoids https://github.com/mozilla/pdf.js/issues/13840 in Chrome, as pdf.scss does */
+.pdfjs-viewer-inner .textLayer br::selection {
+    background: transparent;
+}

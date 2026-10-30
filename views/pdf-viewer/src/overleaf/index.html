@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<!--
+  The viewer of a build with Overleaf's PDF viewer core: Overleaf's PDFJSWrapper, unmodified,
+  on pdf.js's viewer components, with the extension's toolbar (main.ts).
+  The extension host serves this page as dist/overleaf.html and replaces the placeholder comment
+  at the start of <head> with a <base> pointing at views/pdf-viewer/ and the #viewer-config
+  element, so the paths below are relative to views/pdf-viewer/.
+  pdf.mjs comes first: pdf_viewer.mjs, bundled into dist/overleaf.mjs, takes pdf.js from
+  globalThis.pdfjsLib when it runs.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!--viewer-config-->
+<link rel="stylesheet" href="dist/overleaf.css">
+<script type="module" src="vendor/pdfjs-5.1.91/build/pdf.mjs"></script>
+<script type="module" src="dist/overleaf.mjs"></script>
+</head>
+<body>
+<div id="toolbar" role="toolbar" aria-label="PDF">
+  <button id="outlineToggle" type="button" title="Outline" aria-pressed="false">&#9776;</button>
+  <span class="separator"></span>
+  <button id="previousPage" type="button" title="Previous page">&#8249;</button>
+  <input id="pageNumber" type="number" min="1" value="1" title="Page" aria-label="Page">
+  <span id="numPages" class="numPages"></span>
+  <button id="nextPage" type="button" title="Next page">&#8250;</button>
+  <span class="separator"></span>
+  <button id="zoomOut" type="button" title="Zoom out (Ctrl+-)">&minus;</button>
+  <select id="scaleSelect" title="Zoom" aria-label="Zoom">
+    <option id="customScale" value="custom" hidden></option>
+    <option value="page-width">Fit width</option>
+    <option value="page-height">Fit height</option>
+    <option value="0.5">50%</option>
+    <option value="0.75">75%</option>
+    <option value="1">100%</option>
+    <option value="1.5">150%</option>
+    <option value="2">200%</option>
+    <option value="4">400%</option>
+  </select>
+  <button id="zoomIn" type="button" title="Zoom in (Ctrl++)">+</button>
+  <span class="spacer"></span>
+  <button id="goToCode" type="button" title="Go to the source of this position">&#8676; Source</button>
+  <button id="themeToggle" type="button" title="Color theme"></button>
+  <button id="download" type="button" title="Save the PDF to a file">Save</button>
+</div>
+<nav id="outline" aria-label="Outline" hidden></nav>
+<div id="viewerContainer" class="pdfjs-viewer-inner" tabindex="0"><div class="pdfViewer"></div></div>
+</body>
+</html>
