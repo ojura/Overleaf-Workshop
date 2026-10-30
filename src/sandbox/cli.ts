@@ -1,0 +1,291 @@
+#!/usr/bin/env node
+/* eslint-disable @typescript-eslint/naming-convention */
+import * as path from 'path';
+import { OverleafClient } from './client';
+import { readStoredLogin } from './login';
+import { SandboxSafetyError } from './guard';
+import { LockTimeoutError } from './lock';
+import {
+    createSandbox, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions, sandboxStatus, sandboxUrl,
+    settingsOf,
+} from './sandbox';
+
+const HELP = `Compile a local directory on Overleaf, in a private copy of a shared project.
+
+usage:
+  node out/sandbox/cli.js init    --replica <folder> [--name <name>]
+  node out/sandbox/cli.js status  --replica <folder>
+  node out/sandbox/cli.js compile --replica <folder> --dir <folder> --main <file> [options]
+  node out/sandbox/cli.js plan    --replica <folder> --dir <folder> --main <file> [options]
+
+--replica <folder>  the shared project's local replica. Its .overleaf/settings.json names
+                    the project; .overleaf/sandbox.json records the private copy.
+
+init     Clones the shared project once into a new project of this account, named
+         "<project> (sandbox)" unless --name says otherwise, sets the copy's compiler
+         and TeX Live image to the shared project's, and records the copy. Every later
+         run reuses it.
+status   Checks the recorded copy (owned by this account, no collaborators, no invites,
+         link sharing off) and shows its settings, the shared project's, and who holds
+         the lock.
+compile  Makes the copy hold --dir laid over the shared project, compiles --main there
+         and saves the results in --out. Runs on the same copy wait for each other.
+plan     Says what compile would upload and delete, without writing anything.
+
+What the copy holds for a compile:
+  a path in --dir                 the directory's file
+  a path only in the shared       the shared project's current version
+  project
+  a path only in the copy         deleted: an earlier run uploaded it
+Only files that differ from the copy are uploaded: binary files are compared by the
+hash Overleaf reports for them, documents by their text.
+
+compile and plan options:
+  --dir <folder>          the version to compile, e.g. a git archive of a commit
+  --main <file>           the main document, relative to --dir, e.g. main.tex
+  --out <folder>          where to save the results. It must be new, empty, or an
+                          earlier run's output folder, which is emptied first.
+                          Default: a new folder below $TMPDIR/overleaf-sandbox/.
+  --mirror                --dir is the whole project: paths it lacks are deleted
+                          from the copy instead of taken from the shared project,
+                          except the paths --keep matches
+  --keep <glob>           with --mirror, take these paths from the shared project
+                          (repeatable), e.g. --keep 'slike/**'
+  --ignore <glob>         also skip these paths of --dir (repeatable). Dot files and
+                          folders and the products of a local LaTeX build are
+                          skipped by default, as by the local replica.
+  --include <glob>        do not skip these paths (repeatable), e.g. .latexmkrc
+  --incremental           keep the previous compile's output on Overleaf. By default
+                          it is cleared first, as by "Recompile from scratch".
+  --draft                 compile in draft mode
+  --stop-on-first-error   stop at the first error
+  --pdf                   also download output.pdf. It is left on Overleaf by default:
+                          the book's PDF is 885 MB, and each run saves a new copy.
+  --lock-timeout <s>      how long to wait for another run on the copy; default 3600,
+                          0 fails at once
+  --purpose <text>        what this run is for, shown to runs that wait for it
+  --json                  print run.json instead of the summary
+
+Each run adds its start and its end to .overleaf/sandbox-runs.jsonl in the replica:
+what it was for, the directory, the main document, its status and where its results
+are. status shows the latest entries.
+
+Results in --out: every output file Overleaf returned (output.log, output.blg,
+output.ilg, output.stdout, output.stderr, ...; output.pdf with --pdf); compile-response.json,
+Overleaf's answer with "status", "timings" (milliseconds) and "stats"; and run.json:
+what was uploaded and deleted, the settings, the tool's own timings in milliseconds,
+and a summary of output.log.
+
+Exit status: 0 the compile's status is "success"; 3 the compile ran with another
+status (failure, timedout, ...) and its results are saved; 1 the tool failed; 2 wrong
+arguments.
+
+Safety: the tool writes only to the project recorded in .overleaf/sandbox.json, which
+init created, and refuses the shared project's id and every other one. Before each
+write it joins the copy again and stops unless this account owns it, it has no
+collaborators and no pending invites, link sharing is off, and its name is the
+recorded one.
+
+Login: the Overleaf Workshop extension's login, read from the IDE's state database
+(Antigravity, VS Code and its variants), which is opened read-only. --state-db <file>
+names the database. The environment variable OVERLEAF_LOGIN, a JSON object
+{"url", "cookies", "csrfToken", "userId"}, takes precedence.
+`;
+
+const VALUE_FLAGS = new Set(['replica', 'dir', 'main', 'out', 'keep', 'ignore', 'include', 'lock-timeout', 'purpose', 'name', 'state-db']);
+const REPEATABLE = new Set(['keep', 'ignore', 'include']);
+const BOOLEAN_FLAGS = new Set(['mirror', 'incremental', 'draft', 'stop-on-first-error', 'pdf', 'json', 'help']);
+
+class UsageError extends Error {}
+
+function parseArgs(argv: string[]) {
+    const values: Record<string, string> = {};
+    const lists: Record<string, string[]> = { keep: [], ignore: [], include: [] };
+    const flags = new Set<string>();
+    const positional: string[] = [];
+    for (let i = 0; i < argv.length; i++) {
+        const arg = argv[i];
+        if (!arg.startsWith('--')) { positional.push(arg); continue; }
+        const eq = arg.indexOf('=');
+        const key = arg.slice(2, eq < 0 ? undefined : eq);
+        if (BOOLEAN_FLAGS.has(key)) {
+            if (eq >= 0) { throw new UsageError(`--${key} takes no value`); }
+            flags.add(key);
+        } else if (VALUE_FLAGS.has(key)) {
+            const value = eq >= 0 ? arg.slice(eq + 1) : argv[++i];
+            if (value === undefined) { throw new UsageError(`--${key} needs a value`); }
+            if (REPEATABLE.has(key)) { lists[key].push(value); } else { values[key] = value; }
+        } else {
+            throw new UsageError(`unknown option --${key}`);
+        }
+    }
+    return { values, lists, flags, positional };
+}
+
+const log = (message: string) => process.stderr.write(`[${new Date().toISOString().slice(11, 19)}] ${message}\n`);
+const kb = (bytes: number) => bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.ceil(bytes / 1024)} kB`;
+
+function printSummary(summary: any, out?: string) {
+    const lines: string[] = [];
+    const compile = summary.compile;
+    if (compile) {
+        lines.push(`status: ${compile.status}${compile.attempts > 1 ? ` (after ${compile.attempts} attempts)` : ''}`);
+        if (compile.timings) {
+            lines.push(`Overleaf's timings (ms): ${Object.entries(compile.timings).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+        }
+        if (compile.stats) {
+            lines.push(`Overleaf's stats: ${Object.entries(compile.stats).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+        }
+    }
+    if (summary.settings) {
+        lines.push(`compiled with: ${summary.settings.compiler}, image ${summary.settings.imageName}, main document ${summary.main}`);
+    }
+    if (summary.plan) {
+        const uploads = summary.plan.uploads as Array<{ path: string, from: string }>;
+        lines.push(`synced: ${uploads.length} uploaded${uploads.length ? ` (${uploads.map(u => u.path.slice(1) + (u.from === 'shared' ? ' from the shared project' : '')).join(', ')})` : ''}, ${summary.plan.deletions.length} deleted${summary.plan.deletions.length ? ` (${summary.plan.deletions.map((d: any) => d.path.slice(1)).join(', ')})` : ''}, ${summary.plan.unchangedFromLocal + summary.plan.unchangedFromShared} already as wanted`);
+    }
+    if (summary.log) {
+        const l = summary.log;
+        lines.push(`output.log: ${l.errors} errors, ${l.warnings} warnings, ${l.undefinedReferences.length} undefined references, ${l.undefinedCitations.length} undefined citations, ${l.badBoxes} over- or underfull boxes${l.rerunWarning ? ', asks for a rerun' : ''}`);
+        l.firstErrors.slice(0, 5).forEach((e: string) => lines.push(`  error: ${e}`));
+    }
+    if (summary.indexLog) {
+        lines.push(`output.ilg begins: ${summary.indexLog.split('\n')[0]}`);
+    }
+    if (summary.outputs) {
+        lines.push(`saved in ${out}: ${summary.outputs.saved.map((f: any) => `${f.path} (${kb(f.bytes)})`).join(', ')}, compile-response.json, run.json`);
+        summary.outputs.failed.forEach((f: any) => lines.push(`  not saved: ${f.path}: ${f.error}`));
+        if (summary.outputs.notDownloaded.length) { lines.push(`  not downloaded: ${summary.outputs.notDownloaded.join(', ')} (--pdf downloads output.pdf)`); }
+    }
+    if (summary.timingsMs) {
+        lines.push(`this run's timings (ms): ${Object.entries(summary.timingsMs).map(([k, v]) => `${k} ${v}`).join(', ')}; ${summary.checks ?? 0} safety checks`);
+    }
+    process.stdout.write(lines.join('\n') + '\n');
+}
+
+async function main(argv: string[]): Promise<number> {
+    const { values, lists, flags, positional } = parseArgs(argv);
+    const command = positional[0];
+    if (flags.has('help') || command === undefined || command === 'help') {
+        process.stdout.write(HELP);
+        return command === undefined && !flags.has('help') ? 2 : 0;
+    }
+    if (!['init', 'status', 'compile', 'plan'].includes(command)) { throw new UsageError(`unknown command ${command}`); }
+    if (positional.length > 1) { throw new UsageError(`unexpected argument ${positional[1]}`); }
+    if (!values.replica) { throw new UsageError('--replica is required'); }
+
+    const replica = readReplica(path.resolve(values.replica));
+    const login = readStoredLogin(replica.serverName, values['state-db']);
+    const client = new OverleafClient(login.url, login.identity);
+
+    if (command === 'init') {
+        const existing = readRecord(replica.folder);
+        if (existing) {
+            log(`a sandbox is already recorded in ${recordFile(replica.folder)}: "${existing.projectName}", ${sandboxUrl(existing)}`);
+            return 0;
+        }
+        const name = values.name ?? `${replica.projectName} (sandbox)`;
+        const { record, checks } = await createSandbox(client, replica, login.userId, name, log);
+        process.stdout.write(`created the sandbox "${record.projectName}": ${sandboxUrl(record)} (${checks} safety checks)\n`);
+        return 0;
+    }
+
+    if (command === 'status') {
+        const status = await sandboxStatus(client, replica, login.userId);
+        if (!status.record) {
+            process.stdout.write(`no sandbox is recorded in ${recordFile(replica.folder)}; create one with: init --replica "${replica.folder}"\n`);
+            return 1;
+        }
+        const lines = [`sandbox: "${status.record.projectName}", ${sandboxUrl(status.record)}, created ${status.record.createdAt}`];
+        if (status.copy instanceof Error) {
+            lines.push(`could not join the copy: ${status.copy.message}`);
+        } else if (status.copy) {
+            const s = settingsOf(status.copy);
+            lines.push(`copy: compiler ${s.compiler}, image ${s.imageName}, main document ${s.rootDoc}, compile timeout ${status.copy.project.features?.compileTimeout} s, compile group ${status.copy.project.features?.compileGroup}`);
+        }
+        if (status.shared instanceof Error) {
+            lines.push(`could not join the shared project: ${status.shared.message}`);
+        } else if (status.shared) {
+            const s = settingsOf(status.shared);
+            lines.push(`shared project: compiler ${s.compiler}, image ${s.imageName}, main document ${s.rootDoc}`);
+        }
+        lines.push(status.problems!.length ? `NOT SAFE TO WRITE: ${status.problems!.join('; ')}` : 'safety checks pass: owned by this account, no collaborators, no invites, link sharing off');
+        lines.push(status.lock ? `lock held by pid ${status.lock.pid} on ${status.lock.host} since ${status.lock.acquiredAt}: ${status.lock.purpose}` : 'lock: free');
+        const runs = recentRuns(replica.folder, 10);
+        if (runs.length) {
+            lines.push(`latest runs (from ${runLogFile(replica.folder)}):`);
+            for (const run of runs) {
+                lines.push(run.event === 'start' ? `  ${run.at} pid ${run.pid} started: ${run.purpose} (${run.dir}, ${run.main})`
+                    : run.event === 'end' ? `  ${run.at} pid ${run.pid} ended: ${run.status ?? run.error}${run.compileE2EMs ? `, compileE2E ${run.compileE2EMs} ms` : ''}${run.out ? `, results in ${run.out}` : ''}`
+                    : `  ${run.at} ${run.event} ${run.projectId ?? ''}`);
+            }
+        }
+        process.stdout.write(lines.join('\n') + '\n');
+        return status.problems!.length || status.copy instanceof Error ? 1 : 0;
+    }
+
+    if (!values.dir) { throw new UsageError('--dir is required'); }
+    if (!values.main) { throw new UsageError('--main is required'); }
+    const lockTimeout = values['lock-timeout'] === undefined ? 3600 : Number(values['lock-timeout']);
+    if (!Number.isFinite(lockTimeout) || lockTimeout < 0) { throw new UsageError('--lock-timeout takes a number of seconds'); }
+    const options: RunOptions = {
+        dir: path.resolve(values.dir),
+        main: values.main,
+        out: values.out,
+        mirror: flags.has('mirror'),
+        keep: lists.keep,
+        ignore: lists.ignore,
+        include: lists.include,
+        incremental: flags.has('incremental'),
+        draft: flags.has('draft'),
+        stopOnFirstError: flags.has('stop-on-first-error'),
+        pdf: flags.has('pdf'),
+        dryRun: command === 'plan',
+        lockTimeoutMs: lockTimeout * 1000,
+        purpose: values.purpose ?? `compile ${values.main} of ${path.resolve(values.dir)}`,
+    };
+    if (lists.keep.length && !options.mirror) { throw new UsageError('--keep only applies with --mirror'); }
+    try {
+        const result = await runCompile(client, replica, login.userId, options, log);
+        if (flags.has('json')) {
+            process.stdout.write(JSON.stringify(result.summary, null, 2) + '\n');
+        } else if (options.dryRun) {
+            process.stdout.write('plan only: nothing was written\n');
+        } else {
+            printSummary(result.summary, result.out);
+        }
+        return options.dryRun || result.status === 'success' ? 0 : 3;
+    } catch (error: any) {
+        if (error?.out) { log(`what the run did is in ${path.join(error.out, 'run.json')}`); }
+        throw error;
+    }
+}
+
+if (require.main === module) {
+    // stdout carries the summary (or run.json with --json); the extension's API code logs
+    // its retries with console.log, and socket.io-client warns about util.isArray
+    console.log = console.info = (...args: unknown[]) => console.error(...args);
+    const emitWarning = process.emitWarning;
+    process.emitWarning = ((warning: any, ...rest: any[]) => {
+        if (rest.includes('DEP0044') || rest[0]?.code === 'DEP0044') { return; }
+        return (emitWarning as any).call(process, warning, ...rest);
+    }) as any;
+    // A compile answers only when it is done, which can take longer than undici's
+    // default of five minutes for the response headers.
+    const { Agent, setGlobalDispatcher } = require('undici');
+    setGlobalDispatcher(new Agent({ headersTimeout: 15 * 60 * 1000, bodyTimeout: 15 * 60 * 1000 }));
+    for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]] as const) {
+        process.on(signal, () => process.exit(code));
+    }
+    main(process.argv.slice(2)).then(
+        code => process.exit(code),
+        (error: any) => {
+            if (error instanceof UsageError) {
+                process.stderr.write(`${error.message}\n\nRun with --help for the options.\n`);
+                process.exit(2);
+            }
+            const kind = error instanceof SandboxSafetyError ? 'refused' : error instanceof LockTimeoutError ? 'lock' : 'error';
+            process.stderr.write(`${kind}: ${error?.message ?? error}\n`);
+            process.exit(1);
+        });
+}

@@ -6,6 +6,7 @@ import {
     describe, LocalStat, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaStore, ReplicaSync, ReplicaUI,
     SavedState, SyncSummary,
 } from './replicaSync';
+import { DEFAULT_IGNORE_PATTERNS } from './ignorePatterns';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 /** Where the sync keeps its state inside the local folder. Paths in `.overleaf` are never synced. */
@@ -42,29 +43,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private running = 0;
     private vfsWatcher?: vscode.FileSystemWatcher;
     private localWatcher?: vscode.FileSystemWatcher;
-    private ignorePatterns: string[] = [
-        '**/.*',
-        '**/.*/**',
-        '**/*.aux',
-        '**/__latexindent*',
-        '**/*.bbl',
-        '**/*.bcf',
-        '**/*.blg',
-        '**/*.fdb_latexmk',
-        '**/*.fls',
-        '**/*.git',
-        '**/*.lof',
-        '**/*.log',
-        '**/*.lot',
-        '**/*.out',
-        '**/*.run.xml',
-        '**/*.synctex(busy)',
-        '**/*.synctex.gz',
-        '**/*.toc',
-        '**/*.xdv',
-        '**/main.pdf',
-        '**/output.pdf',
-    ];
+    private ignorePatterns: string[] = [...DEFAULT_IGNORE_PATTERNS];
 
     constructor(
         protected readonly vfs: VirtualFileSystem,
