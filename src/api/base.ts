@@ -20,6 +20,14 @@ function getSetCookie(res: any): string[] {
     return [];
 }
 
+/** The compilers Overleaf offers. */
+export const COMPILERS: ReadonlyArray<{code:string, name:string}> = [
+    {code: 'pdflatex', name: 'pdfLaTex'},
+    {code: 'latex',    name: 'LaTex'},
+    {code: 'xelatex',  name: 'XeLaTex'},
+    {code: 'lualatex', name: 'LuaLaTex'},
+];
+
 export interface Identity {
     csrfToken: string;
     cookies: string;
@@ -774,12 +782,7 @@ export class BaseAPI {
             const languages = (languagesMatch!==null) ? JSON.parse(languagesMatch[1].replace(/&quot;/g, '"')) as {code:string,name:string}[] : [];
             languages.length && languages.unshift({name:'Off', code:''});
             // fill in compilers
-            const compilers = [
-                {code: 'pdflatex', name: 'pdfLaTex'},
-                {code: 'latex',    name: 'LaTex'},
-                {code: 'xelatex',  name: 'XeLaTex'},
-                {code: 'lualatex', name: 'LuaLaTex'},
-            ];
+            const compilers = [...COMPILERS];
             // return parsed results
             const settings = {learnedWords, languages, compilers} as ProjectSettingsSchema;
             return {settings};

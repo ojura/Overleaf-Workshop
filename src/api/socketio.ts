@@ -8,8 +8,6 @@ function decodePackedUtf8(text: string): string {
     return Buffer.from(text, 'latin1').toString('utf-8');
 }
 
-/** How long to wait for a server acknowledgement before giving up on an emit. */
-const EMIT_TIMEOUT_MS = 15000;
 
 /** Render a socket.io error payload as something readable instead of `[object Object]`. */
 function stringifyError(err: any): string {
@@ -91,8 +89,19 @@ export interface EventsHandler {
 type ConnectionScheme = 'Alt' | 'v1' | 'v2';
 
 export class SocketIOAPI {
+    /** How long to wait for a server acknowledgement before giving up on an emit. */
+    static emitTimeoutMs = 15000;
+    /** How long to wait for the server's answer to joining the project. */
+    static joinTimeoutMs = 15000;
+    /**
+     * Told when the connection looks lost although socket.io may not have noticed: an emit
+     * got no answer, the socket reported an error, or socket.io gave up reconnecting.
+     */
+    onConnectionProblem?: (reason: string) => void;
     private scheme: ConnectionScheme = 'v1';
     private record?: Promise<ProjectEntity>;
+    /** resolves `record` once the current connection's joinProjectResponse arrives (scheme v2) */
+    private recordWaiter?: (project: ProjectEntity) => void;
     private _handlers: Array<EventsHandler> = [];
     /** Track EventBus listeners for cleanup to prevent MaxListenersExceededWarning */
     private _eventBusCleanups: Array<()=>void> = [];
@@ -157,8 +166,13 @@ export class SocketIOAPI {
             let timer: NodeJS.Timeout;
             const timeoutPromise = new Promise((_, reject) => {
                 timer = setTimeout(() => {
-                    reject(new Error(`'${event}' timed out after ${EMIT_TIMEOUT_MS}ms`));
-                }, EMIT_TIMEOUT_MS);
+                    reject(new Error(`'${event}' timed out after ${SocketIOAPI.emitTimeoutMs}ms`));
+                    // No answer means the connection is gone, even when socket.io still takes it
+                    // for open; unless this socket has been replaced meanwhile.
+                    if (socket===this.socket) {
+                        this.onConnectionProblem?.(`'${event}' got no answer within ${SocketIOAPI.emitTimeoutMs} ms`);
+                    }
+                }, SocketIOAPI.emitTimeoutMs);
             });
             const waitPromise = new Promise((resolve, reject) => {
                 socket.emit(event, ...args, (err:any, ...data:any[]) => {
@@ -202,6 +216,12 @@ export class SocketIOAPI {
         });
         this.socket.on('connect_failed', () => {
             console.log('SocketIOAPI: connect_failed');
+            this.onConnectionProblem?.('the connection could not be made');
+        });
+        // socket.io stops after its last reconnection attempt and leaves the socket closed
+        this.socket.on('reconnect_failed', () => {
+            console.log('SocketIOAPI: reconnect_failed');
+            this.onConnectionProblem?.('socket.io gave up reconnecting');
         });
         this.socket.on('forceDisconnect', (message:string, delay=10) => {
             console.log('SocketIOAPI: forceDisconnect', message);
@@ -223,6 +243,7 @@ export class SocketIOAPI {
         this.socket.on('error', (err:any) => {
             // Log error instead of throwing to avoid crashing the extension
             console.error('SocketIOAPI: socket error', err?.message || err);
+            this.onConnectionProblem?.(`socket error: ${stringifyError(err)}`);
         });
         // The server reports a rejected document update on its own channel and sends no
         // ack for the emit, so without this the real reason (stale version, hash
@@ -233,15 +254,30 @@ export class SocketIOAPI {
         });
 
         if (this.scheme==='v2') {
-            this.record = new Promise(resolve => {
-                this.socket.on('joinProjectResponse', (res:any) => {
-                    const publicId = res.publicId as string;
-                    const project = res.project as ProjectEntity;
-                    EventBus.fire('socketioConnectedEvent', {publicId});
-                    resolve(project);
-                });
+            // The server joins the project when the connection is made and answers with
+            // joinProjectResponse, again after socket.io reconnects. `record` is the answer of
+            // the current connection: after a disconnect it waits for the next one, so that a
+            // join is not taken for done while the socket is closed.
+            this.awaitJoinResponse();
+            this.socket.on('joinProjectResponse', (res:any) => {
+                const publicId = res.publicId as string;
+                const project = res.project as ProjectEntity;
+                EventBus.fire('socketioConnectedEvent', {publicId});
+                if (this.recordWaiter) {
+                    this.recordWaiter(project);
+                    this.recordWaiter = undefined;
+                } else {
+                    this.record = Promise.resolve(project);
+                }
+            });
+            this.socket.on('disconnect', () => {
+                if (this.scheme==='v2') { this.awaitJoinResponse(); }
             });
         }
+    }
+
+    private awaitJoinResponse() {
+        this.record = new Promise(resolve => { this.recordWaiter = resolve; });
     }
 
     disconnect() {
@@ -376,12 +412,20 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async joinProject(project_id:string): Promise<ProjectEntity> {
+        let timer: NodeJS.Timeout | undefined;
         const timeoutPromise: Promise<ProjectEntity> = new Promise((_, reject) => {
-            setTimeout(() => {
-                reject('timeout');
-            }, 5000);
+            timer = setTimeout(() => {
+                reject(new Error(`joining the project got no answer within ${SocketIOAPI.joinTimeoutMs} ms`));
+            }, SocketIOAPI.joinTimeoutMs);
         });
+        try {
+            return await this.joinProjectOnce(project_id, timeoutPromise);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
 
+    private joinProjectOnce(project_id:string, timeoutPromise: Promise<ProjectEntity>): Promise<ProjectEntity> {
         switch(this.scheme) {
             case 'Alt':
             case 'v1':
@@ -400,8 +444,15 @@ export class SocketIOAPI {
                     });
                 });
                 return Promise.race([joinPromise, rejectPromise, timeoutPromise]);
-            case 'v2':
-                return Promise.race([this.record!, timeoutPromise]);
+            case 'v2': {
+                // fail at once when this connection cannot be made, instead of at the timeout
+                const failed = new Promise<ProjectEntity>((_, reject) => {
+                    this.socket.on('connectionRejected', (err:any) => reject(new Error(`the connection was rejected: ${stringifyError(err)}`)));
+                    this.socket.on('connect_failed', () => reject(new Error('the connection could not be made')));
+                    this.socket.on('error', (err:any) => reject(new Error(`socket error: ${stringifyError(err)}`)));
+                });
+                return Promise.race([this.record!, timeoutPromise, failed]);
+            }
         }
     }
 

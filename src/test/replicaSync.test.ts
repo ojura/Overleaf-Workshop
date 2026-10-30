@@ -16,6 +16,7 @@ class FakeRemote implements ReplicaRemote {
     noHash = new Set<string>();
     calls: string[] = [];
     failReads = new Map<string, number>();
+    failWrites = new Map<string, number>();
     corruptReads = new Set<string>();
 
     async list() {
@@ -50,6 +51,11 @@ class FakeRemote implements ReplicaRemote {
     }
     async writeDoc(path: string, text: string) {
         this.calls.push(`writeDoc ${path}`);
+        const failures = this.failWrites.get(path) ?? 0;
+        if (failures>0) {
+            this.failWrites.set(path, failures-1);
+            throw new Error(`'applyOtUpdate' timed out after 15000ms`);
+        }
         this.docs.set(path, text);
     }
     async upload(path: string, content: Uint8Array): Promise<RemoteEntry> {
@@ -373,6 +379,27 @@ describe('ReplicaSync', () => {
         assert.strictEqual(t.remote.count('readFile'), 1);
         assert.strictEqual(summary.unchanged, 1);
         assert.strictEqual(t.local.files.get('/a.png')!.mtime, before);
+    });
+
+    it('reports a live upload that fails, and the next full sync uploads it', async () => {
+        const t = setup();
+        t.remote.docs.set('/INDEXING.md', text);
+        const sync = t.start();
+        await sync.syncAll();
+
+        // the connection is gone: the upload of a local change fails
+        t.local.set('/INDEXING.md', text + 'line 6\n');
+        t.remote.failWrites.set('/INDEXING.md', 1);
+        await sync.localChanged('/INDEXING.md');
+        assert.deepStrictEqual(t.ui.live.at(-1)!.failed.map(f => f.path), ['/INDEXING.md']);
+        assert.match(t.ui.live.at(-1)!.failed[0].error, /timed out/);
+        assert.strictEqual(t.remote.docs.get('/INDEXING.md'), text);
+        await sync.stop();
+
+        // reconnected: the new provider's sync starts with a full sync
+        const summary = await t.start().syncAll();
+        assert.deepStrictEqual(summary.uploaded, ['/INDEXING.md']);
+        assert.strictEqual(t.remote.docs.get('/INDEXING.md'), text + 'line 6\n');
     });
 
     it('syncs live changes in both directions without echoing its own writes', async () => {

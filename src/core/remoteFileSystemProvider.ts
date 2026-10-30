@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
 import * as DiffMatchPatch from 'diff-match-patch';
-import { BaseAPI, CompileResponseSchema, MemberEntity, ProjectSettingsSchema } from '../api/base';
+import { BaseAPI, COMPILERS, CompileResponseSchema, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import type { CompileRecord } from '../compile/outputFiles';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
@@ -151,6 +151,23 @@ export class VirtualFileSystem extends vscode.Disposable {
     /** the project has been compiled once since it was opened */
     private compileStarted: boolean = false;
     private initializing?: Promise<ProjectEntity>;
+    /** How long a file operation waits for a lost connection to come back before it fails. */
+    static reconnectWaitMs = 30 * 1000;
+    /** The pause before the second attempt to reconnect; it doubles with each further attempt. */
+    static reconnectBaseDelayMs = 1000;
+    /** The longest pause between two attempts to reconnect. */
+    static reconnectMaxDelayMs = 60 * 1000;
+    /** The pause before the first connection's second attempt; it doubles with each further one. */
+    static connectRetryBaseMs = 1000;
+    /** The project has been joined; from then on a lost connection is made again in the background. */
+    private joinedOnce = false;
+    /** Set while a lost connection is made again: settles with the project once it is joined. */
+    private reconnecting?: {promise: Promise<ProjectEntity>, resolve: (project: ProjectEntity) => void};
+    /** the tree before the connection was lost, whose documents keep their editing state */
+    private previousRoot?: ProjectEntity;
+    /** why the connection was lost again while a reconnect was still setting up the new one */
+    private lostWhileJoining?: string;
+    private disposed = false;
     private retryConnection: number = 0;
     private retryTimer?: NodeJS.Timeout;
     /** Whether a "Reconnecting..." notification is currently shown */
@@ -183,6 +200,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             // dispose all triggers of scmCollection
             this.scmCollectionItem?.triggers.forEach((trigger) => trigger.dispose());
             this.scmCollectionItem = undefined;
+            this.disposed = true;
             // disconnect socketio
             // this.socket.disconnect();
         });
@@ -200,6 +218,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (res) {
             this.api = res.api;
             this.socket = res.socket;
+            this.socket.onConnectionProblem = (reason) => this.connectionLost(reason);
         } else {
             throw new Error( vscode.l10n.t('Cannot init SocketIOAPI for {serverName}', {serverName}) );
         }
@@ -213,16 +232,30 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (this.root) {
             return Promise.resolve(this.root);
         }
-
+        if (this.reconnecting) {
+            return this.waitForReconnect(this.reconnecting.promise);
+        }
         if (!this.initializing) {
             this.initializing = this.initializingPromise;
         }
         return this.initializing;
     }
 
+    /** The project once the connection is back, or an error after `reconnectWaitMs`. */
+    private waitForReconnect(reconnected: Promise<ProjectEntity>): Promise<ProjectEntity> {
+        let timer: NodeJS.Timeout | undefined;
+        const timeout = new Promise<ProjectEntity>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(
+                vscode.l10n.t('Not connected to {serverName}; reconnecting in the background.', {serverName: this.serverName})
+            )), VirtualFileSystem.reconnectWaitMs);
+        });
+        return Promise.race([reconnected, timeout]).finally(() => clearTimeout(timer));
+    }
+
+    /** The first connection: a few attempts, then a message with Reload and Retry. */
     private get initializingPromise(): Promise<ProjectEntity> {
         const MAX_RETRIES = 5;
-        const BASE_DELAY_MS = 1000; // 1 second base delay
+        const BASE_DELAY_MS = VirtualFileSystem.connectRetryBaseMs;
 
         // if retry connection exhausted, show error
         if (this.retryConnection >= MAX_RETRIES) {
@@ -238,7 +271,6 @@ export class VirtualFileSystem extends vscode.Disposable {
                     vscode.commands.executeCommand("workbench.action.reloadWindow");
                 } else if (choice === vscode.l10n.t('Retry')) {
                     this.retryConnection = 0;
-                    this.handlersRegistered = false;
                     this.socket.init(); // Recreate socket after all auto-reconnect attempts exhausted
                     this.initializing = this.initializingPromise;
                     this.init().catch(() => {});
@@ -248,7 +280,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
 
         // exponential backoff delay: 1s, 2s, 4s, 8s, 16s
-        const delayMs = this.retryConnection > 0 ? Math.min(BASE_DELAY_MS * Math.pow(2, this.retryConnection - 1), 16000) : 0;
+        const delayMs = this.retryConnection > 0 ? Math.min(BASE_DELAY_MS * Math.pow(2, this.retryConnection - 1), 16 * BASE_DELAY_MS) : 0;
 
         // Show reconnecting notification on first retry
         if (this.retryConnection === 1 && !this.reconnectingNotification) {
@@ -261,7 +293,8 @@ export class VirtualFileSystem extends vscode.Disposable {
                 // Keep the notification visible while reconnecting
                 await new Promise<void>((resolve) => {
                     const check = () => {
-                        if (this.root || this.retryConnection >= MAX_RETRIES) {
+                        // once joined, a later loss has its own notification (reconnectInBackground)
+                        if (this.root || this.joinedOnce || this.disposed || this.retryConnection >= MAX_RETRIES) {
                             this.reconnectingNotification = false;
                             resolve();
                         } else {
@@ -280,12 +313,10 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
 
             // Only recreate the socket when the connection scheme has changed
-            // (e.g., v1→v2 after connectionRejected). For transient disconnects,
-            // socket.io's built-in auto-reconnect handles re-establishing the TCP
-            // connection without creating a new one — avoiding TCP RST packets.
+            // (e.g., v1→v2 after connectionRejected). The new socket takes over the event
+            // handlers registered so far, so they are registered once only.
             if (this.socket.needsReinit) {
                 this.socket.init();
-                this.handlersRegistered = false;
             }
 
             // Register event handlers once on the current socket
@@ -294,54 +325,188 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.handlersRegistered = true;
             }
 
+            this.previousRoot = this.root ?? this.previousRoot;
             this.root = undefined;
-            return this.socket.joinProject(this.projectId).then(async (project) => {
-                // Reset retry counter on success
-                this.retryConnection = 0;
-                this.reconnectingNotification = false;
-                // fetch project settings
-                const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-                project.settings = (await this.api.getProjectSettings(identity, this.projectId)).settings!;
-                this.root = project;
-                const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==ROOT_NAME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
-                // Register: [collaboration] ClientManager on Statusbar
-                if (activeCondition) {
-                    if (this.clientManagerItem?.triggers) {
-                        this.clientManagerItem.triggers.forEach((trigger) => trigger.dispose());
-                        delete this.clientManagerItem;
-                    }
-                    const clientManager = new ClientManager(this, this.context, this.publicId||'', this.socket);
-                    this.clientManagerItem = {
-                        manager: clientManager,
-                        triggers: clientManager.triggers,
-                    };
-                }
-                // Register: [scm] SCMCollectionProvider in explorer
-                if (activeCondition) {
-                    if (this.scmCollectionItem?.triggers) {
-                        this.scmCollectionItem.triggers.forEach((trigger) => trigger.dispose());
-                        delete this.scmCollectionItem;
-                    }
-                    const scmCollection = new SCMCollectionProvider(this, this.context);
-                    this.scmCollectionItem = {
-                        collection: scmCollection,
-                        triggers: scmCollection.triggers,
-                    };
-                }
-                // Compile when the project is opened. A reconnect, e.g. after the network
-                // dropped or the machine resumed, does not start another compile.
-                if (!this.compileStarted) {
-                    this.compileStarted = true;
-                    vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
-                }
-                return project;
-            }).catch((err) => {
-                this.retryConnection += 1;
-                return this.initializingPromise;
-            });
+            return this.socket.joinProject(this.projectId)
+                .then(project => this.joined(project))
+                .catch((err) => {
+                    this.retryConnection += 1;
+                    return this.initializingPromise;
+                });
         };
 
         return attemptReconnect();
+    }
+
+    /** The project was joined on the current connection: take its tree, and set up what depends on it. */
+    private async joined(project: ProjectEntity): Promise<ProjectEntity> {
+        this.retryConnection = 0;
+        this.reconnectingNotification = false;
+        // The tree goes into use at once, so that the changes the server reports after the
+        // join apply to it. The settings are fetched next; until then the last ones stand in.
+        const previousSettings = this.previousRoot?.settings;
+        project.settings = previousSettings ?? {learnedWords: [], languages: [], compilers: [...COMPILERS]};
+        const adopted = this.adoptDocuments(project);
+        this.root = project;
+        this.previousRoot = undefined;
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const settings = (await this.api.getProjectSettings(identity, this.projectId)).settings;
+        if (settings) {
+            project.settings = settings;
+        } else {
+            console.warn(`Overleaf Workshop: could not read the settings of ${this.projectName}; using ${previousSettings ? 'the previous ones' : 'the defaults'}`);
+        }
+        this.joinedOnce = true;
+        const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==ROOT_NAME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
+        // Register: [collaboration] ClientManager on Statusbar
+        if (activeCondition) {
+            if (this.clientManagerItem?.triggers) {
+                this.clientManagerItem.triggers.forEach((trigger) => trigger.dispose());
+                delete this.clientManagerItem;
+            }
+            const clientManager = new ClientManager(this, this.context, this.publicId||'', this.socket);
+            this.clientManagerItem = {
+                manager: clientManager,
+                triggers: clientManager.triggers,
+            };
+        }
+        // Register: [scm] SCMCollectionProvider in explorer. A local replica's provider starts
+        // with a full sync, which also uploads the changes that failed while disconnected.
+        if (activeCondition) {
+            if (this.scmCollectionItem?.triggers) {
+                this.scmCollectionItem.triggers.forEach((trigger) => trigger.dispose());
+                delete this.scmCollectionItem;
+            }
+            const scmCollection = new SCMCollectionProvider(this, this.context);
+            this.scmCollectionItem = {
+                collection: scmCollection,
+                triggers: scmCollection.triggers,
+            };
+        }
+        // Compile when the project is opened. A reconnect, e.g. after the network
+        // dropped or the machine resumed, does not start another compile.
+        if (!this.compileStarted) {
+            this.compileStarted = true;
+            vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
+        }
+        // documents may have changed on the server while disconnected: have them read again
+        if (adopted.length > 0) {
+            this.notify(adopted.map(path => ({type: vscode.FileChangeType.Changed, uri: this.pathToUri(path)})));
+        }
+        return project;
+    }
+
+    /**
+     * Put the documents of the tree before the connection was lost into the new tree, by id,
+     * so that their editing state survives: the base an editor's content is merged against,
+     * and a write in flight. Their copy of the server's content is dropped and read again on
+     * the next use, since updates may have been missed meanwhile. Returns their paths.
+     */
+    private adoptDocuments(project: ProjectEntity): string[] {
+        const previous = this.previousRoot;
+        if (previous===undefined) { return []; }
+        const docs = new Map<string, DocumentEntity>();
+        const collect = (folder: FolderEntity) => {
+            folder.docs?.forEach(doc => docs.set(doc._id, doc));
+            folder.folders?.forEach(collect);
+        };
+        collect(previous.rootFolder[0]);
+        const paths: string[] = [];
+        const adopt = (folder: FolderEntity, prefix: string) => {
+            folder.docs = (folder.docs ?? []).map(doc => {
+                const old = docs.get(doc._id);
+                if (old===undefined) { return doc; }
+                old.name = doc.name;
+                if (old.sync===undefined) {
+                    // a write in flight reads the doc again itself when its ack does not come
+                    old.remoteCache = undefined;
+                    old.version = undefined;
+                }
+                paths.push(prefix + doc.name);
+                return old;
+            });
+            folder.folders?.forEach(sub => adopt(sub, `${prefix}${sub.name}/`));
+        };
+        adopt(project.rootFolder[0], '/');
+        return paths;
+    }
+
+    /**
+     * The connection is gone, or looks so: socket.io disconnected, an emit got no answer, or
+     * the socket failed. Once the project has been joined, it is joined again in the
+     * background on a new connection, with growing pauses and without giving up; file
+     * operations meanwhile wait for it, up to `reconnectWaitMs`.
+     */
+    private connectionLost(reason: string) {
+        if (!this.reconnected) {
+            let resolve!: () => void;
+            const promise = new Promise<void>((r) => { resolve = r; });
+            this.reconnected = {promise, resolve};
+        }
+        if (this.reconnecting && this.root!==undefined) {
+            // the reconnect has joined and is still setting up: start again after it
+            this.lostWhileJoining = reason;
+            return;
+        }
+        if (!this.joinedOnce || this.reconnecting || this.disposed || this.socket.isUsingAlternativeConnectionScheme) {
+            return;
+        }
+        console.log(`Overleaf Workshop: lost the connection to ${this.serverName} (${reason}); reconnecting`);
+        if (this.retryTimer) {
+            clearTimeout(this.retryTimer);
+            this.retryTimer = undefined;
+        }
+        this.previousRoot = this.root ?? this.previousRoot;
+        this.root = undefined;
+        let resolve!: (project: ProjectEntity) => void;
+        const promise = new Promise<ProjectEntity>((r) => { resolve = r; });
+        this.reconnecting = {promise, resolve};
+        this.reconnectInBackground(this.reconnecting).catch(error => {
+            console.error('Overleaf Workshop: reconnecting failed:', error);
+        });
+    }
+
+    private async reconnectInBackground(reconnecting: NonNullable<VirtualFileSystem['reconnecting']>) {
+        const started = Date.now();
+        let shown = false;
+        // not from within the event that reported the loss, which may be the old socket's own
+        await new Promise(resolve => setImmediate(resolve));
+        for (let attempt = 1; !this.disposed; attempt++) {
+            if (attempt > 1) {
+                if (!shown) {
+                    shown = true;
+                    vscode.window.withProgress({
+                        location: vscode.ProgressLocation.Notification,
+                        title: vscode.l10n.t('Reconnecting to {serverName}...', {serverName:this.serverName}),
+                        cancellable: false,
+                    }, () => reconnecting.promise);
+                }
+                const delay = Math.min(VirtualFileSystem.reconnectBaseDelayMs * Math.pow(2, attempt - 2), VirtualFileSystem.reconnectMaxDelayMs);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                if (this.disposed) { return; }
+            }
+            try {
+                // A new connection: socket.io may have given up on the old one, or may not
+                // have noticed that it is dead. The new socket takes over the event handlers.
+                this.socket.init();
+                const project = await this.socket.joinProject(this.projectId);
+                if (this.disposed) { return; }
+                this.lostWhileJoining = undefined;
+                await this.joined(project);
+                this.reconnecting = undefined;
+                reconnecting.resolve(project);
+                const lostAgain = this.lostWhileJoining;
+                this.lostWhileJoining = undefined;
+                if (lostAgain!==undefined) { this.connectionLost(lostAgain); }
+                console.log(`Overleaf Workshop: reconnected to ${this.serverName} after ${attempt} attempts, ${Math.round((Date.now() - started) / 1000)} s`);
+                if (shown) {
+                    vscode.window.setStatusBarMessage(vscode.l10n.t('$(check) Reconnected to {serverName}', {serverName: this.serverName}), 10000);
+                }
+                return;
+            } catch (error: any) {
+                console.log(`Overleaf Workshop: reconnection attempt ${attempt} failed: ${error?.message ?? error}`);
+            }
+        }
     }
 
     get isInvisibleMode() {
@@ -351,7 +516,6 @@ export class VirtualFileSystem extends vscode.Disposable {
     toggleInvisibleMode() {
         // Clear disconnect debounce to prevent false retry trigger during mode switch
         this.lastDisconnectTime = 0;
-        this.handlersRegistered = false; // Will re-register on the new socket scheme
         if (this.retryTimer) {
             clearTimeout(this.retryTimer);
             this.retryTimer = undefined;
@@ -485,8 +649,13 @@ export class VirtualFileSystem extends vscode.Disposable {
                     const promise = new Promise<void>((r) => { resolve = r; });
                     this.reconnected = {promise, resolve};
                 }
-                if (this.root===undefined) { return; } // bypass the first initialization
+                if (this.root===undefined) { return; } // the first connection, or already reconnecting
                 console.log("Disconnected");
+                if (!this.socket.isUsingAlternativeConnectionScheme) {
+                    this.connectionLost('disconnected');
+                    return;
+                }
+                // the alternative connection scheme reconnects as before
                 // Debounce: ignore rapid disconnect/reconnect cycles (within 2 seconds)
                 const now = Date.now();
                 if (now - this.lastDisconnectTime < 2000) {
