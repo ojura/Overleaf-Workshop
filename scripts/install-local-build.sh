@@ -62,6 +62,25 @@ for ext in "$HOME"/.antigravity-ide/extensions/iamhyc.overleaf-workshop-* \
         fs.writeFileSync(installedPath, JSON.stringify(built, null, "\t") + "\n");
     ' "$ext/package.json" package.json
     cp package.nls.json "$ext/package.nls.json"
+    # The IDE starts from a cache of the installed extensions and their manifests, which this
+    # install does not update. Its next window would start with the old manifest, notice the
+    # change a few seconds later and ask for another reload ("Extensions have been modified on
+    # disk"). Without the cache the IDE reads the installed manifests and writes a new cache.
+    case "$ext" in
+        "$HOME"/.antigravity-ide/*) data="$HOME/.config/Antigravity IDE" ;;
+        "$HOME"/.vscode/*) data="$HOME/.config/Code" ;;
+        "$HOME"/.vscode-oss/*) data="$HOME/.config/VSCodium" ;;
+        "$HOME"/.cursor/*) data="$HOME/.config/Cursor" ;;
+        *) data="" ;;
+    esac
+    if [ -n "$data" ]; then
+        for cache in "$data"/CachedProfilesData/*/extensions.user.cache; do
+            if [ -f "$cache" ]; then
+                rm -f "$cache"
+                echo "removed the IDE's extension cache $cache"
+            fi
+        done
+    fi
     echo "installed $(git rev-parse --short HEAD) into $ext; reload the window to use it"
 done
 [ "$found" = 1 ] || echo "no Overleaf Workshop extension found"
