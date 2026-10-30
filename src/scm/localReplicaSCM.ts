@@ -40,6 +40,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private fullSync?: Promise<void>;
     private reportProgress?: (done: number, total: number) => void;
     private fullSyncRunning = false;
+    /** a notice about files that failed to sync is open */
+    private failureNoticeOpen = false;
     private running = 0;
     private vfsWatcher?: vscode.FileSystemWatcher;
     private localWatcher?: vscode.FileSystemWatcher;
@@ -390,7 +392,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             notes.push(vscode.l10n.t('{count} local files differed from Overleaf without saved sync state to tell which side changed; Overleaf\'s version is in place and the local one is kept in {folder}: {files}.', {count: summary.keptAside.length, folder: `${SYNC_FOLDER}/conflicts`, files: list(summary.keptAside.map(k => k.path))}));
         }
         if (summary.failed.length) {
-            notes.push(vscode.l10n.t('{count} files could not be synced and keep their local content: {files}.', {count: summary.failed.length, files: list(summary.failed.map(f => f.path))}));
+            notes.push(vscode.l10n.t('{count} files could not be synced and keep their local content: {files} ({error}). They are synced again when the connection is back, or with "Sync Now".', {count: summary.failed.length, files: list(summary.failed.map(f => f.path)), error: summary.failed[0].error}));
         }
         if (summary.untracked.length) {
             notes.push(vscode.l10n.t('{count} local files are not on Overleaf and were not uploaded: {files}.', {count: summary.untracked.length, files: list(summary.untracked)}));
@@ -402,17 +404,30 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             notes.push(vscode.l10n.t('The sync was cancelled before {count} files were checked.', {count: summary.notChecked}));
         }
         if (notes.length===0) { return; }
+        // While the connection is gone every save fails: one notice at a time, the log has all
+        const onlyFailures = notes.length===1 && summary.failed.length>0;
+        if (onlyFailures && this.failureNoticeOpen) { return; }
 
         const showLog = vscode.l10n.t('Show Log');
         const compare = vscode.l10n.t('Compare');
         const open = vscode.l10n.t('Open');
         const upload = vscode.l10n.t('Upload Local-Only Files');
+        const syncNow = vscode.l10n.t('Sync Now');
         const actions = [showLog];
         if (summary.keptAside.length) { actions.push(compare); }
         if (summary.conflicts.length) { actions.push(open); }
         if (summary.untracked.length) { actions.push(upload); }
-        const choice = await vscode.window.showWarningMessage(notes.join(' '), ...actions);
-        if (choice===showLog) {
+        if (summary.failed.length) { actions.push(syncNow); }
+        if (onlyFailures) { this.failureNoticeOpen = true; }
+        let choice: string | undefined;
+        try {
+            choice = await vscode.window.showWarningMessage(notes.join(' '), ...actions);
+        } finally {
+            if (onlyFailures) { this.failureNoticeOpen = false; }
+        }
+        if (choice===syncNow) {
+            await this.syncAll();
+        } else if (choice===showLog) {
             outputChannel?.show();
         } else if (choice===compare) {
             const {path, copy} = summary.keptAside[0];

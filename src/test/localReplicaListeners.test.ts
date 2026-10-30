@@ -146,3 +146,54 @@ describe('LocalReplicaSCMProvider when the first sync fails', () => {
         assert.deepStrictEqual(w.remoteWrites, ['/project/new.tex']);
     });
 });
+
+describe('LocalReplicaSCMProvider when a live sync fails', () => {
+    it('says why, offers Sync Now, and keeps one such notice open at a time', async () => {
+        const { w, mock } = world();
+        const offered: string[][] = [];
+        const answers: Array<(choice?: string) => void> = [];
+        mock.window.showWarningMessage = (message: string, ...items: string[]) => {
+            w.warnings.push(message);
+            offered.push(items);
+            return new Promise(resolve => answers.push(resolve));
+        };
+        const LocalReplicaSCMProvider = load(mock);
+        const origin = new Uri('overleaf-workshop', '/project');
+        // the project is empty and reachable at first; then the connection is gone
+        const vfs = {
+            origin, serverName: 'www.overleaf.com', projectName: 'project', projectId: 'p',
+            pathToUri: (...parts: string[]) => Uri.joinPath(origin, ...parts),
+            getProjectSCMPersist: () => ({ settings: {} }),
+            setProjectSCMPersist: () => {},
+            init: async () => ({ rootFolder: [{ _id: 'root', name: 'rootFolder', docs: [], fileRefs: [], folders: [] }] }),
+            _resolveUri: async () => ({ fileType: undefined, fileEntity: undefined }),
+            createFile: async () => { throw new Error('Not connected to www.overleaf.com; reconnecting in the background.'); },
+            documentUpdatesSettled: async () => {},
+        };
+        const scm = new LocalReplicaSCMProvider(vfs, Uri.file('/home/user/project'));
+        await scm.triggers;
+        await settle();
+        assert.deepStrictEqual(w.warnings, []);
+
+        const local = w.watchers.find(watcher => watcher.pattern.base==='/home/user/project')!;
+        const create = async (name: string) => {
+            w.localFiles.set(`/home/user/project/${name}`, new TextEncoder().encode(name));
+            for (const handler of local.handlers.create ?? []) { await handler(Uri.file(`/home/user/project/${name}`)); }
+            await settle();
+        };
+        await create('INDEXING.md');
+        assert.strictEqual(w.warnings.length, 1);
+        assert.match(w.warnings[0], /\/INDEXING\.md \(Not connected to www\.overleaf\.com; reconnecting in the background\.\)/);
+        assert.ok(offered[0].includes('Sync Now'));
+
+        // while that notice is open, more failures only go to the log
+        await create('index-terms.txt');
+        assert.strictEqual(w.warnings.length, 1);
+
+        // once it is closed, the next failure opens a new one
+        answers[0](undefined);
+        await settle();
+        await create('latexmkrc');
+        assert.strictEqual(w.warnings.length, 2);
+    });
+});
