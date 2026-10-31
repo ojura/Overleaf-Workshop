@@ -14,8 +14,14 @@ export interface VersionEntry { pathname: string; editable: boolean; }
 /** A change of the file tree between two versions. */
 export interface TreeChange { pathname: string; newPathname?: string; operation?: 'edited' | 'added' | 'removed' | 'renamed'; }
 
-/** One history update: the versions it spans and when it ended (milliseconds). */
-export interface HistoryUpdate { fromV: number; toV: number; endTs: number; }
+/** Someone who made a history update. */
+export interface HistoryUser { id?: string; name?: string; email?: string; }
+
+/**
+ * One history update: the versions it spans and when it ended (milliseconds); who made it,
+ * and where it came from when not the editor ('git-bridge' for a push through the git bridge).
+ */
+export interface HistoryUpdate { fromV: number; toV: number; endTs: number; users?: HistoryUser[]; origin?: string; }
 
 /** What the tools read from a project's history. */
 export interface HistorySource {
@@ -82,7 +88,11 @@ export class OverleafHistory implements HistorySource {
     async updates(before?: number) {
         const answer = await this.pacer.call('the history updates', () => this.api.getUpdates(this.identity, this.projectId, before), res => (res as any).updates);
         return {
-            updates: (answer.updates as ProjectHistoryResponseSchema[]).map(u => ({ fromV: u.fromV, toV: u.toV, endTs: u.meta.end_ts })),
+            updates: (answer.updates as ProjectHistoryResponseSchema[]).map(u => ({
+                fromV: u.fromV, toV: u.toV, endTs: u.meta.end_ts,
+                users: (u.meta.users ?? []).filter(x => x).map(x => ({ id: x.id, name: [x.first_name, x.last_name].filter(Boolean).join(' ') || undefined, email: x.email })),
+                origin: u.meta.origin?.kind,
+            })),
             next: answer.nextBeforeTimestamp as number | undefined,
         };
     }

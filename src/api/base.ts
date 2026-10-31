@@ -158,6 +158,8 @@ export interface ProjectUpdateMeta {
     users: {id:string, first_name:string, last_name?:string, email:string}[],
     start_ts: number,
     end_ts: number,
+    /** where the update came from when not the editor, e.g. {kind: 'git-bridge'} for a push through the git bridge */
+    origin?: {kind: string},
 }
 
 export interface ProjectHistoryResponseSchema {
