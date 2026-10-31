@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
 import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { FileRefEntity, FolderEntity, VirtualFileSystem, __OUTPUTS_ID, parseUri } from '../core/remoteFileSystemProvider';
@@ -811,21 +812,27 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // IDE's watcher only where Node's cannot watch the folder.
         const folderWatcher = new LocalFolderWatcher(
             this.baseUri.fsPath,
-            path => {
-                if (path==='/.git/index') {
-                    // e.g. conflicts resolved with git add: the files that waited for that sync now
-                    void sync.indexChanged();
-                } else {
-                    void this.localEvent(sync, path, syncOnFileChange, onLocal);
-                }
-            },
+            path => { void this.localEvent(sync, path, syncOnFileChange, onLocal); },
             reason => {
                 log(`[${this.vfs.projectName}] Looking at the whole folder: ${reason}.`);
                 void this.scanFolder();
             },
-            // the repository's own files, except its index
-            path => path==='/.overleaf' || path.startsWith('/.overleaf/') || (path.startsWith('/.git') && path!=='/.git/index'),
+            path => path==='/.overleaf' || path.startsWith('/.overleaf/') || path==='/.git' || path.startsWith('/.git/'),
         );
+        // The repository's index, which git replaces with a new file at each change: conflicts
+        // resolved with git add, the files that waited for that sync then.
+        try {
+            let timer: NodeJS.Timeout | undefined;
+            const indexWatcher = fs.watch(await store.open(), {persistent: false}, (_event, name) => {
+                if (name!=='index') { return; }
+                clearTimeout(timer);
+                timer = setTimeout(() => { void sync.indexChanged(); }, LocalFolderWatcher.quietMs);
+            });
+            indexWatcher.on('error', () => indexWatcher.close());
+            listeners.push({dispose: () => { clearTimeout(timer); indexWatcher.close(); }});
+        } catch (error) {
+            log(`[${this.vfs.projectName}] The repository's index cannot be watched (${error}); resolved conflicts sync at the next scan.`);
+        }
         const watching = folderWatcher.start();
         if (watching.ok) {
             this.watchedBy = 'node';

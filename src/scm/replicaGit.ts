@@ -787,10 +787,12 @@ export class GitReplicaStore implements ReplicaStore {
             const first = updates?.length ? updates[updates.length - 1].fromV : undefined;
             const subject = imported
                 ? (parent ? 'The replica\'s saved sync state' : 'Overleaf\'s state at the replica\'s last sync')
+                : !parent ? (version === undefined ? 'Overleaf\'s state' : `Overleaf's state at version ${version}`)
                 : version === undefined ? 'Changes made on Overleaf'
                 : first !== undefined && first + 1 < version ? `Overleaf versions ${first + 1} to ${version}` : `Overleaf version ${version}`;
             const body = imported
                 ? `The bases of the sync state that the replica kept in .overleaf/sync before it kept a git repository:\n${remotePaths.length} files.`
+                : !parent ? `The project's files when the replica first synced: ${remotePaths.length} files.`
                 : `Changed on Overleaf:\n${GitReplicaStore.listPaths(before, remoteTree, remotePaths)}`;
             const tree = this.treeFor(remoteTree, tipTree);
             tip = await git.commitTree(await git.writeTree(tree), tip ? [tip] : [], `${subject}\n\n${body}\n\n${this.trailers(version, imported ? [] : coAuthors)}\n`, author, committer);

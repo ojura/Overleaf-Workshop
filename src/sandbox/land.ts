@@ -136,8 +136,8 @@ function mainDocument(joined: JoinedProject): string | undefined {
     return find(joined.project.rootFolder[0], '');
 }
 
-/** The outputs worth keeping: everything but the PDF and the SyncTeX file, which stay on Overleaf. */
-const keepOutput = (file: OutputFileEntity) => /^[^/\\]+$/.test(file.path) && !/\.pdf$|\.synctex\.gz$/.test(file.path);
+/** The outputs kept: the logs, and the files a check of the pages reads; the PDF stays on Overleaf. */
+const keepOutput = (file: OutputFileEntity) => /^output\.(log|stdout|stderr|blg|ilg|aux|toc|lof|lot|idx|ind|bbl)$/.test(file.path);
 
 /** Compile the project as it is on Overleaf, and save the outputs and Overleaf's answer in `dir`. */
 export async function compileProject(client: LandClient, projectId: string, main: string, dir: string, log: Logger,

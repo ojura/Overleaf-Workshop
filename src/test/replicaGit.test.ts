@@ -238,6 +238,7 @@ describe('local replica: git as the merge backend', function () {
         const message = t.g('log', '-1', '--format=%B', head);
         assert.strictEqual(trailerValue(message, 'Overleaf-Version'), String(v));
         assert.strictEqual(trailerValue(message, 'Overleaf-Project'), 'p'.repeat(24));
+        assert.match(message, new RegExp(`^Overleaf's state at version ${v}\n\nThe project's files when the replica first synced: 2 files.\n`));
         assert.match(message, /^Co-authored-by: Bob Builder <bob@example.com>$/m);
         // the index holds the commit, and git status shows neither the build product nor .overleaf
         assert.strictEqual(t.g('status', '--porcelain'), '');

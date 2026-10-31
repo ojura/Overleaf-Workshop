@@ -125,3 +125,54 @@ describe('landing a commit through the replica\'s window (the land request)', fu
         assert.strictEqual(t.w.remote.get('/chapters/one.tex'), 'one v1\n');
     });
 });
+
+describe('a local replica\'s conflicts in its git repository', function () {
+    this.timeout(20000);
+    let folder: string, runtime: string, data: string;
+    const saved: Record<string, string | undefined> = {};
+    let triggers: { dispose(): void }[] = [];
+
+    beforeEach(() => {
+        folder = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-replica-conflict-'));
+        runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-runtime-'));
+        data = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-data-'));
+        fs.chmodSync(runtime, 0o700);
+        for (const key of ['XDG_RUNTIME_DIR', 'XDG_DATA_HOME']) { saved[key] = process.env[key]; }
+        process.env.XDG_RUNTIME_DIR = runtime;
+        process.env.XDG_DATA_HOME = data;
+    });
+    afterEach(async () => {
+        triggers.forEach(trigger => trigger.dispose());
+        triggers = [];
+        await wait(300);
+        for (const [key, value] of Object.entries(saved)) {
+            if (value === undefined) { delete process.env[key]; } else { process.env[key] = value; }
+        }
+        for (const dir of [folder, runtime, data]) { fs.rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it('uploads a resolved conflict as soon as it is staged with git add', async () => {
+        // without syncOnFileChange a local edit waits, so that an edit on Overleaf meets it
+        const t = world(folder, false);
+        t.w.remote.set('/main.tex', 'line 1\nline 2\nline 3\n');
+        git(folder, 'init', '--quiet', '--initial-branch=main');
+        git(folder, 'config', 'user.name', 'Local User');
+        git(folder, 'config', 'user.email', 'local@example.com');
+        const { LocalReplicaSCMProvider, requestReplica } = load(t.mock);
+        const scm = new LocalReplicaSCMProvider(t.vfs, Uri.file(folder));
+        triggers = await scm.triggers;
+        await until(() => fs.existsSync(path.join(folder, 'main.tex')));
+        assert.strictEqual(((await requestReplica(folder, { op: 'sync' }, 10000)) as any).ok, true);
+
+        fs.writeFileSync(path.join(folder, 'main.tex'), 'line 1\nline 2, local\nline 3\n');
+        t.remoteChange('/main.tex', 'line 1\nline 2, remote\nline 3\n');
+        await until(() => fs.readFileSync(path.join(folder, 'main.tex'), 'utf8').includes('<<<<<<< Local'));
+        await until(() => /^UU main.tex$/m.test(git(folder, 'status', '--porcelain')));
+
+        fs.writeFileSync(path.join(folder, 'main.tex'), 'line 1\nline 2, both\nline 3\n');
+        await wait(500);
+        assert.strictEqual(t.w.remote.get('/main.tex'), 'line 1\nline 2, remote\nline 3\n');
+        git(folder, 'add', 'main.tex');
+        await until(() => t.w.remote.get('/main.tex') === 'line 1\nline 2, both\nline 3\n', 3000);
+    });
+});
