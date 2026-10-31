@@ -7,9 +7,12 @@
 // Each viewer's page script src/<engine>/main.ts goes to views/pdf-viewer/dist/<engine>.mjs
 // (and .css), its page src/<engine>/index.html to dist/<engine>.html, which
 // src/core/pdfViewerPages.ts completes at run time.
-//   node scripts/build-pdf-viewer.mjs
+//   node scripts/build-pdf-viewer.mjs [--outdir DIR]
+// --outdir writes the viewers into DIR instead of views/pdf-viewer/dist. The build goes into a new
+// folder next to the output folder, which then replaces it, so that the output folder holds only
+// what this build wrote. Exit status 1 when a viewer does not build.
 import * as esbuild from 'esbuild';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 
@@ -89,29 +92,46 @@ export const bundleOptions = {
 export const engines = ['pdfjs', 'overleaf'];
 const enginePlugins = { pdfjs: [noViewerComponents], overleaf: [] };
 
-/** The viewers whose page script and page exist in this checkout. */
-export function availableEngines() {
-    return engines.filter(engine => existsSync(path.join(src, engine, 'main.ts')) && existsSync(path.join(src, engine, 'index.html')));
-}
-
-/** Build the page script and page of each viewer that exists. */
+/**
+ * Build the page script and page of each viewer into `outdir`: into a new folder next to it,
+ * which then replaces it. Fails when a viewer does not build.
+ */
 export async function buildViewers(outdir = path.join(viewerRoot, 'dist')) {
-    mkdirSync(outdir, { recursive: true });
-    const built = [];
-    for (const engine of availableEngines()) {
-        await esbuild.build({
-            ...bundleOptions,
-            plugins: [...bundleOptions.plugins, ...enginePlugins[engine]],
-            entryPoints: [path.join(src, engine, 'main.ts')],
-            outfile: path.join(outdir, `${engine}.mjs`),
-        });
-        writeFileSync(path.join(outdir, `${engine}.html`), readFileSync(path.join(src, engine, 'index.html'), 'utf8'));
-        built.push(engine);
+    const fresh = `${outdir}.new-${process.pid}`;
+    rmSync(fresh, { recursive: true, force: true });
+    mkdirSync(fresh, { recursive: true });
+    try {
+        for (const engine of engines) {
+            await esbuild.build({
+                ...bundleOptions,
+                plugins: [...bundleOptions.plugins, ...enginePlugins[engine]],
+                entryPoints: [path.join(src, engine, 'main.ts')],
+                outfile: path.join(fresh, `${engine}.mjs`),
+            });
+            writeFileSync(path.join(fresh, `${engine}.html`), readFileSync(path.join(src, engine, 'index.html'), 'utf8'));
+        }
+        const old = `${outdir}.old-${process.pid}`;
+        let replaced = false;
+        try {
+            renameSync(outdir, old);
+            replaced = true;
+        } catch (error) {
+            if (error.code !== 'ENOENT') { throw error; }
+        }
+        renameSync(fresh, outdir);
+        if (replaced) { rmSync(old, { recursive: true, force: true }); }
+    } finally {
+        rmSync(fresh, { recursive: true, force: true });
     }
-    return built;
+    return engines;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-    const built = await buildViewers();
-    console.log(built.length ? `built the PDF viewers: ${built.join(', ')}` : 'no PDF viewer to build yet');
+    const args = process.argv.slice(2);
+    if (args.length && !(args.length === 2 && args[0] === '--outdir')) {
+        console.error('usage: node scripts/build-pdf-viewer.mjs [--outdir DIR]');
+        process.exit(64);
+    }
+    const outdir = args.length ? path.resolve(args[1]) : undefined;
+    console.log(`built the PDF viewers: ${(await buildViewers(outdir)).join(', ')}${outdir ? ` into ${outdir}` : ''}`);
 }

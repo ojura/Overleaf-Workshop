@@ -115,16 +115,17 @@ repository.
 
 The scripts in `ide/` drive the viewers in Antigravity itself, in the window of an instance that
 `scripts/hidden-ide.sh` started on a virtual display, and only there. They read the instance's
-`instance.json` in the folder that `--instance` names, or else in `$HIDDEN_IDE_HOME` (there is no
-default), connect to the DevTools endpoint that the instance's start recorded there, and
+`instance.json` in the folder that `--instance` names, or else in `$HIDDEN_IDE_HOME` (they require
+one of the two), connect to the DevTools endpoint that the instance's start recorded there, and
 go on only when the instance's IDE answers as itself (`scripts/lib/test-instance.mjs`). The
 settings they change are the instance's own (`profile/User/settings.json`), and they restore them
 when they end.
 
 An instance opens either a folder of PDFs, without a login (`--folder`), or the local replica of an
-Overleaf project meant for tests (`--project`), whose `output.pdf` the viewer loads in ranges:
+Overleaf project meant for tests (`--project`); the viewer loads that project's `output.pdf` in ranges:
 
 ```sh
+export HIDDEN_IDE_HOME=<a folder of your own> HIDDEN_IDE_BINARY=<the Antigravity binary>
 scripts/hidden-ide.sh start --folder /tmp/pdf-viewer-harness/book-theme
 node scripts/pdf-viewer-harness/ide/drive-local-pdf.mjs --pdf /tmp/pdf-viewer-harness/book-theme/build-a.pdf --pages 1 --theme-book
 scripts/hidden-ide.sh stop

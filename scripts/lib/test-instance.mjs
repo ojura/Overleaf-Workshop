@@ -10,13 +10,13 @@ import path from 'node:path';
 import { connect, evaluate, waitForActivePort, waitForTarget } from './devtools.mjs';
 
 /**
- * The instance's folder: `explicit`, else HIDDEN_IDE_HOME. There is no default, so that two agents
- * never share an instance.
+ * The instance's folder: `explicit`, else HIDDEN_IDE_HOME. The scripts require one of them and do
+ * not fall back to a shared folder, so that two agents never share an instance.
  */
 export function instanceHome(explicit) {
     const home = explicit ?? process.env.HIDDEN_IDE_HOME;
     if (!home) {
-        throw new Error('name the folder of the test instance with --instance DIR or HIDDEN_IDE_HOME; it has no default, so that two agents never share an instance');
+        throw new Error('name the folder of the test instance with --instance DIR or HIDDEN_IDE_HOME; the scripts do not fall back to a shared folder, so that two agents never share an instance');
     }
     return path.resolve(home);
 }
@@ -29,7 +29,7 @@ export function readInstance(home) {
         text = fs.readFileSync(file, 'utf8');
     } catch (error) {
         if (error.code === 'ENOENT') {
-            throw new Error(`${file} does not exist: start an instance with scripts/hidden-ide.sh start, or name its folder with HIDDEN_IDE_HOME`);
+            throw new Error(`${file} does not exist: start an instance with scripts/hidden-ide.sh start, or name its folder with HIDDEN_IDE_HOME (the drivers also take --instance DIR)`);
         }
         throw error;
     }
@@ -44,8 +44,16 @@ export function writeInstance(home, record) {
     fs.renameSync(`${file}.new`, file);
 }
 
+/**
+ * The path of the page of VS Code's workbench window. The instance's window is the one window that
+ * shows this page: the window commands pick it among the IDE's BrowserWindows, and the page
+ * commands and the drivers among its page targets, both by this path, and both refuse when there
+ * is not exactly one.
+ */
+const WORKBENCH_PAGE = '/workbench/workbench.html';
+
 /** Whether a target is the page of the IDE's workbench window. */
-export const isWorkbench = (target) => target.type === 'page' && target.url.includes('/workbench/workbench.html');
+export const isWorkbench = (target) => target.type === 'page' && target.url.includes(WORKBENCH_PAGE);
 
 /** The process id of the browser on the connection `browser`, as the browser reports it. */
 async function browserProcess(browser) {
@@ -61,11 +69,49 @@ async function checkBrowserProcess(browser, pid) {
     }
 }
 
-/** The process group of process `pid`, from /proc/<pid>/stat (after the command name, which can hold spaces). */
-function processGroup(pid) {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const [, , group] = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    return Number(group);
+/**
+ * The state, the process group and the start time (in clock ticks after the boot) of process
+ * `pid`, from /proc/<pid>/stat, or undefined when no such process exists.
+ */
+export function processStat(pid) {
+    let stat;
+    try {
+        stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    } catch (error) {
+        if (error.code === 'ENOENT' || error.code === 'ESRCH') { return undefined; }
+        throw error;
+    }
+    // after the command name, which can hold spaces: state, ppid, pgrp, ... and starttime, field 22
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return { state: fields[0], group: Number(fields[2]), start: Number(fields[19]) };
+}
+
+/** This boot's id: a recorded pid and start time name the same process only within one boot. */
+export const bootId = () => fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+
+/**
+ * Whether process `pid` is the one recorded with the start time `start` in the boot `boot`, and
+ * not another process that got the same pid later.
+ */
+export function isRecordedProcess(pid, start, boot) {
+    return Boolean(pid) && boot === bootId() && processStat(pid)?.start === start;
+}
+
+/**
+ * The processes of the instance `record` that have not exited: the members of its process group,
+ * while the group is still the one that start made, in this boot. After the group's leader has
+ * ended, the group stays the instance's as long as members of it run, since the system gives the
+ * group's number to another group only after all of them have ended. This is the one test of whether an instance runs, for
+ * start, for the commands and for stop.
+ */
+export function instanceProcesses(record) {
+    if (!record.group || record.boot !== bootId()) { return []; }
+    const leader = processStat(record.group);
+    if (leader && leader.start !== record.groupStart) { return []; }
+    return fs.readdirSync('/proc').filter(entry => /^\d+$/.test(entry)).map(Number).filter((pid) => {
+        const stat = processStat(pid);
+        return stat?.group === record.group && stat.state !== 'Z' && stat.state !== 'X';
+    });
 }
 
 /** Fail unless the Node inspector on the connection `main` runs in the process `pid`. */
@@ -79,7 +125,7 @@ async function checkMainProcess(main, pid) {
 /** Connect to a recorded endpoint of the instance, with the cause when the IDE does not answer there. */
 async function connectRecorded(instance, url, name) {
     if (!url) {
-        throw new Error(`${path.join(instance.home, 'instance.json')} records no ${name} endpoint: the instance did not finish starting`);
+        throw new Error(`${path.join(instance.home, 'instance.json')} does not record the ${name} endpoint: the instance did not finish starting`);
     }
     try {
         return await connect(url);
@@ -114,16 +160,17 @@ export async function connectMainProcess(instance) {
 
 /**
  * The value that `statements` return, run in the main process as the body of an async function in
- * which `electron` is Electron's module and `w` the IDE's window.
+ * which `electron` is Electron's module and `w` the window that shows the workbench (WORKBENCH_PAGE).
  */
 export function inMainProcess(main, statements) {
     return evaluate(main, `(async () => {
-        // the main process is an ES module, and the inspector's context has neither require nor import()
+        // the main process is an ES module, and the inspector's context lacks require and import()
         const electron = typeof require === 'function' ? require('electron')
             : process.mainModule ? process.mainModule.require('electron')
             : process.getBuiltinModule('module').createRequire(process.execPath)('electron');
-        const w = electron.BrowserWindow.getAllWindows().find(w => !w.isDestroyed());
-        if (!w) { throw new Error('the IDE has no window'); }
+        const windows = electron.BrowserWindow.getAllWindows().filter(w => !w.isDestroyed() && w.webContents.getURL().includes(${JSON.stringify(WORKBENCH_PAGE)}));
+        if (windows.length !== 1) { throw new Error(\`the IDE shows \${windows.length} workbench windows, not one\`); }
+        const w = windows[0];
         ${statements}
     })()`);
 }
@@ -175,7 +222,7 @@ const SERVER_ANSWER_LIMIT_MS = 5000;
 
 /**
  * The inspector's endpoint of process `pid`: of the ports it listens on at 127.0.0.1, other than
- * its DevTools port, the one whose /json/list names a target of type node.
+ * its DevTools port, the one that names a target of type node in its /json/list.
  */
 async function findInspector(pid, devtoolsPort) {
     const found = [];
@@ -199,18 +246,19 @@ async function findInspector(pid, devtoolsPort) {
  * Wait until the IDE of the instance in `home`, started with --remote-debugging-port=0 and
  * --inspect=0 in the process group `group`, has opened its workbench window, and return its pid as
  * its browser reports it, checked to be in `group`, and its two endpoints, checked to belong to
- * that pid: { pid, devtools, inspector }. The waits follow file and target events; `limitMs` is
- * the last resort for an IDE that runs but never opens its window. The end of the IDE's session is
- * the caller's to watch: hidden-ide.sh waits for whichever comes first.
+ * that pid: { pid, devtools, inspector }. The waits follow file and target events; `ended`, a
+ * promise that settles when the IDE's session ends, ends the wait for DevToolsActivePort, and the
+ * closed connection the later waits; `limitMs` is the last resort for an IDE that runs but never
+ * opens its window.
  */
-export async function waitForInstance(home, group, limitMs) {
+export async function waitForInstance(home, group, limitMs, ended) {
     const deadline = Date.now() + limitMs;
-    const devtools = await waitForActivePort(path.join(home, 'profile'), { limitMs });
+    const devtools = await waitForActivePort(path.join(home, 'profile'), { ended, limitMs });
     const browser = await connect(devtools);
     let pid;
     try {
         pid = await browserProcess(browser);
-        if (processGroup(pid) !== group) {
+        if (processStat(pid)?.group !== group) {
             throw new Error(`the browser that wrote ${home}/profile/DevToolsActivePort, process ${pid}, is not in the instance's process group ${group}`);
         }
         await waitForTarget(browser, isWorkbench, { what: "the IDE's workbench window", limitMs: Math.max(0, deadline - Date.now()) });
