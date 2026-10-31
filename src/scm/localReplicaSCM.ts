@@ -374,7 +374,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             isIgnored: path => this.leftOut(path),
             history: async () => {
                 const res = await vfs.getUpdates();
-                return res?.updates.map((u): HistoryUpdate => ({
+                if (res===undefined) { throw new Error('the request for the project\'s history updates failed'); }
+                return res.updates.map((u): HistoryUpdate => ({
                     fromV: u.fromV, toV: u.toV, endTs: u.meta.end_ts,
                     users: (u.meta.users ?? []).filter(user => user).map(user => ({
                         id: user.id, name: [user.first_name, user.last_name].filter(Boolean).join(' ') || undefined, email: user.email,

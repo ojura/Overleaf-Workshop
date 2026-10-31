@@ -575,6 +575,43 @@ describe('local replica: git as the merge backend', function () {
         await sync.stop();
     });
 
+    it('records an executable local file as executable when Overleaf\'s state first has it', async () => {
+        const t = await world();
+        t.remote.docs.set('/main.tex', text);
+        t.remote.docs.set('/layout/build.sh', '#!/bin/sh\n');
+        t.write('/layout/build.sh', '#!/bin/sh\n');
+        fs.chmodSync(path.join(t.folder, 'layout/build.sh'), 0o755);
+        t.update(ME);
+        const sync = t.start();
+        await sync.syncAll();
+        await sync.recordNow();
+        assert.match(t.g('ls-tree', 'HEAD', 'layout/build.sh'), /^100755 /);
+        // a new executable file uploaded from the folder
+        t.write('/layout/check.sh', '#!/bin/sh\nexit 0\n');
+        fs.chmodSync(path.join(t.folder, 'layout/check.sh'), 0o755);
+        await sync.localChanged('/layout/check.sh');
+        await sync.recordNow();
+        assert.match(t.g('ls-tree', 'HEAD', 'layout/check.sh'), /^100755 /);
+        assert.strictEqual(t.g('status', '--porcelain'), '');
+        await sync.stop();
+    });
+
+    it('takes a document\'s saved base from the local file when the saved copy of it is gone', async () => {
+        const t = await world();
+        t.remote.docs.set('/terms.txt', 'term\n');
+        fs.mkdirSync(path.join(t.folder, '.overleaf/sync/base'), { recursive: true });
+        fs.writeFileSync(path.join(t.folder, '.overleaf/sync/state.json'), JSON.stringify({
+            project: 'p'.repeat(24),
+            state: { version: 1, untracked: [], entries: { '/terms.txt': { kind: 'doc', base: gitBlobHash(enc('term\n')), size: 1, mtime: 1, checked: 1 } } },
+        }));
+        t.write('/terms.txt', 'term\n');
+        const sync = t.start();
+        assert.strictEqual(await sync.knows('/terms.txt'), true);
+        assert.deepStrictEqual(t.g('ls-tree', '-r', '--name-only', OVERLEAF_REF).split('\n'), ['terms.txt']);
+        assert.doesNotMatch(t.ui.logs.join('\n'), /no saved base any more/);
+        await sync.stop();
+    });
+
     it('makes the sync state kept before git the first commit, and shows local differences as changes', async () => {
         const t = await world();
         const saved = text, edited = text.replace('line 1', 'edited locally');

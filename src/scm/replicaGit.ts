@@ -523,13 +523,14 @@ export class GitReplicaStore implements ReplicaStore {
         const dropped: string[] = [];
         for (const [p, entry] of Object.entries(legacy.state.entries ?? {})) {
             if (entry.kind === 'doc') {
-                let text: Buffer | undefined;
-                try { text = await fsp.readFile(path.join(dir, 'base', entry.base)); } catch { text = undefined; }
-                if (text !== undefined && await this.git.hashObject(text) === entry.base) {
-                    state.entries[p] = { ...entry };
-                } else {
-                    dropped.push(p);
+                // the saved base text, else the local file when it still holds it
+                let held = false;
+                for (const file of [path.join(dir, 'base', entry.base), path.join(this.options.folder, gitPath(p))]) {
+                    let text: Buffer | undefined;
+                    try { text = await fsp.readFile(file); } catch { text = undefined; }
+                    if (text !== undefined && await this.git.hashObject(text) === entry.base) { held = true; break; }
                 }
+                if (held) { state.entries[p] = { ...entry }; } else { dropped.push(p); }
             } else {
                 files.push({ path: p, base: entry.base });
                 state.entries[p] = { ...entry };
@@ -606,15 +607,25 @@ export class GitReplicaStore implements ReplicaStore {
     /**
      * `files` (Overleaf's files) as a commit's tree on top of `parentTree`: the files the sync
      * leaves out as the parent has them, and each file with the parent's mode, which Overleaf
-     * does not keep (an executable script stays executable).
+     * does not keep (an executable script stays executable); a file the parent lacks with the
+     * mode of the file in the folder.
      */
     private treeFor(files: FlatTree, parentTree: FlatTree): FlatTree {
         const tree: FlatTree = new Map();
-        for (const [p, e] of files) { tree.set(p, { mode: parentTree.get(p)?.mode ?? e.mode, oid: e.oid }); }
+        for (const [p, e] of files) { tree.set(p, { mode: parentTree.get(p)?.mode ?? this.localMode(p), oid: e.oid }); }
         for (const [p, e] of parentTree) {
             if (this.options.isIgnored(syncPath(p))) { tree.set(p, e); }
         }
         return tree;
+    }
+
+    /** git's mode for the file at `p` in the folder: executable or not. */
+    private localMode(p: string): string {
+        try {
+            return (fs.statSync(path.join(this.options.folder, p)).mode & 0o111) ? '100755' : '100644';
+        } catch {
+            return '100644';
+        }
     }
 
     private trailers(version: number | undefined, coAuthors: Person[] = []): string {
