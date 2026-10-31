@@ -6,7 +6,7 @@ import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
-import { downloadTo, outputsOf, PdfFetchBridge, PieceCache } from '../core/pdfFetchBridge';
+import { outputsOf, PdfFetchBridge, PieceCache } from '../core/pdfFetchBridge';
 
 const sha256 = (content: Uint8Array) => createHash('sha256').update(content).digest('hex');
 const pdf = new TextEncoder().encode('%PDF-1.7 ' + 'x'.repeat(5000));
@@ -119,25 +119,6 @@ describe('the PDF viewer\'s fetches through the extension', () => {
             assert.deepStrictEqual([whole.status, whole.body.byteLength], [200, pdf.byteLength]);
             const unknown = new PdfFetchBridge(outputsOf(server.domain, 'p1'));
             await assert.rejects(unknown.handle({ id: 5, url }), /an unknown number of bytes/);
-        } finally { server.close(); }
-    });
-
-    it('saves a build to a file as it arrives, and leaves the file as it was when the download fails', async () => {
-        const server = await serve();
-        try {
-            const file = path.join(dir, 'book.pdf');
-            const seen: number[] = [];
-            await downloadTo(`${server.domain}/project/p1/user/u1/build/b1/output/output.pdf`, file, undefined, (received) => seen.push(received));
-            assert.deepStrictEqual(new Uint8Array(fs.readFileSync(file)), pdf);
-            assert.strictEqual(seen.at(-1), pdf.byteLength);
-            fs.writeFileSync(file, 'the earlier copy');
-            const failing = http.createServer((_req, res) => { res.writeHead(404); res.end('gone'); });
-            await new Promise<void>(resolve => failing.listen(0, '127.0.0.1', resolve));
-            try {
-                await assert.rejects(downloadTo(`http://127.0.0.1:${(failing.address() as AddressInfo).port}/output.pdf`, file), /failed: 404/);
-            } finally { failing.close(); }
-            assert.strictEqual(fs.readFileSync(file, 'utf8'), 'the earlier copy');
-            assert.deepStrictEqual(fs.readdirSync(dir), ['book.pdf'], 'the temporary file is gone');
         } finally { server.close(); }
     });
 

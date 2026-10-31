@@ -30,7 +30,7 @@ export interface Position {
     pageSize: { height: number, width: number };
 }
 
-/** The viewer state of one document. All engines share it; the legacy viewer keeps its own fields in it. */
+/** The viewer state of one document, which both viewers share. */
 export interface SavedState {
     colorTheme?: string;
     scale?: string;

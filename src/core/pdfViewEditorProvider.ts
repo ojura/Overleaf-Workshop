@@ -6,26 +6,19 @@ import { EventBus } from '../utils/eventBus';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { parseUri } from './remoteFileSystemProvider';
 import type { PdfOutput, VirtualFileSystem } from './remoteFileSystemProvider';
-import { downloadInRanges, downloadTo, outputsOf, PdfFetchBridge, PieceCache } from './pdfFetchBridge';
-import { completeViewerPage, isBuildPath, PDF_VIEWER_ENGINES, PdfViewerEngine } from './pdfViewerPages';
+import { downloadInRanges, outputsOf, PdfFetchBridge, PieceCache } from './pdfFetchBridge';
+import { completeViewerPage, DEFAULT_PDF_VIEWER_ENGINE, isBuildPath, PDF_VIEWER_ENGINES, PdfViewerEngine } from './pdfViewerPages';
 
 export class PdfDocument implements vscode.CustomDocument {
     cache: Uint8Array = new Uint8Array(0);
-    /** for the build's output.pdf in a viewer that loads in ranges: the build to load */
+    /** for the build's output.pdf: the build, which the viewer loads in ranges */
     output?: PdfOutput;
-    /** for the build's output.pdf in the legacy viewer: the build, downloaded to this file */
-    file?: vscode.Uri;
-    /** the legacy viewer's download of a build that runs now */
-    private downloading?: { build: string, abort: AbortController, done: Promise<vscode.Uri | 'superseded' | undefined> };
 
     private readonly _onDidChange = new vscode.EventEmitter<{}>();
     readonly onDidChange = this._onDidChange.event;
 
-    /**
-     * `engine`: the viewer that shows this document (setting overleaf-workshop.pdfViewer.engine).
-     * `buildFolder`: where the legacy viewer's builds are downloaded to.
-     */
-    constructor(readonly uri: vscode.Uri, private _engine: PdfViewerEngine = 'legacy', private readonly buildFolder?: vscode.Uri) {
+    /** `engine`: the viewer that shows this document (setting overleaf-workshop.pdfViewer.engine) */
+    constructor(readonly uri: vscode.Uri, private _engine: PdfViewerEngine = DEFAULT_PDF_VIEWER_ENGINE) {
         this.uri = uri;
     }
 
@@ -33,19 +26,12 @@ export class PdfDocument implements vscode.CustomDocument {
         return this._engine;
     }
 
-    /**
-     * Show this document in another viewer; false when it is the viewer already. A build moves
-     * between being loaded in ranges and being read whole when the legacy viewer is one of the two.
-     */
+    /** Show this document in the other viewer; false when it is the viewer already. Both load the document the same way. */
     async setEngine(engine: PdfViewerEngine): Promise<boolean> {
         if (engine === this._engine) {
             return false;
         }
-        const reread = this.isBuild && (engine === 'legacy') !== (this._engine === 'legacy');
         this._engine = engine;
-        if (reread) {
-            await this.refresh();
-        }
         return true;
     }
 
@@ -62,42 +48,23 @@ export class PdfDocument implements vscode.CustomDocument {
         return this.isProjectFile && isBuildPath(parseUri(this.uri).pathParts, OUTPUT_FOLDER_NAME);
     }
 
-    dispose() {
-        this.downloading?.abort.abort();
-    }
+    dispose() { }
 
     async refresh(): Promise<Uint8Array> {
-        // The viewers other than the legacy one load a build in ranges, as Overleaf's viewer
-        // loads it: they need only its address, not its content. Other PDFs are read whole.
+        // The viewers load a build in ranges, as Overleaf's viewer loads it: they need only its
+        // address, not its content. Other PDFs, and a build this session has not compiled, are
+        // read whole.
         if (this.isBuild) {
             const vfs = await vscode.commands.executeCommand<VirtualFileSystem>('remoteFileSystem.prefetch', this.uri).then(v => v, () => undefined);
             const output = vfs?.pdfOutput();
-            if (output && this.engine !== 'legacy') {
+            if (output) {
                 this.output = output;
-                this.file = undefined;
                 this.cache = new Uint8Array();
                 this._onDidChange.fire({output});
                 return this.cache;
             }
-            // The legacy viewer reads a build whole. It is downloaded to a file, which the
-            // viewer's page opens itself. Read through the IDE, the build would cross the
-            // extension host's channel to the window three times, with up to three copies held
-            // in the extension host (2 to 3 GB for the 845 MB book).
-            const file = output && vfs && await this.downloadBuild(output, vfs);
-            if (file === 'superseded') {
-                return this.cache; // a refresh for a newer build shows that one
-            }
-            if (file) {
-                const unchanged = this.file?.toString() === file.toString();
-                this.output = undefined;
-                this.file = file;
-                this.cache = new Uint8Array();
-                if (!unchanged) { this._onDidChange.fire({file}); }
-                return this.cache;
-            }
         }
         this.output = undefined;
-        this.file = undefined;
         try {
             this.cache = new Uint8Array(await vscode.workspace.fs.readFile(this.uri));
         } catch {
@@ -105,57 +72,6 @@ export class PdfDocument implements vscode.CustomDocument {
         }
         this._onDidChange.fire({content:this.cache});
         return this.cache;
-    }
-
-    /**
-     * Download the build to a file of its own in the build folder, and remove the project's
-     * older builds there. A refresh for the build that is downloading waits for that download;
-     * one for another build stops it, and the stopped one answers 'superseded'.
-     *
-     * The build comes in ranges from the download domain. When that fails, the project reads it
-     * as the IDE would, with its fallback to the web server, but in the extension host, without
-     * the round trip through the window. Undefined when that fails too: the build is then read
-     * through the IDE and sent to the page, as before.
-     */
-    private downloadBuild(output: PdfOutput, vfs: VirtualFileSystem): Promise<vscode.Uri | 'superseded' | undefined> {
-        const folder = this.buildFolder;
-        const build = output.file.build;
-        const size = output.file.size;
-        if (folder === undefined || !build || !size) { return Promise.resolve(undefined); }
-        if (this.downloading?.build === build) { return this.downloading.done; }
-        this.downloading?.abort.abort();
-        const abort = new AbortController();
-        const name = `${output.projectId}-${build}.pdf`;
-        const target = vscode.Uri.joinPath(folder, name);
-        const done = (async (): Promise<vscode.Uri | 'superseded' | undefined> => {
-            try {
-                await vscode.workspace.fs.createDirectory(folder);
-                try {
-                    await vscode.workspace.fs.stat(target); // downloaded before, e.g. for another viewer
-                } catch {
-                    try {
-                        await downloadInRanges(output.url, target.fsPath, size, abort.signal);
-                    } catch (error: any) {
-                        if (abort.signal.aborted) { throw error; }
-                        console.warn(`overleaf-workshop: downloading the build in ranges failed (${error?.message ?? error}); reading it through the project`);
-                        await vscode.workspace.fs.writeFile(target, await vfs.openFile(this.uri));
-                    }
-                }
-                for (const [other] of await vscode.workspace.fs.readDirectory(folder)) {
-                    if (other !== name && other.startsWith(`${output.projectId}-`) && !other.endsWith('.part')) {
-                        await Promise.resolve(vscode.workspace.fs.delete(vscode.Uri.joinPath(folder, other))).catch(() => {});
-                    }
-                }
-                return abort.signal.aborted ? 'superseded' : target;
-            } catch (error: any) {
-                if (abort.signal.aborted) { return 'superseded'; }
-                console.warn(`overleaf-workshop: downloading the build for the legacy viewer failed (${error?.message ?? error}); reading it through the IDE`);
-                return undefined;
-            }
-        })();
-        this.downloading = { build, abort, done };
-        void done.finally(() => { if (this.downloading?.done === done) { this.downloading = undefined; } });
-        return done;
     }
 }
 
@@ -172,12 +88,11 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         this.context = context;
         const sizeMB = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer').get<number>('pieceCacheSizeMB', 1024);
         this.pieces = new PieceCache(path.join(context.globalStorageUri.fsPath, 'pdf-pieces'), Math.max(0, sizeMB) * 1024 * 1024);
+        // the folder where the PDF viewer of earlier versions (pdf.js 3.10.111's) downloaded the
+        // builds it showed, one book-sized file per project
+        void Promise.resolve(vscode.workspace.fs.delete(vscode.Uri.joinPath(context.globalStorageUri, 'legacy-viewer-builds'), { recursive: true, useTrash: false })).catch(() => {});
     }
 
-    /** where the legacy viewer's builds are downloaded to, one file per project */
-    private get buildFolder(): vscode.Uri {
-        return vscode.Uri.joinPath(this.context.globalStorageUri, 'legacy-viewer-builds');
-    }
 
     public saveCustomDocument(document: PdfDocument, cancellation: vscode.CancellationToken): Thenable<void> {
         return Promise.resolve();
@@ -193,27 +108,18 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
     }
 
     public async openCustomDocument(uri: vscode.Uri): Promise<PdfDocument> {
-        const doc = new PdfDocument(uri, await this.engine(), this.buildFolder);
+        const doc = new PdfDocument(uri, this.engine());
         await doc.refresh();
         return doc;
     }
 
     /**
-     * The viewer that the setting overleaf-workshop.pdfViewer.engine picks, or the legacy viewer
-     * when this install does not have the picked viewer's page.
+     * The viewer that the setting overleaf-workshop.pdfViewer.engine picks; the default for a value
+     * the setting no longer has, such as an earlier version's 'legacy'.
      */
-    private async engine(): Promise<PdfViewerEngine> {
-        const picked = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer').get<string>('engine', 'legacy') as PdfViewerEngine;
-        if (picked === 'legacy' || !PDF_VIEWER_ENGINES.includes(picked)) {
-            return 'legacy';
-        }
-        try {
-            await vscode.workspace.fs.stat(this.viewerFile('dist', `${picked}.html`));
-            return picked;
-        } catch {
-            console.warn(`overleaf-workshop: the ${picked} PDF viewer is not built (npm run build-pdf-viewer); using the legacy viewer`);
-            return 'legacy';
-        }
+    private engine(): PdfViewerEngine {
+        const picked = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer').get<string>('engine', DEFAULT_PDF_VIEWER_ENGINE);
+        return PDF_VIEWER_ENGINES.includes(picked as PdfViewerEngine) ? picked as PdfViewerEngine : DEFAULT_PDF_VIEWER_ENGINE;
     }
 
     private viewerFile(...parts: string[]) {
@@ -222,7 +128,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
 
     /** Show the open PDFs in the viewer that the setting now picks; their pages reload. */
     private async applyEngine() {
-        const engine = await this.engine();
+        const engine = this.engine();
         for (const editor of this.editors) {
             if (await editor.doc.setEngine(engine)) {
                 await editor.render();
@@ -255,8 +161,6 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         const updateWebview = () => {
             if (doc.output) {
                 webviewPanel.webview.postMessage({type:'load', output:doc.output});
-            } else if (doc.file) {
-                webviewPanel.webview.postMessage({type:'updateUrl', url:webviewPanel.webview.asWebviewUri(doc.file).toString()});
             } else if (doc.cache.buffer.byteLength !== 0) {
                 webviewPanel.webview.postMessage({type:'update', content:doc.cache.buffer});
             }
@@ -278,9 +182,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         const editor = {
             doc,
             render: async () => {
-                webviewPanel.webview.html = doc.engine === 'legacy'
-                    ? await this.getHtmlForWebview(webviewPanel.webview)
-                    : await this.getViewerPage(webviewPanel.webview, doc.engine);
+                webviewPanel.webview.html = await this.getViewerPage(webviewPanel.webview, doc.engine);
             },
         };
         this.editors.add(editor);
@@ -290,8 +192,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             this.editors.delete(editor);
         });
 
-        // the legacy viewer's page opens a downloaded build from the build folder
-        webviewPanel.webview.options = {enableScripts:true, localResourceRoots:[this.context.extensionUri, this.buildFolder]};
+        webviewPanel.webview.options = {enableScripts:true, localResourceRoots:[this.context.extensionUri]};
         await editor.render();
 
         // register event listeners
@@ -363,32 +264,21 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         ];
     }
 
-    private patchViewerHtml(webview: vscode.Webview, html: string): string {
-        const patchPath = (...path:string[]) => webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'views/pdf-viewer', ...path)).toString();
-
-        // adjust original path
-        html = html.replace('../build/pdf.js', patchPath('vendor','build','pdf.js'));
-        html = html.replace('viewer.css', patchPath('vendor','web','viewer.css'));
-        html = html.replace('viewer.js',  patchPath('vendor','web','viewer.js'));
-
-        // patch custom files
-        const workerScript = `<script src="${patchPath('vendor','build','pdf.worker.js')}"></script>`;
-        const customScript = `<script src="${patchPath('index.js')}"></script>`;
-        const customStyle = `<link rel="stylesheet" href="${patchPath('index.css')}" />`;
-        html = html.replace(/\<\/head\>/, `${workerScript}\n${customScript}\n${customStyle}\n</head>`);
-
-        return html;
-    }
-
     /** A viewer page from views/pdf-viewer/dist/, completed with its base URL and configuration. */
-    private async getViewerPage(webview: vscode.Webview, engine: Exclude<PdfViewerEngine, 'legacy'>): Promise<string> {
-        const template = (await vscode.workspace.fs.readFile(this.viewerFile('dist', `${engine}.html`))).toString();
+    private async getViewerPage(webview: vscode.Webview, engine: PdfViewerEngine): Promise<string> {
+        let template: string;
+        try {
+            template = (await vscode.workspace.fs.readFile(this.viewerFile('dist', `${engine}.html`))).toString();
+        } catch {
+            throw new Error(`the ${engine} PDF viewer is not built: run npm run build-pdf-viewer`);
+        }
         return completeViewerPage(template, engine, webview.asWebviewUri(this.viewerFile()).toString() + '/');
     }
 
     /**
-     * Save the PDF to a file the user picks. A build is downloaded from Overleaf to the file as
-     * it arrives, since the viewer has only the parts it showed; a PDF read whole is written out.
+     * Save the PDF to a file the user picks. A build is downloaded from Overleaf to the file in
+     * ranges (downloadInRanges), since the viewer has only the parts it showed, and the download
+     * domain cuts off one long response of a large build; a PDF read whole is written out.
      */
     private async download(doc: PdfDocument) {
         const name = path.posix.basename(doc.uri.path);
@@ -397,19 +287,22 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         const target = await vscode.window.showSaveDialog({ defaultUri: vscode.Uri.joinPath(folder, name), filters: { PDF: ['pdf'] } });
         if (!target) { return; }
         const output = doc.output;
+        const size = output?.file.size;
         try {
-            if (output && target.scheme === 'file') {
+            if (output && size && target.scheme === 'file') {
                 await vscode.window.withProgress({
                     location: vscode.ProgressLocation.Notification, title: vscode.l10n.t('Saving {0}', name), cancellable: true,
                 }, async (progress, token) => {
                     const abort = new AbortController();
                     token.onCancellationRequested(() => abort.abort());
                     let reported = 0;
-                    await downloadTo(output.url, target.fsPath, abort.signal, (received, total) => {
-                        if (total && received - reported >= total / 100) {
-                            progress.report({ increment: (received - reported) / total * 100 });
-                            reported = received;
-                        }
+                    await downloadInRanges(output.url, target.fsPath, size, abort.signal, {
+                        onProgress: (received) => {
+                            if (received - reported >= size / 100 || received === size) {
+                                progress.report({ increment: (received - reported) / size * 100 });
+                                reported = received;
+                            }
+                        },
                     });
                 });
             } else {
@@ -419,12 +312,6 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         } catch (error: any) {
             vscode.window.showErrorMessage(vscode.l10n.t('Could not save {0}: {1}', name, error?.message ?? String(error)));
         }
-    }
-
-    private async getHtmlForWebview(webview: vscode.Webview): Promise<string> {
-        const htmlPath = vscode.Uri.joinPath(this.context.extensionUri, 'views/pdf-viewer/vendor/web/viewer.html');
-        let html = (await vscode.workspace.fs.readFile(htmlPath)).toString();
-        return this.patchViewerHtml(webview, html);
     }
 
 }

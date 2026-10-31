@@ -63,6 +63,20 @@ describe('downloadInRanges', () => {
         assert.ok(requests.length < 8, `the other ranges stopped: ${requests.join(', ')}`);
     });
 
+    it('reports the bytes written after each range, and leaves an earlier file as it was when the download fails', async () => {
+        const file = path.join(folder, 'build.pdf');
+        const seen: number[] = [];
+        await downloadInRanges(url, file, body.byteLength, undefined, { chunk: 256, parallel: 2, onProgress: (received) => seen.push(received) });
+        assert.strictEqual(seen.length, 4);
+        assert.strictEqual(seen.at(-1), body.byteLength);
+        assert.ok(seen.every((received, i) => i === 0 || received > seen[i - 1]), seen.join(', '));
+        fs.writeFileSync(file, 'the earlier copy');
+        failures.set(0, 5);
+        await assert.rejects(downloadInRanges(url, file, body.byteLength, undefined, { chunk: 256, parallel: 2, attempts: 2 }));
+        assert.strictEqual(fs.readFileSync(file, 'utf8'), 'the earlier copy');
+        assert.deepStrictEqual(fs.readdirSync(folder), ['build.pdf']);
+    });
+
     it('stops when the caller aborts', async () => {
         const abort = new AbortController();
         const file = path.join(folder, 'build.pdf');

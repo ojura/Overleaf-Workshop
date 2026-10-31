@@ -50,11 +50,9 @@ for ext in "$HOME"/.antigravity-ide/extensions/iamhyc.overleaf-workshop-* \
         echo "kept the installed files in $backup"
     fi
     rsync -a --exclude '*.map' --exclude 'test/' "$build/out/" "$ext/out/"
-    # the PDF viewers that load in ranges (setting overleaf-workshop.pdfViewer.engine), and the
-    # pdf.js release they run on; of the legacy viewer, only its page script, which opens a
-    # build that the extension downloaded to a file
+    # the PDF viewers (setting overleaf-workshop.pdfViewer.engine) and the pdf.js release they run
+    # on; the released extension's own viewer files stay, for the backup above to work with
     mkdir -p "$ext/views/pdf-viewer"
-    cp views/pdf-viewer/index.js "$ext/views/pdf-viewer/index.js"
     rsync -a --delete views/pdf-viewer/dist/ "$ext/views/pdf-viewer/dist/"
     if [ -d views/pdf-viewer/vendor/pdfjs-5.1.91 ]; then
         mkdir -p "$ext/views/pdf-viewer/vendor"

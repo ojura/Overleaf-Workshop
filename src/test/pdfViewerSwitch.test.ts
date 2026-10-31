@@ -29,6 +29,7 @@ class Uri {
 const world = {
     settings: {} as Record<string, unknown>,
     updates: [] as unknown[][],
+    deleted: [] as string[],
     configListeners: [] as ((e: { affectsConfiguration(section: string): boolean }) => void)[],
 };
 const vscodeMock = withStubs({
@@ -57,6 +58,7 @@ const vscodeMock = withStubs({
         onDidChangeConfiguration: (listener: any) => { world.configListeners.push(listener); return { dispose() {} }; },
         fs: withStubs({
             stat: async () => ({ type: 1 }),
+            delete: async (uri: Uri, options: { recursive?: boolean }) => { world.deleted.push(`${uri.path}${options?.recursive ? ' (recursive)' : ''}`); },
             readFile: async (uri: Uri) => {
                 // the extension host's readFile gives a Buffer, which the provider turns into text
                 const page = /\/dist\/(\w+)\.html$/.exec(uri.path);
@@ -105,6 +107,7 @@ describe('the button that switches between the pdfjs and the overleaf viewer', (
         world.settings = { engine: 'pdfjs' };
         world.updates = [];
         world.configListeners = [];
+        world.deleted = [];
         provider = new PdfViewEditorProvider({ extensionUri: Uri.file('/ext'), globalStorageUri: Uri.file('/storage') });
         void provider.triggers;
     });
@@ -125,6 +128,20 @@ describe('the button that switches between the pdfjs and the overleaf viewer', (
         await settled();
         assert.strictEqual(viewerOf(editor.webviewPanel.webview.html), 'pdfjs');
         assert.strictEqual(editor.pages.length, 3);
+    });
+
+    it('deletes the builds that the PDF viewer of earlier versions downloaded', async () => {
+        await settled();
+        assert.deepStrictEqual(world.deleted, ['/storage/legacy-viewer-builds (recursive)']);
+    });
+
+    it('opens the pdfjs viewer for a setting saved by an earlier version, such as legacy', async () => {
+        world.settings = { engine: 'legacy' };
+        const doc = await provider.openCustomDocument(Uri.file('/home/u/paper.pdf'));
+        const editor = panel();
+        await provider.resolveCustomEditor(doc, editor.webviewPanel);
+        assert.strictEqual(doc.engine, 'pdfjs');
+        assert.strictEqual(viewerOf(editor.webviewPanel.webview.html), 'pdfjs');
     });
 
     it('takes only the two viewers that load in ranges', async () => {

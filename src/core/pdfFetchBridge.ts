@@ -1,5 +1,4 @@
 import { createHash } from 'crypto';
-import { once } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Agent, fetch } from 'undici';
@@ -182,11 +181,6 @@ export class PdfFetchBridge {
     }
 }
 
-/**
- * Save `url`, a build's output.pdf on the download domain, to `file`. The response goes to a
- * temporary file next to `file` as it arrives, which then takes `file`'s name, so a large PDF does
- * not have to fit in memory and a failed download leaves `file` as it was.
- */
 /** numbers the downloads of this process, so that two downloads of one file do not share a part file */
 let downloads = 0;
 
@@ -194,11 +188,12 @@ let downloads = 0;
  * Download `url`, a file of `size` bytes, to `file` in ranges, a few at a time, retrying each
  * range. One long response of a large build was cut off: the download domain ended the 885 MB
  * book's response after 81 s in the IDE (undici: "terminated", 2026-10-31), while Overleaf's
- * viewer and the viewers that load in ranges ask for ranges. Holds at most `parallel` ranges in
- * memory.
+ * viewer and the PDF viewers here ask for ranges. Holds at most `parallel` ranges in memory. The
+ * ranges go to a temporary file next to `file`, which then takes `file`'s name, so a failed
+ * download leaves `file` as it was. `onProgress` gets the bytes written so far after each range.
  */
 export async function downloadInRanges(url: string, file: string, size: number, signal?: AbortSignal,
-    { chunk = 8 * 1024 * 1024, parallel = 4, attempts = 3 } = {}) {
+    { chunk = 8 * 1024 * 1024, parallel = 4, attempts = 3, onProgress = undefined as ((received: number) => void) | undefined } = {}) {
     const tmp = `${file}.${process.pid}-${++downloads}.part`;
     // stops every range when one fails for good or the caller aborts
     const stop = new AbortController();
@@ -206,6 +201,7 @@ export async function downloadInRanges(url: string, file: string, size: number, 
     signal?.addEventListener('abort', onAbort);
     if (signal?.aborted) { stop.abort(); }
     const out = await fs.promises.open(tmp, 'w');
+    let received = 0;
     const fetchRange = async (start: number) => {
         const end = Math.min(start + chunk, size) - 1;
         for (let attempt = 1; ; attempt++) {
@@ -219,6 +215,8 @@ export async function downloadInRanges(url: string, file: string, size: number, 
                     throw new Error(`the download of ${path.basename(file)} failed: bytes ${start}-${end} came as ${body.byteLength} bytes`);
                 }
                 await out.write(body, 0, body.byteLength, start);
+                received += body.byteLength;
+                onProgress?.(received);
                 return;
             } catch (error) {
                 if (stop.signal.aborted || attempt >= attempts) { throw error; }
@@ -248,29 +246,5 @@ export async function downloadInRanges(url: string, file: string, size: number, 
         throw error;
     } finally {
         signal?.removeEventListener('abort', onAbort);
-    }
-}
-
-export async function downloadTo(url: string, file: string, signal?: AbortSignal, onProgress?: (received: number, total?: number) => void) {
-    const res = await fetch(url, { signal, dispatcher: PdfFetchBridge.dispatcher });
-    if (res.status !== 200 || !res.body) {
-        throw new Error(`the download of ${path.basename(file)} failed: ${res.status} ${res.statusText}`);
-    }
-    const total = Number(res.headers.get('content-length')) || undefined;
-    const tmp = `${file}.${process.pid}-${++downloads}.part`;
-    const out = fs.createWriteStream(tmp);
-    let received = 0;
-    try {
-        for await (const chunk of res.body) {
-            received += chunk.byteLength;
-            onProgress?.(received, total);
-            if (!out.write(chunk)) { await once(out, 'drain'); }
-        }
-        await new Promise<void>((resolve, reject) => out.end((error?: Error | null) => error ? reject(error) : resolve()));
-        await fs.promises.rename(tmp, file);
-    } catch (error) {
-        out.destroy();
-        await fs.promises.unlink(tmp).catch(() => {});
-        throw error;
     }
 }

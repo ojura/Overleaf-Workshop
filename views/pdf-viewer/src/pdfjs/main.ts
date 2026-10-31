@@ -444,7 +444,7 @@ async function start() {
     // pdf.js's pages have a transparent 9 px border. PDFJSWrapper's currentPosition measures from
     // the page's outer edge, and scrollPageIntoView places PDF points inside the border, so a
     // position would come back 9 px off after each new build. Overleaf's viewer draws pages without
-    // the border too (pdf.scss); this is pdf.js's own class for that, which the legacy viewer also uses.
+    // the border too (pdf.scss); this is pdf.js's own class for that.
     (a.pdfViewer.viewer as HTMLElement).classList.add('removePageBorders');
     const wrapper = () => wrapperOf(a);
     listenForDoubleClick(a.eventBus, (event, canvas, page) => wrapper().clickPosition(event, canvas, page));

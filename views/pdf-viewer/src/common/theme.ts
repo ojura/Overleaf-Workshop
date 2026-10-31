@@ -7,7 +7,7 @@ export interface Theme {
     bgColor: string;
 }
 
-/** the themes of the legacy viewer (views/pdf-viewer/index.js), when the setting has none */
+/** the themes when the setting overleaf-workshop.pdfViewer.themes has none */
 const DEFAULT_THEMES: Record<string, { fontColor: string, bgColor: string }> = {
     'default': { fontColor: 'black', bgColor: 'white' },
     'light': { fontColor: 'black', bgColor: '#F5F5DC' },
@@ -27,7 +27,7 @@ export function themesFrom(init: Pick<InitState, 'colorThemes'>): Theme[] {
 const isPlain = (theme: Theme) => /^(black|#000000)$/i.test(theme.fontColor) && /^(white|#ffffff)$/i.test(theme.bgColor);
 
 /**
- * Draw the pages in `theme`'s colors, as the legacy viewer does. The extension's patch to pdf.js
+ * Draw the pages in `theme`'s colors. The extension's patch to pdf.js
  * (vendor/pdfjs-5.1.91-dist.patch) reads globalThis.pdfjsViewerColorTheme whenever it draws a
  * page: black text and lines outside form XObjects take the theme's text color, and the page's
  * background the theme's background color. Images and colored content keep their colors, which
