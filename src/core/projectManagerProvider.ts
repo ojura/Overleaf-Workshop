@@ -269,7 +269,10 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
     }
 
     logoutServer(server: ServerItem) {
-        vscode.window.showWarningMessage(vscode.l10n.t('Logout server "{name}" ?', {name:server.name}), "Yes", "No")
+        const question = GlobalStateManager.getGitToken(this.context, server.name)
+            ? vscode.l10n.t('Logout server "{name}" ? This also removes the git token stored for this account.', {name:server.name})
+            : vscode.l10n.t('Logout server "{name}" ?', {name:server.name});
+        vscode.window.showWarningMessage(question, "Yes", "No")
         .then((answer) => {
             if (answer === "Yes") {
                 GlobalStateManager.logoutServer(this.context, server.api, server.name)
