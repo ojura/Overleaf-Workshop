@@ -10,6 +10,7 @@ import { addBridgeRemote, rangesCheck } from './overleaf';
 import { readReplica } from '../sandbox/sandbox';
 import { filesMatchVersion, findStartVersion, OverleafHistory, Pacer, updateForVersion } from './history';
 import { GitError, Repo } from './plumbing';
+import { connectReplica, CONNECT_REF } from './replicaConnect';
 
 const HELP = `Connect a local history with the history of Overleaf's git bridge, then fetch, merge and push.
 
@@ -19,6 +20,7 @@ usage:
   node out/gitbridge/cli.js merge   [--repo <dir>] [--remote <name>] [options]
   node out/gitbridge/cli.js pull [--repo <dir>] [--remote <name>]
   node out/gitbridge/cli.js push [--repo <dir>] [--remote <name>] [options]
+  node out/gitbridge/cli.js replica-connect --replica <folder> --history <repo> [--ref <branch>] [options]
 
 --repo <dir>     the local repository (default: the current folder)
 --remote <name>  its remote for the git bridge, e.g. https://git.overleaf.com/<project id>
@@ -84,12 +86,25 @@ push: fetch; merge when Overleaf changed; check; push as a fast-forward; when th
       non-zero status. --project <id> when the remote's address does not name the
       project; --server <name> (default www.overleaf.com).
 
---json prints rebase's, merge's and push's results as JSON.
+replica-connect: connects a development history with a local replica's own repository
+         (the replica folder's .git, which records Overleaf's states on
+         refs/remotes/overleaf/main). It fetches --ref (default master) of --history, which
+         it only reads, writes its commits again on top of the project's state where it
+         started (as rebase does, from the history of the replica's project), and merges
+         them with Overleaf's state as the replica recorded it (as merge does). The result
+         is in refs/gitbridge/connect, a commit on top of the replica's checked-out commit;
+         land it with node out/sandbox/cli.js replica-land --replica <folder>
+         refs/gitbridge/connect, which uploads the files the history adds to the project.
+         The replica must be in sync: its checked-out commit is Overleaf's state. Running
+         it again gives the same rewritten commits; once the replica's branch contains
+         them, it says so. --start-version, --not-own, --pace and --state-db as for rebase.
+
+--json prints rebase's, merge's, push's and replica-connect's results as JSON.
 
 Exit status: 0 done; 1 failed (the message says why); 2 wrong arguments.
 `;
 
-const VALUE_FLAGS = new Set(['repo', 'remote', 'local', 'start-version', 'project', 'replica', 'server', 'bridge', 'state-db', 'map', 'update', 'not-own', 'check', 'attempts', 'pace', 'start']);
+const VALUE_FLAGS = new Set(['repo', 'remote', 'local', 'start-version', 'project', 'replica', 'server', 'bridge', 'state-db', 'map', 'update', 'not-own', 'check', 'attempts', 'pace', 'start', 'history', 'ref']);
 const BOOLEAN_FLAGS = new Set(['take-bridge', 'no-ranges-check', 'accept-warnings', 'json', 'help']);
 
 class UsageError extends Error {}
@@ -192,6 +207,40 @@ async function main(argv: string[]): Promise<number> {
         const report = await pushToBridge(repo, remote, { check, attempts, log });
         process.stdout.write(flags.has('json') ? JSON.stringify(report, null, 1) + '\n'
             : `${report.pushed ? `pushed ${short(report.head)}` : `nothing to push; the bridge holds ${short(report.head)}`} after ${report.attempts.length} attempt${report.attempts.length > 1 ? 's' : ''}\n`);
+        return 0;
+    }
+    if (command === 'replica-connect') {
+        if (!values.replica || !values.history) { throw new UsageError('replica-connect needs --replica and --history'); }
+        const folder = path.resolve(values.replica);
+        const replica = readReplica(folder);
+        const login = readStoredLogin(replica.serverName, values['state-db']);
+        const pace = values.pace ? Number(values.pace) : 3000;
+        if (!Number.isFinite(pace) || pace < 0) { throw new UsageError('--pace needs milliseconds'); }
+        let startVersion: number | undefined;
+        if (values['start-version'] !== undefined) {
+            startVersion = Number(values['start-version']);
+            if (!Number.isInteger(startVersion) || startVersion < 0) { throw new UsageError('--start-version needs a version number'); }
+        }
+        const result = await connectReplica(new Repo(folder), {
+            historyRepo: path.resolve(values.history), ref: values.ref ?? 'master', startVersion, log,
+            history: new OverleafHistory(login.url, login.identity, replica.projectId, new Pacer(pace, undefined, log)),
+            notOwn: notOwn.length ? (p: string) => notOwn.some(g => minimatch(p, g, { dot: true })) : undefined,
+        });
+        if (flags.has('json')) {
+            process.stdout.write(JSON.stringify(result, null, 1) + '\n');
+        } else if (result.already) {
+            process.stdout.write(`the replica's branch already contains ${short(result.local)} (as ${short(result.already)}); nothing to connect\n`);
+        } else {
+            const m = result.merge!;
+            process.stdout.write([
+                `rebase: ${result.rebase!.map.length} commits written again on ${short(result.rebase!.start)}${result.rebase!.startMade ? ' (made from the project\'s history)' : ''}; old and new ids in ${result.mapFile}`,
+                `merge: ${short(m.commit)} in ${CONNECT_REF}, on top of Overleaf's state; ${m.how === 'held' ? `the rewritten ${short(m.heldAt!)} holds Overleaf's state` : m.how === 'three-way' ? `a three-way merge from ${short(m.base!)}` : `the bridge's version taken for ${m.tookBridge.join(', ')}`}`,
+                `files the history adds to the project: ${m.own.length ? m.own.join(', ') : 'none'}`,
+                `project files whose content it changes: ${m.carries.length ? m.carries.join(', ') : 'none'}`,
+                ...(m.deletedOnOverleaf.length ? [`deleted on Overleaf, left out: ${m.deletedOnOverleaf.join(', ')}`] : []),
+                `next: node out/sandbox/cli.js replica-land --replica "${folder}" ${CONNECT_REF}`,
+            ].join('\n') + '\n');
+        }
         return 0;
     }
     if (command !== 'rebase' && command !== 'merge') { throw new UsageError(`unknown command ${positional.join(' ')}`); }

@@ -9,6 +9,7 @@ import { pullFromBridge, pushToBridge } from '../gitbridge/flow';
 import { findStartVersion, HistorySource, HistoryUpdate, readZip, treeAtVersion, TreeChange, VersionEntry } from '../gitbridge/history';
 import { answerFromFindings } from '../gitbridge/overleaf';
 import { gitDate, Repo } from '../gitbridge/plumbing';
+import { connectReplica, CONNECT_REF } from '../gitbridge/replicaConnect';
 
 /** a time in seconds that git reads as one: git takes small numbers for something else */
 const T = 1_700_000_000;
@@ -433,5 +434,47 @@ describe('git bridge: the check of comments and tracked changes', () => {
         const answer = answerFromFindings([f('info')], 'summary', false);
         assert.strictEqual(answer.ok, true);
         assert.match(answer.message!, /a info finding/);
+    });
+});
+
+describe('git bridge: connecting a development history with a local replica\'s repository', () => {
+    /** The replica's repository: Overleaf's newest state of the scenario, as the replica recorded it, checked out. */
+    function replicaOf(s: ReturnType<typeof scenario>) {
+        const replica = newRepo(path.join(s.dir, 'replica'));
+        const files = Object.fromEntries([...s.history.states[s.history.states.length - 1].files].map(([p, f]) => [p, f.content]));
+        const recorded = commit(replica, files, `Overleaf version ${s.lastV}`, s.t0 + 650, 'Collaborator <c@example.com>');
+        replica.run(['update-ref', 'refs/remotes/overleaf/main', recorded]);
+        return { replica, recorded };
+    }
+
+    it('writes the history again from the version it started at and merges it with Overleaf\'s recorded state, without changing the development repository', async () => {
+        const s = scenario();
+        const { replica, recorded } = replicaOf(s);
+        const devRefs = s.local.text(['for-each-ref', '--format=%(refname) %(objectname)']);
+        const result = await connectReplica(replica, { historyRepo: s.local.dir, ref: 'master', history: s.history });
+        assert.strictEqual(result.local, s.l2);
+        assert.strictEqual(result.rebase!.map.length, 3);
+        assert.ok(result.rebase!.startMade);
+        const m = result.merge!;
+        assert.strictEqual(m.how, 'three-way');
+        assert.deepStrictEqual(m.own, ['tests/a.t']);
+        assert.strictEqual(replica.mustCommit(CONNECT_REF), m.commit);
+        assert.deepStrictEqual(replica.commitInfo(m.commit).parents, [recorded, result.rebase!.commit]);
+        assert.deepStrictEqual([...replica.flatTree(m.commit).keys()].sort(), [...replica.flatTree(recorded).keys(), 'tests/a.t'].sort());
+        assert.ok(replica.isAncestor('HEAD', m.commit), 'the connection lands as a fast-forward of the replica\'s branch');
+        assert.strictEqual(s.local.text(['for-each-ref', '--format=%(refname) %(objectname)']), devRefs);
+
+        // after the landing, a second run finds the connection in the branch
+        replica.run(['merge', '--ff-only', '--quiet', m.commit]);
+        replica.run(['update-ref', 'refs/remotes/overleaf/main', m.commit]);
+        const again = await connectReplica(replica, { historyRepo: s.local.dir, ref: 'master', history: s.history });
+        assert.strictEqual(again.already, result.rebase!.commit);
+    });
+
+    it('refuses a replica whose checked-out commit is not Overleaf\'s state', async () => {
+        const s = scenario();
+        const { replica } = replicaOf(s);
+        commit(replica, { 'main.tex': 'a local change\n' }, 'Local', s.t0 + 700);
+        await assert.rejects(connectReplica(replica, { historyRepo: s.local.dir, ref: 'master', history: s.history }), /is not the replica's checked-out commit/);
     });
 });
