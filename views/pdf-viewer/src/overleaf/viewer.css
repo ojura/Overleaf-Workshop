@@ -143,6 +143,9 @@ html, body {
 @media (max-width: 360px) {
     #toolbar .numPages { display: none; }
 }
+@media (max-width: 330px) {
+    #previousPage, #nextPage, #toolbar .separator { display: none; }
+}
 
 #outline {
     position: absolute;

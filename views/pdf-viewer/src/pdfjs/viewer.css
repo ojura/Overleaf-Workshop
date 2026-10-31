@@ -1,5 +1,14 @@
 /* The pdfjs viewer's changes to pdf.js's viewer app (vendor/pdfjs-5.1.91/web/viewer.css). */
 
+/* VS Code's default styles for webviews give the body 20 px of padding on each side (in the CSS
+   layer vscode-default), which pdf.js's viewer does not expect: its toolbar fills the page and
+   ended 20 px past the pane's right edge. These rules are outside any layer, so they win. */
+html,
+body {
+    margin: 0;
+    padding: 0;
+}
+
 /* A webview cannot print, open a file chooser for this viewer, or link to a view of the
    document; annotation editing is off (main.ts). Download stays: the extension host saves
    the PDF (src/core/pdfViewEditorProvider.ts). */
