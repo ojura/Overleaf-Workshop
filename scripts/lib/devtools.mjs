@@ -3,8 +3,8 @@
 // the port that the browser picks itself. Started with --remote-debugging-port=0, the browser
 // listens on a free port of 127.0.0.1 and writes the port and the path of its browser target into
 // the file DevToolsActivePort in its profile folder. The path holds an id that only that browser
-// accepts, so a connection to it reaches the browser of that profile and no other process that
-// listens on the machine. Pages and frames are reached through that connection
+// accepts, so a connection to it reaches the browser of that profile, and fails at any other
+// process that listens on that port. Pages and frames are reached through that connection
 // (Target.attachToTarget), not through ports of their own.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -84,7 +84,7 @@ export function waitForActivePort(profile, { ended, limitMs }) {
  * - close(reason) closes the connection: the commands that wait for answers fail with `reason`,
  *   or with the connection's close when none is given; `closed` resolves with the reason when the
  *   connection has closed.
- * A Node inspector's endpoint has no targets: use send and on alone there.
+ * A Node inspector's endpoint does not have targets: use send and on alone there.
  * A command that waits for its answer fails when the connection closes, and a session's command
  * also when its target detaches or crashes; the error names the command and the reason.
  */
@@ -299,7 +299,7 @@ export function waitFor(target, expression, { what = expression, limitMs, stepMs
     return waitUntil(() => evaluate(target, expression, contextId), { what, limitMs, stepMs });
 }
 
-/** For a .catch() of a wait whose limit is a check's negative answer: undefined for a WaitLimitError, and any other error thrown again. */
+/** For the .catch() of a wait when reaching its limit is a check's negative answer: undefined for a WaitLimitError, and any other error thrown again. */
 export function notWithinLimit(error) {
     if (error instanceof WaitLimitError) { return undefined; }
     throw error;

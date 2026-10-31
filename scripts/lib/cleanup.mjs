@@ -7,9 +7,9 @@
 // DevTools connection of the script (scripts/lib/devtools.mjs) and end every pause of sleep(). The
 // command or pause that the script awaits then fails, naming the signal, and the script's catch
 // and finally blocks run as on any failure; when it has ended, it exits with 128 + the signal's
-// number. A process with neither an open connection nor a pause, such as the harness's server or
-// a script while its browser starts, has nothing that the signal could end; it exits at once
-// through process.exit and the clean-ups, and so does every process on a second signal.
+// number. A process that holds an open connection or a pause ends that way; any other process, such
+// as the harness's server or a script while its browser starts, exits at once through process.exit
+// and the clean-ups, and so does every process on a second signal.
 import { closeAllConnections, openConnectionCount } from './devtools.mjs';
 
 /** the exit status of a script that a signal ended: 128 + the signal's number */

@@ -98,11 +98,11 @@ for ext in "$HOME"/.antigravity-ide/extensions/iamhyc.overleaf-workshop-* \
     installed=$((installed + 1))
 done
 if [ "$found" = 0 ]; then
-    echo "no Overleaf Workshop extension found" >&2
+    echo "did not find an installed Overleaf Workshop extension" >&2
     exit 1
 fi
 if [ "$installed" = 0 ]; then
-    if [ "$check" = yes ]; then echo "would install nothing: no installed Overleaf Workshop has version $built_version" >&2
-    else echo "installed nothing: no installed Overleaf Workshop has version $built_version" >&2; fi
+    if [ "$check" = yes ]; then echo "would not install: the installed Overleaf Workshop extensions have versions other than $built_version" >&2
+    else echo "did not install: the installed Overleaf Workshop extensions have versions other than $built_version" >&2; fi
     exit 1
 fi

@@ -1,6 +1,6 @@
 // What the IDE scripts share. They drive only the window of an Antigravity instance that
 // scripts/hidden-ide.sh started on a virtual display: the instance that instance.json describes in
-// the folder that --instance names, or else in $HIDDEN_IDE_HOME (there is no default). They
+// the folder that --instance names, or else in $HIDDEN_IDE_HOME (they require one of the two). They
 // connect to the DevTools endpoint that start recorded, and only after the instance's IDE has
 // answered there as itself (scripts/lib/test-instance.mjs); the workbench page and the viewers'
 // frames are sessions of that one connection.
@@ -201,7 +201,7 @@ export async function viewerPage(wb, frameTarget, { beforeLoad } = {}) {
     const engine = () => E(`window.overleafViewer ? 'overleaf' : window.PDFViewerApplication ? 'pdfjs' : undefined`)
         .catch((error) => { if (error instanceof NoPageError) { return undefined; } throw error; });
     /**
-     * Wait until the webview shows a viewer whose page in view is drawn (`want`: that viewer only),
+     * Wait until the webview shows a viewer that has drawn the page in view (`want`: that viewer only),
      * and return { engine, ms }, or undefined when that has not happened within `limitMs`. An error
      * in the page ends the wait with that error.
      */
@@ -219,7 +219,7 @@ export async function viewerPage(wb, frameTarget, { beforeLoad } = {}) {
     return { session, problems, context, E, engine, drawn, close: () => session.detach() };
 }
 
-/** Close the editor tab whose label starts with `label`; returns whether such a tab was open. */
+/** Close the editor tab with a label that starts with `label`; returns whether such a tab was open. */
 export async function closeTab(wb, label) {
     const closed = await wb.E(`(() => { const tab = [...document.querySelectorAll('.tabs-container .tab')].find(t => (t.getAttribute('aria-label') || '').startsWith(${JSON.stringify(label)})); if (!tab) { return false; } tab.querySelector('.tab-actions .action-label, .codicon-close').click(); return true; })()`);
     if (closed) { await sleep(800); }
@@ -227,7 +227,7 @@ export async function closeTab(wb, label) {
 }
 
 /**
- * Close the editor tab whose label starts with `label`, reopen it with View: Reopen Closed
+ * Close the editor tab with a label that starts with `label`, reopen it with View: Reopen Closed
  * Editor, and return the new viewer webview's target; undefined when the tab was not open, or
  * when it did not open again within `timeoutMs`.
  */
