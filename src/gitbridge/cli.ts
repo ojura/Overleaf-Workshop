@@ -245,13 +245,17 @@ async function main(argv: string[]): Promise<number> {
     const check = checkResult(repo, side, result.commit);
     const ref = moveOrRecord(repo, result.commit, 'refs/connect/rewrite', local, values.update);
     const lines = [
-        `rewrite: start ${short(result.start)}${result.startMade ? ' (made from the history)' : ' (a bridge commit)'}, ${result.map.length} commits rewritten, the last ${short(result.last)}; merge ${short(result.commit)} with the bridge's ${short(bridge.head)}, now in ${ref}`,
+        `rewrite: start ${short(result.start)}${result.startMade ? ' (made from the history)' : ' (a bridge commit)'}, ${result.map.length} commits rewritten; ${result.joinedAt
+            ? `joined with the bridge's ${short(bridge.head)} by the merge ${short(result.merge)} at the commit rewritten from ${short(result.joinedAt)}, which holds the bridge commit's state${result.after.length ? `; the ${result.after.length} local commit${result.after.length > 1 ? 's' : ''} after it on top, the last ${short(result.commit)}` : ''}`
+            : `no rewritten commit holds the bridge commit's state, so the merge ${short(result.merge)} joins them with the start as the base`}; now in ${ref}`,
         `old and new ids: ${mapFile}`,
         `the repository's own files, which travel into the project: ${result.own.length ? result.own.join(', ') : 'none'}`,
-        check.equal ? 'check: the tree is the bridge\'s tree plus the repository\'s own files' : `check: the tree differs from the bridge's plus the own files in ${check.differing.join(', ')}`,
+        check.equal ? 'check: the tree is the bridge\'s tree plus the repository\'s own files'
+            : result.after.length ? `check: the tree differs from the bridge's plus the own files in ${check.differing.join(', ')}: the changes of the local commits after the join, which the bridge's commit lacks; push them with the routine flow`
+            : `check: the tree differs from the bridge's plus the own files in ${check.differing.join(', ')}: local changes that Overleaf lacks, or a bridge commit older than the project's state (fetch first)`,
     ];
     process.stdout.write(flags.has('json') ? JSON.stringify({ ...result, mapFile, ref, check }, null, 1) + '\n' : lines.join('\n') + '\n');
-    return check.equal ? 0 : 1;
+    return check.equal || result.after.length > 0 ? 0 : 1;
 }
 
 if (require.main === module) {

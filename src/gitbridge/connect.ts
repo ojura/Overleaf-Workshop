@@ -70,7 +70,7 @@ export function attach(repo: Repo, side: Side, options: { takeBridge?: boolean, 
     const { own, deletedOnOverleaf, bridgeTree, localTree } = ownFiles(repo, side, options.notOwn);
     const differing = [...localTree.keys()].filter(p => bridgeTree.has(p) && bridgeTree.get(p)!.oid !== localTree.get(p)!.oid).sort();
     if (differing.length && !options.takeBridge) {
-        throw new ConnectError(`${differing.length} files differ between the local history and Overleaf. attach takes Overleaf's version for each of them; land the local changes first, or pass --take-bridge`, differing);
+        throw new ConnectError(`${differing.length} files differ between the local history and the bridge's commit: a local change that Overleaf lacks, an edit on Overleaf that the local history lacks, or a bridge commit older than the project's state. Fetch first; land the local changes; or pass --take-bridge, which takes the bridge's version of each`, differing);
     }
     const tree = repo.writeTree(bridgePlusOwn(bridgeTree, localTree, own));
     const user = repo.user();
@@ -128,7 +128,16 @@ export interface RewriteResult {
     startMade: boolean;
     /** old id to new id, in the order the commits were written */
     map: Array<[string, string]>;
-    last: string;
+    /**
+     * The local commit (its old id) that holds the state of the bridge's commit, where the
+     * merge joins the two histories; undefined when no local commit holds it.
+     */
+    joinedAt?: string;
+    /** the merge that joins the histories */
+    merge: string;
+    /** the local commits (old ids) written on top of the merge: they came after joinedAt */
+    after: string[];
+    /** the newest commit of the result: the merge, or the last commit on top of it */
     commit: string;
     tree: string;
     own: string[];
@@ -146,10 +155,14 @@ function rewrittenTree(repo: Repo, info: CommitInfo, base: FlatTree): FlatTree {
 }
 
 /**
- * rewrite, from `start`. The merge that ends it is a three-way merge of the bridge's newest
- * commit and the last rewritten one, with the start as the base: edits made on Overleaf
- * after the start come from the bridge's side, local changes that Overleaf lacks from the
- * other side, and the landed ones are on both sides alike.
+ * rewrite, from `start`. The rewritten history joins the bridge's at the newest rewritten
+ * commit that holds the bridge commit's state, apart from the repository's own files: the
+ * merge there changes no project file, and the local commits made after that one are
+ * written on top of the merge, as the commits the bridge lacks. When no rewritten commit
+ * holds that state, because Overleaf has edits the local history lacks, the merge is a
+ * three-way merge of the bridge's commit and the last rewritten one, with the start as the
+ * base: the edits made on Overleaf come from the bridge's side, the local changes from the
+ * other, and the landed ones are on both sides alike.
  */
 export function rewrite(repo: Repo, side: Side, start: Start, options: { message?: string } = {}): RewriteResult {
     const user = repo.user();
@@ -170,37 +183,61 @@ export function rewrite(repo: Repo, side: Side, start: Start, options: { message
         ].join('\n');
         s = repo.commitTree(repo.writeTree(start.tree), start.parent ? [start.parent] : [], message, { person, date: when }, { person, date: when });
     }
-    const map = new Map<string, string>();
-    const trees = new Map<string, FlatTree>();
-    trees.set(s, repo.flatTree(s));
-    const rootTree = trees.get(s)!;
-    for (const c of repo.commitsUpTo(side.local)) {
-        const info = repo.commitInfo(c);
-        const parents = info.parents.length ? info.parents.map(p => map.get(p)!) : [s];
-        const base = info.parents.length ? trees.get(parents[0])! : rootTree;
-        const tree = rewrittenTree(repo, info, base);
-        const message = repo.addTrailer(info.message, `Rewritten-from: ${c}`);
-        const oid = repo.commitTree(repo.writeTree(tree), parents, message,
-                                    { person: info.author, date: info.authorDate }, { person: info.committer, date: info.committerDate });
-        map.set(c, oid);
-        trees.set(oid, tree);
-    }
-    const last = map.get(side.local)!;
-    const merged = repo.mergeTrees(s, side.bridge, last);
-    if (merged.conflicts.length) {
-        throw new ConnectError(`the rewritten history and Overleaf's changes since the start conflict in ${merged.conflicts.length} files`, merged.conflicts);
-    }
-    const message = options.message ?? [
-        'Connect the local history with the git bridge\'s history',
-        '',
-        `The local history, rewritten to branch from ${s.slice(0, 7)}${start.kind === 'version' ? ` (Overleaf's state at history version ${start.update.toV})` : ''},`,
-        `ends in ${last.slice(0, 7)}; this merge joins it to the bridge's commit ${side.bridge.slice(0, 7)}.`,
-        '',
-    ].join('\n');
+    const trees = new Map<string, FlatTree>([[s, repo.flatTree(s)]]);
+    /** write the local commits `commits` again, with `parentOf` for the new id of each old parent */
+    const write = (commits: string[], parentOf: (old: string) => string, map: Map<string, string>) => {
+        for (const c of commits) {
+            const info = repo.commitInfo(c);
+            const parents = info.parents.length ? info.parents.map(parentOf) : [s];
+            const tree = rewrittenTree(repo, info, trees.get(parents[0])!);
+            const oid = repo.commitTree(repo.writeTree(tree), parents, repo.addTrailer(info.message, `Rewritten-from: ${c}`),
+                                        { person: info.author, date: info.authorDate }, { person: info.committer, date: info.committerDate });
+            map.set(c, oid);
+            trees.set(oid, tree);
+        }
+    };
+    const order = repo.commitsUpTo(side.local);
+    const first = new Map<string, string>();
+    write(order, p => first.get(p)!, first);
+
+    const { own, bridgeTree } = ownFiles(repo, side);
+    const roots = new Set(repo.text(['rev-list', '--max-parents=0', side.local]).split('\n').filter(Boolean).flatMap(r => [...repo.flatTree(r).keys()]));
+    /** whether a tree holds the bridge commit's state: the same project files, plus any files of the repository's own */
+    const holdsBridgeState = (tree: FlatTree) => {
+        for (const [p, e] of tree) { if (bridgeTree.get(p)?.oid !== e.oid && (bridgeTree.has(p) || roots.has(p))) { return false; } }
+        for (const p of bridgeTree.keys()) { if (!tree.has(p)) { return false; } }
+        return true;
+    };
+    const joinedAt = [...order].reverse().find(c => holdsBridgeState(trees.get(first.get(c)!)!));
     const now = gitNow();
-    const commit = repo.commitTree(merged.tree, [side.bridge, last], message, { person, date: now }, { person, date: now });
-    const { own } = ownFiles(repo, side);
-    return { start: s, startMade: start.kind === 'version', map: [...map], last, commit, tree: merged.tree, own };
+    const intro = `The local history, rewritten to branch from ${s.slice(0, 7)}${start.kind === 'version' ? ` (Overleaf's state at history version ${start.update.toV})` : ''},`;
+    if (joinedAt === undefined) {
+        const last = first.get(side.local)!;
+        const merged = repo.mergeTrees(s, side.bridge, last);
+        if (merged.conflicts.length) {
+            throw new ConnectError(`no rewritten commit holds the state of the bridge's commit, and the three-way merge from the start conflicts in ${merged.conflicts.length} files`, merged.conflicts);
+        }
+        const message = options.message ?? ['Connect the local history with the git bridge\'s history', '', intro,
+            `ends in ${last.slice(0, 7)}. No rewritten commit holds the state of the bridge's commit ${side.bridge.slice(0, 7)},`,
+            'so this merge joins the two with the start as the merge base.', ''].join('\n');
+        const merge = repo.commitTree(merged.tree, [side.bridge, last], message, { person, date: now }, { person, date: now });
+        return { start: s, startMade: start.kind === 'version', map: [...first], merge, after: [], commit: merge, tree: merged.tree, own };
+    }
+    const joined = first.get(joinedAt)!;
+    const after = order.filter(c => c !== joinedAt && !repo.isAncestor(c, joinedAt));
+    const mergeTree = new Map(bridgeTree);
+    for (const [p, e] of trees.get(joined)!) { if (!bridgeTree.has(p) && !roots.has(p)) { mergeTree.set(p, e); } }
+    const message = options.message ?? ['Connect the local history with the git bridge\'s history', '', intro,
+        `holds the state of the bridge's commit ${side.bridge.slice(0, 7)} at ${joined.slice(0, 7)} (rewritten from ${joinedAt.slice(0, 7)}).`,
+        `This merge joins the two there and changes no project file.${after.length ? ` The ${after.length} local commit${after.length > 1 ? 's' : ''} after it follow${after.length > 1 ? '' : 's'}, on top of this merge.` : ''}`, ''].join('\n');
+    const mergeTreeId = repo.writeTree(mergeTree);
+    const merge = repo.commitTree(mergeTreeId, [side.bridge, joined], message, { person, date: now }, { person, date: now });
+    trees.set(merge, mergeTree);
+    const second = new Map<string, string>();
+    write(after, p => p === joinedAt ? merge : (second.get(p) ?? first.get(p)!), second);
+    const map = order.map(c => [c, second.get(c) ?? first.get(c)!] as [string, string]);
+    const commit = after.length ? second.get(side.local)! : merge;
+    return { start: s, startMade: start.kind === 'version', map, joinedAt, merge, after, commit, tree: repo.text(['rev-parse', `${commit}^{tree}`]), own };
 }
 
 /**

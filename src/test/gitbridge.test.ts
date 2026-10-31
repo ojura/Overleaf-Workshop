@@ -229,8 +229,10 @@ describe('git bridge: connect', () => {
         assert.strictEqual(new1.message, `Change main\n\nCo-Authored-By: Someone <s@example.com>\nRewritten-from: ${s.l1}\n`);
         assert.strictEqual(s.local.text(['show', `${newL1}:fig.png`]).length, 3, 'whole trees: the image is there');
         // the merge: Overleaf's edits from the bridge, the own files from the local side
-        const mInfo = s.local.commitInfo(result.commit);
-        assert.deepStrictEqual(mInfo.parents, [s.b2, result.last]);
+        assert.strictEqual(result.joinedAt, undefined, 'Overleaf has edits the local history lacks, so no rewritten commit holds the bridge\'s state');
+        assert.strictEqual(result.commit, result.merge);
+        const mInfo = s.local.commitInfo(result.merge);
+        assert.deepStrictEqual(mInfo.parents, [s.b2, result.map[result.map.length - 1][1]]);
         assert.deepStrictEqual([...s.local.flatTree(result.commit).keys()].sort(), ['chapter.tex', 'fig.png', 'logo.png', 'main.tex', 'new.png', 'notes.tex', 'tests/a.t']);
         assert.ok(checkResult(s.local, side, result.commit).equal);
         assert.strictEqual(s.history.zips, 1);
@@ -258,6 +260,37 @@ describe('git bridge: connect', () => {
         assert.strictEqual(result.start, b1);
         assert.strictEqual(result.map.length, 3);
         assert.ok(checkResult(s.local, side, result.commit).equal);
+    });
+    it('rewrite joins where a rewritten commit holds the bridge\'s state, and writes the later local commits on top', async () => {
+        const s = scenario();
+        // a bridge that holds the state after l1 landed, and nothing else: Overleaf has no edits of its own
+        const bridge = newRepo(path.join(s.dir, 'bridge3'));
+        commit(bridge, { 'main.tex': 'main v1\n', 'fig.png': Buffer.from([1, 2, 3]), 'logo.png': Buffer.from([5, 5]) }, 'Update on Overleaf.', s.t0, 'Collaborator <c@example.com>');
+        const b3 = commit(bridge, { 'main.tex': 'main v3\n', 'notes.tex': 'notes v1\n', 'old.tex': 'old\n', 'chapter.tex': 'chapter\n' }, 'Update on Overleaf.', s.t0 + 450);
+        s.local.run(['remote', 'add', 'b3', bridge.dir]);
+        s.local.run(['fetch', '--quiet', 'b3']);
+        // after l1: a commit that changes only a test, so it too holds the bridge's state; then
+        // the notes, and a commit that changes the line l1 changed (from the start, both sides changed it)
+        s.local.run(['checkout', '--quiet', s.l1]);
+        const l1b = commit(s.local, { 'tests/a.t': 'test a, changed\n' }, 'Change only a test', s.t0 + 460);
+        const l2b = commit(s.local, { 'notes.tex': 'notes v2\n' }, 'Change notes', s.t0 + 600);
+        const l3 = commit(s.local, { 'main.tex': 'main v4\n' }, 'Change main again', s.t0 + 700);
+        const history = new FakeHistory();
+        history.states = s.history.states.slice(0, 4);  // up to l1's landing, which b3 holds
+        const side = { bridge: b3, local: l3 };
+        const result = rewrite(s.local, side, await startFromVersion(s.local, side, history, history.states[2].update));
+        assert.strictEqual(result.joinedAt, l1b, 'the newest commit that holds the bridge\'s state');
+        assert.deepStrictEqual(result.after, [l2b, l3]);
+        const merge = s.local.commitInfo(result.merge);
+        assert.deepStrictEqual(merge.parents, [b3, result.map[2][1]]);
+        assert.deepStrictEqual([...s.local.flatTree(result.merge)].filter(([p]) => p !== 'tests/a.t'), [...s.local.flatTree(b3)], 'the merge changes no project file');
+        assert.strictEqual(s.local.text(['show', `${result.merge}:tests/a.t`]), 'test a, changed');
+        const head = s.local.commitInfo(result.commit);
+        assert.strictEqual(s.local.commitInfo(head.parents[0]).message.startsWith('Change notes'), true);
+        assert.match(head.message, new RegExp(`Rewritten-from: ${l3}`));
+        assert.strictEqual(s.local.text(['show', `${result.commit}:main.tex`]), 'main v4');
+        assert.strictEqual(s.local.text(['show', `${result.commit}:notes.tex`]), 'notes v2');
+        assert.ok(s.local.isAncestor(b3, result.commit), 'pushing the result is a fast-forward of the bridge');
     });
     it('rewrite stops on a conflict between a local change and an edit on Overleaf', async () => {
         const s = scenario();
