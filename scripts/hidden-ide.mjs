@@ -172,20 +172,48 @@ function privateFolder(dir) {
     }
 }
 
-/** Fail unless `project` is listed in the user's test projects, a file that belongs to the user and that only the user can write. */
-function checkTestProject(project) {
+/**
+ * The project ids of the user's test projects. The list must be a regular file of the user's that
+ * only the user can write, with Unix line ends, and each line that is not blank and not a comment
+ * ("#" to the line's end) must be exactly one project id (24 hexadecimal digits). Any other list is
+ * refused as a whole, with the reason, so that a line that names a project in another way cannot
+ * count as a listed project.
+ */
+function listedTestProjects() {
+    const refuse = (reason) => { throw new Error(`refusing to use ${testProjects}: ${reason}`); };
     let stat;
     try {
-        stat = fs.statSync(testProjects);
+        stat = fs.lstatSync(testProjects);
     } catch (error) {
         if (error.code !== 'ENOENT') { throw error; }
-        throw new Error(`refusing project ${project}: ${testProjects} does not exist; the user lists there, once, the Overleaf projects made for tests, one project id per line ("#" starts a comment)`);
+        refuse('it does not exist; the user lists there, once, the Overleaf projects made for tests, one project id per line ("#" starts a comment)');
     }
-    if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o022) !== 0) {
-        throw new Error(`refusing project ${project}: ${testProjects} must belong to this user, and only the user may write it`);
+    if (stat.isSymbolicLink()) { refuse('it is a symbolic link; the list must be the file itself'); }
+    if (stat.isDirectory()) { refuse('it is a folder; the list is a file'); }
+    if (!stat.isFile()) { refuse('it is not a regular file'); }
+    if (stat.uid !== process.getuid() || (stat.mode & 0o022) !== 0) { refuse('it must belong to this user, and only the user may write it'); }
+    let text;
+    try {
+        text = fs.readFileSync(testProjects, 'utf8');
+    } catch (error) {
+        refuse(`it cannot be read (${error.code})`);
     }
-    const listed = fs.readFileSync(testProjects, 'utf8').split('\n').flatMap(line => line.replace(/#.*/, '').trim().split(/\s+/));
-    if (!listed.includes(project)) {
+    if (text.includes('\r')) { refuse('it has CRLF line ends; write it with Unix line ends'); }
+    const ids = [];
+    text.split('\n').forEach((line, i) => {
+        const content = line.replace(/#.*/, '').trim();
+        if (content === '') { return; }
+        if (!/^[0-9a-f]{24}$/.test(content)) {
+            refuse(`line ${i + 1} is not one project id (24 hexadecimal digits): ${JSON.stringify(line)}`);
+        }
+        ids.push(content);
+    });
+    return ids;
+}
+
+/** Fail unless `project` is one of the user's test projects (listedTestProjects), compared as strings. */
+function checkTestProject(project) {
+    if (!listedTestProjects().includes(project)) {
         throw new Error(`refusing project ${project}: it is not listed in ${testProjects}, the user's list of Overleaf projects made for tests`);
     }
 }
