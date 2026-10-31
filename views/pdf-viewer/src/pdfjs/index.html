@@ -284,6 +284,21 @@ extension's page script from views/pdf-viewer/dist/. The body is unchanged.
 
                 <div id="editorModeSeparator" class="verticalToolbarSeparator"></div>
 
+                <!-- the extension's buttons (main.ts); in narrow panes their copies in the tools menu -->
+                <div id="extensionButtons" class="toolbarHorizontalGroup hiddenMediumView">
+                  <button id="goToCodeButton" class="toolbarButton" type="button" tabindex="0" title="Go to the source of the top of the view (SyncTeX)">
+                    <span>Go to code</span>
+                  </button>
+                  <button id="themeButton" class="toolbarButton" type="button" tabindex="0" title="Color theme">
+                    <span>Color theme</span>
+                  </button>
+                  <button id="switchViewerButton" class="toolbarButton" type="button" tabindex="0" title="Show the PDF in the Overleaf viewer (sets overleaf-workshop.pdfViewer.engine)">
+                    <span>Overleaf viewer</span>
+                  </button>
+                </div>
+
+                <div class="verticalToolbarSeparator hiddenMediumView"></div>
+
                 <div class="toolbarHorizontalGroup hiddenMediumView">
                   <button id="printButton" class="toolbarButton" type="button" tabindex="0" data-l10n-id="pdfjs-print-button">
                     <span data-l10n-id="pdfjs-print-button-label"></span>
@@ -315,6 +330,18 @@ extension's page script from views/pdf-viewer/dist/. The body is unchanged.
                           <span data-l10n-id="pdfjs-save-button-label"></span>
                         </button>
 
+                      </div>
+
+                      <div class="visibleMediumView">
+                        <button id="secondaryGoToCode" class="toolbarButton labeled" type="button" tabindex="0" title="Go to the source of the top of the view (SyncTeX)">
+                          <span>Go to code</span>
+                        </button>
+                        <button id="secondaryTheme" class="toolbarButton labeled" type="button" tabindex="0" title="Color theme">
+                          <span>Color theme</span>
+                        </button>
+                        <button id="secondarySwitchViewer" class="toolbarButton labeled" type="button" tabindex="0" title="Show the PDF in the Overleaf viewer (sets overleaf-workshop.pdfViewer.engine)">
+                          <span>Overleaf viewer</span>
+                        </button>
                       </div>
 
                       <div class="horizontalToolbarSeparator"></div>

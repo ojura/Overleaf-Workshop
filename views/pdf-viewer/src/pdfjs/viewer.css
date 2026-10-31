@@ -13,15 +13,23 @@
     display: none !important;
 }
 
-/* the extension's buttons in the toolbar: go to the source, and the color theme */
-.extensionButton {
-    width: auto !important;
-    padding: 0 6px !important;
-    font: inherit;
-    white-space: nowrap;
+/* The extension's buttons (index.html, main.ts): icon buttons like pdf.js's own, in the toolbar,
+   and labeled entries in the tools menu, which pdf.js shows instead in panes up to 750 px wide
+   (hiddenMediumView, visibleMediumView). */
+#goToCodeButton::before,
+#secondaryGoToCode::before {
+    -webkit-mask-image: var(--ow-icon-go-to-code);
+    mask-image: var(--ow-icon-go-to-code);
 }
-.extensionButton::before {
-    display: none !important;
+#themeButton::before,
+#secondaryTheme::before {
+    -webkit-mask-image: var(--ow-icon-theme);
+    mask-image: var(--ow-icon-theme);
+}
+#switchViewerButton::before,
+#secondarySwitchViewer::before {
+    -webkit-mask-image: var(--ow-icon-switch-viewer);
+    mask-image: var(--ow-icon-switch-viewer);
 }
 
 /* asks before find downloads a build in full */

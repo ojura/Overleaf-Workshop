@@ -1,0 +1,12 @@
+/*
+ * The icons of the extension's toolbar buttons in both viewers, as 16 px masks in the style of
+ * pdf.js's toolbar icons: go to the source (SyncTeX), the color theme, the switch to the other
+ * viewer, and saving the PDF (pdf.js's own download icon, web/images/toolbarButton-download.svg).
+ * The pages set no content security policy, so data: URLs load.
+ */
+:root {
+    --ow-icon-go-to-code: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M5.3 3.3l1.4 1.4L3.4 8l3.3 3.3-1.4 1.4L.6 8zm5.4 0L15.4 8l-4.7 4.7-1.4-1.4L12.6 8 9.3 4.7z'/%3E%3C/svg%3E");
+    --ow-icon-theme: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill-rule='evenodd' d='M8 1a7 7 0 1 1 0 14A7 7 0 0 1 8 1zm0 1.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11z'/%3E%3Cpath d='M8 2.5a5.5 5.5 0 0 1 0 11z'/%3E%3C/svg%3E");
+    --ow-icon-switch-viewer: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M11 1.5L15 5l-4 3.5V6H2V4h9zM5 7.5V10h9v2H5v2.5L1 11z'/%3E%3C/svg%3E");
+    --ow-icon-download: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M9.79407 7.31811H7.86307C7.41807 7.31811 7.19407 7.85711 7.50907 8.17211L10.1911 10.8541C10.3861 11.0491 10.7031 11.0491 10.8981 10.8541L13.5801 8.17211C13.8951 7.85711 13.6721 7.31811 13.2261 7.31811H11.2941V4.38211H11.2961V3.13211H11.2941V2.30811H9.79407V3.13211H9.79107V4.38211H9.79507V7.31811H9.79407Z'/%3E%3Cpath d='M14 3.13208H12.796V4.38208H14C14.345 4.38208 14.625 4.66208 14.625 5.00708V13.0071C14.625 13.3521 14.345 13.6321 14 13.6321H2C1.655 13.6321 1.375 13.3521 1.375 13.0071V3.00708C1.375 2.66208 1.655 2.38208 2 2.38208H5.643C5.82 2.38208 5.989 2.45808 6.108 2.58908L7.536 4.17508C7.654 4.30708 7.823 4.38208 8 4.38208H8.291V3.13208H8.278L7.036 1.75208C6.681 1.35808 6.173 1.13208 5.642 1.13208H2C0.966 1.13208 0.125 1.97308 0.125 3.00708V13.0071C0.125 14.0411 0.966 14.8821 2 14.8821H14C15.034 14.8821 15.875 14.0411 15.875 13.0071V5.00708C15.875 3.97308 15.034 3.13208 14 3.13208Z'/%3E%3C/svg%3E");
+}

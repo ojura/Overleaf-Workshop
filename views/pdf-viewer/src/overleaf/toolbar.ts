@@ -72,8 +72,9 @@ export class Toolbar {
 
     setTheme(name: string | undefined, available: boolean) {
         this.themeToggle.hidden = !available;
-        this.themeToggle.textContent = name ?? '';
-        this.themeToggle.title = name ? `Color theme: ${name}` : 'Color theme';
+        this.themeToggle.dataset.theme = name ?? '';
+        this.themeToggle.title = name ? `Color theme: ${name}; click for the next one` : 'Color theme';
+        this.themeToggle.setAttribute('aria-label', name ? `Color theme: ${name}` : 'Color theme');
     }
 
     get pages() {

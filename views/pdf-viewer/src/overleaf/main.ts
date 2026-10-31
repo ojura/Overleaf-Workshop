@@ -9,6 +9,7 @@ import { Documents } from './documents';
 import { Outline } from './outline';
 import { Toolbar } from './toolbar';
 import { listenForWheelZoom, listenForZoomKeys } from './zoom';
+import '../common/icons.css';
 import './viewer.css';
 
 /**

@@ -26,6 +26,7 @@ import { applyTheme, themesFrom } from '../common/theme';
 import type { Theme } from '../common/theme';
 import { createWorkerPort } from '../common/worker';
 import { documentParams, PDFJS } from '../shims/pdf-js';
+import '../common/icons.css';
 import './viewer.css';
 
 const CHUNK_SIZE = 128 * 1024; // PDFJSWrapper's
@@ -380,40 +381,48 @@ function askBeforeFind(a: any) {
     };
 }
 
+/**
+ * The extension's buttons (index.html): go to the source of the top of the view, the next color
+ * theme, and the switch to the Overleaf viewer. Each is in the toolbar and, for panes too narrow
+ * for it, in pdf.js's tools menu; a click on a menu entry closes the menu, as pdf.js's own do.
+ */
 function addToolbarButtons(a: any) {
-    const right = document.getElementById('toolbarViewerRight');
-    const toCode = Object.assign(document.createElement('button'), {
-        className: 'toolbarButton extensionButton', type: 'button', textContent: 'Go to code',
-        title: 'Open the source at the top of the view (SyncTeX)',
-    });
-    toCode.addEventListener('click', () => {
+    const buttons = (ids: string[]) => ids.map(id => document.getElementById(id)).filter((b): b is HTMLElement => b !== null);
+    const onClick = (ids: string[], action: () => void) => buttons(ids).forEach(button => button.addEventListener('click', () => {
+        a.secondaryToolbar?.close?.();
+        action();
+    }));
+
+    onClick(['goToCodeButton', 'secondaryGoToCode'], () => {
         const position = positionOf(a);
         if (position) { goToCode(position); }
     });
-    const theme = Object.assign(document.createElement('button'), { className: 'toolbarButton extensionButton', type: 'button' });
+
+    const themeButtons = buttons(['themeButton', 'secondaryTheme']);
     let index = Math.max(0, themes.findIndex(t => t.name === savedState().colorTheme));
     const showTheme = () => {
         const current = themes[index];
-        theme.textContent = current.name;
-        theme.title = `Theme: ${current.name}`;
+        for (const button of themeButtons) {
+            button.title = `Color theme: ${current.name}; click for the next one`;
+            button.dataset.theme = current.name;
+            button.hidden = themes.length < 2;
+            const label = button.querySelector('span');
+            if (label) { label.textContent = `Color theme: ${current.name}`; }
+        }
         applyTheme(a.pdfViewer, current);
     };
-    theme.addEventListener('click', () => {
+    onClick(['themeButton', 'secondaryTheme'], () => {
         index = (index + 1) % themes.length;
         showTheme();
         saveState({ colorTheme: themes[index].name });
     });
+
     // shows the PDF in the Overleaf viewer, at the same place: the host sets the viewer setting
     // and reloads the page with the other viewer, which starts from the saved view
-    const switchViewer = Object.assign(document.createElement('button'), {
-        className: 'toolbarButton extensionButton', type: 'button', textContent: 'Overleaf viewer',
-        title: 'Show the PDF in the Overleaf viewer (sets overleaf-workshop.pdfViewer.engine)',
-    });
-    switchViewer.addEventListener('click', () => {
+    onClick(['switchViewerButton', 'secondarySwitchViewer'], () => {
         if (a.pdfDocument) { saveState({ position: positionOf(a), scale: a.pdfViewer.currentScaleValue }); }
         post({ type: 'switchViewer', engine: 'overleaf' });
     });
-    right?.prepend(switchViewer, toCode, theme);
     showTheme();
 }
 

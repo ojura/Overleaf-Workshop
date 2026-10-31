@@ -102,6 +102,46 @@ html, body {
 
 #toolbar .spacer {
     flex: 1;
+    min-width: 0;
+}
+
+/* the icon buttons on the right: go to the source, the color theme, save, and the switch to the
+   pdf.js viewer (common/icons.css) */
+#toolbar button.icon {
+    flex: none;
+    width: 28px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+#toolbar button.icon[hidden] {
+    display: none;
+}
+#toolbar button.icon::before {
+    content: '';
+    width: 16px;
+    height: 16px;
+    background-color: currentColor;
+    -webkit-mask-size: cover;
+    mask-size: cover;
+    -webkit-mask-position: center;
+    mask-position: center;
+}
+#goToCode::before { -webkit-mask-image: var(--ow-icon-go-to-code); mask-image: var(--ow-icon-go-to-code); }
+#themeToggle::before { -webkit-mask-image: var(--ow-icon-theme); mask-image: var(--ow-icon-theme); }
+#download::before { -webkit-mask-image: var(--ow-icon-download); mask-image: var(--ow-icon-download); }
+#switchViewer::before { -webkit-mask-image: var(--ow-icon-switch-viewer); mask-image: var(--ow-icon-switch-viewer); }
+
+/* narrow panes: the zoom list goes first, then the page count, so the buttons stay in view */
+#toolbar > * {
+    flex-shrink: 0;
+}
+@media (max-width: 480px) {
+    #scaleSelect { display: none; }
+}
+@media (max-width: 360px) {
+    #toolbar .numPages { display: none; }
 }
 
 #outline {
