@@ -52,6 +52,8 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
         remoteFolders: new Set<string>(),
         remoteWrites: [] as string[],
         ideWatchers: [] as any[],
+        /** the project's history, newest first, as the history's updates request answers */
+        updates: [] as any[],
     };
     const fsApi = {
         stat: async (uri: Uri) => {
@@ -111,7 +113,7 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
     const changes = new Emitter<{ type: number, uri: Uri }[]>();
     const rel = (uri: Uri) => uri.path.slice(origin.path.length);
     const vfs = {
-        origin, serverName: 'www.overleaf.com', projectName: 'project', projectId: 'p', connected: true,
+        origin, serverName: 'www.overleaf.com', projectName: 'project', projectId: 'p', connected: true, _userId: 'u',
         onDidChangeFiles: changes.event,
         pathToUri: (...parts: string[]) => Uri.joinPath(origin, ...parts),
         getProjectSCMPersist: () => ({ settings: {} }),
@@ -129,6 +131,13 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
             return { _type: 'doc', _id: rel(uri), name: path.posix.basename(uri.path) };
         },
         remove: async (uri: Uri) => { w.remote.delete(rel(uri)); },
+        rename: async (from: Uri, to: Uri) => {
+            if (!w.remote.has(rel(from)) || w.remote.has(rel(to))) { return; }
+            w.remote.set(rel(to), w.remote.get(rel(from))!);
+            w.remote.delete(rel(from));
+            changes.fire([{ type: FileChangeType.Deleted, uri: from }, { type: FileChangeType.Created, uri: to }]);
+        },
+        getUpdates: async () => ({ updates: w.updates, nextBeforeTimestamp: 0 }),
         documentUpdatesSettled: async () => {},
     };
     /** a change on Overleaf, as the project reports it */

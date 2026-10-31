@@ -52,7 +52,7 @@ describe('a local replica while the IDE\'s window does not answer', function () 
     it('makes its first sync, and writes its saved state', async () => {
         await start();
         assert.strictEqual(fs.readFileSync(path.join(folder, 'main.tex'), 'utf8'), 'v1\n');
-        await until(() => fs.existsSync(path.join(folder, '.overleaf', 'sync', 'state.json')));
+        await until(() => fs.existsSync(path.join(folder, '.git', 'overleaf', 'state.json')));
     });
 
     it('uploads new, changed and deleted files that another program writes', async () => {

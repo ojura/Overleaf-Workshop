@@ -15,9 +15,13 @@ import * as path from 'path';
  * Requests and answers are JSON objects, one per line:
  *   {"op":"status"}  the replica's state
  *   {"op":"sync"}    look for files changed on disk, upload them, wait for Overleaf's
- *                    acknowledgement of every change so far, and answer what was done
+ *                    acknowledgement of every change so far, record Overleaf's state in the
+ *                    replica's git repository, and answer what was done
+ *   {"op":"land","commit":"<id>"}
+ *                    push a commit that descends from the checked-out one: fast-forward the
+ *                    branch to it, upload what it changed and wait for Overleaf's acknowledgements
  */
-export type ControlRequest = { op: 'status' } | { op: 'sync' };
+export type ControlRequest = { op: 'status' } | { op: 'sync' } | { op: 'land', commit: string };
 export type ControlAnswer = { ok: true, [key: string]: unknown } | { ok: false, error: string, [key: string]: unknown };
 
 /** The file in a replica's folder that names the socket of the window keeping the folder in sync. */
@@ -135,7 +139,7 @@ export class ReplicaControlServer {
         let answer: ControlAnswer;
         try {
             const request = JSON.parse(line);
-            answer = (request?.op === 'status' || request?.op === 'sync')
+            answer = (request?.op === 'status' || request?.op === 'sync' || (request?.op === 'land' && typeof request.commit === 'string'))
                 ? await this.handle(request)
                 : { ok: false, error: `unknown request ${JSON.stringify(request?.op)}` };
         } catch (error: any) {

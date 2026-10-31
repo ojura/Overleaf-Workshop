@@ -3,18 +3,19 @@ import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { FileRefEntity, FolderEntity, VirtualFileSystem, __OUTPUTS_ID, parseUri } from '../core/remoteFileSystemProvider';
 import {
-    describe, LocalStat, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaStore, ReplicaSync, ReplicaUI,
-    SavedState, SyncSummary,
+    describe, LocalStat, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync, ReplicaUI, SyncSummary,
 } from './replicaSync';
 import { DEFAULT_IGNORE_PATTERNS } from './ignorePatterns';
 import * as localFs from './localFolderFs';
 import { LocalFolderWatcher } from './localFolderWatcher';
 import { ControlAnswer, ControlRequest, ReplicaControlServer } from './replicaControl';
 import { ReplicaModes, replicaModes } from './replicaModes';
+import { GitReplicaStore, OVERLEAF_REF, Person } from './replicaGit';
+import type { HistoryUpdate } from '../gitbridge/history';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
-/** Where the sync keeps its state inside the local folder. Paths in `.overleaf` are never synced. */
-const SYNC_FOLDER = '.overleaf/sync';
+/** Where the sync keeps the local versions it replaced. Paths in `.overleaf` are never synced. */
+const CONFLICTS_FOLDER = '.overleaf/conflicts';
 
 /**
  * How often a replica that syncs the changes of other programs also scans its folder, in case a
@@ -43,8 +44,9 @@ const modeNoticesShown = new Set<string>();
 const providers = new Set<LocalReplicaSCMProvider>();
 
 /**
- * Keeps a local folder in sync with the project, in both directions.
- * It keeps no history versions.
+ * Keeps a local folder in sync with the project, in both directions. The folder is a git
+ * repository, which records Overleaf's states and merges them with the user's commits
+ * (src/scm/replicaGit.ts).
  */
 export class LocalReplicaSCMProvider extends BaseSCM {
     public static readonly label = vscode.l10n.t('Local Replica');
@@ -52,6 +54,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     public readonly iconPath: vscode.ThemeIcon = new vscode.ThemeIcon('folder-library');
 
     private sync?: ReplicaSync;
+    private store?: GitReplicaStore;
     private ready?: Promise<vscode.Disposable[]>;
     private fullSync?: Promise<void>;
     private reportProgress?: (done: number, total: number) => void;
@@ -249,6 +252,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 const entity = await vfs.createFile(uri(path), content, true);
                 return entity._type==='doc' ? {kind: 'doc'} : {kind: 'file', hash: (entity as FileRefEntity).hash};
             },
+            rename: async (from, to) => {
+                // Overleaf renames and moves in separate requests: move first, then rename
+                await this.ensureRemoteFolders(to);
+                const parent = (p: string) => p.slice(0, p.lastIndexOf('/')) || '/';
+                const name = (p: string) => p.slice(p.lastIndexOf('/') + 1);
+                let current = from;
+                const step = async (target: string, what: string) => {
+                    await vfs.rename(uri(current), uri(target), false);
+                    if ((await this.resolveRemote(current))?.fileType!==undefined || (await this.resolveRemote(target))?.fileType===undefined) {
+                        throw new Error(`Overleaf did not ${what} ${current} to ${target}`);
+                    }
+                    current = target;
+                };
+                if (parent(from)!==parent(to)) { await step(`${parent(to)==='/' ? '' : parent(to)}/${name(from)}`, 'move'); }
+                if (name(from)!==name(to)) { await step(to, 'rename'); }
+            },
             remove: (path) => vfs.remove(uri(path), true),
             removeFolderIfEmpty: async (path) => {
                 const res = path==='/' ? undefined : await this.resolveRemote(path);
@@ -335,53 +354,41 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         };
     }
 
-    /** The sync state, in `.overleaf/sync` inside the local folder, which the sync never uploads. */
-    private stateStore(): ReplicaStore {
-        const fs = localFs; // see localSide()
-        const dir = vscode.Uri.joinPath(this.baseUri, SYNC_FOLDER);
-        const stateUri = vscode.Uri.joinPath(dir, 'state.json');
-        const baseUri = (hash: string) => vscode.Uri.joinPath(dir, 'base', hash);
-        const project = this.vfs.projectId;
-        return {
-            load: async () => {
-                try {
-                    const saved = JSON.parse(decoder.decode(await fs.readFile(stateUri)));
-                    return saved.project===project ? saved.state as SavedState : undefined;
-                } catch {
-                    return undefined;
-                }
+    /** Whether the sync leaves `path` out: the replica's own `.overleaf` folder, and the ignored paths. */
+    private leftOut(path: string): boolean {
+        return path==='/.overleaf' || path.startsWith('/.overleaf/') || this.matchIgnorePatterns(path);
+    }
+
+    /** The sync state, in the replica's git repository (src/scm/replicaGit.ts). */
+    private gitStore(): GitReplicaStore {
+        const vfs = this.vfs;
+        let person: Person | undefined;
+        const store = new GitReplicaStore({
+            folder: this.baseUri.fsPath,
+            projectId: vfs.projectId,
+            serverName: vfs.serverName,
+            ignorePatterns: this.getSetting<string[]>(IGNORE_SETTING_KEY) || this.ignorePatterns,
+            isIgnored: path => this.leftOut(path),
+            history: async () => {
+                const res = await vfs.getUpdates();
+                return res?.updates.map((u): HistoryUpdate => ({
+                    fromV: u.fromV, toV: u.toV, endTs: u.meta.end_ts,
+                    users: (u.meta.users ?? []).filter(user => user).map(user => ({
+                        id: user.id, name: [user.first_name, user.last_name].filter(Boolean).join(' ') || undefined, email: user.email,
+                    })),
+                    origin: u.meta.origin?.kind,
+                }));
             },
-            save: async (state) => {
-                // write a new file and rename it over the old one, so a crash cannot leave half a state
-                const tmp = vscode.Uri.joinPath(dir, 'state.json.tmp');
-                await fs.createDirectory(dir);
-                await fs.writeFile(tmp, encoder.encode(JSON.stringify({project, state})));
-                await fs.rename(tmp, stateUri);
-            },
-            readBase: async (hash) => {
-                try { return decoder.decode(await fs.readFile(baseUri(hash))); } catch { return undefined; }
-            },
-            writeBase: async (hash, text) => {
-                await fs.createDirectory(vscode.Uri.joinPath(dir, 'base'));
-                await fs.writeFile(baseUri(hash), encoder.encode(text));
-            },
-            pruneBases: async (keep) => {
-                let items: [string, number][] = [];
-                try { items = await fs.readDirectory(vscode.Uri.joinPath(dir, 'base')); } catch { return; }
-                await Promise.all(items.filter(([name]) => !keep.has(name))
-                    .map(([name]) => fs.remove(baseUri(name)).catch(() => {})));
-            },
-            keepCopy: async (path, content) => {
-                const now = new Date();
-                const pad = (n: number) => String(n).padStart(2, '0');
-                const stamp = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())} ${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
-                const copy = `${SYNC_FOLDER}/conflicts/${stamp}${path}`;
-                const copyUri = vscode.Uri.joinPath(this.baseUri, copy);
-                await fs.createDirectory(vscode.Uri.joinPath(copyUri, '..'));
-                await fs.writeFile(copyUri, content);
-                return copy;
-            },
-        };
+            // when git has no user.name and user.email: the Overleaf account, as the project lists it
+            fallbackUser: () => person,
+            log: message => log(`[${vfs.projectName}] ${message}`),
+            copiesFolder: CONFLICTS_FOLDER,
+        });
+        void vfs.init().then(project => {
+            const me = [project.owner, ...(project.members ?? [])].find(member => member?._id===vfs._userId);
+            if (me?.email) { person = {name: [me.first_name, me.last_name].filter(Boolean).join(' ') || me.email, email: me.email}; }
+        }).catch(() => {});
+        return store;
     }
 
     private userInterface(): ReplicaUI {
@@ -418,10 +425,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const list = (paths: string[]) => paths.slice(0, 3).join(', ') + (paths.length>3 ? ', ...' : '');
         const notes: string[] = [];
         if (summary.conflicts.length) {
-            notes.push(vscode.l10n.t('{count} files were changed on both sides in the same place and have conflict markers to resolve: {files}.', {count: summary.conflicts.length, files: list(summary.conflicts)}));
+            notes.push(vscode.l10n.t('{count} files were changed on both sides in the same place and have conflicts to resolve: {files}. They are uploaded once the markers are gone and the file is staged (git add).', {count: summary.conflicts.length, files: list(summary.conflicts)}));
         }
         if (summary.keptAside.length) {
-            notes.push(vscode.l10n.t('{count} local files differed from Overleaf without saved sync state to tell which side changed; Overleaf\'s version is in place and the local one is kept in {folder}: {files}.', {count: summary.keptAside.length, folder: `${SYNC_FOLDER}/conflicts`, files: list(summary.keptAside.map(k => k.path))}));
+            notes.push(vscode.l10n.t('{count} local files differed from Overleaf without saved sync state to tell which side changed; Overleaf\'s version is in place and the local one is kept in {folder}: {files}.', {count: summary.keptAside.length, folder: CONFLICTS_FOLDER, files: list(summary.keptAside.map(k => k.path))}));
         }
         if (summary.failed.length) {
             notes.push(vscode.l10n.t('{count} files could not be synced and keep their local content: {files} ({error}). They are synced again when the connection is back, or with "Sync Now".', {count: summary.failed.length, files: list(summary.failed.map(f => f.path)), error: summary.failed[0].error}));
@@ -478,6 +485,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const at = new Date().toISOString();
         const done: [string, string[]][] = [
             ['uploaded', summary.uploaded], ['downloaded', summary.downloaded], ['merged', summary.merged],
+            ['renamed', summary.renamed.map(r => `${r.from} -> ${r.to}`)],
             ['deleted locally', summary.deletedLocal], ['deleted on Overleaf', summary.deletedRemote],
             ['failed', summary.failed.map(f => f.path)],
         ];
@@ -586,7 +594,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         await this.ready;
         await this.fullSync;
-        return await this.sync.flush(true);
+        return await this.sync.flush(true, {record: true});
     }
 
     /** The command "Sync Local Replica Now", for every open replica. */
@@ -618,6 +626,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return this.scanning;
     }
 
+    /** The replica's git state, for tools: the checked-out commit, Overleaf's, and the unmerged paths. */
+    private async gitState() {
+        const git = this.store?.git;
+        if (git===undefined) { return undefined; }
+        const [head, overleaf, branch, unmerged] = await Promise.all([
+            git.commit('HEAD'), git.commit(OVERLEAF_REF),
+            git.run(['symbolic-ref', '--quiet', '--short', 'HEAD'], {allowFailure: true}).then(r => r.stdout.toString('utf8').trim() || undefined),
+            git.run(['ls-files', '--unmerged', '-z']).then(r => [...new Set(r.stdout.toString('utf8').split('\0').filter(Boolean).map(x => x.slice(x.indexOf('\t') + 1)))]),
+        ]);
+        return {head, overleaf, branch, unmerged};
+    }
+
     /** Answer a tool's request on the control socket (src/scm/replicaControl.ts). */
     private async answerTool(request: ControlRequest): Promise<ControlAnswer> {
         const state = {
@@ -629,16 +649,69 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             fullSyncRunning: this.fullSyncRunning,
         };
         if (request.op==='status') {
-            return {ok: true, ...state, recent: [...this.recent]};
+            return {ok: true, ...state, git: await this.gitState(), recent: [...this.recent]};
+        }
+        if (request.op==='land') {
+            return {...await this.land(request.commit), ...state, recent: [...this.recent]};
         }
         const summary = await this.syncNow();
         const problems = [
             ...summary.failed.map(f => `${f.path}: ${f.error}`),
             ...summary.conflicts.map(path => `${path}: conflict markers to resolve`),
         ];
+        const git = await this.gitState();
         return problems.length===0
-            ? {ok: true, ...state, summary, recent: [...this.recent]}
-            : {ok: false, error: problems.join('; '), ...state, summary, recent: [...this.recent]};
+            ? {ok: true, ...state, summary, git, recent: [...this.recent]}
+            : {ok: false, error: problems.join('; '), ...state, summary, git, recent: [...this.recent]};
+    }
+
+    /**
+     * A native push of `commit`, for tools (replica-land): once Overleaf holds the checked-out
+     * commit and the folder has no changes, fast-forward the branch to `commit`, upload what it
+     * changed (renames as renames) and wait for Overleaf's acknowledgements. Then Overleaf's
+     * ref is the commit, or a commit on top of it when someone edited meanwhile.
+     */
+    private async land(commit: string): Promise<ControlAnswer> {
+        const sync = this.sync, store = this.store;
+        if (sync===undefined || store===undefined || this.ready===undefined) {
+            return {ok: false, error: vscode.l10n.t('This local replica has not started.')};
+        }
+        await this.ready;
+        await this.fullSync;
+        const git = store.git;
+        const before = await sync.flush(true, {record: true});
+        const problems = [...before.failed.map(f => `${f.path}: ${f.error}`), ...before.conflicts.map(p => `${p}: conflicts to resolve`)];
+        if (problems.length) { return {ok: false, error: `the replica is not in sync: ${problems.join('; ')}`, summary: before}; }
+        const [head, overleaf, target] = await Promise.all([git.commit('HEAD'), git.commit(OVERLEAF_REF), git.commit(commit)]);
+        if (target===undefined) { return {ok: false, error: `${commit} names no commit in the replica's repository`}; }
+        if (head===undefined || head!==overleaf) {
+            return {ok: false, error: `Overleaf does not hold the checked-out commit (HEAD ${head?.slice(0, 7) ?? 'none'}, ${OVERLEAF_REF} ${overleaf?.slice(0, 7) ?? 'none'}); sync and commit first`, git: await this.gitState()};
+        }
+        if (target===head) {
+            return {ok: true, landed: target, overleaf, summary: before, note: 'Overleaf already holds the commit'};
+        }
+        if (!await git.isAncestor(head, target)) {
+            return {ok: false, error: `${commit} does not descend from the checked-out commit ${head.slice(0, 7)}; rebase it onto ${head.slice(0, 7)} first`};
+        }
+        const changes = await git.text(['status', '--porcelain', '--untracked-files=no']);
+        if (changes) { return {ok: false, error: `the folder has changes that are not committed:\n${changes}`}; }
+        log(`[${this.vfs.projectName}] Landing ${target.slice(0, 7)} on top of ${head.slice(0, 7)}.`);
+        sync.hold();
+        try {
+            await git.run(['merge', '--ff-only', '--quiet', target]);
+            const summary = await sync.flush(true);
+            const failed = [...summary.failed.map(f => `${f.path}: ${f.error}`), ...summary.conflicts.map(p => `${p}: conflicts to resolve`)];
+            const recorded = await sync.recordNow({force: true});
+            const after = await git.commit(OVERLEAF_REF);
+            const held = after!==undefined && (after===target || await git.isAncestor(target, after));
+            const ok = failed.length===0 && held && !recorded?.waiting;
+            log(`[${this.vfs.projectName}] Landing ${target.slice(0, 7)}: ${describe(summary)}; ${OVERLEAF_REF} is ${after?.slice(0, 7)}.`);
+            return ok
+                ? {ok: true, landed: target, overleaf: after, summary, editedSince: after!==target}
+                : {ok: false, error: failed.length ? failed.join('; ') : `Overleaf does not hold ${target.slice(0, 7)} yet (${OVERLEAF_REF} is ${after?.slice(0, 7)})`, landed: target, overleaf: after, summary};
+        } finally {
+            sync.release();
+        }
     }
 
     /**
@@ -679,11 +752,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (previous) {
             await (previous.stopped ??= previous.sync.stop());
         }
-        const sync = new ReplicaSync(this.remoteSide(), this.localSide(), this.stateStore(), this.userInterface(),
+        const store = this.gitStore();
+        try {
+            await store.open();
+        } catch (error) {
+            log(`[${this.vfs.projectName}] The replica's git repository could not be opened: ${error}`);
+            throw error;
+        }
+        const sync = new ReplicaSync(this.remoteSide(), this.localSide(), store, this.userInterface(),
                                      path => this.matchIgnorePatterns(path));
         const record: {sync: ReplicaSync, stopped?: Promise<void>} = {sync};
         folderSyncs.set(key, record);
         this.sync = sync;
+        this.store = store;
 
         const syncOnFileChange = vscode.workspace
             .getConfiguration('overleaf-workshop.localReplica.syncOnFileChange')
@@ -700,7 +781,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
         }
         const onLocal = (path: string) => {
-            if (!path.startsWith('/.overleaf/') && path!=='/.overleaf') {
+            if (!path.startsWith('/.overleaf/') && path!=='/.overleaf' && path!=='/.git' && !path.startsWith('/.git/')) {
                 this.track('push', path, sync.localChanged(path));
             }
         };
@@ -730,12 +811,20 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // IDE's watcher only where Node's cannot watch the folder.
         const folderWatcher = new LocalFolderWatcher(
             this.baseUri.fsPath,
-            path => { void this.localEvent(sync, path, syncOnFileChange, onLocal); },
+            path => {
+                if (path==='/.git/index') {
+                    // e.g. conflicts resolved with git add: the files that waited for that sync now
+                    void sync.indexChanged();
+                } else {
+                    void this.localEvent(sync, path, syncOnFileChange, onLocal);
+                }
+            },
             reason => {
                 log(`[${this.vfs.projectName}] Looking at the whole folder: ${reason}.`);
                 void this.scanFolder();
             },
-            path => path==='/.overleaf' || path.startsWith('/.overleaf/'),
+            // the repository's own files, except its index
+            path => path==='/.overleaf' || path.startsWith('/.overleaf/') || (path.startsWith('/.git') && path!=='/.git/index'),
         );
         const watching = folderWatcher.start();
         if (watching.ok) {
