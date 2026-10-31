@@ -17,17 +17,31 @@ export function isPdfViewerEngine(value: unknown): value is PdfViewerEngine {
     return (PDF_VIEWER_ENGINES as readonly unknown[]).includes(value);
 }
 
+/** A package.json, as far as these functions read it. */
+export interface PackageJson {
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+}
+
 /**
- * The folder in views/pdf-viewer/ of pdf.js's release, which npm run download-pdfjs unpacks: the
- * release that `packageJson`, the extension's package.json, pins as pdfjs-dist, the pdf.js of
- * Overleaf's viewer. It must pin one release, a version x.y.z.
+ * The pdf.js version that `packageJson`, the extension's package.json, pins as pdfjs-dist: the
+ * pdf.js of Overleaf's viewer. It must pin one release, a version x.y.z.
  */
-export function pdfjsReleaseOf(packageJson: { dependencies?: Record<string, string>, devDependencies?: Record<string, string> }): string {
+export function pdfjsVersionOf(packageJson: PackageJson): string {
     const version = packageJson.devDependencies?.['pdfjs-dist'] ?? packageJson.dependencies?.['pdfjs-dist'];
     if (version === undefined || !/^\d+\.\d+\.\d+$/.test(version)) {
         throw new Error(`package.json must pin pdfjs-dist to one release, a version x.y.z; it has ${version}`);
     }
-    return `vendor/pdfjs-${version}`;
+    return version;
+}
+
+/**
+ * The folder in views/pdf-viewer/ of the pdf.js release that `packageJson` pins (pdfjsVersionOf),
+ * which npm run download-pdfjs unpacks there; the extension's patch for the release lies next to
+ * it, as <folder>-dist.patch (scripts/download-pdfjs.mjs).
+ */
+export function pdfjsReleaseOf(packageJson: PackageJson): string {
+    return `vendor/pdfjs-${pdfjsVersionOf(packageJson)}`;
 }
 
 /** Absolute webview URLs of pdf.js's files, each ending in '/'. */

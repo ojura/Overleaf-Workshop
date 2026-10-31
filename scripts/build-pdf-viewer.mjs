@@ -10,10 +10,11 @@
 //   node scripts/build-pdf-viewer.mjs
 import * as esbuild from 'esbuild';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
 import path from 'node:path';
+import { pdfjsRelease, pdfjsReleaseFolder, protocol, viewerRoot } from './viewer-protocol.mjs';
 
-export const viewerRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'views', 'pdf-viewer');
+export { viewerRoot };
 const src = path.join(viewerRoot, 'src');
 const overleafJs = path.join(viewerRoot, 'overleaf', 'services', 'web', 'frontend', 'js');
 
@@ -84,22 +85,10 @@ export const bundleOptions = {
     logLevel: 'warning',
 };
 
-/**
- * What the extension defines for its viewers (src/core/viewerProtocol.ts). That module imports
- * nothing, so esbuild can turn it into a module that this script imports.
- */
-async function viewerProtocol() {
-    const source = readFileSync(path.resolve(viewerRoot, '..', '..', 'src', 'core', 'viewerProtocol.ts'), 'utf8');
-    const { code } = await esbuild.transform(source, { loader: 'ts', format: 'esm' });
-    return import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
-}
-const protocol = await viewerProtocol();
 /** the viewers (PDF_VIEWER_ENGINES) */
 export const engines = [...protocol.PDF_VIEWER_ENGINES];
-/** the folder of pdf.js's release in views/pdf-viewer/, from package.json's pdfjs-dist (pdfjsReleaseOf) */
-const pdfjsReleaseFolder = protocol.pdfjsReleaseOf(JSON.parse(readFileSync(path.resolve(viewerRoot, '..', '..', 'package.json'), 'utf8')));
-/** pdf.js's release, which npm run download-pdfjs unpacks; Overleaf's viewer uses this version */
-export const pdfjsRelease = path.join(viewerRoot, pdfjsReleaseFolder);
+/** pdf.js's release, which npm run download-pdfjs unpacks; Overleaf's viewer uses this version (scripts/viewer-protocol.mjs) */
+export { pdfjsRelease };
 /** where a viewer's page source (src/<engine>/index.html) names the folder of pdf.js's release */
 const PDFJS_RELEASE_IN_PAGE = '{{pdfjs-release}}';
 
