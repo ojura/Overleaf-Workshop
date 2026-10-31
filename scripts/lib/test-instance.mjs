@@ -5,7 +5,9 @@
 // picked both ports itself, and only this IDE accepts the id in each path, so a connection to a
 // recorded endpoint reaches this instance's IDE or fails. Each connection also checks that the
 // process that answers is the IDE that start recorded (instance.json's pid).
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { connect, evaluate, waitForActivePort, waitForTarget } from './devtools.mjs';
 
@@ -19,6 +21,59 @@ export function instanceHome(explicit) {
         throw new Error('name the folder of the test instance with --instance DIR or HIDDEN_IDE_HOME; the scripts do not fall back to a shared folder, so that two agents never share an instance');
     }
     return path.resolve(home);
+}
+
+/**
+ * Whether the group `gid` holds no user but this one: no other user has it as the primary group,
+ * and its list of members names only this user (getent, so that the system's user databases
+ * answer).
+ */
+function groupHoldsOnlyThisUser(gid) {
+    const group = spawnSync('getent', ['group', String(gid)], { encoding: 'utf8' });
+    if (group.status !== 0) { return false; }
+    const members = (group.stdout.trim().split(':')[3] ?? '').split(',').filter(Boolean);
+    if (members.some(member => member !== os.userInfo().username)) { return false; }
+    const users = spawnSync('getent', ['passwd'], { encoding: 'utf8' });
+    if (users.status !== 0) { return false; }
+    return users.stdout.split('\n').filter(Boolean).every((line) => {
+        const [, , uid, primary] = line.split(':');
+        return Number(primary) !== gid || Number(uid) === process.getuid();
+    });
+}
+
+/**
+ * Fail unless `home` can hold an instance: it holds the login copy and the record that stop acts
+ * on. It must be the folder itself (not a symbolic link), belong to this user and have mode 700,
+ * and each folder above it must belong to root or to this user, and other users must not be able to
+ * write it, except a folder with the sticky bit (as /tmp has), in which they cannot rename or
+ * remove what is not theirs. A folder that its group can write counts as closed to others when the
+ * group holds no user but this one.
+ */
+export function checkInstanceFolder(home) {
+    const refuse = (reason) => { throw new Error(`refusing the instance's folder ${home}: ${reason}`); };
+    let stat;
+    try {
+        stat = fs.lstatSync(home);
+    } catch (error) {
+        if (error.code === 'ENOENT') { refuse('it does not exist'); }
+        throw error;
+    }
+    if (stat.isSymbolicLink()) { refuse('it is a symbolic link; name the folder itself'); }
+    if (!stat.isDirectory()) { refuse('it is not a folder'); }
+    if (stat.uid !== process.getuid()) { refuse('another user owns it'); }
+    if ((stat.mode & 0o777) !== 0o700) {
+        refuse(`its mode is ${(stat.mode & 0o777).toString(8)}; it must be 700, so that only this user can enter, read and write it`);
+    }
+    for (let dir = path.dirname(fs.realpathSync(home)); ; dir = path.dirname(dir)) {
+        const above = fs.statSync(dir);
+        const sticky = (above.mode & 0o1000) !== 0;
+        if (above.uid !== 0 && above.uid !== process.getuid()) { refuse(`the folder ${dir} above it belongs to another user`); }
+        if ((above.mode & 0o002) && !sticky) { refuse(`every user can write the folder ${dir} above it`); }
+        if ((above.mode & 0o020) && !sticky && !groupHoldsOnlyThisUser(above.gid)) {
+            refuse(`the members of group ${above.gid} can write the folder ${dir} above it, and other users are among them`);
+        }
+        if (dir === path.dirname(dir)) { break; }
+    }
 }
 
 /** The record of the instance in `home`, with `home` added; fails when start has not written one. */

@@ -28,10 +28,11 @@
 // Every command needs HIDDEN_IDE_HOME: the folder of an instance of one's own, for example below
 // one's own scratch folder. The scripts require it and do not fall back to a shared folder, so that
 // two agents never share an instance, and a stop in one agent's folder cannot end another agent's
-// tests. start makes the folder for this user
-// only (mode 700), and refuses a folder that another user owns or that others can enter. It holds
-// profile/, extensions/, replica/ and home/ (below), instance.json and the logs. The replica folder
-// is kept between starts, so only the first start downloads the whole project.
+// tests. start makes the folder for this user only (mode 700), and every command refuses a folder
+// that other users can enter or change, also through a folder above it (checkInstanceFolder in
+// scripts/lib/test-instance.mjs). It holds profile/, extensions/, replica/ and home/ (below),
+// instance.json and the logs. The replica folder is kept between starts, so only the first start
+// downloads the whole project.
 //
 // Options for start (give --project or --folder; without either, start opens the project of the
 // previous start):
@@ -100,8 +101,8 @@ import { fileURLToPath } from 'node:url';
 import { evaluate, removeActivePort } from './lib/devtools.mjs';
 import { buildCheckout, installedExtension, installInto, removeExtensionCache } from './lib/install-build.mjs';
 import {
-    bootId, connectMainProcess, connectWindow, inMainProcess, instanceHome, instanceProcesses, isRecordedProcess, processStat,
-    readInstance, waitForInstance, workbenchTarget, writeInstance,
+    bootId, checkInstanceFolder, connectMainProcess, connectWindow, inMainProcess, instanceHome, instanceProcesses, isRecordedProcess,
+    processStat, readInstance, waitForInstance, workbenchTarget, writeInstance,
 } from './lib/test-instance.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -163,13 +164,15 @@ function writePrivately(file, text) {
     fs.renameSync(`${file}.new`, file);
 }
 
-/** Make `dir` for this user only (mode 700), or check that it is a folder of this user's that others cannot enter. */
-function privateFolder(dir) {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const stat = fs.lstatSync(dir);
-    if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0) {
-        throw new Error(`refusing ${dir}: the instance's folder must be a folder of this user's that others cannot enter (mode 700)`);
-    }
+/**
+ * The instance's folder (HIDDEN_IDE_HOME), checked before any command reads it
+ * (checkInstanceFolder); with `make`, start makes it first, with mode 700, and checks it after.
+ */
+function instanceFolder({ make = false } = {}) {
+    const home = instanceHome();
+    if (make) { fs.mkdirSync(home, { recursive: true, mode: 0o700 }); }
+    checkInstanceFolder(home);
+    return home;
 }
 
 /**
@@ -234,7 +237,7 @@ function recordIfAny(home) {
 
 /** The record of the instance in HIDDEN_IDE_HOME, which must run. */
 function runningInstance() {
-    const home = instanceHome();
+    const home = instanceFolder();
     const record = recordIfAny(home);
     if (!record || instanceProcesses(record).length === 0) { throw new Error(`the instance in ${home} does not run`); }
     return record;
@@ -460,8 +463,7 @@ if project:
 /** start: see the usage at the top. */
 async function start(...argv) {
     const options = parseOptions(argv, ['project', 'folder', 'project-name', 'build', 'ide', 'display', 'screen']);
-    const home = instanceHome();
-    privateFolder(home);
+    const home = instanceFolder({ make: true });
     const previous = recordIfAny(home);
     if (previous && instanceProcesses(previous).length > 0) {
         throw new Error(`an instance is already running in ${home} (process group ${previous.group}); stop it first`);
@@ -558,7 +560,7 @@ async function start(...argv) {
 
 /** stop: see the usage at the top. */
 function stop() {
-    const home = instanceHome();
+    const home = instanceFolder();
     const record = recordIfAny(home);
     if (!record) { throw new Error(`${home} does not hold an instance (instance.json)`); }
     if (instanceProcesses(record).length > 0 && !stopProcesses(['--group', String(record.group)])) {
@@ -615,7 +617,7 @@ const commands = {
     start,
     stop,
     status() {
-        const home = instanceHome();
+        const home = instanceFolder();
         const record = recordIfAny(home);
         if (!record) { throw new Error(`${home} does not hold an instance (instance.json)`); }
         const { home: _, ...fields } = record;
@@ -624,7 +626,7 @@ const commands = {
     },
     field(name) {
         if (!name) { throw new UsageError('field needs a NAME'); }
-        const home = instanceHome();
+        const home = instanceFolder();
         const record = recordIfAny(home);
         if (!record) { throw new Error(`${home} does not hold an instance (instance.json)`); }
         console.log(record[name] ?? '');
