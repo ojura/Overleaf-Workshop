@@ -73,6 +73,11 @@ describe('git push check: edits of a document with ranges', () => {
         assert.deepStrictEqual(severities(f), ['warn']);
         assert.match(f[0].message, /comment by Ana on "commented span text" \(line 4\) shrinks to "ted span text"/);
     });
+    it('warns that a comment shrinks when the push replaces its last word, whose new text lands after it (measured: "commented span ")', () => {
+        const f = assessPush(state, [modify(splice(c + COMMENT.length - 4, c + COMMENT.length, 'TEXT'))]);
+        assert.deepStrictEqual(severities(f), ['warn']);
+        assert.match(f[0].message, /shrinks to "commented span "/);
+    });
     it('warns that a comment covers text the push changes inside it (measured: "comZZZted span text")', () => {
         const f = assessPush(state, [modify(splice(c + 3, c + 6, 'ZZZ'))]);
         assert.match(f[0].message, /then covers "comZZZted span text"/);
