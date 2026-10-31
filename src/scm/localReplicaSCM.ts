@@ -762,7 +762,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return {ok: true, landed: target, overleaf, summary: before, note: 'Overleaf already holds the commit'};
         }
         if (!await git.isAncestor(head, target)) {
-            return {ok: false, error: `${commit} does not descend from the checked-out commit ${head.slice(0, 7)}; rebase it onto ${head.slice(0, 7)} first`};
+            return {ok: false, error: `${commit} does not descend from the checked-out commit ${head.slice(0, 7)}; merge that commit into it first (git pull --no-rebase, or git merge ${head.slice(0, 7)})`};
         }
         const changes = await git.text(['status', '--porcelain', '--untracked-files=no']);
         if (changes) { return {ok: false, error: `the folder has changes that are not committed:\n${changes}`}; }

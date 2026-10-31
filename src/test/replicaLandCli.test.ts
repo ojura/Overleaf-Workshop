@@ -173,7 +173,7 @@ describe('replica-land', function () {
         git(t.folder, 'commit', '--quiet', '--allow-empty', '-m', 'local, not on Overleaf');
         await assert.rejects(landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit: sibling }), /is not the checked-out commit/);
         git(t.folder, 'update-ref', OVERLEAF_REF, 'HEAD');
-        await assert.rejects(landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit: sibling }), /does not descend from Overleaf's state/);
+        await assert.rejects(landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit: sibling }), /does not descend from Overleaf's state .*; merge that state into it first \(git pull --no-rebase/);
     });
 
     it('compiles again while another compile runs, and fails the landing on a LaTeX error', async () => {

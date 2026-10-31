@@ -208,7 +208,7 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
     if (synced.git?.unmerged?.length) { throw new LandError(`the replica has conflicts to resolve: ${synced.git.unmerged.join(', ')}`); }
     const commit = repo.mustCommit(options.commit ?? head);
     if (commit !== head && !repo.isAncestor(head, commit)) {
-        throw new LandError(`${commit.slice(0, 7)} does not descend from Overleaf's state ${head.slice(0, 7)}; rebase it onto ${head.slice(0, 7)} first`);
+        throw new LandError(`${commit.slice(0, 7)} does not descend from Overleaf's state ${head.slice(0, 7)}; merge that state into it first (git pull --no-rebase in the clone it comes from, or git merge ${head.slice(0, 7)})`);
     }
     const report: LandReport = { commit, parent: head, pushed: false };
 
