@@ -379,3 +379,34 @@ describe('VirtualFileSystem: a rename or a move made on Overleaf', () => {
         assert.deepStrictEqual(t.batches, [[{ type: Deleted, path: '/chapters/ch' }, { type: Created, path: '/parts/ch', renamedFrom: '/chapters/ch' }]]);
     });
 });
+
+describe('VirtualFileSystem: a folder moved or deleted on Overleaf', () => {
+    /** A project with the folders "chapters", holding the document "one.tex", and "parts"; the paths its tree holds. */
+    function project() {
+        const handlers: any = {};
+        const vfs = Object.create(VirtualFileSystem.prototype);
+        vfs.socket = { isUsingAlternativeConnectionScheme: false, updateEventHandlers(h: any) { Object.assign(handlers, h); } };
+        vfs.notify = () => {};
+        vfs.pathToUri = (...parts: string[]) => ({ path: parts.join('/').replace(/\/+/g, '/') });
+        vfs.root = { rootFolder: [{ _id: 'root', name: 'rootFolder', docs: [], fileRefs: [], folders: [
+            { _id: 'chapters', name: 'chapters', docs: [{ _id: 'one', name: 'one.tex' }], fileRefs: [], folders: [] },
+            { _id: 'parts', name: 'parts', docs: [], fileRefs: [], folders: [] },
+        ] }] };
+        vfs.connections = [];
+        vfs.remoteWatch();
+        const paths = () => vfs.walk(() => true).map((e: any) => e.path).sort();
+        return { handlers, paths };
+    }
+
+    it('holds a moved folder at its new path only', () => {
+        const t = project();
+        t.handlers.onFileMoved('chapters', 'parts');
+        assert.deepStrictEqual(t.paths(), ['/', '/parts', '/parts/chapters', '/parts/chapters/one.tex']);
+    });
+
+    it('holds a deleted folder nowhere', () => {
+        const t = project();
+        t.handlers.onFileRemoved('chapters');
+        assert.deepStrictEqual(t.paths(), ['/', '/parts']);
+    });
+});

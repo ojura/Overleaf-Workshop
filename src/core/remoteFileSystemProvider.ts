@@ -623,6 +623,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         root = root || this.root.rootFolder[0];
         path = path || '/';
 
+        // the project's root folder; any other folder is found in the folder that holds it, its parent
         if (root._id === entityId) {
             return {parentFolder: root, fileType: 'folder', fileEntity: root, path};
         } else {
@@ -635,8 +636,11 @@ export class VirtualFileSystem extends vscode.Disposable {
                     return {parentFolder: root, fileType: _type as FileType, fileEntity: entity, path:path+entity.name};
                 }
             }
-            // recursive search
+            // the folders in root, then what they hold
             for (const folder of root.folders) {
+                if (folder._id === entityId) {
+                    return {parentFolder: root, fileType: 'folder', fileEntity: folder, path: path+folder.name+'/'};
+                }
                 const res = this._resolveById(entityId, folder, path+folder.name+'/');
                 if (res) { return res; }
             }
@@ -784,7 +788,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             onFileMoved: (entityId:string, folderId:string) => {
                 const oldPath = this._resolveById(entityId);
                 const newPath = this._resolveById(folderId);
-                if (oldPath && newPath) {
+                // a move into the folder that holds it already changes nothing
+                if (oldPath && newPath && oldPath.parentFolder!==newPath.fileEntity) {
                     const newParentFolder = newPath.fileEntity as FolderEntity;
                     this.insertEntity(newParentFolder, oldPath.fileType, oldPath.fileEntity);
                     this.removeEntity(oldPath.parentFolder, oldPath.fileType, oldPath.fileEntity);
