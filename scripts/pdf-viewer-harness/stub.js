@@ -1,0 +1,93 @@
+// Stands in for VS Code's webview API and for the extension host's side of the viewer's
+// messages, in the harness page (server.mjs). Loaded as a classic script before the viewer's
+// modules, as VS Code defines acquireVsCodeApi before the extension's scripts run.
+(() => {
+    const doc = new URL(document.currentScript.src).searchParams.get('doc') || 'book';
+    const syncJSON = (url) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url, false);
+        xhr.send();
+        return JSON.parse(xhr.responseText || 'null');
+    };
+    let hostState = syncJSON(`/state?doc=${encodeURIComponent(doc)}`);
+    const builds = syncJSON('/builds');
+    let currentBuild = new URLSearchParams(location.search).get('build') || 'a';
+    const t0 = performance.now();
+    const events = [];
+    const log = (type, data = {}) => { events.push({ t: Math.round(performance.now() - t0), type, ...data }); };
+    const deliver = (message) => window.postMessage(message, '*');
+    const themes = {
+        default: { fontColor: '#000000', bgColor: '#FFFFFF' },
+        light: { fontColor: '#000000', bgColor: '#F5F5DC' },
+        dark: { fontColor: '#FBF0D9', bgColor: '#4B4B4B' },
+    };
+    const stateKey = `vscode-state:${doc}`;
+    const api = {
+        postMessage(message) { handle(message); },
+        getState() { return JSON.parse(sessionStorage.getItem(stateKey) || 'null'); },
+        setState(state) { sessionStorage.setItem(stateKey, JSON.stringify(state)); return state; },
+    };
+    let acquired = false;
+    window.acquireVsCodeApi = () => {
+        if (acquired) { throw new Error('An instance of the VS Code API has already been acquired'); }
+        acquired = true;
+        return api;
+    };
+    const loadMessage = (build) => ({ type: 'load', output: builds[build] });
+    async function handle(message) {
+        switch (message?.type) {
+            case 'ready':
+                log('ready');
+                deliver({ type: 'initState', content: hostState ?? undefined, colorThemes: themes, defaults: { scrollMode: 'vertical', spreadMode: 'none' } });
+                deliver(loadMessage(currentBuild));
+                log('load', { build: currentBuild });
+                break;
+            case 'saveState':
+                hostState = message.content;
+                fetch(`/state?doc=${encodeURIComponent(doc)}`, { method: 'POST', body: JSON.stringify(message.content) });
+                log('saveState');
+                break;
+            case 'fetch': {
+                const range = (message.headers || []).find(([name]) => name.toLowerCase() === 'range')?.[1];
+                log('fetch', { url: new URL(message.url).pathname.replace(/^.*\/(build|content)\//, '$1/'), range });
+                const res = await fetch('/bridge', { method: 'POST', body: JSON.stringify(message) });
+                const error = res.headers.get('x-bridge-error');
+                if (error) {
+                    deliver({ type: 'fetchError', id: message.id, message: decodeURIComponent(error) });
+                    log('fetchError', { message: decodeURIComponent(error) });
+                    break;
+                }
+                const meta = JSON.parse(res.headers.get('x-bridge'));
+                const body = await res.arrayBuffer();
+                deliver({ type: 'fetchResponse', ...meta, body });
+                break;
+            }
+            case 'fetchAbort':
+                fetch('/bridge-abort', { method: 'POST', body: JSON.stringify({ id: message.id }) });
+                log('fetchAbort', { id: message.id });
+                break;
+            default:
+                log(message?.type ?? 'unknown', { content: message?.content });
+        }
+    }
+    // VS Code's webview adds its keydown listener to the page's window when the page has loaded
+    // (handleInnerKeydown in pre/index.html, bubble phase) and passes each key on to VS Code.
+    window.addEventListener('load', () => {
+        window.addEventListener('keydown', (e) => log('did-keydown', { key: e.key, ctrl: e.ctrlKey, shift: e.shiftKey, meta: e.metaKey }));
+    });
+    window.harness = {
+        events,
+        log,
+        builds,
+        /** the host's 'load' after a new compile */
+        load(build) { currentBuild = build; log('load', { build }); deliver(loadMessage(build)); },
+        /** the host's 'update', with the whole PDF */
+        async update(build) {
+            const data = await (await fetch(`/whole?build=${build}`)).arrayBuffer();
+            log('update', { build, bytes: data.byteLength });
+            deliver({ type: 'update', content: data });
+        },
+        syncCode(boxes) { log('syncCode'); deliver({ type: 'syncCode', content: boxes }); },
+        messages(type) { return events.filter(e => e.type === type); },
+    };
+})();
