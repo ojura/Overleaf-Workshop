@@ -435,6 +435,33 @@ describe('ReplicaSync', () => {
         assert.strictEqual(t.remote.docs.get('/main.tex'), text + 'written by another program\n');
     });
 
+    it('flush answers what its scan synced, and leaves out files written a moment ago', async () => {
+        const t = setup();
+        t.remote.docs.set('/main.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        t.local.set('/main.tex', text + 'written by another program\n');
+        const written = t.local.clock;
+        // a periodic scan right after the write: the file may still be half written
+        const early = await sync.flush(true, {skipRecentMs: 2000, now: written + 1000});
+        assert.deepStrictEqual(early.uploaded, []);
+        assert.strictEqual(t.remote.docs.get('/main.tex'), text);
+        const later = await sync.flush(true, {skipRecentMs: 2000, now: written + 5000});
+        assert.deepStrictEqual(later.uploaded, ['/main.tex']);
+        assert.strictEqual(t.remote.docs.get('/main.tex'), text + 'written by another program\n');
+        // without a scan, flush only waits, and answers that it synced nothing
+        assert.deepStrictEqual((await sync.flush(false)).uploaded, []);
+    });
+
+    it('knows which files it synced before', async () => {
+        const t = setup();
+        t.remote.docs.set('/main.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        assert.strictEqual(await sync.knows('/main.tex'), true);
+        assert.strictEqual(await sync.knows('/new.tex'), false);
+    });
+
     it('never syncs ignored files or the .overleaf folder', async () => {
         const t = setup();
         t.remote.docs.set('/main.tex', text);

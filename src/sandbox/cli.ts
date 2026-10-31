@@ -10,6 +10,8 @@ import { formatProjectInfo, gatherProjectInfo } from './projectInfo';
 import { SandboxSafetyError } from './guard';
 import { LockTimeoutError } from './lock';
 import { describeFindings, describeRanges, exitStatusOf, pushCheck, RANGES_HELP } from './rangesCli';
+import { ControlAnswer, NoReplicaWindowError, ReplicaTimeoutError, requestReplica } from '../scm/replicaControl';
+import { describe, SyncSummary } from '../scm/replicaSync';
 import {
     createSandbox, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions, sandboxStatus, sandboxUrl,
     settingsOf,
@@ -17,7 +19,7 @@ import {
 
 const HELP = `Compile a local directory on Overleaf, in a private copy of a shared project;
 describe a project; reach it through Overleaf's git bridge, and check what a push
-would do to its comments and tracked changes.
+would do to its comments and tracked changes; and have the IDE sync a local replica.
 
 usage:
   node out/sandbox/cli.js init    --replica <folder> [--name <name>]
@@ -31,6 +33,8 @@ usage:
   node out/sandbox/cli.js git-clone (--replica <folder> | --project <id>) --into <folder> [--server <name>]
   node out/sandbox/cli.js git-fetch --into <folder>
   node out/sandbox/cli.js git-credential get|store|erase --server <name> --bridge <url>
+  node out/sandbox/cli.js replica-sync   --replica <folder> [--timeout <s>] [--json]
+  node out/sandbox/cli.js replica-status --replica <folder> [--json]
 
 --replica <folder>  the shared project's local replica. Its .overleaf/settings.json names
                     the project; .overleaf/sandbox.json records the private copy.
@@ -121,6 +125,20 @@ Exit status: 0 the compile's status is "success"; 3 the compile ran with another
 status (failure, timedout, ...) and its results are saved; 1 the tool failed; 2 wrong
 arguments.
 
+replica-sync    Asks the IDE window that keeps the replica in sync with Overleaf to look
+                for files changed on disk, upload them, and wait until Overleaf has
+                acknowledged every local change so far; e.g. after a program wrote files
+                into the folder. The window answers on a local socket, also while it is in
+                the background, and does not come to the front. It also scans when
+                overleaf-workshop.localReplica.syncOnFileChange is off.
+replica-status  Shows whether the window is connected to Overleaf, how it watches the
+                folder, and what it synced in the last 10 minutes.
+--timeout <s>   how long to wait for the window's answer; default 300
+Exit status of both: 0 in sync (replica-status: the window answered); 3 a file could not
+be synced or has conflict markers, listed; 4 no IDE window keeps the folder in sync (the
+IDE is not running, or it has not opened the folder as a replica); 5 the window did not
+answer in time; 1 the tool failed; 2 wrong arguments.
+
 Safety: the tool writes only to the project recorded in .overleaf/sandbox.json, which
 init created, and refuses the shared project's id and every other one. Before each
 write it joins the copy again and stops unless this account owns it, it has no
@@ -134,7 +152,8 @@ names the database. The environment variable OVERLEAF_LOGIN, a JSON object
 `;
 
 const VALUE_FLAGS = new Set(['replica', 'dir', 'main', 'out', 'keep', 'ignore', 'include', 'lock-timeout', 'purpose', 'name', 'state-db',
-    'project', 'repo', 'from', 'to', 'user', 'server', 'into', 'bridge']);
+    'project', 'repo', 'from', 'to', 'user', 'server', 'into', 'bridge',
+    'timeout']);
 const GIT_AND_INFO_COMMANDS = ['project-info', 'git-token', 'git-clone', 'git-fetch', 'git-credential'];
 const OBJECT_ID = /^[0-9a-f]{24}$/;
 const REPEATABLE = new Set(['keep', 'ignore', 'include']);
@@ -278,6 +297,33 @@ async function gitAndInfoCommand(command: string, values: Record<string, string>
     return 0;
 }
 
+/** replica-sync and replica-status: ask the IDE window that keeps the replica in sync. */
+async function replicaCommand(command: 'replica-sync' | 'replica-status', folder: string, timeoutS: number, json: boolean): Promise<number> {
+    let answer: ControlAnswer;
+    try {
+        answer = await requestReplica(folder, { op: command === 'replica-sync' ? 'sync' : 'status' }, timeoutS * 1000);
+    } catch (error: any) {
+        if (error instanceof NoReplicaWindowError) { log(error.message); return 4; }
+        if (error instanceof ReplicaTimeoutError) { log(error.message); return 5; }
+        throw error;
+    }
+    if (json) {
+        process.stdout.write(JSON.stringify(answer, null, 2) + '\n');
+    } else {
+        const a = answer as any;
+        const lines = [`${a.folder ?? folder}: ${a.connected ? 'connected to' : 'not connected to'} ${a.project?.server ?? 'Overleaf'} ("${a.project?.name ?? '?'}"), changes reported by ${a.watcher === 'node' ? "Node's watcher" : "the IDE's file events"}${a.fullSyncRunning ? ', a full sync is running' : ''}`];
+        if (a.summary) { lines.push(`this sync: ${describe(a.summary as SyncSummary)}`); }
+        if (!answer.ok) { lines.push(`not in sync: ${answer.error}`); }
+        const recent = (a.recent ?? []) as Array<{ path: string, what: string, at: string }>;
+        lines.push(recent.length
+            // local time, as in the IDE's log of the replica
+            ? `synced in the last 10 minutes: ${recent.map(r => `${r.path} ${r.what} at ${new Date(r.at).toTimeString().slice(0, 8)}`).join(', ')}`
+            : 'synced in the last 10 minutes: nothing');
+        process.stdout.write(lines.join('\n') + '\n');
+    }
+    return answer.ok ? 0 : 3;
+}
+
 async function main(argv: string[]): Promise<number> {
     const { values, lists, flags, positional } = parseArgs(argv);
     const command = positional[0];
@@ -288,7 +334,7 @@ async function main(argv: string[]): Promise<number> {
     if (GIT_AND_INFO_COMMANDS.includes(command)) {
         return gitAndInfoCommand(command, values, flags, positional);
     }
-    if (!['init', 'status', 'compile', 'plan', 'ranges', 'push-check'].includes(command)) { throw new UsageError(`unknown command ${command}`); }
+    if (!['init', 'status', 'compile', 'plan', 'ranges', 'push-check', 'replica-sync', 'replica-status'].includes(command)) { throw new UsageError(`unknown command ${command}`); }
     if (positional.length > 1) { throw new UsageError(`unexpected argument ${positional[1]}`); }
     if (command === 'ranges' || command === 'push-check') {
         const { serverName, projectId } = serverAndProject(values);
@@ -306,6 +352,11 @@ async function main(argv: string[]): Promise<number> {
         return exitStatusOf(result.findings);
     }
     if (!values.replica) { throw new UsageError('--replica is required'); }
+    if (command === 'replica-sync' || command === 'replica-status') {
+        const timeoutS = Number(values.timeout ?? 300);
+        if (!(timeoutS > 0)) { throw new UsageError('--timeout takes a number of seconds'); }
+        return await replicaCommand(command, path.resolve(values.replica), timeoutS, flags.has('json'));
+    }
 
     const replica = readReplica(path.resolve(values.replica));
     const login = readStoredLogin(replica.serverName, values['state-db']);

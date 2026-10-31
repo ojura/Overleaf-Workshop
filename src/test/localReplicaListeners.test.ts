@@ -114,6 +114,21 @@ function load(mock: any) {
 
 const settle = async () => { for (let i = 0; i < 50; i++) { await new Promise(resolve => setImmediate(resolve)); } };
 
+// the replicas below start a control socket (src/scm/replicaControl.ts): keep it out of the
+// user's runtime folder
+let savedRuntime: string | undefined;
+let runtime: string;
+beforeEach(() => {
+    savedRuntime = process.env.XDG_RUNTIME_DIR;
+    runtime = require('fs').mkdtempSync(path.join(require('os').tmpdir(), 'ow-runtime-'));
+    require('fs').chmodSync(runtime, 0o700);
+    process.env.XDG_RUNTIME_DIR = runtime;
+});
+afterEach(() => {
+    if (savedRuntime === undefined) { delete process.env.XDG_RUNTIME_DIR; } else { process.env.XDG_RUNTIME_DIR = savedRuntime; }
+    require('fs').rmSync(runtime, { recursive: true, force: true });
+});
+
 describe('LocalReplicaSCMProvider when the first sync fails', () => {
     it('keeps its listeners, reports the failure and uploads later changes', async () => {
         const { w, mock } = world();
@@ -123,6 +138,7 @@ describe('LocalReplicaSCMProvider when the first sync fails', () => {
         const vfs = {
             origin, serverName: 'www.overleaf.com', projectName: 'project', projectId: 'p',
             pathToUri: (...parts: string[]) => Uri.joinPath(origin, ...parts),
+            onDidChangeFiles: () => ({ dispose() {} }),
             getProjectSCMPersist: () => ({ settings: {} }),
             setProjectSCMPersist: () => {},
             init: async () => { throw new Error('getaddrinfo EAI_AGAIN www.overleaf.com'); },
@@ -163,6 +179,7 @@ describe('LocalReplicaSCMProvider when a live sync fails', () => {
         const vfs = {
             origin, serverName: 'www.overleaf.com', projectName: 'project', projectId: 'p',
             pathToUri: (...parts: string[]) => Uri.joinPath(origin, ...parts),
+            onDidChangeFiles: () => ({ dispose() {} }),
             getProjectSCMPersist: () => ({ settings: {} }),
             setProjectSCMPersist: () => {},
             init: async () => ({ rootFolder: [{ _id: 'root', name: 'rootFolder', docs: [], fileRefs: [], folders: [] }] }),

@@ -7,10 +7,22 @@ import {
     SavedState, SyncSummary,
 } from './replicaSync';
 import { DEFAULT_IGNORE_PATTERNS } from './ignorePatterns';
+import { LocalFolderWatcher } from './localFolderWatcher';
+import { ControlAnswer, ControlRequest, ReplicaControlServer } from './replicaControl';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 /** Where the sync keeps its state inside the local folder. Paths in `.overleaf` are never synced. */
 const SYNC_FOLDER = '.overleaf/sync';
+
+/**
+ * How often a replica that syncs the changes of other programs also scans its folder, in case a
+ * watcher missed a change, e.g. when the system's queue of file events overflowed.
+ */
+const SCAN_INTERVAL_MS = 60_000;
+/** A periodic scan leaves out files written this recently, which may still be half written. */
+const SCAN_SKIP_RECENT_MS = 2_000;
+/** How long the replica remembers what it synced, for tools that ask. */
+const RECENT_MS = 10 * 60_000;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -43,8 +55,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     /** a notice about files that failed to sync is open */
     private failureNoticeOpen = false;
     private running = 0;
-    private vfsWatcher?: vscode.FileSystemWatcher;
+    /** the IDE's watcher of the local folder, only where Node's watcher cannot watch it */
     private localWatcher?: vscode.FileSystemWatcher;
+    /** what reports changes of the local folder: Node's watcher, or the IDE's */
+    private watchedBy: 'node' | 'ide' = 'node';
+    private scanning?: Promise<void>;
+    /** the files synced in the last RECENT_MS, newest last */
+    private readonly recent: {path: string, what: string, at: string}[] = [];
     private ignorePatterns: string[] = [...DEFAULT_IGNORE_PATTERNS];
 
     constructor(
@@ -377,7 +394,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     if (choice===open) { vscode.window.showTextDocument(vscode.Uri.joinPath(this.baseUri, path)); }
                 });
             },
-            liveResult: (summary) => this.report(summary),
+            liveResult: (summary) => {
+                this.remember(summary);
+                this.report(summary);
+            },
         };
     }
 
@@ -439,6 +459,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         } else if (choice===upload) {
             await this.uploadUntracked();
         }
+    }
+
+    /** Note what a sync did, for tools that ask what happened. */
+    private remember(summary: SyncSummary) {
+        const at = new Date().toISOString();
+        const done: [string, string[]][] = [
+            ['uploaded', summary.uploaded], ['downloaded', summary.downloaded], ['merged', summary.merged],
+            ['deleted locally', summary.deletedLocal], ['deleted on Overleaf', summary.deletedRemote],
+            ['failed', summary.failed.map(f => f.path)],
+        ];
+        for (const [what, paths] of done) {
+            paths.forEach(path => this.recent.push({path, what, at}));
+        }
+        const oldest = new Date(Date.now() - RECENT_MS).toISOString();
+        while (this.recent.length>0 && (this.recent[0].at<oldest || this.recent.length>200)) { this.recent.shift(); }
     }
 
     /** Keep the SCM status on push or pull while event-driven work runs. */
@@ -528,6 +563,86 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         await Promise.all([...providers].filter(provider => provider.vfs===vfs).map(provider => provider.flush()));
     }
 
+    /**
+     * For tools and the "Sync Local Replica Now" command: look for files changed on disk,
+     * whatever `syncOnFileChange` says, upload them, wait until Overleaf has acknowledged every
+     * local change so far, and answer what the scan synced.
+     */
+    async syncNow(): Promise<SyncSummary> {
+        if (this.ready===undefined || this.sync===undefined) {
+            throw new Error(vscode.l10n.t('This local replica has not started.'));
+        }
+        await this.ready;
+        await this.fullSync;
+        return await this.sync.flush(true);
+    }
+
+    /** The command "Sync Local Replica Now", for every open replica. */
+    static async syncNowCommand() {
+        const open = [...providers].filter(provider => provider.sync!==undefined);
+        if (open.length===0) {
+            vscode.window.showInformationMessage(vscode.l10n.t('No local replica is open.'));
+            return;
+        }
+        for (const provider of open) {
+            const folder = provider.baseUri.fsPath;
+            try {
+                const summary = await provider.syncNow();
+                vscode.window.setStatusBarMessage(vscode.l10n.t('$(cloud) Overleaf: "{folder}" is in sync: {result}', {folder, result: describe(summary)}), 10000);
+                provider.report(summary);
+            } catch (error: any) {
+                vscode.window.showErrorMessage(vscode.l10n.t('The sync of "{folder}" with Overleaf failed: {error}.', {folder, error: String(error?.message ?? error)}));
+            }
+        }
+    }
+
+    /** Look for files changed on disk that no event reported, unless a full sync or a scan runs. */
+    private scanFolder(): Promise<void> | undefined {
+        if (this.scanning || this.fullSyncRunning || this.sync===undefined) { return this.scanning; }
+        const sync = this.sync;
+        this.scanning = sync.flush(true, {skipRecentMs: SCAN_SKIP_RECENT_MS})
+            .then(() => {}, error => log(`[${this.vfs.projectName}] The scan of the folder failed: ${error}`))
+            .finally(() => { this.scanning = undefined; });
+        return this.scanning;
+    }
+
+    /** Answer a tool's request on the control socket (src/scm/replicaControl.ts). */
+    private async answerTool(request: ControlRequest): Promise<ControlAnswer> {
+        const state = {
+            folder: this.baseUri.fsPath,
+            project: {id: this.vfs.projectId, name: this.vfs.projectName, server: this.vfs.serverName},
+            connected: this.vfs.connected,
+            watcher: this.watchedBy,
+            fullSyncRunning: this.fullSyncRunning,
+        };
+        if (request.op==='status') {
+            return {ok: true, ...state, recent: [...this.recent]};
+        }
+        const summary = await this.syncNow();
+        const problems = [
+            ...summary.failed.map(f => `${f.path}: ${f.error}`),
+            ...summary.conflicts.map(path => `${path}: conflict markers to resolve`),
+        ];
+        return problems.length===0
+            ? {ok: true, ...state, summary, recent: [...this.recent]}
+            : {ok: false, error: problems.join('; '), ...state, summary, recent: [...this.recent]};
+    }
+
+    /**
+     * Node reports created, changed and removed files alike. Without `syncOnFileChange` only
+     * creations and removals sync, as with the IDE's watcher: a file that was synced before and
+     * is still there was changed.
+     */
+    private async localEvent(sync: ReplicaSync, path: string, syncOnFileChange: boolean, onLocal: (path: string) => void) {
+        if (syncOnFileChange) {
+            onLocal(path);
+            return;
+        }
+        let exists = true;
+        try { await vscode.workspace.fs.stat(vscode.Uri.joinPath(this.baseUri, path)); } catch { exists = false; }
+        if (exists !== await sync.knows(path)) { onLocal(path); }
+    }
+
     private async initWatch() {
         // write ".overleaf/settings.json" if not exist
         const settingUri = vscode.Uri.joinPath(this.baseUri, '.overleaf/settings.json');
@@ -557,39 +672,76 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         folderSyncs.set(key, record);
         this.sync = sync;
 
-        this.vfsWatcher = vscode.workspace.createFileSystemWatcher(
-            new vscode.RelativePattern( this.vfs.origin, '**/*' )
-        );
-        this.localWatcher = vscode.workspace.createFileSystemWatcher(
-            new vscode.RelativePattern( this.baseUri.path, '**/*' )
-        );
-
         const syncOnFileChange = vscode.workspace
             .getConfiguration('overleaf-workshop.localReplica.syncOnFileChange')
             .get<boolean>('enabled', false);
-        const onLocal = (uri: vscode.Uri) => {
-            const path = this.localPath(uri);
-            if (path!==undefined && !path.startsWith('/.overleaf/')) {
+        const onLocal = (path: string) => {
+            if (!path.startsWith('/.overleaf/') && path!=='/.overleaf') {
                 this.track('push', path, sync.localChanged(path));
             }
         };
-        const onRemote = (deleted: boolean) => (uri: vscode.Uri) => {
-            const path = this.remotePath(uri);
+        const onLocalUri = (uri: vscode.Uri) => {
+            const path = this.localPath(uri);
+            if (path!==undefined) { onLocal(path); }
+        };
+        const onRemote = (path: string, deleted: boolean) => {
             this.track('pull', path, sync.remoteChanged(path, deleted));
         };
 
         const listeners: vscode.Disposable[] = [
-            // sync from vfs to local
-            this.vfsWatcher.onDidChange(onRemote(false)),
-            this.vfsWatcher.onDidCreate(onRemote(false)),
-            this.vfsWatcher.onDidDelete(onRemote(true)),
-            // sync from local to vfs: saves in the editor always, and with `syncOnFileChange`
-            // also changes that other programs write; the saved sync state keeps the two
-            // from uploading a file twice and our own writes from coming back as uploads
-            vscode.workspace.onDidSaveTextDocument(doc => onLocal(doc.uri)),
-            ...(syncOnFileChange ? [this.localWatcher.onDidChange(onLocal)] : []),
-            this.localWatcher.onDidCreate(onLocal),
-            this.localWatcher.onDidDelete(onLocal),
+            // Overleaf's side: the project reports its changes here directly, not through the
+            // window as a file system watcher would
+            this.vfs.onDidChangeFiles(events => {
+                for (const event of events) {
+                    onRemote(this.remotePath(event.uri), event.type===vscode.FileChangeType.Deleted);
+                }
+            }),
+            // saves in the editor always sync; the saved sync state keeps a save and the
+            // watcher's event of the same change from uploading the file twice, and our own
+            // writes from coming back as uploads
+            vscode.workspace.onDidSaveTextDocument(doc => onLocalUri(doc.uri)),
+        ];
+
+        // The local side: Node's watcher, which reports to the extension host directly. The
+        // IDE's watcher only where Node's cannot watch the folder.
+        const folderWatcher = new LocalFolderWatcher(
+            this.baseUri.fsPath,
+            path => { void this.localEvent(sync, path, syncOnFileChange, onLocal); },
+            reason => {
+                log(`[${this.vfs.projectName}] Looking at the whole folder: ${reason}.`);
+                void this.scanFolder();
+            },
+            path => path==='/.overleaf' || path.startsWith('/.overleaf/'),
+        );
+        const watching = folderWatcher.start();
+        if (watching.ok) {
+            this.watchedBy = 'node';
+            listeners.push({dispose: () => folderWatcher.dispose()});
+        } else {
+            this.watchedBy = 'ide';
+            log(`[${this.vfs.projectName}] Node cannot watch "${this.baseUri.fsPath}" (${watching.reason}); the IDE's file events are used, which the window passes on.`);
+            this.localWatcher = vscode.workspace.createFileSystemWatcher(
+                new vscode.RelativePattern( this.baseUri.path, '**/*' )
+            );
+            listeners.push(
+                ...(syncOnFileChange ? [this.localWatcher.onDidChange(onLocalUri)] : []),
+                this.localWatcher.onDidCreate(onLocalUri),
+                this.localWatcher.onDidDelete(onLocalUri),
+            );
+        }
+        // in case a watcher missed a change
+        if (syncOnFileChange) {
+            const timer = setInterval(() => { void this.scanFolder(); }, SCAN_INTERVAL_MS);
+            timer.unref?.();
+            listeners.push({dispose: () => clearInterval(timer)});
+        }
+
+        // tools ask for a sync on the control socket
+        const control = new ReplicaControlServer(this.baseUri.fsPath, request => this.answerTool(request),
+                                                 message => log(`[${this.vfs.projectName}] ${message}`));
+        void control.start();
+        listeners.push(
+            {dispose: () => control.dispose()},
             {dispose: () => {
                 providers.delete(this);
                 record.stopped ??= sync.stop();
@@ -597,7 +749,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     if (folderSyncs.get(key)===record) { folderSyncs.delete(key); }
                 });
             }},
-        ];
+        );
 
         // The full sync runs in the background. The listeners above are already active,
         // so changes on either side keep syncing when it fails or is cancelled.
@@ -624,17 +776,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     get triggers(): Promise<vscode.Disposable[]> {
         this.ready = this.initWatch();
-        return this.ready.then((watches) => {
-            if (this.vfsWatcher!==undefined && this.localWatcher!==undefined) {
-                return [
-                    this.vfsWatcher,
-                    this.localWatcher,
-                    ...watches,
-                ];
-            } else {
-                return [];
-            }
-        });
+        return this.ready.then((watches) => [
+            ...(this.localWatcher ? [this.localWatcher] : []),
+            ...watches,
+        ]);
     }
 
     public static get baseUriInputBox(): vscode.QuickPick<vscode.QuickPickItem> {

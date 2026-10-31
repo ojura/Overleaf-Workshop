@@ -196,6 +196,10 @@ export class VirtualFileSystem extends vscode.Disposable {
     private joinedOnce = false;
     /** Set while a lost connection is made again: settles with the project once it is joined. */
     private reconnecting?: {promise: Promise<ProjectEntity>, resolve: (project: ProjectEntity) => void};
+    /** Whether the project is joined on a working connection now, e.g. for a tool asking for the state. */
+    get connected(): boolean {
+        return this.joinedOnce && !this.disposed && this.reconnected===undefined && this.reconnecting===undefined;
+    }
     /** the tree before the connection was lost, whose documents keep their editing state */
     private previousRoot?: ProjectEntity;
     /** why the connection was lost again while a reconnect was still setting up the new one */
@@ -216,6 +220,13 @@ export class VirtualFileSystem extends vscode.Disposable {
     private clsiServerId?: string;
     private pdfDownloadDomain?: string;
     private notify: (events:vscode.FileChangeEvent[])=>void;
+    private readonly changes = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
+    /**
+     * The changes of this project's files, as they are reported to the IDE. Listeners in the
+     * extension host get them here directly: a file system watcher gets them only after a round
+     * trip through the window, which can stop passing file events on.
+     */
+    readonly onDidChangeFiles = this.changes.event;
     private clientManagerItem?: {manager: ClientManager, triggers: vscode.Disposable[]};
     private scmCollectionItem?: {collection: SCMCollectionProvider, triggers: vscode.Disposable[]};
 
@@ -233,6 +244,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             // dispose all triggers of scmCollection
             this.scmCollectionItem?.triggers.forEach((trigger) => trigger.dispose());
             this.scmCollectionItem = undefined;
+            this.changes.dispose();
             this.disposed = true;
             // disconnect socketio
             // this.socket.disconnect();
@@ -245,7 +257,10 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.userId = userId;
         this.projectId = projectId;
         this.context = context;
-        this.notify = notify;
+        this.notify = (events) => {
+            notify(events);
+            this.changes.fire(events);
+        };
 
         const res = GlobalStateManager.initSocketIOAPI(this.context, this.serverName, projectId);
         if (res) {

@@ -365,28 +365,39 @@ export class ReplicaSync {
 
     /**
      * Wait until the local changes made so far have reached Overleaf. With `scan`, first look
-     * for files changed on disk that no event reported, e.g. written by another program.
+     * for files changed on disk that no event reported, e.g. written by another program, and
+     * answer what the scan synced. `skipRecentMs` leaves out files written that recently, which
+     * may still be half written: a periodic scan gets them the next time.
      */
-    async flush(scan: boolean): Promise<void> {
+    async flush(scan: boolean, {skipRecentMs = 0, now = Date.now()} = {}): Promise<SyncSummary> {
         await this.load();
+        const summary = emptySummary();
         if (scan) {
             const localFiles = await this.local.list();
             const changed: string[] = [];
             for (const [path, stat] of localFiles) {
                 const entry = this.state.entries[path];
                 if (!this.tracked(path) || this.state.untracked.includes(path)) { continue; }
+                if (skipRecentMs>0 && now - stat.mtime < skipRecentMs) { continue; }
                 if (!entry || entry.size!==stat.size || entry.mtime!==stat.mtime) { changed.push(path); }
             }
             for (const path of Object.keys(this.state.entries)) {
                 if (!localFiles.has(path) && this.tracked(path)) { changed.push(path); }
             }
-            const mode: Mode = {deletions: 'apply', summary: emptySummary(), live: true};
+            const mode: Mode = {deletions: 'apply', summary, live: true};
             await Promise.all(changed.map(path => this.schedule(path, mode)));
             this.ui.liveResult(mode.summary);
         }
         await Promise.all([...this.slots.values()].map(slot => slot.tail));
         await this.remote.settled();
         this.scheduleSave();
+        return summary;
+    }
+
+    /** Whether the saved sync state has the file at `path`, i.e. whether it was synced before. */
+    async knows(path: string): Promise<boolean> {
+        await this.load();
+        return this.state.entries[path]!==undefined;
     }
 
     /** Stop syncing: drop the queued work, wait for the running work and save the state. */

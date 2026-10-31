@@ -357,6 +357,12 @@
         "category": "%extension.displayName%"
       },
       {
+        "command": "overleaf-workshop.localReplica.syncNow",
+        "title": "%commands.localReplica.syncNow.title%",
+        "enablement": "overleaf-workshop.activate",
+        "category": "%extension.displayName%"
+      },
+      {
         "command": "overleaf-workshop.compileManager.compile",
         "title": "%commands.compileManager.compile.title%",
         "icon": "$(debug-start)",

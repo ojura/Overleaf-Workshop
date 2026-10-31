@@ -29,6 +29,11 @@ export function activate(context: vscode.ExtensionContext) {
     const langIntellisenseProvider = new LangIntellisenseProvider(context, remoteFileSystemProvider);
     context.subscriptions.push( ...langIntellisenseProvider.triggers );
 
+    // Register: [scm] "Sync Local Replica Now", which tools can also ask for (src/scm/replicaControl.ts)
+    context.subscriptions.push(
+        vscode.commands.registerCommand(`${ROOT_NAME}.localReplica.syncNow`, () => LocalReplicaSCMProvider.syncNowCommand()),
+    );
+
     // activate vfs for local replica
     LocalReplicaSCMProvider.readSettings()
     .then(async setting => {

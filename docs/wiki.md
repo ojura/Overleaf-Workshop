@@ -334,6 +334,15 @@ The project-related metadata for local replica are located in `.overleaf/setting
 ```
 Most of the items are immutable, except for `enableCompileNPreview`, which is used to enable/disable the compile and preview feature in local folder. The default value is `false`.
 
+Files that other programs write into the local replica are uploaded as well when the setting `overleaf-workshop.localReplica.syncOnFileChange.enabled` is on. The extension watches the folder itself, and also scans it once a minute for a change it missed. With the setting off, saves in the editor, new files and removed files sync as they happen, and other changes wait for a sync.
+
+A program that writes files into the folder can wait until they are on Overleaf. The command "Sync Local Replica Now" uploads what changed, and so does the command-line tool, which asks the open window, also while the window is in the background:
+```
+node out/sandbox/cli.js replica-sync --replica <folder>
+node out/sandbox/cli.js replica-status --replica <folder>
+```
+The window answers on a local socket that only your account on the computer can reach, and names it in `.overleaf/control.json`.
+
 ### Invisible Mode
 > [!WARNING]
 > This feature is not considered robust yet, and may not work as expected, especially under unstable network environment.

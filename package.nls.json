@@ -43,6 +43,7 @@
     "commands.compileManager.compile.title": "Compile Project",
     "commands.compileManager.recompileFromScratch.title": "Recompile Project from Scratch",
     "commands.localReplica.toggleCompileNPreview.title": "Turn Compile and Preview On or Off for the Local Replica",
+    "commands.localReplica.syncNow.title": "Sync Local Replica Now",
     "commands.compileManager.viewPdf.title": "View Compiled PDF",
     "commands.compileManager.syncCode.title": "Jump to PDF",
     "commands.compileManager.setCompiler.title": "Set Compiler",
@@ -54,7 +55,7 @@
     "commands.collaboration.jumpToUser.title": "Jump to Collaborator ...",
 
     "configuration.compileOnSave.enabled.markdownDescription": "Always update the compiled PDF when a file is saved.",
-    "configuration.localReplica.syncOnFileChange.enabled.markdownDescription": "Sync Local Replica changes made by external tools. (Take effect after restarting VSCode)",
+    "configuration.localReplica.syncOnFileChange.enabled.markdownDescription": "Upload the changes that other programs make to the files of a Local Replica as they happen, and scan the folder once a minute for a change the watcher missed. When this is off, saves in the editor, new files and removed files sync as they happen, and other changes are uploaded by \"Sync Local Replica Now\" or the command-line tool's `replica-sync`. Takes effect after the window reloads.",
     "configuration.compileOutputFolderName.markdownDescription": "The name of the folder where the compiled output files (e.g., `output.pdf`) is located. (Take effect after restarting VSCode)",
     "configuration.pdfViewer.themes.markdownDescription": "Configure the color themes used by the PDF viewer. (Take effect after restarting VSCode)",
     "configuration.pdfViewer.themes.theme.description": "The name of the theme.",
