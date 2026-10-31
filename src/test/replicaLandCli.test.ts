@@ -64,7 +64,7 @@ describe('replica-land', function () {
     beforeEach(() => { scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'replica-land-cli-')); });
     afterEach(() => { fs.rmSync(scratch, { recursive: true, force: true }); });
 
-    /** A replica whose repository holds Overleaf's state, an IDE window that pushes as the extension does, and Overleaf. */
+    /** A replica with Overleaf's state in its repository, an IDE window that pushes as the extension does, and Overleaf. */
     function setup() {
         const folder = path.join(scratch, 'replica');
         fs.mkdirSync(folder);

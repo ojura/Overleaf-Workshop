@@ -15,12 +15,12 @@ import { gitMergeText } from './replicaGit';
  *
  * Files are compared by git blob SHA-1. Overleaf reports that hash for every binary file in
  * the project tree, so a binary file that matches is never downloaded again. A local file
- * whose size and modification time are those recorded at the last sync is not hashed again.
+ * with the size and modification time recorded at the last sync is not hashed again.
  *
  * Merges are git's (git merge-file). The extension's store (replicaGit.ts) keeps the bases in
  * the replica's git repository and, once the sync has been idle for `recordQuietMs`, records
  * them as a commit of Overleaf's state; the sync tells it where each change of a base came
- * from (`SavedState.changes`). A text file whose changes overlap is unmerged in git's index
+ * from (`SavedState.changes`). A text file with overlapping changes is unmerged in git's index
  * until the user resolves it, and is not uploaded meanwhile.
  *
  * A local file that appears with the content of a synced file that disappeared, as after a
@@ -103,7 +103,7 @@ export interface SavedState {
     entries: {[path: string]: SavedEntry},
     /** local files that were not on Overleaf at the first sync and stay local */
     untracked: string[],
-    /** the paths whose base changed since the store last recorded the state, and where each change came from */
+    /** the paths with a base that changed since the store last recorded the state, and where each change came from */
     changes?: {[path: string]: Origin},
 }
 
@@ -113,7 +113,7 @@ export interface ReplicaStore {
     save(state: SavedState): Promise<void>,
     readBase(hash: string): Promise<string | undefined>,
     writeBase(hash: string, text: string): Promise<void>,
-    /** Remove the saved base texts whose hash is not in `keep`. */
+    /** Remove the saved base texts with a hash that is not in `keep`. */
     pruneBases(keep: Set<string>): Promise<void>,
     /** Keep a copy of a local version that the sync replaces; returns where the copy is. */
     keepCopy(path: string, content: Uint8Array): Promise<string>,
@@ -135,7 +135,7 @@ export interface ReplicaUI {
     progress(done: number, total: number): void,
     /** Asked before deleting more than `deletionThreshold` files after a startup scan. */
     confirmDeletions(where: 'local' | 'remote', paths: string[]): Promise<boolean>,
-    /** Told once about each file whose conflict markers keep it from being uploaded. */
+    /** Told once about each file that its conflicts keep from being uploaded. */
     conflictBlocked(path: string): void,
     /** What the sync did for changes reported by events (not for `syncAll`). */
     liveResult(summary: SyncSummary): void,
@@ -809,7 +809,7 @@ export class ReplicaSync {
         }
         const merged = await this.merge(baseText, localText, remoteText);
         // Markers left from an earlier conflict merge cleanly with new changes, but must not be
-        // uploaded either; nor a merge into a file whose conflicts git's index still has
+        // uploaded either; nor a merge into a file that git's index still has unmerged
         if (merged.hasConflict || (entry.conflict && (hasConflictMarkers(merged.content) || await this.isUnmerged(path)))) {
             // Overlapping changes: write them with markers and upload nothing until they are resolved.
             await this.local.write(path, encoder.encode(merged.content));
@@ -878,8 +878,8 @@ export class ReplicaSync {
 
     /**
      * The synced file that a new local file at `path` with content `hash` replaces, as after a
-     * rename or a move: one whose local file is gone and that Overleaf still has with the same
-     * content. Undefined when there is none, or the remote side cannot rename.
+     * rename or a move: a synced path with no local file any more, which Overleaf still has
+     * with the same content. Undefined when there is none, or the remote side cannot rename.
      */
     private async renamedFrom(path: string, hash: string): Promise<string | undefined> {
         if (!this.remote.rename || !this.uploads) { return undefined; }

@@ -343,6 +343,21 @@ node out/sandbox/cli.js replica-status --replica <folder>
 ```
 The window answers on a local socket that only your account on the computer can reach, and names it in `.overleaf/control.json`.
 
+#### The replica's git repository
+
+The local replica is a git repository (`.git` in its folder, never uploaded), and git merges the changes made on both sides:
+- Overleaf's states are commits on `refs/remotes/overleaf/main`, made about ten seconds after a change: by the person the project's history names for an edit made on Overleaf, and by you (`user.name` and `user.email`) for an upload from the folder. The checked-out branch takes them as a fast-forward, or as a merge when it has commits of its own.
+- A document changed on both sides in the same place has git's conflict markers, and its path is unmerged in git's index. It is not uploaded until you resolve it and stage it (`git add`) or commit it.
+- A file renamed or moved locally is renamed or moved on Overleaf, so the document keeps its comments.
+
+A commit lands on Overleaf, is checked there file for file and is compiled with:
+```
+node out/sandbox/cli.js replica-land --replica <folder> <commit>
+```
+The commit must descend from the checked-out one, which Overleaf must hold. A development history that started from a copy of the project's files joins the replica's repository with `node out/gitbridge/cli.js replica-connect --replica <folder> --history <repository>`.
+
+The settings `overleaf-workshop.localReplica.fetchMode` and `overleaf-workshop.localReplica.pushMode` also bring in the commits of Overleaf's git bridge, or make pushes go through it. [docs/replica-workflows.md](replica-workflows.md) describes all of it.
+
 ### Invisible Mode
 > [!WARNING]
 > This feature is not considered robust yet, and may not work as expected, especially under unstable network environment.

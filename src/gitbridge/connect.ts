@@ -32,7 +32,7 @@ export class ConnectError extends Error {
 export interface Side { bridge: string; local: string; }
 
 /**
- * The commits whose trees are the project's state the local history started from: `start`
+ * The commits with the project's state the local history started from as their tree: `start`
  * when given (after a rebase, the commit the local history branches from), otherwise the
  * local history's first commits.
  */
@@ -178,7 +178,7 @@ export interface MergeResult {
     base?: string;
     own: string[];
     deletedOnOverleaf: string[];
-    /** project files whose content in the merge differs from the bridge's commit: the local changes a push carries */
+    /** project files with other content in the merge than in the bridge's commit: the local changes a push carries */
     carries: string[];
     /** paths both sides have with different content, where the bridge's version was taken */
     tookBridge: string[];

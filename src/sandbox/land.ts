@@ -311,7 +311,7 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
     return report;
 }
 
-/** Whether a report shows a landing whose compile and checks all passed. */
+/** Whether the landing's compile and checks all passed, by its report. */
 export function landedCleanly(report: LandReport): boolean {
     if (report.compile && (report.compile.status !== 'success' || !report.compile.check?.ok)) { return false; }
     return !report.hook || report.hook.status === 0;

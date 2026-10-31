@@ -286,7 +286,7 @@ async function main(argv: string[]): Promise<number> {
                 `rebase: ${result.rebase!.map.length} commits written again on ${short(result.rebase!.start)}${result.rebase!.startMade ? ' (made from the project\'s history)' : ''}; old and new ids in ${result.mapFile}`,
                 `merge: ${short(m.commit)} in ${CONNECT_REF}, on top of Overleaf's state; ${m.how === 'held' ? `the rewritten ${short(m.heldAt!)} holds Overleaf's state` : m.how === 'three-way' ? `a three-way merge from ${short(m.base!)}` : `the bridge's version taken for ${m.tookBridge.join(', ')}`}`,
                 `files the history adds to the project: ${m.own.length ? m.own.join(', ') : 'none'}`,
-                `project files whose content it changes: ${m.carries.length ? m.carries.join(', ') : 'none'}`,
+                `project files it changes: ${m.carries.length ? m.carries.join(', ') : 'none'}`,
                 ...(m.deletedOnOverleaf.length ? [`deleted on Overleaf, left out: ${m.deletedOnOverleaf.join(', ')}`] : []),
                 `next: node out/sandbox/cli.js replica-land --replica "${folder}" ${CONNECT_REF}`,
             ].join('\n') + '\n');

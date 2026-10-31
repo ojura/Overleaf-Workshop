@@ -98,7 +98,7 @@ The interface `Identity` define the format of login information persisted in [vs
 
 **Class**
 
-The `class BaseAPI` is the the only export class in this file, whose function can be split into following categories:
+The `class BaseAPI` is the only exported class in this file. Its functions fall into these categories:
 - **utility functions**: `setIdentity` which alter the global identity when necessary, `request` to apply http request with proper credentials, `download` to download large files possible with `206 Partial Content` status code
 - **login-related API**: `(private async) getCsrfToken`, `(private async) getUserId`, `(async) passportLogin`, `(async) cookiesLogin`, `(async) updateCookies`, `(async) logout`
 - **project management API**: `(async) userProjectsJson / getProjectsJson`, `(async) newProject`, `(async) renameProject`, `(async) deleteProject`, `(async) archiveProject`, `(async) unarchiveProject`, `(async) trashProject`, `(async) untrashProject`, `(async) getAllTags`, `(async) createTag`, `(async) renameTag`, `(async) deleteTag`, `(async) addProjectToTag`, `(async) removeProjectFromTag`
@@ -151,7 +151,7 @@ Considering the restrictions of the public API (some API used by `socketio` is m
 
 **Class**
 
-The `class SocketIOAlt` is the only export class in this file, whose implementation is tightly coupled with the [virtual filesystem](#srccoreremotefilesystemproviderts), and hence highly depends on the `vscode` API.
+The `class SocketIOAlt` is the only exported class in this file. Its implementation is tightly coupled with the [virtual filesystem](#srccoreremotefilesystemproviderts), so it depends heavily on the `vscode` API.
 The `class SocketIOAlt` extends the interface of native `socket.io-client`: `emit`, `on` and `disconnect`, and also fulfil the interface of `class SocketIOAPI` for alternative implementation.
 
 Specifically, the purposes of the major methods are listed below:
@@ -181,7 +181,7 @@ The export `class ClientManager` exposes features to vscode via `(get) triggers`
 
 #### `src/collaboration/chatViewProvider.ts`
 The export `class ChatViewProvider` exposes features to vscode via `(get) triggers` with:
-- **WebviewProvider**: the chat webview in the sidebar, whose source code is located in [views/chat-view](#viewschat-view)
+- **WebviewProvider**: the chat webview in the sidebar; its source code is in [views/chat-view](#viewschat-view)
 - **Commands**:
   - "${ROOT_NAME}.collaboration.copyLineRef": context menu to document editor to copy the line reference to clipboard
   - "${ROOT_NAME}.collaboration.insertLineRef": context menu to document editor to insert the line reference to the chat webview
@@ -211,7 +211,7 @@ The standalone module which consists of the most important components of this ex
 
 #### `src/core/pdfViewEditorProvider.ts`
 The export `class PdfViewEditorProvider` exposes features to vscode via `(get) triggers` with:
-- **CustomEditorProvider**: PDF viewer powered by `pdf.js`, whose source code is located in [views/pdf-viewer](#viewspdf-viewer).
+- **CustomEditorProvider**: the PDF viewer, built on `pdf.js`; its source code is in [views/pdf-viewer](#viewspdf-viewer).
 
 #### `src/core/projectManagerProvider.ts`
 The export `class ProjectManagerProvider` exposes features to vscode via `(get) triggers` with:
@@ -281,12 +281,13 @@ The export `class SCMCollectionProvider` exposes features to vscode via `(get) t
 It also proxies commands for `class HistoryDataProvider` via `(get) triggers`.
 
 #### `src/scm/localReplicaSCM.ts`
-The exported `LocalReplicaSCMProvider` implements the `BaseSCM` interface and supports the ["Open Project Locally"](wiki.md#open-project-locally) feature.
+The exported `LocalReplicaSCMProvider` implements the `BaseSCM` interface and supports the ["Open Project Locally"](wiki.md#open-project-locally) feature. It connects the sync (`replicaSync.ts`) with the project (through the VFS), with the local folder (Node's file functions, `localFolderFs.ts`, and its watcher, `localFolderWatcher.ts`) and with the replica's git repository (`replicaGit.ts`); it answers tools on the control socket (`replicaControl.ts`), and reads the fetch and push modes (`replicaModes.ts`).
 
-Since the local filesystem keeps no version information, at the start of project open, it always apply `this.overwrite` to overwrite local changes with overleaf server version.
-Therefore, if there is a network disturbance, your local changes or remote changes (by other collaborators) will be lost depending on `syncFromVFS` is called via `this.vfsWatcher` firstly, or `syncToVFS` is called via `this.localWatcher` firstly.
+#### `src/scm/replicaSync.ts`
+The sync of one folder with one project, file by file: it compares each side with the file's base (the content both sides had after its last sync), downloads, uploads, merges with `git merge-file`, renames on Overleaf what was renamed locally, and leaves alone what git's index has unmerged.
 
-A smarter solution is proposed in `(private async) overwrite`, but is not applied in the `this.writeFile`.
+#### `src/scm/replicaGit.ts`
+The replica's git repository: the bases as blobs, the sync's state in `.git/overleaf/state.json`, Overleaf's states as commits on `refs/remotes/overleaf/main` and their merge into the checked-out branch, and conflicts as unmerged index entries. [replica-workflows.md](replica-workflows.md) describes it.
 
 #### `src/scm/localGitBridgeSCM.ts`
 > Not completed now. Target to provide local git bridge via [isomorphic-git](https://github.com/isomorphic-git/isomorphic-git) without local file system or git client binary needed.

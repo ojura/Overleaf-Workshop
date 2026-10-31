@@ -603,7 +603,7 @@ describe('local replica: git as the merge backend', function () {
         assert.strictEqual(t.g('rev-parse', 'HEAD'), first);
         assert.deepStrictEqual(t.g('ls-tree', '-r', '--name-only', first).split('\n'), ['main.tex', 'slike/a.png']);
         assert.strictEqual(t.g('show', `${first}:main.tex`), saved.trimEnd());
-        // the local edit shows as a change; b.png, whose saved base is gone, syncs as a new file
+        // the local edit shows as a change; b.png, with its saved base gone, syncs as a new file
         assert.strictEqual(spawnSync('git', ['-C', t.folder, 'status', '--porcelain'], { encoding: 'utf8' }).stdout, ' M main.tex\n?? slike/b.png\n');
         assert.match(t.ui.logs.join('\n'), /no saved base any more.*\/slike\/b.png/);
         await sync.stop();

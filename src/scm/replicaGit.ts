@@ -406,14 +406,14 @@ export class GitReplicaStore implements ReplicaStore {
         return this.ready;
     }
 
-    private async sidecarFile(): Promise<string> {
+    private async stateFile(): Promise<string> {
         return path.join(await this.open(), 'overleaf', 'state.json');
     }
 
     // ---- ReplicaStore
 
     async load(): Promise<SavedState | undefined> {
-        const file = await this.sidecarFile();
+        const file = await this.stateFile();
         try {
             const saved = JSON.parse(await fsp.readFile(file, 'utf8')) as Sidecar;
             if (saved.project === this.options.projectId) { return this.lastState = saved.state; }
@@ -429,7 +429,7 @@ export class GitReplicaStore implements ReplicaStore {
     save(state: SavedState): Promise<void> {
         // one save at a time, each a new file renamed over the old one, so that a crash cannot leave half a state
         const save = this.saving.then(async () => {
-            const file = await this.sidecarFile();
+            const file = await this.stateFile();
             await fsp.mkdir(path.dirname(file), { recursive: true });
             const tmp = `${file}.${process.pid}.tmp`;
             await fsp.writeFile(tmp, JSON.stringify({ project: this.options.projectId, state } satisfies Sidecar));
@@ -631,8 +631,8 @@ export class GitReplicaStore implements ReplicaStore {
 
     /**
      * Record the sync's bases as Overleaf's state (see the top of this file), and merge it into
-     * the checked-out branch. `state.changes` says, for each path whose base changed since the
-     * last record, where the change came from; it is cleared by the caller after a record.
+     * the checked-out branch. `state.changes` lists the paths with a base that changed since the
+     * last record, and where each change came from; the caller clears it after a record.
      */
     async record(state: SavedState = this.lastState ?? { version: 1, entries: {}, untracked: [] }): Promise<RecordResult> {
         await this.open();
@@ -845,8 +845,8 @@ export class GitReplicaStore implements ReplicaStore {
 
     /**
      * Move the checked-out branch from `from` to `to`. The work tree already holds `to`'s files
-     * where they differ (the sync wrote them), so only the index follows: each changed path
-     * whose entry is `from`'s takes `to`'s; a path staged with other content, or unmerged,
+     * where they differ (the sync wrote them), so only the index follows: a changed path takes
+     * `to`'s entry where its entry is `from`'s; a path staged with other content, or unmerged,
      * stays as it is.
      */
     private async moveHead(from: string, to: string, fromTree: FlatTree, toTree: FlatTree, reason: string) {

@@ -472,7 +472,7 @@ describe('git bridge: connecting a development history with a local replica\'s r
         assert.strictEqual(again.already, result.rebase!.commit);
     });
 
-    it('refuses a replica whose checked-out commit is not Overleaf\'s state', async () => {
+    it('refuses a replica when its checked-out commit is not Overleaf\'s state', async () => {
         const s = scenario();
         const { replica } = replicaOf(s);
         commit(replica, { 'main.tex': 'a local change\n' }, 'Local', s.t0 + 700);
@@ -482,7 +482,7 @@ describe('git bridge: connecting a development history with a local replica\'s r
 
 describe('git bridge: joining the bridge\'s commits with a replica\'s', () => {
     const isProjectFile = (p: string) => !p.startsWith('.') && !p.endsWith('.aux');
-    /** A replica whose branch and Overleaf's ref hold `files`, recorded at `seconds`; a bridge with its own history. */
+    /** A replica with `files` in its branch and in Overleaf's ref, recorded at `seconds`; a bridge with its own history. */
     function setup(files: Record<string, string>, seconds: number) {
         const dir = tmp();
         const replica = newRepo(path.join(dir, 'replica'));
