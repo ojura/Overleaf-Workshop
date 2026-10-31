@@ -56,6 +56,13 @@
 
     "configuration.compileOnSave.enabled.markdownDescription": "Always update the compiled PDF when a file is saved.",
     "configuration.localReplica.syncOnFileChange.enabled.markdownDescription": "Upload the changes that other programs make to the files of a Local Replica as they happen, and scan the folder once a minute for a change the watcher missed. When this is off, saves in the editor, new files and removed files sync as they happen, and other changes are uploaded by \"Sync Local Replica Now\" or the command-line tool's `replica-sync`. Takes effect after the window reloads.",
+    "configuration.localReplica.fetchMode.markdownDescription": "How a Local Replica takes in the changes made on Overleaf. Only `native` is available so far; another value falls back to it with a notice. Takes effect after the window reloads.",
+    "configuration.localReplica.fetchMode.native": "Read Overleaf's state over the editor's connection, as the extension always has.",
+    "configuration.localReplica.fetchMode.mixed": "Native, and the git bridge's commits at chosen moments, such as a three-way merge. Not available yet.",
+    "configuration.localReplica.fetchMode.bridge": "Only the git bridge's commits. Not available yet.",
+    "configuration.localReplica.pushMode.markdownDescription": "How a Local Replica sends its changes to Overleaf. Only `native` is available so far; another value falls back to it with a notice. Takes effect after the window reloads.",
+    "configuration.localReplica.pushMode.native": "Upload over the editor's connection, as the extension always has.",
+    "configuration.localReplica.pushMode.bridge": "git push through the git bridge. Not available yet.",
     "configuration.compileOutputFolderName.markdownDescription": "The name of the folder where the compiled output files (e.g., `output.pdf`) is located. (Take effect after restarting VSCode)",
     "configuration.pdfViewer.themes.markdownDescription": "Configure the color themes used by the PDF viewer. (Take effect after restarting VSCode)",
     "configuration.pdfViewer.themes.theme.description": "The name of the theme.",

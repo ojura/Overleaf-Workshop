@@ -9,6 +9,7 @@ import {
 import { DEFAULT_IGNORE_PATTERNS } from './ignorePatterns';
 import { LocalFolderWatcher } from './localFolderWatcher';
 import { ControlAnswer, ControlRequest, ReplicaControlServer } from './replicaControl';
+import { ReplicaModes, replicaModes } from './replicaModes';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 /** Where the sync keeps its state inside the local folder. Paths in `.overleaf` are never synced. */
@@ -35,6 +36,8 @@ function log(message: string) {
 
 /** The sync working on each local folder, by the folder's URI. */
 const folderSyncs = new Map<string, {sync: ReplicaSync, stopped?: Promise<void>}>();
+/** The notices about fetch and push modes shown in this session, so that each shows once. */
+const modeNoticesShown = new Set<string>();
 /** The active providers, so that a compile can wait for their uploads. */
 const providers = new Set<LocalReplicaSCMProvider>();
 
@@ -59,6 +62,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private localWatcher?: vscode.FileSystemWatcher;
     /** what reports changes of the local folder: Node's watcher, or the IDE's */
     private watchedBy: 'node' | 'ide' = 'node';
+    /** the fetch and push modes in effect (src/scm/replicaModes.ts); only native is implemented so far */
+    private modes: ReplicaModes = {fetch: 'native', push: 'native'};
     private scanning?: Promise<void>;
     /** the files synced in the last RECENT_MS, newest last */
     private readonly recent: {path: string, what: string, at: string}[] = [];
@@ -613,6 +618,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             project: {id: this.vfs.projectId, name: this.vfs.projectName, server: this.vfs.serverName},
             connected: this.vfs.connected,
             watcher: this.watchedBy,
+            modes: this.modes,
             fullSyncRunning: this.fullSyncRunning,
         };
         if (request.op==='status') {
@@ -675,6 +681,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const syncOnFileChange = vscode.workspace
             .getConfiguration('overleaf-workshop.localReplica.syncOnFileChange')
             .get<boolean>('enabled', false);
+        const replicaSettings = vscode.workspace.getConfiguration('overleaf-workshop.localReplica');
+        const {modes, notices} = replicaModes({fetch: replicaSettings.get('fetchMode'), push: replicaSettings.get('pushMode')});
+        this.modes = modes;
+        log(`[${this.vfs.projectName}] Fetch mode ${modes.fetch}, push mode ${modes.push}.`);
+        for (const notice of notices) {
+            log(`[${this.vfs.projectName}] ${notice}`);
+            if (!modeNoticesShown.has(notice)) {
+                modeNoticesShown.add(notice);
+                void vscode.window.showInformationMessage(vscode.l10n.t('Overleaf Workshop: {0}', notice));
+            }
+        }
         const onLocal = (path: string) => {
             if (!path.startsWith('/.overleaf/') && path!=='/.overleaf') {
                 this.track('push', path, sync.localChanged(path));

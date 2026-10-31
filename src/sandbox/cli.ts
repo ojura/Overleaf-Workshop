@@ -311,7 +311,7 @@ async function replicaCommand(command: 'replica-sync' | 'replica-status', folder
         process.stdout.write(JSON.stringify(answer, null, 2) + '\n');
     } else {
         const a = answer as any;
-        const lines = [`${a.folder ?? folder}: ${a.connected ? 'connected to' : 'not connected to'} ${a.project?.server ?? 'Overleaf'} ("${a.project?.name ?? '?'}"), changes reported by ${a.watcher === 'node' ? "Node's watcher" : "the IDE's file events"}${a.fullSyncRunning ? ', a full sync is running' : ''}`];
+        const lines = [`${a.folder ?? folder}: ${a.connected ? 'connected to' : 'not connected to'} ${a.project?.server ?? 'Overleaf'} ("${a.project?.name ?? '?'}"), changes reported by ${a.watcher === 'node' ? "Node's watcher" : "the IDE's file events"}${a.modes ? `, fetch mode ${a.modes.fetch}, push mode ${a.modes.push}` : ''}${a.fullSyncRunning ? ', a full sync is running' : ''}`];
         if (a.summary) { lines.push(`this sync: ${describe(a.summary as SyncSummary)}`); }
         if (!answer.ok) { lines.push(`not in sync: ${answer.error}`); }
         const recent = (a.recent ?? []) as Array<{ path: string, what: string, at: string }>;

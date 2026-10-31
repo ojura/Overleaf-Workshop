@@ -466,6 +466,29 @@
           "scope": "machine",
           "markdownDescription": "%configuration.localReplica.syncOnFileChange.enabled.markdownDescription%"
         },
+        "overleaf-workshop.localReplica.fetchMode": {
+          "type": "string",
+          "enum": ["native", "mixed", "bridge"],
+          "markdownEnumDescriptions": [
+            "%configuration.localReplica.fetchMode.native%",
+            "%configuration.localReplica.fetchMode.mixed%",
+            "%configuration.localReplica.fetchMode.bridge%"
+          ],
+          "default": "native",
+          "scope": "machine",
+          "markdownDescription": "%configuration.localReplica.fetchMode.markdownDescription%"
+        },
+        "overleaf-workshop.localReplica.pushMode": {
+          "type": "string",
+          "enum": ["native", "bridge"],
+          "markdownEnumDescriptions": [
+            "%configuration.localReplica.pushMode.native%",
+            "%configuration.localReplica.pushMode.bridge%"
+          ],
+          "default": "native",
+          "scope": "machine",
+          "markdownDescription": "%configuration.localReplica.pushMode.markdownDescription%"
+        },
         "overleaf-workshop.compileOutputFolderName": {
           "type": "string",
           "default": ".output",
