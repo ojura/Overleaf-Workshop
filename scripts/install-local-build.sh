@@ -13,6 +13,8 @@
 #
 #   scripts/install-local-build.sh            build and install
 #   scripts/install-local-build.sh --check    only say what would be installed where
+# Exit status 1 when it installed into no extension folder (with --check: when it would install
+# into none), for example after an update of the installed extension to another version.
 set -eu
 repo=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo"
@@ -23,11 +25,15 @@ built_version=$(node -p "require('./package.json').version")
 if [ "$check" = no ]; then
     build=$(mktemp -d "${TMPDIR:-/tmp}/overleaf-workshop-build.XXXXXX")
     trap 'rm -rf "$build"' EXIT
+    # sh (dash) leaves without its EXIT trap when a signal ends it; these leave through exit
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     node node_modules/typescript/bin/tsc -p ./ --outDir "$build/out"
     node scripts/build-pdf-viewer.mjs
 fi
 
 found=0
+installed=0
 for ext in "$HOME"/.antigravity-ide/extensions/iamhyc.overleaf-workshop-* \
            "$HOME"/.vscode/extensions/iamhyc.overleaf-workshop-* \
            "$HOME"/.vscode-oss/extensions/iamhyc.overleaf-workshop-* \
@@ -41,6 +47,7 @@ for ext in "$HOME"/.antigravity-ide/extensions/iamhyc.overleaf-workshop-* \
     fi
     if [ "$check" = yes ]; then
         echo "would install into $ext"
+        installed=$((installed + 1))
         continue
     fi
     backup="$repo/.local-install/backup-$(basename "$ext")"
@@ -88,5 +95,14 @@ for ext in "$HOME"/.antigravity-ide/extensions/iamhyc.overleaf-workshop-* \
         done
     fi
     echo "installed $(git rev-parse --short HEAD) into $ext; reload the window to use it"
+    installed=$((installed + 1))
 done
-[ "$found" = 1 ] || echo "no Overleaf Workshop extension found"
+if [ "$found" = 0 ]; then
+    echo "no Overleaf Workshop extension found" >&2
+    exit 1
+fi
+if [ "$installed" = 0 ]; then
+    if [ "$check" = yes ]; then echo "would install nothing: no installed Overleaf Workshop has version $built_version" >&2
+    else echo "installed nothing: no installed Overleaf Workshop has version $built_version" >&2; fi
+    exit 1
+fi
