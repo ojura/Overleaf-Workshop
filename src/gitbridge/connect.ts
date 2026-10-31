@@ -88,8 +88,8 @@ export function bridgeCommitWithStart(repo: Repo, side: Side): string | undefine
 export async function startFromVersion(repo: Repo, side: Side, history: HistorySource, update: HistoryUpdate, log: (m: string) => void = () => {}): Promise<Start> {
     const bridgeInfo = repo.commitInfo(side.bridge);
     const head = await versionAtTime(history, Number(bridgeInfo.authorDate.split(' ')[0]));
-    log(`the bridge's commit ${side.bridge.slice(0, 7)} holds the state of version ${head.toV}`);
-    if (update.toV > head.toV) { throw new ConnectError(`version ${update.toV} is newer than the bridge's commit (version ${head.toV}); fetch first`); }
+    log(`${side.bridge.slice(0, 7)} holds the state of version ${head.toV}`);
+    if (update.toV > head.toV) { throw new ConnectError(`version ${update.toV} is newer than Overleaf's state in ${side.bridge.slice(0, 7)} (version ${head.toV}); fetch or sync first`); }
     const { tree, read, fromZip } = await treeAtVersion(history, repo, update.toV, head.toV, repo.flatTree(side.bridge), log);
     // the bridge dates a commit at the project's last change it holds: its author date
     const seconds = Math.floor(update.endTs / 1000);
@@ -137,9 +137,10 @@ export function rebase(repo: Repo, local: string, start: Start): RebaseResult {
             `Overleaf's state at history version ${start.update.toV}`,
             '',
             `The project's files at version ${start.update.toV} of its history (${new Date(start.update.endTs).toISOString()}),`,
-            'the state the local history started from. The git bridge has no commit for it,',
-            `because nobody fetched then; this commit was made from the history: ${start.read.length} documents`,
-            `read at that version${start.fromZip.length ? `, ${start.fromZip.length} files from its zip` : ''}, every other file as in the bridge's commit.`,
+            'the state the local history started from. No commit of Overleaf\'s states had it, so this',
+            `commit was made from the history: ${start.read.length} documents read at that version,`,
+            ...(start.fromZip.length ? [`${start.fromZip.length} files from the version's zip,`] : []),
+            'and every other file as in the newest state, which the history shows unchanged since.',
             '',
         ].join('\n');
         s = repo.commitTree(repo.writeTree(start.tree), start.parent ? [start.parent] : [], message, { person, date: when }, { person, date: when });
@@ -256,7 +257,7 @@ export function merge(repo: Repo, side: Side, options: { takeBridge?: boolean, n
     if (base) {
         const merged = repo.mergeTrees(base, side.bridge, side.local);
         if (merged.conflicts.length) {
-            throw new ConnectError(`no local commit holds the state of the bridge's commit, and the three-way merge from ${base.slice(0, 7)} conflicts in ${merged.conflicts.length} files`, merged.conflicts);
+            throw new ConnectError(`no local commit holds Overleaf's state in ${side.bridge.slice(0, 7)}, and the three-way merge from ${base.slice(0, 7)} conflicts in ${merged.conflicts.length} files`, merged.conflicts);
         }
         return finish(repo.flatTree(merged.tree), 'three-way', [
             `No commit of the local history (${count} commits, ending in ${side.local.slice(0, 7)}) holds the state of the`,
@@ -266,7 +267,7 @@ export function merge(repo: Repo, side: Side, options: { takeBridge?: boolean, n
 
     const differing = [...localTree.keys()].filter(p => bridgeTree.has(p) && bridgeTree.get(p)!.oid !== localTree.get(p)!.oid).sort();
     if (!options.takeBridge) {
-        throw new ConnectError(`no local commit holds the state of the bridge's commit, and the histories are unrelated; ${differing.length} files differ: a local change that Overleaf lacks, an edit on Overleaf that the local history lacks, or a bridge commit older than the project's state. Fetch first; land the local changes; rebase; or pass --take-bridge, which takes the bridge's version of each`, differing);
+        throw new ConnectError(`no local commit holds Overleaf's state in ${side.bridge.slice(0, 7)}, and the histories are unrelated; ${differing.length} files differ: a local change that Overleaf lacks, an edit on Overleaf that the local history lacks, or a recorded state older than the project's. Fetch first; land the local changes; rebase; or pass --take-bridge, which takes Overleaf's version of each`, differing);
     }
     return finish(bridgePlusOwn(bridgeTree, localTree, own), 'took-bridge', [
         `The local history (${count} commits, ending in ${side.local.slice(0, 7)}) becomes a second root. The tree is the`,
