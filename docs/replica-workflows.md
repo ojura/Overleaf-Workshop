@@ -5,8 +5,10 @@ sync. This document describes the repository, how the sync records Overleaf's st
 merges them with the user's commits, how a commit lands on Overleaf, how conflicts show, how an
 existing development history joins the repository, the settings
 `overleaf-workshop.localReplica.fetchMode` and `pushMode`, and what was measured about
-Overleaf's git bridge. The code is in src/scm/replicaGit.ts, src/scm/replicaSync.ts,
-src/sandbox/land.ts and src/gitbridge/.
+Overleaf's git bridge, the server at git.overleaf.com that gives a project a git repository. The
+code is in src/scm/ (replicaGit.ts, replicaSync.ts, replicaConnect.ts), src/sandbox/land.ts and
+src/gitbridge/ (connect.ts, the rebase and merge steps that connect a history; anchor.ts, which
+joins the git bridge's commits with the replica's).
 
 ## The repository
 
@@ -119,8 +121,8 @@ A binary file changed on both sides keeps Overleaf's version in place and the lo
 ## A development history in the replica's repository
 
 ```
-node out/gitbridge/cli.js replica-connect --replica <folder> --history <repo> [--ref master]
-node out/sandbox/cli.js replica-land --replica <folder> refs/gitbridge/connect
+node out/sandbox/cli.js replica-connect --replica <folder> --history <repo> [--ref master]
+node out/sandbox/cli.js replica-land --replica <folder> refs/connect/merge
 ```
 
 replica-connect joins a development history that started from a copy of the project's files,
@@ -129,13 +131,35 @@ repository. It fetches the branch from the development repository, which it only
 its commits again on top of the project's state where the history started (a recorded state with
 those files, or one made from the project's history at that version), each with a
 `Rewritten-from` trailer, and merges them with Overleaf's state as the replica recorded it. The
-merge, in `refs/gitbridge/connect`, descends from the replica's checked-out commit; replica-land
+merge, in `refs/connect/merge`, descends from the replica's checked-out commit; replica-land
 lands it, which uploads the files the history adds to the project. Running replica-connect again
 gives the same rewritten commits, and once the branch contains them it says so.
 
-After that the replica's repository is the book's repository: work happens in the replica
-folder, or in a clone of its repository (a sparse checkout without the images works), and
-commits land with replica-land. `tests/` and `layout/` travel into the project.
+After that the replica's repository is the book's repository. Work that should not upload as
+it is written happens in a clone of it, or in the development repository with the replica as
+its remote; a sparse checkout keeps the images out of its work tree:
+
+```
+git remote add replica <replica folder>
+git fetch replica
+git sparse-checkout set --no-cone '/*' '!/slike/'
+git reset --keep replica/main
+git branch --set-upstream-to=replica/main
+```
+
+Each commit lands from there:
+
+```
+git pull --no-rebase
+(edit, commit)
+node out/sandbox/cli.js replica-land --replica <replica folder> --from .
+git pull --no-rebase
+```
+
+The first pull merges the edits made on Overleaf since the last pull; the last one brings the
+landed commit, and edits made on Overleaf during the landing, which the replica recorded on top
+of it. Rebasing is not part of this flow: it is how replica-connect joins a history that started
+apart. `tests/` and `layout/` travel into the project.
 
 ## Fetch and push modes
 
@@ -156,7 +180,7 @@ push through the bridge is a fast-forward.
 - `native`: only the replica's own commits.
 - `mixed`: the bridge is fetched when git cannot merge Overleaf's state into the branch, when a
   document has conflicts, and on request:
-  `node out/gitbridge/cli.js replica-bridge --replica <folder> [--label <comment>]`. With
+  `node out/sandbox/cli.js replica-bridge --replica <folder> [--label <comment>]`. With
   `--label`, the project's current version is labelled first, so that the bridge's commit holds
   exactly that version, with the comment as its message; collaborators see the label in the
   history's Labels tab, so it happens only on request.

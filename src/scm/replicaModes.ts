@@ -8,7 +8,7 @@
  *   native  only that
  *   mixed   and the git bridge's newest commit, joined with the replica's, when git cannot
  *           merge Overleaf's state into the branch or a document has conflicts, and on
- *           request (node out/gitbridge/cli.js replica-bridge)
+ *           request (node out/sandbox/cli.js replica-bridge)
  *   bridge  and the git bridge's newest commit for every new state the replica records
  * push modes:
  *   native  local changes are uploaded over the editor's connection, also as files change

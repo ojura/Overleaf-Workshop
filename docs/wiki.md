@@ -354,7 +354,7 @@ A commit lands on Overleaf, is checked there file for file and is compiled with:
 ```
 node out/sandbox/cli.js replica-land --replica <folder> <commit>
 ```
-The commit must descend from the checked-out one, which Overleaf must hold. A development history that started from a copy of the project's files joins the replica's repository with `node out/gitbridge/cli.js replica-connect --replica <folder> --history <repository>`.
+The commit must descend from the checked-out one, which Overleaf must hold. A development history that started from a copy of the project's files joins the replica's repository with `node out/sandbox/cli.js replica-connect --replica <folder> --history <repository>`.
 
 The settings `overleaf-workshop.localReplica.fetchMode` and `overleaf-workshop.localReplica.pushMode` also bring in the commits of Overleaf's git bridge, or make pushes go through it. [docs/replica-workflows.md](replica-workflows.md) describes all of it.
 

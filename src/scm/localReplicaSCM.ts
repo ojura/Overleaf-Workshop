@@ -668,7 +668,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     /**
      * Fetch the git bridge's newest commit and join it with the replica's commits
-     * (node out/gitbridge/cli.js replica-bridge), in a process of its own: a request to the
+     * (node out/sandbox/cli.js replica-bridge), in a process of its own: a request to the
      * bridge takes from seconds to a minute. One at a time; a request meanwhile runs after it.
      */
     private fetchBridge(reason: string, label?: string): Promise<void> {
@@ -676,7 +676,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.bridgeFetchAgain = true;
             return this.bridgeFetching;
         }
-        const cli = path.join(__dirname, '..', 'gitbridge', 'cli.js');
+        const cli = path.join(__dirname, '..', 'sandbox', 'cli.js');
         const args = [cli, 'replica-bridge', '--replica', this.baseUri.fsPath, ...(label!==undefined ? ['--label', label] : [])];
         log(`[${this.vfs.projectName}] Fetching the git bridge's commit (${reason}).`);
         this.bridgeFetching = new Promise<void>(resolve => {

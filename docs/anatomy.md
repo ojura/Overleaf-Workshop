@@ -259,7 +259,7 @@ The standalone module for history view and source control management functions.
 
 #### `src/scm/index.ts`
 The source control manager (SCM) targets to provide alternative version management in sync with overleaf server version system.
-This file provides the abstract interface for SCM implementations, e.g., [local replica](#srcscmlocalreplicascmts) and [local git bridge](#srcscmlocalgitbridgescmts).
+This file provides the abstract interface for SCM implementations, e.g., the [local replica](#srcscmlocalreplicascmts), and the unfinished [git repository through isomorphic-git](#srcscmlocalgitbridgescmts).
 
 #### `src/scm/scmCollectionProvider.ts`
 The export `class SCMCollectionProvider` exposes features to vscode via `(get) triggers` with:
@@ -290,7 +290,7 @@ The sync of one folder with one project, file by file: it compares each side wit
 The replica's git repository: the bases as blobs, the sync's state in `.git/overleaf/state.json`, Overleaf's states as commits on `refs/remotes/overleaf/main` and their merge into the checked-out branch, and conflicts as unmerged index entries. [replica-workflows.md](replica-workflows.md) describes it.
 
 #### `src/scm/localGitBridgeSCM.ts`
-> Not completed now. Target to provide local git bridge via [isomorphic-git](https://github.com/isomorphic-git/isomorphic-git) without local file system or git client binary needed.
+> Unfinished, and left out of the source control choices. It was meant to keep a project in sync with a git repository such as one on GitHub, through [isomorphic-git](https://github.com/isomorphic-git/isomorphic-git), without a local file system or a git client. Its label, "Git Bridge", is not Overleaf's git bridge.
 
 ### `utils`
 The utility functions for global usage

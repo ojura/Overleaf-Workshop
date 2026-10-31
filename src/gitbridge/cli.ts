@@ -4,16 +4,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { minimatch } from 'minimatch';
 import { readStoredLogin } from '../sandbox/login';
-import { bridgeCommitWithStart, ConnectError, merge, rebase, Side, Start, startFromVersion } from './connect';
+import { overleafCommitWithStart, ConnectError, merge, rebase, Side, Start, startFromVersion } from './connect';
 import { bridgeBranch, commandCheck, PrePushCheck, pullFromBridge, pushToBridge } from './flow';
 import { addBridgeRemote, rangesCheck } from './overleaf';
 import { readReplica } from '../sandbox/sandbox';
 import { filesMatchVersion, findStartVersion, OverleafHistory, Pacer, updateForVersion } from './history';
 import { GitError, Repo } from './plumbing';
-import { connectReplica, CONNECT_REF } from './replicaConnect';
-import { anchorBridge } from './anchor';
-import { BaseAPI } from '../api/base';
-import { DEFAULT_IGNORE_PATTERNS } from '../scm/ignorePatterns';
 
 const HELP = `Connect a local history with the history of Overleaf's git bridge, then fetch, merge and push.
 
@@ -23,8 +19,6 @@ usage:
   node out/gitbridge/cli.js merge   [--repo <dir>] [--remote <name>] [options]
   node out/gitbridge/cli.js pull [--repo <dir>] [--remote <name>]
   node out/gitbridge/cli.js push [--repo <dir>] [--remote <name>] [options]
-  node out/gitbridge/cli.js replica-connect --replica <folder> --history <repo> [--ref <branch>] [options]
-  node out/gitbridge/cli.js replica-bridge  --replica <folder> [--label <comment>] [--remote <name>]
 
 --repo <dir>     the local repository (default: the current folder)
 --remote <name>  its remote for the git bridge, e.g. https://git.overleaf.com/<project id>
@@ -90,40 +84,16 @@ push: fetch; merge when Overleaf changed; check; push as a fast-forward; when th
       non-zero status. --project <id> when the remote's address does not name the
       project; --server <name> (default www.overleaf.com).
 
-replica-connect: connects a development history with a local replica's own repository
-         (the replica folder's .git, which records Overleaf's states on
-         refs/remotes/overleaf/main). It fetches --ref (default master) of --history, which
-         it only reads, writes its commits again on top of the project's state where it
-         started (as rebase does, from the history of the replica's project), and merges
-         them with Overleaf's state as the replica recorded it (as merge does). The result
-         is in refs/gitbridge/connect, a commit on top of the replica's checked-out commit;
-         land it with node out/sandbox/cli.js replica-land --replica <folder>
-         refs/gitbridge/connect, which uploads the files the history adds to the project.
-         The replica must be in sync: its checked-out commit is Overleaf's state. Running
-         it again gives the same rewritten commits; once the replica's branch contains
-         them, it says so. --start-version, --not-own, --pace and --state-db as for rebase.
+--json prints rebase's, merge's and push's results as JSON.
 
-replica-bridge: brings the git bridge's newest commit into a local replica's repository and
-         joins it with the replica's own commits, so that a push through the bridge is a
-         fast-forward (the fetch modes "mixed" and "bridge" of the extension run it). It
-         fetches --remote (default bridge, added for the project's address on the bridge
-         when missing, with the credential helper of remote-add) and, when the checked-out
-         branch lacks the bridge's commit, makes an anchor merge: parents the checked-out
-         commit and the bridge's, tree unchanged. That needs a commit of the replica's with
-         the bridge commit's files, or a bridge commit older than the replica's newest
-         recorded state (Overleaf's history is a line, so that state holds its changes); a
-         bridge commit with changes the replica has not recorded yet is left for later.
-         --label <comment> first labels the project's current version in its history,
-         which every collaborator sees in the Labels tab, so that the bridge's commit holds
-         exactly that version, with the comment as its message. Exit status 3 when nothing
-         was joined (newer changes, or a branch that lacks the replica's recorded state).
-
---json prints rebase's, merge's, push's, replica-connect's and replica-bridge's results as JSON.
+A local replica's repository has commands of its own in node out/sandbox/cli.js:
+replica-connect connects a development history with it, and replica-bridge brings the git
+bridge's commits into it.
 
 Exit status: 0 done; 1 failed (the message says why); 2 wrong arguments.
 `;
 
-const VALUE_FLAGS = new Set(['repo', 'remote', 'local', 'start-version', 'project', 'replica', 'server', 'bridge', 'state-db', 'map', 'update', 'not-own', 'check', 'attempts', 'pace', 'start', 'history', 'ref', 'label']);
+const VALUE_FLAGS = new Set(['repo', 'remote', 'local', 'start-version', 'project', 'replica', 'server', 'bridge', 'state-db', 'map', 'update', 'not-own', 'check', 'attempts', 'pace', 'start']);
 const BOOLEAN_FLAGS = new Set(['take-bridge', 'no-ranges-check', 'accept-warnings', 'json', 'help']);
 
 class UsageError extends Error {}
@@ -228,76 +198,11 @@ async function main(argv: string[]): Promise<number> {
             : `${report.pushed ? `pushed ${short(report.head)}` : `nothing to push; the bridge holds ${short(report.head)}`} after ${report.attempts.length} attempt${report.attempts.length > 1 ? 's' : ''}\n`);
         return 0;
     }
-    if (command === 'replica-bridge') {
-        if (!values.replica) { throw new UsageError('replica-bridge needs --replica'); }
-        const folder = path.resolve(values.replica);
-        const replica = readReplica(folder);
-        const replicaRepo = new Repo(folder);
-        const name = values.remote ?? 'bridge';
-        if (replicaRepo.run(['remote', 'get-url', name], { allowFailure: true }).status !== 0) {
-            const { url } = addBridgeRemote(replicaRepo, { remote: name, projectId: replica.projectId, serverName: replica.serverName, bridgeUrl: values.bridge });
-            log(`added the remote ${name}: ${url}`);
-        }
-        if (values.label !== undefined) {
-            const login = readStoredLogin(replica.serverName, values['state-db']);
-            const history = new OverleafHistory(login.url, login.identity, replica.projectId, new Pacer(1200, undefined, log));
-            const newest = (await history.updates()).updates[0];
-            if (!newest) { throw new Error('the project\'s history has no version to label'); }
-            const res = await new BaseAPI(login.url).createLabel(login.identity, replica.projectId, values.label, newest.toV);
-            if (res.type !== 'success') { throw new Error(`labelling version ${newest.toV} failed: ${res.message}`); }
-            log(`labelled version ${newest.toV}: ${values.label}`);
-        }
-        log(`fetching ${name}; the bridge makes a commit for the project's current state when it has none`);
-        replicaRepo.run(['fetch', '--quiet', name]);
-        const fetched = bridgeBranch(replicaRepo, name);
-        const isProjectFile = (p: string) => !DEFAULT_IGNORE_PATTERNS.some(g => minimatch(`/${p}`, g, { dot: true }));
-        const result = anchorBridge(replicaRepo, `refs/remotes/${name}/${fetched.branch}`, isProjectFile, { log });
-        process.stdout.write(flags.has('json') ? JSON.stringify(result, null, 1) + '\n'
-            : result.outcome === 'up-to-date' ? `the branch already contains the bridge's ${short(result.bridge)}\n`
-            : result.outcome === 'anchored' ? `joined the bridge's ${short(result.bridge)} with an anchor merge, ${short(result.commit!)}${result.twin ? `; it holds the files of ${short(result.twin)}` : ''}\n`
-            : result.outcome === 'newer' ? `the bridge's ${short(result.bridge)} has changes the replica has not recorded yet; nothing joined\n`
-            : `the checked-out branch lacks the replica's recorded state; nothing joined\n`);
-        return result.outcome === 'up-to-date' || result.outcome === 'anchored' ? 0 : 3;
-    }
-    if (command === 'replica-connect') {
-        if (!values.replica || !values.history) { throw new UsageError('replica-connect needs --replica and --history'); }
-        const folder = path.resolve(values.replica);
-        const replica = readReplica(folder);
-        const login = readStoredLogin(replica.serverName, values['state-db']);
-        const pace = values.pace ? Number(values.pace) : 3000;
-        if (!Number.isFinite(pace) || pace < 0) { throw new UsageError('--pace needs milliseconds'); }
-        let startVersion: number | undefined;
-        if (values['start-version'] !== undefined) {
-            startVersion = Number(values['start-version']);
-            if (!Number.isInteger(startVersion) || startVersion < 0) { throw new UsageError('--start-version needs a version number'); }
-        }
-        const result = await connectReplica(new Repo(folder), {
-            historyRepo: path.resolve(values.history), ref: values.ref ?? 'master', startVersion, log,
-            history: new OverleafHistory(login.url, login.identity, replica.projectId, new Pacer(pace, undefined, log)),
-            notOwn: notOwn.length ? (p: string) => notOwn.some(g => minimatch(p, g, { dot: true })) : undefined,
-        });
-        if (flags.has('json')) {
-            process.stdout.write(JSON.stringify(result, null, 1) + '\n');
-        } else if (result.already) {
-            process.stdout.write(`the replica's branch already contains ${short(result.local)} (as ${short(result.already)}); nothing to connect\n`);
-        } else {
-            const m = result.merge!;
-            process.stdout.write([
-                `rebase: ${result.rebase!.map.length} commits written again on ${short(result.rebase!.start)}${result.rebase!.startMade ? ' (made from the project\'s history)' : ''}; old and new ids in ${result.mapFile}`,
-                `merge: ${short(m.commit)} in ${CONNECT_REF}, on top of Overleaf's state; ${m.how === 'held' ? `the rewritten ${short(m.heldAt!)} holds Overleaf's state` : m.how === 'three-way' ? `a three-way merge from ${short(m.base!)}` : `the bridge's version taken for ${m.tookBridge.join(', ')}`}`,
-                `files the history adds to the project: ${m.own.length ? m.own.join(', ') : 'none'}`,
-                `project files it changes: ${m.carries.length ? m.carries.join(', ') : 'none'}`,
-                ...(m.deletedOnOverleaf.length ? [`deleted on Overleaf, left out: ${m.deletedOnOverleaf.join(', ')}`] : []),
-                `next: node out/sandbox/cli.js replica-land --replica "${folder}" ${CONNECT_REF}`,
-            ].join('\n') + '\n');
-        }
-        return 0;
-    }
     if (command !== 'rebase' && command !== 'merge') { throw new UsageError(`unknown command ${positional.join(' ')}`); }
 
     const bridge = bridgeBranch(repo, remote);
     const local = repo.mustCommit(values.local ?? 'HEAD');
-    const side: Side = { bridge: bridge.head, local };
+    const side: Side = { overleaf: bridge.head, local };
     const notOwnMatch = (p: string) => notOwn.some(g => minimatch(p, g, { dot: true }));
 
     if (command === 'merge') {
@@ -306,13 +211,13 @@ async function main(argv: string[]): Promise<number> {
             const rebased = repo.commit('refs/gitbridge/rebase-start');
             if (rebased && repo.isAncestor(rebased, local)) { start = rebased; }
         }
-        const result = merge(repo, side, { takeBridge: flags.has('take-bridge'), notOwn: notOwnMatch, start });
+        const result = merge(repo, side, { takeOverleaf: flags.has('take-bridge'), notOwn: notOwnMatch, start });
         const ref = moveOrRecord(repo, result.commit, 'refs/gitbridge/merge', local, values.update);
         const lines = [
             `merge: ${short(result.commit)}, parents ${short(bridge.head)} (the bridge's ${bridge.branch}) and ${short(local)} (the local history), now in ${ref}`,
             result.how === 'held' ? `the local commit ${short(result.heldAt!)} holds the bridge commit's state; the tree is the bridge's, with the changes made after it`
                 : result.how === 'three-way' ? `no local commit holds the bridge commit's state: a three-way merge from ${short(result.base!)}`
-                : `the histories are unrelated and no local commit holds the bridge commit's state: the bridge's version was taken for ${result.tookBridge.join(', ')}`,
+                : `the histories are unrelated and no local commit holds the bridge commit's state: the bridge's version was taken for ${result.tookOverleaf.join(', ')}`,
             `the repository's own files, which travel into the project: ${result.own.length ? result.own.join(', ') : 'none'}`,
             `the project files a push carries to Overleaf: ${result.carries.length ? result.carries.join(', ') : 'none'}`,
         ];
@@ -323,7 +228,7 @@ async function main(argv: string[]): Promise<number> {
 
     // rebase
     let start: Start;
-    const existing = values['start-version'] ? undefined : bridgeCommitWithStart(repo, side);
+    const existing = values['start-version'] ? undefined : overleafCommitWithStart(repo, side);
     if (existing) {
         log(`the bridge's commit ${short(existing)} has the local history's first state; the rebase starts from it`);
         start = { kind: 'commit', commit: existing };

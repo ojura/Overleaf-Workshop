@@ -721,7 +721,7 @@ export class GitReplicaStore implements ReplicaStore {
         }
         const base = await git.mergeBase(head, tip);
         if (!base) {
-            return { ...result, notMerged: this.tellOnce(`unrelated:${head}`, `The checked-out branch (${head.slice(0, 7)}) and Overleaf's state (${OVERLEAF_REF}) have no commit in common, so git does not merge them; connect a history with "node out/gitbridge/cli.js replica-connect".`) };
+            return { ...result, notMerged: this.tellOnce(`unrelated:${head}`, `The checked-out branch (${head.slice(0, 7)}) and Overleaf's state (${OVERLEAF_REF}) have no commit in common, so git does not merge them; connect a history with "node out/sandbox/cli.js replica-connect".`) };
         }
         const merged = await git.mergeTrees(base, head, tip);
         if (merged.conflicts.length) {

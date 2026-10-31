@@ -1,10 +1,11 @@
 /**
- * Connecting a development history with a local replica's repository: the history's commits
- * are written again on top of the project's state where the history started, and merged with
- * Overleaf's state as the replica recorded it (refs/remotes/overleaf/main), with the rebase and
- * merge of connect.ts. The result goes to refs/gitbridge/connect, a commit that descends from
- * the replica's checked-out commit; replica-land then lands it, which uploads the files the
- * history adds to the project (its tests, say).
+ * Connecting a development history with a local replica's repository (replica-connect): the
+ * history's commits are written again on top of the project's state where the history started,
+ * and merged with Overleaf's state as the replica recorded it (refs/remotes/overleaf/main), with
+ * the rebase and merge of src/gitbridge/connect.ts. It works from the project's history and the
+ * two repositories. The result goes to refs/connect/merge, a commit that
+ * descends from the replica's checked-out commit; replica-land then lands it, which uploads the
+ * files the history adds to the project (its tests, say).
  *
  * The development repository is only read (git fetch from it). Running the connection again
  * makes the same rebased commits from the same input; once the replica's branch contains the
@@ -12,14 +13,15 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { bridgeCommitWithStart, ConnectError, merge, MergeResult, rebase, RebaseResult, Start, startFromVersion } from './connect';
-import { filesMatchVersion, findStartVersion, HistorySource, updateForVersion } from './history';
-import { Repo } from './plumbing';
+import { ConnectError, merge, MergeResult, overleafCommitWithStart, rebase, RebaseResult, Start, startFromVersion } from '../gitbridge/connect';
+import { filesMatchVersion, findStartVersion, HistorySource, updateForVersion } from '../gitbridge/history';
+import { Repo } from '../gitbridge/plumbing';
 
 /** Overleaf's states in a replica's repository (src/scm/replicaGit.ts). */
 const OVERLEAF_REF = 'refs/remotes/overleaf/main';
-export const CONNECT_REF = 'refs/gitbridge/connect';
-const LOCAL_REF = 'refs/gitbridge/connect-local';
+export const CONNECT_REF = 'refs/connect/merge';
+const LOCAL_REF = 'refs/connect/local';
+const START_REF = 'refs/connect/start';
 
 export interface ConnectOptions {
     /** the development repository, a path or URL git can fetch from */
@@ -60,9 +62,9 @@ export async function connectReplica(repo: Repo, options: ConnectOptions): Promi
         log(`the replica's branch already contains ${local.slice(0, 7)}, rewritten as ${already.slice(0, 7)}`);
         return { local, already };
     }
-    const side = { bridge: overleaf, local };
+    const side = { overleaf, local };
     let start: Start;
-    const existing = options.startVersion === undefined ? bridgeCommitWithStart(repo, side) : undefined;
+    const existing = options.startVersion === undefined ? overleafCommitWithStart(repo, side) : undefined;
     if (existing) {
         log(`the recorded state ${existing.slice(0, 7)} has the development history's first files; the rebase starts from it`);
         start = { kind: 'commit', commit: existing };
@@ -83,11 +85,11 @@ export async function connectReplica(repo: Repo, options: ConnectOptions): Promi
         start = await startFromVersion(repo, side, options.history, update, log);
     }
     const rebased = rebase(repo, local, start);
-    const mapFile = path.join(repo.gitDir(), 'gitbridge', 'connect-map.txt');
+    const mapFile = path.join(repo.gitDir(), 'overleaf', 'connect-map.txt');
     fs.mkdirSync(path.dirname(mapFile), { recursive: true });
     fs.writeFileSync(mapFile, rebased.map.map(([o, n]) => `${o} ${n}`).join('\n') + '\n');
-    repo.updateRef('refs/gitbridge/rebase-start', rebased.start);
-    const merged = merge(repo, { bridge: overleaf, local: rebased.commit }, {
+    repo.updateRef(START_REF, rebased.start);
+    const merged = merge(repo, { overleaf, local: rebased.commit }, {
         start: rebased.start,
         notOwn: options.notOwn,
         message: [

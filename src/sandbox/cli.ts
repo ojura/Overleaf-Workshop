@@ -18,7 +18,10 @@ import { minimatch } from 'minimatch';
 import { fetchCommitFrom, LandError, landCommit, landedCleanly, LandReport } from './land';
 import { anchorBridge } from '../gitbridge/anchor';
 import { bridgeBranch, pushToBridge } from '../gitbridge/flow';
+import { OverleafHistory, Pacer } from '../gitbridge/history';
 import { addBridgeRemote, rangesCheck } from '../gitbridge/overleaf';
+import { connectReplica, CONNECT_REF } from '../scm/replicaConnect';
+import { BaseAPI } from '../api/base';
 import {
     createSandbox, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions, sandboxStatus, sandboxUrl,
     settingsOf,
@@ -43,6 +46,8 @@ usage:
   node out/sandbox/cli.js replica-sync   --replica <folder> [--timeout <s>] [--json]
   node out/sandbox/cli.js replica-status --replica <folder> [--json]
   node out/sandbox/cli.js replica-land   --replica <folder> [<commit>] [--from <repo>] [--push native|bridge] [--main <file>] [--no-compile] [--timeout <s>] [--json]
+  node out/sandbox/cli.js replica-connect --replica <folder> --history <repo> [--ref <branch>] [--start-version <n>] [--not-own <glob>] [--pace <ms>] [--json]
+  node out/sandbox/cli.js replica-bridge  --replica <folder> [--label <comment>] [--remote <name>] [--bridge <url>] [--json]
 
 --replica <folder>  the shared project's local replica. Its .overleaf/settings.json names
                     the project; .overleaf/sandbox.json records the private copy.
@@ -173,7 +178,7 @@ replica-land    Lands <commit> of the replica's git repository in the project, t
                 default) and fetched into the replica's repository first
 --push bridge   push through the git bridge instead: the branch fast-forwards to the
                 commit, the bridge's newest commit is joined with an anchor merge (as
-                node out/gitbridge/cli.js replica-bridge does), and git pushes the branch to
+                node out/sandbox/cli.js replica-bridge does), and git pushes the branch to
                 the remote "bridge" (added when missing) after the check of comments and
                 tracked changes (push-check). Overleaf shows the push as one version "via
                 Git", and every file of the commit goes into the project, also the ones the
@@ -185,6 +190,36 @@ replica-land    Lands <commit> of the replica's git repository in the project, t
 Exit status: 0 landed and compiled without errors; 3 landed, but the compile or a check
 failed; 1 stopped before the push, or the push failed (the message says why); 4 and 5 as
 for replica-sync; 2 wrong arguments.
+
+replica-connect Connects a development history with the replica's repository, for a history
+                that started from a copy of the project's files. It fetches --ref (default
+                master) of --history, which it only reads, writes its commits again on top of
+                the project's state where the history started (from the project's history,
+                or --start-version), each with a Rewritten-from trailer, and merges them with
+                Overleaf's state as the replica recorded it (refs/remotes/overleaf/main). The
+                result is in refs/connect/merge, on top of the replica's checked-out commit;
+                replica-land lands it, which uploads the files the history adds to the
+                project. It lists those files, and the project files the history changes. The
+                replica must be in sync: its checked-out commit is Overleaf's state. Running
+                it again gives the same rewritten commits, and once the replica's branch
+                contains them it says so.
+--not-own <glob>  a file of the history to leave out of the project (repeatable)
+--pace <ms>     the pause between requests to the project's history (default 3000); Overleaf
+                answers faster ones with HTTP 429
+
+replica-bridge  Brings the git bridge's newest commit into the replica's repository and joins
+                it with the replica's commits, so that a push through the bridge is a
+                fast-forward; the fetch modes "mixed" and "bridge" run it. It fetches --remote
+                (default bridge, added for the project's address on the bridge when missing,
+                with git-credential of this tool as its credential helper) and, when the
+                checked-out branch lacks the bridge's commit, makes an anchor merge: parents
+                the checked-out commit and the bridge's, tree unchanged. That needs a commit
+                of the replica's with the bridge commit's files, or a bridge commit older than
+                the replica's newest recorded state; a bridge commit with changes the replica
+                has not recorded yet waits for a later fetch. --label <comment> first labels
+                the project's current version, which collaborators see in the history's
+                Labels tab, so that the bridge's commit holds exactly that version. Exit
+                status 3 when nothing was joined.
 
 Safety: the tool writes only to the project recorded in .overleaf/sandbox.json, which
 init created, and refuses the shared project's id and every other one. Before each
@@ -200,17 +235,17 @@ names the database. The environment variable OVERLEAF_LOGIN, a JSON object
 
 const VALUE_FLAGS = new Set(['replica', 'dir', 'main', 'out', 'keep', 'ignore', 'include', 'lock-timeout', 'purpose', 'name', 'state-db',
     'project', 'repo', 'from', 'to', 'user', 'server', 'into', 'bridge',
-    'timeout', 'push', 'from']);
+    'timeout', 'push', 'from', 'history', 'ref', 'start-version', 'not-own', 'pace', 'label', 'remote']);
 const GIT_AND_INFO_COMMANDS = ['project-info', 'git-token', 'git-clone', 'git-fetch', 'git-credential'];
 const OBJECT_ID = /^[0-9a-f]{24}$/;
-const REPEATABLE = new Set(['keep', 'ignore', 'include']);
+const REPEATABLE = new Set(['keep', 'ignore', 'include', 'not-own']);
 const BOOLEAN_FLAGS = new Set(['mirror', 'incremental', 'draft', 'stop-on-first-error', 'pdf', 'json', 'help', 'no-compile']);
 
 class UsageError extends Error {}
 
 function parseArgs(argv: string[]) {
     const values: Record<string, string> = {};
-    const lists: Record<string, string[]> = { keep: [], ignore: [], include: [] };
+    const lists: Record<string, string[]> = { keep: [], ignore: [], include: [], 'not-own': [] };
     const flags = new Set<string>();
     const positional: string[] = [];
     for (let i = 0; i < argv.length; i++) {
@@ -375,13 +410,83 @@ async function replicaCommand(command: 'replica-sync' | 'replica-status', folder
     return answer.ok ? 0 : 3;
 }
 
+/** The paths the replica leaves out, by its default ignore patterns; '/dir/name' */
+const replicaIgnored = (p: string) => p === '/.overleaf' || p.startsWith('/.overleaf/') || DEFAULT_IGNORE_PATTERNS.some(g => minimatch(p, g, { dot: true }));
+
+/** replica-connect: join a development history with the replica's repository (src/scm/replicaConnect.ts). */
+async function replicaConnectCommand(folder: string, values: Record<string, string>, notOwn: string[], json: boolean): Promise<number> {
+    if (!values.history) { throw new UsageError('replica-connect needs --history'); }
+    const replica = readReplica(folder);
+    const login = readStoredLogin(replica.serverName, values['state-db']);
+    const pace = values.pace ? Number(values.pace) : 3000;
+    if (!Number.isFinite(pace) || pace < 0) { throw new UsageError('--pace takes milliseconds'); }
+    let startVersion: number | undefined;
+    if (values['start-version'] !== undefined) {
+        startVersion = Number(values['start-version']);
+        if (!Number.isInteger(startVersion) || startVersion < 0) { throw new UsageError('--start-version takes a version number'); }
+    }
+    const result = await connectReplica(new Repo(folder), {
+        historyRepo: path.resolve(values.history), ref: values.ref ?? 'master', startVersion, log,
+        history: new OverleafHistory(login.url, login.identity, replica.projectId, new Pacer(pace, undefined, log)),
+        notOwn: notOwn.length ? (p: string) => notOwn.some(g => minimatch(p, g, { dot: true })) : undefined,
+    });
+    const short = (oid: string) => oid.slice(0, 7);
+    if (json) {
+        process.stdout.write(JSON.stringify(result, null, 1) + '\n');
+    } else if (result.already) {
+        process.stdout.write(`the replica's branch already contains ${short(result.local)} (as ${short(result.already)}); nothing to connect\n`);
+    } else {
+        const m = result.merge!;
+        process.stdout.write([
+            `rebase: ${result.rebase!.map.length} commits written again on ${short(result.rebase!.start)}${result.rebase!.startMade ? ' (made from the project\'s history)' : ''}; old and new ids in ${result.mapFile}`,
+            `merge: ${short(m.commit)} in ${CONNECT_REF}, on top of Overleaf's state; ${m.how === 'held' ? `the rewritten ${short(m.heldAt!)} holds Overleaf's state` : m.how === 'three-way' ? `a three-way merge from ${short(m.base!)}` : `Overleaf's version taken for ${m.tookOverleaf.join(', ')}`}`,
+            `files the history adds to the project: ${m.own.length ? m.own.join(', ') : 'none'}`,
+            `project files it changes: ${m.carries.length ? m.carries.join(', ') : 'none'}`,
+            ...(m.deletedOnOverleaf.length ? [`deleted on Overleaf, left out: ${m.deletedOnOverleaf.join(', ')}`] : []),
+            `next: node out/sandbox/cli.js replica-land --replica "${folder}" ${CONNECT_REF}`,
+        ].join('\n') + '\n');
+    }
+    return 0;
+}
+
+/** replica-bridge: fetch the git bridge's newest commit into the replica's repository and join it (src/gitbridge/anchor.ts). */
+async function replicaBridgeCommand(folder: string, values: Record<string, string>, json: boolean): Promise<number> {
+    const replica = readReplica(folder);
+    const repo = new Repo(folder);
+    const name = values.remote ?? 'bridge';
+    if (repo.run(['remote', 'get-url', name], { allowFailure: true }).status !== 0) {
+        const { url } = addBridgeRemote(repo, { remote: name, projectId: replica.projectId, serverName: replica.serverName, bridgeUrl: values.bridge });
+        log(`added the remote ${name}: ${url}`);
+    }
+    if (values.label !== undefined) {
+        const login = readStoredLogin(replica.serverName, values['state-db']);
+        const history = new OverleafHistory(login.url, login.identity, replica.projectId, new Pacer(1200, undefined, log));
+        const newest = (await history.updates()).updates[0];
+        if (!newest) { throw new Error('the project\'s history has no version to label'); }
+        const res = await new BaseAPI(login.url).createLabel(login.identity, replica.projectId, values.label, newest.toV);
+        if (res.type !== 'success') { throw new Error(`labelling version ${newest.toV} failed: ${res.message}`); }
+        log(`labelled version ${newest.toV}: ${values.label}`);
+    }
+    log(`fetching ${name}; the bridge makes a commit for the project's current state when it has none`);
+    repo.run(['fetch', '--quiet', name]);
+    const fetched = bridgeBranch(repo, name);
+    const result = anchorBridge(repo, `refs/remotes/${name}/${fetched.branch}`, p => !replicaIgnored(`/${p}`), { log });
+    const short = (oid: string) => oid.slice(0, 7);
+    process.stdout.write(json ? JSON.stringify(result, null, 1) + '\n'
+        : result.outcome === 'up-to-date' ? `the branch already contains the bridge's ${short(result.bridge)}\n`
+        : result.outcome === 'anchored' ? `joined the bridge's ${short(result.bridge)} with an anchor merge, ${short(result.commit!)}${result.twin ? `; it holds the files of ${short(result.twin)}` : ''}\n`
+        : result.outcome === 'newer' ? `the bridge's ${short(result.bridge)} has changes the replica has not recorded yet; nothing joined\n`
+        : 'the checked-out branch lacks the replica\'s recorded state; nothing joined\n');
+    return result.outcome === 'up-to-date' || result.outcome === 'anchored' ? 0 : 3;
+}
+
 /** replica-land: land a commit of the replica's repository through the IDE window, verify it on Overleaf, compile. */
 async function replicaLand(folder: string, commit: string | undefined,
                            options: { main?: string, compile: boolean, timeoutS: number, json: boolean, stateDb?: string, push: 'native' | 'bridge' }): Promise<number> {
     const replica = readReplica(folder);
     const login = readStoredLogin(replica.serverName, options.stateDb);
     const client = new OverleafClient(login.url, login.identity);
-    const isIgnored = (p: string) => p === '/.overleaf' || p.startsWith('/.overleaf/') || DEFAULT_IGNORE_PATTERNS.some(g => minimatch(p, g, { dot: true }));
+    const isIgnored = replicaIgnored;
     let report: LandReport;
     try {
         report = await landCommit(new Repo(folder), client, (request, timeoutMs) => requestReplica(folder, request, timeoutMs), {
@@ -459,7 +564,14 @@ async function main(argv: string[]): Promise<number> {
     if (GIT_AND_INFO_COMMANDS.includes(command)) {
         return gitAndInfoCommand(command, values, flags, positional);
     }
-    if (!['init', 'status', 'compile', 'plan', 'ranges', 'push-check', 'replica-sync', 'replica-status', 'replica-land'].includes(command)) { throw new UsageError(`unknown command ${command}`); }
+    if (!['init', 'status', 'compile', 'plan', 'ranges', 'push-check', 'replica-sync', 'replica-status', 'replica-land', 'replica-connect', 'replica-bridge'].includes(command)) { throw new UsageError(`unknown command ${command}`); }
+    if (command === 'replica-connect' || command === 'replica-bridge') {
+        if (!values.replica) { throw new UsageError('--replica is required'); }
+        if (positional.length > 1) { throw new UsageError(`unexpected argument ${positional[1]}`); }
+        return command === 'replica-connect'
+            ? await replicaConnectCommand(path.resolve(values.replica), values, lists['not-own'], flags.has('json'))
+            : await replicaBridgeCommand(path.resolve(values.replica), values, flags.has('json'));
+    }
     if (command === 'replica-land') {
         if (!values.replica) { throw new UsageError('--replica is required'); }
         if (positional.length > 2) { throw new UsageError(`unexpected argument ${positional[2]}`); }

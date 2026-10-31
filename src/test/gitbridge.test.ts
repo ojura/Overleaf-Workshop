@@ -1,15 +1,16 @@
 /* eslint-disable @typescript-eslint/naming-convention -- environment variable names */
 import * as assert from 'assert';
+import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as zlib from 'zlib';
-import { bridgeCommitWithStart, checkResult, ConnectError, merge, ownFiles, rebase, startFromVersion } from '../gitbridge/connect';
+import { overleafCommitWithStart, checkResult, ConnectError, merge, ownFiles, rebase, startFromVersion } from '../gitbridge/connect';
 import { pullFromBridge, pushToBridge } from '../gitbridge/flow';
 import { findStartVersion, HistorySource, HistoryUpdate, readZip, treeAtVersion, TreeChange, VersionEntry } from '../gitbridge/history';
 import { answerFromFindings } from '../gitbridge/overleaf';
 import { gitDate, Repo } from '../gitbridge/plumbing';
-import { connectReplica, CONNECT_REF } from '../gitbridge/replicaConnect';
+import { connectReplica, CONNECT_REF } from '../scm/replicaConnect';
 import { anchorBridge } from '../gitbridge/anchor';
 
 /** a time in seconds that git reads as one: git takes small numbers for something else */
@@ -179,7 +180,7 @@ describe('git bridge: connect', () => {
     const show = (repo: Repo, rev: string, file: string) => repo.text(['show', `${rev}:${file}`]);
     it('merge without a rebase keeps every local id, takes the bridge\'s tree and adds the repository\'s own files', () => {
         const s = scenario();
-        const side = { bridge: s.b2, local: s.l2 };
+        const side = { overleaf: s.b2, local: s.l2 };
         const own = ownFiles(s.local, side);
         assert.deepStrictEqual(own.own, ['tests/a.t']);
         assert.deepStrictEqual(own.deletedOnOverleaf, ['old.tex']);
@@ -196,7 +197,7 @@ describe('git bridge: connect', () => {
         const s = scenario();
         s.local.run(['checkout', '--quiet', s.l2]);
         const l3 = commit(s.local, { 'notes.tex': 'notes v3, not landed\n', 'tests/b.t': 'test b\n' }, 'Not landed', s.t0 + 700);
-        const result = merge(s.local, { bridge: s.b2, local: l3 });
+        const result = merge(s.local, { overleaf: s.b2, local: l3 });
         assert.strictEqual(result.how, 'held');
         assert.strictEqual(result.heldAt, s.l2);
         assert.deepStrictEqual(result.carries, ['notes.tex']);
@@ -211,27 +212,27 @@ describe('git bridge: connect', () => {
         s.bridge.run(['checkout', '--quiet', 'master']);
         const b3 = commit(s.bridge, { 'main.tex': 'main, edited on Overleaf\n' }, 'Update on Overleaf.', s.t0 + 660);
         s.local.run(['fetch', '--quiet', 'overleaf']);
-        assert.throws(() => merge(s.local, { bridge: b3, local: l3 }), (e: any) => e instanceof ConnectError && e.paths.join() === 'main.tex');
-        const result = merge(s.local, { bridge: b3, local: l3 }, { takeBridge: true });
-        assert.strictEqual(result.how, 'took-bridge');
-        assert.deepStrictEqual(result.tookBridge, ['main.tex']);
+        assert.throws(() => merge(s.local, { overleaf: b3, local: l3 }), (e: any) => e instanceof ConnectError && e.paths.join() === 'main.tex');
+        const result = merge(s.local, { overleaf: b3, local: l3 }, { takeOverleaf: true });
+        assert.strictEqual(result.how, 'took-overleaf');
+        assert.deepStrictEqual(result.tookOverleaf, ['main.tex']);
         assert.strictEqual(show(s.local, result.commit, 'main.tex'), 'main, edited on Overleaf');
     });
     it('merge stops on a local change to a file deleted on Overleaf', () => {
         const s = scenario();
         s.local.run(['checkout', '--quiet', s.l2]);
         const l3 = commit(s.local, { 'old.tex': 'old, changed here after Overleaf deleted it\n' }, 'Change old', s.t0 + 700);
-        assert.throws(() => merge(s.local, { bridge: s.b2, local: l3 }), (e: any) => e instanceof ConnectError && e.paths.join() === 'old.tex');
+        assert.throws(() => merge(s.local, { overleaf: s.b2, local: l3 }), (e: any) => e instanceof ConnectError && e.paths.join() === 'old.tex');
     });
     it('merge refuses a local history that already contains the bridge\'s commit', () => {
         const s = scenario();
-        const first = merge(s.local, { bridge: s.b2, local: s.l2 });
-        assert.throws(() => merge(s.local, { bridge: s.b2, local: first.commit }), (e: any) => e instanceof ConnectError);
+        const first = merge(s.local, { overleaf: s.b2, local: s.l2 });
+        assert.throws(() => merge(s.local, { overleaf: s.b2, local: first.commit }), (e: any) => e instanceof ConnectError);
     });
     it('rebase from a version, then merge: the start is made from the history, authors, dates and messages stay, and the merge is three-way from the start', async () => {
         const s = scenario();
-        const side = { bridge: s.b2, local: s.l2 };
-        assert.strictEqual(bridgeCommitWithStart(s.local, side), undefined, 'no bridge commit has version 3');
+        const side = { overleaf: s.b2, local: s.l2 };
+        assert.strictEqual(overleafCommitWithStart(s.local, side), undefined, 'no bridge commit has version 3');
         const files = new Map([...s.local.flatTree(s.root)].map(([p, e]) => [p, s.local.run(['cat-file', 'blob', e.oid]).stdout]));
         const update = await findStartVersion(s.history, files, s.t0 + 300);
         assert.strictEqual(update.toV, s.startV);
@@ -263,7 +264,7 @@ describe('git bridge: connect', () => {
         assert.strictEqual(show(s.local, newL1, 'fig.png').length, 3, 'whole trees: the image is there');
         assert.strictEqual(s.history.zips, 1);
         // the merge: Overleaf's edits come from the bridge, the own files from the local side
-        const rside = { bridge: s.b2, local: rebased.commit };
+        const rside = { overleaf: s.b2, local: rebased.commit };
         const result = merge(s.local, rside, { start: rebased.start });
         assert.strictEqual(result.how, 'three-way', 'Overleaf has edits the local history lacks (fig.png), so no rebased commit holds the bridge\'s state');
         assert.strictEqual(result.base, rebased.start);
@@ -276,7 +277,7 @@ describe('git bridge: connect', () => {
     });
     it('rebase gives the same ids when it runs again', async () => {
         const s = scenario();
-        const side = { bridge: s.b2, local: s.l2 };
+        const side = { overleaf: s.b2, local: s.l2 };
         const update = s.history.states[2].update;
         const one = rebase(s.local, s.l2, await startFromVersion(s.local, side, s.history, update));
         const two = rebase(s.local, s.l2, await startFromVersion(s.local, side, s.history, update));
@@ -291,12 +292,12 @@ describe('git bridge: connect', () => {
         const b2 = commit(bridge, { 'main.tex': 'main v3\n', 'notes.tex': 'notes v2\n' }, 'Update on Overleaf.', s.t0 + 650);
         s.local.run(['remote', 'add', 'b2', bridge.dir]);
         s.local.run(['fetch', '--quiet', 'b2']);
-        assert.strictEqual(bridgeCommitWithStart(s.local, { bridge: b2, local: s.l2 }), b1);
+        assert.strictEqual(overleafCommitWithStart(s.local, { overleaf: b2, local: s.l2 }), b1);
         const rebased = rebase(s.local, s.l2, { kind: 'commit', commit: b1 });
         assert.strictEqual(rebased.start, b1);
         assert.ok(!rebased.startMade);
         assert.strictEqual(rebased.map.length, 3);
-        const rside = { bridge: b2, local: rebased.commit };
+        const rside = { overleaf: b2, local: rebased.commit };
         const result = merge(s.local, rside, { start: rebased.start });
         assert.strictEqual(result.how, 'held');
         assert.strictEqual(result.heldAt, rebased.commit);
@@ -318,9 +319,9 @@ describe('git bridge: connect', () => {
         const l3 = commit(s.local, { 'main.tex': 'main v4\n' }, 'Change main again', s.t0 + 700);
         const history = new FakeHistory();
         history.states = s.history.states.slice(0, 4);  // up to l1's landing, which b3 holds
-        const rebased = rebase(s.local, l3, await startFromVersion(s.local, { bridge: b3, local: l3 }, history, history.states[2].update));
+        const rebased = rebase(s.local, l3, await startFromVersion(s.local, { overleaf: b3, local: l3 }, history, history.states[2].update));
         const ids = new Map(rebased.map);
-        const result = merge(s.local, { bridge: b3, local: rebased.commit }, { start: rebased.start });
+        const result = merge(s.local, { overleaf: b3, local: rebased.commit }, { start: rebased.start });
         assert.strictEqual(result.how, 'held');
         assert.strictEqual(result.heldAt, ids.get(l1b), 'the newest rebased commit that holds the bridge\'s state');
         assert.deepStrictEqual(s.local.commitInfo(result.commit).parents, [b3, rebased.commit], 'the merge sits at the tip; nothing is written again');
@@ -338,9 +339,9 @@ describe('git bridge: connect', () => {
         const b3 = commit(s.bridge, { 'main.tex': 'main, edited on Overleaf\n' }, 'Update on Overleaf.', s.t0 + 650);
         s.history.add(s.t0 + 650, f => { f.set('main.tex', doc('main, edited on Overleaf\n')); });
         s.local.run(['fetch', '--quiet', 'overleaf']);
-        const start = await startFromVersion(s.local, { bridge: b3, local: l3 }, s.history, s.history.states[2].update);
+        const start = await startFromVersion(s.local, { overleaf: b3, local: l3 }, s.history, s.history.states[2].update);
         const rebased = rebase(s.local, l3, start);
-        assert.throws(() => merge(s.local, { bridge: b3, local: rebased.commit }, { start: rebased.start }), (e: any) => e instanceof ConnectError && e.paths.join() === 'main.tex');
+        assert.throws(() => merge(s.local, { overleaf: b3, local: rebased.commit }, { start: rebased.start }), (e: any) => e instanceof ConnectError && e.paths.join() === 'main.tex');
     });
 });
 
@@ -470,6 +471,18 @@ describe('git bridge: connecting a development history with a local replica\'s r
         replica.run(['update-ref', 'refs/remotes/overleaf/main', m.commit]);
         const again = await connectReplica(replica, { historyRepo: s.local.dir, ref: 'master', history: s.history });
         assert.strictEqual(again.already, result.rebase!.commit);
+
+        // the command is the replica tool's (out/sandbox/cli.js), not the git-bridge tools'
+        fs.mkdirSync(path.join(replica.dir, '.overleaf'), { recursive: true });
+        fs.writeFileSync(path.join(replica.dir, '.overleaf', 'settings.json'), JSON.stringify({
+            uri: `overleaf-workshop://www.overleaf.com/Book?user%3D${'a'.repeat(24)}%26project%3D${'b'.repeat(24)}`, projectName: 'Book',
+        }));
+        const env = { ...process.env, OVERLEAF_LOGIN: JSON.stringify({ url: 'https://www.overleaf.invalid/', cookies: 'x', csrfToken: 'x', userId: 'a'.repeat(24) }) };
+        const run = (cli: string) => spawnSync(process.execPath, [path.join(__dirname, '..', cli), 'replica-connect', '--replica', replica.dir, '--history', s.local.dir], { encoding: 'utf8', env });
+        const replicaTool = run('sandbox/cli.js');
+        assert.strictEqual(replicaTool.status, 0, replicaTool.stderr);
+        assert.match(replicaTool.stdout, /already contains .* nothing to connect/);
+        assert.strictEqual(run('gitbridge/cli.js').status, 2);
     });
 
     it('refuses a replica when its checked-out commit is not Overleaf\'s state', async () => {
