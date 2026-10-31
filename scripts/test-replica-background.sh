@@ -18,8 +18,6 @@ set -uo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 ide="$repo/scripts/hidden-ide.sh"
 cli="$repo/out/sandbox/cli.js"
-[ -n "${HIDDEN_IDE_HOME:-}" ] || { echo "set HIDDEN_IDE_HOME to the folder of the test instance (scripts/hidden-ide.sh); it has no default" >&2; exit 64; }
-home=$(realpath -m -- "$HIDDEN_IDE_HOME")
 states="shown frozen hidden"; minutes=6.5; limit=60
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -29,9 +27,8 @@ while [ $# -gt 0 ]; do
         *) echo "usage: $0 [--states \"shown frozen hidden\"] [--hidden-minutes M] [--timeout S]" >&2; exit 64 ;;
     esac
 done
-field() { python3 -I -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2]); print("" if v is None else v)' "$home/instance.json" "$1"; }
-[ -f "$home/instance.json" ] || { echo "no test instance in $home; start one with scripts/hidden-ide.sh start --project ID" >&2; exit 64; }
-replica=$(field replica); project=$(field project); profile=$(field profile)
+# the instance's record, read by hidden-ide.sh, which names the instance's folder by HIDDEN_IDE_HOME
+replica=$("$ide" field replica) && project=$("$ide" field project) && profile=$("$ide" field profile) || exit 64
 [ -n "$replica" ] && [ -n "$project" ] || { echo "the test instance has no replica; start it with --project" >&2; exit 64; }
 [ -f "$cli" ] || { echo "build this checkout first: $cli is missing" >&2; exit 64; }
 
@@ -76,22 +73,24 @@ check_state() {  # check_state NAME: one round of probe, sync, check and deletio
 for state in $states; do
     case "$state" in
         shown)
-            "$ide" window show > /dev/null
+            "$ide" window show > /dev/null || { echo "FAIL: could not show the window; the remaining states do not run"; exit 1; }
             echo "shown: $("$ide" probe)"
             check_state shown ;;
         frozen)
-            "$ide" freeze > /dev/null || { echo "FAIL: could not freeze the page"; failed=1; continue; }
-            echo "frozen: $("$ide" probe 2>&1 | head -1) (no answer means frozen)"
+            "$ide" freeze > /dev/null || { echo "FAIL: could not freeze the page; the remaining states do not run"; exit 1; }
+            # freeze records the frozen state, and probe reports it without asking the frozen page
+            [ "$("$ide" field frozen)" = true ] || { echo "FAIL: the record does not say frozen after freeze"; exit 1; }
+            echo "frozen: $("$ide" probe)"
             check_state frozen
-            "$ide" thaw > /dev/null
+            "$ide" thaw > /dev/null || { echo "FAIL: could not thaw the page (see above); the remaining states do not run"; exit 1; }
             echo "thawed: $("$ide" probe)" ;;
         hidden)
-            "$ide" window hide > /dev/null
+            "$ide" window hide > /dev/null || { echo "FAIL: could not hide the window; the remaining states do not run"; exit 1; }
             start=$(date +%s)
             until python3 -I -c 'import sys,time; sys.exit(0 if time.time() - float(sys.argv[1]) >= 60 * float(sys.argv[2]) else 1)' "$start" "$minutes"; do sleep 5; done
             echo "hidden for $minutes min: $("$ide" probe)"
             check_state hidden
-            "$ide" window show > /dev/null ;;
+            "$ide" window show > /dev/null || { echo "FAIL: could not show the window again"; exit 1; } ;;
         *) echo "unknown state $state" >&2; exit 64 ;;
     esac
 done
