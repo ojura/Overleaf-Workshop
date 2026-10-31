@@ -5,18 +5,22 @@ import { OverleafClient } from './client';
 import { readStoredLogin } from './login';
 import { SandboxSafetyError } from './guard';
 import { LockTimeoutError } from './lock';
+import { describeFindings, describeRanges, exitStatusOf, pushCheck, RANGES_HELP } from './rangesCli';
 import {
     createSandbox, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions, sandboxStatus, sandboxUrl,
     settingsOf,
 } from './sandbox';
 
-const HELP = `Compile a local directory on Overleaf, in a private copy of a shared project.
+const HELP = `Compile a local directory on Overleaf, in a private copy of a shared project, and
+check what a git push would do to the comments and tracked changes of a project.
 
 usage:
   node out/sandbox/cli.js init    --replica <folder> [--name <name>]
   node out/sandbox/cli.js status  --replica <folder>
   node out/sandbox/cli.js compile --replica <folder> --dir <folder> --main <file> [options]
   node out/sandbox/cli.js plan    --replica <folder> --dir <folder> --main <file> [options]
+  node out/sandbox/cli.js ranges  --project <id> | --replica <folder>
+  node out/sandbox/cli.js push-check --repo <folder> [--from <rev>] [--to <rev>] [--project <id>] [--user <id>]
 
 --replica <folder>  the shared project's local replica. Its .overleaf/settings.json names
                     the project; .overleaf/sandbox.json records the private copy.
@@ -32,6 +36,7 @@ compile  Makes the copy hold --dir laid over the shared project, compiles --main
          and saves the results in --out. Runs on the same copy wait for each other.
 plan     Says what compile would upload and delete, without writing anything.
 
+${RANGES_HELP}
 What the copy holds for a compile:
   a path in --dir                 the directory's file
   a path only in the shared       the shared project's current version
@@ -92,7 +97,8 @@ names the database. The environment variable OVERLEAF_LOGIN, a JSON object
 {"url", "cookies", "csrfToken", "userId"}, takes precedence.
 `;
 
-const VALUE_FLAGS = new Set(['replica', 'dir', 'main', 'out', 'keep', 'ignore', 'include', 'lock-timeout', 'purpose', 'name', 'state-db']);
+const VALUE_FLAGS = new Set(['replica', 'dir', 'main', 'out', 'keep', 'ignore', 'include', 'lock-timeout', 'purpose', 'name', 'state-db',
+    'project', 'repo', 'from', 'to', 'user', 'server']);
 const REPEATABLE = new Set(['keep', 'ignore', 'include']);
 const BOOLEAN_FLAGS = new Set(['mirror', 'incremental', 'draft', 'stop-on-first-error', 'pdf', 'json', 'help']);
 
@@ -170,8 +176,24 @@ async function main(argv: string[]): Promise<number> {
         process.stdout.write(HELP);
         return command === undefined && !flags.has('help') ? 2 : 0;
     }
-    if (!['init', 'status', 'compile', 'plan'].includes(command)) { throw new UsageError(`unknown command ${command}`); }
+    if (!['init', 'status', 'compile', 'plan', 'ranges', 'push-check'].includes(command)) { throw new UsageError(`unknown command ${command}`); }
     if (positional.length > 1) { throw new UsageError(`unexpected argument ${positional[1]}`); }
+    if (command === 'ranges' || command === 'push-check') {
+        const replica = values.replica ? readReplica(path.resolve(values.replica)) : undefined;
+        const login = readStoredLogin(values.server ?? replica?.serverName ?? 'www.overleaf.com', values['state-db']);
+        const client = new OverleafClient(login.url, login.identity);
+        if (command === 'ranges') {
+            const projectId = values.project ?? replica?.projectId;
+            if (!projectId) { throw new UsageError('ranges needs --project or --replica'); }
+            const state = await client.readRanges(projectId);
+            process.stdout.write(flags.has('json') ? JSON.stringify(state, null, 2) + '\n' : describeRanges(state));
+            return 0;
+        }
+        if (!values.repo) { throw new UsageError('push-check needs --repo'); }
+        const result = await pushCheck(client, { repo: values.repo, from: values.from, to: values.to, project: values.project ?? replica?.projectId, userId: values.user ?? login.userId });
+        process.stdout.write(flags.has('json') ? JSON.stringify({ summary: result.summary, findings: result.findings }, null, 2) + '\n' : describeFindings(result.findings, result.summary));
+        return exitStatusOf(result.findings);
+    }
     if (!values.replica) { throw new UsageError('--replica is required'); }
 
     const replica = readReplica(path.resolve(values.replica));

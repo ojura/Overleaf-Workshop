@@ -2,6 +2,8 @@
 import { BaseAPI, CompileResponseSchema, Identity } from '../api/base';
 import type { FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
 import { CompileRequest, EntityType, JoinedView, ProjectView, ProjectWriter } from './guard';
+import { decodePackedUtf8 } from '../api/packedUtf8';
+import { DocRanges, ProjectRanges, rangesOf } from './ranges';
 
 /** What joinProject returns for a project, as far as the tool reads it. */
 export interface JoinedProject extends JoinedView {
@@ -67,8 +69,11 @@ export class OverleafClient implements ProjectWriter {
         this.api = new SandboxAPI(url);
     }
 
-    /** Join `projectId` on a new connection, as the web editor does, and disconnect again. */
-    join(projectId: string): Promise<JoinedProject> {
+    /**
+     * Join `projectId` on a new connection, as the web editor does. Resolves with the joined
+     * project and the open socket, which the caller must disconnect.
+     */
+    private open(projectId: string): Promise<{ joined: JoinedProject, socket: any }> {
         const origin = new URL(this.url).origin;
         const io = require('socket.io-client');
         return new Promise((resolve, reject) => {
@@ -82,8 +87,12 @@ export class OverleafClient implements ProjectWriter {
                 if (settled) { return; }
                 settled = true;
                 clearTimeout(timer);
-                try { socket.removeAllListeners?.(); socket.disconnect(); } catch { /* already closed */ }
-                error ? reject(error) : resolve(value!);
+                if (error) {
+                    try { socket.removeAllListeners?.(); socket.disconnect(); } catch { /* already closed */ }
+                    reject(error);
+                } else {
+                    resolve({ joined: value!, socket });
+                }
             };
             const timer = setTimeout(() => finish(new Error(`joining project ${projectId} took more than ${this.joinTimeoutMs/1000} s`)), this.joinTimeoutMs);
             socket.on('joinProjectResponse', (res: any) => {
@@ -98,6 +107,56 @@ export class OverleafClient implements ProjectWriter {
             socket.on('error', (err: any) => finish(new Error(`connection to ${origin} failed: ${err?.message ?? err}`)));
             socket.on('disconnect', () => finish(new Error(`the connection to ${origin} closed before project ${projectId} was joined`)));
         });
+    }
+
+    private static close(socket: any) {
+        try { socket.removeAllListeners?.(); socket.disconnect(); } catch { /* already closed */ }
+    }
+
+    /** Join `projectId` on a new connection, as the web editor does, and disconnect again. */
+    async join(projectId: string): Promise<JoinedProject> {
+        const { joined, socket } = await this.open(projectId);
+        OverleafClient.close(socket);
+        return joined;
+    }
+
+    /**
+     * Join `projectId` and read every document with its comments and tracked changes, as the
+     * editor's joinDoc returns them. Only reads: joinDoc and leaveDoc, never an update.
+     */
+    async readRanges(projectId: string): Promise<ProjectRanges> {
+        const { joined, socket } = await this.open(projectId);
+        const emit = (...args: any[]) => new Promise<any[]>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(`${args[0]} took more than ${this.joinTimeoutMs/1000} s`)), this.joinTimeoutMs);
+            socket.emit(...args, (err: any, ...rest: any[]) => {
+                clearTimeout(timer);
+                err ? reject(new Error(`${args[0]}: ${err?.message ?? JSON.stringify(err)}`)) : resolve(rest);
+            });
+        });
+        try {
+            const docs: DocRanges[] = [];
+            const walk = async (folder: FolderEntity, prefix: string) => {
+                for (const doc of folder.docs) {
+                    const [lines, , , ranges] = await emit('joinDoc', doc._id, { encodeRanges: true });
+                    await emit('leaveDoc', doc._id);
+                    docs.push({
+                        path: prefix + doc.name, docId: doc._id,
+                        text: (lines as string[]).map(decodePackedUtf8).join('\n'),
+                        ...rangesOf(ranges),
+                    });
+                }
+                for (const sub of folder.folders) { await walk(sub, `${prefix}${sub.name}/`); }
+            };
+            await walk(joined.project.rootFolder[0], '');
+            const project: any = joined.project;
+            const users: Record<string, string> = {};
+            for (const user of [project.owner, ...(project.members ?? [])]) {
+                if (user?._id) { users[user._id] = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.email || user._id; }
+            }
+            return { projectId, docs, trackChanges: project.trackChangesState ?? false, users };
+        } finally {
+            OverleafClient.close(socket);
+        }
     }
 
     docText(projectId: string, docId: string): Promise<string> {
