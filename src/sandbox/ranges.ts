@@ -19,9 +19,7 @@
  *   alike.
  */
 import { overleafText } from './plan';
-import { semanticDiff, trackChangesFor, TrackChangesState } from '../utils/docUpdate';
-
-export { trackChangesFor };
+import { semanticDiff, trackChangesOn, TrackChangesState } from '../utils/docUpdate';
 
 export interface CommentRange { id: string; threadId: string; p: number; text: string; userId?: string; }
 export interface TrackedChange { id: string; kind: 'insertion' | 'deletion'; p: number; text: string; userId?: string; }
@@ -232,7 +230,7 @@ export function assessPush(state: ProjectRanges, files: PushedFile[], userId?: s
             }
         }
     }
-    if (changesText && trackChangesFor(state.trackChanges, userId)) {
+    if (changesText && trackChangesOn(state.trackChanges).isOnFor(userId)) {
         findings.push({ severity: 'warn', path: '', message: `track changes is on for ${who(userId)}: Overleaf records the push's edits as tracked changes, which someone has to accept` });
     }
     const order: Record<Severity, number> = { refuse: 0, warn: 1, info: 2 };

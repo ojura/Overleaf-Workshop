@@ -1,6 +1,7 @@
+/* eslint-disable @typescript-eslint/naming-convention -- Overleaf's field names (__guests__) */
 import * as assert from 'assert';
 import * as DiffMatchPatch from 'diff-match-patch';
-import { opsFor, semanticDiff, TextOp, trackChangesFor, trackedChangesSeed, updateMeta } from '../utils/docUpdate';
+import { opsFor, semanticDiff, TextOp, trackChangesOn, trackedChangesSeed, updateMeta } from '../utils/docUpdate';
 
 /** Apply ops one after the other, as Overleaf does. */
 function apply(text: string, ops: TextOp[]): string {
@@ -38,13 +39,17 @@ describe('docUpdate: the ops of an update', () => {
 });
 
 describe('docUpdate: tracked updates', () => {
-    it('knows for whom track changes is on', () => {
-        assert.strictEqual(trackChangesFor(true, 'u1'), true);
-        assert.strictEqual(trackChangesFor(false, 'u1'), false);
-        assert.strictEqual(trackChangesFor({ u1: true }, 'u1'), true);
-        assert.strictEqual(trackChangesFor({ u1: false, u2: true }, 'u1'), false);
-        assert.strictEqual(trackChangesFor(undefined, 'u1'), false);
-        assert.strictEqual(trackChangesFor({ u1: true }, undefined), false);
+    it('reads for whom track changes is on, as the toggle event and joinProject send it', () => {
+        assert.deepStrictEqual({ ...trackChangesOn(true), isOnFor: undefined }, { everyone: true, users: [], isOnFor: undefined });
+        assert.deepStrictEqual(trackChangesOn(false).users, []);
+        assert.deepStrictEqual(trackChangesOn(undefined).users, []);
+        assert.deepStrictEqual(trackChangesOn({ u1: true, u2: false, __guests__: true }).users, ['u1', '__guests__']);
+        assert.strictEqual(trackChangesOn(true).isOnFor('u1'), true);
+        assert.strictEqual(trackChangesOn(false).isOnFor('u1'), false);
+        assert.strictEqual(trackChangesOn({ u1: true }).isOnFor('u1'), true);
+        assert.strictEqual(trackChangesOn({ u1: false, u2: true }).isOnFor('u1'), false);
+        assert.strictEqual(trackChangesOn(undefined).isOnFor('u1'), false);
+        assert.strictEqual(trackChangesOn({ u1: true }).isOnFor(undefined), false);
     });
     it('gives an update a fresh seed when track changes is on for its user, and no meta otherwise', () => {
         const a = updateMeta({ u1: true }, 'u1'), b = updateMeta(true, 'u1');

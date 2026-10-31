@@ -4,6 +4,7 @@ import { editorPageMeta, newerImages, OfferedImage, offeredImages } from '../api
 import { formatGitTokenStatus, gitProjectUrl, GitTokenStatus, gitTokenStatus } from '../api/gitBridge';
 import type { JoinedProject } from './client';
 import type { DocRanges, ProjectRanges } from './ranges';
+import { trackChangesOn } from '../utils/docUpdate';
 
 /**
  * What project-info needs from a connection to Overleaf; OverleafClient has it. readProject is
@@ -104,13 +105,13 @@ function countsOf(doc: DocRanges): DocumentCounts {
     };
 }
 
-/** Overleaf's track-changes state: true (everyone), false or absent (nobody), or {userId: true}. */
+/** The people track changes is on for, as trackChangesOn reads Overleaf's track-changes state. */
 function trackChangesOf(state: unknown, people: PersonInfo[]): ProjectInfo['trackChanges'] {
-    if (state === true) {
+    const on = trackChangesOn(state);
+    if (on.everyone) {
         return { everyone: true };
     }
-    const ids = state && typeof state === 'object' ? Object.entries(state).filter(([, on]) => on).map(([id]) => id) : [];
-    const users = ids.map(id => people.find(person => person.id === id)
+    const users = on.users.map(id => people.find(person => person.id === id)
                                ?? { id, name: id === '__guests__' ? 'guests (anyone with the link who is not logged in)' : `user ${id}, not a member of the project now` });
     return { everyone: false, users };
 }

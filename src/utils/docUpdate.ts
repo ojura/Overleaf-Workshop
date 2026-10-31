@@ -43,10 +43,17 @@ export function opsFor(before: string, after: string): TextOp[] {
 /** A project's trackChangesState: on or off for everyone, or on for the users it lists. */
 export type TrackChangesState = boolean | { [userId: string]: boolean };
 
-/** Whether track changes is on for `userId`. */
-export function trackChangesFor(state: TrackChangesState | undefined, userId?: string): boolean {
-    if (typeof state === 'boolean') { return state; }
-    return !!(userId && state?.[userId]);
+/**
+ * For whom track changes is on in a project's trackChangesState: true is everyone; false,
+ * or no state, is nobody; an object lists the ids it is on for: user ids, and "__guests__"
+ * for people with the link who are not logged in. The one reading of trackChangesState:
+ * the extension's updates, push-check and project-info all use it.
+ */
+export function trackChangesOn(state: unknown): { everyone: boolean, users: string[], isOnFor(userId?: string): boolean } {
+    const everyone = state === true;
+    const users = !everyone && state && typeof state === 'object'
+        ? Object.entries(state).filter(([, on]) => on).map(([id]) => id) : [];
+    return { everyone, users, isOnFor: (userId?: string) => everyone || (!!userId && users.includes(userId)) };
 }
 
 /**
@@ -64,5 +71,5 @@ export function trackedChangesSeed(): string {
  * and nothing otherwise. overleaf.com refuses an update whose meta has other keys.
  */
 export function updateMeta(state: TrackChangesState | undefined, userId?: string): { tc: string } | undefined {
-    return trackChangesFor(state, userId) ? { tc: trackedChangesSeed() } : undefined;
+    return trackChangesOn(state).isOnFor(userId) ? { tc: trackedChangesSeed() } : undefined;
 }

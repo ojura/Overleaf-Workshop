@@ -5,7 +5,8 @@
 import * as path from 'path';
 import { OverleafClient } from './client';
 import { bridgeProjectId, pushedFiles, resolveCommit } from './gitPush';
-import { assessPush, Finding, ProjectRanges, trackChangesFor } from './ranges';
+import { assessPush, Finding, ProjectRanges } from './ranges';
+import { trackChangesOn } from '../utils/docUpdate';
 
 export const RANGES_HELP = `ranges      Lists the comments and tracked changes of every document of the
             project on Overleaf now, and for whom track changes is on.
@@ -37,8 +38,8 @@ const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
 export function describeRanges(state: ProjectRanges): string {
     const lines: string[] = [];
     const who = (id?: string) => (id && state.users[id]) || id || 'someone';
-    const tc = state.trackChanges;
-    const tcOn = typeof tc === 'boolean' ? (tc ? 'everyone' : '') : Object.entries(tc ?? {}).filter(([, on]) => on).map(([id]) => who(id)).join(', ');
+    const tc = trackChangesOn(state.trackChanges);
+    const tcOn = tc.everyone ? 'everyone' : tc.users.map(who).join(', ');
     lines.push(`project ${state.projectId}: track changes ${tcOn ? `is on for ${tcOn}` : 'is off for everyone'}`);
     let comments = 0, changes = 0, withRanges = 0;
     for (const doc of state.docs) {
@@ -82,6 +83,6 @@ export async function pushCheck(client: OverleafClient, options: { repo: string,
     const files = pushedFiles(repo, from, to);
     const state = await client.readRanges(projectId);
     const findings = assessPush(state, files, options.userId);
-    const summary = `push-check: ${files.length} files changed from ${from.slice(0, 7)} to ${to.slice(0, 7)}; project ${projectId}; pushing as ${state.users[options.userId] ?? options.userId}${trackChangesFor(state.trackChanges, options.userId) ? ' (track changes on)' : ''}`;
+    const summary = `push-check: ${files.length} files changed from ${from.slice(0, 7)} to ${to.slice(0, 7)}; project ${projectId}; pushing as ${state.users[options.userId] ?? options.userId}${trackChangesOn(state.trackChanges).isOnFor(options.userId) ? ' (track changes on)' : ''}`;
     return { findings, summary, state, files };
 }
