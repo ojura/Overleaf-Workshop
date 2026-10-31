@@ -5,21 +5,31 @@ import * as path from 'path';
 import { minimatch } from 'minimatch';
 import { readStoredLogin } from '../sandbox/login';
 import { attach, bridgeCommitWithStart, checkResult, ConnectError, rewrite, Side, Start, startFromVersion } from './connect';
-import { bridgeBranch, commandCheck, pullFromBridge, pushToBridge } from './flow';
+import { bridgeBranch, commandCheck, PrePushCheck, pullFromBridge, pushToBridge } from './flow';
+import { addBridgeRemote, rangesCheck } from './overleaf';
+import { readReplica } from '../sandbox/sandbox';
 import { filesMatchVersion, findStartVersion, OverleafHistory, Pacer, updateForVersion } from './history';
 import { GitError, Repo } from './plumbing';
 
 const HELP = `Connect a local history with the history of Overleaf's git bridge, then fetch, merge and push.
 
 usage:
+  node out/gitbridge/cli.js remote-add [--repo <dir>] [--remote <name>] (--project <id> | --replica <folder>)
   node out/gitbridge/cli.js connect attach  [--repo <dir>] [--remote <name>] [options]
   node out/gitbridge/cli.js connect rewrite [--repo <dir>] [--remote <name>] [options]
   node out/gitbridge/cli.js pull [--repo <dir>] [--remote <name>]
-  node out/gitbridge/cli.js push [--repo <dir>] [--remote <name>] [--check <command>] [--attempts <n>]
+  node out/gitbridge/cli.js push [--repo <dir>] [--remote <name>] [options]
 
 --repo <dir>     the local repository (default: the current folder)
 --remote <name>  its remote for the git bridge, e.g. https://git.overleaf.com/<project id>
                  (default: origin). git asks the remote's credential helper for the token.
+
+remote-add: adds --remote (here the default is overleaf) for the project's address on the
+git bridge, with the credential helper that git-clone of the private-copy tool gives a
+clone: git gets the git token that the extension keeps next to its login, and neither
+the address nor the configuration holds it. --project <id>, or --replica <folder> for the
+project of a local replica; --server <name> (default www.overleaf.com, or the replica's);
+--bridge <url> when the server's git bridge is not known.
 
 connect: once, when the local history started from a copy of the project's files and has
 no commit in common with the bridge's. Run git fetch first: connect uses the remote's
@@ -53,11 +63,16 @@ it still points at the local history's commit (--local, default HEAD).
   travel with the commits into the project. --not-own <glob> (repeatable) leaves paths out.
 
 pull: fetch, and merge the bridge's commit into the checked-out branch when Overleaf changed.
-push: fetch; merge when Overleaf changed; run --check; push as a fast-forward; when the
-      bridge refuses it because the project changed after the fetch, again from the fetch
-      (--attempts, default 3). --check <command> runs before each push with BRIDGE_FROM
-      (the bridge's commit), BRIDGE_TO (the commit to push) and BRIDGE_REPO set, and stops
-      the push by exiting with a non-zero status.
+push: fetch; merge when Overleaf changed; check; push as a fast-forward; when the bridge
+      refuses it because the project changed after the fetch, again from the fetch
+      (--attempts, default 3). The check before each push is push-check's: it reads the
+      comments and tracked changes on Overleaf and stops a push that would lose or move
+      them ("refuse"), and one with warnings unless --accept-warnings. It joins the project
+      as the editor does, so others see you online meanwhile; --no-ranges-check skips it.
+      --check <command> runs after it, with BRIDGE_FROM (the bridge's commit), BRIDGE_TO
+      (the commit to push) and BRIDGE_REPO set, and stops the push by exiting with a
+      non-zero status. --project <id> when the remote's address does not name the
+      project; --server <name> (default www.overleaf.com).
 
 --json prints connect's and push's results as JSON.
 
@@ -65,8 +80,8 @@ Exit status: 0 done; 1 failed (the message says why) or connect's check found a
 difference; 2 wrong arguments.
 `;
 
-const VALUE_FLAGS = new Set(['repo', 'remote', 'local', 'start-version', 'project', 'server', 'state-db', 'map', 'update', 'not-own', 'check', 'attempts', 'pace']);
-const BOOLEAN_FLAGS = new Set(['take-bridge', 'json', 'help']);
+const VALUE_FLAGS = new Set(['repo', 'remote', 'local', 'start-version', 'project', 'replica', 'server', 'bridge', 'state-db', 'map', 'update', 'not-own', 'check', 'attempts', 'pace']);
+const BOOLEAN_FLAGS = new Set(['take-bridge', 'no-ranges-check', 'accept-warnings', 'json', 'help']);
 
 class UsageError extends Error {}
 
@@ -137,10 +152,35 @@ async function main(argv: string[]): Promise<number> {
         process.stdout.write(`fetched ${bridge.branch} at ${short(bridge.head)}: ${merge}\n`);
         return 0;
     }
+    if (command === 'remote-add') {
+        const name = values.remote ?? 'overleaf';
+        const replica = values.replica ? readReplica(path.resolve(values.replica)) : undefined;
+        const projectId = values.project ?? replica?.projectId;
+        if (!projectId) { throw new UsageError('remote-add needs --project <id> or --replica <folder>'); }
+        const { url } = addBridgeRemote(repo, { remote: name, projectId, serverName: values.server ?? replica?.serverName ?? 'www.overleaf.com', bridgeUrl: values.bridge });
+        process.stdout.write(`added the remote ${name}: ${url}; git fetch ${name} gets the token from the extension's login\n`);
+        return 0;
+    }
     if (command === 'push') {
         const attempts = values.attempts ? Number(values.attempts) : 3;
         if (!Number.isInteger(attempts) || attempts < 1) { throw new UsageError('--attempts needs a whole number from 1'); }
-        const report = await pushToBridge(repo, remote, { check: values.check ? commandCheck(values.check) : undefined, attempts, log });
+        const checks: PrePushCheck[] = [];
+        if (!flags.has('no-ranges-check')) {
+            const projectId = values.project ?? projectIdOf(repo.text(['remote', 'get-url', remote]));
+            if (!projectId) { throw new UsageError(`the remote ${remote}'s address names no project; give --project, or --no-ranges-check`); }
+            checks.push(rangesCheck({ serverName: values.server ?? 'www.overleaf.com', projectId, acceptWarnings: flags.has('accept-warnings') }));
+        }
+        if (values.check) { checks.push(commandCheck(values.check)); }
+        const check: PrePushCheck | undefined = checks.length === 0 ? undefined : async (r, from, to) => {
+            const messages: string[] = [];
+            for (const c of checks) {
+                const answer = await c(r, from, to);
+                if (answer.message) { messages.push(answer.message); }
+                if (!answer.ok) { return { ok: false, message: messages.join('\n') }; }
+            }
+            return { ok: true, message: messages.join('\n') || undefined };
+        };
+        const report = await pushToBridge(repo, remote, { check, attempts, log });
         process.stdout.write(flags.has('json') ? JSON.stringify(report, null, 1) + '\n'
             : `${report.pushed ? `pushed ${short(report.head)}` : `nothing to push; the bridge holds ${short(report.head)}`} after ${report.attempts.length} attempt${report.attempts.length > 1 ? 's' : ''}\n`);
         return 0;

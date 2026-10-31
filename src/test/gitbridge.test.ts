@@ -7,6 +7,7 @@ import * as zlib from 'zlib';
 import { attach, bridgeCommitWithStart, checkResult, ConnectError, ownFiles, rewrite, startFromVersion } from '../gitbridge/connect';
 import { pullFromBridge, pushToBridge } from '../gitbridge/flow';
 import { findStartVersion, HistorySource, HistoryUpdate, readZip, treeAtVersion, TreeChange, VersionEntry } from '../gitbridge/history';
+import { answerFromFindings } from '../gitbridge/overleaf';
 import { gitDate, Repo } from '../gitbridge/plumbing';
 
 /** a time in seconds that git reads as one: git takes small numbers for something else */
@@ -345,5 +346,23 @@ describe('git bridge: the tree at a version', () => {
         assert.deepStrictEqual(result.read.sort(), ['main.tex', 'notes.tex', 'old.tex']);
         assert.deepStrictEqual(result.fromZip, ['fig.png'], 'logo.png is unchanged since the version, so it comes from the bridge');
         assert.ok(!s.history.docReads.includes(`chapter.tex@${s.startV}`), 'chapter.tex is unchanged since the version, so it comes from the bridge');
+    });
+});
+
+describe('git bridge: the check of comments and tracked changes', () => {
+    const f = (severity: 'info' | 'warn' | 'refuse') => ({ severity, path: 'main.tex', message: `a ${severity} finding` });
+    it('stops the push on "refuse", even with --accept-warnings', () => {
+        assert.strictEqual(answerFromFindings([f('info'), f('refuse')], 'summary', true).ok, false);
+    });
+    it('stops the push on "warn" unless the warnings are accepted', () => {
+        const stopped = answerFromFindings([f('warn')], 'summary', false);
+        assert.strictEqual(stopped.ok, false);
+        assert.match(stopped.message!, /--accept-warnings/);
+        assert.strictEqual(answerFromFindings([f('warn')], 'summary', true).ok, true);
+    });
+    it('lets the push go with findings of "info" only', () => {
+        const answer = answerFromFindings([f('info')], 'summary', false);
+        assert.strictEqual(answer.ok, true);
+        assert.match(answer.message!, /a info finding/);
     });
 });
