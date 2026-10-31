@@ -3,10 +3,7 @@ import { Identity, BaseAPI, ProjectMessageResponseSchema } from './base';
 import { FileEntity, DocumentEntity, FileRefEntity, FileType, FolderEntity, ProjectEntity } from '../core/remoteFileSystemProvider';
 import { EventBus } from '../utils/eventBus';
 import { SocketIOAlt } from './socketioAlt';
-
-function decodePackedUtf8(text: string): string {
-    return Buffer.from(text, 'latin1').toString('utf-8');
-}
+import { decodePackedUtf8 } from './packedUtf8';
 
 
 /** Render a socket.io error payload as something readable instead of `[object Object]`. */
