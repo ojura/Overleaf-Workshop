@@ -12,7 +12,8 @@
 // through process.exit and the clean-ups, and so does every process on a second signal.
 import { closeAllConnections, openConnectionCount } from './devtools.mjs';
 
-const EXIT_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+/** the exit status of a script that a signal ended: 128 + the signal's number */
+export const EXIT_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
 
 /** the clean-ups that have not run, oldest first */
 const cleanups = [];

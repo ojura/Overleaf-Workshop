@@ -5,11 +5,20 @@
 // another folder, for example another checkout's. By default each viewer runs as VS Code shows it
 // (frame) at 40 and 150 ms per request, and as a plain page at 40 ms. The results go to --out, by
 // default compare/ in the work folder (common.mjs): <engine>-<mode>-<latency>.json and .log for
-// each run, and table.md.
+// each run, and table.md. Exit status 0 when every run passed all its checks, 1 when a run failed
+// a check, failed itself or wrote no result; a run that a signal ended stops the comparison, with
+// that run's status.
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { EXIT_CODES } from '../lib/cleanup.mjs';
 import { arg, defaultExt, here, work } from './common.mjs';
+
+/**
+ * The last resort for a drive that never ends: drive.mjs ends on its own, also when the viewer
+ * hangs, since each of its waits has a limit; a run takes about a minute.
+ */
+const RUN_LIMIT_MS = 600000;
 
 const ext = arg('ext', defaultExt);
 const exts = { overleaf: arg('overleaf', ext), pdfjs: arg('pdfjs', ext) };
@@ -23,6 +32,8 @@ const outDir = path.resolve(arg('out', path.join(work, 'compare')));
 fs.mkdirSync(outDir, { recursive: true });
 
 const all = {};
+/** the runs that failed, with why */
+const failures = [];
 for (const engine of engines) {
     for (const run of runs) {
         const name = `${engine}-${run.framed ? 'frame' : 'plain'}-${run.latency}`;
@@ -32,9 +43,22 @@ for (const engine of engines) {
             '--port', String(port), '--json', json, '--shots', path.join(outDir, `shots-${name}`)];
         if (run.framed) { args.push('--frame'); }
         console.log(`running ${name} ...`);
-        const result = spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 600000 });
+        // at the limit drive.mjs gets SIGTERM, ends as on Ctrl+C (scripts/lib/cleanup.mjs) and stops its Chrome
+        const result = spawnSync(process.execPath, args, { encoding: 'utf8', timeout: RUN_LIMIT_MS });
         fs.writeFileSync(path.join(outDir, `${name}.log`), `${result.stdout}\n${result.stderr}`);
         all[name] = fs.existsSync(json) ? JSON.parse(fs.readFileSync(json, 'utf8')) : { error: result.stderr || 'drive.mjs did not write a result' };
+        if (result.error?.code === 'ETIMEDOUT') {
+            failures.push(`${name}: still running after ${RUN_LIMIT_MS / 1000} s, ended with SIGTERM`);
+        } else if (Object.values(EXIT_CODES).includes(result.status)) {
+            console.log(`${name} ended by a signal (exit status ${result.status}); the comparison stops`);
+            process.exit(result.status);
+        } else if (result.error) {
+            failures.push(`${name}: could not run drive.mjs: ${result.error.message}`);
+        } else if (result.status !== 0) {
+            failures.push(`${name}: drive.mjs exited with ${result.signal ?? `status ${result.status}`}`);
+        } else if (all[name].error) {
+            failures.push(`${name}: ${all[name].error}`);
+        }
     }
 }
 
@@ -76,3 +100,7 @@ for (const n of names) {
         console.log(`${n}: ${all[n].error ?? failed.map(f => `${f.name} (${f.detail})`).join('; ')}`);
     }
 }
+if (failures.length) {
+    console.log(`\n${failures.length} of ${names.length} runs failed:\n${failures.map(f => `  ${f}`).join('\n')}`);
+}
+process.exitCode = failures.length ? 1 : 0;
