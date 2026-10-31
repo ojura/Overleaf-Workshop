@@ -16,7 +16,7 @@ try {
     await page.useFrame();
     const V = engine === 'overleaf' ? 'window.overleafViewer.wrapper.viewer' : 'window.PDFViewerApplication.pdfViewer';
     await page.waitFor(`(() => { try { return ${V}.getPageView(0).renderingState === 3; } catch { return false; } })()`, 60000);
-    for (const width of [1400, 1085, 900, 760, 740, 680, 560, 470, 350]) {
+    for (const width of [1400, 1085, 900, 760, 740, 680, 560, 470, 350, 330, 300]) {
         await page.send('Emulation.setDeviceMetricsOverride', { width, height: 400, deviceScaleFactor: 1, mobile: false });
         await new Promise(r => setTimeout(r, 500));
         // the toolbar's elements whose right edge is past the pane's
@@ -27,7 +27,7 @@ try {
     if (engine === 'pdfjs') {
         await page.evaluate(`document.getElementById('secondaryToolbarToggleButton').click(); true`);
         await new Promise(r => setTimeout(r, 500));
-        await page.screenshot(path.join(outDir, `${engine}-350-menu.png`));
+        await page.screenshot(path.join(outDir, `${engine}-300-menu.png`));
     }
     console.log(`screenshots in ${outDir}`);
 } finally {

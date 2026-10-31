@@ -1,8 +1,9 @@
 # PDF viewer test harness
 
 These scripts test the extension's two PDF viewers in `views/pdf-viewer/`, the pdfjs viewer and
-the Overleaf viewer. They run a viewer page in headless Chrome, against a local server that stands
-in for Overleaf and for VS Code.
+the Overleaf viewer. The scripts in this folder and in `probes/` run a viewer page in headless
+Chrome, against a local server that stands in for Overleaf and for VS Code. The scripts in `ide/`
+drive the viewers in a test instance of Antigravity on a virtual display.
 
 ## What the headless harness runs
 
@@ -55,7 +56,7 @@ request and as a plain page at 40 ms, and writes a table of the results.
 | `pdfjs-same-build-zoom.mjs` | pdfjs viewer: the build in view stays when the host sends it again; zoom steps of 1.25 |
 | `switch-button.mjs` | the button to the other viewer, and the message it sends the host |
 | `theme-colors.mjs` | the pixel colors of each color theme on the page of `theme_book.py` |
-| `toolbar-shots.mjs` | the toolbar at pane widths from 1400 to 350 px, and what reaches past the edge |
+| `toolbar-shots.mjs` | the toolbar at pane widths from 1400 to 300 px, and what reaches past the edge |
 | `live.mjs` | a real build from a saved compile response (see below) |
 
 ## Requirements
@@ -106,3 +107,39 @@ The compile response is the JSON that Overleaf's compile endpoint returns. Save 
 of a project meant for tests, and run the probe soon after: Overleaf removes old builds, after
 which the download fails. Compile responses name a project's builds, so keep them out of the
 repository.
+
+## The IDE scripts
+
+The scripts in `ide/` drive the viewers in Antigravity itself, in the window of an instance that
+`scripts/hidden-ide.sh` started on a virtual display, and only there. They read the instance's
+`instance.json` in `$HIDDEN_IDE_HOME` (default `/tmp/hidden-ide-<uid>`), or in the folder that
+`--instance` names, and check that the instance's main process holds its debugging port before
+they connect. The settings they change are the instance's own (`profile/User/settings.json`), and
+they restore them when they end.
+
+An instance opens either a folder of PDFs, without a login (`--folder`), or the local replica of an
+Overleaf project meant for tests (`--project`), whose `output.pdf` the viewer loads in ranges:
+
+```sh
+scripts/hidden-ide.sh start --folder /tmp/pdf-viewer-harness/book-theme
+node scripts/pdf-viewer-harness/ide/drive-local-pdf.mjs --pdf /tmp/pdf-viewer-harness/book-theme/build-a.pdf --pages 1 --theme-book
+scripts/hidden-ide.sh stop
+```
+
+| script | what it does |
+|---|---|
+| `drive-local-pdf.mjs` | opens a local PDF with Quick Open; drawing, pdf.js's worker, zoom keys, Ctrl+P, find, and the dark theme on the page of `theme_book.py` |
+| `drive-build.mjs` | reopens `output.pdf`; loading in ranges, jumps, and with `--theme-page N` the dark theme on page N |
+| `drive-switch.mjs` | on the open `output.pdf`: the viewer setting and each viewer's switch button |
+| `timeline.mjs` | reopens `output.pdf` and records the host's messages, pdf.js's events and the page's state |
+| `toolbar-shots.mjs` | screenshots of both toolbars at window widths from 1440 to 450 px |
+| `find-image-page.mjs` | lists pages with images, for the theme checks |
+| `probe-page-colors.mjs` | page N in the default and the dark theme: changed colored pixels and drawing operators |
+| `snap-page.mjs` | page N in the default and the dark theme as PNGs, for a look by eye |
+
+`drive-local-pdf.mjs` and `toolbar-shots.mjs` associate `*.pdf` with the extension's viewer while
+they run, because the viewer's own selector takes only PDFs of the extension's file system. The
+scripts on `output.pdf` need it open in the instance, for example through Overleaf Workshop's View
+PDF command. In a folder instance they also run on a local file named `output.pdf` while
+`workbench.editorAssociations` maps `*.pdf` to `overleaf-workshop.pdfViewer`; the viewer then reads
+the whole file, so their checks of loading in ranges fail.
