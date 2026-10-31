@@ -18,8 +18,8 @@
  *   changed, and the comment can end up on another copy, through git and the extension
  *   alike.
  */
-import * as DiffMatchPatch from 'diff-match-patch';
 import { overleafText } from './plan';
+import { semanticDiff } from '../utils/docUpdate';
 
 export interface CommentRange { id: string; threadId: string; p: number; text: string; userId?: string; }
 export interface TrackedChange { id: string; kind: 'insertion' | 'deletion'; p: number; text: string; userId?: string; }
@@ -62,11 +62,9 @@ export function trackChangesFor(state: ProjectRanges['trackChanges'], userId?: s
 /** One change of a document: the text from `from` to `to` replaced by `inserted`, in the positions of the text before it. */
 export interface Edit { from: number; to: number; inserted: string; }
 
-/** The edits Overleaf makes when a push changes a document from `before` to `after`. */
+/** The edits Overleaf makes when a push changes a document from `before` to `after`, placed by semanticDiff. */
 export function bridgeEdits(before: string, after: string): Edit[] {
-    const dmp = new DiffMatchPatch();
-    const diffs = dmp.diff_main(before, after);
-    dmp.diff_cleanupSemantic(diffs);
+    const diffs = semanticDiff(before, after);
     const edits: Edit[] = [];
     let pos = 0;
     let current: Edit | undefined;

@@ -4,6 +4,7 @@ import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, COMPILERS, CompileResponseSchema, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import type { CompileRecord } from '../compile/outputFiles';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
+import { opsFor } from '../utils/docUpdate';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { ClientManager } from '../collaboration/clientManager';
@@ -1142,26 +1143,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                         ).digest('hex');
                     }
                 })() as string,
-                op: (()=>{
-                    const remoteCacheAscii = Buffer.from(doc.remoteCache!, 'utf-8').toString('utf-8');
-                    const mergeResAscii = Buffer.from(mergeRes, 'utf-8').toString('utf-8');
-                    let currentPos = 0;
-                    return dmp.diff_main(remoteCacheAscii, mergeResAscii)
-                                .map((part) => {
-                                    // part[0] === -1: delete, 0: equal, 1: insert; part[1]: compared content
-                                    const incCount = part[0] === -1 ? 0 : part[1].length;
-                                    currentPos += incCount;
-                                    // add op when content not equal
-                                    if (part[0] !== 0) {
-                                        return {
-                                            p: currentPos - incCount,
-                                            i: part[0] ===  1 ?  part[1] : undefined,
-                                            d: part[0] === -1 ?  part[1] : undefined,
-                                        };
-                                    }
-                                })
-                                .filter(x => x) as any;
-                })(),
+                // placed as Overleaf places edits (semantic cleanup), so comments and tracked
+                // changes next to the edit move as with the same edit in the editor or a git push
+                op: opsFor(doc.remoteCache!, mergeRes),
             };
             if (update.op.length>0) { this.isDirty = true; }
             if (update.op.length===0) {

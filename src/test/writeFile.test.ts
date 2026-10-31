@@ -224,6 +224,21 @@ describe('VirtualFileSystem.writeFile', () => {
     });
 });
 
+describe('VirtualFileSystem.writeFile: the placement of edits', () => {
+    const ackTimeout = VirtualFileSystem.ownUpdateAckTimeoutMs;
+    before(() => { VirtualFileSystem.ownUpdateAckTimeoutMs = 20; });
+    after(() => { VirtualFileSystem.ownUpdateAckTimeoutMs = ackTimeout; });
+
+    it('places a deleted line as Overleaf does, from its start to the next line\'s start', async () => {
+        const t = setup('L09 x.\nL10 y.\nL11 z.\n');
+        await t.open();
+        await t.save('L09 x.\nL11 z.\n');
+        await settle();
+        assert.deepStrictEqual(t.server.emitted[0].op, [{ p: 7, d: 'L10 y.\n' }]);
+        assert.strictEqual(t.server.content, 'L09 x.\nL11 z.\n');
+    });
+});
+
 describe('SocketIOAPI.applyOtUpdate', () => {
     it('does not emit an update that carries no ops', async () => {
         const emitted: any[] = [];
