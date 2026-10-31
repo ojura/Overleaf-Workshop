@@ -63,3 +63,17 @@
      this.current.patternStroke = false;
    }
    setStrokeTransparent() {
+@@ -13005,6 +13029,13 @@
+     });
+   }
+   getStructTree(pageIndex) {
++    // Overleaf Workshop: a page view whose render was cancelled still builds its structure tree
++    // layer (PDFPageView.draw), also when the render was cancelled because its document is being
++    // destroyed. A worker that has handled "Terminate" answers with an error, and nothing handles
++    // it: the layer keeps the promise until it renders. A destroyed document has no structure tree.
++    if (this.destroyed) {
++      return Promise.resolve(null);
++    }
+     return this.messageHandler.sendWithPromise("GetStructTree", {
+       pageIndex
+     });

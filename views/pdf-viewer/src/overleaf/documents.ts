@@ -20,6 +20,14 @@ interface Job {
     task?: any;
 }
 
+/** What the page ends together with a document it loaded. */
+interface Owned {
+    /** the document's worker */
+    worker: Worker;
+    /** the abort controller of the document's range requests (Overleaf's transport), for a build loaded in ranges */
+    requests?: AbortController;
+}
+
 /** how long a document may take to be destroyed before its worker is stopped anyway */
 const DESTROY_TIMEOUT_MS = 10_000;
 
@@ -40,13 +48,20 @@ const DESTROY_TIMEOUT_MS = 10_000;
  * A load that a newer one overtakes is not awaited: once its transport is set up, destroying its
  * task leaves the task's promise pending for good (it settles only on the worker's GetDoc or
  * DocException, pdf.mjs).
+ *
+ * Destroying a document stops its range requests first. pdf.js removes the transport's range
+ * readers when the document's worker ends (the worker's Terminate handler cancels its range
+ * requests, pdf.worker.mjs), and aborts the transport only after the worker has answered
+ * (WorkerTransport.destroy, pdf.mjs). A response that arrives in between finds its reader gone,
+ * and pdf.js throws "_onReceiveData - no `PDFDataTransportStreamRangeReader` instance found".
+ * Overleaf's transport delivers a response only while its signal is not aborted.
  */
 export class Documents {
     private queue: Promise<void> = Promise.resolve();
     private inFlight?: Job;
     private shownUrl?: string;
-    /** the worker of each document's loading task */
-    private readonly workers = new Map<any, Worker>();
+    /** the worker and the range requests of each document's loading task */
+    private readonly owned = new Map<any, Owned>();
 
     constructor(private readonly wrapper: PDFJSWrapper, private readonly hooks: DocumentHooks) {}
 
@@ -80,12 +95,13 @@ export class Documents {
     private destroy(task: any) {
         if (!loadingTasks.has(task)) { return; }
         loadingTasks.delete(task);
-        const worker = this.workers.get(task);
-        this.workers.delete(task);
+        const owned = this.owned.get(task);
+        this.owned.delete(task);
+        owned?.requests?.abort();
         const timeout = new Promise(resolve => setTimeout(resolve, DESTROY_TIMEOUT_MS));
         Promise.race([task.destroy(), timeout])
             .catch(error => console.warn('pdf viewer: destroying a document:', error))
-            .finally(() => worker?.terminate());
+            .finally(() => owned?.worker.terminate());
     }
 
     /** Destroy every document but `shown`. */
@@ -138,7 +154,7 @@ export class Documents {
         });
         // loadDocument has created the task before its first await
         job.task = [...loadingTasks].find(task => !before.has(task));
-        if (job.task) { this.workers.set(job.task, port); } else { port.terminate(); }
+        if (job.task) { this.owned.set(job.task, { worker: port, requests: job.abort }); } else { port.terminate(); }
         let doc: any;
         try {
             doc = await this.untilAborted(job, loading);
@@ -170,7 +186,7 @@ export class Documents {
         // the wrapper loads URLs only; a PDF read whole is set the way loadDocument sets one
         const task = PDFJS.getDocument({ data, ...documentParams() });
         loadingTasks.add(task);
-        this.workers.set(task, port);
+        this.owned.set(task, { worker: port });
         job.task = task;
         let doc: any;
         try {

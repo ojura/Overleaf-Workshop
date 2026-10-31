@@ -108,8 +108,8 @@ try {
     }
     await new Promise(r => setTimeout(r, 500));
     if (engine === 'overleaf') {
-        const workers = await page.evaluate('window.overleafViewer.documents.workers.size');
-        check('reload: the old document was destroyed', workers === 1, `${workers} document worker(s) alive`);
+        const alive = await page.evaluate('window.overleafViewer.documents.owned.size');
+        check('reload: the old document was destroyed', alive === 1, `${alive} document(s) with a worker`);
     }
     await page.screenshot(path.join(shots, '3-after-reload.png'));
 
@@ -122,8 +122,8 @@ try {
     check('update: a PDF read whole is shown', true, `${traffic(s)}`);
     if (engine === 'overleaf') {
         await new Promise(r => setTimeout(r, 500));
-        const workers = await page.evaluate('window.overleafViewer.documents.workers.size');
-        check('update: the replaced document was destroyed', workers === 1, `${workers} document worker(s) alive`);
+        const alive = await page.evaluate('window.overleafViewer.documents.owned.size');
+        check('update: the replaced document was destroyed', alive === 1, `${alive} document(s) with a worker`);
     }
     // back to a build in ranges
     await page.evaluate(`harness.load('a'); true`);
