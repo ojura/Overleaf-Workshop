@@ -110,7 +110,7 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
     // the project: documents only, enough for the replica's Overleaf side
     // the project's files, addressed as the extension addresses them
     const origin = new Uri('overleaf-workshop', '/project', 'www.overleaf.com', 'user=u&project=p');
-    const changes = new Emitter<{ type: number, uri: Uri }[]>();
+    const changes = new Emitter<{ type: number, uri: Uri, renamedFrom?: Uri }[]>();
     const rel = (uri: Uri) => uri.path.slice(origin.path.length);
     const vfs = {
         origin, serverName: 'www.overleaf.com', projectName: 'project', projectId: 'p', connected: true, _userId: 'u',
@@ -141,7 +141,8 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
             if (!w.remote.has(rel(from)) || w.remote.has(rel(to))) { return; }
             w.remote.set(rel(to), w.remote.get(rel(from))!);
             w.remote.delete(rel(from));
-            changes.fire([{ type: FileChangeType.Deleted, uri: from }, { type: FileChangeType.Created, uri: to }]);
+            // as the project reports a rename: the Created event names where the file was
+            changes.fire([{ type: FileChangeType.Deleted, uri: from }, { type: FileChangeType.Created, uri: to, renamedFrom: from }]);
         },
         getUpdates: async () => ({ updates: w.updates, nextBeforeTimestamp: 0 }),
         documentUpdatesSettled: async () => {},

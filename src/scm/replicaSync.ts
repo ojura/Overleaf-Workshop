@@ -27,7 +27,8 @@ import { gitMergeText } from './replicaGit';
  * A synced file gone from the folder and a new file in it that git pairs as one file renamed
  * or moved, as git log shows the history, are renamed or moved on Overleaf, and a change of
  * the content follows as an edit, so that a document keeps its comments, tracked changes and
- * history there (docs/replica-workflows.md, "Renames and moves").
+ * history there. A rename or a move made on Overleaf moves the local file and its base, with
+ * its local changes (docs/replica-workflows.md, "Renames and moves").
  *
  * Deletions go through one step in every kind of sync (`applyDeletions`): more than
  * `deletionThreshold` files deleted on one side and still synced on the other need the user's
@@ -89,6 +90,8 @@ export interface ReplicaLocal {
     /** undefined only when `path` does not exist; rejects when the file cannot be read */
     read(path: string): Promise<Uint8Array | undefined>,
     write(path: string, content: Uint8Array): Promise<LocalStat>,
+    /** Move the file at `from` to `to`, where nothing may be, keeping the file itself; fails when something is at `to`. */
+    move?(from: string, to: string): Promise<void>,
     remove(path: string): Promise<void>,
     removeFolderIfEmpty(path: string): Promise<void>,
     /** Rejects, saying why, when the folder is no longer the one the sync started with; cheap enough for every sync. */
@@ -174,6 +177,8 @@ export interface SyncSummary {
     uploaded: string[],
     /** renamed or moved on Overleaf as they were locally */
     renamed: {from: string, to: string}[],
+    /** renamed or moved locally as they were on Overleaf */
+    renamedLocally: {from: string, to: string}[],
     merged: string[],
     deletedLocal: string[],
     deletedRemote: string[],
@@ -197,7 +202,7 @@ export interface SyncSummary {
 
 function emptySummary(): SyncSummary {
     return {
-        downloaded: [], uploaded: [], renamed: [], merged: [], deletedLocal: [], deletedRemote: [],
+        downloaded: [], uploaded: [], renamed: [], renamedLocally: [], merged: [], deletedLocal: [], deletedRemote: [],
         keptAside: [], conflicts: [], held: [], untracked: [], skippedDeletions: [], deletionsToConfirm: [], failed: [], unchanged: 0, notChecked: 0,
     };
 }
@@ -288,6 +293,10 @@ interface Mode {
     approved?: ReadonlySet<string>,
     /** git's pairing of the local renames and moves (`localRenames`), asked for once by the reconciles of this mode */
     renames?: Promise<Map<string, string>>,
+    /** work that reconciles of this mode queued in the queues of two paths (a rename); the batch waits for it */
+    queued?: Promise<void>[],
+    /** the reconciles of a rename made on Overleaf, which apply it (`remoteRenamed`) */
+    remoteMove?: boolean,
 }
 
 /** A mode that collects deletions. */
@@ -361,6 +370,8 @@ export class ReplicaSync {
     /** a pairing of local renames that has not started yet, which a request joins, and the end of the last one (`localRenames`) */
     private renamesWaiting?: Promise<Map<string, string>>;
     private renamesTail: Promise<unknown> = Promise.resolve();
+    /** renames made on Overleaf that `remoteRenamed` is applying, old path (a file's or a folder's) to new path */
+    private remoteMoves = new Map<string, string>();
     private readonly onRecorded?: (result: {waiting?: boolean}) => void;
 
     constructor(
@@ -481,6 +492,8 @@ export class ReplicaSync {
             }
         };
         await Promise.all(Array.from({length: ReplicaSync.scanConcurrency}, worker));
+        // the renames that the scan found, before the deletions it collected are confirmed
+        await this.queuedWork(mode);
         summary.notChecked = todo.length - done;
 
         if (!this.stopped && !this.cancelled) {
@@ -536,6 +549,73 @@ export class ReplicaSync {
         return this.changed(path, true);
     }
 
+    /**
+     * The file or folder at `from` was renamed or moved on Overleaf to `to`: one change, as the
+     * project reports it. The local file moves with its saved entry and keeps its local changes,
+     * which then sync as for any file, and the record shows the rename as git shows renames. Where
+     * a file cannot move (it was never synced, its local file is gone, or `to` is taken in the
+     * folder), its two paths sync as a deletion and a new file.
+     */
+    async remoteRenamed(from: string, to: string): Promise<void> {
+        if (this.stopped || from===to) { return; }
+        // From now until the move is applied, other reconciles leave both paths alone: a reconcile
+        // of `from` would take the local file for one deleted on Overleaf, one of `to` would download it.
+        this.remoteMoves.set(from, to);
+        const mode: Mode = {...collecting(emptySummary(), {live: true}), remoteMove: true};
+        try {
+            await this.load();
+            await this.local.verify();
+            const prefix = `${from}/`;
+            const moves: [string, string][] = this.state.entries[from]!==undefined ? [[from, to]]
+                : Object.keys(this.state.entries).filter(p => p.startsWith(prefix)).map(p => [p, `${to}${p.slice(from.length)}`]);
+            // each file moves, and then both of its paths sync as they are, in the queues of both
+            await Promise.all(moves.map(([a, b]) => this.inQueues([a, b], async () => {
+                await this.reported(a, mode, () => this.moveLocally(a, b, mode.summary));
+                await this.reconcileReported(a, mode);
+                if (this.tracked(b)) { await this.reconcileReported(b, mode); }
+            })));
+            // Overleaf's other files in a moved folder
+            const moved = new Set(moves.map(([, b]) => b));
+            await this.scheduleAll((await this.expand(to, true)).filter(p => !moved.has(p) && this.tracked(p)), mode);
+        } catch (error) {
+            // e.g. the folder is not the one the sync started with
+            mode.summary.failed.push({path: from, error: errorText(error)});
+            this.ui.log(`${from}: applying its rename to ${to} on Overleaf failed: ${errorText(error)}`);
+        } finally {
+            if (this.remoteMoves.get(from)===to) { this.remoteMoves.delete(from); }
+        }
+        // a file that did not move is a deletion like any other, decided with them
+        await this.applyDeletions(mode);
+        this.scheduleSave();
+        this.ui.liveResult(mode.summary);
+    }
+
+    /** Whether `path` is the old or the new path of a rename made on Overleaf that `remoteRenamed` is applying, or inside one. */
+    private movingOnOverleaf(path: string): boolean {
+        const inside = (p: string) => path===p || path.startsWith(`${p}/`);
+        return [...this.remoteMoves].some(([from, to]) => inside(from) || inside(to));
+    }
+
+    /** Move the local file at `from` and its saved entry to `to`, as Overleaf moved it; nothing when it cannot move. */
+    private async moveLocally(from: string, to: string, summary: SyncSummary): Promise<void> {
+        const entry = this.state.entries[from];
+        if (!this.local.move || entry===undefined || this.state.entries[to]!==undefined || !this.tracked(to)) { return; }
+        const [localFrom, localTo, remoteFrom, remoteTo] = await Promise.all([
+            this.local.stat(from), this.local.stat(to), this.remote.entry(from), this.remote.entry(to)]);
+        if (localFrom===undefined || localFrom==='folder' || localTo!==undefined || remoteFrom!==undefined || remoteTo?.kind!==entry.kind) { return; }
+        if (await this.isUnmerged(from) || await this.isUnmerged(to)) { return; }
+        await this.local.move(from, to);
+        // the file is the same: its size and time still tell whether it holds the base
+        delete this.state.entries[from];
+        this.state.entries[to] = entry;
+        this.noteChange(from, 'remote');
+        this.noteChange(to, 'remote');
+        this.scheduleSave();
+        summary.renamedLocally.push({from, to});
+        this.ui.log(`${from}: renamed to ${to} locally, as on Overleaf`);
+        if (parentOf(from)!==parentOf(to)) { await this.local.removeFolderIfEmpty(parentOf(from)); }
+    }
+
     private async changed(path: string, remote: boolean): Promise<void> {
         if (this.stopped || path==='' || path==='/') { return; }
         await this.load();
@@ -543,7 +623,7 @@ export class ReplicaSync {
         try {
             await this.local.verify();
             const paths = await this.expand(path, remote);
-            await Promise.all(paths.filter(p => this.tracked(p)).map(p => this.schedule(p, mode)));
+            await this.scheduleAll(paths.filter(p => this.tracked(p)), mode);
             await this.applyDeletions(mode);
         } catch (error) {
             // e.g. Overleaf does not answer: the next full sync looks at the file again
@@ -622,7 +702,7 @@ export class ReplicaSync {
                 }
             }
             const mode = collecting(summary, {live: true, tool: by==='tool', approved});
-            await Promise.all([...changed, ...deleted].map(path => this.schedule(path, mode)));
+            await this.scheduleAll([...changed, ...deleted], mode);
             await this.applyDeletions(mode);
             this.ui.liveResult(mode.summary);
         }
@@ -672,7 +752,7 @@ export class ReplicaSync {
         this.state.untracked = [];
         const summary = emptySummary();
         const mode = collecting(summary);
-        await Promise.all(paths.map(path => this.schedule(path, mode)));
+        await this.scheduleAll(paths, mode);
         await this.applyDeletions(mode);
         await this.saveNow();
         return summary;
@@ -684,11 +764,7 @@ export class ReplicaSync {
 
     /** Run one reconcile of `path` after the ones already scheduled. */
     private schedule(path: string, mode: Mode): Promise<void> {
-        let slot = this.slots.get(path);
-        if (slot===undefined) {
-            slot = {tail: Promise.resolve()};
-            this.slots.set(path, slot);
-        }
+        const slot = this.slotOf(path);
         if (slot.waiting && mode.live) {
             return slot.waiting;
         }
@@ -704,27 +780,58 @@ export class ReplicaSync {
         return run;
     }
 
+    /** Schedule a reconcile of each path, and wait for them and for the work they queued (a rename's). */
+    private async scheduleAll(paths: string[], mode: Mode): Promise<void> {
+        await Promise.all(paths.map(path => this.schedule(path, mode)));
+        await this.queuedWork(mode);
+    }
+
+    /** Wait for the work that the reconciles of `mode` queued, and for the work that queues. */
+    private async queuedWork(mode: Mode): Promise<void> {
+        while (mode.queued?.length) {
+            await Promise.all(mode.queued.splice(0));
+        }
+    }
+
+    private slotOf(path: string): Slot {
+        let slot = this.slots.get(path);
+        if (slot===undefined) {
+            slot = {tail: Promise.resolve()};
+            this.slots.set(path, slot);
+        }
+        return slot;
+    }
+
     /** Reconcile `path`, in its queue already; a failure goes into the summary and the log. */
-    private async reconcileReported(path: string, mode: Mode): Promise<void> {
+    private reconcileReported(path: string, mode: Mode): Promise<void> {
+        return this.reported(path, mode, () => this.reconcile(path, mode));
+    }
+
+    /** Run `work` on `path`; a failure goes into the summary and the log. */
+    private async reported(path: string, mode: Mode, work: () => Promise<void>): Promise<void> {
         try {
-            await this.reconcile(path, mode);
+            await work();
         } catch (error) {
             mode.summary.failed.push({path, error: errorText(error)});
             this.ui.log(`${path}: sync failed: ${errorText(error)}`);
         }
     }
 
-    /** Run `task` in the queue of `path`, after the reconciles of it that are scheduled. */
-    private inQueue<T>(path: string, task: () => Promise<T>): Promise<T> {
-        let slot = this.slots.get(path);
-        if (slot===undefined) {
-            slot = {tail: Promise.resolve()};
-            this.slots.set(path, slot);
-        }
+    /**
+     * Run `task` in the queues of `paths` at once: after the work scheduled so far for each of
+     * them, and before the work scheduled for any of them later. Work on two paths, a rename, is
+     * queued this way, and no work waits for a queue while it holds another, so that queues
+     * cannot wait for each other in a circle.
+     */
+    private inQueues(paths: string[], task: () => Promise<void>): Promise<void> {
+        const slots = [...new Set(paths)].map(path => this.slotOf(path));
         this.active += 1;
-        const run = slot.tail.then(task).finally(() => { this.active -= 1; });
-        slot.tail = run.then(() => {}, () => {});
-        slot.waiting = undefined;
+        const run = Promise.all(slots.map(slot => slot.tail)).then(task).finally(() => { this.active -= 1; });
+        const settled = run.then(() => {}, () => {});
+        for (const slot of slots) {
+            slot.tail = settled;
+            slot.waiting = undefined;
+        }
         return run;
     }
 
@@ -943,20 +1050,12 @@ export class ReplicaSync {
                         await this.upload(path, localContent ?? await this.local.read(path), localStat, undefined, summary);
                         return;
                     }
-                    if (await this.inQueue(from, () => this.renameOnOverleaf(from, path, summary))) {
-                        // the base moved with the file: the content syncs as for any file, a change as an edit of it
-                        await this.reconcile(path, mode);
-                        return;
-                    }
-                    // Not renamed: the new file syncs as a new file. The removed one is a deletion
-                    // like any other once the new one is on Overleaf or gone, not while it waits
-                    // (e.g. for its conflicts to be resolved).
-                    const unpaired: Mode = {...mode, renames: Promise.resolve(new Map([...renames].filter(([to]) => to!==path)))};
-                    await this.reconcile(path, unpaired);
-                    if (this.state.entries[path]!==undefined || await this.local.stat(path)===undefined) {
-                        await this.inQueue(from, () => this.reconcileReported(from, unpaired));
-                    }
+                    // the rename, in the queues of both paths, after this reconcile
+                    (mode.queued ??= []).push(this.inQueues([from, path], () => this.reported(path, mode, () => this.renameLocalPair(from, path, renames, mode))));
                 }
+            } else if (!mode.remoteMove && this.movingOnOverleaf(path)) {
+                // renamed on Overleaf: the move takes the local file, with its local changes
+                return;
             } else if (mode.deletions==='collect') {
                 mode.collected!.local.push(path);
             } else if (localHash===base) {
@@ -982,6 +1081,10 @@ export class ReplicaSync {
         // only the Overleaf file exists
         if (base!==undefined && [...(await this.localRenames(mode)).values()].includes(path)) {
             // git pairs it with a new local file: the reconcile of that file renames it on Overleaf
+            return;
+        }
+        if (base===undefined && !mode.remoteMove && this.movingOnOverleaf(path)) {
+            // the new path of a rename made on Overleaf: the move brings the local file here
             return;
         }
         if (base===undefined || remoteHash!==base) {
@@ -1183,6 +1286,25 @@ export class ReplicaSync {
     }
 
     /**
+     * The rename on Overleaf of `from` to `to`, as git pairs them in the folder, and then the sync
+     * of `to`'s content; run in the queues of both paths. When the rename does not happen, `to`
+     * syncs as a new file, and `from` is a deletion like any other once `to` is on Overleaf or
+     * gone, not while it waits (e.g. for its conflicts to be resolved).
+     */
+    private async renameLocalPair(from: string, to: string, renames: Map<string, string>, mode: Mode) {
+        if (await this.renameOnOverleaf(from, to, mode.summary)) {
+            // the base moved with the file: the content syncs as for any file, a change as an edit of it
+            await this.reconcile(to, mode);
+            return;
+        }
+        const unpaired: Mode = {...mode, renames: Promise.resolve(new Map([...renames].filter(([p]) => p!==to)))};
+        await this.reconcile(to, unpaired);
+        if (this.state.entries[to]!==undefined || await this.local.stat(to)===undefined) {
+            await this.reconcileReported(from, unpaired);
+        }
+    }
+
+    /**
      * Rename or move `from` to `to` on Overleaf, as git pairs them in the folder: the file keeps
      * its id there, and a document its comments, tracked changes and history. The saved base
      * moves with it, without the local file's size and time, so that the reconcile of `to` that
@@ -1231,7 +1353,7 @@ export class ReplicaSync {
         const mode = collecting(emptySummary(), {live: true});
         try {
             await this.local.verify();
-            await Promise.all(paths.map(path => this.schedule(path, mode)));
+            await this.scheduleAll(paths, mode);
             await this.applyDeletions(mode);
         } catch (error) {
             mode.summary.failed.push(...paths.map(path => ({path, error: errorText(error)})));
@@ -1344,6 +1466,7 @@ export function describe(summary: SyncSummary): string {
         [summary.downloaded.length, 'downloaded'],
         [summary.uploaded.length, 'uploaded'],
         [summary.renamed.length, 'renamed'],
+        [summary.renamedLocally.length, 'renamed locally'],
         [summary.merged.length, 'merged'],
         [summary.deletedLocal.length, 'deleted locally'],
         [summary.deletedRemote.length, 'deleted on Overleaf'],

@@ -220,4 +220,31 @@ describe('a local replica\'s conflicts in its git repository', function () {
         git(folder, 'add', 'main.tex');
         await until(() => t.w.remote.get('/main.tex') === 'line 1\nline 2, both\nline 3\n', 3000);
     });
+
+    it('moves a file that Overleaf renames, with a change saved before in it, and uploads that change to the renamed document', async () => {
+        const lines = (line: (i: number) => string) => Array.from({ length: 10 }, (_, i) => `${line(i + 1)}\n`).join('');
+        const chapter = lines(i => `Line ${i} of the chapter, with a few words in it.`);
+        const edited = lines(i => i >= 9 ? `Line ${i} of the chapter, edited after the rename.` : `Line ${i} of the chapter, with a few words in it.`);
+        // without syncOnFileChange a local edit waits for a sync
+        const t = world(folder, false);
+        t.w.remote.set('/chapter.tex', chapter);
+        git(folder, 'init', '--quiet', '--initial-branch=main');
+        git(folder, 'config', 'user.name', 'Local User');
+        git(folder, 'config', 'user.email', 'local@example.com');
+        const { LocalReplicaSCMProvider, requestReplica } = load(t.mock);
+        const scm = new LocalReplicaSCMProvider(t.vfs, Uri.file(folder));
+        triggers = await scm.triggers;
+        await until(() => fs.existsSync(path.join(folder, 'chapter.tex')));
+        assert.strictEqual(((await requestReplica(folder, { op: 'sync' }, 10000)) as any).ok, true, 'the first sync');
+        const first = git(folder, 'rev-parse', 'HEAD');
+
+        fs.writeFileSync(path.join(folder, 'chapter.tex'), edited);
+        await t.vfs.rename(Uri.joinPath(t.vfs.origin, 'chapter.tex'), Uri.joinPath(t.vfs.origin, 'intro.tex'));
+        const answer: any = await requestReplica(folder, { op: 'sync' }, 10000);
+        assert.strictEqual(answer.ok, true, `the sync after the rename: ${JSON.stringify(answer)}`);
+        assert.deepStrictEqual([fs.existsSync(path.join(folder, 'chapter.tex')), fs.readFileSync(path.join(folder, 'intro.tex'), 'utf8')], [false, edited], 'the local files: the moved file keeps the change');
+        assert.ok(!fs.existsSync(path.join(folder, '.overleaf', 'conflicts')), 'nothing is kept aside');
+        assert.strictEqual(t.w.remote.get('/intro.tex'), edited, 'the renamed document on Overleaf has the change');
+        assert.match(git(folder, 'diff', '--name-status', '-M', first, 'HEAD'), /^R0[5-9]\d\tchapter.tex\tintro.tex$/m, 'git\'s view of the recorded state');
+    });
 });

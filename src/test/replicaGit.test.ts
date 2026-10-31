@@ -8,6 +8,7 @@ import * as path from 'path';
 import { minimatch } from 'minimatch';
 import type { HistoryUpdate } from '../gitbridge/history';
 import { DEFAULT_IGNORE_PATTERNS } from '../scm/ignorePatterns';
+import { moveFile } from '../scm/localFolderFs';
 import { gitignoreLine, gitMergeText, GitReplicaStore, NOTES_REF, OVERLEAF_REF, trailerValue } from '../scm/replicaGit';
 import {
     gitBlobHash, LocalStat, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync, ReplicaUI, SyncSummary,
@@ -93,7 +94,16 @@ class Remote implements ReplicaRemote {
         return content === undefined ? undefined : { kind: 'file', hash: gitBlobHash(content) };
     }
     async isFolder(p: string) { return [...this.docs.keys(), ...this.files.keys()].some(q => q.startsWith(`${p}/`)); }
-    async readDoc(p: string) { const text = this.docs.get(p); if (text === undefined) { throw new Error(`no doc ${p}`); } return text; }
+    /** while set, a read of a document waits for it; `onRead` hears of each read */
+    readGate?: Promise<void>;
+    onRead?: (p: string) => void;
+    async readDoc(p: string) {
+        this.onRead?.(p);
+        await this.readGate;
+        const text = this.docs.get(p);
+        if (text === undefined) { throw new Error(`no doc ${p}`); }
+        return text;
+    }
     async readFile(p: string) { const content = this.files.get(p); if (content === undefined) { throw new Error(`no file ${p}`); } return content; }
     async writeDoc(p: string, text: string) {
         this.calls.push(`writeDoc ${p}`);
@@ -156,6 +166,7 @@ class Folder implements ReplicaLocal {
         const s = await fsp.stat(this.abs(p));
         return { size: s.size, mtime: s.mtimeMs };
     }
+    async move(from: string, to: string) { await moveFile(this.abs(from), this.abs(to)); }
     async remove(p: string) { await fsp.rm(this.abs(p), { force: true }); }
     async removeFolderIfEmpty(p: string) { try { await fsp.rmdir(this.abs(p)); } catch { /* not empty */ } }
 }
@@ -774,6 +785,146 @@ describe('local replica: git as the merge backend', function () {
                 await t.sync.stop();
             });
         }
+
+        it('moves the local file when Overleaf renames it, with the local changes that wait for a push in it', async () => {
+            const t = await world();
+            t.remote.docs.set('/chapter.tex', chapter);
+            t.update(ME);
+            const sync = new ReplicaSync(t.remote, t.local, t.store, t.ui, (p: string) => p.endsWith('.aux'), { uploads: false });
+            await sync.syncAll();
+            await sync.recordNow();
+            const first = t.g('rev-parse', 'HEAD');
+            const local = chapter.replace('Line 1 of', 'Line 1, edited locally, of');
+            t.write('/chapter.tex', local);
+            await sync.localChanged('/chapter.tex');
+            assert.strictEqual(t.remote.docs.get('/chapter.tex'), chapter, 'the local change waits for a push');
+
+            await t.remote.rename('/chapter.tex', '/intro.tex');
+            t.update(ALICE);
+            await sync.remoteRenamed('/chapter.tex', '/intro.tex');
+            assert.deepStrictEqual([fs.existsSync(path.join(t.folder, 'chapter.tex')), t.read('/intro.tex')], [false, local], 'the local files: the moved file keeps the local change');
+            assert.ok(!fs.existsSync(path.join(t.folder, '.overleaf/conflicts')), 'nothing is kept aside');
+            await sync.recordNow();
+            assert.match(t.g('diff', '--name-status', '-M', first, 'HEAD'), /^R100\tchapter.tex\tintro.tex$/m, 'git\'s view of the recorded state');
+            assert.strictEqual(t.g('status', '--porcelain'), 'M intro.tex', 'git status: the local change, still to push');
+            await sync.stop();
+        });
+
+        it('finishes when Overleaf reports the rename that the folder made, while the folder\'s rename waits for its pairing', async () => {
+            const t = await synced({ '/y.tex': chapter });
+            const id = t.remote.idOf('/y.tex');
+            move(t, 'y.tex', 'x.tex');
+            // git's pairing of the folder's rename is made, and then held, while the reconcile of x.tex holds x.tex's queue
+            let open!: () => void;
+            const gate = new Promise<void>(resolve => { open = resolve; });
+            let paired!: () => void;
+            const pairing = new Promise<void>(resolve => { paired = resolve; });
+            const renames = t.store.renames.bind(t.store);
+            t.store.renames = async (removed, added) => {
+                const pairs = await renames(removed, added);
+                paired();
+                await gate;
+                return pairs;
+            };
+            const folder = t.sync.localChanged('/x.tex');
+            await pairing;
+            // Overleaf reports the same rename: its move needs the queues of both paths
+            await t.remote.rename('/y.tex', '/x.tex');
+            const overleaf = t.sync.remoteRenamed('/y.tex', '/x.tex');
+            // remoteRenamed queues its move after promise steps only, without I/O: one turn of the event loop has it queued
+            await new Promise(resolve => setImmediate(resolve));
+            open();
+            await Promise.all([folder, overleaf]);
+            assert.deepStrictEqual([fs.existsSync(path.join(t.folder, 'y.tex')), t.read('/x.tex')], [false, chapter], 'the local files');
+            assert.deepStrictEqual(t.remote.calls, ['rename /y.tex /x.tex'], 'what was asked of Overleaf: its own rename only');
+            assert.strictEqual(t.remote.ids.get('/x.tex'), id, 'the document keeps its id');
+            await t.sync.stop();
+        });
+
+        it('moves the local file when Overleaf renames it while a reconcile of the old path waits in its queue', async () => {
+            const t = await world();
+            t.remote.docs.set('/chapter.tex', chapter);
+            t.update(ME);
+            const sync = new ReplicaSync(t.remote, t.local, t.store, t.ui, (p: string) => p.endsWith('.aux'), { uploads: false });
+            await sync.syncAll();
+            await sync.recordNow();
+            const local = chapter.replace('Line 1 of', 'Line 1, edited locally, of');
+            t.write('/chapter.tex', local);
+            // a reconcile of chapter.tex waits for Overleaf's text, and a second one waits behind it
+            let open!: () => void;
+            t.remote.readGate = new Promise<void>(resolve => { open = resolve; });
+            const reading = new Promise<void>(resolve => { t.remote.onRead = () => resolve(); });
+            const first = sync.localChanged('/chapter.tex');
+            await reading;
+            const second = sync.remoteChanged('/chapter.tex', false);
+            // remoteChanged schedules after promise steps only, without I/O: one turn of the event loop has it queued
+            await new Promise(resolve => setImmediate(resolve));
+            // then Overleaf renames it
+            await t.remote.rename('/chapter.tex', '/intro.tex');
+            const renamed = sync.remoteRenamed('/chapter.tex', '/intro.tex');
+            t.remote.readGate = undefined;
+            open();
+            await Promise.all([first, second, renamed]);
+            assert.deepStrictEqual([fs.existsSync(path.join(t.folder, 'chapter.tex')), t.read('/intro.tex')], [false, local], 'the local files: the moved file keeps the local change');
+            assert.ok(!fs.existsSync(path.join(t.folder, '.overleaf/conflicts')), 'nothing is kept aside');
+            await sync.stop();
+        });
+
+        it('moves the local file when Overleaf renames it, and uploads a local change saved before to the renamed document', async () => {
+            const t = await synced({ '/chapter.tex': chapter });
+            const id = t.remote.idOf('/chapter.tex');
+            t.remote.comment('/chapter.tex', commented);
+            // a change saved, which no event has reported yet
+            t.write('/chapter.tex', edited);
+            await t.remote.rename('/chapter.tex', '/intro.tex');
+            t.remote.calls.length = 0;
+            t.update(ALICE);
+            await t.sync.remoteRenamed('/chapter.tex', '/intro.tex');
+            assert.deepStrictEqual([fs.existsSync(path.join(t.folder, 'chapter.tex')), t.read('/intro.tex')], [false, edited], 'the local files');
+            assert.deepStrictEqual(t.remote.calls, ['writeDoc /intro.tex'], 'what the sync asked of Overleaf: the local change, as an edit of the renamed document');
+            assert.deepStrictEqual([t.remote.ids.get('/intro.tex'), t.remote.docs.get('/intro.tex')], [id, edited], 'the document on Overleaf');
+            assert.deepStrictEqual(t.remote.commentedText('/intro.tex'), [commented], 'the comment on the text that the change left alone');
+            await t.sync.stop();
+        });
+
+        it('moves the files of a folder that Overleaf moved, with a local change in one of them', async () => {
+            const two = lines(i => `The second chapter, paragraph ${i}.`);
+            const t = await world();
+            t.remote.docs.set('/chapters/one.tex', chapter);
+            t.remote.docs.set('/chapters/two.tex', two);
+            t.update(ME);
+            const sync = new ReplicaSync(t.remote, t.local, t.store, t.ui, (p: string) => p.endsWith('.aux'), { uploads: false });
+            await sync.syncAll();
+            await sync.recordNow();
+            const first = t.g('rev-parse', 'HEAD');
+            t.write('/chapters/one.tex', edited);
+            await sync.localChanged('/chapters/one.tex');
+            // Overleaf moves the folder: its files are at the new path
+            await t.remote.rename('/chapters/one.tex', '/parts/one.tex');
+            await t.remote.rename('/chapters/two.tex', '/parts/two.tex');
+            t.update(ALICE);
+            await sync.remoteRenamed('/chapters', '/parts');
+            assert.deepStrictEqual([t.read('/parts/one.tex'), t.read('/parts/two.tex')], [edited, two], 'the local files in the new folder');
+            assert.ok(!fs.existsSync(path.join(t.folder, 'chapters')), 'the folder they left is gone');
+            await sync.recordNow();
+            const diff = t.g('diff', '--name-status', '-M', first, 'HEAD');
+            assert.match(diff, /^R100\tchapters\/one.tex\tparts\/one.tex$/m, 'git\'s view of the recorded state: one.tex');
+            assert.match(diff, /^R100\tchapters\/two.tex\tparts\/two.tex$/m, 'git\'s view of the recorded state: two.tex');
+            assert.strictEqual(t.g('status', '--porcelain'), 'M parts/one.tex', 'git status: the local change, still to push');
+            await sync.stop();
+        });
+
+        it('syncs a rename on Overleaf onto a path the folder already has as a deletion and a new file', async () => {
+            const t = await synced({ '/chapter.tex': chapter });
+            t.write('/intro.tex', 'a local file of the same name, not uploaded yet\n');
+            await t.remote.rename('/chapter.tex', '/intro.tex');
+            t.update(ALICE);
+            await t.sync.remoteRenamed('/chapter.tex', '/intro.tex');
+            assert.deepStrictEqual([fs.existsSync(path.join(t.folder, 'chapter.tex')), t.read('/intro.tex')], [false, chapter], 'the local files: Overleaf\'s version at the new path');
+            const kept = fs.readdirSync(path.join(t.folder, '.overleaf/conflicts'), { recursive: true }).map(String);
+            assert.ok(kept.some(p => p.endsWith('intro.tex')), `the local file at the new path is kept aside: ${kept.join(', ')}`);
+            await t.sync.stop();
+        });
 
         it('records a rename and an edit made on Overleaf as git shows a rename', async () => {
             const t = await synced({ '/one.tex': chapter });

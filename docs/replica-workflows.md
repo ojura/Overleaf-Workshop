@@ -113,9 +113,14 @@ and creates a new one, losing its comments and tracked changes (measured 2026-10
 src/sandbox/ranges.ts), and push-check, which pairs the push's paths by the same rule, refuses
 such a push for a document with comments or tracked changes.
 
-A rename made on Overleaf, with or without an edit, reaches the folder as a deletion and a new
-file: the sync deletes the local file and downloads the new one, and the commit of Overleaf's
-state holds both, so git shows a rename where it pairs them.
+A rename or a move made on Overleaf is one change in the project's events (the editor's rename
+and move), which the extension reports with the old and the new path. The sync moves the local
+file and its saved base to the new path, so local changes that are not uploaded yet, or that
+wait for a push, stay in the file and then sync as for any file; the commit of Overleaf's state
+shows the rename, and an edit made on Overleaf with it. A folder moved on Overleaf moves the
+local files that the sync has synced; files that it leaves out stay in the old folder. Where a
+file cannot move, because it was never synced, its local file is gone, or the folder already
+has a file at the new path, its two paths sync as a deletion and a new file.
 
 ## Landing a commit
 
