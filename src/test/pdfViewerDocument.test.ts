@@ -94,3 +94,35 @@ describe('what the PDF viewer loads', () => {
         assert.deepStrictEqual(world.reads, ['/home/u/paper/output.pdf']);
     });
 });
+
+describe('switching the viewer of an open PDF', () => {
+    beforeEach(() => { world.reads = []; world.output = output; });
+
+    it('keeps a build loaded in ranges between the two viewers that load in ranges', async () => {
+        const doc = new PdfDocument(projectFile('.output/output.pdf'), 'pdfjs');
+        await doc.refresh();
+        assert.strictEqual(await doc.setEngine('overleaf'), true);
+        assert.strictEqual(doc.engine, 'overleaf');
+        assert.strictEqual(doc.output, output);
+        assert.deepStrictEqual(world.reads, []);
+        assert.strictEqual(await doc.setEngine('overleaf'), false);
+    });
+
+    it('reads a build whole for the legacy viewer, and back in ranges after it', async () => {
+        const doc = new PdfDocument(projectFile('.output/output.pdf'), 'overleaf');
+        await doc.refresh();
+        assert.strictEqual(await doc.setEngine('legacy'), true);
+        assert.strictEqual(doc.output, undefined);
+        assert.deepStrictEqual(world.reads, ['/Book/.output/output.pdf']);
+        assert.strictEqual(await doc.setEngine('pdfjs'), true);
+        assert.strictEqual(doc.output, output);
+        assert.strictEqual(world.reads.length, 1);
+    });
+
+    it('does not read a PDF read whole again', async () => {
+        const doc = new PdfDocument(projectFile('slike/figure.pdf'), 'pdfjs');
+        await doc.refresh();
+        assert.strictEqual(await doc.setEngine('legacy'), true);
+        assert.deepStrictEqual(world.reads, ['/Book/slike/figure.pdf']);
+    });
+});

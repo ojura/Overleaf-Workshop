@@ -9,6 +9,9 @@
  *                                        page counts from 1, h and v are PDF points from the top left
  *   { type: 'recompile' }                compile the project again
  *   { type: 'download' }                 save the PDF to a file the user picks
+ *   { type: 'switchViewer', engine }     show the PDFs in the viewer `engine` ('pdfjs' or
+ *                                        'overleaf'): the host sets overleaf-workshop.pdfViewer.engine,
+ *                                        and the open viewers reload with that viewer's page
  *   { type: 'fetch' | 'fetchAbort', ... } the loader's requests (bridge-fetch.ts)
  *
  * The host posts:

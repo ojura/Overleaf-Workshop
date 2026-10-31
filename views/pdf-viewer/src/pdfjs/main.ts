@@ -403,7 +403,17 @@ function addToolbarButtons(a: any) {
         showTheme();
         saveState({ colorTheme: themes[index].name });
     });
-    right?.prepend(toCode, theme);
+    // shows the PDF in the Overleaf viewer, at the same place: the host sets the viewer setting
+    // and reloads the page with the other viewer, which starts from the saved view
+    const switchViewer = Object.assign(document.createElement('button'), {
+        className: 'toolbarButton extensionButton', type: 'button', textContent: 'Overleaf viewer',
+        title: 'Show the PDF in the Overleaf viewer (sets overleaf-workshop.pdfViewer.engine)',
+    });
+    switchViewer.addEventListener('click', () => {
+        if (a.pdfDocument) { saveState({ position: positionOf(a), scale: a.pdfViewer.currentScaleValue }); }
+        post({ type: 'switchViewer', engine: 'overleaf' });
+    });
+    right?.prepend(switchViewer, toCode, theme);
     showTheme();
 }
 

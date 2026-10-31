@@ -1,4 +1,4 @@
-/** The toolbar of index.html: page number, zoom, outline, theme, go to source, save. */
+/** The toolbar of index.html: page number, zoom, outline, theme, go to source, save, switch to the pdf.js viewer. */
 export interface ToolbarActions {
     goToPage(page: number): void;
     zoom(value: string): void; // 'zoom-in', 'zoom-out' or a scale value
@@ -6,6 +6,7 @@ export interface ToolbarActions {
     nextTheme(): void;
     goToCode(): void;
     download(): void;
+    switchViewer(): void;
 }
 
 const byId = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -35,6 +36,7 @@ export class Toolbar {
         this.themeToggle.addEventListener('click', () => actions.nextTheme());
         byId('goToCode').addEventListener('click', () => actions.goToCode());
         byId('download').addEventListener('click', () => actions.download());
+        byId('switchViewer').addEventListener('click', () => actions.switchViewer());
     }
 
     private current() {

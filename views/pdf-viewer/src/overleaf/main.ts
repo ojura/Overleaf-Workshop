@@ -119,6 +119,15 @@ const toolbar = new Toolbar({
     download() {
         post({ type: 'download' });
     },
+    // shows the PDF in the pdf.js viewer, at the same place: the host sets the viewer setting
+    // and reloads the page with the other viewer, which starts from the saved view
+    switchViewer() {
+        if (initialised) {
+            storePosition();
+            saveState({ scale });
+        }
+        post({ type: 'switchViewer', engine: 'pdfjs' });
+    },
 });
 
 const outline = new Outline(wrapper.viewer.linkService);

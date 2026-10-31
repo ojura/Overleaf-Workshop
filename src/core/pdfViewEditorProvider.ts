@@ -18,8 +18,28 @@ export class PdfDocument implements vscode.CustomDocument {
     readonly onDidChange = this._onDidChange.event;
 
     /** `engine`: the viewer that shows this document (setting overleaf-workshop.pdfViewer.engine) */
-    constructor(readonly uri: vscode.Uri, readonly engine: PdfViewerEngine = 'legacy') {
+    constructor(readonly uri: vscode.Uri, private _engine: PdfViewerEngine = 'legacy') {
         this.uri = uri;
+    }
+
+    get engine(): PdfViewerEngine {
+        return this._engine;
+    }
+
+    /**
+     * Show this document in another viewer; false when it is the viewer already. A build moves
+     * between being loaded in ranges and being read whole when the legacy viewer is one of the two.
+     */
+    async setEngine(engine: PdfViewerEngine): Promise<boolean> {
+        if (engine === this._engine) {
+            return false;
+        }
+        const reread = this.isBuild && (engine === 'legacy') !== (this._engine === 'legacy');
+        this._engine = engine;
+        if (reread) {
+            await this.refresh();
+        }
+        return true;
     }
 
     /**
@@ -66,6 +86,8 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
 
     /** the pieces of compiled PDFs kept between builds and sessions (src/core/pdfFetchBridge.ts) */
     private readonly pieces: PieceCache;
+    /** the open viewers, which a change of overleaf-workshop.pdfViewer.engine reloads */
+    private readonly editors = new Set<{ doc: PdfDocument, render: () => Promise<void> }>();
 
     constructor(private readonly context:vscode.ExtensionContext) {
         this.context = context;
@@ -94,8 +116,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
 
     /**
      * The viewer that the setting overleaf-workshop.pdfViewer.engine picks, or the legacy viewer
-     * when this install does not have the picked viewer's page. A change of the setting applies
-     * to the PDFs opened after it.
+     * when this install does not have the picked viewer's page.
      */
     private async engine(): Promise<PdfViewerEngine> {
         const picked = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer').get<string>('engine', 'legacy') as PdfViewerEngine;
@@ -113,6 +134,32 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
 
     private viewerFile(...parts: string[]) {
         return vscode.Uri.joinPath(this.context.extensionUri, 'views/pdf-viewer', ...parts);
+    }
+
+    /** Show the open PDFs in the viewer that the setting now picks; their pages reload. */
+    private async applyEngine() {
+        const engine = await this.engine();
+        for (const editor of this.editors) {
+            if (await editor.doc.setEngine(engine)) {
+                await editor.render();
+            }
+        }
+    }
+
+    /**
+     * The button in the pdfjs and overleaf viewers that shows the PDF in the other one: it sets
+     * the setting, whose change reloads the open viewers (applyEngine). The setting is machine
+     * scoped, so it is a user setting.
+     */
+    private async switchViewer(engine: unknown) {
+        if (engine !== 'pdfjs' && engine !== 'overleaf') {
+            return;
+        }
+        try {
+            await vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer').update('engine', engine, vscode.ConfigurationTarget.Global);
+        } catch (error: any) {
+            vscode.window.showErrorMessage(vscode.l10n.t('Could not switch the PDF viewer: {0}', String(error?.message ?? error)));
+        }
     }
 
     public async resolveCustomEditor(doc: PdfDocument, webviewPanel: vscode.WebviewPanel): Promise<void> {
@@ -140,14 +187,25 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             updateWebview();
         });
 
+        // the page of the document's viewer; a new page reloads the webview, which then asks for
+        // the document again ('ready')
+        const editor = {
+            doc,
+            render: async () => {
+                webviewPanel.webview.html = doc.engine === 'legacy'
+                    ? await this.getHtmlForWebview(webviewPanel.webview)
+                    : await this.getViewerPage(webviewPanel.webview, doc.engine);
+            },
+        };
+        this.editors.add(editor);
+
         webviewPanel.onDidDispose(() => {
             docOnDidChangeListener.dispose();
+            this.editors.delete(editor);
         });
 
         webviewPanel.webview.options = {enableScripts:true};
-        webviewPanel.webview.html = doc.engine === 'legacy'
-            ? await this.getHtmlForWebview(webviewPanel.webview)
-            : await this.getViewerPage(webviewPanel.webview, doc.engine);
+        await editor.render();
 
         // register event listeners
         webviewPanel.onDidChangeViewState((e) => {
@@ -182,6 +240,9 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                 case 'download':
                     this.download(doc);
                     break;
+                case 'switchViewer':
+                    void this.switchViewer(e.engine);
+                    break;
                 case 'ready':
                     const state = GlobalStateManager.getPdfViewPersist(this.context, doc.uri.toString());
                     const config = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer');
@@ -201,6 +262,11 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
 
     public get triggers(): vscode.Disposable[] {
         return [
+            vscode.workspace.onDidChangeConfiguration((e) => {
+                if (e.affectsConfiguration('overleaf-workshop.pdfViewer.engine')) {
+                    this.applyEngine().catch((error) => console.error('overleaf-workshop: switching the PDF viewer:', error));
+                }
+            }),
             vscode.window.registerCustomEditorProvider(`${ROOT_NAME}.pdfViewer`, this, {
                 webviewOptions: {
                     retainContextWhenHidden: true,
