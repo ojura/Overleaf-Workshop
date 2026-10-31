@@ -79,11 +79,14 @@ node scripts/pdf-viewer-harness/probes/theme-colors.mjs --engine overleaf
 ```
 
 Every script takes `--ext DIR` for another `views/pdf-viewer` folder, such as another checkout's,
-and `--port N` for the server; Chrome's debugging port follows from it. Scripts on different ports
-can run at the same time. The usage of each script is in its first comment.
+and `--port N` for the server. Scripts on different ports can run at the same time. The usage of
+each script is in its first comment.
 
 Each script starts its own server and Chrome, with a new Chrome profile and an empty piece cache,
-and stops both when it ends, also after Ctrl+C or a timeout. Generated files go to the work
+and stops both when it ends, also after Ctrl+C or a timeout. Chrome picks a free DevTools port
+itself and writes it into its profile, and the script connects through what Chrome wrote there
+(`scripts/lib/devtools.mjs`), so it drives only the Chrome it started. Chrome's own messages go to
+the script's stderr, after `chrome: `. Generated files go to the work
 folder, `$PDF_VIEWER_HARNESS_WORK` or by default `pdf-viewer-harness` in the system's temporary
 folder:
 

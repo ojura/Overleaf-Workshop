@@ -106,12 +106,12 @@ export async function startServer({ name, port, ext = defaultExt, bookDir = book
 
 /**
  * Start the server and headless Chrome for a probe, with the Runtime and Page domains enabled on
- * Chrome's page. `name` and `port` keep the piece cache and the Chrome profile apart from other
- * runs; Chrome's debugging port is the server's port + 1000. close() stops both.
+ * Chrome's page. `name` and `port` keep the piece cache apart from other runs; Chrome gets a new
+ * profile in the work folder each time. close() stops both.
  */
 export async function openHarness({ name, port, width, height, ...serverOptions }) {
     const server = await startServer({ name, port, ...serverOptions });
-    const chrome = await launchChrome({ profile: path.join(work, `chrome-profile-${name}-${port}`), port: port + 1000, width, height });
+    const chrome = await launchChrome({ dir: work, width, height });
     await chrome.page.send('Runtime.enable');
     await chrome.page.send('Page.enable');
     return {
