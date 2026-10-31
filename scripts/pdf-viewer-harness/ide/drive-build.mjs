@@ -17,16 +17,16 @@ import { checker, instance, rafOnTimer, reopenTab, sleep, viewerOf, viewerPage, 
 const themePage = arg('theme-page') && Number(arg('theme-page'));
 const inst = instance();
 const { check, summary } = checker();
-const wb = await workbench(inst.port);
+const wb = await workbench(inst);
 let view;
 try {
     const draws = await windowDraws(wb);
     console.log(`the window ${draws ? 'draws' : 'does not draw: the viewer page gets a 16 ms timer for requestAnimationFrame'}`);
     const t0 = Date.now();
-    const frame = await reopenTab(wb, inst.port, 'output.pdf');
+    const frame = await reopenTab(wb, 'output.pdf');
     check('output.pdf opens again in a new viewer webview', !!frame);
     if (!frame) { throw new Error('the instance does not show an output.pdf tab, or it did not open again'); }
-    view = await viewerPage(frame, { beforeLoad: draws ? undefined : rafOnTimer });
+    view = await viewerPage(wb, frame, { beforeLoad: draws ? undefined : rafOnTimer });
     const shown = await view.drawn(undefined, 90000);
     check('the page in view is drawn', !!shown, `${Date.now() - t0} ms after reopening the tab${shown ? `, in the ${shown.engine} viewer` : ''}`);
     if (!shown) { throw new Error('the viewer did not draw the page in view'); }

@@ -33,16 +33,16 @@ const findText = arg('find', isThemeBook ? 'IIII' : 'quick brown');
 const inst = instance();
 const restoreAssociation = await associatePdfs(settings(inst));
 const { check, summary } = checker();
-const wb = await workbench(inst.port);
+const wb = await workbench(inst);
 let view;
 try {
     const draws = await windowDraws(wb);
     check('requestAnimationFrame fires in the window', draws);
     const t0 = Date.now();
-    const frame = await openWithQuickOpen(wb, inst.port, path.resolve(pdf));
+    const frame = await openWithQuickOpen(wb, path.resolve(pdf));
     check(`${path.basename(pdf)} opens in the extension's viewer`, !!frame, JSON.stringify(await wb.E(`[...document.querySelectorAll('.tabs-container .tab')].map(t => t.getAttribute('aria-label'))`)));
     if (!frame) { throw new Error('the viewer did not open'); }
-    view = await viewerPage(frame, { beforeLoad: draws ? undefined : rafOnTimer });
+    view = await viewerPage(wb, frame, { beforeLoad: draws ? undefined : rafOnTimer });
     const shown = await view.drawn(undefined, 60000);
     check('the page in view is drawn', !!shown, `${Date.now() - t0} ms after Enter in Quick Open${shown ? `, in the ${shown.engine} viewer` : ''}`);
     if (!shown) { throw new Error('the viewer did not draw the page in view'); }

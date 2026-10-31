@@ -7,9 +7,9 @@ import { evaluate, instance, reopenTab, sleep, viewerPage, workbench } from './i
 
 const seconds = Number(arg('seconds', '25'));
 const inst = instance();
-const wb = await workbench(inst.port);
+const wb = await workbench(inst);
 const t0 = Date.now();
-const frame = await reopenTab(wb, inst.port, arg('tab', 'output.pdf'));
+const frame = await reopenTab(wb, arg('tab', 'output.pdf'));
 if (!frame) {
     console.log('the tab is not open, or it did not open again in a new viewer webview');
     wb.close();
@@ -17,7 +17,7 @@ if (!frame) {
 }
 const log = [];
 const at = () => `${String(Date.now() - t0).padStart(6)} ms`;
-const view = await viewerPage(frame);
+const view = await viewerPage(wb, frame);
 view.session.on('Runtime.consoleAPICalled', (p) => log.push(`${at()} console.${p.type}: ${p.args.map(a => a.value ?? a.description).join(' ').slice(0, 260).replace(/\n/g, ' | ')}`));
 view.session.on('Runtime.exceptionThrown', (p) => log.push(`${at()} exception: ${(p.exceptionDetails.exception?.description ?? p.exceptionDetails.text).slice(0, 260)}`));
 log.push(`${at()} attached to the viewer's webview`);

@@ -116,9 +116,10 @@ repository.
 The scripts in `ide/` drive the viewers in Antigravity itself, in the window of an instance that
 `scripts/hidden-ide.sh` started on a virtual display, and only there. They read the instance's
 `instance.json` in `$HIDDEN_IDE_HOME` (default `/tmp/hidden-ide-<uid>`), or in the folder that
-`--instance` names, and check that the instance's main process holds its debugging port before
-they connect. The settings they change are the instance's own (`profile/User/settings.json`), and
-they restore them when they end.
+`--instance` names, connect to the DevTools endpoint that the instance's start recorded there, and
+go on only when the instance's IDE answers as itself (`scripts/lib/test-instance.mjs`). The
+settings they change are the instance's own (`profile/User/settings.json`), and they restore them
+when they end.
 
 An instance opens either a folder of PDFs, without a login (`--folder`), or the local replica of an
 Overleaf project meant for tests (`--project`), whose `output.pdf` the viewer loads in ranges:

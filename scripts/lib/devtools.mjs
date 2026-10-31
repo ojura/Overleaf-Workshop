@@ -66,7 +66,9 @@ export function waitForActivePort(profile, { ended, limitMs }) {
  *   function that stops it;
  * - attach(targetId) opens a session on one of the browser's targets (a page, a frame, a worker),
  *   with the same send and on for that target, and detach();
+ * - discoverTargets() asks the browser for its target events (Target.targetCreated, ...), once;
  * - close() closes the connection, and `closed` resolves with the reason when it has closed.
+ * A Node inspector's endpoint has no targets: use send and on alone there.
  * A command that waits for its answer fails when the connection closes, and a session's command
  * also when its target detaches or crashes; the error names the command and the reason.
  */
@@ -156,7 +158,11 @@ export async function connect(url) {
         listeners.get(key).add(fn);
         return () => listeners.get(key)?.delete(fn);
     };
+    let discovering;
+    // the browser reports crashed targets only while it reports its targets at all
+    const discoverTargets = () => (discovering ??= send('Target.setDiscoverTargets', { discover: true }));
     const attach = async (targetId) => {
+        await discoverTargets();
         const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
         sessions.set(sessionId, targetId);
         return {
@@ -164,14 +170,51 @@ export async function connect(url) {
             targetId,
             send: (method, params) => send(method, params, sessionId),
             on: (method, fn) => on(method, fn, sessionId),
-            /** Detach from the target; a session that has ended already stays as it is. */
+            /**
+             * Detach from the target. A session that has ended, or that ends while the browser
+             * answers, because its target or the connection went away, is gone already.
+             */
             detach: async () => {
                 if (!sessions.has(sessionId) || endReason !== undefined) { return; }
-                await send('Target.detachFromTarget', { sessionId });
+                try {
+                    await send('Target.detachFromTarget', { sessionId });
+                } catch (error) {
+                    if (endReason === undefined && sessions.has(sessionId)) { throw error; }
+                }
             },
         };
     };
-    // the browser reports crashed targets only while it reports its targets at all
-    await send('Target.setDiscoverTargets', { discover: true });
-    return { url, send: (method, params) => send(method, params), on: (method, fn) => on(method, fn), attach, close: () => ws.close(), closed };
+    return {
+        url, send: (method, params) => send(method, params), on: (method, fn) => on(method, fn),
+        attach, discoverTargets, close: () => ws.close(), closed,
+    };
+}
+
+/**
+ * Wait until the browser on `connection` has a target for which `matches(targetInfo)` holds, and
+ * return that targetInfo. The browser's targets are checked when the wait begins, and then with
+ * each target event. The wait fails when the connection closes; `limitMs` is the last resort for
+ * a browser that runs but never opens such a target, and `what` names the target in that error.
+ */
+export function waitForTarget(connection, matches, { what, limitMs }) {
+    return new Promise((resolve, reject) => {
+        let done = false;
+        const stops = [];
+        const finish = (settle, value) => {
+            if (done) { return; }
+            done = true;
+            clearTimeout(timer);
+            stops.forEach(stop => stop());
+            settle(value);
+        };
+        const look = (targetInfo) => { if (matches(targetInfo)) { finish(resolve, targetInfo); } };
+        const timer = setTimeout(() => finish(reject, new Error(`the browser at ${connection.url} did not open ${what} within ${limitMs / 1000} s`)), limitMs);
+        stops.push(connection.on('Target.targetCreated', ({ targetInfo }) => look(targetInfo)));
+        stops.push(connection.on('Target.targetInfoChanged', ({ targetInfo }) => look(targetInfo)));
+        connection.closed.then((reason) => finish(reject, new Error(`${what}: ${reason}`)));
+        connection.discoverTargets()
+            .then(() => connection.send('Target.getTargets'))
+            .then(({ targetInfos }) => targetInfos.forEach(look))
+            .catch((error) => finish(reject, error));
+    });
 }

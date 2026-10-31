@@ -32,20 +32,21 @@
 #                       without it, the instance runs a copy of the installed extension
 #   --display :N        the virtual display, default :99; :0 and :1 are refused, and so is any
 #                       display in use that this script did not start
-#   --cdp PORT          the window's debugging port, default 9341
-#   --inspect PORT      the Electron main process's inspector port, default 9342
 #   --screen WxH        the virtual screen, default 1600x1000, when the display starts
 #   --ide PATH          the Antigravity binary, default the running Antigravity's
-# A display or port in use is refused, naming the process that holds it, and every command checks
-# that the instance's own process holds the port before it connects, so two instances (for
-# example of two agents) never reach each other's window.
+# A display in use is refused, naming the process that holds it. The IDE picks the ports of its
+# two DevTools endpoints itself, one for the window and one for its main process's inspector, and
+# start records the endpoints; each holds an id that only this IDE accepts. Every command connects
+# to those endpoints only, and checks that the process that answers is the instance's IDE, so that
+# two instances (for example of two agents) never reach each other's window.
 #
 # All of the instance lives in $HIDDEN_IDE_HOME (default /tmp/hidden-ide-$UID): profile/,
 # extensions/, replica/, instance.json and the logs. The replica folder is kept between starts,
 # so only the first start downloads the whole project. instance.json, for tools that drive the
-# instance: pid (the IDE's main process, which holds both ports; check that with ss before
-# connecting), xvfb (the display's process), display (":N"), cdp, inspect, project and replica
-# (null in folder mode), folder (what the instance opened), profile and ide.
+# instance (scripts/lib/test-instance.mjs reads it): pid (the IDE's main process), xvfb (the
+# display's process), display (":N"), devtools and inspector (the endpoints of the window's browser
+# and of the main process), project and replica (null in folder mode), folder (what the instance
+# opened), profile and ide.
 #
 # The test projects: the user lists in ${XDG_CONFIG_HOME:-~/.config}/overleaf-workshop/test-projects,
 # once, the Overleaf projects made for tests, one project id per line ("#" starts a comment).
@@ -57,6 +58,7 @@
 # this script prints it. Do not run this script under set -x.
 set -uo pipefail
 
+here=$(cd "$(dirname "$0")" && pwd)
 home=$(realpath -m "${HIDDEN_IDE_HOME:-/tmp/hidden-ide-$(id -u)}")
 state="$home/instance.json"
 user_state=${HIDDEN_IDE_USER_STATE:-"$HOME/.config/Antigravity IDE/User/globalStorage/state.vscdb"}
@@ -71,14 +73,6 @@ cmdline() { [ -n "${1:-}" ] && { tr '\0' ' ' < "/proc/$1/cmdline"; } 2>/dev/null
 own_ide() { cmdline "$(field pid)" | grep -q -F -- "--user-data-dir=$home/profile "; }
 own_xvfb() { [ -n "$(field display)" ] && cmdline "$(field xvfb)" | grep -q -E "^Xvfb $(field display) "; }
 running() { own_ide || die "no instance is running"; }
-# The process listening on a local TCP port, as "pid N (command)", or nothing.
-port_holder() {
-    local line pid
-    line=$(ss -ltnpH "sport = :$1" 2>/dev/null | head -1)
-    [ -n "$line" ] || return 0
-    pid=$(printf '%s' "$line" | grep -o -E 'pid=[0-9]+' | head -1 | cut -d= -f2)
-    if [ -n "$pid" ]; then echo "pid $pid ($(ps -o args= -p "$pid" 2>/dev/null | cut -c1-120))"; else echo "a process of another user"; fi
-}
 # The X server of display N, as "pid N (command)", from its socket or else its lock file.
 display_holder() {
     local pid
@@ -102,76 +96,14 @@ check_test_project() {
     awk -v id="$1" '{ sub(/#.*/, ""); for (i = 1; i <= NF; i++) if ($i == id) found = 1 } END { exit !found }' "$test_projects" \
         || die "refusing project $1: it is not listed in $test_projects, the user's list of Overleaf projects made for tests"
 }
-# Fail unless the instance's own main process listens on PORT, so a command never reaches another instance.
-own_port() {
-    local pid=$(field pid)
-    ss -ltnpH "sport = :$1" 2>/dev/null | grep -q "pid=$pid," \
-        || die "port $1 is not this instance's (it is held by: $(port_holder "$1"))"
-}
-
-# Run JavaScript with a DevTools connection to the page (KIND cdp) or the main process (KIND
-# inspect) on PORT. The script gets args, the further arguments, and call(method, params), which
-# sends one command and resolves to its reply, or to {timeout, error} after 15 s without one. What
-# the script returns is the exit status.
-devtools() {  # devtools PORT KIND SCRIPT [ARGS...]
-    node - "$@" <<'EOF'
-const [port, kind, script, ...args] = process.argv.slice(2);
-const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
-const target = kind === 'inspect' ? list[0] : list.find(t => t.type === 'page');
-if (!target) { console.error(`nothing to debug on port ${port}`); process.exit(1); }
-const ws = new WebSocket(target.webSocketDebuggerUrl);
-await new Promise(resolve => {
-    ws.onopen = resolve;
-    ws.onerror = () => { console.error(`could not connect to ${target.webSocketDebuggerUrl}`); process.exit(1); };
-});
-let id = 0; const pending = new Map();
-ws.onmessage = ev => { const m = JSON.parse(ev.data); pending.get(m.id)?.(m); pending.delete(m.id); };
-const call = (method, params = {}) => new Promise(resolve => {
-    const timer = setTimeout(() => resolve({ timeout: true, error: { message: `${method}: no answer within 15 s` } }), 15000);
-    pending.set(++id, m => { clearTimeout(timer); resolve(m); });
-    ws.send(JSON.stringify({ id, method, params }));
-});
-const AsyncFunction = (async () => {}).constructor;
-const status = await new AsyncFunction('call', 'args', script)(call, args);
-ws.close();
-process.exit(status ?? 0);
-EOF
-}
-
-# Print the value of a JavaScript expression in the page (cdp) or the main process (inspect) as
-# JSON, or {"error": ...}; exit status 1 on an error, 2 when there is no answer within 15 s.
-evaluate() {  # evaluate PORT KIND EXPRESSION
-    devtools "$1" "$2" '
-        const answer = await call("Runtime.evaluate", { expression: args[0], awaitPromise: true, returnByValue: true });
-        const details = answer.result?.exceptionDetails;
-        const failure = answer.error?.message ?? (details && (details.exception?.description ?? details.text));
-        if (failure) { console.log(JSON.stringify({ error: failure })); return answer.timeout ? 2 : 1; }
-        console.log(JSON.stringify(answer.result.result.value));' "$3"
-}
-
-# Run JavaScript statements in the IDE's main process, with w set to its window, and print what they return.
-main_process() {  # main_process STATEMENTS
-    own_port "$(field inspect)"
-    evaluate "$(field inspect)" inspect "(async () => {
-        // the main process is an ES module, and the inspector's context has neither require nor import()
-        const electron = typeof require === 'function' ? require('electron')
-            : process.mainModule ? process.mainModule.require('electron')
-            : process.getBuiltinModule('module').createRequire(process.execPath)('electron');
-        const w = electron.BrowserWindow.getAllWindows().find(w => !w.isDestroyed());
-        if (!w) { return 'no window'; }
-        $1
-    })()"
-}
+# The DevTools work, in hidden-ide.mjs: it connects only to the endpoints that start recorded in
+# instance.json, and checks that the instance's IDE answers there.
+ide_devtools() { node "$here/hidden-ide.mjs" "$1" "$home" "${@:2}"; }
+# Print what STATEMENTS return in the IDE's main process, with w set to its window, as JSON.
+main_process() { ide_devtools evaluate main "$1"; }
+# Send one DevTools command (METHOD PARAMS_JSON) to the instance's page.
+page_command() { ide_devtools page-command "$1" "$2"; }
 window_state='{ visible: w.isVisible(), minimized: w.isMinimized(), focused: w.isFocused(), bounds: w.getBounds() }'
-
-# Send one DevTools command to the instance's page.
-page_command() {  # page_command METHOD PARAMS_JSON
-    own_port "$(field cdp)"
-    devtools "$(field cdp)" cdp '
-        const answer = await call(args[0], JSON.parse(args[1]));
-        if (answer.error) { console.error(`${args[0]}: ${answer.error.message}`); return 1; }
-        console.log(`${args[0]}: done`);' "$1" "$2"
-}
 
 stop_xvfb() {
     local xvfb=$(field xvfb)
@@ -180,7 +112,7 @@ stop_xvfb() {
 }
 
 start() {
-    local project="" project_name="" folder="" build="" display=":99" cdp=9341 inspect=9342 screen="1600x1000" ide=""
+    local project="" project_name="" folder="" build="" display=":99" screen="1600x1000" ide=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --project) project=$2; shift 2 ;;
@@ -188,8 +120,6 @@ start() {
             --folder) folder=$2; shift 2 ;;
             --build) build=$2; shift 2 ;;
             --display) display=$2; shift 2 ;;
-            --cdp) cdp=$2; shift 2 ;;
-            --inspect) inspect=$2; shift 2 ;;
             --screen) screen=$2; shift 2 ;;
             --ide) ide=$2; shift 2 ;;
             *) die "unknown option $1" ;;
@@ -222,10 +152,6 @@ start() {
     if [ -z "$xvfb" ] && { [ -e "/tmp/.X11-unix/X$number" ] || [ -e "/tmp/.X$number-lock" ]; }; then
         die "refusing display $display: it is in use ($(display_holder "$number"))"
     fi
-    [[ "$cdp" =~ ^[0-9]+$ && "$inspect" =~ ^[0-9]+$ && "$cdp" != "$inspect" ]] || die "--cdp and --inspect need two different port numbers"
-    for port in "$cdp" "$inspect"; do
-        [ -z "$(port_holder "$port")" ] || die "refusing port $port: it is in use by $(port_holder "$port")"
-    done
     if [ -z "$ide" ]; then
         for pid in $(pgrep -x antigravity-ide 2>/dev/null); do
             ide=$(readlink -f "/proc/$pid/exe" 2>/dev/null) && [ -x "$ide" ] && break
@@ -345,34 +271,38 @@ EOF
         for _ in $(seq 1 50); do [ -e "/tmp/.X11-unix/X$number" ] && break; sleep 0.1; done
         [ -e "/tmp/.X11-unix/X$number" ] || die "Xvfb did not start on $display (see $home/xvfb.log)"
     fi
-    # the IDE, in a process group of its own
+    # The IDE, in a process group of its own. It picks the ports of its DevTools endpoints itself
+    # (port 0): the window's browser names its endpoint in DevToolsActivePort in the profile, and
+    # the file that an earlier start left there must not be taken for the new one.
+    rm -f "$home/profile/DevToolsActivePort"
     env -u WAYLAND_DISPLAY -u GNOME_TERMINAL_SCREEN XDG_SESSION_TYPE=x11 DISPLAY="$display" setsid "$ide" \
-        --ozone-platform=x11 --disable-gpu --remote-debugging-port="$cdp" --inspect="$inspect" \
+        --ozone-platform=x11 --disable-gpu --remote-debugging-port=0 --inspect=0 \
         --user-data-dir="$home/profile" --extensions-dir="$home/extensions" \
         --disable-workspace-trust --skip-welcome --skip-release-notes --new-window "$folder" \
         > "$home/ide.log" 2>&1 < /dev/null &
     local pid=$!
-    # pid is the IDE's main process, which holds both ports; tools check that before connecting
-    python3 -I - "$state" "$pid" "$xvfb" "$display" "$cdp" "$inspect" "$project" "$folder" "$home/profile" "$ide" <<'EOF'
+    # recorded at once, so that stop finds the IDE also when the wait below fails
+    python3 -I - "$state" "$pid" "$xvfb" "$display" "$project" "$folder" "$home/profile" "$ide" <<'EOF'
 import json, sys
-state, pid, xvfb, display, cdp, inspect, project, folder, profile, ide = sys.argv[1:]
+state, pid, xvfb, display, project, folder, profile, ide = sys.argv[1:]
 with open(state, "w") as out:
-    json.dump({"pid": int(pid), "xvfb": int(xvfb), "display": display, "cdp": int(cdp), "inspect": int(inspect),
+    json.dump({"pid": int(pid), "xvfb": int(xvfb), "display": display,
                "project": project or None, "replica": folder if project else None, "folder": folder,
                "profile": profile, "ide": ide}, out, indent=2)
     out.write("\n")
 EOF
-    for _ in $(seq 1 120); do
-        curl -s "http://127.0.0.1:$cdp/json/list" 2>/dev/null | grep -q '"type": "page"' && break
-        own_ide || die "the IDE exited (see $home/ide.log)"
-        sleep 0.5
-    done
-    curl -s "http://127.0.0.1:$cdp/json/list" | grep -q '"type": "page"' || die "the IDE's window did not open within 60 s (see $home/ide.log)"
-    for port in "$cdp" "$inspect"; do
-        ss -ltnpH "sport = :$port" 2>/dev/null | grep -q "pid=$pid," \
-            || die "the IDE (pid $pid) does not hold port $port: $(port_holder "$port"); see $home/ide.log, then stop the instance"
-    done
-    echo "started: pid $pid on $display, window debugging port $cdp, main process inspector port $inspect, folder $folder"
+    # Wait until the window is open and both endpoints answer as this IDE, which records them in
+    # instance.json, or until the IDE exits, whichever comes first.
+    ide_devtools ready "$pid" &
+    local ready=$! first status
+    wait -n -p first "$pid" "$ready"
+    status=$?
+    if [ "$first" = "$pid" ]; then
+        kill "$ready" 2>/dev/null
+        die "the IDE exited with status $status (see $home/ide.log)"
+    fi
+    [ "$status" = 0 ] || die "the IDE's window did not open (see the message above and $home/ide.log); stop the instance"
+    echo "started: pid $pid on $display, folder $folder"
 }
 
 stop() {
@@ -408,28 +338,14 @@ case "${1:-}" in
         esac ;;
     probe)
         running
-        own_port "$(field cdp)"
-        evaluate "$(field cdp)" cdp "(async () => {
+        ide_devtools evaluate page "(async () => {
             const frame = await Promise.race([new Promise(r => requestAnimationFrame(() => r('drawing'))), new Promise(r => setTimeout(() => r('no frame within 2 s'), 2000))]);
             return { visibility: document.visibilityState, focus: document.hasFocus(), frame };
         })()" ;;
     screenshot)
         running
         [ -n "${2:-}" ] || die "usage: screenshot FILE.png [WIDTH HEIGHT]"
-        own_port "$(field cdp)"
-        # The page's size is set in the same DevTools session as the capture: the override ends with the session.
-        devtools "$(field cdp)" cdp '
-            const [file, width, height] = args;
-            if (width && height) {
-                const set = await call("Emulation.setDeviceMetricsOverride", { width: Number(width), height: Number(height), deviceScaleFactor: 1, mobile: false });
-                if (set.error) { console.error(set.error.message); return 1; }
-                await new Promise(r => setTimeout(r, 800)); // let the workbench lay itself out at the new size
-            }
-            const answer = await call("Page.captureScreenshot", { format: "png" });
-            if (width && height) { await call("Emulation.clearDeviceMetricsOverride"); }
-            if (answer.error) { console.error(`screenshot: ${answer.error.message}`); return 1; }
-            (await import("node:fs")).writeFileSync(file, Buffer.from(answer.result.data, "base64"));
-            console.log(`saved ${file}`);' "$2" "${3:-}" "${4:-}" ;;
+        ide_devtools screenshot "$2" "${3:-}" "${4:-}" ;;
     freeze) running; page_command Page.setWebLifecycleState '{"state":"frozen"}' ;;
     thaw)
         running

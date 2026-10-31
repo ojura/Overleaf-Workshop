@@ -3,14 +3,15 @@
 // operators: pages for drive-build.mjs --theme-page and for probe-page-colors.mjs.
 //   node ide/find-image-page.mjs [--from 1] [--to <last page>] [--step 1]
 import { arg } from '../common.mjs';
-import { instance, viewerFrames, viewerOf, viewerPage } from './ide.mjs';
+import { instance, viewerFrames, viewerOf, viewerPage, workbench } from './ide.mjs';
 
 const inst = instance();
-const frame = (await viewerFrames(inst.port)).at(-1);
-if (!frame) { console.error('the instance does not show a PDF viewer'); process.exit(1); }
-const view = await viewerPage(frame);
+const wb = await workbench(inst);
+const frame = (await viewerFrames(wb)).at(-1);
+if (!frame) { console.error('the instance does not show a PDF viewer'); wb.close(); process.exit(1); }
+const view = await viewerPage(wb, frame);
 const shown = await view.drawn(undefined, 30000);
-if (!shown) { console.error('the webview does not show a drawn viewer page'); view.close(); process.exit(1); }
+if (!shown) { console.error('the webview does not show a drawn viewer page'); wb.close(); process.exit(1); }
 const V = viewerOf(shown.engine);
 const from = Number(arg('from', '1'));
 const step = Number(arg('step', '1'));
@@ -24,4 +25,4 @@ console.log(JSON.stringify(await view.E(`(async () => {
     }
     return found;
 })()`)));
-view.close();
+wb.close();
