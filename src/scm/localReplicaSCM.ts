@@ -814,8 +814,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     /**
      * A native push of `commit`, for tools (replica-land): once Overleaf holds the checked-out
      * commit and the folder has no changes, fast-forward the branch to `commit`, upload what it
-     * changed (renames as renames) and wait for Overleaf's acknowledgements. Then Overleaf's
-     * ref is the commit, or a commit on top of it when someone edited meanwhile.
+     * changed (the sync renames on Overleaf what git shows as renames and moves) and wait for
+     * Overleaf's acknowledgements. Then Overleaf's ref is the commit, or a commit on top of it
+     * when someone edited meanwhile.
      */
     private async land(commit: string): Promise<ControlAnswer> {
         const sync = this.sync, store = this.store;

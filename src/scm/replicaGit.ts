@@ -5,7 +5,7 @@ import * as fsp from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import type { HistoryUpdate } from '../gitbridge/history';
-import { changedPaths, Entry, FlatTree, GitError } from '../gitbridge/plumbing';
+import { changedPaths, Entry, FlatTree, GitError, parseTreeDiff, TREE_DIFF_ARGS } from '../gitbridge/plumbing';
 import { REPLICA_OWN_FOLDERS } from './ignorePatterns';
 import type { Origin, ReplicaStore, SavedState } from './replicaSync';
 
@@ -531,6 +531,44 @@ export class GitReplicaStore implements ReplicaStore {
         const mode = (await this.git.indexEntries()).entries.get(p)?.mode ?? '100644';
         const lines = `0 ${NULL_OID}\t${p}\0${mode} ${base} 1\t${p}\0${mode} ${local} 2\t${p}\0${mode} ${remote} 3\t${p}\0`;
         await this.git.withIndexLock(() => this.git.run(['update-index', '-z', '--index-info'], { input: lines }));
+    }
+
+    /**
+     * git's pairing of the synced files gone from the folder with the new files in it
+     * (TREE_DIFF_ARGS; docs/replica-workflows.md, "Renames and moves"). `removed` maps each
+     * removed path to its base, `added` lists the new paths in the folder. Answers the removed
+     * path of each new path that git pairs with one.
+     *
+     * git compares a tree of the removed files' bases with a tree of the new files' content,
+     * which this store keeps byte for byte, as it keeps every base. The two trees hold the
+     * removed and the new files only, which gives the pairs that the trees of the last state and
+     * of the whole folder give: git pairs a removed path only with an added one. A base that the
+     * repository lacks cannot be compared, and its path is left out; so is a new file gone meanwhile.
+     */
+    async renames(removed: Map<string, string>, added: string[]): Promise<Map<string, string>> {
+        const pairs = new Map<string, string>();
+        if (removed.size === 0 || added.length === 0) { return pairs; }
+        await this.open();
+        const missing = await this.git.missing([...new Set(removed.values())]);
+        const before: FlatTree = new Map();
+        for (const [p, oid] of removed) {
+            if (!missing.has(oid)) { before.set(gitPath(p), { mode: '100644', oid }); }
+        }
+        if (missing.size > 0) {
+            const lost = [...removed].filter(([, oid]) => missing.has(oid)).map(([p]) => p);
+            this.options.log(`The saved content of ${lost.length} removed files is not in the repository, so git cannot tell whether they were renamed: ${lost.slice(0, 10).join(', ')}${lost.length > 10 ? ', ...' : ''}`);
+        }
+        const file = (p: string) => path.join(this.options.folder, p);
+        const present = added.map(gitPath).filter(p => { try { return fs.statSync(file(p)).isFile(); } catch { return false; } });
+        if (before.size === 0 || present.length === 0) { return pairs; }
+        const oids = await this.git.hashFiles(present.map(file));
+        const after: FlatTree = new Map(present.map((p, i) => [p, { mode: '100644', oid: oids[i] }]));
+        const [from, to] = await Promise.all([this.git.writeTree(before), this.git.writeTree(after)]);
+        const out = (await this.git.run([...TREE_DIFF_ARGS, from, to])).stdout.toString('utf8');
+        for (const change of parseTreeDiff(out)) {
+            if (change.status === 'R') { pairs.set(syncPath(change.path), syncPath(change.oldPath!)); }
+        }
+        return pairs;
     }
 
     async isUnmerged(filePath: string): Promise<boolean> {

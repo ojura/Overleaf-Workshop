@@ -107,6 +107,38 @@ describe('landing a commit through the replica\'s window (the land request)', fu
         assert.strictEqual(git(folder, 'status', '--porcelain'), '');
     });
 
+    it('pushes a commit that renames and edits a document: Overleaf renames the document, then gets the edit', async () => {
+        const t = await start();
+        const lines = (line: (i: number) => string) => Array.from({ length: 10 }, (_, i) => `${line(i + 1)}\n`).join('');
+        const chapter = lines(i => `Line ${i} of the chapter, with a few words in it.`);
+        const edited = lines(i => i >= 9 ? `Line ${i} of the chapter, edited after the rename.` : `Line ${i} of the chapter, with a few words in it.`);
+        // what the replica asks of Overleaf's side of the project
+        const calls: string[] = [];
+        const rel = (uri: Uri) => uri.path.slice(t.vfs.origin.path.length);
+        for (const op of ['rename', 'createFile', 'writeFile', 'remove'] as const) {
+            const real = t.vfs[op] as (...args: any[]) => Promise<any>;
+            (t.vfs as any)[op] = (...args: any[]) => {
+                calls.push(`${op} ${rel(args[0])}${op === 'rename' ? ` ${rel(args[1])}` : ''}`);
+                return real(...args);
+            };
+        }
+        const head = git(folder, 'rev-parse', 'HEAD');
+        const longer = commitInClone(folder, clone, head, { 'chapters/one.tex': chapter }, 'A chapter long enough for git to tell an edit from a new file');
+        const grown: any = await t.requestReplica(folder, { op: 'land', commit: longer }, 10000);
+        assert.strictEqual(grown.ok, true, `the landing of the longer chapter: ${JSON.stringify(grown)}`);
+
+        const commit = commitInClone(folder, clone, longer, { 'chapters/one.tex': null, 'chapters/first.tex': edited }, 'Rename the chapter and edit it');
+        assert.match(git(folder, 'diff', '--name-status', '-M', longer, commit), /^R0[5-9]\d\tchapters\/one.tex\tchapters\/first.tex$/m, 'git pairs the paths');
+        calls.length = 0;
+        const answer: any = await t.requestReplica(folder, { op: 'land', commit }, 10000);
+        assert.strictEqual(answer.ok, true, `the landing: ${JSON.stringify(answer)}`);
+        assert.deepStrictEqual(answer.summary.renamed, [{ from: '/chapters/one.tex', to: '/chapters/first.tex' }], 'the landing\'s renames');
+        assert.deepStrictEqual(calls, ['rename /chapters/one.tex /chapters/first.tex', 'writeFile /chapters/first.tex'], 'what the replica asked of Overleaf: the rename, then the edit');
+        assert.deepStrictEqual([t.w.remote.get('/chapters/first.tex'), t.w.remote.has('/chapters/one.tex')], [edited, false], 'the documents on Overleaf');
+        assert.strictEqual(git(folder, 'rev-parse', OVERLEAF_REF), commit, 'Overleaf\'s state');
+        assert.strictEqual(git(folder, 'status', '--porcelain'), '', 'git status');
+    });
+
     it('pushes a commit that adds several files in new folders', async () => {
         const t = await start();
         const head = git(folder, 'rev-parse', 'HEAD');

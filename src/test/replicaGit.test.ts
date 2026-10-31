@@ -12,17 +12,74 @@ import { gitignoreLine, gitMergeText, GitReplicaStore, NOTES_REF, OVERLEAF_REF, 
 import {
     gitBlobHash, LocalStat, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync, ReplicaUI, SyncSummary,
 } from '../scm/replicaSync';
+import { opsFor, TextOp } from '../utils/docUpdate';
 
 const enc = (text: string) => new TextEncoder().encode(text);
 const dec = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 
-/** Overleaf, in memory: docs hold text, files hold bytes and report their hash; it can rename. */
+/** A comment on a document: where the commented text starts, and that text. */
+interface Comment { p: number; text: string; }
+
+/**
+ * Move the comments of a document by the ops of an edit, as Overleaf moves a comment when text
+ * is inserted or deleted before it. An op at or inside a comment is not modelled here: it
+ * throws, so that the edit fails and the test says so.
+ */
+function moveComments(comments: Comment[], ops: TextOp[]) {
+    for (const op of ops) {
+        for (const c of comments) {
+            const end = c.p + c.text.length;
+            if (op.i !== undefined) {
+                if (op.p < c.p) { c.p += op.i.length; } else if (op.p <= end) { throw new Error(`the edit inserts ${JSON.stringify(op.i)} at the comment on ${JSON.stringify(c.text)}`); }
+            } else if (op.p + op.d!.length <= c.p) {
+                c.p -= op.d!.length;
+            } else if (op.p < end) {
+                throw new Error(`the edit deletes ${JSON.stringify(op.d)} across the comment on ${JSON.stringify(c.text)}`);
+            }
+        }
+    }
+}
+
+/**
+ * Overleaf, in memory: docs hold text, files hold bytes and report their hash; it can rename.
+ * Each document and file has an id: a rename keeps it, and an upload makes a new one, as
+ * Overleaf gives a new id to a new document and to a binary file it replaces. A document's
+ * comments belong to its id, and an edit (writeDoc) moves them by the ops the extension sends
+ * for it (opsFor); a removal drops them.
+ */
 class Remote implements ReplicaRemote {
     connected() { return true; }
     docs = new Map<string, string>();
     files = new Map<string, Uint8Array>();
     calls: string[] = [];
     failWrites = new Map<string, number>();
+    ids = new Map<string, number>();
+    comments = new Map<number, Comment[]>();
+    /** the folders removed because they were empty */
+    removedFolders = new Set<string>();
+    private lastId = 0;
+
+    /** The id of the document or file at `p`, given when first asked for. */
+    idOf(p: string): number {
+        if (!this.ids.has(p)) { this.ids.set(p, ++this.lastId); }
+        return this.ids.get(p)!;
+    }
+    /** A comment on the first place where the document at `p` has `text`. */
+    comment(p: string, text: string) {
+        const at = this.docs.get(p)!.indexOf(text);
+        assert.ok(at >= 0, `${p} has no ${JSON.stringify(text)} to comment on`);
+        const id = this.idOf(p);
+        this.comments.set(id, [...this.comments.get(id) ?? [], { p: at, text }]);
+    }
+    /** The text that each comment of the document at `p` covers now. */
+    commentedText(p: string): string[] {
+        const text = this.docs.get(p) ?? '';
+        return (this.comments.get(this.ids.get(p)!) ?? []).map(c => text.slice(c.p, c.p + c.text.length));
+    }
+    private dropId(p: string) {
+        const id = this.ids.get(p);
+        if (id !== undefined) { this.comments.delete(id); this.ids.delete(p); }
+    }
 
     async list() {
         const all = new Map<string, RemoteEntry>();
@@ -42,24 +99,32 @@ class Remote implements ReplicaRemote {
         this.calls.push(`writeDoc ${p}`);
         const failures = this.failWrites.get(p) ?? 0;
         if (failures > 0) { this.failWrites.set(p, failures - 1); throw new Error('applyOtUpdate timed out'); }
+        moveComments(this.comments.get(this.idOf(p)) ?? [], opsFor(this.docs.get(p) ?? '', text));
         this.docs.set(p, text);
     }
     async upload(p: string, content: Uint8Array): Promise<RemoteEntry> {
         this.calls.push(`upload ${p}`);
         const failures = this.failWrites.get(p) ?? 0;
         if (failures > 0) { this.failWrites.set(p, failures - 1); throw new Error('the upload failed'); }
+        this.dropId(p);
+        this.idOf(p);
         if (/\.(tex|bib|txt|md|t|py|sh)$/.test(p) && !this.files.has(p)) { this.docs.set(p, dec(content)); return { kind: 'doc' }; }
         this.files.set(p, content);
         return { kind: 'file', hash: gitBlobHash(content) };
     }
     async rename(from: string, to: string) {
         this.calls.push(`rename ${from} ${to}`);
-        if (this.docs.has(from)) { this.docs.set(to, this.docs.get(from)!); this.docs.delete(from); return; }
-        if (this.files.has(from)) { this.files.set(to, this.files.get(from)!); this.files.delete(from); return; }
-        throw new Error(`no ${from}`);
+        const id = this.idOf(from);
+        if (this.docs.has(from)) { this.docs.set(to, this.docs.get(from)!); this.docs.delete(from); }
+        else if (this.files.has(from)) { this.files.set(to, this.files.get(from)!); this.files.delete(from); }
+        else { throw new Error(`no ${from}`); }
+        this.ids.delete(from);
+        this.ids.set(to, id);
     }
-    async remove(p: string) { this.calls.push(`remove ${p}`); this.docs.delete(p); this.files.delete(p); }
-    async removeFolderIfEmpty() {}
+    async remove(p: string) { this.calls.push(`remove ${p}`); this.docs.delete(p); this.files.delete(p); this.dropId(p); }
+    async removeFolderIfEmpty(folder: string) {
+        if (folder !== '/' && ![...this.docs.keys(), ...this.files.keys()].some(q => q.startsWith(`${folder}/`))) { this.removedFolders.add(folder); }
+    }
     async settled() {}
     count(prefix: string) { return this.calls.filter(c => c.startsWith(prefix)).length; }
 }
@@ -512,6 +577,218 @@ describe('local replica: git as the merge backend', function () {
         assert.ok(!fs.existsSync(path.join(t.folder, 'one.tex')));
         assert.strictEqual(t.g('status', '--porcelain'), '');
         await sync.stop();
+    });
+
+    describe('renames and moves, as git pairs them', () => {
+        const lines = (line: (i: number) => string) => Array.from({ length: 10 }, (_, i) => `${line(i + 1)}\n`).join('');
+        const chapter = lines(i => `Line ${i} of the chapter, with a few words in it.`);
+        // git: 79% similar, a rename
+        const edited = lines(i => i >= 9 ? `Line ${i} of the chapter, edited after the rename.` : `Line ${i} of the chapter, with a few words in it.`);
+        // git: below 50% similar, not a rename
+        const rewritten = lines(i => i <= 2 ? `Line ${i} of the chapter, with a few words in it.` : `Something else entirely, number ${i}.`);
+        const commented = 'Line 2 of the chapter';
+
+        /** The renames git shows for the folder's files against `rev`: git add -A, then git diff --cached -M, in an index of the test's own. */
+        function gitShowsRenames(folder: string, rev: string): { from: string, to: string }[] {
+            const env = { ...process.env, GIT_INDEX_FILE: path.join(scratch, `index-${Date.now()}-${Math.random()}`) };
+            const run = (...args: string[]) => {
+                const result = spawnSync('git', ['-C', folder, ...args], { encoding: 'utf8', env });
+                if (result.status !== 0) { throw new Error(`git ${args.join(' ')}: ${result.stderr}`); }
+                return result.stdout;
+            };
+            run('read-tree', rev);
+            run('add', '-A');
+            return run('diff', '--cached', '-M', '--name-status', rev).split('\n').filter(line => line.startsWith('R'))
+                .map(line => line.split('\t')).map(([, from, to]) => ({ from: `/${from}`, to: `/${to}` }));
+        }
+        const byFrom = (pairs: { from: string, to: string }[]) => [...pairs].sort((a, b) => a.from.localeCompare(b.from));
+
+        /** A replica of a project with `docs`, synced and recorded; the calls made of Overleaf so far are cleared. */
+        async function synced(docs: Record<string, string | Uint8Array>) {
+            const t = await world();
+            for (const [p, content] of Object.entries(docs)) {
+                if (typeof content === 'string') { t.remote.docs.set(p, content); } else { t.remote.files.set(p, content); }
+            }
+            t.update(ME);
+            const sync = t.start();
+            await sync.syncAll();
+            await sync.recordNow();
+            t.remote.calls.length = 0;
+            return { ...t, sync, first: t.g('rev-parse', 'HEAD') };
+        }
+        const move = (t: { folder: string }, from: string, to: string) => {
+            fs.mkdirSync(path.dirname(path.join(t.folder, to)), { recursive: true });
+            fs.renameSync(path.join(t.folder, from), path.join(t.folder, to));
+        };
+
+        it('renames a document with the same content, which keeps its id and comments', async () => {
+            const t = await synced({ '/a.tex': chapter });
+            const id = t.remote.idOf('/a.tex');
+            t.remote.comment('/a.tex', commented);
+            move(t, 'a.tex', 'b.tex');
+            const summary = await t.sync.flush(true);
+            assert.deepStrictEqual(t.remote.calls, ['rename /a.tex /b.tex'], 'what the sync asked of Overleaf');
+            assert.deepStrictEqual(summary.renamed, [{ from: '/a.tex', to: '/b.tex' }], 'the summary');
+            assert.strictEqual(t.remote.ids.get('/b.tex'), id, 'the document at the new path is the one that was at the old path');
+            assert.deepStrictEqual(t.remote.commentedText('/b.tex'), [commented], 'the comment, after the rename');
+            t.update(ME);
+            await t.sync.recordNow();
+            assert.match(t.g('diff', '--name-status', '-M', t.first, OVERLEAF_REF), /^R100\ta.tex\tb.tex$/m, 'git\'s view of the recorded state');
+            await t.sync.stop();
+        });
+
+        it('renames a document renamed and edited, then sends the edit, as git pairs the paths', async () => {
+            const t = await synced({ '/a.tex': chapter });
+            const id = t.remote.idOf('/a.tex');
+            t.remote.comment('/a.tex', commented);
+            move(t, 'a.tex', 'b.tex');
+            fs.writeFileSync(path.join(t.folder, 'b.tex'), edited);
+            assert.deepStrictEqual(gitShowsRenames(t.folder, t.first), [{ from: '/a.tex', to: '/b.tex' }], 'git pairs the paths');
+            const summary = await t.sync.flush(true);
+            assert.deepStrictEqual(t.remote.calls, ['rename /a.tex /b.tex', 'writeDoc /b.tex'], 'what the sync asked of Overleaf: the rename, then the edit');
+            assert.deepStrictEqual([summary.renamed, summary.uploaded, summary.failed], [[{ from: '/a.tex', to: '/b.tex' }], ['/b.tex'], []], 'the summary');
+            assert.strictEqual(t.remote.docs.get('/b.tex'), edited, 'the text on Overleaf');
+            assert.strictEqual(t.remote.ids.get('/b.tex'), id, 'the document at the new path is the one that was at the old path');
+            assert.deepStrictEqual(t.remote.commentedText('/b.tex'), [commented], 'the comment on the text that the edit left alone');
+            t.update(ME);
+            await t.sync.recordNow();
+            assert.match(t.g('diff', '--name-status', '-M', t.first, OVERLEAF_REF), /^R0[5-9]\d\ta.tex\tb.tex$/m, 'git\'s view of the recorded state');
+            assert.match(t.g('log', '--follow', '--format=%H', OVERLEAF_REF, '--', 'b.tex'), new RegExp(`^${t.first}$`, 'm'), 'git log --follow reaches the commit before the rename');
+            assert.strictEqual(t.g('status', '--porcelain'), '', 'git status after the record');
+            await t.sync.stop();
+        });
+
+        it('uploads a rewritten document under a new name as a new document, as git does not pair the paths', async () => {
+            const t = await synced({ '/a.tex': chapter });
+            const id = t.remote.idOf('/a.tex');
+            move(t, 'a.tex', 'b.tex');
+            fs.writeFileSync(path.join(t.folder, 'b.tex'), rewritten);
+            assert.deepStrictEqual(gitShowsRenames(t.folder, t.first), [], 'git does not pair the paths');
+            const summary = await t.sync.flush(true);
+            assert.deepStrictEqual([...t.remote.calls].sort(), ['remove /a.tex', 'upload /b.tex'], 'what the sync asked of Overleaf');
+            assert.deepStrictEqual(summary.renamed, [], 'the summary');
+            assert.notStrictEqual(t.remote.ids.get('/b.tex'), id, 'the document at the new path is a new one');
+            t.update(ME);
+            await t.sync.recordNow();
+            assert.match(t.g('diff', '--name-status', '-M', t.first, OVERLEAF_REF), /^D\ta.tex\nA\tb.tex$/m, 'git\'s view of the recorded state');
+            await t.sync.stop();
+        });
+
+        it('pairs two documents renamed and edited crosswise as git does, by content', async () => {
+            const one = lines(i => `The first chapter, sentence ${i}.`), two = lines(i => `The second chapter, paragraph ${i}.`);
+            const t = await synced({ '/one.tex': one, '/two.tex': two });
+            const ids = { one: t.remote.idOf('/one.tex'), two: t.remote.idOf('/two.tex') };
+            // the second chapter becomes first.tex and the first second.tex, each with an edit
+            move(t, 'two.tex', 'first.tex');
+            move(t, 'one.tex', 'second.tex');
+            fs.writeFileSync(path.join(t.folder, 'first.tex'), two.replace('paragraph 2.', 'paragraph two.'));
+            fs.writeFileSync(path.join(t.folder, 'second.tex'), one.replace('sentence 9.', 'sentence nine.'));
+            const git = byFrom(gitShowsRenames(t.folder, t.first));
+            assert.deepStrictEqual(git, [{ from: '/one.tex', to: '/second.tex' }, { from: '/two.tex', to: '/first.tex' }], 'git pairs the paths by content');
+            const summary = await t.sync.flush(true);
+            assert.deepStrictEqual(byFrom(summary.renamed), git, 'the sync\'s renames are git\'s pairs');
+            assert.deepStrictEqual([...t.remote.calls].sort(), ['rename /one.tex /second.tex', 'rename /two.tex /first.tex', 'writeDoc /first.tex', 'writeDoc /second.tex'], 'what the sync asked of Overleaf');
+            assert.deepStrictEqual([t.remote.ids.get('/second.tex'), t.remote.ids.get('/first.tex')], [ids.one, ids.two], 'each document keeps its id');
+            assert.strictEqual(t.remote.docs.get('/first.tex'), two.replace('paragraph 2.', 'paragraph two.'), 'the text of first.tex on Overleaf');
+            await t.sync.stop();
+        });
+
+        it('renames a document to a name with spaces and letters outside ASCII, as git names them', async () => {
+            const t = await synced({ '/poglavlje.tex': chapter });
+            const id = t.remote.idOf('/poglavlje.tex');
+            const to = 'uvod i čćžšđ/prvo poglavlje.tex';
+            move(t, 'poglavlje.tex', to);
+            fs.writeFileSync(path.join(t.folder, to), edited);
+            const summary = await t.sync.flush(true);
+            assert.deepStrictEqual(t.remote.calls, [`rename /poglavlje.tex /${to}`, `writeDoc /${to}`], 'what the sync asked of Overleaf: the rename, then the edit');
+            assert.deepStrictEqual(summary.failed, [], 'the failures');
+            assert.strictEqual(t.remote.ids.get(`/${to}`), id, 'the document at the new path is the one that was at the old path');
+            await t.sync.stop();
+        });
+
+        it('sends two documents that swapped their content as two edits, as git does not pair paths that both trees have', async () => {
+            const one = lines(i => `The first chapter, sentence ${i}.`), two = lines(i => `The second chapter, paragraph ${i}.`);
+            const t = await synced({ '/one.tex': one, '/two.tex': two });
+            const ids = { one: t.remote.idOf('/one.tex'), two: t.remote.idOf('/two.tex') };
+            fs.writeFileSync(path.join(t.folder, 'one.tex'), two);
+            fs.writeFileSync(path.join(t.folder, 'two.tex'), one);
+            assert.deepStrictEqual(gitShowsRenames(t.folder, t.first), [], 'git shows two changed files');
+            const summary = await t.sync.flush(true);
+            assert.deepStrictEqual([...t.remote.calls].sort(), ['writeDoc /one.tex', 'writeDoc /two.tex'], 'what the sync asked of Overleaf');
+            assert.deepStrictEqual(summary.renamed, [], 'the summary');
+            assert.deepStrictEqual([t.remote.ids.get('/one.tex'), t.remote.ids.get('/two.tex')], [ids.one, ids.two], 'each path keeps its document');
+            await t.sync.stop();
+        });
+
+        it('renames a binary file renamed and changed, then replaces its content', async () => {
+            const png = new Uint8Array(4096).map((_, i) => (i * 7 + (i >> 5)) & 0xff);
+            png.set([0x89, 0x50, 0x4e, 0x47]);
+            const changed = png.map((byte, i) => i >= 3000 && i < 3100 ? 0 : byte);
+            const t = await synced({ '/main.tex': chapter, '/slike/a.png': png });
+            move(t, 'slike/a.png', 'figures/a.png');
+            fs.writeFileSync(path.join(t.folder, 'figures/a.png'), changed);
+            assert.deepStrictEqual(gitShowsRenames(t.folder, t.first), [{ from: '/slike/a.png', to: '/figures/a.png' }], 'git pairs the paths');
+            const summary = await t.sync.flush(true);
+            assert.deepStrictEqual(t.remote.calls, ['rename /slike/a.png /figures/a.png', 'upload /figures/a.png'], 'what the sync asked of Overleaf: the rename, then the new content');
+            assert.deepStrictEqual([summary.renamed, summary.uploaded], [[{ from: '/slike/a.png', to: '/figures/a.png' }], ['/figures/a.png']], 'the summary');
+            assert.deepStrictEqual([t.remote.files.get('/figures/a.png'), t.remote.files.has('/slike/a.png')], [changed, false], 'the files on Overleaf');
+            assert.deepStrictEqual([...t.remote.removedFolders], ['/slike'], 'the folders removed on Overleaf once empty');
+            t.update(ME);
+            await t.sync.recordNow();
+            assert.match(t.g('diff', '--name-status', '-M', t.first, OVERLEAF_REF), /^R0[5-9]\d\tslike\/a.png\tfigures\/a.png$/m, 'git\'s view of the recorded state');
+            await t.sync.stop();
+        });
+
+        it('moves a folder with an edit inside as the moves of its files, and removes the folder it left', async () => {
+            const two = lines(i => `The second chapter, paragraph ${i}.`);
+            const t = await synced({ '/chapters/one.tex': chapter, '/chapters/two.tex': two });
+            const ids = { one: t.remote.idOf('/chapters/one.tex'), two: t.remote.idOf('/chapters/two.tex') };
+            t.remote.comment('/chapters/one.tex', commented);
+            move(t, 'chapters', 'parts');
+            fs.writeFileSync(path.join(t.folder, 'parts/one.tex'), edited);
+            const summary = await t.sync.flush(true);
+            assert.deepStrictEqual([...t.remote.calls].sort(), ['rename /chapters/one.tex /parts/one.tex', 'rename /chapters/two.tex /parts/two.tex', 'writeDoc /parts/one.tex'], 'what the sync asked of Overleaf');
+            assert.deepStrictEqual(summary.failed, [], 'the failures');
+            assert.deepStrictEqual([t.remote.ids.get('/parts/one.tex'), t.remote.ids.get('/parts/two.tex')], [ids.one, ids.two], 'each document keeps its id');
+            assert.deepStrictEqual(t.remote.commentedText('/parts/one.tex'), [commented], 'the comment on the text that the edit left alone');
+            assert.deepStrictEqual([...t.remote.removedFolders], ['/chapters'], 'the folders removed on Overleaf once empty');
+            t.update(ME);
+            await t.sync.recordNow();
+            const diff = t.g('diff', '--name-status', '-M', t.first, OVERLEAF_REF);
+            assert.match(diff, /^R0[5-9]\d\tchapters\/one.tex\tparts\/one.tex$/m, 'git\'s view of the recorded state: one.tex');
+            assert.match(diff, /^R100\tchapters\/two.tex\tparts\/two.tex$/m, 'git\'s view of the recorded state: two.tex');
+            await t.sync.stop();
+        });
+
+        for (const [content, what, calls] of [[chapter, 'the same', ['rename /a.tex /b.tex']], [edited, 'edited', ['rename /a.tex /b.tex', 'writeDoc /b.tex']]] as const) {
+            it(`renames a document when the event of its old path comes first, the content ${what}`, async () => {
+                const t = await synced({ '/a.tex': chapter });
+                const id = t.remote.idOf('/a.tex');
+                move(t, 'a.tex', 'b.tex');
+                fs.writeFileSync(path.join(t.folder, 'b.tex'), content);
+                await t.sync.localChanged('/a.tex');
+                assert.deepStrictEqual(t.remote.calls, [], 'after the event of the old path: it waits for the new one');
+                await t.sync.localChanged('/b.tex');
+                assert.deepStrictEqual(t.remote.calls, calls, 'after the event of the new path');
+                assert.strictEqual(t.remote.ids.get('/b.tex'), id, 'the document at the new path is the one that was at the old path');
+                await t.sync.stop();
+            });
+        }
+
+        it('records a rename and an edit made on Overleaf as git shows a rename', async () => {
+            const t = await synced({ '/one.tex': chapter });
+            await t.remote.rename('/one.tex', '/two.tex');
+            t.remote.docs.set('/two.tex', edited);
+            t.update(ALICE);
+            await Promise.all([t.sync.remoteChanged('/one.tex', true), t.sync.remoteChanged('/two.tex', false)]);
+            assert.strictEqual(t.read('/two.tex'), edited, 'the local file at the new path');
+            assert.ok(!fs.existsSync(path.join(t.folder, 'one.tex')), 'the local file at the old path is gone');
+            await t.sync.recordNow();
+            assert.match(t.g('diff', '--name-status', '-M', t.first, 'HEAD'), /^R0[5-9]\d\tone.tex\ttwo.tex$/m, 'git\'s view of the recorded state');
+            assert.match(t.g('log', '--follow', '--format=%H', 'HEAD', '--', 'two.tex'), new RegExp(`^${t.first}$`, 'm'), 'git log --follow reaches the commit before the rename');
+            assert.strictEqual(t.g('status', '--porcelain'), '', 'git status after the record');
+            await t.sync.stop();
+        });
     });
 
     it('keeps files that the sync leaves out, and the files\' modes, in the commits of Overleaf\'s state', async () => {
