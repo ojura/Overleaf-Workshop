@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # A second Antigravity for tests: on a virtual display, with its own profile and extensions
-# folder, on a local replica of an Overleaf project that the user's own IDE does not keep a
-# replica of (normally the private copy). Tests then never touch the user's window, the user's
-# replica folder or the shared project.
+# folder, on a local replica of an Overleaf project that the user listed as a test project and
+# that the user's own IDE does not keep a replica of, or on a local folder.
 #
 #   scripts/hidden-ide.sh start [options]     start the virtual display and the IDE
 #   scripts/hidden-ide.sh stop                stop the IDE and the display, delete the login copy
@@ -23,7 +22,8 @@
 #                                             bounds but not the page's size)
 #
 # Options for start (give --project or --folder):
-#   --project ID        the Overleaf project of the replica; the instance opens its replica folder
+#   --project ID        the Overleaf project of the replica; the instance opens its replica folder.
+#                       It must be listed in the user's test projects (below)
 #   --folder DIR        without --project: open DIR, with no login copy and no replica, e.g. for
 #                       tests that only open local files
 #   --project-name N    its name, if the extension's saved login does not list the project
@@ -47,6 +47,11 @@
 # connecting), xvfb (the display's process), display (":N"), cdp, inspect, project and replica
 # (null in folder mode), folder (what the instance opened), profile and ide.
 #
+# The test projects: the user lists in ${XDG_CONFIG_HOME:-~/.config}/overleaf-workshop/test-projects,
+# once, the Overleaf projects made for tests, one project id per line ("#" starts a comment).
+# start refuses every other project, so that a mistyped or misremembered id cannot make an
+# instance sync, write to or delete files of a project that other people edit.
+#
 # The login: the IDE's own saved Overleaf login is copied into the instance's profile, with only
 # the chosen project in it, readable only by this user, and deleted again by "stop". Nothing in
 # this script prints it. Do not run this script under set -x.
@@ -56,6 +61,7 @@ home=$(realpath -m "${HIDDEN_IDE_HOME:-/tmp/hidden-ide-$(id -u)}")
 state="$home/instance.json"
 user_state=${HIDDEN_IDE_USER_STATE:-"$HOME/.config/Antigravity IDE/User/globalStorage/state.vscdb"}
 user_extensions=${HIDDEN_IDE_USER_EXTENSIONS:-"$HOME/.antigravity-ide/extensions"}
+test_projects="${XDG_CONFIG_HOME:-$HOME/.config}/overleaf-workshop/test-projects"
 
 die() { echo "hidden-ide: $*" >&2; exit 1; }
 field() { [ -f "$state" ] && python3 -I -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2]); print("" if v is None else v)' "$state" "$1"; }
@@ -83,6 +89,18 @@ display_holder() {
     else
         echo "no process runs it; /tmp/.X11-unix/X$1 or /tmp/.X$1-lock is left over from an X server that ended"
     fi
+}
+# Fail unless PROJECT is listed in the user's test projects, a file that belongs to the user and
+# that only the user can write.
+check_test_project() {
+    local info owner mode
+    [ -f "$test_projects" ] || die "refusing project $1: $test_projects does not exist; the user lists there, once, the Overleaf projects made for tests, one project id per line (\"#\" starts a comment)"
+    info=$(stat -c '%u %a' -- "$test_projects") || die "refusing project $1: could not read the owner and mode of $test_projects"
+    read -r owner mode <<< "$info"
+    [ "$owner" = "$(id -u)" ] && (( (8#$mode & 8#022) == 0 )) \
+        || die "refusing project $1: $test_projects must belong to this user, and only the user may write it"
+    awk -v id="$1" '{ sub(/#.*/, ""); for (i = 1; i <= NF; i++) if ($i == id) found = 1 } END { exit !found }' "$test_projects" \
+        || die "refusing project $1: it is not listed in $test_projects, the user's list of Overleaf projects made for tests"
 }
 # Fail unless the instance's own main process listens on PORT, so a command never reaches another instance.
 own_port() {
@@ -190,6 +208,7 @@ start() {
         [ -n "$project" ] || project=$(field project)
         [ -n "$project" ] || die "--project ID or --folder DIR is required"
         [[ "$project" =~ ^[0-9a-f]{24}$ ]] || die "not a project id: $project"
+        check_test_project "$project"
         folder="$home/replica"
     fi
     [[ "$display" =~ ^:([0-9]+)$ ]] || die "not a display: $display"
