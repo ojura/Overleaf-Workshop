@@ -288,7 +288,7 @@ const vscodeStandIn = strict('vscode', {
     }),
 });
 
-const { VirtualFileSystem, PdfDocument, PdfViewEditorProvider, CompileManager, LocalReplicaSCMProvider, EventBus, EDITOR_ID, BaseAPI, PLACEHOLDER, pdfjsReleaseOf } = loadWithVscode(vscodeStandIn, () => ({
+const { VirtualFileSystem, PdfDocument, PdfViewEditorProvider, CompileManager, LocalReplicaSCMProvider, EventBus, EDITOR_ID, BaseAPI, downloadDomainUrl, PLACEHOLDER, pdfjsReleaseOf } = loadWithVscode(vscodeStandIn, () => ({
     ...require('../utils/eventBus'),
     ...require('../core/remoteFileSystemProvider'),
     ...require('../core/pdfViewEditorProvider'),
@@ -564,6 +564,8 @@ describe('the build in use, from Overleaf to the window', function () {
             const load = await panel.first('load');
             assert.strictEqual(load.output.file.build, 'b-web');
             assert.strictEqual(load.output.file.editorId, WEB_EDITOR);
+            // the address that Overleaf's viewer uses: the compile server that made the build, as the answer names it
+            assert.strictEqual(load.output.url, downloadDomainUrl(overleaf.downloadDomain, '/project/p1/user/u1/build/b-web/output/output.pdf', 'clsi-vm-1', 'priority'));
             assert.strictEqual(load.output.clsiCacheShard, 'cache-1');
             assert.deepStrictEqual(overleaf.to('/project/p1/compile'), []);
             assert.ok(!panel.types.includes('update'));

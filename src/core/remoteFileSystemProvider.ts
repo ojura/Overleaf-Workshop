@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
 import * as DiffMatchPatch from 'diff-match-patch';
-import { BaseAPI, COMPILERS, CompileRequest, CompileResponseSchema, EDITOR_ID, MemberEntity, ProjectSettingsSchema } from '../api/base';
+import { BaseAPI, COMPILERS, CompileRequest, CompileResponseSchema, downloadDomainUrl, EDITOR_ID, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import type { CompileRecord } from '../compile/outputFiles';
 import { windowCompileSettings } from '../compile/compileSettings';
 import { cachedBuild, CompileSettings, CompileStart, isCompileStart, LatestAnswer, ownBuild, ProjectBuilds } from './projectBuilds';
@@ -1578,12 +1578,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         const response = build?.record.response;
         const file = response?.outputFiles?.find(f => f.path==='output.pdf');
         if (!build || !response || !file?.size || !response.pdfDownloadDomain) { return undefined; }
-        const query = new URLSearchParams();
-        if (response.compileGroup) { query.set('compileGroup', response.compileGroup); }
-        if (response.clsiServerId) { query.set('clsiserverid', response.clsiServerId); }
-        query.set('enable_pdf_caching', 'true');
         return {
-            url: `${response.pdfDownloadDomain}${file.url}?${query}`,
+            url: downloadDomainUrl(response.pdfDownloadDomain, file.url, response.clsiServerId, response.compileGroup),
             downloadDomain: response.pdfDownloadDomain,
             projectId: this.projectId,
             file: { ...file, editorId: build.editorId },

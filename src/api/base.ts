@@ -22,6 +22,20 @@ function getSetCookie(res: any): string[] {
     return [];
 }
 
+/**
+ * Output file `url` of a build on Overleaf's download domain `downloadDomain`, with the query that
+ * Overleaf's viewer sends there (features/pdf-preview/util/output-files.ts, handleOutputFiles): the
+ * compile group when the compile names one, the compile server that made the build, and
+ * enable_pdf_caching.
+ */
+export function downloadDomainUrl(downloadDomain: string, url: string, clsiServerId: string | undefined, compileGroup: string | undefined): string {
+    const query = new URLSearchParams();
+    if (compileGroup) { query.set('compileGroup', compileGroup); }
+    if (clsiServerId) { query.set('clsiserverid', clsiServerId); }
+    query.set('enable_pdf_caching', 'true');
+    return `${downloadDomain.replace(/\/+$/, '')}/${url.replace(/^\/+/, '')}?${query}`;
+}
+
 /** The compilers Overleaf offers. */
 export const COMPILERS: ReadonlyArray<{code:string, name:string}> = [
     {code: 'pdflatex', name: 'pdfLaTex'},
@@ -1029,12 +1043,7 @@ export class BaseAPI {
         // The CDN is cross-origin, so we must NOT send web frontend cookies.
         if (pdfDownloadDomain && clsiServerId) {
             try {
-                const query = new URLSearchParams();
-                if (compileGroup) { query.set('compileGroup', compileGroup); }
-                query.set('clsiserverid', clsiServerId);
-                query.set('enable_pdf_caching', 'true');
-                const cdnUrl = `${pdfDownloadDomain.replace(/\/+$/, '')}/${url.replace(/^\/+/g, '')}?${query}`;
-                const content = await this._downloadAbsolute(cdnUrl, false);
+                const content = await this._downloadAbsolute(downloadDomainUrl(pdfDownloadDomain, url, clsiServerId, compileGroup), false);
                 return { type: 'success', content: new Uint8Array(content) };
             } catch (error) {
                 // The download domain does not serve every output file: it answered HTTP 503

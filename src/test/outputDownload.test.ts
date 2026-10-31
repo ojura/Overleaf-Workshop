@@ -1,7 +1,7 @@
 import * as assert from 'assert';
 import * as http from 'http';
 import { AddressInfo } from 'net';
-import { BaseAPI } from '../api/base';
+import { BaseAPI, downloadDomainUrl } from '../api/base';
 
 /** A server that plays both the download domain (paths below /cdn) and the web frontend. */
 async function serve(answer: (req: http.IncomingMessage) => { status: number, body?: string }) {
@@ -61,5 +61,19 @@ describe('BaseAPI.getFileFromClsi', () => {
             assert.strictEqual(res.type, 'success');
             assert.deepStrictEqual(server.requests.map(r => r.url), [url]);
         } finally { server.close(); }
+    });
+});
+
+describe('downloadDomainUrl', () => {
+    it('joins the download domain and the file with one slash, and adds the query of Overleaf\'s viewer', () => {
+        const file = '/project/p1/user/u1/build/b1/output/output.pdf';
+        const expected = 'https://dl/zone/b/project/p1/user/u1/build/b1/output/output.pdf?compileGroup=priority&clsiserverid=clsi-1&enable_pdf_caching=true';
+        assert.strictEqual(downloadDomainUrl('https://dl/zone/b', file, 'clsi-1', 'priority'), expected);
+        assert.strictEqual(downloadDomainUrl('https://dl/zone/b/', file, 'clsi-1', 'priority'), expected);
+        assert.strictEqual(downloadDomainUrl('https://dl/zone/b', file.slice(1), 'clsi-1', 'priority'), expected);
+    });
+
+    it('leaves out the compile group and the compile server that the compile does not name', () => {
+        assert.strictEqual(downloadDomainUrl('https://dl', '/f', undefined, undefined), 'https://dl/f?enable_pdf_caching=true');
     });
 });
