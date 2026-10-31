@@ -214,25 +214,37 @@ export async function downloadInRanges(url: string, file: string, size: number, 
     if (signal?.aborted) { stop.abort(); }
     const out = await fs.promises.open(tmp, 'w');
     let received = 0;
+    /** The bytes `start` to `end` from the server; throws a DownloadError for an answer other than 206. */
+    const fetchBytes = async (start: number, end: number): Promise<Uint8Array> => {
+        const res = await fetch(url, { signal: stop.signal, dispatcher: PdfFetchBridge.dispatcher, headers: { range: `bytes=${start}-${end}` } });
+        if (res.status !== 206) {
+            await res.body?.cancel();
+            throw new DownloadError(`the download of ${path.basename(file)} failed: bytes ${start}-${end}: ${res.status} ${res.statusText}`, res.status);
+        }
+        const body = new Uint8Array(await res.arrayBuffer());
+        if (body.byteLength !== end - start + 1) {
+            throw new Error(`the download of ${path.basename(file)} failed: bytes ${start}-${end} came as ${body.byteLength} bytes`);
+        }
+        return body;
+    };
     const fetchRange = async (start: number) => {
         const end = Math.min(start + chunk, size) - 1;
         for (let attempt = 1; ; attempt++) {
+            let body: Uint8Array;
             try {
-                const res = await fetch(url, { signal: stop.signal, dispatcher: PdfFetchBridge.dispatcher, headers: { range: `bytes=${start}-${end}` } });
-                if (res.status !== 206) {
-                    throw new DownloadError(`the download of ${path.basename(file)} failed: bytes ${start}-${end}: ${res.status} ${res.statusText}`, res.status);
-                }
-                const body = new Uint8Array(await res.arrayBuffer());
-                if (body.byteLength !== end - start + 1) {
-                    throw new Error(`the download of ${path.basename(file)} failed: bytes ${start}-${end} came as ${body.byteLength} bytes`);
-                }
-                await out.write(body, 0, body.byteLength, start);
-                received += body.byteLength;
-                onProgress?.(received);
-                return;
+                body = await fetchBytes(start, end);
             } catch (error) {
-                if (stop.signal.aborted || attempt >= attempts) { throw error; }
+                // A network error, a range that came cut off and a 5xx answer can pass; any other
+                // answer, such as 404 for a build that is gone, comes again the same way.
+                const passing = !(error instanceof DownloadError) || error.status >= 500;
+                if (stop.signal.aborted || attempt >= attempts || !passing) { throw error; }
+                continue;
             }
+            // a failure to write the file is not the server's, and is not asked again
+            await out.write(body, 0, body.byteLength, start);
+            received += body.byteLength;
+            onProgress?.(received);
+            return;
         }
     };
     try {
