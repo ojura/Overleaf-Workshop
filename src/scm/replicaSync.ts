@@ -240,7 +240,7 @@ export function syncProblems(summary: SyncSummary): string[] {
     return [
         ...summary.failed.map(f => `${f.path}: ${f.error}`),
         ...summary.conflicts.map(path => `${path}: conflict markers to resolve`),
-        ...summary.deletionsToConfirm.map(({where, paths}) => deletionsNeedConfirmation(where, paths.length)),
+        ...summary.deletionsToConfirm.map(({where, paths}) => `${deletionsNeedConfirmation(where, paths.length)}: ${paths.join(', ')}`),
         ...(summary.skippedDeletions.length ? [`${summary.skippedDeletions.length} deletions were not confirmed in the IDE window`] : []),
     ];
 }
@@ -337,6 +337,10 @@ export class ReplicaSync {
     private declined = {local: new Set<string>(), remote: new Set<string>()};
     /** one deletion step at a time, so that the deletions of one moment get one question */
     private deleting: Promise<unknown> = Promise.resolve();
+    /** the deletions that a question open in the window asks about (decideDeletions); undefined while the window does not ask */
+    private question?: {where: 'local' | 'remote', paths: string[]};
+    /** who waits for a question to open (`questionOpened`) */
+    private readonly questionListeners = new Set<() => void>();
     private readonly merge: MergeText;
     /** whether local changes are uploaded; without, they wait for a push through the git bridge */
     private readonly uploads: boolean;
@@ -358,6 +362,27 @@ export class ReplicaSync {
     /** Read the saved state; rejects when it cannot be used, and then the sync does not start. */
     open(): Promise<void> {
         return this.load();
+    }
+
+    /** The deletions that a question open in the window asks about now; undefined while the window does not ask. */
+    get openQuestion(): {where: 'local' | 'remote', paths: string[]} | undefined {
+        return this.question && {where: this.question.where, paths: [...this.question.paths]};
+    }
+
+    /**
+     * Resolves once a question about deletions is open in the window, at once while one is: a
+     * tool that must not wait behind the question waits for this or for what it needs, whichever
+     * comes first. `dispose` ends the wait.
+     */
+    questionOpened(): {opened: Promise<void>, dispose(): void} {
+        let listener!: () => void;
+        const opened = new Promise<void>(resolve => { listener = resolve; });
+        if (this.question) {
+            listener();
+            return {opened, dispose: () => {}};
+        }
+        this.questionListeners.add(listener);
+        return {opened, dispose: () => { this.questionListeners.delete(listener); }};
     }
 
     private load(): Promise<void> {
@@ -578,6 +603,11 @@ export class ReplicaSync {
             await this.applyDeletions(mode);
             this.ui.liveResult(mode.summary);
         }
+        // a tool learns about a question open in the window, whatever its own step collected
+        const question = by==='tool' ? this.openQuestion : undefined;
+        if (question && !summary.deletionsToConfirm.some(({where}) => where===question.where)) {
+            summary.deletionsToConfirm.push(question);
+        }
         await Promise.all([...this.slots.values()].map(slot => slot.tail));
         await this.remote.settled();
         if (record) {
@@ -682,8 +712,10 @@ export class ReplicaSync {
      * the one the sync started with.
      */
     private applyDeletions(mode: Mode): Promise<void> {
-        // a tool's request never asks, so it does not wait for a question open in the window
-        if (mode.tool) { return this.decideDeletions(mode); }
+        const collected = mode.collected!;
+        // only a window step with deletions can ask, so only such a step waits behind a question
+        // open in the window; a tool's request never asks
+        if (mode.tool || (collected.local.length===0 && collected.remote.length===0)) { return this.decideDeletions(mode); }
         const run = this.deleting.then(() => this.decideDeletions(mode));
         this.deleting = run.catch(() => {});
         return run;
@@ -718,7 +750,14 @@ export class ReplicaSync {
                         requested[where].forEach(path => open.delete(path));
                         continue;
                     }
-                    const confirmed = await this.ui.confirmDeletions(where, counted);
+                    this.question = {where, paths: counted};
+                    this.questionListeners.forEach(listener => listener());
+                    let confirmed: boolean;
+                    try {
+                        confirmed = await this.ui.confirmDeletions(where, counted);
+                    } finally {
+                        this.question = undefined;
+                    }
                     if (this.stopped) { return; }
                     if (!confirmed) {
                         counted.forEach(path => declined.add(path));

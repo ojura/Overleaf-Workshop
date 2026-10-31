@@ -671,8 +671,25 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             throw new Error(vscode.l10n.t('This local replica has not started.'));
         }
         await this.ready;
+        if (by==='tool' && await this.questionComesFirst()) {
+            // the answer names the question at once (flush adds it for a tool) instead of waiting for the user
+            return await this.sync.flush(false, {by});
+        }
         await this.fullSync;
         return await this.sync.flush(true, {record: true, by});
+    }
+
+    /**
+     * For a tool: whether a question about deletions is open in the window, or opens before the
+     * full sync under way is done, e.g. the full sync's own question. A tool waits for neither.
+     */
+    private async questionComesFirst(): Promise<boolean> {
+        const question = this.sync!.questionOpened();
+        try {
+            return await Promise.race([question.opened.then(() => true), (this.fullSync ?? Promise.resolve()).then(() => false)]);
+        } finally {
+            question.dispose();
+        }
     }
 
     /** The command "Sync Local Replica Now", for every open replica. */
@@ -772,6 +789,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             watcher: this.watchedBy,
             modes: this.modes,
             fullSyncRunning: this.fullSyncRunning,
+            question: this.sync?.openQuestion,
         };
         if (request.op==='status') {
             return {ok: true, ...state, git: await this.gitState(), recent: [...this.recent]};
@@ -799,6 +817,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return {ok: false, error: vscode.l10n.t('This local replica has not started.')};
         }
         await this.ready;
+        if (await this.questionComesFirst()) {
+            const waiting = await sync.flush(false, {by: 'tool'});
+            return {ok: false, error: `the replica is not in sync: ${syncProblems(waiting).join('; ')}`, summary: waiting};
+        }
         await this.fullSync;
         const git = store.git;
         const before = await sync.flush(true, {record: true, by: 'tool'});

@@ -13,17 +13,6 @@ const read = (file: string) => fs.readFileSync(file, 'utf8');
 /** The files of Overleaf's last recorded state, by git path. */
 const recorded = (folder: string) => git(folder, 'ls-tree', '-r', '--name-only', OVERLEAF_REF).split('\n').filter(Boolean);
 
-/** Resolves once `file` exists: the replica's control server writes it after it listens. */
-function fileAppears(file: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-        const watcher = fs.watch(path.dirname(file), () => {
-            if (fs.existsSync(file)) { watcher.close(); resolve(); }
-        });
-        watcher.on('error', error => { watcher.close(); reject(error); });
-        if (fs.existsSync(file)) { watcher.close(); resolve(); }
-    });
-}
-
 /** A replica's deletions, the folders it calls its own, and its saved state. */
 describe('local replica: what it deletes and what it never syncs', function () {
     this.timeout(20000);
@@ -47,6 +36,36 @@ describe('local replica: what it deletes and what it never syncs', function () {
         const saved = process.env[key];
         process.env[key] = value;
         undo.push(() => { if (saved === undefined) { delete process.env[key]; } else { process.env[key] = saved; } });
+    }
+    /**
+     * Resolves once `holds()` is true: at once, or at the change in the folder `dir` that makes
+     * it so. Its watcher closes then, or at the end of the test.
+     */
+    function folderShows(dir: string, holds: () => boolean): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const watcher = fs.watch(dir);
+            undo.push(() => watcher.close());
+            const check = () => { if (holds()) { watcher.close(); resolve(); } };
+            watcher.on('change', check);
+            watcher.on('error', error => { watcher.close(); reject(error); });
+            check();
+        });
+    }
+    /** Resolves once `file` exists: the replica's control server writes it after it listens. */
+    const fileAppears = (file: string) => folderShows(path.dirname(file), () => fs.existsSync(file));
+    /**
+     * A commit of the folder as an agent makes it with `git add -A` and `git commit` on top of
+     * HEAD, in an index of its own, so that the replica's index and HEAD stay as they are.
+     */
+    function commitAll(folder: string, message: string): string {
+        const env = {
+            ...process.env, GIT_INDEX_FILE: path.join(tempDir('ow-safety-index-'), 'index'),
+            GIT_AUTHOR_NAME: 'An Agent', GIT_AUTHOR_EMAIL: 'agent@example.com', GIT_COMMITTER_NAME: 'An Agent', GIT_COMMITTER_EMAIL: 'agent@example.com',
+        };
+        const run = (...args: string[]) => execFileSync('git', ['-C', folder, ...args], { encoding: 'utf8', env }).trim();
+        run('read-tree', 'HEAD');
+        run('add', '-A');
+        return run('commit-tree', run('write-tree'), '-p', 'HEAD', '-m', message);
     }
 
     /** One extension host with its own socket folder and trash, and the replica's folder. */
@@ -203,6 +222,75 @@ describe('local replica: what it deletes and what it never syncs', function () {
                 assert.deepStrictEqual([...question].sort(), ['/chapter0.tex', '/chapter1.tex', '/chapter2.tex', '/chapter3.tex', '/chapter4.tex', '/chapter5.tex']);
             }
             assert.strictEqual(t.w.remote.size, 8, 'every file stays on Overleaf');
+        });
+    });
+
+    describe('a question about deletions that waits for an answer in the window', () => {
+        /**
+         * Nine synced files; a collaborator deletes six on Overleaf, and the window asks whether
+         * to delete them locally too. The user answers with `answer`, or never. `noticeShown`
+         * resolves at the first notice that the window shows after the answer.
+         */
+        async function questionOpen() {
+            const t = host();
+            const chapters = Array.from({ length: 8 }, (_, i) => `/chapter${i}.tex`);
+            project(t, { ...Object.fromEntries(chapters.map(p => [p, `${p}\n`])), '/main.tex': 'main\n' });
+            let shown!: () => void;
+            const questionShown = new Promise<void>(resolve => { shown = resolve; });
+            let respond!: (confirm: boolean) => void;
+            let answered = false;
+            let noticed!: () => void;
+            const noticeShown = new Promise<void>(resolve => { noticed = resolve; });
+            t.mock.window.showWarningMessage = (_message: string, options?: any, ...actions: string[]) => {
+                if (options?.modal) {
+                    shown();
+                    return new Promise(resolve => {
+                        respond = confirm => { answered = true; resolve(confirm ? actions[0] : undefined); };
+                    });
+                }
+                if (answered) { noticed(); }
+                return Promise.resolve(undefined);
+            };
+            const started = await start(t);
+            await fileAppears(path.join(t.folder, POINTER_FILE));
+            const deleted = chapters.slice(0, 6);
+            deleted.forEach(p => t.remoteDelete(p));
+            await questionShown;
+            return { ...started, t, deleted, answer: (confirm: boolean) => respond(confirm), noticeShown };
+        }
+
+        it('is named to a tool at once, and shows in the status', async () => {
+            const { t, deleted, requestReplica } = await questionOpen();
+            const answer: any = await requestReplica(t.folder, { op: 'sync' }, 10000);
+            assert.strictEqual(answer.ok, false, JSON.stringify(answer));
+            for (const p of deleted) { assert.ok(answer.error.includes(p), answer.error); }
+            const status: any = await requestReplica(t.folder, { op: 'status' }, 10000);
+            assert.deepStrictEqual([...(status.question?.paths ?? [])].sort(), deleted);
+        });
+
+        it('keeps the files tracked in git, so that a commit of the folder made meanwhile does not upload them after the user confirms', async () => {
+            const { t, deleted, scm, requestReplica, answer } = await questionOpen();
+            await scm.sync.recordNow();
+            assert.strictEqual(git(t.folder, 'status', '--porcelain'), '', 'git status is clean while the deletion waits');
+            const commit = commitAll(t.folder, 'an agent\'s commit of the folder');
+            assert.strictEqual(git(t.folder, 'diff', '--name-status', 'HEAD', commit), '', 'the commit adds nothing');
+            answer(true);
+            const files = deleted.map(p => path.join(t.folder, p.slice(1)));
+            await folderShows(t.folder, () => files.every(file => !fs.existsSync(file)));
+            await requestReplica(t.folder, { op: 'sync' }, 10000);
+            await requestReplica(t.folder, { op: 'land', commit }, 10000);
+            assert.deepStrictEqual([...t.w.remote.keys()].sort(), ['/chapter6.tex', '/chapter7.tex', '/main.tex'], 'the collaborator\'s deletion stands on Overleaf');
+            assert.deepStrictEqual(files.filter(file => fs.existsSync(file)), [], 'and in the folder');
+        });
+
+        it('keeps the files tracked in git after the user declines their deletion', async () => {
+            const { t, deleted, scm, answer, noticeShown } = await questionOpen();
+            answer(false);
+            await noticeShown;
+            await scm.sync.recordNow();
+            assert.strictEqual(git(t.folder, 'status', '--porcelain'), '', 'git status is clean');
+            assert.strictEqual(git(t.folder, 'diff', '--name-status', 'HEAD', commitAll(t.folder, 'an agent\'s commit of the folder')), '', 'a commit of the folder adds nothing');
+            assert.ok(deleted.every(p => fs.existsSync(path.join(t.folder, p.slice(1)))), 'the local files stay');
         });
     });
 

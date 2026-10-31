@@ -11,7 +11,7 @@ import { SandboxSafetyError } from './guard';
 import { LockTimeoutError } from './lock';
 import { describeFindings, describeRanges, exitStatusOf, pushCheck, RANGES_HELP } from './rangesCli';
 import { ControlAnswer, NoReplicaWindowError, ReplicaTimeoutError, requestReplica } from '../scm/replicaControl';
-import { describe, ReplicaSync, SyncSummary } from '../scm/replicaSync';
+import { deletionsNeedConfirmation, describe, ReplicaSync, SyncSummary } from '../scm/replicaSync';
 import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath } from '../scm/ignorePatterns';
 import { Repo } from '../gitbridge/plumbing';
 import { minimatch } from 'minimatch';
@@ -399,6 +399,7 @@ async function replicaCommand(command: 'replica-sync' | 'replica-status', folder
     } else {
         const a = answer as any;
         const lines = [`${a.folder ?? folder}: ${a.connected ? 'connected to' : 'not connected to'} ${a.project?.server ?? 'Overleaf'} ("${a.project?.name ?? '?'}"), changes reported by ${a.watcher === 'node' ? "Node's watcher" : "the IDE's file events"}${a.modes ? `, fetch mode ${a.modes.fetch}, push mode ${a.modes.push}` : ''}${a.fullSyncRunning ? ', a full sync is running' : ''}`];
+        if (a.question) { lines.push(`a question in the IDE window waits for an answer: ${deletionsNeedConfirmation(a.question.where, a.question.paths.length)}: ${a.question.paths.join(', ')}`); }
         if (a.git) {
             const g = a.git as { head?: string, overleaf?: string, branch?: string, unmerged?: string[] };
             lines.push(`git: ${g.branch ?? 'detached HEAD'} at ${g.head?.slice(0, 7) ?? 'no commit'}, Overleaf's state (refs/remotes/overleaf/main) ${g.overleaf?.slice(0, 7) ?? 'not recorded yet'}${g.head && g.head === g.overleaf ? ', the same' : ''}${g.unmerged?.length ? `; conflicts to resolve in ${g.unmerged.join(', ')}` : ''}`);

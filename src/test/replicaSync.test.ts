@@ -130,12 +130,16 @@ class FakeStore implements ReplicaStore {
 class FakeUI implements ReplicaUI {
     logs: string[] = [];
     confirm = true;
+    /** while set, the answer to a question, e.g. one that never comes */
+    answer?: Promise<boolean>;
+    /** told when a question is asked */
+    onAsk?: () => void;
     asked: string[][] = [];
     blocked: string[] = [];
     live: SyncSummary[] = [];
     log(message: string) { this.logs.push(message); }
     progress() {}
-    async confirmDeletions(_where: 'local' | 'remote', paths: string[]) { this.asked.push(paths); return this.confirm; }
+    async confirmDeletions(_where: 'local' | 'remote', paths: string[]) { this.asked.push(paths); this.onAsk?.(); return this.answer ?? this.confirm; }
     conflictBlocked(path: string) { this.blocked.push(path); }
     liveResult(summary: SyncSummary) { this.live.push(summary); }
 }
@@ -354,6 +358,26 @@ describe('ReplicaSync', () => {
         } finally {
             ReplicaSync.localDeleteDelayMs = saved;
         }
+    });
+
+    it('finishes the steps without deletions while a question about others waits for an answer', async () => {
+        const t = setup();
+        for (let i = 0; i < 6; i++) { t.remote.files.set(`/fig/f${i}.png`, new Uint8Array([i])); }
+        t.remote.docs.set('/main.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        // a collaborator deletes the six figures; the question about them is never answered
+        for (let i = 0; i < 6; i++) { t.remote.files.delete(`/fig/f${i}.png`); }
+        t.ui.answer = new Promise(() => { /* the user is away */ });
+        const asked = new Promise<void>(resolve => { t.ui.onAsk = resolve; });
+        void sync.remoteChanged('/fig', true);
+        await asked;
+        // a local edit meanwhile is uploaded and reported
+        t.local.set('/main.tex', text + 'line 6\n');
+        await sync.localChanged('/main.tex');
+        assert.strictEqual(t.remote.docs.get('/main.tex'), text + 'line 6\n');
+        assert.deepStrictEqual(t.ui.live.at(-1)!.uploaded, ['/main.tex']);
+        assert.strictEqual(t.ui.asked.length, 1);
     });
 
     it('asks before deleting the many local files of a folder deleted on Overleaf', async () => {
