@@ -5,7 +5,9 @@ import { PdfDocument } from '../core/pdfViewEditorProvider';
 import { LatexParser, ErrorSchema } from './compileLogParser';
 import { EventBus } from '../utils/eventBus';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
-import { REPLICA_OUTPUT_FOLDER, saveCompileOutputs } from './outputFiles';
+import { CompileRecord, REPLICA_OUTPUT_FOLDER, saveCompileOutputs } from './outputFiles';
+import { windowCompileSettings } from './compileSettings';
+import type { CompileOutcome, CompileStart } from '../core/projectBuilds';
 
 // map string level to severity
 const severityMap: Record<string, vscode.DiagnosticSeverity> = {
@@ -16,6 +18,15 @@ const severityMap: Record<string, vscode.DiagnosticSeverity> = {
 
 // Match the document class in the tex file
 const documentClassRegex = new RegExp(/\\documentclass(?:\[[^\[\]\{\}]*\])?\{([^\[\]\{\}]+)\}/);
+
+/** Why compile `record` made no build, as the viewers' banner says it. */
+function failureOf(record: CompileRecord | undefined): string {
+    const status = record?.response?.status;
+    if (status === undefined) {
+        return `the compile request failed: ${record?.message}`;
+    }
+    return status === 'success' ? 'the compile made no output.pdf' : `Overleaf's status is "${status}"`;
+}
 
 const pdfViewRecord: {
     [key: string]: {
@@ -118,12 +129,18 @@ export class CompileManager {
     /** how long a compile waits for a local replica to upload its changes */
     static uploadWaitMs = 60 * 1000;
     readonly status: vscode.StatusBarItem;
+    /** a compile runs: from the request (compile) to its end (run) */
     public inCompiling: boolean = false;
     private diagnosticProvider: CompileDiagnosticProvider;
-    private compileAsDraft: boolean = false;
-    private compileStopOnFirstError: boolean = false;
     /** the saves of local replica logs, one after another */
     private outputSaves: Promise<void> = Promise.resolve();
+    /**
+     * the handling of the last build from Overleaf's cache: the Problems view, the status and the
+     * replica's logs (showCachedBuild); it settles when they are done
+     */
+    cachedBuildShown: Promise<void> = Promise.resolve();
+    /** the event listeners of the constructor, which `triggers` hands on for disposal */
+    private readonly listeners: vscode.Disposable[] = [];
 
     constructor(
         private vfsm: RemoteFileSystemProvider,
@@ -132,8 +149,16 @@ export class CompileManager {
         this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -1);
         this.status.command = `${ROOT_NAME}.compilerManager.settings`;
         this.diagnosticProvider = new CompileDiagnosticProvider(vfsm);
+        // another client's compile became the build in use (the web editor, another window, a
+        // command-line tool): the Problems view, the status and the replica's copy of the logs
+        // show it, as they show this window's compiles at their end (run)
+        this.listeners.push(EventBus.on('buildChangedEvent', ({uri, fromCache}) => {
+            if (fromCache) {
+                this.cachedBuildShown = this.showCachedBuild(uri);
+            }
+        }));
         // listen pdf open event
-        EventBus.on('pdfWillOpenEvent', ({uri, doc, webviewPanel}) => {
+        this.listeners.push(EventBus.on('pdfWillOpenEvent', ({uri, doc, webviewPanel}) => {
             const {identifier,pathParts} = parseUri(uri);
             const filePath = pathParts.join('/');
             if (pdfViewRecord[identifier]) {
@@ -141,7 +166,7 @@ export class CompileManager {
             } else {
                 pdfViewRecord[identifier] = {[filePath]:{doc, webviewPanel}};
             }
-        });
+        }));
     }
 
     static async check(uri?: vscode.Uri) {
@@ -160,10 +185,10 @@ export class CompileManager {
         return undefined;
     }
 
-    async update(status: 'idle'|'success'|'compiling'|'failed'|'alert') {
-        const uri = await CompileManager.check();
+    /** Show `status` for the project of `target`, else of the active editor or the workspace (check). */
+    async update(status: 'idle'|'success'|'compiling'|'failed'|'alert', target?: vscode.Uri) {
+        const uri = await CompileManager.check(target);
         if (uri) {
-            this.inCompiling = status === 'compiling';
             this.vfsm.prefetch(uri).then((vfs) => {
                 const rootDocName = vfs.getRootDocName().slice(1);
                 const compilerName = vfs.getCompiler()?.name || '';
@@ -197,70 +222,106 @@ export class CompileManager {
                 }
                 this.status.tooltip.appendMarkdown(`\n\n*${vscode.l10n.t('Click to manage compile settings.')}*`);
                 this.status.show();
-            });
+            }).catch((error) => console.error(`${ELEGANT_NAME}: showing the compile status failed:`, error));
         } else {
             this.status.hide();
         }
         return uri;
     }
 
-    async compile(force:boolean=false, fromScratch:boolean=false) {
-        if (this.inCompiling) { return; }
-        await vscode.workspace.saveAll(); // save all dirty files
+    /**
+     * Compile the project of `target`, else of the active editor or the workspace (check).
+     * Returns 'busy' while another compile of this window runs, 'unavailable' when there is no
+     * project to compile, and 'started' when the compile started; its end fires
+     * compileEndedEvent, however it ends.
+     */
+    async compile(force:boolean=false, fromScratch:boolean=false, target?: vscode.Uri): Promise<CompileStart> {
+        if (this.inCompiling) { return 'busy'; }
+        // taken before the first wait, so that a request meanwhile finds the window busy
+        this.inCompiling = true;
+        let started = false;
+        try {
+            await vscode.workspace.saveAll(); // save all dirty files
+            const uri = await this.update('compiling', target);
+            if (!uri) { return 'unavailable'; }
+            started = true;
+            void this.run(uri, force, fromScratch);
+            return 'started';
+        } finally {
+            if (!started) { this.inCompiling = false; }
+        }
+    }
 
-        const uri = await this.update('compiling');
-        if (uri) {
-            this.vfsm.prefetch(uri)
-                .then(async (vfs) => {
-                    await this.waitForLocalReplica(vfs);
-                    // Compile the open document as the main document when it has a
-                    // \documentclass. For a local replica `uri` is the project folder.
-                    const {fileType, fileId} = await vfs._resolveUri(uri);
-                    let rootDocId: string | undefined = undefined;
-                    if (fileType==='doc') {
-                        const content = new TextDecoder().decode( await vfs.openFile(uri) );
-                        rootDocId = RegExp(documentClassRegex).exec(content) ? fileId : undefined;
-                    }
-                    const res = await vfs.compile(force, this.compileAsDraft, this.compileStopOnFirstError, rootDocId, fromScratch);
-                    if (res!==undefined) {
-                        // not awaited: the PDF and the diagnostics do not wait for the local copies of the logs
-                        this.saveLocalReplicaOutputs(vfs);
-                    }
-                    return res;
-                })
-                .then(async (res) => {
-                    switch (res) {
-                        case undefined:
-                            await this.update('success');
-                            break;
-                        case false:
-                            await this.update('failed');
-                            break;
-                        case true:
-                            return true;
-                        default:
-                            await this.update('alert');
-                            break;
-                    }
-                })
-                .then(status =>
-                    status ?
-                        vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compileErrorCheck`, uri)
-                        : Promise.reject()
-                )
-                .then(async (hasError) => {
-                    if (hasError) {
-                        await this.update('failed');
-                    } else {
-                        await this.update('success');
-                    }
-                    // refresh pdf
-                    const { identifier } = parseUri(uri);
-                    pdfViewRecord[identifier] && Object.values(pdfViewRecord[identifier]).forEach(
-                        (record) => record.doc.refresh()
-                    );
-                });
+    /** The compile of the project at `uri` that `compile` started, up to its diagnostics. */
+    private async run(uri: vscode.Uri, force: boolean, fromScratch: boolean) {
+        let outcome: CompileOutcome = { result: 'failure', detail: 'the compile did not start' };
+        try {
+            const vfs = await this.vfsm.prefetch(uri);
+            await this.waitForLocalReplica(vfs);
+            // Compile the open document as the main document when it has a
+            // \documentclass. For a local replica `uri` is the project folder.
+            const {fileType, fileId} = await vfs._resolveUri(uri);
+            let rootDocId: string | undefined = undefined;
+            if (fileType==='doc') {
+                const content = new TextDecoder().decode( await vfs.openFile(uri) );
+                rootDocId = RegExp(documentClassRegex).exec(content) ? fileId : undefined;
+            }
+            const res = await vfs.compile(force, windowCompileSettings.draft, windowCompileSettings.stopOnFirstError, rootDocId, fromScratch);
+            if (res===undefined) {
+                // nothing changed since the last compile
+                outcome = { result: 'skipped' };
+                await this.update('success', uri);
+                return;
+            }
+            // not awaited: the PDF and the diagnostics do not wait for the local copies of the logs
+            this.saveLocalReplicaOutputs(vfs);
+            if (res===false) {
+                outcome = { result: 'failure', detail: failureOf(vfs.lastCompile) };
+                await this.update('failed', uri);
+                return;
+            }
+            // the build is in use already (VirtualFileSystem.compile): the viewers load it
+            outcome = { result: 'success' };
+            const hasError = await this.problemsOf(uri);
+            await this.update(hasError ? 'failed' : 'success', uri);
+        } catch (error) {
+            outcome = { result: 'failure', detail: String((error as Error)?.message ?? error) };
+            console.error(`${ELEGANT_NAME}: the compile failed:`, error);
+            await this.update('failed', uri).catch((statusError) => console.error(`${ELEGANT_NAME}: showing the compile's status failed:`, statusError));
+        } finally {
+            this.inCompiling = false;
+            EventBus.fire('compileEndedEvent', { uri, outcome });
+        }
+    }
 
+    /**
+     * Show the Problems of the build in use's output.log; whether it reports errors. When the log
+     * cannot be read, the user is told, and the Problems view stays as it was.
+     */
+    private async problemsOf(uri: vscode.Uri): Promise<boolean> {
+        try {
+            return await vscode.commands.executeCommand<boolean>(`${ROOT_NAME}.compileManager.compileErrorCheck`, uri);
+        } catch (error) {
+            vscode.window.showWarningMessage( vscode.l10n.t('The compile log could not be read, so the Problems view does not show its errors: {error}', {error: String((error as Error)?.message ?? error)}) );
+            return false;
+        }
+    }
+
+    /** Another client's compile became the build in use of the project at `uri`. */
+    private async showCachedBuild(uri: vscode.Uri) {
+        try {
+            const vfs = await this.vfsm.prefetch(uri);
+            const build = vfs.builds.build;
+            if (!build) { return; }
+            const saved = this.saveLocalReplicaOutputs(vfs, build.record);
+            const hasError = await this.problemsOf(uri);
+            // a compile of this window shows its own status when it ends
+            if (!this.inCompiling) {
+                await this.update(hasError ? 'failed' : 'success', uri);
+            }
+            await saved;
+        } catch (error) {
+            console.error(`${ELEGANT_NAME}: showing another client's compile failed:`, error);
         }
     }
 
@@ -286,11 +347,12 @@ export class CompileManager {
     /**
      * Keep the logs of a local replica's compile in the replica's .overleaf/output folder, so
      * that editors and tools can read Overleaf's log locally. The replica never syncs that
-     * folder. Saves run one after another, so the folder ends up with the last compile's logs.
+     * folder. Saves run one after another, so the folder ends up with the last one's logs:
+     * `compile` is this window's last compile, whatever its status, or another client's compile
+     * that became the build in use.
      */
-    private saveLocalReplicaOutputs(vfs: VirtualFileSystem) {
-        const compile = vfs.lastCompile;
-        if (compile===undefined) { return; }
+    private saveLocalReplicaOutputs(vfs: VirtualFileSystem, compile: CompileRecord | undefined = vfs.lastCompile): Promise<void> {
+        if (compile===undefined) { return this.outputSaves; }
         this.outputSaves = this.outputSaves.then(async () => {
             const setting = await LocalReplicaSCMProvider.readSettings();
             if (!setting?.uri || parseUri(vscode.Uri.parse(setting.uri)).projectId!==vfs.projectId) { return; }
@@ -301,6 +363,7 @@ export class CompileManager {
         }).catch(error => {
             console.error(`${ELEGANT_NAME}: could not save the compile's logs in ${REPLICA_OUTPUT_FOLDER}:`, error);
         });
+        return this.outputSaves;
     }
 
     /** Switch compiling on Overleaf and the PDF preview on or off for the workspace's local replica. */
@@ -527,8 +590,8 @@ export class CompileManager {
         const currentCompiler = vfs?.getCompiler();
         const currentRootDoc = vfs?.getRootDocName();
 
-        const currentDraftMode = this.compileAsDraft ? vscode.l10n.t('Draft Mode') : vscode.l10n.t('Normal Mode');
-        const currentStopOnError = this.compileStopOnFirstError ? vscode.l10n.t('Stop on first error') : vscode.l10n.t('Try to compile despite errors');
+        const currentDraftMode = windowCompileSettings.draft ? vscode.l10n.t('Draft Mode') : vscode.l10n.t('Normal Mode');
+        const currentStopOnError = windowCompileSettings.stopOnFirstError ? vscode.l10n.t('Stop on first error') : vscode.l10n.t('Try to compile despite errors');
         const settingItems = [
             {label: vscode.l10n.t('Compile Mode'), description: currentDraftMode},
             {label: vscode.l10n.t('Compile Error Handling'), description: currentStopOnError},
@@ -556,11 +619,11 @@ export class CompileManager {
                 this.compile(true, true);
                 break;
             case vscode.l10n.t('Compile Mode'):
-                this.compileAsDraft = !this.compileAsDraft;
+                windowCompileSettings.draft = !windowCompileSettings.draft;
                 this.compileSettings();
                 break;
             case vscode.l10n.t('Compile Error Handling'):
-                this.compileStopOnFirstError = !this.compileStopOnFirstError;
+                windowCompileSettings.stopOnFirstError = !windowCompileSettings.stopOnFirstError;
                 this.compileSettings();
                 break;
             default:
@@ -570,10 +633,12 @@ export class CompileManager {
 
     get triggers() {
         return [
+            ...this.listeners,
             // register status bar
             this.status,
             // register compile commands
-            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.compile`, () => this.compile(true)),
+            // a menu passes the editor's file, and a viewer of the build its project's output.pdf
+            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.compile`, (target?: vscode.Uri) => this.compile(true, false, target)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.recompileFromScratch`, () => this.compile(true, true)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.viewPdf`, () =>  this.openPdf()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncCode`, () => this.syncCode()),

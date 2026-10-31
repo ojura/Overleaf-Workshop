@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention -- mirrors the 'vscode' and class export names */
 import * as assert from 'assert';
-import Module = require('module');
+import { loadWithVscode } from './standIn';
 
 // The modules under test import 'vscode', which only exists inside the extension host.
 // Serve a minimal stand-in so the save path can be driven from plain Node.
@@ -24,14 +24,10 @@ const vscodeMock = withStubs({
     FileChangeType: { Changed: 1, Created: 2, Deleted: 3 },
     workspace: withStubs({ textDocuments: [] }),
 });
-const moduleAny = Module as any;
-const originalLoad = moduleAny._load;
-moduleAny._load = function (request: string, ...rest: any[]) {
-    return request === 'vscode' ? vscodeMock : originalLoad.call(this, request, ...rest);
-};
-const { VirtualFileSystem } = require('../core/remoteFileSystemProvider');
-const { SocketIOAPI } = require('../api/socketio');
-moduleAny._load = originalLoad;
+const { VirtualFileSystem, SocketIOAPI } = loadWithVscode(vscodeMock, () => ({
+    VirtualFileSystem: require('../core/remoteFileSystemProvider').VirtualFileSystem,
+    SocketIOAPI: require('../api/socketio').SocketIOAPI,
+}));
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const settle = async () => { for (let i = 0; i < 20; i++) { await tick(); } };

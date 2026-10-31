@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import {EventEmitter} from 'events';
 import { PdfDocument } from '../core/pdfViewEditorProvider';
+import type { BuildStatus, CompileOutcome } from '../core/projectBuilds';
 import { StatusInfo } from '../scm';
 
 export type Events = {
@@ -11,6 +12,15 @@ export type Events = {
     'rootDocUpdateEvent': {rootDocId:string},
     'scmStatusChangeEvent': {status:StatusInfo},
     'socketioConnectedEvent': {publicId:string},
+    /**
+     * the build in use of the project at `uri` changed (VirtualFileSystem.builds): to this
+     * window's compile, or to another client's from Overleaf's cache when `fromCache`
+     */
+    'buildChangedEvent': {uri: vscode.Uri, fromCache: boolean},
+    /** what the viewers of the build of the project at `uri` show changed (ProjectBuilds.status) */
+    'buildStatusEvent': {uri: vscode.Uri, status: BuildStatus},
+    /** a compile of the project at `uri` ended (CompileManager.compile) */
+    'compileEndedEvent': {uri: vscode.Uri, outcome: CompileOutcome},
 };
 
 export class EventBus {

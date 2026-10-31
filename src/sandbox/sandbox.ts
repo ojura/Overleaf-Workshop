@@ -500,7 +500,7 @@ export async function runCompile(client: OverleafClient, replica: Replica, userI
             const folder = upload.path.slice(0, upload.path.lastIndexOf('/')) || '/';
             const name = upload.path.slice(upload.path.lastIndexOf('/') + 1);
             const entity = await guarded.upload(folderIds.get(folder)!, name, content);
-            return { path: upload.path, type: entity.type, hash: gitBlobHash(content), bytes: content.byteLength };
+            return { path: upload.path, type: entity.type, id: entity.id, hash: gitBlobHash(content), bytes: content.byteLength };
         }));
         await time('delete', () => mapLimit(plan.deletions, 4, (deletion) => guarded.remove(deletion.kind, deletion.id, deletion.path)));
         if (Object.keys(settings).length > 0) {
@@ -510,7 +510,11 @@ export async function runCompile(client: OverleafClient, replica: Replica, userI
             await time('clearOutput', () => guarded.clearOutput());
         }
 
-        // ---- compile
+        // ---- compile, naming the main document by its ID in the copy: an upload replaces a
+        // document with a new one, and Overleaf compiles the document the ID names (BaseAPI.compile)
+        const mainUpload = uploaded.find(u => u.path === `/${main}`);
+        const mainEntry = mainUpload ? { kind: mainUpload.type, id: mainUpload.id } : copyTree.files.get(`/${main}`);
+        const rootDocId = mainEntry?.kind === 'doc' ? mainEntry.id : undefined;
         let result: CompileResult | undefined;
         let attempts = 0;
         const compileStarted = Date.now();
@@ -519,7 +523,7 @@ export async function runCompile(client: OverleafClient, replica: Replica, userI
                 attempts += 1;
                 log(`compiling ${main} in "${record.projectName}"${attempts > 1 ? ` (attempt ${attempts})` : ''} ...`);
                 const t = Date.now();
-                const attempt = await guarded.compile({ rootResourcePath: main, draft: options.draft, stopOnFirstError: options.stopOnFirstError });
+                const attempt = await guarded.compile({ rootDocId, rootResourcePath: main, draft: options.draft, stopOnFirstError: options.stopOnFirstError });
                 result = attempt;
                 const status = attempt.response.status;
                 log(`compile status "${status}" after ${((Date.now() - t) / 1000).toFixed(1)} s`);

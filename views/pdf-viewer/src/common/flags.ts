@@ -12,8 +12,12 @@
  * plain range request. On the 885 MB book that happened on every few requests. Prefetching's other
  * part, fetching the cross-reference table with the first request, needs startXRefTable, which the
  * compile responses do not list. Download tracking stays off: it only reports metrics to Overleaf.
- * The fallback to Overleaf's cache of compile outputs stays off too: it needs the editor ID that
- * the compile request sent, which the extension does not keep.
+ * The fallback to Overleaf's cache of compile outputs is on. Overleaf's compile server deletes a
+ * build after 90 minutes, or once two newer builds exist (OutputCacheManager.js:110-111), and the
+ * cache keeps a copy of each build whose compile named an editor (clsi CompileController.js:152-157).
+ * When the compile server answers 404, the loader asks the cache's shard for
+ * /build/<editor>-<build>/output/output.pdf (getOutputPDFURLFromCache), from the build's editor ID
+ * and shard, which the host passes on (output.ts).
  */
 const cache: Map<string, unknown> = (window as any).metaAttributesCache ??= new Map();
 
@@ -25,6 +29,6 @@ cache.set('ol-splitTestVariants', {
     'pdf-caching-cached-url-lookup': 'enabled',
     'track-pdf-download': 'disabled',
 });
-cache.set('ol-canUseClsiCache', false);
+cache.set('ol-canUseClsiCache', true);
 
 export {};

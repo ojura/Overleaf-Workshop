@@ -37,8 +37,11 @@ describe('the Overleaf viewer\'s documents', function () {
     class FakeWorker {
         static made: FakeWorker[] = [];
         terminated = false;
+        private onTerminated!: () => void;
+        /** settles when the page stops this worker */
+        readonly stopped = new Promise<void>(resolve => { this.onTerminated = resolve; });
         constructor() { FakeWorker.made.push(this); }
-        terminate() { this.terminated = true; }
+        terminate() { this.terminated = true; this.onTerminated(); }
     }
 
     before(async () => {
@@ -68,6 +71,8 @@ describe('the Overleaf viewer\'s documents', function () {
             `export { loadingTasks } from ${JSON.stringify(path.join(viewerRoot, 'src', 'shims', 'pdf-js.ts'))};`,
         ].join('\n'));
         await esbuild.build({ ...bundleOptions, entryPoints: [entry], outfile: path.join(dir, 'documents.mjs') });
+        // esbuild's service process is not needed any more; another build starts it again
+        await esbuild.stop();
         viewer = await importModule(path.join(dir, 'documents.mjs'));
     });
 
@@ -108,7 +113,7 @@ describe('the Overleaf viewer\'s documents', function () {
         await loaded;
         const inRanges = tasks.at(-1)!;
         // the load is over; the document shown keeps its requests, which pdf.js makes as it reads on
-        for (let i = 0; i < 100 && documents.loading; i++) { await new Promise(resolve => setTimeout(resolve, 0)); }
+        await documents.settled;
         assert.strictEqual(documents.loading, false);
         assert.strictEqual(inRanges.requests?.signal.aborted, false);
 
@@ -117,7 +122,8 @@ describe('the Overleaf viewer\'s documents', function () {
         documents.loadData(new ArrayBuffer(8));
         await loaded;
         assert.strictEqual(inRanges.abortedAtDestroy, true, 'its range requests were aborted before its task was destroyed');
-        await new Promise(resolve => setTimeout(resolve, 0));
+        // its worker stops once its destroy has settled
+        await FakeWorker.made[0].stopped;
         assert.deepStrictEqual(FakeWorker.made.map(w => w.terminated), [true, false], 'its worker is stopped, the new document\'s runs');
         assert.deepStrictEqual(errors, []);
     });

@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention -- mirrors the 'vscode' export names and Overleaf's fields */
 import * as assert from 'assert';
-import Module = require('module');
+import { loadWithVscode } from './standIn';
 
 // ---- the 'vscode' stand-in, and stand-ins for what a joined project sets up
 function stub(): any {
@@ -41,22 +41,14 @@ const created = { scm: 0 };
 class FakeSCMCollection { triggers = []; constructor() { created.scm += 1; } }
 class FakeClientManager { triggers = []; }
 
-const moduleAny = Module as any;
-const originalLoad = moduleAny._load;
-const ownModules = () => Object.keys(require.cache).filter(key => /[\\/]out[\\/](?!test[\\/])/.test(key));
-ownModules().forEach(key => delete require.cache[key]);
-moduleAny._load = function (request: string, ...rest: any[]) {
-    if (request === 'vscode') { return vscodeMock; }
-    if (/scmCollectionProvider$/.test(request)) { return { SCMCollectionProvider: FakeSCMCollection }; }
-    if (/clientManager$/.test(request)) { return { ClientManager: FakeClientManager }; }
-    return originalLoad.call(this, request, ...rest);
-};
-const { VirtualFileSystem } = require('../core/remoteFileSystemProvider');
-const { SocketIOAPI } = require('../api/socketio');
-const { BaseAPI } = require('../api/base');
-moduleAny._load = originalLoad;
-// The modules just loaded hold this file's stand-ins: keep them out of other tests.
-ownModules().forEach(key => delete require.cache[key]);
+const { VirtualFileSystem, SocketIOAPI, BaseAPI } = loadWithVscode(vscodeMock, () => ({
+    VirtualFileSystem: require('../core/remoteFileSystemProvider').VirtualFileSystem,
+    SocketIOAPI: require('../api/socketio').SocketIOAPI,
+    BaseAPI: require('../api/base').BaseAPI,
+}), {
+    '../scm/scmCollectionProvider': { SCMCollectionProvider: FakeSCMCollection },
+    '../collaboration/clientManager': { ClientManager: FakeClientManager },
+});
 
 // ---- socket.io connections to a fake Overleaf
 
