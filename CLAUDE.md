@@ -44,4 +44,9 @@ window) are in CLAUDE.local.md, which git leaves out.
 - Experiments never write into a shared project or into a live local replica. Use a private copy
   of the project (`node out/sandbox/cli.js init`) and a test instance of the IDE
   (scripts/hidden-ide.sh).
-- Never turn on shell tracing (`set -x`) where a session cookie or a token is expanded.
+- Never print a secret's value: a session cookie, a CSRF token, or an API, git or messaging token.
+  That rules out shell tracing (`set -x`, `bash -x`) in a command that expands one, dumps of an
+  environment with its values (`env`, `printenv`, `/proc/<pid>/environ`), and echoes through
+  `${VAR-...}` or `${VAR:-...}`, which print the value whenever the variable is set. Record
+  variable names, or a secret's length. What a command prints stays in the agent's transcript,
+  and the only remedy is to invalidate the secret.
