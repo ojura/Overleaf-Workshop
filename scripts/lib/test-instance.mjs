@@ -41,13 +41,25 @@ export function writeInstance(home, record) {
 /** Whether a target is the page of the IDE's workbench window. */
 export const isWorkbench = (target) => target.type === 'page' && target.url.includes('/workbench/workbench.html');
 
+/** The process id of the browser on the connection `browser`, as the browser reports it. */
+async function browserProcess(browser) {
+    const { processInfo } = await browser.send('SystemInfo.getProcessInfo');
+    return processInfo.find(p => p.type === 'browser')?.id;
+}
+
 /** Fail unless the browser on the connection `browser` is the process `pid`. */
 async function checkBrowserProcess(browser, pid) {
-    const { processInfo } = await browser.send('SystemInfo.getProcessInfo');
-    const answering = processInfo.find(p => p.type === 'browser')?.id;
+    const answering = await browserProcess(browser);
     if (answering !== pid) {
         throw new Error(`the browser at ${browser.url} is process ${answering}, not the instance's IDE (process ${pid})`);
     }
+}
+
+/** The process group of process `pid`, from /proc/<pid>/stat (after the command name, which can hold spaces). */
+function processGroup(pid) {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const [, , group] = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return Number(group);
 }
 
 /** The value of `expression` in a DevTools context: the session's page, or a Node inspector's main context. */
@@ -187,18 +199,23 @@ async function findInspector(pid, devtoolsPort) {
 }
 
 /**
- * Wait until the IDE `pid` of the instance in `home`, started with --remote-debugging-port=0 and
- * --inspect=0, has opened its workbench window, and return its two endpoints, each checked to
- * belong to process `pid`: { devtools, inspector }. The waits follow file and target events;
- * `limitMs` is the last resort for an IDE that runs but never opens its window. The IDE's exit is
+ * Wait until the IDE of the instance in `home`, started with --remote-debugging-port=0 and
+ * --inspect=0 in the process group `group`, has opened its workbench window, and return its pid as
+ * its browser reports it, checked to be in `group`, and its two endpoints, checked to belong to
+ * that pid: { pid, devtools, inspector }. The waits follow file and target events; `limitMs` is
+ * the last resort for an IDE that runs but never opens its window. The end of the IDE's session is
  * the caller's to watch: hidden-ide.sh waits for whichever comes first.
  */
-export async function waitForInstance(home, pid, limitMs) {
+export async function waitForInstance(home, group, limitMs) {
     const deadline = Date.now() + limitMs;
     const devtools = await waitForActivePort(path.join(home, 'profile'), { limitMs });
     const browser = await connect(devtools);
+    let pid;
     try {
-        await checkBrowserProcess(browser, pid);
+        pid = await browserProcess(browser);
+        if (processGroup(pid) !== group) {
+            throw new Error(`the browser that wrote ${home}/profile/DevToolsActivePort, process ${pid}, is not in the instance's process group ${group}`);
+        }
         await waitForTarget(browser, isWorkbench, { what: "the IDE's workbench window", limitMs: Math.max(0, deadline - Date.now()) });
     } finally {
         browser.close();
@@ -210,5 +227,5 @@ export async function waitForInstance(home, pid, limitMs) {
     } finally {
         main.close();
     }
-    return { devtools, inspector };
+    return { pid, devtools, inspector };
 }

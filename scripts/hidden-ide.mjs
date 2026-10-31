@@ -1,6 +1,7 @@
 // The DevTools part of scripts/hidden-ide.sh, which runs it with the instance's folder HOME:
-//   ready HOME PID                    wait until the IDE (process PID) has opened its window, and
-//                                     add its two DevTools endpoints to HOME/instance.json
+//   ready HOME GROUP                  wait until the IDE in the process group GROUP has opened its
+//                                     window, and add its pid and its two DevTools endpoints to
+//                                     HOME/instance.json
 //   evaluate HOME page EXPRESSION     the value of EXPRESSION in the window's page
 //   evaluate HOME main STATEMENTS     what STATEMENTS return in the IDE's main process, with w set
 //                                     to the window (inMainProcess in scripts/lib/test-instance.mjs)
@@ -44,9 +45,9 @@ async function withPage(instance, what, work) {
 }
 
 const commands = {
-    async ready(home, pid) {
-        const endpoints = await waitForInstance(home, Number(pid), START_LIMIT_MS);
-        writeInstance(home, { ...readInstance(home), ...endpoints });
+    async ready(home, group) {
+        const found = await waitForInstance(home, Number(group), START_LIMIT_MS);
+        writeInstance(home, { ...readInstance(home), ...found });
     },
     async evaluate(home, where, code) {
         const instance = readInstance(home);

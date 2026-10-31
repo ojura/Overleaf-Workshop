@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # A second Antigravity for tests: on a virtual display, with its own profile and extensions
 # folder, on a local replica of an Overleaf project that the user listed as a test project and
-# that the user's own IDE does not keep a replica of, or on a local folder.
+# that the user's own IDE does not keep a replica of, or on a local folder. It runs outside the
+# caller's desktop session (see "The instance's environment" below).
 #
 #   scripts/hidden-ide.sh start [options]     start the virtual display and the IDE
 #   scripts/hidden-ide.sh stop                stop the IDE and the display, delete the login copy
@@ -41,12 +42,22 @@
 # two instances (for example of two agents) never reach each other's window.
 #
 # All of the instance lives in $HIDDEN_IDE_HOME (default /tmp/hidden-ide-$UID): profile/,
-# extensions/, replica/, instance.json and the logs. The replica folder is kept between starts,
-# so only the first start downloads the whole project. instance.json, for tools that drive the
-# instance (scripts/lib/test-instance.mjs reads it): pid (the IDE's main process), xvfb (the
-# display's process), display (":N"), devtools and inspector (the endpoints of the window's browser
-# and of the main process), project and replica (null in folder mode), folder (what the instance
-# opened), profile and ide.
+# extensions/, replica/, home/ and run/ (below), instance.json and the logs. The replica folder is
+# kept between starts, so only the first start downloads the whole project. instance.json, for
+# tools that drive the instance (scripts/lib/test-instance.mjs reads it): group (the process group
+# of the instance's session bus and IDE), pid (the IDE's main process), xvfb (the display's
+# process), display (":N"), devtools and inspector (the endpoints of the window's browser and of
+# the main process), project and replica (null in folder mode), folder (what the instance opened),
+# profile and ide.
+#
+# The instance's environment: the IDE gets PATH and LANG from the caller and nothing else of the
+# caller's environment, so neither the session bus, the keyring, the SSH agent nor the caller's
+# tokens. HOME is home/ and the XDG folders are in it, so Antigravity's own data (~/.gemini,
+# ~/.antigravity-ide) is the instance's; XDG_RUNTIME_DIR is run/, where the replica's control
+# socket is. The IDE runs under dbus-run-session, on a session bus of its own on which no service
+# starts on demand: a file dialog, a notification or a keyring prompt cannot reach the user's
+# desktop. Chromium keeps the secrets it encrypts in the profile (--password-store=basic) instead
+# of the user's keyring.
 #
 # The test projects: the user lists in ${XDG_CONFIG_HOME:-~/.config}/overleaf-workshop/test-projects,
 # once, the Overleaf projects made for tests, one project id per line ("#" starts a comment).
@@ -71,6 +82,9 @@ cmdline() { [ -n "${1:-}" ] && { tr '\0' ' ' < "/proc/$1/cmdline"; } 2>/dev/null
 # Whether instance.json's pid is still this instance's IDE, and its xvfb still the Xvfb that this
 # script started on its display. After a reboot either number can belong to another process.
 own_ide() { cmdline "$(field pid)" | grep -q -F -- "--user-data-dir=$home/profile "; }
+# Whether instance.json's group is still the process group that start made for this instance: its
+# leader runs dbus-run-session with this instance's bus configuration.
+own_group() { cmdline "$(field group)" | grep -q -F -- "--config-file=$home/session-bus.conf "; }
 own_xvfb() { [ -n "$(field display)" ] && cmdline "$(field xvfb)" | grep -q -E "^Xvfb $(field display) "; }
 running() { own_ide || die "no instance is running"; }
 # The X server of display N, as "pid N (command)", from its socket or else its lock file.
@@ -125,7 +139,7 @@ start() {
             *) die "unknown option $1" ;;
         esac
     done
-    own_ide && die "an instance is already running (pid $(field pid)); stop it first"
+    { own_ide || own_group; } && die "an instance is already running (process group $(field group)); stop it first"
     if [ -n "$build" ]; then
         [ -d "$build" ] || die "no checkout $build"
         build=$(cd "$build" && pwd)
@@ -158,13 +172,14 @@ start() {
         done
     fi
     [ -n "$ide" ] && [ -x "$ide" ] || die "no Antigravity binary found; pass --ide PATH"
+    command -v dbus-run-session > /dev/null || die "dbus-run-session is missing; it gives the instance a session bus of its own"
     if [ -n "$project" ] && [ ! -f "$user_state" ]; then die "no saved login at $user_state"; fi
     local source_ext
     source_ext=$(ls -d "$user_extensions"/iamhyc.overleaf-workshop-* 2>/dev/null | head -1)
     [ -n "$source_ext" ] || die "no installed Overleaf Workshop in $user_extensions"
 
     umask 077
-    mkdir -p "$home/profile/User/globalStorage" "$home/extensions"
+    mkdir -p "$home/profile/User/globalStorage" "$home/extensions" "$home/home" "$home/run"
     if [ -n "$project" ]; then mkdir -p "$home/replica/.overleaf"; fi
     # the extensions: a copy of the installed Overleaf Workshop (and LaTeX Workshop, for .tex files)
     rsync -a --delete "$source_ext" "$home/extensions/" || die "could not copy $source_ext"
@@ -271,47 +286,69 @@ EOF
         for _ in $(seq 1 50); do [ -e "/tmp/.X11-unix/X$number" ] && break; sleep 0.1; done
         [ -e "/tmp/.X11-unix/X$number" ] || die "Xvfb did not start on $display (see $home/xvfb.log)"
     fi
-    # The IDE, in a process group of its own. It picks the ports of its DevTools endpoints itself
-    # (port 0): the window's browser names its endpoint in DevToolsActivePort in the profile, and
-    # the file that an earlier start left there must not be taken for the new one.
+    # The instance's session bus: only this user may connect, and without service folders no
+    # service starts on demand.
+    cat > "$home/session-bus.conf" <<EOF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:dir=$home/run</listen>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+EOF
+    # The IDE, under its own session bus, in a process group of its own that dbus-run-session
+    # leads, with the environment described at the top. It picks the ports of its DevTools
+    # endpoints itself (port 0): the window's browser names its endpoint in DevToolsActivePort in
+    # the profile, and the file that an earlier start left there must not be taken for the new one.
     rm -f "$home/profile/DevToolsActivePort"
-    env -u WAYLAND_DISPLAY -u GNOME_TERMINAL_SCREEN XDG_SESSION_TYPE=x11 DISPLAY="$display" setsid "$ide" \
-        --ozone-platform=x11 --disable-gpu --remote-debugging-port=0 --inspect=0 \
+    setsid env -i PATH="$PATH" LANG="${LANG:-C.UTF-8}" HOME="$home/home" \
+        XDG_CONFIG_HOME="$home/home/.config" XDG_DATA_HOME="$home/home/.local/share" \
+        XDG_STATE_HOME="$home/home/.local/state" XDG_CACHE_HOME="$home/home/.cache" \
+        XDG_RUNTIME_DIR="$home/run" DISPLAY="$display" XDG_SESSION_TYPE=x11 \
+        dbus-run-session --config-file="$home/session-bus.conf" -- "$ide" \
+        --ozone-platform=x11 --disable-gpu --password-store=basic --remote-debugging-port=0 --inspect=0 \
         --user-data-dir="$home/profile" --extensions-dir="$home/extensions" \
         --disable-workspace-trust --skip-welcome --skip-release-notes --new-window "$folder" \
         > "$home/ide.log" 2>&1 < /dev/null &
-    local pid=$!
-    # recorded at once, so that stop finds the IDE also when the wait below fails
-    python3 -I - "$state" "$pid" "$xvfb" "$display" "$project" "$folder" "$home/profile" "$ide" <<'EOF'
+    local group=$!
+    # recorded at once, so that stop finds the instance also when the wait below fails
+    python3 -I - "$state" "$group" "$xvfb" "$display" "$project" "$folder" "$home/profile" "$ide" <<'EOF'
 import json, sys
-state, pid, xvfb, display, project, folder, profile, ide = sys.argv[1:]
+state, group, xvfb, display, project, folder, profile, ide = sys.argv[1:]
 with open(state, "w") as out:
-    json.dump({"pid": int(pid), "xvfb": int(xvfb), "display": display,
+    json.dump({"group": int(group), "xvfb": int(xvfb), "display": display,
                "project": project or None, "replica": folder if project else None, "folder": folder,
                "profile": profile, "ide": ide}, out, indent=2)
     out.write("\n")
 EOF
-    # Wait until the window is open and both endpoints answer as this IDE, which records them in
-    # instance.json, or until the IDE exits, whichever comes first.
-    ide_devtools ready "$pid" &
+    # Wait until the window is open and both endpoints answer as the IDE of this process group,
+    # which records the IDE's pid and the endpoints in instance.json, or until the IDE's session
+    # ends, whichever comes first.
+    # (node itself in the background, so that $! is its pid and the kill below reaches it)
+    node "$here/hidden-ide.mjs" ready "$home" "$group" &
     local ready=$! first status
-    wait -n -p first "$pid" "$ready"
+    wait -n -p first "$group" "$ready"
     status=$?
-    if [ "$first" = "$pid" ]; then
+    if [ "$first" = "$group" ]; then
         kill "$ready" 2>/dev/null
         die "the IDE exited with status $status (see $home/ide.log)"
     fi
     [ "$status" = 0 ] || die "the IDE's window did not open (see the message above and $home/ide.log); stop the instance"
-    echo "started: pid $pid on $display, folder $folder"
+    echo "started: pid $(field pid) on $display, folder $folder"
 }
 
 stop() {
-    if own_ide; then
-        local pid=$(field pid)
-        # the whole process group when the IDE leads one (start runs it under setsid), else the IDE alone
-        if [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; then kill -TERM -- "-$pid" 2>/dev/null; else kill -TERM "$pid" 2>/dev/null; fi
-        for _ in $(seq 1 30); do own_ide || break; sleep 0.5; done
-        own_ide && echo "the IDE (pid $pid) is still running 15 s after SIGTERM; not killing it further"
+    if own_group; then
+        local group=$(field group)
+        # the whole process group: dbus-run-session, the session bus and the IDE with its processes
+        kill -TERM -- "-$group" 2>/dev/null
+        for _ in $(seq 1 30); do kill -0 -- "-$group" 2>/dev/null || break; sleep 0.5; done
+        kill -0 -- "-$group" 2>/dev/null && echo "the instance's process group $group still runs 15 s after SIGTERM; not killing it further"
     fi
     own_xvfb && stop_xvfb
     for suffix in "" "-journal" ".backup"; do
