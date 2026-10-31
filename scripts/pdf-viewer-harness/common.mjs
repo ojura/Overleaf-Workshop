@@ -8,6 +8,7 @@ import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { onCleanup } from '../lib/cleanup.mjs';
 import { launchChrome } from './cdp.mjs';
 
 /** the harness's folder, scripts/pdf-viewer-harness/ */
@@ -19,11 +20,9 @@ export const defaultExt = path.join(repo, 'views/pdf-viewer');
 export const work = path.resolve(process.env.PDF_VIEWER_HARNESS_WORK ?? path.join(os.tmpdir(), 'pdf-viewer-harness'));
 fs.mkdirSync(work, { recursive: true });
 
-// Ctrl+C, and the SIGTERM of a timeout, end a script through process.exit, which runs the 'exit'
-// handlers that stop the server and Chrome the script started.
-for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]]) {
-    process.once(signal, () => process.exit(code));
-}
+// Ctrl+C, and the SIGTERM of a time limit, end a script as scripts/lib/cleanup.mjs describes: the
+// command that it awaits fails, its finally blocks run, and the server and Chrome that it started
+// are stopped also when it ends without them.
 
 /** The value of the option `--name`, or `fallback`. */
 export const arg = (name, fallback) => {
@@ -73,8 +72,8 @@ export function bridgeModule() {
 
 /**
  * Start server.mjs on `port` with an empty piece cache of its own (piece-cache-<name>-<port> in the
- * work folder) and wait until it listens. stop() stops the server and deletes the piece cache; when this
- * process exits first, it kills the server and deletes the piece cache on the way out. `args` are
+ * work folder) and wait until it listens. stop() stops the server and deletes the piece cache; when the
+ * script ends first, its clean-up kills the server and deletes the piece cache. `args` are
  * more options for server.mjs; `stderr: 'pipe'` lets the caller read the server's errors.
  */
 export async function startServer({ name, port, ext = defaultExt, bookDir = book(), latency = 20, args = [], stderr = 'inherit' }) {
@@ -82,17 +81,16 @@ export async function startServer({ name, port, ext = defaultExt, bookDir = book
     fs.rmSync(cache, { recursive: true, force: true });
     const server = spawn(process.execPath, [path.join(here, 'server.mjs'), '--ext', ext, '--book', bookDir,
         '--latency', String(latency), '--cache', cache, '--port', String(port), ...args], { stdio: ['ignore', 'pipe', stderr] });
-    const onExit = () => {
+    const cleanup = onCleanup(() => {
         server.kill('SIGKILL');
-        try { fs.rmSync(cache, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); } catch { /* the next start deletes it */ }
-    };
-    process.once('exit', onExit);
+        fs.rmSync(cache, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    });
     await new Promise((resolve, reject) => {
         server.stdout.on('data', (d) => { if (String(d).includes('harness on')) { resolve(); } });
         server.once('exit', (code, signal) => reject(new Error(`server.mjs ended (${signal ?? `exit code ${code}`}) before it listened on port ${port}`)));
     });
     const stop = () => new Promise((resolve) => {
-        process.removeListener('exit', onExit);
+        cleanup.cancel();
         const removeCache = () => {
             fs.rmSync(cache, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
             resolve();

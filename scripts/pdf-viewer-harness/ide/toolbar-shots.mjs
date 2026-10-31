@@ -26,7 +26,8 @@ fs.mkdirSync(outDir, { recursive: true });
 const SETTING = 'overleaf-workshop.pdfViewer.engine';
 const inst = instance();
 const config = settings(inst);
-const originalEngine = config.get(SETTING);
+// the switch buttons write the viewer setting; it is restored when the script ends
+const restoreEngine = config.guard(SETTING);
 const restoreAssociation = await associatePdfs(config);
 const wb = await workbench(inst);
 let view;
@@ -79,7 +80,7 @@ try {
     problems++;
 } finally {
     await wb.session.send('Emulation.clearDeviceMetricsOverride').catch(() => {});
-    config.set(SETTING, originalEngine);
+    restoreEngine();
     view?.close();
     wb.close();
     restoreAssociation();

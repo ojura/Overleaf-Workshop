@@ -6,13 +6,12 @@
 // frames are sessions of that one connection.
 import fs from 'node:fs';
 import path from 'node:path';
+import { onCleanup, sleep } from '../../lib/cleanup.mjs';
 import { evaluate, waitUntil, notWithinLimit } from '../../lib/devtools.mjs';
 import { connectWindow, instanceHome, readInstance, workbenchTarget } from '../../lib/test-instance.mjs';
 import { arg } from '../common.mjs';
 
-export { evaluate, waitUntil, notWithinLimit };
-
-export const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+export { evaluate, waitUntil, notWithinLimit, onCleanup, sleep };
 
 /** The instance: its record in instance.json (pid, devtools, display, profile, replica, ...) and its folder, home. */
 export function instance() {
@@ -22,20 +21,28 @@ export function instance() {
 /**
  * The instance's user settings (profile/User/settings.json): get(key), and set(key, value), which
  * VS Code applies when it sees the file change; set(key, undefined) removes the key. The file must
- * be plain JSON, as hidden-ide.sh and VS Code's settings editor write it.
+ * be plain JSON, as hidden-ide.sh and VS Code's settings editor write it. guard(key) registers the
+ * restore of the key's present value as a clean-up of the script (scripts/lib/cleanup.mjs), and
+ * returns the restore, which runs at once when called; change(key, value) guards the key and sets it.
  */
 export function settings(inst) {
     const file = path.join(inst.profile, 'User', 'settings.json');
     const read = () => (fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8') || '{}') : {});
-    return {
-        file,
-        get: (key) => read()[key],
-        set: (key, value) => {
-            const all = read();
-            if (value === undefined) { delete all[key]; } else { all[key] = value; }
-            fs.writeFileSync(file, `${JSON.stringify(all, null, 4)}\n`);
-        },
+    const set = (key, value) => {
+        const all = read();
+        if (value === undefined) { delete all[key]; } else { all[key] = value; }
+        fs.writeFileSync(file, `${JSON.stringify(all, null, 4)}\n`);
     };
+    const guard = (key) => {
+        const before = read()[key];
+        return onCleanup(() => set(key, before)).run;
+    };
+    const change = (key, value) => {
+        const restore = guard(key);
+        set(key, value);
+        return restore;
+    };
+    return { file, get: (key) => read()[key], set, guard, change };
 }
 
 /** Press and release a key; modifiers add up from 1 Alt, 2 Ctrl, 4 Meta and 8 Shift. */
@@ -95,15 +102,15 @@ export async function focusWorkbench(wb) {
 /**
  * Open *.pdf files in the extension's viewer, through workbench.editorAssociations in the
  * instance's settings: the viewer's own selector takes only PDFs of the extension's file system.
- * Returns a function that restores the setting.
+ * Returns a function that restores the setting, which also runs when the script ends otherwise.
  */
 export async function associatePdfs(config) {
     const name = 'workbench.editorAssociations';
     const before = config.get(name);
     if (before?.['*.pdf'] === 'overleaf-workshop.pdfViewer') { return () => {}; }
-    config.set(name, { ...(before ?? {}), '*.pdf': 'overleaf-workshop.pdfViewer' });
+    const restore = config.change(name, { ...(before ?? {}), '*.pdf': 'overleaf-workshop.pdfViewer' });
     await sleep(1500);
-    return () => config.set(name, before);
+    return restore;
 }
 
 /**

@@ -6,6 +6,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { onCleanup } from '../lib/cleanup.mjs';
 import { connect, evaluate, waitFor, waitForActivePort, WaitLimitError } from '../lib/devtools.mjs';
 
 /** The last resort for a Chrome that runs but never opens DevTools; it opens them within a second or two. */
@@ -25,8 +26,8 @@ function forwardLines(stream, prefix) {
 
 /**
  * Start headless Chrome on a new profile in the folder `dir` and connect to its page. close()
- * stops Chrome and deletes the profile; when this process exits before that, it kills Chrome and
- * deletes the profile on the way out. Chrome's own messages go to this process's stderr, each line
+ * stops Chrome and deletes the profile; when the script ends before that, its clean-up kills
+ * Chrome and deletes the profile (scripts/lib/cleanup.mjs). Chrome's own messages go to this process's stderr, each line
  * after "chrome: ".
  */
 export async function launchChrome({ dir, width = 1200, height = 900 }) {
@@ -45,11 +46,7 @@ export async function launchChrome({ dir, width = 1200, height = 900 }) {
     // Chrome leads its own process group, with its renderer and GPU processes in it
     const stop = (signal = 'SIGTERM') => { try { process.kill(-chrome.pid, signal); } catch { chrome.kill(signal); } };
     const removeProfile = () => fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-    const onExit = () => {
-        stop('SIGKILL');
-        try { removeProfile(); } catch { /* the work folder can be deleted at any time */ }
-    };
-    process.once('exit', onExit);
+    const cleanup = onCleanup(() => { stop('SIGKILL'); removeProfile(); });
     let browser;
     let page;
     try {
@@ -60,14 +57,14 @@ export async function launchChrome({ dir, width = 1200, height = 900 }) {
         page = pageOf(await browser.attach(target.targetId));
     } catch (error) {
         browser?.close();
-        process.removeListener('exit', onExit);
+        cleanup.cancel();
         stop('SIGKILL');
         await ended.catch(() => {});
         removeProfile();
         throw error;
     }
     const close = async () => {
-        process.removeListener('exit', onExit);
+        cleanup.cancel();
         browser.close();
         stop();
         await ended.catch(() => {});

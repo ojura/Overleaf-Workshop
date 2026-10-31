@@ -12,6 +12,20 @@ import path from 'node:path';
 /** The file in which a browser names its DevTools port and its browser target. */
 const ACTIVE_PORT_FILE = 'DevToolsActivePort';
 
+/** The connections that are open, so that a signal can end every command that a script awaits (scripts/lib/cleanup.mjs). */
+const openConnections = new Set();
+/** why connect() refuses new connections: set when the script ends them all */
+let refusal;
+
+/** The number of open connections. */
+export const openConnectionCount = () => openConnections.size;
+
+/** Close every open connection, and refuse new ones: the commands that wait for answers fail with `reason`. */
+export function closeAllConnections(reason) {
+    refusal = reason;
+    for (const connection of [...openConnections]) { connection.close(reason); }
+}
+
 /**
  * The WebSocket URL of the browser that wrote `profile`'s DevToolsActivePort, or undefined while
  * the file is missing or not yet written whole. A browser leaves the file behind when it ends; a
@@ -67,12 +81,15 @@ export function waitForActivePort(profile, { ended, limitMs }) {
  * - attach(targetId) opens a session on one of the browser's targets (a page, a frame, a worker),
  *   with the same send and on for that target, and detach();
  * - discoverTargets() asks the browser for its target events (Target.targetCreated, ...), once;
- * - close() closes the connection, and `closed` resolves with the reason when it has closed.
+ * - close(reason) closes the connection: the commands that wait for answers fail with `reason`,
+ *   or with the connection's close when none is given; `closed` resolves with the reason when the
+ *   connection has closed.
  * A Node inspector's endpoint has no targets: use send and on alone there.
  * A command that waits for its answer fails when the connection closes, and a session's command
  * also when its target detaches or crashes; the error names the command and the reason.
  */
 export async function connect(url) {
+    if (refusal !== undefined) { throw new Error(`no connection to ${url}: ${refusal}`); }
     const ws = new WebSocket(url);
     await new Promise((resolve, reject) => {
         const opened = () => { ws.removeEventListener('error', failed); resolve(); };
@@ -136,8 +153,9 @@ export async function connect(url) {
         emit(message.sessionId, message.method, message.params);
     });
     ws.addEventListener('close', (event) => {
-        endReason = `the DevTools connection to ${url} closed (code ${event.code}${event.reason ? `, ${event.reason}` : ''})`;
+        endReason ??= `the DevTools connection to ${url} closed (code ${event.code}${event.reason ? `, ${event.reason}` : ''})`;
         failPending(() => true, endReason);
+        openConnections.delete(connection);
         reportClosed(endReason);
     });
 
@@ -184,10 +202,19 @@ export async function connect(url) {
             },
         };
     };
-    return {
-        url, send: (method, params) => send(method, params), on: (method, fn) => on(method, fn),
-        attach, discoverTargets, close: () => ws.close(), closed,
+    const close = (reason) => {
+        if (reason !== undefined && endReason === undefined) {
+            endReason = reason;
+            failPending(() => true, reason);
+        }
+        ws.close();
     };
+    const connection = {
+        url, send: (method, params) => send(method, params), on: (method, fn) => on(method, fn),
+        attach, discoverTargets, close, closed,
+    };
+    openConnections.add(connection);
+    return connection;
 }
 
 /**

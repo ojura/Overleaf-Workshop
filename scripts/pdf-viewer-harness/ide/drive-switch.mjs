@@ -10,6 +10,7 @@ const SETTING = 'overleaf-workshop.pdfViewer.engine';
 const inst = instance();
 const config = settings(inst);
 const original = config.get(SETTING);
+let restoreSetting;
 const { check, summary } = checker();
 const wb = await workbench(inst);
 let view;
@@ -37,7 +38,7 @@ try {
 
     // the setting
     const target = other(start.engine);
-    config.set(SETTING, target);
+    restoreSetting = config.change(SETTING, target);
     let now = await view.drawn(target, 90000);
     check(`a change of the setting to ${target} switches the open PDF to the ${target} viewer`, !!now, now ? `${now.ms} ms` : 'timed out');
     if (!now) { throw new Error('the setting did not switch the viewer'); }
@@ -68,8 +69,9 @@ try {
     check('run', false, String(error?.message ?? error));
 } finally {
     // restore the setting, and wait for the viewer it picks
-    config.set(SETTING, original);
-    const restored = await view?.drawn(original === 'overleaf' ? 'overleaf' : 'pdfjs', 90000);
+    restoreSetting?.();
+    const restored = await view?.drawn(original === 'overleaf' ? 'overleaf' : 'pdfjs', 90000)
+        .catch((error) => console.log(`the viewer after the restore: ${error.message}`));
     console.log(`the setting is ${original ?? '(not set)'} again; the PDF is in the ${restored?.engine ?? 'unknown'} viewer`);
     console.log('console problems in the viewer pages:', view?.problems.length ? view.problems.slice(0, 8) : 'none');
     summary();
