@@ -6,7 +6,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { Repo } from '../gitbridge/plumbing';
 import { checkBuild } from '../sandbox/buildCheck';
-import { AskWindow, LandClient, LandError, landCommit, landedCleanly } from '../sandbox/land';
+import { AskWindow, fetchCommitFrom, LandClient, LandError, landCommit, landedCleanly } from '../sandbox/land';
 
 const OVERLEAF_REF = 'refs/remotes/overleaf/main';
 
@@ -206,6 +206,24 @@ describe('replica-land', function () {
         assert.strictEqual(git(t.folder, 'rev-parse', 'HEAD'), commit);
         assert.strictEqual(report.verified, 2);
         assert.ok(!t.asked.includes(`land ${commit.slice(0, 7)}`), 'the window does not push');
+    });
+
+    it('takes the commit from a clone where the work happens, at a branch\'s tip or below it', () => {
+        const t = setup();
+        const clone = path.join(scratch, 'clone');
+        spawnSync('git', ['clone', '--quiet', t.folder, clone]);
+        git(clone, 'config', 'user.name', 'Book Author');
+        git(clone, 'config', 'user.email', 'author@example.com');
+        fs.writeFileSync(path.join(clone, 'main.tex'), 'main v2\n');
+        git(clone, 'commit', '--quiet', '-am', 'One');
+        const one = git(clone, 'rev-parse', 'HEAD');
+        fs.writeFileSync(path.join(clone, 'main.tex'), 'main v3\n');
+        git(clone, 'commit', '--quiet', '-am', 'Two');
+        const two = git(clone, 'rev-parse', 'HEAD');
+        // a commit below the branch's tip first, which the clone does not advertise
+        assert.strictEqual(fetchCommitFrom(t.repo, clone, one.slice(0, 10)), one);
+        assert.strictEqual(git(t.folder, 'rev-parse', `${one}^{commit}`), one);
+        assert.strictEqual(fetchCommitFrom(t.repo, clone, 'HEAD'), two);
     });
 
     describe('the build check', () => {

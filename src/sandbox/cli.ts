@@ -15,7 +15,7 @@ import { describe, SyncSummary } from '../scm/replicaSync';
 import { DEFAULT_IGNORE_PATTERNS } from '../scm/ignorePatterns';
 import { Repo } from '../gitbridge/plumbing';
 import { minimatch } from 'minimatch';
-import { LandError, landCommit, landedCleanly, LandReport } from './land';
+import { fetchCommitFrom, LandError, landCommit, landedCleanly, LandReport } from './land';
 import { anchorBridge } from '../gitbridge/anchor';
 import { bridgeBranch, pushToBridge } from '../gitbridge/flow';
 import { addBridgeRemote, rangesCheck } from '../gitbridge/overleaf';
@@ -42,7 +42,7 @@ usage:
   node out/sandbox/cli.js git-credential get|store|erase --server <name> --bridge <url>
   node out/sandbox/cli.js replica-sync   --replica <folder> [--timeout <s>] [--json]
   node out/sandbox/cli.js replica-status --replica <folder> [--json]
-  node out/sandbox/cli.js replica-land   --replica <folder> [<commit>] [--push native|bridge] [--main <file>] [--no-compile] [--timeout <s>] [--json]
+  node out/sandbox/cli.js replica-land   --replica <folder> [<commit>] [--from <repo>] [--push native|bridge] [--main <file>] [--no-compile] [--timeout <s>] [--json]
 
 --replica <folder>  the shared project's local replica. Its .overleaf/settings.json names
                     the project; .overleaf/sandbox.json records the private copy.
@@ -168,6 +168,9 @@ replica-land    Lands <commit> of the replica's git repository in the project, t
                 OVERLEAF_COMMIT and OVERLEAF_PARENT, e.g. a check of where the pages of the
                 contents fall. Without <commit>, the checked-out commit is checked and
                 compiled. <git dir>/overleaf/landings.log lists the landings.
+--from <repo>   take <commit> from that repository, e.g. a clone of the replica's
+                repository where the work happens: <commit> is resolved there (HEAD by
+                default) and fetched into the replica's repository first
 --push bridge   push through the git bridge instead: the branch fast-forwards to the
                 commit, the bridge's newest commit is joined with an anchor merge (as
                 node out/gitbridge/cli.js replica-bridge does), and git pushes the branch to
@@ -197,7 +200,7 @@ names the database. The environment variable OVERLEAF_LOGIN, a JSON object
 
 const VALUE_FLAGS = new Set(['replica', 'dir', 'main', 'out', 'keep', 'ignore', 'include', 'lock-timeout', 'purpose', 'name', 'state-db',
     'project', 'repo', 'from', 'to', 'user', 'server', 'into', 'bridge',
-    'timeout', 'push']);
+    'timeout', 'push', 'from']);
 const GIT_AND_INFO_COMMANDS = ['project-info', 'git-token', 'git-clone', 'git-fetch', 'git-credential'];
 const OBJECT_ID = /^[0-9a-f]{24}$/;
 const REPEATABLE = new Set(['keep', 'ignore', 'include']);
@@ -464,7 +467,12 @@ async function main(argv: string[]): Promise<number> {
         if (!(timeoutS > 0)) { throw new UsageError('--timeout takes a number of seconds'); }
         const push = values.push ?? 'native';
         if (push !== 'native' && push !== 'bridge') { throw new UsageError('--push takes native or bridge'); }
-        return await replicaLand(path.resolve(values.replica), positional[1], { main: values.main, compile: !flags.has('no-compile'), timeoutS, json: flags.has('json'), stateDb: values['state-db'], push });
+        let commit = positional[1];
+        if (values.from) {
+            commit = fetchCommitFrom(new Repo(path.resolve(values.replica)), path.resolve(values.from), commit ?? 'HEAD');
+            log(`took ${commit.slice(0, 7)} from ${path.resolve(values.from)}`);
+        }
+        return await replicaLand(path.resolve(values.replica), commit, { main: values.main, compile: !flags.has('no-compile'), timeoutS, json: flags.has('json'), stateDb: values['state-db'], push });
     }
     if (positional.length > 1) { throw new UsageError(`unexpected argument ${positional[1]}`); }
     if (command === 'ranges' || command === 'push-check') {

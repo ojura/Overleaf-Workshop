@@ -311,6 +311,22 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
     return report;
 }
 
+/**
+ * Bring `commit` (a commit or a ref of the repository `from`, e.g. a clone of the replica's
+ * repository where the work happens) into the replica's repository, and return its id. It
+ * fetches the commit itself, or else every branch of `from`, into refs/land/from/.
+ */
+export function fetchCommitFrom(repo: Repo, from: string, commit: string): string {
+    const source = new Repo(from);
+    const oid = source.mustCommit(commit);
+    if (repo.commit(oid)) { return oid; }
+    const direct = repo.run(['fetch', '--quiet', '--no-tags', from, oid], { allowFailure: true });
+    if (direct.status !== 0 || !repo.commit(oid)) {
+        repo.run(['fetch', '--quiet', '--no-tags', from, '+refs/heads/*:refs/land/from/*']);
+    }
+    return repo.mustCommit(oid);
+}
+
 /** Whether the landing's compile and checks all passed, by its report. */
 export function landedCleanly(report: LandReport): boolean {
     if (report.compile && (report.compile.status !== 'success' || !report.compile.check?.ok)) { return false; }
