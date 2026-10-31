@@ -15,9 +15,10 @@ window) are in CLAUDE.local.md, which git leaves out.
   while no tool runs.
 - Build, test and lint:
   - `node node_modules/typescript/bin/tsc -p ./`
-  - `node node_modules/.bin/mocha "out/test/**/*.test.js"`. Most test files load the extension's
-    modules through their own copy of a 'vscode' stand-in, and those copies only work when the
-    tests are compiled into a folder named out.
+  - `npm run test:unit`: it builds out/ as above, runs the tests in out/test with mocha, and
+    base.test.js, which is written for node:test, with `node --test`, and fails when either fails.
+    Most test files load the extension's modules through their own copy of a 'vscode' stand-in,
+    and those copies only work when the tests are compiled into a folder named out.
   - `npx eslint src --ext ts`
 - A new test fails on the code before the fix and passes with it; report both runs. Tests wait for
   the events or awaited calls they need, not for sleeps or polling with a time limit, and close
