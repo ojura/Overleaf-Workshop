@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/naming-convention -- Overleaf's field names */
-import { BaseAPI, CompileResponseSchema, Identity } from '../api/base';
+import { BaseAPI, CompileResponseSchema, GitTokenInfo, Identity } from '../api/base';
 import type { FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
 import { CompileRequest, EntityType, JoinedView, ProjectView, ProjectWriter } from './guard';
 import { decodePackedUtf8 } from '../api/packedUtf8';
@@ -157,6 +157,15 @@ export class OverleafClient implements ProjectWriter {
         } finally {
             OverleafClient.close(socket);
         }
+    }
+
+    /** The account's git authentication tokens, as Account Settings lists them. */
+    async gitTokens(): Promise<GitTokenInfo[]> {
+        const res = await this.api.listGitTokens(this.identity);
+        if (res.type !== 'success' || !res.gitTokens) {
+            throw new Error(`listing the git tokens failed: ${res.message}`);
+        }
+        return res.gitTokens;
     }
 
     docText(projectId: string, docId: string): Promise<string> {

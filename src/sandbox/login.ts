@@ -9,6 +9,11 @@ export interface StoredLogin {
     url: string;
     userId: string;
     identity: Identity;
+    /**
+     * The account's git authentication token, when the extension keeps one: in the server's
+     * `gitTokens`, by user id (GlobalStateManager.setGitToken).
+     */
+    gitToken?: string;
     /** where it was read from */
     source: string;
 }
@@ -50,8 +55,8 @@ function readExtensionState(file: string): any | undefined {
 
 /**
  * The login for `serverName` (e.g. www.overleaf.com). From the environment variable
- * OVERLEAF_LOGIN when it is set, a JSON object {url, cookies, csrfToken, userId}; otherwise
- * from the state database `stateDb`, or the first of the usual ones that has a login.
+ * OVERLEAF_LOGIN when it is set, a JSON object {url, cookies, csrfToken, userId, gitToken?};
+ * otherwise from the state database `stateDb`, or the first of the usual ones that has a login.
  */
 export function readStoredLogin(serverName: string, stateDb?: string): StoredLogin {
     const fromEnv = process.env.OVERLEAF_LOGIN;
@@ -61,7 +66,8 @@ export function readStoredLogin(serverName: string, stateDb?: string): StoredLog
         if (!value.url || !value.cookies || !csrfToken || !value.userId) {
             throw new Error('OVERLEAF_LOGIN needs url, cookies, csrfToken and userId');
         }
-        return { url: value.url, userId: value.userId, identity: { cookies: value.cookies, csrfToken }, source: 'OVERLEAF_LOGIN' };
+        return { url: value.url, userId: value.userId, identity: { cookies: value.cookies, csrfToken },
+                 gitToken: value.gitToken || undefined, source: 'OVERLEAF_LOGIN' };
     }
     const candidates = stateDb ? [stateDb] : stateDatabaseCandidates().filter(file => fs.existsSync(file));
     const tried: string[] = [];
@@ -70,7 +76,8 @@ export function readStoredLogin(serverName: string, stateDb?: string): StoredLog
         const server = state?.['overleaf-servers']?.[serverName];
         const login = server?.login;
         if (login?.identity?.cookies && login?.identity?.csrfToken && login?.userId) {
-            return { url: server.url, userId: login.userId, identity: login.identity, source: file };
+            const gitToken: string | undefined = server.gitTokens?.[login.userId]?.token || undefined;
+            return { url: server.url, userId: login.userId, identity: login.identity, gitToken, source: file };
         }
         tried.push(file);
     }

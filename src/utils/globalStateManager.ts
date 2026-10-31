@@ -6,6 +6,16 @@ import { ExtendedBaseAPI } from '../api/extendedBase';
 const keyServerPersists: string = 'overleaf-servers';
 const keyPdfViewPersists: string = 'overleaf-pdf-viewers';
 
+/** A git authentication token for the server's git bridge, kept for one account. */
+export interface GitTokenPersist {
+    /** what git sends as the password, with the user name "git" */
+    token: string;
+    /** Overleaf's id for the token, when it is known; revoking the token needs it */
+    id?: string;
+    createdAt?: string;
+    expiresAt?: string;
+}
+
 export interface ServerPersist {
     name: string;
     url: string;
@@ -15,6 +25,12 @@ export interface ServerPersist {
         identity: Identity;
         projects?: ProjectPersist[]
     };
+    /**
+     * Git authentication tokens, by the user id of the login they belong to. They sit next to
+     * `login` rather than in it: an expired session cookie removes `login`, and a token stays
+     * valid for a year, so the next login of the same account finds it again.
+     */
+    gitTokens?: {[userId: string]: GitTokenPersist};
 }
 type ServerPersistMap = {[name: string]: ServerPersist};
 
@@ -99,18 +115,55 @@ export class GlobalStateManager {
         }
     }
 
-    static async logoutServer(context:vscode.ExtensionContext, api:BaseAPI, name:string): Promise<boolean> {
+    /**
+     * Log out of the server. A logout the user asks for also removes the account's git
+     * token; `keepGitToken` keeps it, for the logout after the session cookie expired.
+     */
+    static async logoutServer(context:vscode.ExtensionContext, api:BaseAPI, name:string, keepGitToken = false): Promise<boolean> {
         const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
         const server   = persists[name];
 
         if (server.login!==undefined) {
             await api.logout(server.login.identity);
+            if (!keepGitToken && server.gitTokens) {
+                delete server.gitTokens[server.login.userId];
+            }
             delete server.login;
             context.globalState.update(keyServerPersists, persists);
             return true;
         } else {
             return false;
         }
+    }
+
+    /** The git token of the account that is logged in to the server. */
+    static getGitToken(context:vscode.ExtensionContext, name:string): GitTokenPersist | undefined {
+        const server = context.globalState.get<ServerPersistMap>(keyServerPersists, {})[name];
+        return server?.login ? server.gitTokens?.[server.login.userId] : undefined;
+    }
+
+    /** Keep `gitToken` for the account that is logged in to the server; false when nobody is. */
+    static async setGitToken(context:vscode.ExtensionContext, name:string, gitToken:GitTokenPersist): Promise<boolean> {
+        const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
+        const server   = persists[name];
+        if (server?.login===undefined) {
+            return false;
+        }
+        server.gitTokens = {...server.gitTokens, [server.login.userId]: gitToken};
+        await context.globalState.update(keyServerPersists, persists);
+        return true;
+    }
+
+    /** Forget the git token of the account that is logged in; returns what was stored. */
+    static async removeGitToken(context:vscode.ExtensionContext, name:string): Promise<GitTokenPersist | undefined> {
+        const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
+        const server   = persists[name];
+        const stored   = server?.login ? server.gitTokens?.[server.login.userId] : undefined;
+        if (stored!==undefined) {
+            delete server.gitTokens![server.login!.userId];
+            await context.globalState.update(keyServerPersists, persists);
+        }
+        return stored;
     }
 
     static async fetchServerProjects(context:vscode.ExtensionContext, api:BaseAPI, name:string): Promise<ProjectPersist[]> {

@@ -1,9 +1,11 @@
 import * as vscode from 'vscode';
 import { ROOT_NAME } from '../consts';
-import { ProjectTagsResponseSchema } from '../api/base';
-import { GlobalStateManager } from '../utils/globalStateManager';
+import { BaseAPI, GitTokenInfo, Identity, ProjectTagsResponseSchema } from '../api/base';
+import { checkGitToken, formatGitTokenStatus, gitTokenStatus, knownGitBridgeUrl } from '../api/gitBridge';
+import { GitTokenPersist, GlobalStateManager } from '../utils/globalStateManager';
 import { VirtualFileSystem, parseUri } from './remoteFileSystemProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
+import { OverleafClient } from '../sandbox/client';
 
 class DataItem extends vscode.TreeItem {
     constructor(
@@ -104,8 +106,8 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             if (element instanceof ServerItem) {
                 return GlobalStateManager.fetchServerProjects(this.context, element.api, element.name)
                 .catch(() => {
-                    // Direct logout if cookie expired
-                    GlobalStateManager.logoutServer(this.context, element.api, element.name)
+                    // Direct logout if cookie expired; the account's git token stays valid
+                    GlobalStateManager.logoutServer(this.context, element.api, element.name, true)
                     .then(success => {
                         if (success) {
                             this.refresh();
@@ -281,6 +283,117 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     refreshServer(server: ServerItem) {
         this.refresh();
+    }
+
+    /** The logged-in server to act on: the tree's item, the only logged-in server, or one the user picks. */
+    private async loggedInServer(server?: {name: string}): Promise<{name: string, url: string, api: BaseAPI, username: string} | undefined> {
+        const loggedIn = GlobalStateManager.getServers(this.context).filter(({server}) => server.login!==undefined)
+            .map(({server, api}) => ({name: server.name, url: server.url, api, username: server.login!.username}));
+        if (server) {
+            return loggedIn.find(s => s.name===server.name);
+        }
+        if (loggedIn.length<=1) {
+            return loggedIn[0];
+        }
+        const picked = await vscode.window.showQuickPick(loggedIn.map(s => ({label: s.name, description: s.username})),
+                                                         {placeHolder: vscode.l10n.t('Select a server')});
+        return loggedIn.find(s => s.name===picked?.label);
+    }
+
+    /** Overleaf's id and dates for `token`, from Account Settings' list, matched by its first characters. */
+    private async describeGitToken(api: BaseAPI, identity: Identity, token: string): Promise<GitTokenPersist> {
+        const res = await api.listGitTokens(identity);
+        const matches = (res.gitTokens ?? []).filter((entry: GitTokenInfo) => entry.accessTokenPartial && token.startsWith(entry.accessTokenPartial));
+        const entry = matches.length===1 ? matches[0] : undefined;
+        return {token, id: entry?._id, createdAt: entry?.createdAt, expiresAt: entry?.accessTokenExpiresAt};
+    }
+
+    /**
+     * Keep, create, check or remove the git token of a logged-in account. The token is stored
+     * with the login, in the extension's global state (GlobalStateManager.setGitToken), where
+     * the command-line tool reads it too.
+     */
+    async manageGitToken(item?: ServerItem) {
+        const server = await this.loggedInServer(item);
+        if (server===undefined) {
+            vscode.window.showErrorMessage(vscode.l10n.t('Log in to a server first.'));
+            return;
+        }
+        const identity = await GlobalStateManager.authenticate(this.context, server.name);
+        const bridgeUrl = knownGitBridgeUrl(server.url);
+        const stored = GlobalStateManager.getGitToken(this.context, server.name);
+        const actions = [
+            {label: vscode.l10n.t('Enter a git token...'), action: 'enter',
+             detail: vscode.l10n.t('A token from Account Settings > Git Integration on Overleaf')},
+            {label: vscode.l10n.t('Create a new git token on Overleaf'), action: 'create',
+             detail: vscode.l10n.t('As Account Settings does; an account can have at most 10 tokens')},
+            ...(stored ? [
+                {label: vscode.l10n.t('Check the stored git token'), action: 'check', detail: ''},
+                {label: vscode.l10n.t('Remove the stored git token'), action: 'remove',
+                 detail: vscode.l10n.t('The token stays valid on Overleaf')},
+            ] : []),
+            ...(stored?.id ? [{label: vscode.l10n.t('Remove the stored git token and revoke it on Overleaf'), action: 'revoke', detail: ''}] : []),
+        ];
+        const picked = await vscode.window.showQuickPick(actions, {placeHolder: stored
+            ? vscode.l10n.t('A git token is stored for {user} on {server}', {user: server.username, server: server.name})
+            : vscode.l10n.t('No git token is stored for {user} on {server}', {user: server.username, server: server.name})});
+        try {
+            switch (picked?.action) {
+                case 'enter': {
+                    const token = (await vscode.window.showInputBox({
+                        password: true, ignoreFocusOut: true,
+                        prompt: vscode.l10n.t('Git authentication token for {user} on {server}', {user: server.username, server: server.name}),
+                        validateInput: value => /^\S+$/.test(value.trim()) ? undefined : vscode.l10n.t('A token has no spaces'),
+                    }))?.trim();
+                    if (!token) { return; }
+                    if (bridgeUrl && await checkGitToken(bridgeUrl, token)==='rejected') {
+                        vscode.window.showErrorMessage(vscode.l10n.t('The git bridge rejects this token; it is wrong, expired or revoked. Nothing was stored.'));
+                        return;
+                    }
+                    await GlobalStateManager.setGitToken(this.context, server.name, await this.describeGitToken(server.api, identity, token));
+                    vscode.window.showInformationMessage(vscode.l10n.t('Stored the git token for {user} on {server}.', {user: server.username, server: server.name}));
+                    break;
+                }
+                case 'create': {
+                    const res = await server.api.createGitToken(identity);
+                    if (res.type!=='success' || !res.gitToken) {
+                        vscode.window.showErrorMessage(vscode.l10n.t('Creating a git token failed: {message}', {message: res.message ?? ''}));
+                        return;
+                    }
+                    const created = await this.describeGitToken(server.api, identity, res.gitToken);
+                    await GlobalStateManager.setGitToken(this.context, server.name, created);
+                    vscode.window.showInformationMessage(vscode.l10n.t('Created and stored a git token for {user} on {server}, valid until {date}.',
+                        {user: server.username, server: server.name, date: created.expiresAt?.slice(0, 10) ?? '?'}));
+                    break;
+                }
+                case 'check': {
+                    const client = new OverleafClient(server.url, identity);
+                    const status = await gitTokenStatus(() => client.gitTokens(), stored!.token, bridgeUrl);
+                    if (status.check==='accepted') {
+                        vscode.window.showInformationMessage(formatGitTokenStatus(status));
+                    } else {
+                        vscode.window.showErrorMessage(formatGitTokenStatus(status));
+                    }
+                    break;
+                }
+                case 'remove':
+                    await GlobalStateManager.removeGitToken(this.context, server.name);
+                    vscode.window.showInformationMessage(vscode.l10n.t('Removed the stored git token for {user} on {server}.', {user: server.username, server: server.name}));
+                    break;
+                case 'revoke': {
+                    const res = await server.api.revokeGitToken(identity, stored!.id!);
+                    if (res.type!=='success') {
+                        vscode.window.showErrorMessage(vscode.l10n.t('Revoking the git token failed: {message}', {message: res.message ?? ''}));
+                        return;
+                    }
+                    await GlobalStateManager.removeGitToken(this.context, server.name);
+                    vscode.window.showInformationMessage(vscode.l10n.t('Revoked the git token on Overleaf and removed it here.'));
+                    break;
+                }
+            }
+        } catch (error: any) {
+            vscode.window.showErrorMessage(vscode.l10n.t('Git token: {message}', {message: error?.message ?? String(error)}));
+        }
     }
 
     newProject(server: ServerItem) {
@@ -661,6 +774,9 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.logoutServer`, (item) => {
                 this.logoutServer(item);
+            }),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.gitToken`, (item) => {
+                this.manageGitToken(item);
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.refreshServer`, (item) => {
                 this.refreshServer(item);

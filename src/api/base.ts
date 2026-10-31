@@ -116,6 +116,21 @@ export interface ProjectPersist {
     scm?: any; //injected by SCMCollectionProvider
 }
 
+/**
+ * A git authentication token as Overleaf's account settings list it: the token itself
+ * appears only once, in the answer to the request that creates it.
+ */
+export interface GitTokenInfo {
+    _id: string,
+    /** the token's first characters, e.g. "olp_58Pf" */
+    accessTokenPartial: string,
+    createdAt: string,
+    accessTokenExpiresAt: string,
+    lastUsedAt?: string,
+    /** "git_bridge" */
+    scope: string,
+}
+
 export interface ProjectTagsResponseSchema {
     __v: number,
     _id: string,
@@ -210,6 +225,8 @@ export interface ResponseSchema {
     treeDiff?: ProjectFileTreeDiffResponseSchema;
     messages?: ProjectMessageResponseSchema[];
     settings?: ProjectSettingsSchema;
+    gitTokens?: GitTokenInfo[];
+    gitToken?: string;
 }
 
 /** How `BaseAPI.request` sends one request. */
@@ -637,6 +654,34 @@ export class BaseAPI {
     async deleteProject(identity:Identity, projectId:string) {
         this.setIdentity(identity);
         return this.request('DELETE', `project/${projectId}`);
+    }
+
+    /** The account's git authentication tokens, as the Git Integration part of Account Settings lists them. */
+    async listGitTokens(identity:Identity): Promise<ResponseSchema> {
+        this.setIdentity(identity);
+        return this.request('GET', 'oauth/personal-access-tokens', undefined, (res) => {
+            const gitTokens = JSON.parse(res!) as GitTokenInfo[];
+            return {gitTokens};
+        }, {'Accept': 'application/json'});
+    }
+
+    /**
+     * Create a git authentication token, as Account Settings does. An account can have at most
+     * ten. The request is sent once: sent again after an error, it could create a second token.
+     */
+    async createGitToken(identity:Identity): Promise<ResponseSchema> {
+        this.setIdentity(identity);
+        return this.request('POST', 'oauth/personal-access-tokens', {}, (res) => {
+            const gitToken = (JSON.parse(res!) as {accessToken?: string}).accessToken;
+            return {gitToken};
+        }, {'Accept': 'application/json', 'X-Csrf-Token': identity.csrfToken}, {retries: 0});
+    }
+
+    /** Revoke the git authentication token with Overleaf's id `tokenId`. */
+    async revokeGitToken(identity:Identity, tokenId:string): Promise<ResponseSchema> {
+        this.setIdentity(identity);
+        return this.request('DELETE', `oauth/personal-access-tokens/${encodeURIComponent(tokenId)}`,
+                            undefined, undefined, {'Accept': 'application/json'});
     }
 
     async archiveProject(identity:Identity, projectId:string) {

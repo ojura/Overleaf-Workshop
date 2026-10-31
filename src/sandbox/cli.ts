@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 /* eslint-disable @typescript-eslint/naming-convention */
+import * as fs from 'fs';
 import * as path from 'path';
+import { formatGitTokenStatus, gitTokenStatus, knownGitBridgeUrl } from '../api/gitBridge';
 import { OverleafClient } from './client';
-import { readStoredLogin } from './login';
+import { cloneProject, credentialAnswer, credentialHelperCommand, fetchProject, parseCredentialInput, stableNodePath } from './git';
+import { readStoredLogin, StoredLogin } from './login';
 import { SandboxSafetyError } from './guard';
 import { LockTimeoutError } from './lock';
 import { describeFindings, describeRanges, exitStatusOf, pushCheck, RANGES_HELP } from './rangesCli';
@@ -11,8 +14,9 @@ import {
     settingsOf,
 } from './sandbox';
 
-const HELP = `Compile a local directory on Overleaf, in a private copy of a shared project, and
-check what a git push would do to the comments and tracked changes of a project.
+const HELP = `Compile a local directory on Overleaf, in a private copy of a shared project;
+reach a project through Overleaf's git bridge, and check what a push would do to the
+comments and tracked changes of a project.
 
 usage:
   node out/sandbox/cli.js init    --replica <folder> [--name <name>]
@@ -21,6 +25,10 @@ usage:
   node out/sandbox/cli.js plan    --replica <folder> --dir <folder> --main <file> [options]
   node out/sandbox/cli.js ranges  --project <id> | --replica <folder>
   node out/sandbox/cli.js push-check --repo <folder> [--from <rev>] [--to <rev>] [--project <id>] [--user <id>]
+  node out/sandbox/cli.js git-token [--replica <folder>] [--server <name>]
+  node out/sandbox/cli.js git-clone (--replica <folder> | --project <id>) --into <folder> [--server <name>]
+  node out/sandbox/cli.js git-fetch --into <folder>
+  node out/sandbox/cli.js git-credential get|store|erase --server <name> --bridge <url>
 
 --replica <folder>  the shared project's local replica. Its .overleaf/settings.json names
                     the project; .overleaf/sandbox.json records the private copy.
@@ -37,6 +45,27 @@ compile  Makes the copy hold --dir laid over the shared project, compiles --main
 plan     Says what compile would upload and delete, without writing anything.
 
 ${RANGES_HELP}
+git-token     Says whether the extension keeps a git token for this account, whether the
+              git bridge accepts it, and how Account Settings lists it. The check asks the
+              bridge for a project id that no project can have, so it does not make a
+              commit on Overleaf; it does count as a use of the token.
+git-clone     Clones the project through the git bridge into --into. git gets the token
+              from git-credential, and the clone keeps that helper in its own
+              configuration, so git fetch and git pull work there. Neither the address nor
+              any configuration holds the token. Overleaf makes a commit for the
+              project's current state when none exists yet.
+git-fetch     git fetch in such a clone. It too makes Overleaf commit the current state
+              when none exists yet.
+git-credential  The credential helper that git-clone configures; git starts it.
+
+--server <name>  the server's name in the extension, e.g. www.overleaf.com; by default the
+                 replica's, or www.overleaf.com
+--bridge <url>   the server's git bridge; www.overleaf.com's is known. A project's editor
+                 page names it in the meta tag ol-gitBridgePublicBaseUrl.
+
+The git token is the one the extension keeps next to its login (Overleaf Workshop: Git
+Token..., on a server of the Projects view). OVERLEAF_LOGIN may give it as "gitToken".
+
 What the copy holds for a compile:
   a path in --dir                 the directory's file
   a path only in the shared       the shared project's current version
@@ -98,7 +127,9 @@ names the database. The environment variable OVERLEAF_LOGIN, a JSON object
 `;
 
 const VALUE_FLAGS = new Set(['replica', 'dir', 'main', 'out', 'keep', 'ignore', 'include', 'lock-timeout', 'purpose', 'name', 'state-db',
-    'project', 'repo', 'from', 'to', 'user', 'server']);
+    'project', 'repo', 'from', 'to', 'user', 'server', 'into', 'bridge']);
+const GIT_AND_INFO_COMMANDS = ['git-token', 'git-clone', 'git-fetch', 'git-credential'];
+const OBJECT_ID = /^[0-9a-f]{24}$/;
 const REPEATABLE = new Set(['keep', 'ignore', 'include']);
 const BOOLEAN_FLAGS = new Set(['mirror', 'incremental', 'draft', 'stop-on-first-error', 'pdf', 'json', 'help']);
 
@@ -169,12 +200,80 @@ function printSummary(summary: any, out?: string) {
     process.stdout.write(lines.join('\n') + '\n');
 }
 
+/** The server name and project id for the git commands: --replica, or --server and --project. */
+function serverAndProject(values: Record<string, string>): { serverName: string, projectId?: string } {
+    const replica = values.replica ? readReplica(path.resolve(values.replica)) : undefined;
+    const projectId = values.project ?? replica?.projectId;
+    if (projectId !== undefined && !OBJECT_ID.test(projectId)) { throw new UsageError(`--project takes a project id (24 hexadecimal digits), not ${projectId}`); }
+    return { serverName: values.server ?? replica?.serverName ?? 'www.overleaf.com', projectId };
+}
+
+/** The git bridge for `login`: --bridge, or the known one of its server. */
+const bridgeOf = (login: StoredLogin, values: Record<string, string>) => values.bridge ?? knownGitBridgeUrl(login.url);
+
+async function gitAndInfoCommand(command: string, values: Record<string, string>, flags: Set<string>, positional: string[]): Promise<number> {
+    if (command === 'git-credential') {
+        // git starts this with "get", "store" or "erase" and the request on stdin; only the
+        // answer may go to stdout
+        const action = positional[1];
+        if (!['get', 'store', 'erase'].includes(action)) { throw new UsageError('git-credential takes get, store or erase'); }
+        if (!values.bridge) { throw new UsageError('git-credential needs --bridge'); }
+        const request = parseCredentialInput(fs.readFileSync(0, 'utf8'));
+        let token: string | undefined;
+        if (action === 'get') {
+            const serverName = values.server ?? 'www.overleaf.com';
+            token = readStoredLogin(serverName, values['state-db']).gitToken;
+            if (!token) { log(`no git token is stored for ${serverName}; store one with the extension (Overleaf Workshop: Git Token...)`); }
+        }
+        process.stdout.write(credentialAnswer(action, request, values.bridge, token));
+        return 0;
+    }
+    if (positional.length > 1) { throw new UsageError(`unexpected argument ${positional[1]}`); }
+
+    if (command === 'git-fetch') {
+        if (!values.into) { throw new UsageError('--into is required'); }
+        log('fetching; Overleaf makes a commit for the project\'s current state when none exists yet');
+        fetchProject({ into: path.resolve(values.into) });
+        return 0;
+    }
+
+    const { serverName, projectId } = serverAndProject(values);
+    const login = readStoredLogin(serverName, values['state-db']);
+    const client = new OverleafClient(login.url, login.identity);
+
+    if (command === 'git-token') {
+        if (!login.gitToken) {
+            process.stdout.write(`${formatGitTokenStatus({ stored: false })} (account ${login.userId} on ${serverName})\n`);
+            return 1;
+        }
+        const status = await gitTokenStatus(() => client.gitTokens(), login.gitToken, bridgeOf(login, values));
+        process.stdout.write(`${formatGitTokenStatus(status)} (account ${login.userId} on ${serverName})\n`);
+        return status.check === 'accepted' ? 0 : 1;
+    }
+
+    if (!projectId) { throw new UsageError(`${command} needs --replica or --project`); }
+
+    // git-clone
+    if (!values.into) { throw new UsageError('--into is required'); }
+    if (!login.gitToken) { throw new Error(`no git token is stored for ${serverName}; store one with the extension (Overleaf Workshop: Git Token...)`); }
+    const bridgeUrl = bridgeOf(login, values);
+    if (!bridgeUrl) { throw new Error(`the git bridge of ${serverName} is not known; give --bridge <url> (a project's editor page names it in ol-gitBridgePublicBaseUrl)`); }
+    const into = path.resolve(values.into);
+    log(`cloning ${projectId} from ${bridgeUrl}; Overleaf makes a commit for the project's current state when none exists yet`);
+    cloneProject({ bridgeUrl, projectId, into, helper: credentialHelperCommand(stableNodePath(process.execPath), __filename, serverName, bridgeUrl) });
+    process.stdout.write(`cloned ${projectId} into ${into}; git fetch and git pull there get the token from this tool\n`);
+    return 0;
+}
+
 async function main(argv: string[]): Promise<number> {
     const { values, lists, flags, positional } = parseArgs(argv);
     const command = positional[0];
     if (flags.has('help') || command === undefined || command === 'help') {
         process.stdout.write(HELP);
         return command === undefined && !flags.has('help') ? 2 : 0;
+    }
+    if (GIT_AND_INFO_COMMANDS.includes(command)) {
+        return gitAndInfoCommand(command, values, flags, positional);
     }
     if (!['init', 'status', 'compile', 'plan', 'ranges', 'push-check'].includes(command)) { throw new UsageError(`unknown command ${command}`); }
     if (positional.length > 1) { throw new UsageError(`unexpected argument ${positional[1]}`); }
