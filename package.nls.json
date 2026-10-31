@@ -10,6 +10,7 @@
     "commands.projectManager.loginServer.title": "Login to Server",
     "commands.projectManager.logoutServer.title": "Logout from Server",
     "commands.projectManager.gitToken.title": "Git Token...",
+    "commands.projectManager.projectInfo.title": "Project Info",
     "commands.projectManager.refreshServer.title": "Refresh Project List",
     "commands.projectManager.newProject.title": "New Project",
     "commands.projectManager.copyProject.title": "Make a Copy",

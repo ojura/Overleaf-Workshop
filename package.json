@@ -169,6 +169,12 @@
         "category": "%extension.displayName%"
       },
       {
+        "command": "overleaf-workshop.projectManager.projectInfo",
+        "title": "%commands.projectManager.projectInfo.title%",
+        "icon": "$(info)",
+        "category": "%extension.displayName%"
+      },
+      {
         "command": "overleaf-workshop.projectManager.newProject",
         "title": "%commands.projectManager.newProject.title%",
         "icon": "$(add)",
@@ -809,6 +815,11 @@
           "command": "overleaf-workshop.projectManager.gitToken",
           "when": "view == overleaf-workshop.projectManager && viewItem == server_login",
           "group": "9_git"
+        },
+        {
+          "command": "overleaf-workshop.projectManager.projectInfo",
+          "when": "view == overleaf-workshop.projectManager && viewItem =~ /project/",
+          "group": "9_info"
         }
       ]
     },

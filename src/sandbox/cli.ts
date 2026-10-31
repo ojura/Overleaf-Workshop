@@ -6,6 +6,7 @@ import { formatGitTokenStatus, gitTokenStatus, knownGitBridgeUrl } from '../api/
 import { OverleafClient } from './client';
 import { cloneProject, credentialAnswer, credentialHelperCommand, fetchProject, parseCredentialInput, stableNodePath } from './git';
 import { readStoredLogin, StoredLogin } from './login';
+import { formatProjectInfo, gatherProjectInfo } from './projectInfo';
 import { SandboxSafetyError } from './guard';
 import { LockTimeoutError } from './lock';
 import { describeFindings, describeRanges, exitStatusOf, pushCheck, RANGES_HELP } from './rangesCli';
@@ -15,8 +16,8 @@ import {
 } from './sandbox';
 
 const HELP = `Compile a local directory on Overleaf, in a private copy of a shared project;
-reach a project through Overleaf's git bridge, and check what a push would do to the
-comments and tracked changes of a project.
+describe a project; reach it through Overleaf's git bridge, and check what a push
+would do to its comments and tracked changes.
 
 usage:
   node out/sandbox/cli.js init    --replica <folder> [--name <name>]
@@ -25,6 +26,7 @@ usage:
   node out/sandbox/cli.js plan    --replica <folder> --dir <folder> --main <file> [options]
   node out/sandbox/cli.js ranges  --project <id> | --replica <folder>
   node out/sandbox/cli.js push-check --repo <folder> [--from <rev>] [--to <rev>] [--project <id>] [--user <id>]
+  node out/sandbox/cli.js project-info (--replica <folder> | --project <id>) [--server <name>] [--json]
   node out/sandbox/cli.js git-token [--replica <folder>] [--server <name>]
   node out/sandbox/cli.js git-clone (--replica <folder> | --project <id>) --into <folder> [--server <name>]
   node out/sandbox/cli.js git-fetch --into <folder>
@@ -45,6 +47,11 @@ compile  Makes the copy hold --dir laid over the shared project, compiles --main
 plan     Says what compile would upload and delete, without writing anything.
 
 ${RANGES_HELP}
+project-info  Reads a project without changing it: its settings and features (gitBridge
+              among them), the owner, your access level, the collaborators and invites,
+              link sharing, who has track changes on, the comments and tracked changes of
+              every document and the comment threads, and the git token's state. It joins
+              the project once, as the editor does, so others see you online meanwhile.
 git-token     Says whether the extension keeps a git token for this account, whether the
               git bridge accepts it, and how Account Settings lists it. The check asks the
               bridge for a project id that no project can have, so it does not make a
@@ -128,7 +135,7 @@ names the database. The environment variable OVERLEAF_LOGIN, a JSON object
 
 const VALUE_FLAGS = new Set(['replica', 'dir', 'main', 'out', 'keep', 'ignore', 'include', 'lock-timeout', 'purpose', 'name', 'state-db',
     'project', 'repo', 'from', 'to', 'user', 'server', 'into', 'bridge']);
-const GIT_AND_INFO_COMMANDS = ['git-token', 'git-clone', 'git-fetch', 'git-credential'];
+const GIT_AND_INFO_COMMANDS = ['project-info', 'git-token', 'git-clone', 'git-fetch', 'git-credential'];
 const OBJECT_ID = /^[0-9a-f]{24}$/;
 const REPEATABLE = new Set(['keep', 'ignore', 'include']);
 const BOOLEAN_FLAGS = new Set(['mirror', 'incremental', 'draft', 'stop-on-first-error', 'pdf', 'json', 'help']);
@@ -200,7 +207,7 @@ function printSummary(summary: any, out?: string) {
     process.stdout.write(lines.join('\n') + '\n');
 }
 
-/** The server name and project id for the git commands: --replica, or --server and --project. */
+/** The server name and project id: --replica, or --server and --project. */
 function serverAndProject(values: Record<string, string>): { serverName: string, projectId?: string } {
     const replica = values.replica ? readReplica(path.resolve(values.replica)) : undefined;
     const projectId = values.project ?? replica?.projectId;
@@ -253,6 +260,12 @@ async function gitAndInfoCommand(command: string, values: Record<string, string>
 
     if (!projectId) { throw new UsageError(`${command} needs --replica or --project`); }
 
+    if (command === 'project-info') {
+        const info = await gatherProjectInfo(client, projectId, { token: login.gitToken, bridgeUrl: bridgeOf(login, values) });
+        process.stdout.write(flags.has('json') ? JSON.stringify(info, null, 2) + '\n' : formatProjectInfo(info));
+        return 0;
+    }
+
     // git-clone
     if (!values.into) { throw new UsageError('--into is required'); }
     if (!login.gitToken) { throw new Error(`no git token is stored for ${serverName}; store one with the extension (Overleaf Workshop: Git Token...)`); }
@@ -278,18 +291,17 @@ async function main(argv: string[]): Promise<number> {
     if (!['init', 'status', 'compile', 'plan', 'ranges', 'push-check'].includes(command)) { throw new UsageError(`unknown command ${command}`); }
     if (positional.length > 1) { throw new UsageError(`unexpected argument ${positional[1]}`); }
     if (command === 'ranges' || command === 'push-check') {
-        const replica = values.replica ? readReplica(path.resolve(values.replica)) : undefined;
-        const login = readStoredLogin(values.server ?? replica?.serverName ?? 'www.overleaf.com', values['state-db']);
+        const { serverName, projectId } = serverAndProject(values);
+        const login = readStoredLogin(serverName, values['state-db']);
         const client = new OverleafClient(login.url, login.identity);
         if (command === 'ranges') {
-            const projectId = values.project ?? replica?.projectId;
             if (!projectId) { throw new UsageError('ranges needs --project or --replica'); }
             const state = await client.readRanges(projectId);
             process.stdout.write(flags.has('json') ? JSON.stringify(state, null, 2) + '\n' : describeRanges(state));
             return 0;
         }
         if (!values.repo) { throw new UsageError('push-check needs --repo'); }
-        const result = await pushCheck(client, { repo: values.repo, from: values.from, to: values.to, project: values.project ?? replica?.projectId, userId: values.user ?? login.userId });
+        const result = await pushCheck(client, { repo: values.repo, from: values.from, to: values.to, project: projectId, userId: values.user ?? login.userId });
         process.stdout.write(flags.has('json') ? JSON.stringify({ summary: result.summary, findings: result.findings }, null, 2) + '\n' : describeFindings(result.findings, result.summary));
         return exitStatusOf(result.findings);
     }

@@ -6,6 +6,7 @@ import { GitTokenPersist, GlobalStateManager } from '../utils/globalStateManager
 import { VirtualFileSystem, parseUri } from './remoteFileSystemProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 import { OverleafClient } from '../sandbox/client';
+import { formatProjectInfo, gatherProjectInfo } from '../sandbox/projectInfo';
 
 class DataItem extends vscode.TreeItem {
     constructor(
@@ -396,6 +397,53 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         }
     }
 
+    /** The project of the open workspace: an Overleaf folder, or a local replica's .overleaf/settings.json. */
+    private async workspaceProject(): Promise<{serverName: string, projectId: string} | undefined> {
+        const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+        if (folder?.scheme===ROOT_NAME) {
+            const {serverName, projectId} = parseUri(folder);
+            return {serverName, projectId};
+        }
+        const settings = await LocalReplicaSCMProvider.readSettings();
+        if (settings?.uri) {
+            const {serverName, projectId} = parseUri(vscode.Uri.parse(settings.uri));
+            return {serverName, projectId};
+        }
+        return undefined;
+    }
+
+    /**
+     * Show what project-info reports about a project: from the Projects view's item, or the open
+     * workspace's project. Everything is read when the command runs.
+     */
+    async showProjectInfo(item?: ProjectItem) {
+        const target = item ? {serverName: item.parent.name, projectId: item.pid} : await this.workspaceProject();
+        if (target===undefined) {
+            vscode.window.showErrorMessage(vscode.l10n.t('Open an Overleaf project or a local replica, or run this on a project in the Projects view.'));
+            return;
+        }
+        const server = await this.loggedInServer({name: target.serverName});
+        if (server===undefined) {
+            vscode.window.showErrorMessage(vscode.l10n.t('Log in to {server} first.', {server: target.serverName}));
+            return;
+        }
+        const identity = await GlobalStateManager.authenticate(this.context, server.name);
+        const client = new OverleafClient(server.url, identity);
+        const token = GlobalStateManager.getGitToken(this.context, server.name)?.token;
+        try {
+            const info = await vscode.window.withProgress({location: vscode.ProgressLocation.Notification, title: vscode.l10n.t('Reading the project...')},
+                () => gatherProjectInfo(client, target.projectId, {token, bridgeUrl: knownGitBridgeUrl(server.url)}));
+            this.infoChannel ??= vscode.window.createOutputChannel(vscode.l10n.t('Overleaf Workshop: Project Info'));
+            this.infoChannel.clear();
+            this.infoChannel.append(formatProjectInfo(info));
+            this.infoChannel.show(true);
+        } catch (error: any) {
+            vscode.window.showErrorMessage(vscode.l10n.t('Project info: {message}', {message: error?.message ?? String(error)}));
+        }
+    }
+
+    private infoChannel?: vscode.OutputChannel;
+
     newProject(server: ServerItem) {
         // 'Blank Project', 'Example Project', 'Upload Project'
         vscode.window.showQuickPick([vscode.l10n.t('Blank Project'), vscode.l10n.t('Example Project'), vscode.l10n.t('Upload Project')])
@@ -777,6 +825,9 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.gitToken`, (item) => {
                 this.manageGitToken(item);
+            }),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.projectInfo`, (item) => {
+                this.showProjectInfo(item);
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.refreshServer`, (item) => {
                 this.refreshServer(item);

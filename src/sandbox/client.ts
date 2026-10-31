@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/naming-convention -- Overleaf's field names */
-import { BaseAPI, CompileResponseSchema, GitTokenInfo, Identity } from '../api/base';
+import { BaseAPI, CommentThreadSchema, CompileResponseSchema, GitTokenInfo, Identity } from '../api/base';
 import type { FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
 import { CompileRequest, EntityType, JoinedView, ProjectView, ProjectWriter } from './guard';
 import { decodePackedUtf8 } from '../api/packedUtf8';
@@ -31,6 +31,13 @@ class SandboxAPI extends BaseAPI {
     async docText(identity: Identity, projectId: string, docId: string): Promise<string> {
         this.setIdentity(identity);
         const content = await this.download(`Project/${projectId}/doc/${docId}/download`);
+        return content.toString('utf8');
+    }
+
+    /** The project's editor page, whose meta tags hold the editor's settings (editorPageMeta). */
+    async editorPage(identity: Identity, projectId: string): Promise<string> {
+        this.setIdentity(identity);
+        const content = await this.download(`project/${projectId}`);
         return content.toString('utf8');
     }
 
@@ -125,6 +132,14 @@ export class OverleafClient implements ProjectWriter {
      * editor's joinDoc returns them. Only reads: joinDoc and leaveDoc, never an update.
      */
     async readRanges(projectId: string): Promise<ProjectRanges> {
+        return (await this.readProject(projectId)).ranges;
+    }
+
+    /**
+     * readRanges, with the joined project too: push-check needs the ranges, project-info both,
+     * from one connection.
+     */
+    async readProject(projectId: string): Promise<{ joined: JoinedProject, ranges: ProjectRanges }> {
         const { joined, socket } = await this.open(projectId);
         const emit = (...args: any[]) => new Promise<any[]>((resolve, reject) => {
             const timer = setTimeout(() => reject(new Error(`${args[0]} took more than ${this.joinTimeoutMs/1000} s`)), this.joinTimeoutMs);
@@ -153,7 +168,7 @@ export class OverleafClient implements ProjectWriter {
             for (const user of [project.owner, ...(project.members ?? [])]) {
                 if (user?._id) { users[user._id] = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.email || user._id; }
             }
-            return { projectId, docs, trackChanges: project.trackChangesState ?? false, users };
+            return { joined, ranges: { projectId, docs, trackChanges: project.trackChangesState ?? false, users } };
         } finally {
             OverleafClient.close(socket);
         }
@@ -168,8 +183,21 @@ export class OverleafClient implements ProjectWriter {
         return res.gitTokens;
     }
 
+    /** The project's comment threads. */
+    async commentThreads(projectId: string): Promise<{[threadId: string]: CommentThreadSchema}> {
+        const res = await this.api.getCommentThreads(this.identity, projectId);
+        if (res.type !== 'success' || !res.threads) {
+            throw new Error(`reading the comment threads failed: ${res.message}`);
+        }
+        return res.threads;
+    }
+
     docText(projectId: string, docId: string): Promise<string> {
         return this.api.docText(this.identity, projectId, docId);
+    }
+
+    editorPage(projectId: string): Promise<string> {
+        return this.api.editorPage(this.identity, projectId);
     }
 
     async fileContent(projectId: string, fileId: string): Promise<Uint8Array> {

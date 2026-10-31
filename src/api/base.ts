@@ -131,6 +131,12 @@ export interface GitTokenInfo {
     scope: string,
 }
 
+/** A comment thread, as `project/:id/threads` returns it. */
+export interface CommentThreadSchema {
+    messages?: unknown[],
+    resolved?: boolean,
+}
+
 export interface ProjectTagsResponseSchema {
     __v: number,
     _id: string,
@@ -227,6 +233,7 @@ export interface ResponseSchema {
     settings?: ProjectSettingsSchema;
     gitTokens?: GitTokenInfo[];
     gitToken?: string;
+    threads?: {[threadId: string]: CommentThreadSchema};
 }
 
 /** How `BaseAPI.request` sends one request. */
@@ -682,6 +689,15 @@ export class BaseAPI {
         this.setIdentity(identity);
         return this.request('DELETE', `oauth/personal-access-tokens/${encodeURIComponent(tokenId)}`,
                             undefined, undefined, {'Accept': 'application/json'});
+    }
+
+    /** The project's comment threads; a resolved thread has `resolved: true`. */
+    async getCommentThreads(identity:Identity, projectId:string): Promise<ResponseSchema> {
+        this.setIdentity(identity);
+        return this.request('GET', `project/${projectId}/threads`, undefined, (res) => {
+            const threads = JSON.parse(res!) as {[threadId: string]: CommentThreadSchema};
+            return {threads};
+        }, {'Accept': 'application/json'});
     }
 
     async archiveProject(identity:Identity, projectId:string) {
