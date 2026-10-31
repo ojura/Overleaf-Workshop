@@ -9,6 +9,7 @@
 // associated with it while the script runs (associatePdfs). Test books are in the work folder
 // (common.mjs) once a harness script has written them: book/build-a.pdf (120 pages, with the text
 // "quick brown") and book-theme/build-a.pdf (1 page, with the text "IIII").
+import fs from 'node:fs';
 import path from 'node:path';
 import { arg } from '../common.mjs';
 import {
@@ -20,6 +21,11 @@ const pdf = arg('pdf');
 const expectedPages = Number(arg('pages'));
 if (!pdf || !expectedPages) {
     console.error('usage: node ide/drive-local-pdf.mjs --pdf <path> --pages N [--find TEXT] [--theme-book]');
+    process.exit(2);
+}
+// Quick Open finds files by name, so a path that does not exist could open another file of that name
+if (!fs.existsSync(path.resolve(pdf))) {
+    console.error(`${path.resolve(pdf)} does not exist`);
     process.exit(2);
 }
 const isThemeBook = process.argv.includes('--theme-book');

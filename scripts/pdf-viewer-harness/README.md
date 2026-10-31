@@ -56,7 +56,7 @@ request and as a plain page at 40 ms, and writes a table of the results.
 | `pdfjs-same-build-zoom.mjs` | pdfjs viewer: the build in view stays when the host sends it again; zoom steps of 1.25 |
 | `switch-button.mjs` | the button to the other viewer, and the message it sends the host |
 | `theme-colors.mjs` | the pixel colors of each color theme on the page of `theme_book.py` |
-| `toolbar-shots.mjs` | the toolbar at pane widths from 1400 to 300 px, and what reaches past the edge |
+| `toolbar-shots.mjs` | the toolbar at pane widths from 1400 to 220 px, with the pdfjs viewer's find bar and tools menu, and what reaches past the edge |
 | `live.mjs` | a real build from a saved compile response (see below) |
 
 ## Requirements
@@ -132,7 +132,7 @@ scripts/hidden-ide.sh stop
 | `drive-build.mjs` | reopens `output.pdf`; loading in ranges, jumps, and with `--theme-page N` the dark theme on page N |
 | `drive-switch.mjs` | on the open `output.pdf`: the viewer setting and each viewer's switch button |
 | `timeline.mjs` | reopens `output.pdf` and records the host's messages, pdf.js's events and the page's state |
-| `toolbar-shots.mjs` | screenshots of both toolbars at window widths from 1440 to 450 px |
+| `toolbar-shots.mjs` | screenshots of both toolbars at window widths from 1440 px down to a 220 px pane, and what reaches past the edge |
 | `find-image-page.mjs` | lists pages with images, for the theme checks |
 | `probe-page-colors.mjs` | page N in the default and the dark theme: changed colored pixels and drawing operators |
 | `snap-page.mjs` | page N in the default and the dark theme as PNGs, for a look by eye |

@@ -5,7 +5,8 @@
  */
 :root {
     --toolbar-height: 32px;
-    --outline-width: 260px;
+    /* no wider than the pane, which can be 220 px: the outline's scroll bar is at its right edge */
+    --outline-width: min(260px, 100vw);
 }
 
 html, body {
@@ -145,6 +146,13 @@ html, body {
 }
 @media (max-width: 330px) {
     #previousPage, #nextPage, #toolbar .separator { display: none; }
+}
+/* down to 220 px, the narrowest editor pane VS Code allows: tighter buttons and a shorter page field */
+@media (max-width: 300px) {
+    #toolbar { padding: 0 2px; gap: 1px; }
+    #toolbar button { min-width: 22px; padding: 0 4px; }
+    #toolbar button.icon { width: 24px; }
+    #pageNumber { width: 3.2em; }
 }
 
 #outline {

@@ -9,6 +9,40 @@ body {
     padding: 0;
 }
 
+/* VS Code lets an editor pane narrow to 220 px. pdf.js's viewer keeps its page at least 350 px
+   wide (#mainContainer), which in a narrower pane puts the toolbar's right end past the pane's
+   edge, with the tools menu that holds this viewer's own buttons below 750 px. So the page follows
+   the pane, and in a narrow pane the page count goes first, as in the Overleaf viewer. */
+#mainContainer {
+    min-width: 0;
+}
+@media (max-width: 360px) {
+    #numPages {
+        display: none;
+    }
+}
+/* The find bar opens 36 px from the left, under its button. It keeps pdf.js's 200 px search field
+   only where the pane leaves room for the field with its padding and the two arrows, and in a
+   narrow pane its rows of options wrap. The tools menu, 220 px wide at the right edge, narrows
+   with the pane. */
+#findbar {
+    min-width: 0;
+    max-width: calc(100vw - 40px);
+}
+#findbar #findInputContainer #findInput {
+    width: min(200px, calc(100vw - 126px));
+}
+@media (max-width: 300px) {
+    #findbar > * {
+        height: auto;
+        min-height: var(--toolbar-height);
+        flex-wrap: wrap;
+    }
+}
+#secondaryToolbar {
+    max-width: calc(100vw - 8px);
+}
+
 /* A webview cannot print, open a file chooser for this viewer, or link to a view of the
    document; annotation editing is off (main.ts). Download stays: the extension host saves
    the PDF (src/core/pdfViewEditorProvider.ts). */
