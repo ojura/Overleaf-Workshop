@@ -18,7 +18,8 @@ set -uo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 ide="$repo/scripts/hidden-ide.sh"
 cli="$repo/out/sandbox/cli.js"
-home=$(realpath -m "${HIDDEN_IDE_HOME:-/tmp/hidden-ide-$(id -u)}")
+[ -n "${HIDDEN_IDE_HOME:-}" ] || { echo "set HIDDEN_IDE_HOME to the folder of the test instance (scripts/hidden-ide.sh); it has no default" >&2; exit 64; }
+home=$(realpath -m -- "$HIDDEN_IDE_HOME")
 states="shown frozen hidden"; minutes=6.5; limit=60
 while [ $# -gt 0 ]; do
     case "$1" in

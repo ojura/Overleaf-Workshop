@@ -41,9 +41,13 @@
 # to those endpoints only, and checks that the process that answers is the instance's IDE, so that
 # two instances (for example of two agents) never reach each other's window.
 #
-# All of the instance lives in $HIDDEN_IDE_HOME (default /tmp/hidden-ide-$UID): profile/,
-# extensions/, replica/, home/ and run/ (below), instance.json and the logs. The replica folder is
-# kept between starts, so only the first start downloads the whole project. instance.json, for
+# All of the instance lives in $HIDDEN_IDE_HOME, a folder that each agent or person picks for an
+# instance of its own, for example below its own scratch folder, and names in every command. It has
+# no default, so that two agents never share an instance, and a stop in one agent's folder cannot
+# end another agent's tests. start makes the folder for this user only, and refuses a folder that
+# another user owns or that others can enter. It holds profile/, extensions/, replica/, home/ and
+# run/ (below), instance.json and the logs. The replica folder is kept between starts, so only the
+# first start downloads the whole project. instance.json, for
 # tools that drive the instance (scripts/lib/test-instance.mjs reads it): group (the process group
 # of the instance's session bus and IDE), pid (the IDE's main process), xvfb (the display's
 # process), display (":N"), devtools and inspector (the endpoints of the window's browser and of
@@ -70,13 +74,15 @@
 set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-home=$(realpath -m "${HIDDEN_IDE_HOME:-/tmp/hidden-ide-$(id -u)}")
+home=""
+if [ -n "${HIDDEN_IDE_HOME:-}" ]; then home=$(realpath -m -- "$HIDDEN_IDE_HOME"); fi
 state="$home/instance.json"
 user_state=${HIDDEN_IDE_USER_STATE:-"$HOME/.config/Antigravity IDE/User/globalStorage/state.vscdb"}
 user_extensions=${HIDDEN_IDE_USER_EXTENSIONS:-"$HOME/.antigravity-ide/extensions"}
 test_projects="${XDG_CONFIG_HOME:-$HOME/.config}/overleaf-workshop/test-projects"
 
 die() { echo "hidden-ide: $*" >&2; exit 1; }
+need_home() { [ -n "$home" ] || die "set HIDDEN_IDE_HOME to the folder of your own test instance, for example below your own scratch folder; it has no default, so that two agents never share an instance"; }
 field() { [ -f "$state" ] && python3 -I -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2]); print("" if v is None else v)' "$state" "$1"; }
 cmdline() { [ -n "${1:-}" ] && { tr '\0' ' ' < "/proc/$1/cmdline"; } 2>/dev/null; }
 # Whether instance.json's pid is still this instance's IDE, and its xvfb still the Xvfb that this
@@ -86,7 +92,7 @@ own_ide() { cmdline "$(field pid)" | grep -q -F -- "--user-data-dir=$home/profil
 # leader runs dbus-run-session with this instance's bus configuration.
 own_group() { cmdline "$(field group)" | grep -q -F -- "--config-file=$home/session-bus.conf "; }
 own_xvfb() { [ -n "$(field display)" ] && cmdline "$(field xvfb)" | grep -q -E "^Xvfb $(field display) "; }
-running() { own_ide || die "no instance is running"; }
+running() { need_home; own_ide || die "no instance is running in $home"; }
 # The X server of display N, as "pid N (command)", from its socket or else its lock file.
 display_holder() {
     local pid
@@ -126,6 +132,7 @@ stop_xvfb() {
 }
 
 start() {
+    need_home
     local project="" project_name="" folder="" build="" display=":99" screen="1600x1000" ide=""
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -179,6 +186,15 @@ start() {
     [ -n "$source_ext" ] || die "no installed Overleaf Workshop in $user_extensions"
 
     umask 077
+    # The folder holds the login copy and the control sockets: it belongs to this user, and others
+    # cannot enter it.
+    if [ -e "$home" ]; then
+        local info owner mode
+        info=$(stat -c '%u %a %F' -- "$home") || die "could not read the owner and mode of $home"
+        read -r owner mode _ <<< "$info"
+        [ -d "$home" ] && [ "$owner" = "$(id -u)" ] && (( (8#$mode & 8#077) == 0 )) \
+            || die "refusing $home: the instance's folder must be a folder of this user's that others cannot enter (mode 700)"
+    fi
     mkdir -p "$home/profile/User/globalStorage" "$home/extensions" "$home/home" "$home/run"
     if [ -n "$project" ]; then mkdir -p "$home/replica/.overleaf"; fi
     # the extensions: a copy of the installed Overleaf Workshop (and LaTeX Workshop, for .tex files)
@@ -343,6 +359,7 @@ EOF
 }
 
 stop() {
+    need_home
     if own_group; then
         local group=$(field group)
         # the whole process group: dbus-run-session, the session bus and the IDE with its processes
@@ -361,6 +378,7 @@ case "${1:-}" in
     start) shift; start "$@" ;;
     stop) stop ;;
     status)
+        need_home
         [ -f "$state" ] || die "no instance in $home"
         cat "$state"; own_ide && echo "running" || echo "not running" ;;
     window)

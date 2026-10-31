@@ -6,13 +6,19 @@
 // recorded endpoint reaches this instance's IDE or fails. Each connection also checks that the
 // process that answers is the IDE that start recorded (instance.json's pid).
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { connect, waitForActivePort, waitForTarget } from './devtools.mjs';
 
-/** The instance's folder: `explicit`, else HIDDEN_IDE_HOME, else hidden-ide-<uid> in /tmp. */
+/**
+ * The instance's folder: `explicit`, else HIDDEN_IDE_HOME. There is no default, so that two agents
+ * never share an instance.
+ */
 export function instanceHome(explicit) {
-    return path.resolve(explicit ?? process.env.HIDDEN_IDE_HOME ?? `/tmp/hidden-ide-${os.userInfo().uid}`);
+    const home = explicit ?? process.env.HIDDEN_IDE_HOME;
+    if (!home) {
+        throw new Error('name the folder of the test instance with --instance DIR or HIDDEN_IDE_HOME; it has no default, so that two agents never share an instance');
+    }
+    return path.resolve(home);
 }
 
 /** The record of the instance in `home`, with `home` added; fails when start has not written one. */

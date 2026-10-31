@@ -115,8 +115,8 @@ repository.
 
 The scripts in `ide/` drive the viewers in Antigravity itself, in the window of an instance that
 `scripts/hidden-ide.sh` started on a virtual display, and only there. They read the instance's
-`instance.json` in `$HIDDEN_IDE_HOME` (default `/tmp/hidden-ide-<uid>`), or in the folder that
-`--instance` names, connect to the DevTools endpoint that the instance's start recorded there, and
+`instance.json` in the folder that `--instance` names, or else in `$HIDDEN_IDE_HOME` (there is no
+default), connect to the DevTools endpoint that the instance's start recorded there, and
 go on only when the instance's IDE answers as itself (`scripts/lib/test-instance.mjs`). The
 settings they change are the instance's own (`profile/User/settings.json`), and they restore them
 when they end.

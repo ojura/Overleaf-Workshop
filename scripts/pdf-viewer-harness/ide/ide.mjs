@@ -1,6 +1,6 @@
 // What the IDE scripts share. They drive only the window of an Antigravity instance that
 // scripts/hidden-ide.sh started on a virtual display: the instance that instance.json describes in
-// $HIDDEN_IDE_HOME (default /tmp/hidden-ide-<uid>), or in the folder that --instance names. They
+// the folder that --instance names, or else in $HIDDEN_IDE_HOME (there is no default). They
 // connect to the DevTools endpoint that start recorded, and only after the instance's IDE has
 // answered there as itself (scripts/lib/test-instance.mjs); the workbench page and the viewers'
 // frames are sessions of that one connection.
