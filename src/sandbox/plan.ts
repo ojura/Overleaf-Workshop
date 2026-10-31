@@ -1,5 +1,6 @@
 import { isUtf8 } from 'buffer';
 import { mapLimit } from './mapLimit';
+import { overleafLineEndings } from '../utils/docUpdate';
 
 /**
  * Which writes make the sandbox hold the version to compile.
@@ -94,7 +95,7 @@ export function overleafText(bytes: Uint8Array): string | undefined {
     if (text.length >= MAX_DOC_LENGTH || text.includes('\x00') || /[\uD800-\uDFFF]/.test(text)) {
         return undefined;
     }
-    return text.split(/\r\n|\n|\r/).join('\n');
+    return overleafLineEndings(text);
 }
 
 function parentOf(path: string): string {

@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention -- Overleaf's field names (__guests__) */
 import * as assert from 'assert';
 import * as DiffMatchPatch from 'diff-match-patch';
-import { opsFor, semanticDiff, TextOp, trackChangesOn, trackedChangesSeed, updateMeta } from '../utils/docUpdate';
+import { opsFor, overleafLineEndings, semanticDiff, TextOp, trackChangesOn, trackedChangesSeed, updateMeta } from '../utils/docUpdate';
 
 /** Apply ops one after the other, as Overleaf does. */
 function apply(text: string, ops: TextOp[]): string {
@@ -35,6 +35,14 @@ describe('docUpdate: the ops of an update', () => {
         // the plain diff, which the extension used before: from the middle of one line to the middle of the next
         assert.deepStrictEqual(new DiffMatchPatch().diff_main(before, after).filter(d => d[0] !== 0), [[-1, '0 y.\nL1']]);
         assert.deepStrictEqual(semanticDiff(before, after).filter(d => d[0] !== 0), [[-1, 'L10 y.\n']]);
+    });
+});
+
+describe('docUpdate: line endings', () => {
+    it('gives the text Overleaf stores: "\\n" for "\\r\\n" and for a lone "\\r"', () => {
+        assert.strictEqual(overleafLineEndings('a\r\nb\rc\nd'), 'a\nb\nc\nd');
+        assert.strictEqual(overleafLineEndings('no line ending'), 'no line ending');
+        assert.strictEqual(overleafLineEndings('\r\n\r\n'), '\n\n');
     });
 });
 

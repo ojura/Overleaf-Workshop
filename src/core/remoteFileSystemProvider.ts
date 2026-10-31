@@ -4,7 +4,7 @@ import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, COMPILERS, CompileResponseSchema, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import type { CompileRecord } from '../compile/outputFiles';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
-import { opsFor, TrackChangesState, updateMeta } from '../utils/docUpdate';
+import { opsFor, overleafLineEndings, TrackChangesState, updateMeta } from '../utils/docUpdate';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { ClientManager } from '../collaboration/clientManager';
@@ -164,6 +164,21 @@ export class VirtualFileSystem extends vscode.Disposable {
     private reconnected?: {promise: Promise<void>, resolve: () => void};
     /** How long to wait for the server's ack of our own update before re-reading the doc. */
     static ownUpdateAckTimeoutMs = 5000;
+    /** whether this session has told the user that "\r\n" line endings go up as "\n" */
+    private static toldLineEndings = false;
+
+    /**
+     * `doc` was written with "\r\n" or "\r" line endings, which go up as "\n". The local
+     * replica then writes the file back with "\n" too, as Overleaf holds it, so the user is
+     * told once a session why the file changed.
+     */
+    private lineEndingsNormalized(doc: DocumentEntity) {
+        console.log(`${doc.name}: "\\r\\n" line endings written; sent with "\\n", as Overleaf stores them`);
+        if (VirtualFileSystem.toldLineEndings) { return; }
+        VirtualFileSystem.toldLineEndings = true;
+        vscode.window.showInformationMessage(vscode.l10n.t(
+            '{0} has Windows line endings (\\r\\n). Overleaf stores \\n, so it was uploaded with \\n, and the local replica writes it back with \\n. Other files with \\r\\n are handled the same way.', doc.name));
+    }
     private userId: string;
     private isDirty: boolean = true;
     /** the project has been compiled once since it was opened */
@@ -1116,7 +1131,11 @@ export class VirtualFileSystem extends vscode.Disposable {
         // if exists and is doc --> update
         if (fileType && fileType==='doc' && fileEntity) {
             const doc = fileEntity as DocumentEntity;
-            const _content = new TextDecoder().decode(content);
+            // Overleaf stores "\n" line endings, and drops the connection after an update
+            // that inserts "\r": send the text Overleaf stores
+            const decoded = new TextDecoder().decode(content);
+            const _content = overleafLineEndings(decoded);
+            if (_content!==decoded) { this.lineEndingsNormalized(doc); }
             // one write per doc at a time: wait until the previous one is reconciled
             await this.syncSettled(doc);
             if (doc.unconfirmed) {

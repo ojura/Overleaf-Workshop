@@ -505,6 +505,11 @@ export class SocketIOAPI {
         if (!update.op?.length) {
             return;
         }
+        // overleaf.com acknowledges an update that inserts "\r", does not apply it, and drops
+        // the connection; the document writes send the text with "\n" (overleafLineEndings)
+        if (update.op.some(op => op.i?.includes('\r') || op.d?.includes('\r'))) {
+            throw new Error('refused to send an update with a "\\r" character: Overleaf stores "\\n" line endings and drops the connection after such an update');
+        }
         return this.emit('applyOtUpdate', docId, update)
             .then(() => {
                 return;

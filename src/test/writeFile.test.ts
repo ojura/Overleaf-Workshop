@@ -239,6 +239,31 @@ describe('VirtualFileSystem.writeFile: the placement of edits', () => {
     });
 });
 
+describe('VirtualFileSystem.writeFile: line endings', () => {
+    const ackTimeout = VirtualFileSystem.ownUpdateAckTimeoutMs;
+    before(() => { VirtualFileSystem.ownUpdateAckTimeoutMs = 20; });
+    after(() => { VirtualFileSystem.ownUpdateAckTimeoutMs = ackTimeout; });
+
+    it('sends "\\r\\n" line endings as "\\n", as Overleaf stores them', async () => {
+        const t = setup('hello\n');
+        await t.open();
+        await t.save('hello\r\nworld\r\n');
+        await settle();
+        assert.ok(t.server.emitted.every(u => u.op.every((c: any) => !(c.i ?? c.d).includes('\r'))), JSON.stringify(t.server.emitted.map(u => u.op)));
+        assert.strictEqual(t.server.content, 'hello\nworld\n');
+        assert.strictEqual(await t.open(), 'hello\nworld\n');
+    });
+
+    it('sends nothing when only the line endings differ', async () => {
+        const t = setup('a\nb\n');
+        await t.open();
+        await t.save('a\r\nb\r');
+        await settle();
+        assert.strictEqual(t.server.emitted.length, 0);
+        assert.strictEqual(t.server.content, 'a\nb\n');
+    });
+});
+
 describe('VirtualFileSystem.writeFile: tracked changes', () => {
     const ackTimeout = VirtualFileSystem.ownUpdateAckTimeoutMs;
     before(() => { VirtualFileSystem.ownUpdateAckTimeoutMs = 20; });
@@ -305,5 +330,14 @@ describe('SocketIOAPI.applyOtUpdate', () => {
 
         await api.applyOtUpdate('doc1', { doc: 'doc1', v: 1, op: [{ p: 0, i: 'x' }] });
         assert.strictEqual(emitted.length, 1);
+    });
+
+    it('refuses an update with a "\\r", which overleaf.com takes without applying it and then disconnects', async () => {
+        const emitted: any[] = [];
+        const api = Object.create(SocketIOAPI.prototype);
+        api.emit = async (...args: any[]) => { emitted.push(args); return []; };
+        await assert.rejects(api.applyOtUpdate('doc1', { doc: 'doc1', v: 1, op: [{ p: 5, i: '\r' }] }), /"\\r"/);
+        await assert.rejects(api.applyOtUpdate('doc1', { doc: 'doc1', v: 1, op: [{ p: 0, d: 'a\r\n' }] }), /"\\r"/);
+        assert.strictEqual(emitted.length, 0);
     });
 });

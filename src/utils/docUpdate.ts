@@ -57,6 +57,15 @@ export function trackChangesOn(state: unknown): { everyone: boolean, users: stri
 }
 
 /**
+ * The text Overleaf stores for a document: every line ending, "\r\n" or a lone "\r", becomes
+ * "\n". overleaf.com acknowledges an update that inserts "\r" but does not apply it, and then
+ * drops the connection (measured 2026-10-31), so no update may carry one.
+ */
+export function overleafLineEndings(text: string): string {
+    return text.split(/\r\n|\n|\r/).join('\n');
+}
+
+/**
  * The seed from which Overleaf numbers the tracked changes of one update: the first 18
  * hexadecimal digits of an ObjectId, its timestamp in seconds and random digits. Overleaf
  * appends a 6-digit counter. The editor makes a new one for each update.
