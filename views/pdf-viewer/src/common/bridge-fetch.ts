@@ -8,14 +8,19 @@ interface Pending { resolve: (response: Response) => void, reject: (error: unkno
 
 const NULL_BODY = new Set([101, 204, 205, 304]);
 
-export function installBridgeFetch(post: (message: unknown) => void, bridged: (url: URL) => boolean) {
+/**
+ * `page` is this page's ID (config.ts): the requests carry it, and only answers that carry it are
+ * taken, since the page numbers its requests from 1 and the panel may have shown another page before.
+ */
+export function installBridgeFetch(post: (message: unknown) => void, bridged: (url: URL) => boolean, page: string) {
     const nativeFetch = globalThis.fetch.bind(globalThis);
     const pending = new Map<number, Pending>();
     let next = 1;
 
     window.addEventListener('message', (event: MessageEvent) => {
         const message = event.data;
-        const waiting = typeof message?.id === 'number' ? pending.get(message.id) : undefined;
+        if (message?.page !== page) { return; }
+        const waiting = typeof message.id === 'number' ? pending.get(message.id) : undefined;
         if (!waiting) { return; }
         if (message.type === 'fetchResponse') {
             pending.delete(message.id);
@@ -41,11 +46,11 @@ export function installBridgeFetch(post: (message: unknown) => void, bridged: (u
             pending.set(id, { resolve, reject });
             signal?.addEventListener('abort', () => {
                 if (pending.delete(id)) {
-                    post({ type: 'fetchAbort', id });
+                    post({ type: 'fetchAbort', page, id });
                     reject(aborted());
                 }
             }, { once: true });
-            post({ type: 'fetch', id, url: url.href, method: init?.method ?? 'GET', headers });
+            post({ type: 'fetch', page, id, url: url.href, method: init?.method ?? 'GET', headers });
         });
     };
 }

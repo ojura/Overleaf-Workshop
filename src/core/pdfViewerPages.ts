@@ -16,11 +16,16 @@ export const PDFJS_RELEASE = 'vendor/pdfjs-5.1.91';
 /** where a viewer page takes its configuration (completeViewerPage) */
 export const PLACEHOLDER = '<!--viewer-config-->';
 
-/** What a page reads from its #viewer-config element; `base` is the webview URL of views/pdf-viewer/. */
-export function viewerConfig(engine: PdfViewerEngine, base: string) {
+/**
+ * What a page reads from its #viewer-config element; `base` is the webview URL of views/pdf-viewer/,
+ * and `page` names this page among the pages that the panel has shown, for its requests to the
+ * extension host (src/core/pdfFetchBridge.ts).
+ */
+export function viewerConfig(engine: PdfViewerEngine, base: string, page: string) {
     const release = `${base}${PDFJS_RELEASE}/`;
     return {
         engine,
+        page,
         pdfjs: {
             build: `${release}build/`,
             cMapUrl: `${release}web/cmaps/`,
@@ -38,7 +43,7 @@ const attribute = (value: string) => value.replace(/&/g, '&amp;').replace(/"/g, 
  * Complete a viewer page: its relative URLs then resolve against views/pdf-viewer/, and the page
  * script finds pdf.js's files by their absolute URLs, which pdf.js needs for its worker.
  */
-export function completeViewerPage(template: string, engine: PdfViewerEngine, base: string): string {
+export function completeViewerPage(template: string, engine: PdfViewerEngine, base: string, page: string): string {
     if (!base.endsWith('/')) {
         base = `${base}/`;
     }
@@ -46,7 +51,7 @@ export function completeViewerPage(template: string, engine: PdfViewerEngine, ba
         throw new Error(`the ${engine} viewer page has no ${PLACEHOLDER}`);
     }
     // '<' escaped, so the JSON cannot end the script element
-    const json = JSON.stringify(viewerConfig(engine, base)).replace(/</g, '\\u003c');
+    const json = JSON.stringify(viewerConfig(engine, base, page)).replace(/</g, '\\u003c');
     return template.replace(PLACEHOLDER, `<base href="${attribute(base)}"><script id="viewer-config" type="application/json">${json}</script>`);
 }
 

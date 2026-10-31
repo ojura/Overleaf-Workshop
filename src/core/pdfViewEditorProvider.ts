@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as os from 'os';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { EventBus } from '../utils/eventBus';
 import { GlobalStateManager } from '../utils/globalStateManager';
@@ -206,13 +207,20 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                 webviewPanel.webview.postMessage({type:'buildState', ...builds.status});
             }
         };
-        // the viewer's loader fetches the build's ranges and pieces through the extension host,
-        // and only outputs of the build's project
-        const bridge = new PdfFetchBridge(
-            (url) => doc.output!==undefined && outputsOf(doc.output.downloadDomain, doc.output.projectId)(url),
-            this.pieces,
-            { buildSize: () => doc.output?.file.size },
-        );
+        // The viewer's loader fetches the build's ranges and pieces through the extension host,
+        // and only outputs of the build's project. Each page that the panel shows gets a bridge of
+        // its own, under the page's ID: the page numbers its requests from 1, so the requests of a
+        // page that a new page replaced, as after a switch of the viewer, are stopped, and their
+        // answers do not reach the new page.
+        const newBridge = () => ({
+            page: randomUUID(),
+            fetches: new PdfFetchBridge(
+                (url) => doc.output!==undefined && outputsOf(doc.output.downloadDomain, doc.output.projectId)(url),
+                this.pieces,
+                { buildSize: () => doc.output?.file.size },
+            ),
+        });
+        let bridge = newBridge();
 
         const listeners: Array<() => void> = [];
         const docOnDidChangeListener = doc.onDidChange(() => {
@@ -230,12 +238,15 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             doc,
             panel: webviewPanel,
             render: async () => {
-                webviewPanel.webview.html = await this.getViewerPage(webviewPanel.webview, doc.engine);
+                bridge.fetches.abortAll();
+                bridge = newBridge();
+                webviewPanel.webview.html = await this.getViewerPage(webviewPanel.webview, doc.engine, bridge.page);
             },
         };
         this.editors.add(editor);
 
         webviewPanel.onDidDispose(() => {
+            bridge.fetches.abortAll();
             listeners.forEach(stop => stop());
             this.editors.delete(editor);
         });
@@ -266,14 +277,21 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                 case 'saveState':
                     GlobalStateManager.updatePdfViewPersist(this.context, doc.uri.toString(), e.content);
                     break;
-                case 'fetch':
-                    bridge.handle(e).then(
-                        (res) => webviewPanel.webview.postMessage({type:'fetchResponse', ...res}),
-                        (error) => webviewPanel.webview.postMessage({type:'fetchError', id:e.id, message:String(error?.message ?? error)}),
+                case 'fetch': {
+                    // a request of a page that the panel no longer shows is not sent
+                    const asked = bridge;
+                    if (e.page !== asked.page) { break; }
+                    const answer = (message: object) => {
+                        if (asked === bridge) { webviewPanel.webview.postMessage({...message, page: asked.page}); }
+                    };
+                    asked.fetches.handle(e).then(
+                        (res) => answer({type:'fetchResponse', ...res}),
+                        (error) => answer({type:'fetchError', id:e.id, message:String(error?.message ?? error)}),
                     );
                     break;
+                }
                 case 'fetchAbort':
-                    bridge.abort(e.id);
+                    if (e.page === bridge.page) { bridge.fetches.abort(e.id); }
                     break;
                 case 'recompile':
                     // the project of this build, whichever editor is active; only a build's viewer
@@ -339,14 +357,14 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
     }
 
     /** A viewer page from views/pdf-viewer/dist/, completed with its base URL and configuration. */
-    private async getViewerPage(webview: vscode.Webview, engine: PdfViewerEngine): Promise<string> {
+    private async getViewerPage(webview: vscode.Webview, engine: PdfViewerEngine, page: string): Promise<string> {
         let template: string;
         try {
             template = (await vscode.workspace.fs.readFile(this.viewerFile('dist', `${engine}.html`))).toString();
         } catch {
             throw new Error(`the ${engine} PDF viewer is not built: run npm run build-pdf-viewer`);
         }
-        return completeViewerPage(template, engine, webview.asWebviewUri(this.viewerFile()).toString() + '/');
+        return completeViewerPage(template, engine, webview.asWebviewUri(this.viewerFile()).toString() + '/', page);
     }
 
     /**

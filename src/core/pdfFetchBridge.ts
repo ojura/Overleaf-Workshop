@@ -138,6 +138,11 @@ export class PdfFetchBridge {
         this.running.get(id)?.abort();
     }
 
+    /** Stop every running request: the page that asked for them is gone. */
+    abortAll() {
+        this.running.forEach(controller => controller.abort());
+    }
+
     async handle(request: BridgeRequest): Promise<BridgeResponse> {
         const url = new URL(request.url);
         if (!this.allowed(url)) {

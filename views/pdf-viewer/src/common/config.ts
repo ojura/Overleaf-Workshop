@@ -16,6 +16,8 @@ export interface PdfjsResources {
 
 export interface ViewerConfig {
     engine: 'pdfjs' | 'overleaf';
+    /** this page's ID, which its requests to the extension host carry (bridge-fetch.ts) */
+    page: string;
     pdfjs: PdfjsResources;
 }
 

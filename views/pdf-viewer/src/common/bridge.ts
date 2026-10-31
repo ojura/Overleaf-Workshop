@@ -1,4 +1,5 @@
 import { installBridgeFetch } from './bridge-fetch';
+import { config } from './config';
 import { post } from './host';
 import type { PdfOutput } from './output';
 
@@ -15,6 +16,6 @@ export function bridgeOutputsOf(output: PdfOutput) {
     current = { origin: base.origin, prefix: base.pathname };
     if (!installed) {
         installed = true;
-        installBridgeFetch(post, (url) => current !== undefined && url.origin === current.origin && url.pathname.startsWith(current.prefix));
+        installBridgeFetch(post, (url) => current !== undefined && url.origin === current.origin && url.pathname.startsWith(current.prefix), config.page);
     }
 }

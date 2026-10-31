@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention -- mirrors the 'vscode' export names and Overleaf's fields */
 import * as assert from 'assert';
+import { EventEmitter as NodeEventEmitter, once } from 'events';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as os from 'os';
@@ -40,6 +41,13 @@ class Overleaf {
     readonly compiles: unknown[] = [];
     /** what the servers send, by path */
     readonly files = new Map<string, Buffer>();
+    /**
+     * 'held' when a request of a held path arrives (hold), and 'closed' when the asker closes the
+     * connection of a held request before its answer
+     */
+    readonly events = new NodeEventEmitter();
+    /** the paths whose answers wait for release(path), with the answers waiting */
+    private readonly holding = new Map<string, Array<() => void>>();
     base = '';
     private readonly server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -64,6 +72,17 @@ class Overleaf {
     /** the requests to paths that start with `prefix` */
     to(prefix: string) {
         return this.requests.filter(r => r.path.startsWith(prefix));
+    }
+
+    /** Hold the answers to `path` until release(path). */
+    hold(path: string) {
+        this.holding.set(path, []);
+    }
+
+    release(path: string) {
+        const waiting = this.holding.get(path) ?? [];
+        this.holding.delete(path);
+        waiting.forEach(answer => answer());
     }
 
     private answer(req: http.IncomingMessage, body: string, res: http.ServerResponse) {
@@ -95,6 +114,18 @@ class Overleaf {
             json(200, { code: [{ file: 'main.tex', line: 7, column: 0 }] });
             return;
         }
+        const waiting = this.holding.get(url.pathname);
+        if (waiting) {
+            res.on('close', () => { if (!res.writableFinished) { this.events.emit('closed', url.pathname); } });
+            waiting.push(() => this.send(req, res, url));
+            this.events.emit('held', url.pathname);
+            return;
+        }
+        this.send(req, res, url);
+    }
+
+    /** Send the file at `url`'s path, whole or the range asked for; 404 when there is none. */
+    private send(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
         const content = this.files.get(url.pathname);
         if (!content) {
             res.writeHead(404);
@@ -174,6 +205,8 @@ const world = {
     saveTarget: undefined as Uri | undefined,
     /** the save of the editors before a compile (vscode.workspace.saveAll) */
     saveAll: async () => true as boolean,
+    /** the settings that the test sets, by name, e.g. 'engine' */
+    settings: {} as Record<string, unknown>,
     /** the project's file system, for 'remoteFileSystem.prefetch' and the workspace's reads */
     vfs: undefined as any,
     overleaf: undefined as unknown as Overleaf,
@@ -239,7 +272,7 @@ const vscodeStandIn = strict('vscode', {
         saveAll: () => world.saveAll(),
         onDidSaveTextDocument: () => disposable,
         onDidChangeConfiguration: () => disposable,
-        getConfiguration: () => ({ get: (_key: string, value: unknown) => value }),
+        getConfiguration: () => ({ get: (key: string, value: unknown) => world.settings[key] ?? value }),
         // main.tex, whose first line the log's error names
         openTextDocument: async () => ({ getText: () => '\\foo', lineCount: 1 }),
         fs: strict('vscode.workspace.fs', {
@@ -342,6 +375,7 @@ describe('the build in use, from Overleaf to the window', function () {
         world.commands.clear();
         world.saveTarget = undefined;
         world.saveAll = async () => true;
+        world.settings = {};
         scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'build-in-use-'));
         vfs = new VirtualFileSystem({ globalState: { get: (_key: string, value: unknown) => value } }, projectUri, () => {});
         vfs.root = tree();
@@ -627,6 +661,55 @@ describe('the build in use, from Overleaf to the window', function () {
             const detail = 'the compile command answered {"kind":"busy","ended":{}}, not how the compile started';
             assert.deepStrictEqual(await unavailable, { state: 'compile-unavailable', detail });
             assert.deepStrictEqual(panel.posted.filter(message => message.type === 'buildState').pop(), { type: 'buildState', state: 'compile-unavailable', detail });
+        });
+    });
+
+    describe('the viewer\'s requests through the extension host', () => {
+        const pdfPath = '/cdn/project/p1/user/u1/build/b-web/output/output.pdf';
+        const pdfUrl = () => `${overleaf.downloadDomain}/project/p1/user/u1/build/b-web/output/output.pdf`;
+        /** the ID of the page that the panel shows now, from the page's configuration */
+        const pageOf = (panel: Panel) => JSON.parse(/<script id="viewer-config" type="application\/json">(.*?)<\/script>/.exec(panel.webview.html)![1]).page;
+
+        it('stop the requests of a page that a new page replaced, and are answered only to the page that asked', async () => {
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            overleaf.files.set(pdfPath, PDF);
+            const { panel } = await open();
+            await panel.first('load');
+            const first = pageOf(panel);
+            overleaf.hold(pdfPath);
+            const held = once(overleaf.events, 'held');
+            const closed = once(overleaf.events, 'closed');
+            panel.send({ type: 'fetch', page: first, id: 1, url: pdfUrl(), headers: [['range', 'bytes=0-99']] });
+            await held;
+            // the other viewer: the panel shows a new page, which numbers its requests from 1 again
+            world.settings.engine = 'overleaf';
+            await provider.applyEngine();
+            await closed;
+            const second = pageOf(panel);
+            assert.notStrictEqual(second, first);
+            overleaf.release(pdfPath);
+            // a request that the replaced page sent late is not sent on
+            panel.send({ type: 'fetch', page: first, id: 2, url: pdfUrl(), headers: [['range', 'bytes=0-99']] });
+            panel.send({ type: 'fetch', page: second, id: 1, url: pdfUrl(), headers: [['range', 'bytes=0-99']] });
+            const answer = await panel.first('fetchResponse');
+            assert.deepStrictEqual([answer.page, answer.id, answer.status], [second, 1, 206]);
+            assert.deepStrictEqual(panel.posted.filter(message => message.page === first), []);
+            assert.strictEqual(overleaf.to(pdfPath).length, 2, 'the stopped request and the new page\'s');
+        });
+
+        it('stop when the panel closes', async () => {
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            overleaf.files.set(pdfPath, PDF);
+            const { panel } = await open();
+            await panel.first('load');
+            overleaf.hold(pdfPath);
+            const held = once(overleaf.events, 'held');
+            const closed = once(overleaf.events, 'closed');
+            panel.send({ type: 'fetch', page: pageOf(panel), id: 1, url: pdfUrl(), headers: [['range', 'bytes=0-99']] });
+            await held;
+            panel.close();
+            await closed;
+            assert.deepStrictEqual(panel.posted.filter(message => message.type === 'fetchResponse'), []);
         });
     });
 
