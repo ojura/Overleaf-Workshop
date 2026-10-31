@@ -13,8 +13,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { arg } from '../common.mjs';
 import {
-    associatePdfs, checker, click, instance, key, openWithQuickOpen, rafOnTimer, settings, sleep,
-    viewerOf, viewerPage, windowDraws, workbench,
+    associatePdfs, checker, click, instance, key, notWithinLimit, openWithQuickOpen, rafOnTimer, settings, sleep,
+    viewerOf, viewerPage, waitUntil, windowDraws, workbench,
 } from './ide.mjs';
 
 const pdf = arg('pdf');
@@ -56,12 +56,9 @@ try {
     if (expectedPages > 1) {
         const tJump = Date.now();
         await E(`${V}.currentPageNumber = ${expectedPages}; true`);
-        let drawn = false;
-        while (!drawn && Date.now() - tJump < 20000) {
-            drawn = await E(`${V}.getPageView(${expectedPages - 1})?.renderingState === 3`);
-            if (!drawn) { await sleep(50); }
-        }
-        check(`jump to page ${expectedPages}: drawn`, drawn, `${Date.now() - tJump} ms`);
+        const drawn = await waitUntil(() => E(`${V}.getPageView(${expectedPages - 1})?.renderingState === 3`), { what: `page ${expectedPages} drawn`, limitMs: 20000 })
+            .catch(notWithinLimit);
+        check(`jump to page ${expectedPages}: drawn`, !!drawn, `${Date.now() - tJump} ms`);
     }
 
     // the dark theme on the page of theme_book.py: the line takes the theme's text color, the

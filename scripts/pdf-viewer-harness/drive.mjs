@@ -10,6 +10,7 @@
 // viewer and from window.PDFViewerApplication in the pdfjs viewer.
 import fs from 'node:fs';
 import path from 'node:path';
+import { notWithinLimit } from '../lib/devtools.mjs';
 import { launchChrome } from './cdp.mjs';
 import { arg, book, defaultExt, startServer, work } from './common.mjs';
 
@@ -127,11 +128,11 @@ try {
     }
     // back to a build in ranges
     await page.evaluate(`harness.load('a'); true`);
-    await page.waitFor(`${VIEWER}.pdfDocument && ${VIEWER}.pagesCount === 120 && window.overleafViewer?.documents?.inFlight === undefined`, 60000).catch(() => {});
+    await page.waitFor(`${VIEWER}.pdfDocument && ${VIEWER}.pagesCount === 120 && window.overleafViewer?.documents?.inFlight === undefined`, 60000);
 
     // 5. SyncTeX from the source: a highlight on page 30
     await page.evaluate(`harness.syncCode([{ page: 30, h: 72, v: 110, width: 320, height: 14 }]); true`);
-    const highlight = await page.waitFor(`[...document.querySelectorAll('.pdfViewer > div, .pdfViewer .page > div')].some(d => d.style.backgroundColor === 'rgb(255, 255, 0)')`, 10000).catch(() => undefined);
+    const highlight = await page.waitFor(`[...document.querySelectorAll('.pdfViewer > div, .pdfViewer .page > div')].some(d => d.style.backgroundColor === 'rgb(255, 255, 0)')`, 10000).catch(notWithinLimit);
     check('forward SyncTeX: the highlight is drawn', !!highlight);
     // the highlight scrolls smoothly: read the page once the scroll has settled
     let at = -1;
@@ -165,7 +166,7 @@ try {
         const items = await page.waitFor(`document.querySelectorAll('#outline .outline-item').length`, 10000);
         check('outline: the chapters are listed', items.value === 12, `${items.value} items`);
         await page.evaluate(`document.querySelectorAll('#outline .outline-item')[2].click(); true`);
-        const ch3 = await page.waitFor(`${VIEWER}.currentPageNumber === 21`, 10000).catch(() => undefined);
+        const ch3 = await page.waitFor(`${VIEWER}.currentPageNumber === 21`, 10000).catch(notWithinLimit);
         check('outline: a chapter opens its page', !!ch3, `page ${await page.evaluate(`${VIEWER}.currentPageNumber`)}`);
         await new Promise(r => setTimeout(r, 400));
         await page.screenshot(path.join(shots, '7-outline.png'));

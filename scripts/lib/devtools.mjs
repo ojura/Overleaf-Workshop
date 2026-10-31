@@ -218,3 +218,62 @@ export function waitForTarget(connection, matches, { what, limitMs }) {
             .catch((error) => finish(reject, error));
     });
 }
+
+/**
+ * The value of `expression` in a DevTools target: a session on a page or a frame, or a Node
+ * inspector's connection; with `contextId`, in that execution context. An exception in the target
+ * rejects with its description, as does a command that fails.
+ */
+export async function evaluate(target, expression, contextId) {
+    const r = await target.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, ...(contextId ? { contextId } : {}) });
+    if (r.exceptionDetails) {
+        throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
+    }
+    return r.result.value;
+}
+
+/** A wait that reached its limit before its condition held. */
+export class WaitLimitError extends Error {}
+
+/**
+ * Wait until `probe()` resolves to a truthy value, and return { value, ms }. probe runs again
+ * `stepMs` after each falsy answer, and an error that it throws ends the wait with that error.
+ * `limitMs` is the last resort for a condition that never holds: a timer that ends the wait with a
+ * WaitLimitError naming `what`, also while a probe has not answered.
+ */
+export function waitUntil(probe, { what, limitMs, stepMs = 50 }) {
+    const start = Date.now();
+    return new Promise((resolve, reject) => {
+        let done = false;
+        let step;
+        const finish = (settle, value) => {
+            if (done) { return; }
+            done = true;
+            clearTimeout(limit);
+            clearTimeout(step);
+            settle(value);
+        };
+        const limit = setTimeout(() => finish(reject, new WaitLimitError(`${what} did not hold within ${limitMs / 1000} s`)), limitMs);
+        const check = () => {
+            Promise.resolve().then(probe).then((value) => {
+                if (done) { return; }
+                if (value) { finish(resolve, { value, ms: Date.now() - start }); } else { step = setTimeout(check, stepMs); }
+            }, (error) => finish(reject, error));
+        };
+        check();
+    });
+}
+
+/**
+ * Wait until `expression` is truthy in `target` (in `contextId` when given), as waitUntil does:
+ * an exception in the page ends the wait with that exception, and `limitMs` with a WaitLimitError.
+ */
+export function waitFor(target, expression, { what = expression, limitMs, stepMs, contextId } = {}) {
+    return waitUntil(() => evaluate(target, expression, contextId), { what, limitMs, stepMs });
+}
+
+/** For a .catch() of a wait whose limit is a check's negative answer: undefined for a WaitLimitError, and any other error thrown again. */
+export function notWithinLimit(error) {
+    if (error instanceof WaitLimitError) { return undefined; }
+    throw error;
+}

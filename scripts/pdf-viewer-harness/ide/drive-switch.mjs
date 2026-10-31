@@ -4,7 +4,7 @@
 // same page, and writes the setting. At the end the setting is restored.
 //   node ide/drive-switch.mjs
 // Open output.pdf in the instance first, for example with Overleaf Workshop's View PDF command.
-import { checker, instance, rafOnTimer, settings, sleep, viewerFrames, viewerOf, viewerPage, windowDraws, workbench } from './ide.mjs';
+import { checker, instance, rafOnTimer, settings, sleep, viewerFrames, viewerOf, viewerPage, waitUntil, windowDraws, workbench } from './ide.mjs';
 
 const SETTING = 'overleaf-workshop.pdfViewer.engine';
 const inst = instance();
@@ -31,7 +31,7 @@ try {
     const goTo = async (engine, n) => {
         const V = viewerOf(engine);
         await view.E(`(() => { const v = ${V}; v.currentPageNumber = ${n}; ${draws ? '' : 'v.update();'} return true; })()`);
-        for (let i = 0; i < 300; i++) { if (await view.E(`${V}.getPageView(${n - 1})?.renderingState === 3`)) { break; } await sleep(50); }
+        await waitUntil(() => view.E(`${V}.getPageView(${n - 1})?.renderingState === 3`), { what: `page ${n} drawn in the ${engine} viewer`, limitMs: 15000 });
         await sleep(800); // the viewers save their position 500 ms after a scroll
     };
 

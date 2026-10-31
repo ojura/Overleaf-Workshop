@@ -8,6 +8,7 @@
 // of a project you may compile, such as a private copy for tests; its build stays on the download
 // domain for a limited time after the compile.
 import path from 'node:path';
+import { notWithinLimit } from '../../lib/devtools.mjs';
 import { arg, openHarness, themeBook } from '../common.mjs';
 
 const response = arg('response');
@@ -41,11 +42,8 @@ try {
     const t0 = Date.now();
     await page.send('Page.navigate', { url: `${h.origin}/frame?engine=${engine}&doc=live-${engine}` });
     await page.useFrame();
-    let ok = false;
-    for (let i = 0; i < seconds * 5 && !ok; i++) {
-        ok = await page.evaluate(`(() => { try { const v = ${V}; return v.getPageView(v.currentPageNumber - 1).renderingState === 3; } catch { return false; } })()`).catch(() => false);
-        if (!ok) { await new Promise(r => setTimeout(r, 200)); }
-    }
+    const ok = await page.waitFor(`(() => { const v = ${V}; return !!v && v.getPageView(v.currentPageNumber - 1)?.renderingState === 3; })()`, seconds * 1000, 200)
+        .then(() => true, (error) => notWithinLimit(error) ?? false);
     console.log(ok ? `the first page was drawn after ${Date.now() - t0} ms` : `the first page was still not drawn after ${seconds} s`);
 } finally {
     console.log('console problems:', logs.length ? logs.slice(0, 12).join('\n') : 'none');

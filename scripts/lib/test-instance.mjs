@@ -7,7 +7,7 @@
 // process that answers is the IDE that start recorded (instance.json's pid).
 import fs from 'node:fs';
 import path from 'node:path';
-import { connect, waitForActivePort, waitForTarget } from './devtools.mjs';
+import { connect, evaluate, waitForActivePort, waitForTarget } from './devtools.mjs';
 
 /**
  * The instance's folder: `explicit`, else HIDDEN_IDE_HOME. There is no default, so that two agents
@@ -66,15 +66,6 @@ function processGroup(pid) {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
     const [, , group] = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
     return Number(group);
-}
-
-/** The value of `expression` in a DevTools context: the session's page, or a Node inspector's main context. */
-export async function evaluate(target, expression, contextId) {
-    const r = await target.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, ...(contextId ? { contextId } : {}) });
-    if (r.exceptionDetails) {
-        throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
-    }
-    return r.result.value;
 }
 
 /** Fail unless the Node inspector on the connection `main` runs in the process `pid`. */

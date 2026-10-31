@@ -1,6 +1,7 @@
 // The Overleaf viewer: is a forward SyncTeX search drawn when it arrives before the first document,
 // and when it arrives during a reload?
 //   node probes/pending-highlight.mjs [--ext DIR] [--port 8766]
+import { notWithinLimit } from '../../lib/devtools.mjs';
 import { arg, openHarness } from '../common.mjs';
 
 const h = await openHarness({ name: 'pending-highlight', port: Number(arg('port', '8766')), ext: arg('ext'), latency: 80 });
@@ -12,13 +13,13 @@ try {
     await page.send('Page.navigate', { url: `${h.origin}/page?engine=overleaf&doc=pending-probe` });
     await page.waitFor(`!!window.harness && !!window.overleafViewer`, 20000);
     await page.evaluate(`harness.syncCode([{ page: 40, h: 72, v: 300, width: 320, height: 14 }]); true`);
-    const first = await page.waitFor(yellow, 20000).then(() => true, () => false);
+    const first = await page.waitFor(yellow, 20000).then(() => true, (error) => notWithinLimit(error) ?? false);
     await new Promise(r => setTimeout(r, 1500));
     console.log('search before the first document: drawn', first, 'current page', await page.evaluate(`${V}.currentPageNumber`));
     // 2. during a reload
     await page.evaluate(`window.__old = ${V}.pdfDocument; harness.load('b'); harness.syncCode([{ page: 70, h: 72, v: 300, width: 320, height: 14 }]); true`);
     await page.waitFor(`${V}.pdfDocument !== window.__old`, 30000);
-    const second = await page.waitFor(yellow, 20000).then(() => true, () => false);
+    const second = await page.waitFor(yellow, 20000).then(() => true, (error) => notWithinLimit(error) ?? false);
     await new Promise(r => setTimeout(r, 1500));
     console.log('search during a reload: drawn after the swap', second, 'current page', await page.evaluate(`${V}.currentPageNumber`));
 } finally {

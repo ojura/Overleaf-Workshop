@@ -18,7 +18,7 @@ const A = 'window.PDFViewerApplication';
 try {
     await page.send('Page.navigate', { url: `${origin}/frame?engine=pdfjs&doc=same-build` });
     await page.useFrame();
-    await page.waitFor(`(() => { try { return ${A}.pdfViewer.getPageView(0).renderingState === 3; } catch { return false; } })()`, 60000);
+    await page.waitFor(`${A}?.pdfViewer?.getPageView(0)?.renderingState === 3`, 60000);
     await sleep(1500);
 
     // the host sends the build in view again

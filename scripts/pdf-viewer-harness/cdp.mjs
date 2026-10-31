@@ -6,7 +6,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { connect, waitForActivePort } from '../lib/devtools.mjs';
+import { connect, evaluate, waitFor, waitForActivePort, WaitLimitError } from '../lib/devtools.mjs';
 
 /** The last resort for a Chrome that runs but never opens DevTools; it opens them within a second or two. */
 const DEVTOOLS_LIMIT_MS = 30000;
@@ -76,43 +76,50 @@ export async function launchChrome({ dir, width = 1200, height = 900 }) {
     return { chrome, page, close };
 }
 
-/** The harness's helpers on a session with a page. */
+/**
+ * The harness's helpers on a session with a page: evaluate(expression), and waitFor(expression,
+ * limitMs, stepMs), which ends with the page's exception when the expression throws, and with a
+ * WaitLimitError (scripts/lib/devtools.mjs) when it is not truthy within limitMs.
+ */
 function pageOf(session) {
     const { send, on } = session;
     let contextId; // set by useFrame: evaluate in a child frame's page
-    const evaluate = async (expression) => {
-        const r = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, ...(contextId ? { contextId } : {}) });
-        if (r.exceptionDetails) {
-            throw new Error(`${r.exceptionDetails.text} ${r.exceptionDetails.exception?.description ?? ''}`);
-        }
-        return r.result.value;
-    };
-    const waitFor = async (expression, timeoutMs = 30000, stepMs = 50) => {
-        const start = Date.now();
-        for (;;) {
-            const value = await evaluate(expression).catch(() => undefined);
-            if (value) { return { value, ms: Date.now() - start }; }
-            if (Date.now() - start > timeoutMs) { throw new Error(`timed out waiting for ${expression}`); }
-            await new Promise(r => setTimeout(r, stepMs));
-        }
-    };
     const screenshot = async (file) => {
         const { data } = await send('Page.captureScreenshot', { format: 'png' });
         fs.writeFileSync(file, Buffer.from(data, 'base64'));
     };
-    const contexts = [];
-    on('Runtime.executionContextCreated', ({ context }) => contexts.push(context));
-    /** From now on evaluate in the default context of the first child frame (call after Runtime.enable and navigation). */
-    const useFrame = async (timeoutMs = 30000) => {
-        const start = Date.now();
-        for (;;) {
-            const { frameTree } = await send('Page.getFrameTree');
-            const child = frameTree.childFrames?.[0]?.frame;
-            const context = child && [...contexts].reverse().find(c => c.auxData?.frameId === child.id && c.auxData?.isDefault);
-            if (context) { contextId = context.id; return child; }
-            if (Date.now() - start > timeoutMs) { throw new Error(`the page did not get a child frame within ${timeoutMs} ms`); }
-            await new Promise(r => setTimeout(r, 50));
-        }
+    /** the execution contexts that exist, by id, from the Runtime domain's events */
+    const contexts = new Map();
+    on('Runtime.executionContextCreated', ({ context }) => contexts.set(context.id, context));
+    on('Runtime.executionContextDestroyed', ({ executionContextId }) => contexts.delete(executionContextId));
+    on('Runtime.executionContextsCleared', () => contexts.clear());
+    /**
+     * From now on evaluate in the default context of a child frame of the page's main frame, and
+     * return that frame's id: one that exists, or the first that the page attaches and gives a
+     * context. Call it after Runtime.enable, Page.enable and the navigation. `limitMs` is the last
+     * resort for a page that never gets a child frame.
+     */
+    const useFrame = async (limitMs = 30000) => {
+        const { frameTree } = await send('Page.getFrameTree');
+        const children = new Set((frameTree.childFrames ?? []).map(c => c.frame.id));
+        return new Promise((resolve, reject) => {
+            const stops = [];
+            const finish = (settle, value) => { clearTimeout(timer); stops.forEach(stop => stop()); settle(value); };
+            const look = () => {
+                const context = [...contexts.values()].reverse().find(c => children.has(c.auxData?.frameId) && c.auxData?.isDefault);
+                if (context) { contextId = context.id; finish(resolve, context.auxData.frameId); }
+            };
+            const timer = setTimeout(() => finish(reject, new WaitLimitError(`the page did not get a child frame within ${limitMs / 1000} s`)), limitMs);
+            stops.push(on('Page.frameAttached', ({ frameId, parentFrameId }) => {
+                if (parentFrameId === frameTree.frame.id) { children.add(frameId); look(); }
+            }));
+            stops.push(on('Runtime.executionContextCreated', look));
+            look();
+        });
     };
-    return { send, on, evaluate, waitFor, screenshot, useFrame, close: () => session.detach() };
+    return {
+        send, on, screenshot, useFrame, close: () => session.detach(),
+        evaluate: (expression) => evaluate(session, expression, contextId),
+        waitFor: (expression, limitMs = 30000, stepMs = 50) => waitFor(session, expression, { limitMs, stepMs, contextId }),
+    };
 }

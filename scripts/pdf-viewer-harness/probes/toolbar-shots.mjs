@@ -22,7 +22,7 @@ try {
     await page.send('Page.navigate', { url: `${h.origin}/frame?engine=${engine}&doc=shots-${engine}` });
     await page.useFrame();
     const V = engine === 'overleaf' ? 'window.overleafViewer.wrapper.viewer' : 'window.PDFViewerApplication.pdfViewer';
-    await page.waitFor(`(() => { try { return ${V}.getPageView(0).renderingState === 3; } catch { return false; } })()`, 60000);
+    await page.waitFor(`${V.replaceAll('.', '?.')}?.getPageView(0)?.renderingState === 3`, 60000);
     for (const width of [1400, 1085, 900, 760, 740, 680, 560, 470, 350, 330, 300, 260, 220]) {
         await page.send('Emulation.setDeviceMetricsOverride', { width, height: 500, deviceScaleFactor: 1, mobile: false });
         await new Promise(r => setTimeout(r, 400));

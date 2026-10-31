@@ -6,10 +6,11 @@
 // frames are sessions of that one connection.
 import fs from 'node:fs';
 import path from 'node:path';
-import { connectWindow, evaluate, instanceHome, readInstance, workbenchTarget } from '../../lib/test-instance.mjs';
+import { evaluate, waitUntil, notWithinLimit } from '../../lib/devtools.mjs';
+import { connectWindow, instanceHome, readInstance, workbenchTarget } from '../../lib/test-instance.mjs';
 import { arg } from '../common.mjs';
 
-export { evaluate };
+export { evaluate, waitUntil, notWithinLimit };
 
 export const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -142,19 +143,30 @@ export async function viewerFrames(wb) {
 /** The viewer object of a page, by the viewer it runs: an expression for the page. */
 export const viewerOf = (engine) => engine === 'overleaf' ? 'window.overleafViewer.wrapper.viewer' : 'window.PDFViewerApplication.pdfViewer';
 
+/** Whether the page in view is drawn in the viewer `engine`: an expression that is false while the viewer has no document. */
+const pageInViewDrawn = (engine) => `(() => { const v = ${viewerOf(engine).replaceAll('.', '?.')}; return !!v && v.pagesCount > 0 && v.getPageView(v.currentPageNumber - 1)?.renderingState === 3; })()`;
+
+/** The webview shows no viewer page at the moment, for example while a new page replaces the old one. */
+export class NoPageError extends Error {}
+
 /**
  * Attach to a viewer's webview, a target of viewerFrames(wb). VS Code runs the viewer page in the webview's inner frame named
  * active-frame, and a new frame replaces it when the page reloads, as after a switch of viewer.
- * E(expression) evaluates in the page that the webview shows now; engine() says which viewer that
- * is (pdfjs or overleaf), or undefined while it shows neither. The page's console errors, warnings
- * and exceptions collect in `problems`. `beforeLoad` is a script that runs in every page the
- * webview loads from now on, before the page's own scripts.
+ * E(expression) evaluates in the page that the webview shows now, and fails with a NoPageError
+ * while it shows none, or when the page goes away during the evaluation; that is known from the
+ * page's context events, not from the error. engine() says which viewer the page runs (pdfjs or
+ * overleaf), or undefined while the webview shows no viewer page. The page's console errors,
+ * warnings and exceptions collect in `problems`. `beforeLoad` is a script that runs in every page
+ * the webview loads from now on, before the page's own scripts.
  */
 export async function viewerPage(wb, frameTarget, { beforeLoad } = {}) {
     const session = await wb.browser.attach(frameTarget.targetId);
-    const contexts = [];
+    /** the execution contexts that exist, by id, from the Runtime domain's events */
+    const contexts = new Map();
     const problems = [];
-    session.on('Runtime.executionContextCreated', (p) => contexts.push(p.context));
+    session.on('Runtime.executionContextCreated', (p) => contexts.set(p.context.id, p.context));
+    session.on('Runtime.executionContextDestroyed', (p) => contexts.delete(p.executionContextId));
+    session.on('Runtime.executionContextsCleared', () => contexts.clear());
     session.on('Runtime.consoleAPICalled', (p) => { if (p.type === 'error' || p.type === 'warning') { problems.push(`${p.type}: ${p.args.map(a => a.value ?? a.description).join(' ').slice(0, 300)}`); } });
     session.on('Runtime.exceptionThrown', (p) => problems.push(`exception: ${(p.exceptionDetails.exception?.description ?? p.exceptionDetails.text).slice(0, 300)}`));
     await session.send('Page.enable');
@@ -167,27 +179,36 @@ export async function viewerPage(wb, frameTarget, { beforeLoad } = {}) {
         const walk = (node) => { all.push(node.frame); (node.childFrames ?? []).forEach(walk); };
         walk(frameTree);
         const inner = all.find(f => f.name === 'active-frame');
-        return inner && contexts.filter(c => c.auxData?.frameId === inner.id && c.auxData?.isDefault).at(-1);
+        return inner && [...contexts.values()].filter(c => c.auxData?.frameId === inner.id && c.auxData?.isDefault).at(-1);
     };
     const E = async (expression) => {
         const ctx = await context();
-        if (!ctx) { throw new Error('the webview does not show a page'); }
-        return evaluate(session, expression, ctx.id);
-    };
-    const engine = () => E(`window.overleafViewer ? 'overleaf' : window.PDFViewerApplication ? 'pdfjs' : undefined`).catch(() => undefined);
-    /** wait until the webview shows a viewer whose page in view is drawn (`want`: that viewer only); returns the viewer and the time taken */
-    const drawn = async (want, timeoutMs = 60000) => {
-        const t0 = Date.now();
-        while (Date.now() - t0 < timeoutMs) {
-            const now = await engine();
-            if (now && (!want || now === want)) {
-                const ok = await E(`(() => { try { const v = ${viewerOf(now)}; return v.pagesCount > 0 && v.getPageView(v.currentPageNumber - 1).renderingState === 3; } catch { return false; } })()`).catch(() => false);
-                if (ok) { return { engine: now, ms: Date.now() - t0 }; }
-            }
-            await sleep(100);
+        if (!ctx) { throw new NoPageError('the webview does not show a page'); }
+        try {
+            return await evaluate(session, expression, ctx.id);
+        } catch (error) {
+            if (!contexts.has(ctx.id)) { throw new NoPageError(`the page went away during the evaluation (${error.message})`); }
+            throw error;
         }
-        return undefined;
     };
+    const engine = () => E(`window.overleafViewer ? 'overleaf' : window.PDFViewerApplication ? 'pdfjs' : undefined`)
+        .catch((error) => { if (error instanceof NoPageError) { return undefined; } throw error; });
+    /**
+     * Wait until the webview shows a viewer whose page in view is drawn (`want`: that viewer only),
+     * and return { engine, ms }, or undefined when that has not happened within `limitMs`. An error
+     * in the page ends the wait with that error.
+     */
+    const drawn = (want, limitMs = 60000) => waitUntil(async () => {
+        const now = await engine();
+        if (!now || (want && now !== want)) { return undefined; }
+        try {
+            return (await E(pageInViewDrawn(now))) && now;
+        } catch (error) {
+            if (error instanceof NoPageError) { return undefined; }
+            throw error;
+        }
+    }, { what: `a drawn page in the ${want ?? 'pdfjs or overleaf'} viewer`, limitMs, stepMs: 100 })
+        .then(({ value, ms }) => ({ engine: value, ms }), notWithinLimit);
     return { session, problems, context, E, engine, drawn, close: () => session.detach() };
 }
 

@@ -1,6 +1,7 @@
 // The Overleaf viewer: five reloads within a few milliseconds (the last build must stay, with one
 // document), the banner for a build that is gone from the server, and the Recompile button.
 //   node probes/errors.mjs [--ext DIR] [--port 8766]
+import { notWithinLimit } from '../../lib/devtools.mjs';
 import { arg, openHarness, shotPath } from '../common.mjs';
 
 const h = await openHarness({ name: 'errors', port: Number(arg('port', '8766')), ext: arg('ext'), latency: 30 });
@@ -20,7 +21,7 @@ try {
     console.log('rapid reloads:', JSON.stringify(rapid));
     // 2. a build that is gone from the server (404)
     await page.evaluate(`(() => { const o = structuredClone(harness.builds.b); o.url = o.url.replace('0000000000000002', '00000000000000ff'); o.file.url = o.file.url.replace('0000000000000002', '00000000000000ff'); o.file.build = o.file.build.replace('0000000000000002', '00000000000000ff'); window.postMessage({ type: 'load', output: o }, '*'); return true; })()`);
-    const banner = await page.waitFor(`(() => { const all = [...document.body.querySelectorAll('*')].filter(e => /no longer|Recompile|could not|failed/i.test(e.textContent) && e.children.length < 4 && e.offsetParent); return all.map(e => e.textContent.trim()).join(' | ').slice(0, 300); })()`, 20000).catch(() => ({ value: 'the page did not show a banner within 20 s' }));
+    const banner = await page.waitFor(`(() => { const all = [...document.body.querySelectorAll('*')].filter(e => /no longer|Recompile|could not|failed/i.test(e.textContent) && e.children.length < 4 && e.offsetParent); return all.map(e => e.textContent.trim()).join(' | ').slice(0, 300); })()`, 20000).catch((error) => notWithinLimit(error) ?? { value: 'the page did not show a banner within 20 s' });
     console.log('banner for the missing build:', banner.value);
     const stillShown = await page.evaluate(`({ pages: ${V}.pagesCount, rendered: ${V}.getPageView(${V}.currentPageNumber - 1)?.renderingState, documents: window.overleafViewer.documents.owned.size })`);
     console.log('after the failed load, the viewer shows:', JSON.stringify(stillShown));

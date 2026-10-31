@@ -12,7 +12,7 @@
 //   node ide/drive-build.mjs [--theme-page N]
 // Open output.pdf in the instance first, for example with Overleaf Workshop's View PDF command.
 import { arg } from '../common.mjs';
-import { checker, instance, rafOnTimer, reopenTab, sleep, viewerOf, viewerPage, windowDraws, workbench } from './ide.mjs';
+import { checker, instance, notWithinLimit, rafOnTimer, reopenTab, sleep, viewerOf, viewerPage, waitUntil, windowDraws, workbench } from './ide.mjs';
 
 const themePage = arg('theme-page') && Number(arg('theme-page'));
 const inst = instance();
@@ -41,15 +41,12 @@ try {
     check('pdf.js 5.1.91 in its own worker', info.version === '5.1.91' && info.workerPort && !info.fakeWorker);
     check('the build is loaded in ranges', info.whole === 'only parts are loaded');
 
-    /** show page n and wait until it is drawn; returns the time taken, or undefined */
-    const goTo = async (n, timeoutMs = 30000) => {
+    /** show page n and wait until it is drawn; returns the time taken, or undefined when it is not drawn within limitMs */
+    const goTo = async (n, limitMs = 30000) => {
         const t = Date.now();
         await E(`${V}.currentPageNumber = ${n}; ${draws ? '' : `${V}.update();`} true`);
-        while (Date.now() - t < timeoutMs) {
-            if (await E(`${V}.getPageView(${n - 1})?.renderingState === 3`)) { return Date.now() - t; }
-            await sleep(50);
-        }
-        return undefined;
+        const done = await waitUntil(() => E(`${V}.getPageView(${n - 1})?.renderingState === 3`), { what: `page ${n} drawn`, limitMs }).catch(notWithinLimit);
+        return done && Date.now() - t;
     };
     for (const target of [...new Set([Math.min(200, info.pages), info.pages])]) {
         const ms = await goTo(target);

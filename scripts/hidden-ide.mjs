@@ -12,8 +12,9 @@
 // {"error": ...} and exits with 1; it exits with 2 when the page has not answered within
 // PAGE_ANSWER_LIMIT_MS.
 import fs from 'node:fs';
+import { evaluate } from './lib/devtools.mjs';
 import {
-    connectMainProcess, connectWindow, evaluate, inMainProcess, readInstance, waitForInstance, workbenchTarget, writeInstance,
+    connectMainProcess, connectWindow, inMainProcess, readInstance, waitForInstance, workbenchTarget, writeInstance,
 } from './lib/test-instance.mjs';
 
 /** The last resort for an IDE that runs but never opens its window. */

@@ -13,7 +13,7 @@ page.on('Runtime.exceptionThrown', (p) => problems.push(`exception: ${p.exceptio
 await page.send('Page.navigate', { url: `${h.origin}/frame?engine=${engine}&doc=theme-${engine}` });
 await page.useFrame();
 const V = engine === 'overleaf' ? 'window.overleafViewer.wrapper.viewer' : 'window.PDFViewerApplication.pdfViewer';
-await page.waitFor(`(() => { try { return ${V}.getPageView(0).renderingState === 3; } catch { return false; } })()`, 60000);
+await page.waitFor(`${V.replaceAll('.', '?.')}?.getPageView(0)?.renderingState === 3`, 60000);
 
 // [x0, y0, x1, y1] in PDF points
 const areas = {
