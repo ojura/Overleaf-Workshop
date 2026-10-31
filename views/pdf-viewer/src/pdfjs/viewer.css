@@ -1,4 +1,4 @@
-/* The pdfjs viewer's changes to pdf.js's viewer app (vendor/pdfjs-5.1.91/web/viewer.css). */
+/* The pdfjs viewer's changes to pdf.js's viewer app (web/viewer.css of pdf.js's release). */
 
 /* VS Code's default styles for webviews give the body 20 px of padding on each side (in the CSS
    layer vscode-default), which pdf.js's viewer does not expect: its toolbar fills the page and

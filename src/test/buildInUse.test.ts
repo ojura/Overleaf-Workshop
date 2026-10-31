@@ -288,7 +288,7 @@ const vscodeStandIn = strict('vscode', {
     }),
 });
 
-const { VirtualFileSystem, PdfDocument, PdfViewEditorProvider, CompileManager, LocalReplicaSCMProvider, EventBus, EDITOR_ID, BaseAPI, PLACEHOLDER } = loadWithVscode(vscodeStandIn, () => ({
+const { VirtualFileSystem, PdfDocument, PdfViewEditorProvider, CompileManager, LocalReplicaSCMProvider, EventBus, EDITOR_ID, BaseAPI, PLACEHOLDER, pdfjsReleaseOf } = loadWithVscode(vscodeStandIn, () => ({
     ...require('../utils/eventBus'),
     ...require('../core/remoteFileSystemProvider'),
     ...require('../core/pdfViewEditorProvider'),
@@ -296,6 +296,7 @@ const { VirtualFileSystem, PdfDocument, PdfViewEditorProvider, CompileManager, L
     ...require('../scm/localReplicaSCM'),
     ...require('../api/base'),
     ...require('../core/pdfViewerPages'),
+    ...require('../core/viewerProtocol'),
 }), {
     // the login and the API of this test's Overleaf, without a socket.io connection
     '../utils/globalStateManager': {
@@ -310,6 +311,8 @@ const { VirtualFileSystem, PdfDocument, PdfViewEditorProvider, CompileManager, L
     '../scm/scmCollectionProvider': { SCMCollectionProvider: class { triggers = []; } },
 });
 
+/** the extension's package.json, as VS Code gives it to the extension (ExtensionContext.extension.packageJSON) */
+const packageJSON = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', '..', 'package.json'), 'utf8'));
 const projectUri = Uri.parse('overleaf-workshop://www.overleaf.com/Book?user%3Du1%26project%3Dp1');
 const inProject = (file: string) => Uri.joinPath(projectUri, file);
 const buildUri = inProject('.output/output.pdf');
@@ -384,7 +387,7 @@ describe('the build in use, from Overleaf to the window', function () {
         LocalReplicaSCMProvider.readSettings = async () => undefined;
         manager = new CompileManager({ prefetch: async () => vfs });
         managerTriggers = manager.triggers;
-        provider = new PdfViewEditorProvider({ globalStorageUri: Uri.file(path.join(scratch, 'storage')), extensionUri: Uri.file('/extension') });
+        provider = new PdfViewEditorProvider({ globalStorageUri: Uri.file(path.join(scratch, 'storage')), extensionUri: Uri.file('/extension'), extension: { packageJSON } });
     });
 
     afterEach(async () => {
@@ -667,8 +670,9 @@ describe('the build in use, from Overleaf to the window', function () {
     describe('the viewer\'s requests through the extension host', () => {
         const pdfPath = '/cdn/project/p1/user/u1/build/b-web/output/output.pdf';
         const pdfUrl = () => `${overleaf.downloadDomain}/project/p1/user/u1/build/b-web/output/output.pdf`;
-        /** the ID of the page that the panel shows now, from the page's configuration */
-        const pageOf = (panel: Panel) => JSON.parse(/<script id="viewer-config" type="application\/json">(.*?)<\/script>/.exec(panel.webview.html)![1]).page;
+        /** the configuration of the page that the panel shows now */
+        const configOf = (panel: Panel) => JSON.parse(/<script id="viewer-config" type="application\/json">(.*?)<\/script>/.exec(panel.webview.html)![1]);
+        const pageOf = (panel: Panel) => configOf(panel).page;
 
         it('stop the requests of a page that a new page replaced, and are answered only to the page that asked', async () => {
             overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
@@ -687,6 +691,8 @@ describe('the build in use, from Overleaf to the window', function () {
             await closed;
             const second = pageOf(panel);
             assert.notStrictEqual(second, first);
+            // pdf.js's files come from the release that the extension's package.json pins
+            assert.ok(configOf(panel).pdfjs.build.endsWith(`/views/pdf-viewer/${pdfjsReleaseOf(packageJSON)}/build/`), configOf(panel).pdfjs.build);
             overleaf.release(pdfPath);
             // a request that the replaced page sent late is not sent on
             panel.send({ type: 'fetch', page: first, id: 2, url: pdfUrl(), headers: [['range', 'bytes=0-99']] });

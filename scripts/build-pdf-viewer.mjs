@@ -16,8 +16,6 @@ import path from 'node:path';
 export const viewerRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'views', 'pdf-viewer');
 const src = path.join(viewerRoot, 'src');
 const overleafJs = path.join(viewerRoot, 'overleaf', 'services', 'web', 'frontend', 'js');
-/** pdf.js 5.1.91's release, which the download-pdfjs script unpacks; Overleaf uses this version */
-export const pdfjsRelease = path.join(viewerRoot, 'vendor', 'pdfjs-5.1.91');
 
 const shims = {
     'infrastructure/error-reporter': 'error-reporter.ts',
@@ -87,15 +85,32 @@ export const bundleOptions = {
 };
 
 /**
- * The viewers, as the extension defines them (PDF_VIEWER_ENGINES in src/core/viewerProtocol.ts).
- * That module imports nothing, so esbuild can turn it into a module that this script imports.
+ * What the extension defines for its viewers (src/core/viewerProtocol.ts). That module imports
+ * nothing, so esbuild can turn it into a module that this script imports.
  */
 async function viewerProtocol() {
     const source = readFileSync(path.resolve(viewerRoot, '..', '..', 'src', 'core', 'viewerProtocol.ts'), 'utf8');
     const { code } = await esbuild.transform(source, { loader: 'ts', format: 'esm' });
     return import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
 }
-export const engines = [...(await viewerProtocol()).PDF_VIEWER_ENGINES];
+const protocol = await viewerProtocol();
+/** the viewers (PDF_VIEWER_ENGINES) */
+export const engines = [...protocol.PDF_VIEWER_ENGINES];
+/** the folder of pdf.js's release in views/pdf-viewer/, from package.json's pdfjs-dist (pdfjsReleaseOf) */
+const pdfjsReleaseFolder = protocol.pdfjsReleaseOf(JSON.parse(readFileSync(path.resolve(viewerRoot, '..', '..', 'package.json'), 'utf8')));
+/** pdf.js's release, which npm run download-pdfjs unpacks; Overleaf's viewer uses this version */
+export const pdfjsRelease = path.join(viewerRoot, pdfjsReleaseFolder);
+/** where a viewer's page source (src/<engine>/index.html) names the folder of pdf.js's release */
+const PDFJS_RELEASE_IN_PAGE = '{{pdfjs-release}}';
+
+/** The page of viewer `engine`, with the folder of pdf.js's release written in. */
+export function viewerPage(engine) {
+    const page = readFileSync(path.join(src, engine, 'index.html'), 'utf8');
+    if (!page.includes(PDFJS_RELEASE_IN_PAGE)) {
+        throw new Error(`the ${engine} viewer's page does not name ${PDFJS_RELEASE_IN_PAGE}`);
+    }
+    return page.replaceAll(PDFJS_RELEASE_IN_PAGE, pdfjsReleaseFolder);
+}
 /** what the pdf.js viewer leaves out of pdf.js's viewer app */
 const enginePlugins = { pdfjs: [noViewerComponents] };
 
@@ -110,7 +125,7 @@ export async function buildViewers(outdir = path.join(viewerRoot, 'dist')) {
             entryPoints: [path.join(src, engine, 'main.ts')],
             outfile: path.join(outdir, `${engine}.mjs`),
         });
-        writeFileSync(path.join(outdir, `${engine}.html`), readFileSync(path.join(src, engine, 'index.html'), 'utf8'));
+        writeFileSync(path.join(outdir, `${engine}.html`), viewerPage(engine));
         built.push(engine);
     }
     return built;

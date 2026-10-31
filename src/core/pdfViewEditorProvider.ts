@@ -9,7 +9,7 @@ import { parseUri } from './remoteFileSystemProvider';
 import type { VirtualFileSystem } from './remoteFileSystemProvider';
 import { outputsOf, PdfFetchBridge, PieceCache } from './pdfFetchBridge';
 import { completeViewerPage, isBuildPath } from './pdfViewerPages';
-import { DEFAULT_PDF_VIEWER_ENGINE, HostMessage, isPdfViewerEngine, PdfOutput, PdfViewerEngine, ViewerMessage } from './viewerProtocol';
+import { DEFAULT_PDF_VIEWER_ENGINE, HostMessage, isPdfViewerEngine, pdfjsReleaseOf, PdfOutput, PdfViewerEngine, ViewerMessage } from './viewerProtocol';
 
 export class PdfDocument implements vscode.CustomDocument {
     /** the PDF read whole: a PDF that is not the project's build, or a build that the download domain does not serve */
@@ -119,9 +119,12 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
     private readonly pieces: PieceCache;
     /** the open viewers, which a change of overleaf-workshop.pdfViewer.engine reloads */
     private readonly editors = new Set<{ doc: PdfDocument, panel: vscode.WebviewPanel, render: () => Promise<void> }>();
+    /** the folder of pdf.js's release in views/pdf-viewer/, from the extension's package.json */
+    private readonly pdfjsRelease: string;
 
     constructor(private readonly context:vscode.ExtensionContext) {
         this.context = context;
+        this.pdfjsRelease = pdfjsReleaseOf(context.extension.packageJSON);
         const sizeMB = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer').get<number>('pieceCacheSizeMB', 1024);
         this.pieces = new PieceCache(path.join(context.globalStorageUri.fsPath, 'pdf-pieces'), Math.max(0, sizeMB) * 1024 * 1024);
         // the folder where the PDF viewer of earlier versions (pdf.js 3.10.111's) downloaded the
@@ -366,7 +369,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         } catch {
             throw new Error(`the ${engine} PDF viewer is not built: run npm run build-pdf-viewer`);
         }
-        return completeViewerPage(template, engine, webview.asWebviewUri(this.viewerFile()).toString() + '/', page);
+        return completeViewerPage(template, { engine, base: webview.asWebviewUri(this.viewerFile()).toString() + '/', page, pdfjsRelease: this.pdfjsRelease });
     }
 
     /**

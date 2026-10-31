@@ -1,6 +1,6 @@
 /**
- * The page script of the pdfjs viewer: pdf.js 5.1.91's own viewer app
- * (vendor/pdfjs-5.1.91/web/viewer.mjs, with its toolbar, sidebar, find and page modes) showing
+ * The page script of the pdfjs viewer: pdf.js's own viewer app (web/viewer.mjs of the pdf.js
+ * release that package.json pins as pdfjs-dist, with its toolbar, sidebar, find and page modes) showing
  * a build that Overleaf's loader fetches in ranges, as Overleaf's web editor does.
  *
  * The page loads this script before viewer.mjs, so that it can set the app's options when the

@@ -7,19 +7,23 @@
 
 import type { PdfViewerEngine, ViewerConfig } from './viewerProtocol';
 
-/** pdf.js 5.1.91's release in views/pdf-viewer/, the pdf.js version of Overleaf's viewer */
-export const PDFJS_RELEASE = 'vendor/pdfjs-5.1.91';
+/** A viewer page as the provider shows it in a panel. */
+export interface PageOptions {
+    engine: PdfViewerEngine;
+    /** the webview URL of views/pdf-viewer/ */
+    base: string;
+    /** the page's ID among the pages that the panel has shown, for its requests to the extension host (src/core/pdfFetchBridge.ts) */
+    page: string;
+    /** the folder of pdf.js's release in views/pdf-viewer/ (pdfjsReleaseOf) */
+    pdfjsRelease: string;
+}
 
 /** where a viewer page takes its configuration (completeViewerPage) */
 export const PLACEHOLDER = '<!--viewer-config-->';
 
-/**
- * What a page reads from its #viewer-config element; `base` is the webview URL of views/pdf-viewer/,
- * and `page` names this page among the pages that the panel has shown, for its requests to the
- * extension host (src/core/pdfFetchBridge.ts).
- */
-export function viewerConfig(engine: PdfViewerEngine, base: string, page: string): ViewerConfig {
-    const release = `${base}${PDFJS_RELEASE}/`;
+/** What a page reads from its #viewer-config element; `base` ends in '/'. */
+export function viewerConfig({ engine, base, page, pdfjsRelease }: PageOptions): ViewerConfig {
+    const release = `${base}${pdfjsRelease}/`;
     return {
         engine,
         page,
@@ -40,15 +44,13 @@ const attribute = (value: string) => value.replace(/&/g, '&amp;').replace(/"/g, 
  * Complete a viewer page: its relative URLs then resolve against views/pdf-viewer/, and the page
  * script finds pdf.js's files by their absolute URLs, which pdf.js needs for its worker.
  */
-export function completeViewerPage(template: string, engine: PdfViewerEngine, base: string, page: string): string {
-    if (!base.endsWith('/')) {
-        base = `${base}/`;
-    }
+export function completeViewerPage(template: string, options: PageOptions): string {
+    const base = options.base.endsWith('/') ? options.base : `${options.base}/`;
     if (!template.includes(PLACEHOLDER)) {
-        throw new Error(`the ${engine} viewer page has no ${PLACEHOLDER}`);
+        throw new Error(`the ${options.engine} viewer page has no ${PLACEHOLDER}`);
     }
     // '<' escaped, so the JSON cannot end the script element
-    const json = JSON.stringify(viewerConfig(engine, base, page)).replace(/</g, '\\u003c');
+    const json = JSON.stringify(viewerConfig({ ...options, base })).replace(/</g, '\\u003c');
     return template.replace(PLACEHOLDER, `<base href="${attribute(base)}"><script id="viewer-config" type="application/json">${json}</script>`);
 }
 

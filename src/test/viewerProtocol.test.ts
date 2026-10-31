@@ -1,8 +1,9 @@
+/* eslint-disable @typescript-eslint/naming-convention -- package.json's package names */
 import * as assert from 'assert';
 import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { DEFAULT_PDF_VIEWER_ENGINE, PDF_VIEWER_ENGINES } from '../core/viewerProtocol';
+import { DEFAULT_PDF_VIEWER_ENGINE, PDF_VIEWER_ENGINES, pdfjsReleaseOf } from '../core/viewerProtocol';
 
 // tsc turns import() into require(), which cannot load ES modules
 const importModule = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
@@ -27,6 +28,28 @@ describe('what the extension host and the PDF viewer pages share', function () {
         const { engines } = await importModule(path.join(repo, 'scripts', 'build-pdf-viewer.mjs'));
         assert.deepStrictEqual(engines, [...PDF_VIEWER_ENGINES]);
         // the build script started esbuild's service to read the protocol; another build starts it again
+        await (await importModule('esbuild')).stop();
+    });
+
+    it('takes the folder of pdf.js\'s release from the release that package.json pins as pdfjs-dist', () => {
+        const packageJson = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8'));
+        assert.strictEqual(pdfjsReleaseOf(packageJson), `vendor/pdfjs-${packageJson.devDependencies['pdfjs-dist']}`);
+        assert.strictEqual(pdfjsReleaseOf({ dependencies: { 'pdfjs-dist': '9.8.7' } }), 'vendor/pdfjs-9.8.7');
+        // a range names no one release, and so no folder
+        assert.throws(() => pdfjsReleaseOf({ devDependencies: { 'pdfjs-dist': '^5.1.91' } }), /one release/);
+        assert.throws(() => pdfjsReleaseOf({}), /one release/);
+    });
+
+    it('the viewers\' build writes that folder into the pages, and gives it to other scripts', async () => {
+        const { pdfjsRelease, viewerPage, viewerRoot } = await importModule(path.join(repo, 'scripts', 'build-pdf-viewer.mjs'));
+        const release = pdfjsReleaseOf(JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8')));
+        assert.strictEqual(pdfjsRelease, path.join(viewerRoot, release));
+        for (const engine of PDF_VIEWER_ENGINES) {
+            const page: string = viewerPage(engine);
+            assert.ok(page.includes(`${release}/build/pdf.mjs`), `${engine}: ${release}/build/pdf.mjs`);
+            assert.ok(!page.includes('{{'), `${engine}: a placeholder is left`);
+        }
+        assert.ok(viewerPage('pdfjs').includes(`${release}/web/viewer.mjs`));
         await (await importModule('esbuild')).stop();
     });
 
