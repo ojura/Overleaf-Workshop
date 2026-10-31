@@ -107,6 +107,19 @@ describe('landing a commit through the replica\'s window (the land request)', fu
         assert.strictEqual(git(folder, 'status', '--porcelain'), '');
     });
 
+    it('pushes a commit that adds several files in new folders', async () => {
+        const t = await start();
+        const head = git(folder, 'rev-parse', 'HEAD');
+        const commit = commitInClone(folder, clone, head, {
+            'tests/01.t': 'ok 1\n', 'tests/02.t': 'ok 2\n', 'tests/03.t': 'ok 3\n',
+            'tests/fixture/a.txt': 'a\n', 'tests/fixture/b.txt': 'b\n', 'tests/other/c.txt': 'c\n',
+        }, 'Tests in new folders');
+        const answer: any = await t.requestReplica(folder, { op: 'land', commit }, 10000);
+        assert.strictEqual(answer.ok, true, JSON.stringify(answer));
+        assert.strictEqual(answer.summary.uploaded.length, 6);
+        assert.deepStrictEqual([...t.w.remoteFolders].sort(), ['/tests', '/tests/fixture', '/tests/other']);
+    });
+
     it('refuses a commit that does not descend from Overleaf\'s state, and one while the folder has changes', async () => {
         const t = await start();
         const head = git(folder, 'rev-parse', 'HEAD');

@@ -122,7 +122,13 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
         _resolveUri: async (uri: Uri) => w.remote.has(rel(uri)) ? { fileType: 'doc', fileEntity: {} }
             : w.remoteFolders.has(rel(uri)) ? { fileType: 'folder', fileEntity: { docs: [], fileRefs: [], folders: [] } }
             : { fileType: undefined, fileEntity: undefined },
-        mkdir: async (uri: Uri) => { w.remoteFolders.add(rel(uri)); },
+        // as Overleaf does: a folder that exists already is refused, and the request takes a moment
+        mkdir: async (uri: Uri) => {
+            if (w.remoteFolders.has(rel(uri))) { throw new Error(`${uri.path}: 400: file already exists`); }
+            await new Promise(resolve => setTimeout(resolve, 20));
+            if (w.remoteFolders.has(rel(uri))) { throw new Error(`${uri.path}: 400: file already exists`); }
+            w.remoteFolders.add(rel(uri));
+        },
         openFile: async (uri: Uri) => new TextEncoder().encode(w.remote.get(rel(uri)) ?? ''),
         writeFile: async (uri: Uri, content: Uint8Array) => { w.remote.set(rel(uri), new TextDecoder().decode(content)); w.remoteWrites.push(rel(uri)); },
         createFile: async (uri: Uri, content: Uint8Array) => {

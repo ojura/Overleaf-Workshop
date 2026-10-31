@@ -289,14 +289,15 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
         const compiled = await compileProject(client, options.projectId, main!, dir, log, sleep);
         report.compile = { ...compiled, check: compiled.status === 'success' ? checkBuild(dir) : undefined };
 
-        // 6. the project's own check
+        // 6. the project's own check; a check of the checked-out commit compares with its parent's compile
         if (hook) {
-            const parentDir = path.join(compiles, head);
+            const parent = commit === head ? repo.commit(`${head}^`) : head;
+            const parentDir = parent ? path.join(compiles, parent) : undefined;
             const result = spawnSync(hook, {
                 shell: true, cwd: options.folder, encoding: 'utf8',
                 env: {
-                    ...process.env, OVERLEAF_COMMIT: commit, OVERLEAF_PARENT: head, OVERLEAF_COMPILE: dir,
-                    OVERLEAF_PARENT_COMPILE: fs.existsSync(path.join(parentDir, 'output.log')) ? parentDir : '',
+                    ...process.env, OVERLEAF_COMMIT: commit, OVERLEAF_PARENT: parent ?? '', OVERLEAF_COMPILE: dir,
+                    OVERLEAF_PARENT_COMPILE: parentDir && fs.existsSync(path.join(parentDir, 'output.log')) ? parentDir : '',
                     OVERLEAF_REPLICA: options.folder,
                 },
             });

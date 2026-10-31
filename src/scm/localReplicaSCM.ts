@@ -211,14 +211,32 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
-    /** Create the folders on Overleaf that `path` needs. */
+    /** folders being created on Overleaf, so that uploads into the same new folder create it once */
+    private readonly creatingFolders = new Map<string, Promise<void>>();
+
+    /**
+     * Create the folders on Overleaf that `path` needs. Uploads run four at a time, and several
+     * into the same new folder wait for one creation of it: Overleaf refuses a second one ("file
+     * already exists"). A folder that appears meanwhile, made by someone else, is taken as it is.
+     */
     private async ensureRemoteFolders(path: string) {
         let folder = '';
         for (const name of path.split('/').filter(Boolean).slice(0, -1)) {
             folder += `/${name}`;
-            if ((await this.resolveRemote(folder))?.fileType!=='folder') {
-                await this.vfs.mkdir(this.vfs.pathToUri(folder));
+            const current = folder;
+            let creating = this.creatingFolders.get(current);
+            if (creating===undefined) {
+                creating = (async () => {
+                    if ((await this.resolveRemote(current))?.fileType==='folder') { return; }
+                    try {
+                        await this.vfs.mkdir(this.vfs.pathToUri(current));
+                    } catch (error) {
+                        if ((await this.resolveRemote(current))?.fileType!=='folder') { throw error; }
+                    }
+                })().finally(() => this.creatingFolders.delete(current));
+                this.creatingFolders.set(current, creating);
             }
+            await creating;
         }
     }
 

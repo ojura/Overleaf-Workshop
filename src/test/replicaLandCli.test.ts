@@ -180,8 +180,11 @@ describe('replica-land', function () {
         const t = setup();
         t.overleaf.statuses = ['compile-in-progress', 'compile-in-progress'];
         t.overleaf.outputs['output.log'] = 'stuff\n! Undefined control sequence.\nl.42 \\foo\n   bar\nOutput written on output.pdf (3 pages).\n';
+        git(t.folder, 'config', 'overleaf.landCheck', 'printf "%s" "$(basename "$OVERLEAF_PARENT_COMPILE")"');
         const report = await landCommit(t.repo, t.overleaf, t.ask, t.options);
         assert.strictEqual(report.pushed, false);
+        // the checked-out commit is the root here: no parent's compile to compare with
+        assert.strictEqual(report.hook?.output, '');
         assert.strictEqual(report.compile?.attempts, 3);
         assert.strictEqual(report.compile?.check?.ok, false);
         assert.match(report.compile!.check!.problems[0], /1 LaTeX errors in output.log; the first:\n {2}! Undefined control sequence.\n {2}l.42 \\foo\n {5}bar$/);
@@ -206,6 +209,16 @@ describe('replica-land', function () {
         assert.strictEqual(git(t.folder, 'rev-parse', 'HEAD'), commit);
         assert.strictEqual(report.verified, 2);
         assert.ok(!t.asked.includes(`land ${commit.slice(0, 7)}`), 'the window does not push');
+    });
+
+    it('compares a check of the checked-out commit with its parent\'s compile', async () => {
+        const t = setup();
+        const commit = t.commit({ 'main.tex': 'main v2\n' }, 'Landed');
+        git(t.folder, 'config', 'overleaf.landCheck', 'printf "%s %s" "$(basename "$OVERLEAF_PARENT_COMPILE")" "$(basename "$OVERLEAF_COMPILE")"');
+        await landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit });
+        const report = await landCommit(t.repo, t.overleaf, t.ask, t.options);
+        assert.strictEqual(report.pushed, false);
+        assert.strictEqual(report.hook?.output, `${t.head} ${commit}`);
     });
 
     it('takes the commit from a clone where the work happens, at a branch\'s tip or below it', () => {
