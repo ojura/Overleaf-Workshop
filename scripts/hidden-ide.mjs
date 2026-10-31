@@ -30,8 +30,8 @@
 // two agents never share an instance, and a stop in one agent's folder cannot end another agent's
 // tests. start makes the folder for this user
 // only (mode 700), and refuses a folder that another user owns or that others can enter. It holds
-// profile/, extensions/, replica/, home/ and run/ (below), instance.json and the logs. The replica
-// folder is kept between starts, so only the first start downloads the whole project.
+// profile/, extensions/, replica/ and home/ (below), instance.json and the logs. The replica folder
+// is kept between starts, so only the first start downloads the whole project.
 //
 // Options for start (give --project or --folder; without either, start opens the project of the
 // previous start):
@@ -58,8 +58,11 @@
 // The instance's environment: of the caller's environment, the IDE gets PATH and LANG; the session
 // bus's address, the keyring's and the SSH agent's sockets and the caller's tokens stay with the
 // caller. HOME is home/ and the XDG folders are in it, so Antigravity's own data (~/.gemini,
-// ~/.antigravity-ide) is the instance's; XDG_RUNTIME_DIR is run/, where the replica's control
-// socket is. The IDE runs under dbus-run-session, on a session bus of its own that does not start
+// ~/.antigravity-ide) is the instance's. XDG_RUNTIME_DIR, where the session bus's, the IDE's and
+// the replica's control sockets are, is a new folder of the instance's own in /tmp (the record's
+// run), short so that a socket's path stays within the system's limit however long the instance's
+// folder is; start makes it with mode 700, and stop and a failed start remove it. The IDE runs
+// under dbus-run-session, on a session bus of its own that does not start
 // services on demand (its configuration leaves out the service folders), so a file dialog, a
 // notification or a keyring prompt that the IDE asks for on its session bus does not reach the
 // user's desktop. Chromium keeps the secrets it encrypts in the profile (--password-store=basic)
@@ -74,9 +77,9 @@
 //
 // instance.json: boot (the boot's id), group and groupStart (the process group of the session bus
 // and the IDE, and its leader's start time), pid and pidStart (the IDE's main process), xvfb and
-// xvfbStart (the display's X server), display (":N"), devtools and inspector (the endpoints),
-// frozen, project and replica (null in folder mode), folder (what the instance opened), profile and
-// ide. A recorded pid counts only together with its start time in the recorded boot, so that a
+// xvfbStart (the display's X server), display (":N"), run (the runtime folder), devtools and
+// inspector (the endpoints), frozen, project and replica (null in folder mode), folder (what the
+// instance opened), profile and ide. A recorded pid counts only together with its start time in the recorded boot, so that a
 // command never acts on another process that got the same pid.
 //
 // stop sends SIGTERM to the instance's process group and waits for each process's exit through a
@@ -218,6 +221,17 @@ function stopProcesses(args) {
     return result.status === 0;
 }
 
+/**
+ * A new runtime folder for the instance, made with mode 700. It is in /tmp, not in the instance's
+ * folder or in TMPDIR, so that the paths of the sockets in it stay short.
+ */
+const makeRuntimeFolder = () => fs.mkdtempSync('/tmp/hidden-ide-run-');
+
+/** Remove the runtime folder `runtime` (a record's run), when it is given and exists. */
+function removeRuntimeFolder(runtime) {
+    if (runtime) { fs.rmSync(runtime, { recursive: true, force: true }); }
+}
+
 /** Delete the instance's saved state, which holds the login copy in --project mode. */
 function deleteSavedState(home) {
     for (const suffix of ['', '-journal', '.backup']) {
@@ -293,14 +307,14 @@ const xmlText = (text) => text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').
  * (port 0): the window's browser names its endpoint in DevToolsActivePort in the profile, and the
  * file that an earlier start left there must not be taken for the new one.
  */
-function startIde(home, ide, display, folder) {
+function startIde(home, runtime, ide, display, folder) {
     const busConfig = path.join(home, 'session-bus.conf');
     // only this user may connect, and the configuration leaves out the service folders, so the bus does not start services on demand
     writePrivately(busConfig, `<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig>
   <type>session</type>
-  <listen>unix:dir=${xmlText(dbusAddressValue(path.join(home, 'run')))}</listen>
+  <listen>unix:dir=${xmlText(dbusAddressValue(runtime))}</listen>
   <policy context="default">
     <allow send_destination="*" eavesdrop="true"/>
     <allow eavesdrop="true"/>
@@ -321,7 +335,7 @@ function startIde(home, ide, display, folder) {
             PATH: process.env.PATH, LANG: process.env.LANG ?? 'C.UTF-8', HOME: userHome,
             XDG_CONFIG_HOME: path.join(userHome, '.config'), XDG_DATA_HOME: path.join(userHome, '.local', 'share'),
             XDG_STATE_HOME: path.join(userHome, '.local', 'state'), XDG_CACHE_HOME: path.join(userHome, '.cache'),
-            XDG_RUNTIME_DIR: path.join(home, 'run'), DISPLAY: display, XDG_SESSION_TYPE: 'x11',
+            XDG_RUNTIME_DIR: runtime, DISPLAY: display, XDG_SESSION_TYPE: 'x11',
         },
     });
     fs.closeSync(log);
@@ -424,6 +438,7 @@ async function start(...argv) {
     if (previous && instanceProcesses(previous).length > 0) {
         throw new Error(`an instance is already running in ${home} (process group ${previous.group}); stop it first`);
     }
+    removeRuntimeFolder(previous?.run); // left by an instance that ended without stop
     let { project, folder } = options;
     if (folder) {
         if (project) { throw new UsageError('give --project or --folder, not both'); }
@@ -445,7 +460,7 @@ async function start(...argv) {
         build = fs.realpathSync(options.build);
     }
 
-    for (const dir of [['profile', 'User', 'globalStorage'], ['extensions'], ['home'], ['run'], ...(project ? [['replica', '.overleaf']] : [])]) {
+    for (const dir of [['profile', 'User', 'globalStorage'], ['extensions'], ['home'], ...(project ? [['replica', '.overleaf']] : [])]) {
         fs.mkdirSync(path.join(home, ...dir), { recursive: true, mode: 0o700 });
     }
     const ext = copyExtensions(home);
@@ -463,9 +478,11 @@ async function start(...argv) {
 
     // From here on, start stops what it started when it fails or gets a signal.
     const started = [];
+    let runtime;
     const abandon = () => {
         for (const stopIt of started.reverse()) { stopIt(); }
         deleteSavedState(home);
+        removeRuntimeFolder(runtime);
     };
     const handlers = [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]].map(([signal, code]) => [signal, () => {
         process.stderr.write(`hidden-ide: start got ${signal}; stopping what it started\n`);
@@ -474,17 +491,18 @@ async function start(...argv) {
     }]);
     handlers.forEach(([signal, handler]) => process.on(signal, handler));
     try {
+        runtime = makeRuntimeFolder();
         writeSavedState(home, project, options['project-name']);
         if (!project) { console.log(`the instance opens ${folder}; start did not copy the login`); }
         const boot = bootId();
         const { display, xvfb } = await startDisplay(options.display, options.screen ?? '1600x1000', home);
         started.push(() => stopProcesses(['--pid', String(xvfb.pid)]));
         let record = {
-            boot, xvfb: xvfb.pid, xvfbStart: processStat(xvfb.pid)?.start, display, frozen: false,
+            boot, xvfb: xvfb.pid, xvfbStart: processStat(xvfb.pid)?.start, display, run: runtime, frozen: false,
             project: project ?? null, replica: project ? folder : null, folder, profile: path.join(home, 'profile'), ide,
         };
         writeInstance(home, record);
-        const session = startIde(home, ide, display, folder);
+        const session = startIde(home, runtime, ide, display, folder);
         started.push(() => stopProcesses(['--group', String(session.pid)]));
         const ended = new Promise((resolve, reject) => {
             session.once('exit', (code, signal) => resolve(signal ?? `exit code ${code}`));
@@ -522,8 +540,9 @@ function stop() {
         throw new Error(`the display's X server (process ${record.xvfb}) still runs ${STOP_LIMIT_S} s after SIGTERM; the saved state stays`);
     }
     deleteSavedState(home);
-    writeInstance(home, { ...record, frozen: false });
-    console.log('stopped; deleted the instance\'s saved state (state.vscdb, which holds the login copy in --project mode)');
+    removeRuntimeFolder(record.run);
+    writeInstance(home, { ...record, run: null, frozen: false });
+    console.log('stopped; deleted the instance\'s saved state (state.vscdb, which holds the login copy in --project mode) and its runtime folder');
 }
 
 /**
