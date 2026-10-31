@@ -7,6 +7,7 @@ import {
     SavedState, SyncSummary,
 } from './replicaSync';
 import { DEFAULT_IGNORE_PATTERNS } from './ignorePatterns';
+import * as localFs from './localFolderFs';
 import { LocalFolderWatcher } from './localFolderWatcher';
 import { ControlAnswer, ControlRequest, ReplicaControlServer } from './replicaControl';
 import { ReplicaModes, replicaModes } from './replicaModes';
@@ -262,13 +263,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     /** The local folder's side of the sync. */
     private localSide(): ReplicaLocal {
-        const fs = vscode.workspace.fs;
+        // Node's own file functions: vscode.workspace.fs waits for the window (src/scm/localFolderFs.ts)
+        const fs = localFs;
         const uri = (path: string) => vscode.Uri.joinPath(this.baseUri, path);
-        const statOf = (stat: vscode.FileStat): LocalStat => ({size: stat.size, mtime: stat.mtime});
+        const statOf = (stat: localFs.LocalStat): LocalStat => ({size: stat.size, mtime: stat.mtime});
         const stat = async (path: string): Promise<LocalStat | 'folder' | undefined> => {
             try {
                 const res = await fs.stat(uri(path));
-                return (res.type & vscode.FileType.Directory) ? 'folder' : statOf(res);
+                return (res.type & localFs.fileType.directory) ? 'folder' : statOf(res);
             } catch {
                 return undefined;
             }
@@ -277,14 +279,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             list: async () => {
                 const files = new Map<string, LocalStat>();
                 const walk = async (dir: string) => {
-                    let items: [string, vscode.FileType][] = [];
+                    let items: [string, number][] = [];
                     try { items = await fs.readDirectory(uri(dir)); } catch { return; }
                     await Promise.all(items.map(async ([name, type]) => {
                         const path = dir + name;
                         if (path==='/.overleaf' || this.matchIgnorePatterns(path)) { return; }
-                        if (type & vscode.FileType.Directory) {
-                            if (!(type & vscode.FileType.SymbolicLink)) { await walk(`${path}/`); }
-                        } else if (type & vscode.FileType.File) {
+                        if (type & localFs.fileType.directory) {
+                            if (!(type & localFs.fileType.symbolicLink)) { await walk(`${path}/`); }
+                        } else if (type & localFs.fileType.file) {
                             const res = await stat(path);
                             if (res!==undefined && res!=='folder') { files.set(path, res); }
                         }
@@ -303,14 +305,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 return statOf(await fs.stat(uri(path)));
             },
             remove: async (path) => {
-                try {
-                    await fs.delete(uri(path), {useTrash: true});
-                    return;
-                } catch {
-                    // no trash here: delete it for good
+                // to the system trash: on Linux through gio, without the window; elsewhere only the
+                // IDE can move a file there, and that waits for the window
+                if (await fs.trash(uri(path))) { return; }
+                if (process.platform!=='linux') {
+                    try {
+                        await vscode.workspace.fs.delete(uri(path), {useTrash: true});
+                        return;
+                    } catch {
+                        // no trash here: delete it for good
+                    }
                 }
                 try {
-                    await fs.delete(uri(path), {useTrash: false});
+                    await fs.remove(uri(path));
                 } catch (error) {
                     if (await stat(path)!==undefined) { throw error; }
                 }
@@ -319,7 +326,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (path==='/' || path==='') { return; }
                 try {
                     if ((await fs.readDirectory(uri(path))).length===0) {
-                        await fs.delete(uri(path), {recursive: false, useTrash: false});
+                        await fs.remove(uri(path));
                     }
                 } catch {
                     // already gone
@@ -330,7 +337,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     /** The sync state, in `.overleaf/sync` inside the local folder, which the sync never uploads. */
     private stateStore(): ReplicaStore {
-        const fs = vscode.workspace.fs;
+        const fs = localFs; // see localSide()
         const dir = vscode.Uri.joinPath(this.baseUri, SYNC_FOLDER);
         const stateUri = vscode.Uri.joinPath(dir, 'state.json');
         const baseUri = (hash: string) => vscode.Uri.joinPath(dir, 'base', hash);
@@ -349,7 +356,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 const tmp = vscode.Uri.joinPath(dir, 'state.json.tmp');
                 await fs.createDirectory(dir);
                 await fs.writeFile(tmp, encoder.encode(JSON.stringify({project, state})));
-                await fs.rename(tmp, stateUri, {overwrite: true});
+                await fs.rename(tmp, stateUri);
             },
             readBase: async (hash) => {
                 try { return decoder.decode(await fs.readFile(baseUri(hash))); } catch { return undefined; }
@@ -359,10 +366,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 await fs.writeFile(baseUri(hash), encoder.encode(text));
             },
             pruneBases: async (keep) => {
-                let items: [string, vscode.FileType][] = [];
+                let items: [string, number][] = [];
                 try { items = await fs.readDirectory(vscode.Uri.joinPath(dir, 'base')); } catch { return; }
                 await Promise.all(items.filter(([name]) => !keep.has(name))
-                    .map(([name]) => Promise.resolve(fs.delete(baseUri(name))).catch(() => {})));
+                    .map(([name]) => fs.remove(baseUri(name)).catch(() => {})));
             },
             keepCopy: async (path, content) => {
                 const now = new Date();
@@ -645,7 +652,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return;
         }
         let exists = true;
-        try { await vscode.workspace.fs.stat(vscode.Uri.joinPath(this.baseUri, path)); } catch { exists = false; }
+        try { await localFs.stat(vscode.Uri.joinPath(this.baseUri, path)); } catch { exists = false; }
         if (exists !== await sync.knows(path)) { onLocal(path); }
     }
 
@@ -653,9 +660,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // write ".overleaf/settings.json" if not exist
         const settingUri = vscode.Uri.joinPath(this.baseUri, '.overleaf/settings.json');
         try {
-            await vscode.workspace.fs.stat(settingUri);
+            await localFs.stat(settingUri);
         } catch (error) {
-            await vscode.workspace.fs.writeFile(settingUri, Buffer.from(
+            await localFs.writeFile(settingUri, Buffer.from(
                 JSON.stringify({
                     'uri': this.vfs.origin.toString(),
                     'serverName': this.vfs.serverName,
@@ -775,20 +782,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     writeFile(relPath: string, content: Uint8Array): Thenable<void> {
-        const uri = vscode.Uri.joinPath(this.baseUri, relPath);
-        return vscode.workspace.fs.writeFile(uri, content);
+        return localFs.writeFile(vscode.Uri.joinPath(this.baseUri, relPath), content);
     }
 
     readFile(relPath: string): Thenable<Uint8Array|undefined> {
-        const uri = vscode.Uri.joinPath(this.baseUri, relPath);
-        return new Promise(async (resolve, reject) => {
-            try {
-                const content = await vscode.workspace.fs.readFile(uri);
-                resolve(content);
-            } catch (error) {
-                resolve(undefined);
-            }
-        });
+        return localFs.readFile(vscode.Uri.joinPath(this.baseUri, relPath)).catch(() => undefined);
     }
 
     get triggers(): Promise<vscode.Disposable[]> {
