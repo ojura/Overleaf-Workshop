@@ -572,6 +572,22 @@ describe('the build in use, from Overleaf to the window', function () {
             await vfs.builds.check();
             assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
         });
+
+        it('compiles the project\'s main document when the user clicks Recompile, while the window knows no build', async () => {
+            overleaf.latest = { status: 404 };
+            overleaf.compiles.push({ status: 'failure', compileGroup: 'priority', clsiServerId: 'clsi-vm-2', outputFiles: [] }, ownAnswer(overleaf, 'b-new'));
+            let ended = compileEnd();
+            const { panel } = await open();
+            await ended;
+            assert.strictEqual(vfs.builds.status.state, 'compile-failed');
+            // the line about the build offers Recompile
+            ended = compileEnd();
+            panel.send({ type: 'recompile' });
+            assert.deepStrictEqual((await ended).outcome, { result: 'success' });
+            assert.deepStrictEqual(overleaf.to('/project/p1/compile').map(r => [r.body.rootDoc_id, r.body.rootResourcePath]), [['doc-main', 'main.tex'], ['doc-main', 'main.tex']]);
+            assert.strictEqual((await panel.first('load')).output.file.build, 'b-new');
+            assert.deepStrictEqual(vfs.builds.status, { state: 'ready' });
+        });
     });
 
     describe('5. the replica\'s .overleaf/output', () => {

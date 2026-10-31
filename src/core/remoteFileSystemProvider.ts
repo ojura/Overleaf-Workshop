@@ -285,8 +285,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.builds = new ProjectBuilds({
             latest: () => this.latestBuild(),
             settings: () => this.compileSettings(),
-            // the window's compile path, for this project whatever editor is active
-            compile: async () => await vscode.commands.executeCommand<CompileStart | undefined>(`${ROOT_NAME}.compileManager.compile`, this.pathToUri()) ?? 'unavailable',
+            compile: () => this.compileProject(),
         });
         this.buildListeners.push(
             this.builds.onDidChangeBuild((build) => {
@@ -1461,6 +1460,16 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             }
         }
+    }
+
+    /**
+     * Compile this project through the window's compile path (CompileManager.compile), whichever
+     * editor is active: the compile that ProjectBuilds starts for a missing build, and the PDF
+     * viewers' Recompile. The path gets the project's folder, so Overleaf compiles the project's
+     * main document.
+     */
+    async compileProject(): Promise<CompileStart> {
+        return await vscode.commands.executeCommand<CompileStart | undefined>(`${ROOT_NAME}.compileManager.compile`, this.pathToUri()) ?? 'unavailable';
     }
 
     /**
