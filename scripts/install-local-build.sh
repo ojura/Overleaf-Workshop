@@ -7,6 +7,10 @@
 # An installed version that differs from the one this checkout builds is left alone: rebase
 # the patches onto that release first, so the install does not undo what the update changed.
 #
+# The build goes to a temporary folder, not to this checkout's out/: the command-line tools run
+# from out/ (node out/sandbox/cli.js), and removing it would break a run in progress. Bring
+# out/ up to date separately, while no tool runs.
+#
 #   scripts/install-local-build.sh            build and install
 #   scripts/install-local-build.sh --check    only say what would be installed where
 set -eu
@@ -17,8 +21,9 @@ check=no
 
 built_version=$(node -p "require('./package.json').version")
 if [ "$check" = no ]; then
-    rm -rf out
-    node node_modules/typescript/bin/tsc -p ./
+    build=$(mktemp -d "${TMPDIR:-/tmp}/overleaf-workshop-build.XXXXXX")
+    trap 'rm -rf "$build"' EXIT
+    node node_modules/typescript/bin/tsc -p ./ --outDir "$build/out"
     node scripts/build-pdf-viewer.mjs
 fi
 
@@ -44,7 +49,7 @@ for ext in "$HOME"/.antigravity-ide/extensions/iamhyc.overleaf-workshop-* \
         cp -a "$ext/out" "$ext/package.json" "$ext/package.nls.json" "$backup/"
         echo "kept the installed files in $backup"
     fi
-    rsync -a --exclude '*.map' --exclude 'test/' out/ "$ext/out/"
+    rsync -a --exclude '*.map' --exclude 'test/' "$build/out/" "$ext/out/"
     # the PDF viewers that load in ranges (setting overleaf-workshop.pdfViewer.engine), and the
     # pdf.js release they run on; of the legacy viewer, only its page script, which opens a
     # build that the extension downloaded to a file
@@ -52,6 +57,7 @@ for ext in "$HOME"/.antigravity-ide/extensions/iamhyc.overleaf-workshop-* \
     cp views/pdf-viewer/index.js "$ext/views/pdf-viewer/index.js"
     rsync -a --delete views/pdf-viewer/dist/ "$ext/views/pdf-viewer/dist/"
     if [ -d views/pdf-viewer/vendor/pdfjs-5.1.91 ]; then
+        mkdir -p "$ext/views/pdf-viewer/vendor"
         rsync -a --delete --exclude '*.map' views/pdf-viewer/vendor/pdfjs-5.1.91/ "$ext/views/pdf-viewer/vendor/pdfjs-5.1.91/"
     fi
     # package.json from this checkout, keeping the installer's metadata
