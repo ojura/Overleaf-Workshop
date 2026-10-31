@@ -1,30 +1,5 @@
 import type { PDFFile } from '@ol-types/compile';
-
-/** output.pdf in a compile response, as the extension host passes it on (OutputFileEntity). */
-export interface OutputFile {
-    path: string;
-    url: string;
-    type: string;
-    build: string;
-    size?: number;
-    ranges?: { start: number, end: number, hash: string, objectId?: string }[];
-    contentId?: string;
-    createdAt?: string;
-    startXRefTable?: number;
-    /** the editor whose compile made the build; with the build ID it names the build in Overleaf's cache of compile outputs */
-    editorId?: string;
-}
-
-/** A build's output.pdf, as the host's 'load' message carries it (src/core/remoteFileSystemProvider.ts). */
-export interface PdfOutput {
-    /** output.pdf on the download domain, with the query that Overleaf's viewer uses */
-    url: string;
-    downloadDomain: string;
-    projectId: string;
-    file: OutputFile;
-    /** the shard of Overleaf's cache of compile outputs that keeps the build */
-    clsiCacheShard?: string;
-}
+import type { PdfOutput } from './protocol';
 
 /**
  * The file and URL that Overleaf's loader and PDFJSWrapper.loadDocument take, as

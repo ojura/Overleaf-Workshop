@@ -5,10 +5,7 @@
  * replaces with the page's base URL and its configuration (views/pdf-viewer/src/common/config.ts).
  */
 
-export type PdfViewerEngine = 'pdfjs' | 'overleaf';
-export const PDF_VIEWER_ENGINES: readonly PdfViewerEngine[] = ['pdfjs', 'overleaf'];
-/** the viewer when the setting names none of these, as it can after an older version's 'legacy' */
-export const DEFAULT_PDF_VIEWER_ENGINE: PdfViewerEngine = 'pdfjs';
+import type { PdfViewerEngine, ViewerConfig } from './viewerProtocol';
 
 /** pdf.js 5.1.91's release in views/pdf-viewer/, the pdf.js version of Overleaf's viewer */
 export const PDFJS_RELEASE = 'vendor/pdfjs-5.1.91';
@@ -21,7 +18,7 @@ export const PLACEHOLDER = '<!--viewer-config-->';
  * and `page` names this page among the pages that the panel has shown, for its requests to the
  * extension host (src/core/pdfFetchBridge.ts).
  */
-export function viewerConfig(engine: PdfViewerEngine, base: string, page: string) {
+export function viewerConfig(engine: PdfViewerEngine, base: string, page: string): ViewerConfig {
     const release = `${base}${PDFJS_RELEASE}/`;
     return {
         engine,

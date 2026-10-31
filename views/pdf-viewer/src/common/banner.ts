@@ -1,11 +1,11 @@
-import type { BuildState, BuildStatus } from '../../../../src/core/projectBuilds';
+import type { BuildState, BuildStatus } from './protocol';
 import { post } from './host';
 
 /**
  * The line across the top of a viewer page that says what happens to the project's build, or why
  * the PDF cannot be shown, as Overleaf's viewer shows its errors
  * (features/pdf-preview/components/pdf-preview-error.tsx). Its `data-state` attribute names the
- * state: one of the host's build states (src/core/projectBuilds.ts, BuildState), which the host's
+ * state: one of the host's build states (BuildState, src/core/viewerProtocol.ts), which the host's
  * 'buildState' messages carry, or 'failed' when the document could not be shown. The viewer
  * finds 'gone' itself too, when the loader reports the build's files missing from Overleaf's
  * servers and from its cache; it then tells the host (reportGone).

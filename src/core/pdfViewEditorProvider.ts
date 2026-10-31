@@ -6,9 +6,10 @@ import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { EventBus } from '../utils/eventBus';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { parseUri } from './remoteFileSystemProvider';
-import type { PdfOutput, VirtualFileSystem } from './remoteFileSystemProvider';
+import type { VirtualFileSystem } from './remoteFileSystemProvider';
 import { outputsOf, PdfFetchBridge, PieceCache } from './pdfFetchBridge';
-import { completeViewerPage, DEFAULT_PDF_VIEWER_ENGINE, isBuildPath, PDF_VIEWER_ENGINES, PdfViewerEngine } from './pdfViewerPages';
+import { completeViewerPage, isBuildPath } from './pdfViewerPages';
+import { DEFAULT_PDF_VIEWER_ENGINE, HostMessage, isPdfViewerEngine, PdfOutput, PdfViewerEngine, ViewerMessage } from './viewerProtocol';
 
 export class PdfDocument implements vscode.CustomDocument {
     /** the PDF read whole: a PDF that is not the project's build, or a build that the download domain does not serve */
@@ -154,7 +155,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
      */
     private engine(): PdfViewerEngine {
         const picked = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer').get<string>('engine', DEFAULT_PDF_VIEWER_ENGINE);
-        return PDF_VIEWER_ENGINES.includes(picked as PdfViewerEngine) ? picked as PdfViewerEngine : DEFAULT_PDF_VIEWER_ENGINE;
+        return isPdfViewerEngine(picked) ? picked : DEFAULT_PDF_VIEWER_ENGINE;
     }
 
     private viewerFile(...parts: string[]) {
@@ -177,7 +178,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
      * scoped, so it is a user setting.
      */
     private async switchViewer(engine: unknown) {
-        if (engine !== 'pdfjs' && engine !== 'overleaf') {
+        if (!isPdfViewerEngine(engine)) {
             return;
         }
         try {
@@ -193,18 +194,19 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             EventBus.fire('pdfWillOpenEvent', {uri: doc.uri, doc, webviewPanel});
         }
 
+        const post = (message: HostMessage) => webviewPanel.webview.postMessage(message);
         const updateWebview = () => {
             if (doc.output) {
-                webviewPanel.webview.postMessage({type:'load', output:doc.output});
+                post({type:'load', output:doc.output});
             } else if (doc.cache.buffer.byteLength !== 0) {
-                webviewPanel.webview.postMessage({type:'update', content:doc.cache.buffer});
+                post({type:'update', content:doc.cache.buffer as ArrayBuffer});
             }
         };
         // what the viewer's banner says about the project's build (ProjectBuilds.status)
         const builds = doc.vfs?.builds;
         const postStatus = () => {
             if (builds) {
-                webviewPanel.webview.postMessage({type:'buildState', ...builds.status});
+                post({type:'buildState', ...builds.status});
             }
         };
         // The viewer's loader fetches the build's ranges and pieces through the extension host,
@@ -267,7 +269,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                 void builds?.check();
             }
         });
-        webviewPanel.webview.onDidReceiveMessage((e) => {
+        webviewPanel.webview.onDidReceiveMessage((e: ViewerMessage) => {
             switch (e.type) {
                 case 'syncPdf':
                     if (doc.isProjectFile) {
@@ -281,12 +283,12 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     // a request of a page that the panel no longer shows is not sent
                     const asked = bridge;
                     if (e.page !== asked.page) { break; }
-                    const answer = (message: object) => {
-                        if (asked === bridge) { webviewPanel.webview.postMessage({...message, page: asked.page}); }
+                    const answer = (message: HostMessage) => {
+                        if (asked === bridge) { post(message); }
                     };
                     asked.fetches.handle(e).then(
-                        (res) => answer({type:'fetchResponse', ...res}),
-                        (error) => answer({type:'fetchError', id:e.id, message:String(error?.message ?? error)}),
+                        (res) => answer({type:'fetchResponse', page: asked.page, ...res}),
+                        (error) => answer({type:'fetchError', page: asked.page, id:e.id, message:String(error?.message ?? error)}),
                     );
                     break;
                 }
@@ -320,7 +322,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                         scrollMode: config.get('defaultScrollMode', 'vertical'),
                         spreadMode: config.get('defaultSpreadMode', 'none'),
                     };
-                    webviewPanel.webview.postMessage({type:'initState', content:state, colorThemes, defaults});
+                    post({type:'initState', content:state, colorThemes, defaults});
                     updateWebview();
                     postStatus();
                     break;

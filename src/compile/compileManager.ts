@@ -8,6 +8,7 @@ import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 import { CompileRecord, REPLICA_OUTPUT_FOLDER, saveCompileOutputs } from './outputFiles';
 import { windowCompileSettings } from './compileSettings';
 import type { CompileOutcome, CompileStart } from '../core/projectBuilds';
+import type { HostMessage } from '../core/viewerProtocol';
 
 // map string level to severity
 const severityMap: Record<string, vscode.DiagnosticSeverity> = {
@@ -511,10 +512,8 @@ export class CompileManager {
         const res = await vfs.syncCode(filePath, startPoint.line + 1, startPoint.character);
         if (!res) { return; }
         const viewer = await this.buildViewerOf(uri);
-        viewer?.webviewPanel.webview.postMessage({
-            type: 'syncCode',
-            content: res,
-        });
+        const jump: HostMessage = { type: 'syncCode', content: res };
+        viewer?.webviewPanel.webview.postMessage(jump);
     }
 
     private _revealSelectionInEditor(editor: vscode.TextEditor, targetLine: number, identifier: string) {

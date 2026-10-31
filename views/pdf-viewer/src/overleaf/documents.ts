@@ -1,7 +1,8 @@
 import type PDFJSWrapper from '@/features/pdf-preview/util/pdf-js-wrapper';
 import { PDFJS, documentParams, loadingTasks } from '../shims/pdf-js';
 import { bridgeOutputsOf } from '../common/bridge';
-import { toPdfFile, type PdfOutput } from '../common/output';
+import { toPdfFile } from '../common/output';
+import type { PdfOutput } from '../common/protocol';
 import { createWorkerPort } from '../common/worker';
 
 export interface DocumentHooks {

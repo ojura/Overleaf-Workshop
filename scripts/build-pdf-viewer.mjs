@@ -9,7 +9,7 @@
 // src/core/pdfViewerPages.ts completes at run time.
 //   node scripts/build-pdf-viewer.mjs
 import * as esbuild from 'esbuild';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 
@@ -86,22 +86,27 @@ export const bundleOptions = {
     logLevel: 'warning',
 };
 
-export const engines = ['pdfjs', 'overleaf'];
-const enginePlugins = { pdfjs: [noViewerComponents], overleaf: [] };
-
-/** The viewers whose page script and page exist in this checkout. */
-export function availableEngines() {
-    return engines.filter(engine => existsSync(path.join(src, engine, 'main.ts')) && existsSync(path.join(src, engine, 'index.html')));
+/**
+ * The viewers, as the extension defines them (PDF_VIEWER_ENGINES in src/core/viewerProtocol.ts).
+ * That module imports nothing, so esbuild can turn it into a module that this script imports.
+ */
+async function viewerProtocol() {
+    const source = readFileSync(path.resolve(viewerRoot, '..', '..', 'src', 'core', 'viewerProtocol.ts'), 'utf8');
+    const { code } = await esbuild.transform(source, { loader: 'ts', format: 'esm' });
+    return import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
 }
+export const engines = [...(await viewerProtocol()).PDF_VIEWER_ENGINES];
+/** what the pdf.js viewer leaves out of pdf.js's viewer app */
+const enginePlugins = { pdfjs: [noViewerComponents] };
 
-/** Build the page script and page of each viewer that exists. */
+/** Build the page script and page of each viewer; a viewer whose files are missing fails the build. */
 export async function buildViewers(outdir = path.join(viewerRoot, 'dist')) {
     mkdirSync(outdir, { recursive: true });
     const built = [];
-    for (const engine of availableEngines()) {
+    for (const engine of engines) {
         await esbuild.build({
             ...bundleOptions,
-            plugins: [...bundleOptions.plugins, ...enginePlugins[engine]],
+            plugins: [...bundleOptions.plugins, ...(enginePlugins[engine] ?? [])],
             entryPoints: [path.join(src, engine, 'main.ts')],
             outfile: path.join(outdir, `${engine}.mjs`),
         });
@@ -113,5 +118,5 @@ export async function buildViewers(outdir = path.join(viewerRoot, 'dist')) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
     const built = await buildViewers();
-    console.log(built.length ? `built the PDF viewers: ${built.join(', ')}` : 'no PDF viewer to build yet');
+    console.log(`built the PDF viewers: ${built.join(', ')}`);
 }

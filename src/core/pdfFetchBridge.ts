@@ -2,6 +2,7 @@ import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Agent, fetch } from 'undici';
+import type { BridgeRequest, BridgeResponse } from './viewerProtocol';
 
 /**
  * The PDF viewer loads compiled PDFs with Overleaf's loader, which fetches byte ranges and
@@ -11,21 +12,6 @@ import { Agent, fetch } from 'undici';
  */
 
 /** A request of the viewer's loader. */
-export interface BridgeRequest {
-    id: number;
-    url: string;
-    method?: string;
-    headers?: [string, string][];
-}
-
-export interface BridgeResponse {
-    id: number;
-    status: number;
-    statusText: string;
-    headers: [string, string][];
-    body: Uint8Array;
-}
-
 /** A piece of Overleaf's PDF caching: /content/<contentId>/<SHA-256 of the piece> */
 const PIECE = /\/content\/[^/]+\/([0-9a-f]{64})$/;
 /** the request headers the loader needs; others are not sent on */

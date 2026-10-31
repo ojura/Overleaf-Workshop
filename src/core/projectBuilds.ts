@@ -1,5 +1,6 @@
 import type { CompileResponseSchema } from '../api/base';
 import type { CompileRecord } from '../compile/outputFiles';
+import type { BuildStatus } from './viewerProtocol';
 
 /**
  * The build of a project that this window shows: in the PDF viewers, for SyncTeX, in the output
@@ -123,24 +124,6 @@ export type CompileOutcome =
     | { result: 'success' }
     | { result: 'failure', detail: string }
     | { result: 'skipped' };
-
-/**
- * What the viewers of the build show (views/pdf-viewer/src/common/banner.ts has the texts):
- *   ready                the build in use, with nothing to report
- *   none                 no build to show; a compile starts when a viewer of the build is visible
- *   gone                 the build in use is gone from Overleaf's servers, the same
- *   checking             no build to show while the window asks Overleaf for the latest compile
- *   compiling            no build to show while a compile runs that makes one
- *   check-failed         asking Overleaf for the latest compile failed; `detail` says why
- *   compile-failed       the compile ended without a build; `detail` says why
- *   compile-unavailable  the compile did not start; `detail` says why
- */
-export type BuildState = 'ready' | 'none' | 'gone' | 'checking' | 'compiling' | 'check-failed' | 'compile-failed' | 'compile-unavailable';
-
-export interface BuildStatus {
-    state: BuildState;
-    detail?: string;
-}
 
 /**
  * Runs of a task, one at a time. A request while a run is in flight asks for one more run after

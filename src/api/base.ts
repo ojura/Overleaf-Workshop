@@ -4,6 +4,7 @@ import { randomUUID } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { Agent, Dispatcher, fetch, FormData } from 'undici';
 import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
+import type { SyncBox } from '../core/viewerProtocol';
 
 function errorMessage(error: any): string {
     const cause = error?.cause?.message;
@@ -73,15 +74,8 @@ export interface SyncPdfResponseSchema {
     column: number
 }
 
-export interface SyncCodeResponseSchema {
-    pdf: Array<{
-        page: number,
-        h: number,
-        v: number,
-        width: number,
-        height: number,
-    }>
-}
+/** the PDF boxes of a source position, as Overleaf's sync/code answer lists them under `pdf` */
+export type SyncCodeResponseSchema = SyncBox[];
 
 export interface SnippetItemSchema {
     meta: string,

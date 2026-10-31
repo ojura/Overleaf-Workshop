@@ -1,9 +1,10 @@
 import * as assert from 'assert';
 import type { CompileResponseSchema } from '../api/base';
 import {
-    Build, BuildsHost, BuildStatus, cachedBuild, CoalescedRuns, CompileSettings, CompileStart, LatestAnswer, ownBuild,
+    Build, BuildsHost, cachedBuild, CoalescedRuns, CompileSettings, CompileStart, LatestAnswer, ownBuild,
     ProjectBuilds, sameSettings,
 } from '../core/projectBuilds';
+import type { BuildStatus } from '../core/viewerProtocol';
 
 /** A promise and the functions that settle it. */
 function deferred<T>() {

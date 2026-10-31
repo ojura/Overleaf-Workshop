@@ -1,7 +1,7 @@
 import { installBridgeFetch } from './bridge-fetch';
 import { config } from './config';
 import { post } from './host';
-import type { PdfOutput } from './output';
+import type { PdfOutput } from './protocol';
 
 /**
  * The outputs of the project that the page loads from: those requests go through the extension

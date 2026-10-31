@@ -14,6 +14,7 @@ import { EventBus } from '../utils/eventBus';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
 import { DownloadError, downloadInRanges, downloadWhole } from './pdfFetchBridge';
+import type { PdfOutput, PdfOutputFile } from './viewerProtocol';
 
 export const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
@@ -81,33 +82,10 @@ export interface FileRefEntity extends FileEntity {
     hash?: string, //git blob SHA-1 of the content
 }
 
-export interface OutputFileEntity extends FileEntity {
-    path: string, //output file name
-    url: string, // `project/${projectId}/user/${userId}/output/${build}/output/${path}`
-    type: string, //output file type (postfix)
-    build: string, //build id
-    // for output.pdf, when the compile asked for PDF caching: its size, and the pieces of the
-    // PDF that the download domain serves by their SHA-256 under /content/<contentId>/
-    size?: number,
-    ranges?: Array<{start: number, end: number, hash: string, objectId?: string}>,
-    contentId?: string,
-    createdAt?: string,
-    // for output.pdf: the editor whose compile made the build; with the build ID it names the
-    // build in Overleaf's cache of compile outputs
-    editorId?: string,
-    // for a compile from Overleaf's cache of compile outputs: the web server's route to the file
+/** An output file of a compile, in the project's output folder (listBuildOutputs). */
+export interface OutputFileEntity extends FileEntity, PdfOutputFile {
+    /** for a compile from Overleaf's cache of compile outputs: the web server's route to the file */
     downloadURL?: string,
-}
-
-/** A build's output.pdf, as Overleaf's PDF viewer loads it: in ranges from the download domain. */
-export interface PdfOutput {
-    /** output.pdf on the download domain, with the query Overleaf's viewer uses */
-    url: string,
-    downloadDomain: string,
-    projectId: string,
-    file: OutputFileEntity,
-    /** the shard of Overleaf's cache of compile outputs that keeps the build, for when the compile server has deleted it */
-    clsiCacheShard?: string,
 }
 
 export interface FolderEntity extends FileEntity {
@@ -1623,14 +1601,15 @@ export class VirtualFileSystem extends vscode.Disposable {
     async savePdf(target: string, signal: AbortSignal, onProgress: (received: number) => void) {
         const build = this.builds.build;
         const output = this.pdfOutput();
-        if (!build || !output?.file.size) {
+        const file = build?.record.response.outputFiles?.find(f => f.path==='output.pdf');
+        if (!build || !file || !output?.file.size) {
             throw new Error(vscode.l10n.t('There is no build of the PDF to save.'));
         }
         const size = output.file.size;
         try {
             await downloadInRanges(output.url, target, size, signal, { onProgress });
         } catch (error) {
-            const route = BaseAPI.webRouteOf(output.file, build.record.response, build.editorId);
+            const route = BaseAPI.webRouteOf(file, build.record.response, build.editorId);
             if (signal.aborted || (error as DownloadError).status!==404 || route===undefined) { throw error; }
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
             await downloadWhole(this.api.serverUrl + route, target, { headers: {'Cookie': identity.cookies}, size, signal, onProgress });

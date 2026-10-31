@@ -1,21 +1,12 @@
 import { buildHighlightElement } from '@/features/pdf-preview/util/highlights';
 import { post } from './host';
-import type { Position } from './host';
+import type { Position, SyncBox } from './protocol';
 
 /**
  * SyncTeX in a viewer page, as Overleaf's viewer does it
  * (features/pdf-preview/components/pdf-js-viewer.tsx, hooks/use-synctex.ts). The extension host
  * sends the requests to Overleaf (src/compile/compileManager.ts).
  */
-
-/** A box of the PDF that a source position maps to; page counts from 1, PDF points from the top left. */
-export interface SyncBox {
-    page: number;
-    h: number;
-    v: number;
-    width: number;
-    height: number;
-}
 
 /** The page and PDF point of a click, as PDFJSWrapper.clickPosition gives them; page counts from 0. */
 export type ClickPosition = (event: MouseEvent, canvas: HTMLCanvasElement, page: number) =>
