@@ -53,9 +53,11 @@ class Host implements BuildsHost {
     held: Array<ReturnType<typeof deferred<LatestAnswer>>> = [];
     checks = 0;
     compiles = 0;
-    /** what the next compile requests answer */
+    /** what the next compile requests answer; a compile starts when none is given */
     starts: CompileStart[] = [];
     window: CompileSettings = MAIN;
+    /** the waiters for the next compile request */
+    private readonly compileWaiters: Array<() => void> = [];
 
     latest(): Promise<LatestAnswer> {
         this.checks += 1;
@@ -68,7 +70,12 @@ class Host implements BuildsHost {
     settings() { return this.window; }
     async compile(): Promise<CompileStart> {
         this.compiles += 1;
-        return this.starts.shift() ?? 'started';
+        this.compileWaiters.splice(0).forEach(resolve => resolve());
+        return this.starts.shift() ?? { kind: 'started' };
+    }
+    /** settles at the next compile request */
+    nextCompile(): Promise<void> {
+        return new Promise(resolve => this.compileWaiters.push(resolve));
     }
 }
 
@@ -219,32 +226,75 @@ describe('the build in use (ProjectBuilds)', () => {
     it('says why when the compile cannot start', async () => {
         const { host, builds } = setup();
         host.answers.push({ kind: 'none' });
-        host.starts.push('unavailable');
+        host.starts.push({ kind: 'unavailable' });
         await builds.check();
         assert.strictEqual(builds.status.state, 'compile-unavailable');
         assert.ok(builds.status.detail);
     });
 
-    it('compiles once another project\'s compile that kept it from starting has ended', async () => {
-        const { host, builds } = setup();
-        host.answers.push({ kind: 'none' });
-        host.starts.push('busy');
-        await builds.check();
-        assert.strictEqual(host.compiles, 1);
-        assert.deepStrictEqual(builds.status, { state: 'compiling' });
-        // the window compiles one project at a time: when the other one ends, this one starts
-        builds.compileEnded({ result: 'success' }, false);
-        assert.strictEqual(host.compiles, 2);
-        assert.deepStrictEqual(builds.status, { state: 'compiling' });
-    });
+    describe('when another compile of the window kept its compile from starting', () => {
+        /** a project without a build, whose compile request found the window busy with the compile `running` */
+        async function waiting() {
+            const { host, builds, statuses } = setup();
+            const running = deferred<void>();
+            host.answers.push({ kind: 'none' });
+            host.starts.push({ kind: 'busy', ended: running.promise });
+            await builds.check();
+            assert.strictEqual(host.compiles, 1);
+            assert.deepStrictEqual(builds.status, { state: 'compiling' });
+            return { host, builds, statuses, running };
+        }
 
-    it('compiles once a compile of this project that kept its own from starting turned out to have nothing to compile', async () => {
-        const { host, builds } = setup();
-        host.answers.push({ kind: 'none' });
-        host.starts.push('busy');
-        await builds.check();
-        builds.compileEnded({ result: 'skipped' }, true);
-        assert.strictEqual(host.compiles, 2);
+        it('compiles once another project\'s compile has ended', async () => {
+            const { host, builds, running } = await waiting();
+            builds.compileEnded({ result: 'success' }, false);
+            const asked = host.nextCompile();
+            running.resolve();
+            await asked;
+            assert.strictEqual(host.compiles, 2);
+            assert.deepStrictEqual(builds.status, { state: 'compiling' });
+        });
+
+        it('compiles once a compile of this project turned out to have nothing to compile', async () => {
+            const { host, builds, running } = await waiting();
+            builds.compileEnded({ result: 'skipped' }, true);
+            const asked = host.nextCompile();
+            running.resolve();
+            await asked;
+            assert.strictEqual(host.compiles, 2);
+        });
+
+        it('compiles once that compile has ended before it compiled anything, which reports no end', async () => {
+            const { host, builds, running } = await waiting();
+            const asked = host.nextCompile();
+            running.resolve();
+            await asked;
+            assert.strictEqual(host.compiles, 2);
+            assert.deepStrictEqual(builds.status, { state: 'compiling' });
+        });
+
+        // ProjectBuilds took its reaction to `running` when it found the window busy, and the
+        // reactions to one promise run in the order they were taken: the tests' own waits for
+        // `running` below go on after ProjectBuilds' reaction has run
+        it('does not compile again when that compile was of this project and failed', async () => {
+            const { host, builds, running } = await waiting();
+            builds.compileEnded({ result: 'failure', detail: 'Overleaf\'s status is "failure"' }, true);
+            running.resolve();
+            await running.promise;
+            assert.strictEqual(host.compiles, 1);
+            assert.deepStrictEqual(builds.status, { state: 'compile-failed', detail: 'Overleaf\'s status is "failure"' });
+        });
+
+        it('checks meanwhile, and does not compile again when a build came', async () => {
+            const { host, builds, running } = await waiting();
+            host.answers.push({ kind: 'build', build: fromCache('y') });
+            await builds.check();
+            assert.strictEqual(builds.build?.id, 'y');
+            running.resolve();
+            await running.promise;
+            assert.strictEqual(host.compiles, 1);
+            assert.deepStrictEqual(builds.status, { state: 'ready' });
+        });
     });
 
     it('stores a failed check, says why, and keeps the build it has', async () => {

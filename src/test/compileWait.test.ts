@@ -3,6 +3,8 @@ import * as assert from 'assert';
 import { loadWithVscode, strict } from './standIn';
 
 const warnings: string[] = [];
+/** the save of the editors before a compile (vscode.workspace.saveAll) */
+let saveAll = async () => true;
 const disposable = { dispose() {} };
 const vscodeStandIn = strict('vscode', {
     Disposable: class { dispose() {} },
@@ -24,7 +26,7 @@ const vscodeStandIn = strict('vscode', {
     }),
     workspace: strict('vscode.workspace', {
         workspaceFolders: undefined,
-        saveAll: async () => true,
+        saveAll: () => saveAll(),
         getConfiguration: () => ({ get: (_key: string, value: unknown) => value }),
     }),
     commands: strict('vscode.commands', {
@@ -51,6 +53,7 @@ describe('CompileManager with a local replica', () => {
         LocalReplicaSCMProvider.flushAll = flushAll;
         LocalReplicaSCMProvider.readSettings = readSettings;
         CompileManager.uploadWaitMs = waitMs;
+        saveAll = async () => true;
         warnings.length = 0;
     });
 
@@ -78,7 +81,7 @@ describe('CompileManager with a local replica', () => {
         const flushStarted = new Promise<void>(resolve => { flushing = resolve; });
         const { events, manager } = setup(() => { flushing(); return new Promise<void>(resolve => { release = resolve; }); });
         const ended = compileEnd();
-        assert.strictEqual(await manager.compile(true), 'started');
+        assert.deepStrictEqual(await manager.compile(true), { kind: 'started' });
         await flushStarted;
         assert.deepStrictEqual(events, ['flush started'], 'the compile waits for the uploads');
         release();
@@ -107,20 +110,54 @@ describe('CompileManager with a local replica', () => {
         assert.strictEqual(warnings.length, 1);
     });
 
-    it('answers that it is busy while a compile runs, and reports the end once', async () => {
+    it('answers that it is busy while a compile runs, with the end of that compile, which comes after the compile\'s end event', async () => {
         let release!: () => void;
         const { manager } = setup(() => new Promise<void>(resolve => { release = resolve; }));
-        const ended = compileEnd();
-        assert.strictEqual(await manager.compile(true), 'started');
-        assert.strictEqual(await manager.compile(true), 'busy');
-        release();
-        await ended;
-        assert.strictEqual(manager.inCompiling, false);
+        const order: string[] = [];
+        const listener = EventBus.on('compileEndedEvent', () => order.push('compileEndedEvent'));
+        try {
+            assert.deepStrictEqual(await manager.compile(true), { kind: 'started' });
+            const busy = await manager.compile(true);
+            assert.strictEqual(busy.kind, 'busy');
+            const waited = busy.ended.then(() => order.push('busy ended'));
+            release();
+            await waited;
+            assert.deepStrictEqual(order, ['compileEndedEvent', 'busy ended']);
+            assert.strictEqual(manager.inCompiling, false);
+        } finally {
+            listener.dispose();
+        }
     });
 
     it('answers that no compile is available without a project to compile', async () => {
         const { manager } = setup(async () => {}, { replica: false });
-        assert.strictEqual(await manager.compile(true), 'unavailable');
+        assert.deepStrictEqual(await manager.compile(true), { kind: 'unavailable' });
+        assert.strictEqual(manager.inCompiling, false);
+    });
+
+    it('ends the compile that a busy answer waits for also when that compile finds no project to compile', async () => {
+        const { manager } = setup(async () => {}, { replica: false });
+        let saved!: () => void;
+        saveAll = () => new Promise<boolean>(resolve => { saved = () => resolve(true); });
+        const first = manager.compile(true);
+        const busy = await manager.compile(true);
+        assert.strictEqual(busy.kind, 'busy');
+        saved();
+        assert.deepStrictEqual(await first, { kind: 'unavailable' });
+        await busy.ended;
+        assert.strictEqual(manager.inCompiling, false);
+    });
+
+    it('ends the compile that a busy answer waits for also when that compile fails before it starts', async () => {
+        const { manager } = setup(async () => {});
+        let failed!: (error: Error) => void;
+        saveAll = () => new Promise<boolean>((_resolve, reject) => { failed = reject; });
+        const first = manager.compile(true);
+        const busy = await manager.compile(true);
+        assert.strictEqual(busy.kind, 'busy');
+        failed(new Error('a save failed'));
+        await assert.rejects(first, /a save failed/);
+        await busy.ended;
         assert.strictEqual(manager.inCompiling, false);
     });
 });

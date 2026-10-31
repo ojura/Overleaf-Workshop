@@ -4,7 +4,7 @@ import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, COMPILERS, CompileRequest, CompileResponseSchema, EDITOR_ID, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import type { CompileRecord } from '../compile/outputFiles';
 import { windowCompileSettings } from '../compile/compileSettings';
-import { cachedBuild, CompileSettings, CompileStart, LatestAnswer, ownBuild, ProjectBuilds } from './projectBuilds';
+import { cachedBuild, CompileSettings, CompileStart, isCompileStart, LatestAnswer, ownBuild, ProjectBuilds } from './projectBuilds';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { opsFor, overleafLineEndings, TrackChangesState, updateMeta } from '../utils/docUpdate';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
@@ -1467,9 +1467,23 @@ export class VirtualFileSystem extends vscode.Disposable {
      * editor is active: the compile that ProjectBuilds starts for a missing build, and the PDF
      * viewers' Recompile. The path gets the project's folder, so Overleaf compiles the project's
      * main document.
+     *
+     * The answer comes through vscode.commands.executeCommand, and a 'busy' answer carries a
+     * promise. executeCommand "resolves to the returned value of the given command" (vscode.d.ts,
+     * which also puts "no restrictions" on the arguments of commands that extensions contribute),
+     * and for a command registered in the same extension host it returns that value itself, not a
+     * copy: ExtHostCommands._doExecuteCommand calls _executeContributedCommand, which returns
+     * `await callback.apply(thisArg, args)` (extHostCommands.ts, as VS Code 1.107.0 runs it in
+     * the IDE's out/vs/workbench/api/node/extensionHostProcess.js). An answer of another form
+     * fails here with what came, so that the viewers show the failure instead of waiting for an
+     * end they cannot see.
      */
     async compileProject(): Promise<CompileStart> {
-        return await vscode.commands.executeCommand<CompileStart | undefined>(`${ROOT_NAME}.compileManager.compile`, this.pathToUri()) ?? 'unavailable';
+        const start = await vscode.commands.executeCommand<unknown>(`${ROOT_NAME}.compileManager.compile`, this.pathToUri());
+        if (!isCompileStart(start)) {
+            throw new Error(`the compile command answered ${JSON.stringify(start)}, not how the compile started`);
+        }
+        return start;
     }
 
     /**

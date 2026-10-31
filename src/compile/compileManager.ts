@@ -129,8 +129,11 @@ export class CompileManager {
     /** how long a compile waits for a local replica to upload its changes */
     static uploadWaitMs = 60 * 1000;
     readonly status: vscode.StatusBarItem;
-    /** a compile runs: from the request (compile) to its end (run) */
-    public inCompiling: boolean = false;
+    /**
+     * the compile that runs, from the request (compile) to its end (run); the promise settles when
+     * the compile has ended, however it ended
+     */
+    private running?: Promise<void>;
     private diagnosticProvider: CompileDiagnosticProvider;
     /** the saves of local replica logs, one after another */
     private outputSaves: Promise<void> = Promise.resolve();
@@ -167,6 +170,11 @@ export class CompileManager {
                 pdfViewRecord[identifier] = {[filePath]:{doc, webviewPanel}};
             }
         }));
+    }
+
+    /** whether a compile runs: from the request (compile) to its end (run) */
+    get inCompiling(): boolean {
+        return this.running !== undefined;
     }
 
     static async check(uri?: vscode.Uri) {
@@ -231,29 +239,37 @@ export class CompileManager {
 
     /**
      * Compile the project of `target`, else of the active editor or the workspace (check).
-     * Returns 'busy' while another compile of this window runs, 'unavailable' when there is no
-     * project to compile, and 'started' when the compile started; its end fires
-     * compileEndedEvent, however it ends.
+     * Answers 'started' when the compile started, and its end fires compileEndedEvent, however it
+     * ends; 'busy' while another compile of this window runs, with the promise of that compile's
+     * end; and 'unavailable' when there is no project to compile. A request that does not start
+     * a compile, because there is no project or because saving or finding the project failed,
+     * fires no compileEndedEvent, and its end settles the promise of 'busy' all the same.
      */
     async compile(force:boolean=false, fromScratch:boolean=false, target?: vscode.Uri): Promise<CompileStart> {
-        if (this.inCompiling) { return 'busy'; }
+        if (this.running) { return { kind: 'busy', ended: this.running }; }
         // taken before the first wait, so that a request meanwhile finds the window busy
-        this.inCompiling = true;
+        let settle!: () => void;
+        const running = new Promise<void>(resolve => { settle = resolve; });
+        this.running = running;
+        const end = () => {
+            if (this.running === running) { this.running = undefined; }
+            settle();
+        };
         let started = false;
         try {
             await vscode.workspace.saveAll(); // save all dirty files
             const uri = await this.update('compiling', target);
-            if (!uri) { return 'unavailable'; }
+            if (!uri) { return { kind: 'unavailable' }; }
             started = true;
-            void this.run(uri, force, fromScratch);
-            return 'started';
+            void this.run(uri, force, fromScratch, end);
+            return { kind: 'started' };
         } finally {
-            if (!started) { this.inCompiling = false; }
+            if (!started) { end(); }
         }
     }
 
-    /** The compile of the project at `uri` that `compile` started, up to its diagnostics. */
-    private async run(uri: vscode.Uri, force: boolean, fromScratch: boolean) {
+    /** The compile of the project at `uri` that `compile` started, up to its diagnostics; it calls `end` when it ends. */
+    private async run(uri: vscode.Uri, force: boolean, fromScratch: boolean, end: () => void) {
         let outcome: CompileOutcome = { result: 'failure', detail: 'the compile did not start' };
         try {
             const vfs = await this.vfsm.prefetch(uri);
@@ -289,7 +305,8 @@ export class CompileManager {
             console.error(`${ELEGANT_NAME}: the compile failed:`, error);
             await this.update('failed', uri).catch((statusError) => console.error(`${ELEGANT_NAME}: showing the compile's status failed:`, statusError));
         } finally {
-            this.inCompiling = false;
+            // in one step: the waiters of a 'busy' answer go on after the event's listeners have run
+            end();
             EventBus.fire('compileEndedEvent', { uri, outcome });
         }
     }

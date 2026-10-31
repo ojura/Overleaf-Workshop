@@ -94,10 +94,24 @@ export type LatestAnswer =
     | { kind: 'failed', detail: string };
 
 /**
- * How a request for a compile went: the compile started; another compile was running, whose
- * end the compile-end event reports; or the window has no project to compile.
+ * How a request for a compile went (CompileManager.compile):
+ *   started      the compile started; compileEndedEvent reports its end, however it ends
+ *   busy         another compile of the window was running; `ended` settles when that compile has
+ *                ended, however it ended, also when it ended before it compiled anything, which
+ *                fires no compileEndedEvent
+ *   unavailable  the window has no project to compile
  */
-export type CompileStart = 'started' | 'busy' | 'unavailable';
+export type CompileStart =
+    | { kind: 'started' }
+    | { kind: 'busy', ended: Promise<void> }
+    | { kind: 'unavailable' };
+
+/** Whether `value`, an answer that came through a command, is a CompileStart: 'busy' with a promise it can wait for. */
+export function isCompileStart(value: unknown): value is CompileStart {
+    const start = value as { kind?: unknown, ended?: { then?: unknown } } | undefined;
+    return start?.kind === 'started' || start?.kind === 'unavailable'
+        || (start?.kind === 'busy' && typeof start.ended?.then === 'function');
+}
 
 /**
  * How a compile in the window ended:
@@ -175,8 +189,9 @@ type CompileState =
     /** no compile was asked for since the build in use came */
     | { state: 'idle' }
     /**
-     * a compile was asked for and has not ended: `started` when the compile path started it; else
-     * another compile was running, maybe of another project, and the window waits for its end
+     * a compile was asked for and has not ended: `started` once the compile path has started it;
+     * before, the request is on its way, or it found another compile running, maybe of another
+     * project, and waits for that compile's end (CompileStart 'busy')
      */
     | { state: 'running', started: boolean }
     /** the compile ended without a build, or did not start; the user's Recompile is next */
@@ -313,13 +328,9 @@ export class ProjectBuilds {
      * project, which the window compiles one at a time.
      */
     compileEnded(outcome: CompileOutcome, ofThisProject: boolean) {
+        // it made no build of this project; a compile of this project that waited for it asks
+        // again when it has ended (compileIfNeeded)
         if (!ofThisProject || outcome.result === 'skipped') {
-            // the compile that kept this project's compile from starting has ended without
-            // compiling this project: ask again
-            if (this.compile.state === 'running' && !this.compile.started) {
-                this.compile = { state: 'idle' };
-                void this.compileIfNeeded();
-            }
             return;
         }
         if (this.hasBuildToShow()) {
@@ -393,25 +404,38 @@ export class ProjectBuilds {
         if (this.hasBuildToShow() || this.compile.state !== 'idle' || ![...this.viewers].some(viewer => viewer.visible)) {
             return;
         }
-        this.compile = { state: 'running', started: false };
+        const request: CompileState = { state: 'running', started: false };
+        this.compile = request;
         this.update();
         let start: CompileStart;
         let detail = 'this window has no Overleaf project to compile';
         try {
             start = await this.host.compile();
         } catch (error) {
-            start = 'unavailable';
+            start = { kind: 'unavailable' };
             detail = messageOf(error);
         }
         // the compile may have ended meanwhile (compileEnded), or a build may have come
-        if (this.compile.state !== 'running') {
+        if (this.compile !== request) {
             return;
         }
-        if (start === 'unavailable') {
+        if (start.kind === 'unavailable') {
             this.compile = { state: 'failed', status: { state: 'compile-unavailable', detail } };
             this.update();
-        } else if (start === 'started') {
+        } else if (start.kind === 'started') {
             this.compile = { state: 'running', started: true };
+        } else {
+            // the window compiles one project at a time: once the running compile has ended,
+            // however it ended, ask again, unless a build or a failure to show replaced this
+            // request meanwhile. A failure of this project that the compile's end reports comes
+            // first: the compile fires compileEndedEvent in the same step as it settles `ended`.
+            // Not awaited, so that checks go on meanwhile.
+            void start.ended.then(() => {
+                if (this.compile === request) {
+                    this.compile = { state: 'idle' };
+                    void this.compileIfNeeded();
+                }
+            });
         }
     }
 

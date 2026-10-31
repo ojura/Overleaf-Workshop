@@ -172,6 +172,8 @@ const world = {
     written: [] as string[],
     commands: new Map<string, (...args: any[]) => any>(),
     saveTarget: undefined as Uri | undefined,
+    /** the save of the editors before a compile (vscode.workspace.saveAll) */
+    saveAll: async () => true as boolean,
     /** the project's file system, for 'remoteFileSystem.prefetch' and the workspace's reads */
     vfs: undefined as any,
     overleaf: undefined as unknown as Overleaf,
@@ -234,7 +236,7 @@ const vscodeStandIn = strict('vscode', {
     workspace: strict('vscode.workspace', {
         workspaceFolders: undefined,
         textDocuments: [],
-        saveAll: async () => true,
+        saveAll: () => world.saveAll(),
         onDidSaveTextDocument: () => disposable,
         onDidChangeConfiguration: () => disposable,
         getConfiguration: () => ({ get: (_key: string, value: unknown) => value }),
@@ -339,6 +341,7 @@ describe('the build in use, from Overleaf to the window', function () {
         world.written = [];
         world.commands.clear();
         world.saveTarget = undefined;
+        world.saveAll = async () => true;
         scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'build-in-use-'));
         vfs = new VirtualFileSystem({ globalState: { get: (_key: string, value: unknown) => value } }, projectUri, () => {});
         vfs.root = tree();
@@ -587,6 +590,43 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.deepStrictEqual(overleaf.to('/project/p1/compile').map(r => [r.body.rootDoc_id, r.body.rootResourcePath]), [['doc-main', 'main.tex'], ['doc-main', 'main.tex']]);
             assert.strictEqual((await panel.first('load')).output.file.build, 'b-new');
             assert.deepStrictEqual(vfs.builds.status, { state: 'ready' });
+        });
+
+        it('compiles once the compile that kept it from starting has ended, also one that found no project to compile', async () => {
+            // the user compiles a file outside any Overleaf project, which waits while the editors are saved
+            let saved!: () => void;
+            world.saveAll = () => new Promise<boolean>(resolve => { saved = () => resolve(true); });
+            const other = manager.compile(true, false, Uri.file('/elsewhere/notes.tex'));
+            world.saveAll = async () => true;
+            overleaf.latest = { status: 404 };
+            overleaf.compiles.push(ownAnswer(overleaf, 'b-new'));
+            const ended = compileEnd();
+            const { panel } = await open();
+            // a check after the opening's one, which asked for the compile and found the window busy
+            await vfs.builds.check();
+            assert.deepStrictEqual(vfs.builds.status, { state: 'compiling' });
+            assert.deepStrictEqual(overleaf.to('/project/p1/compile'), []);
+            saved();
+            await other;
+            assert.deepStrictEqual((await ended).outcome, { result: 'success' });
+            assert.strictEqual((await panel.first('load')).output.file.build, 'b-new');
+            assert.deepStrictEqual(vfs.builds.status, { state: 'ready' });
+            assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
+        });
+
+        it('says why it does not compile when the compile command\'s answer has lost the end of the running compile', async () => {
+            // 'busy' as a copy of the answer would bring it, without its promise
+            world.commands.set('overleaf-workshop.compileManager.compile', async () => ({ kind: 'busy', ended: {} }));
+            overleaf.latest = { status: 404 };
+            const unavailable = new Promise<any>(resolve => {
+                const stop = vfs.builds.onDidChangeStatus((status: any) => {
+                    if (status.state === 'compile-unavailable') { stop(); resolve(status); }
+                });
+            });
+            const { panel } = await open();
+            const detail = 'the compile command answered {"kind":"busy","ended":{}}, not how the compile started';
+            assert.deepStrictEqual(await unavailable, { state: 'compile-unavailable', detail });
+            assert.deepStrictEqual(panel.posted.filter(message => message.type === 'buildState').pop(), { type: 'buildState', state: 'compile-unavailable', detail });
         });
     });
 
