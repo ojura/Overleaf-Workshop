@@ -12,6 +12,10 @@ import { LockTimeoutError } from './lock';
 import { describeFindings, describeRanges, exitStatusOf, pushCheck, RANGES_HELP } from './rangesCli';
 import { ControlAnswer, NoReplicaWindowError, ReplicaTimeoutError, requestReplica } from '../scm/replicaControl';
 import { describe, SyncSummary } from '../scm/replicaSync';
+import { DEFAULT_IGNORE_PATTERNS } from '../scm/ignorePatterns';
+import { Repo } from '../gitbridge/plumbing';
+import { minimatch } from 'minimatch';
+import { LandError, landCommit, landedCleanly, LandReport } from './land';
 import {
     createSandbox, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions, sandboxStatus, sandboxUrl,
     settingsOf,
@@ -35,6 +39,7 @@ usage:
   node out/sandbox/cli.js git-credential get|store|erase --server <name> --bridge <url>
   node out/sandbox/cli.js replica-sync   --replica <folder> [--timeout <s>] [--json]
   node out/sandbox/cli.js replica-status --replica <folder> [--json]
+  node out/sandbox/cli.js replica-land   --replica <folder> [<commit>] [--main <file>] [--no-compile] [--timeout <s>] [--json]
 
 --replica <folder>  the shared project's local replica. Its .overleaf/settings.json names
                     the project; .overleaf/sandbox.json records the private copy.
@@ -132,12 +137,39 @@ replica-sync    Asks the IDE window that keeps the replica in sync with Overleaf
                 the background, and does not come to the front. It also scans when
                 overleaf-workshop.localReplica.syncOnFileChange is off.
 replica-status  Shows whether the window is connected to Overleaf, how it watches the
-                folder, and what it synced in the last 10 minutes.
+                folder, what it synced in the last 10 minutes, and the replica's git state:
+                the checked-out commit and Overleaf's state (refs/remotes/overleaf/main).
 --timeout <s>   how long to wait for the window's answer; default 300
 Exit status of both: 0 in sync (replica-status: the window answered); 3 a file could not
 be synced or has conflict markers, listed; 4 no IDE window keeps the folder in sync (the
 IDE is not running, or it has not opened the folder as a replica); 5 the window did not
 answer in time; 1 the tool failed; 2 wrong arguments.
+
+replica-land    Lands <commit> of the replica's git repository in the project, then compiles
+                the project. The commit must descend from the checked-out commit, which
+                must be Overleaf's state: the window syncs first, and the tool checks that
+                Overleaf holds that commit file for file (documents by their text, binary
+                files by the hash Overleaf reports). Then the window pushes the commit: it
+                fast-forwards the branch, uploads what the commit changed (a rename as a
+                rename on Overleaf, so documents keep their comments) and waits for
+                Overleaf's acknowledgements. The tool checks again that Overleaf holds the
+                commit, for up to three minutes, and compiles the project once (again while
+                Overleaf answers that another compile of yours runs). The compile's logs are
+                kept in <git dir>/overleaf/compiles/<commit>/ and checked: an error line
+                ("! ") in output.log, no "Output written on output.pdf", latexmk's
+                "Collected error summary", an "Automatic index:" line in output.stderr, or
+                "The index was not built/sorted" fails the landing. The warnings are listed
+                by kind. Then, when git config overleaf.landCheck names a command, it runs in
+                the replica folder with OVERLEAF_COMPILE (the compile's folder),
+                OVERLEAF_PARENT_COMPILE (the parent's, compiled first when missing),
+                OVERLEAF_COMMIT and OVERLEAF_PARENT, e.g. a check of where the pages of the
+                contents fall. Without <commit>, the checked-out commit is checked and
+                compiled. <git dir>/overleaf/landings.log lists the landings.
+--main <file>   the main document; by default the project's
+--no-compile    land and check, without the compile
+Exit status: 0 landed and compiled without errors; 3 landed, but the compile or a check
+failed; 1 stopped before the push, or the push failed (the message says why); 4 and 5 as
+for replica-sync; 2 wrong arguments.
 
 Safety: the tool writes only to the project recorded in .overleaf/sandbox.json, which
 init created, and refuses the shared project's id and every other one. Before each
@@ -157,7 +189,7 @@ const VALUE_FLAGS = new Set(['replica', 'dir', 'main', 'out', 'keep', 'ignore', 
 const GIT_AND_INFO_COMMANDS = ['project-info', 'git-token', 'git-clone', 'git-fetch', 'git-credential'];
 const OBJECT_ID = /^[0-9a-f]{24}$/;
 const REPEATABLE = new Set(['keep', 'ignore', 'include']);
-const BOOLEAN_FLAGS = new Set(['mirror', 'incremental', 'draft', 'stop-on-first-error', 'pdf', 'json', 'help']);
+const BOOLEAN_FLAGS = new Set(['mirror', 'incremental', 'draft', 'stop-on-first-error', 'pdf', 'json', 'help', 'no-compile']);
 
 class UsageError extends Error {}
 
@@ -324,6 +356,64 @@ async function replicaCommand(command: 'replica-sync' | 'replica-status', folder
     return answer.ok ? 0 : 3;
 }
 
+/** replica-land: land a commit of the replica's repository through the IDE window, verify it on Overleaf, compile. */
+async function replicaLand(folder: string, commit: string | undefined,
+                           options: { main?: string, compile: boolean, timeoutS: number, json: boolean, stateDb?: string }): Promise<number> {
+    const replica = readReplica(folder);
+    const login = readStoredLogin(replica.serverName, options.stateDb);
+    const client = new OverleafClient(login.url, login.identity);
+    const isIgnored = (p: string) => p === '/.overleaf' || p.startsWith('/.overleaf/') || DEFAULT_IGNORE_PATTERNS.some(g => minimatch(p, g, { dot: true }));
+    let report: LandReport;
+    try {
+        report = await landCommit(new Repo(folder), client, (request, timeoutMs) => requestReplica(folder, request, timeoutMs), {
+            commit, folder, projectId: replica.projectId, isIgnored, windowTimeoutMs: options.timeoutS * 1000,
+            compile: options.compile, main: options.main, log,
+        });
+    } catch (error: any) {
+        if (error instanceof NoReplicaWindowError) { log(error.message); return 4; }
+        if (error instanceof ReplicaTimeoutError) { log(error.message); return 5; }
+        if (error instanceof LandError) {
+            log(`STOPPED: ${error.message}`);
+            error.details.slice(0, 30).forEach(line => log(`  ${line}`));
+            if (error.details.length > 30) { log(`  ... and ${error.details.length - 30} more`); }
+            return 1;
+        }
+        throw error;
+    }
+    if (options.json) {
+        process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+        return landedCleanly(report) ? 0 : 3;
+    }
+    const short = (oid?: string) => oid?.slice(0, 7) ?? 'none';
+    const lines: string[] = [];
+    lines.push(report.pushed
+        ? `landed ${short(report.commit)} on top of ${short(report.parent)}; Overleaf's state is ${short(report.overleaf)}${report.overleaf !== report.commit ? ' (with edits made on Overleaf meanwhile)' : ''}`
+        : `Overleaf holds the checked-out commit ${short(report.commit)}`);
+    const summary = (report.push as any)?.summary as SyncSummary | undefined;
+    if (summary) { lines.push(`push: ${describe(summary)}${summary.renamed?.length ? `; renamed ${summary.renamed.map(r => `${r.from} -> ${r.to}`).join(', ')}` : ''}`); }
+    if (report.verified !== undefined) { lines.push(`Overleaf holds every file of it (${report.verified} compared)`); }
+    if (report.parentCompile) { lines.push(`compiled the parent first: ${report.parentCompile.status} (${report.parentCompile.dir})`); }
+    if (report.compile) {
+        const check = report.compile.check;
+        lines.push(`compile: ${report.compile.status}${report.compile.attempts > 1 ? ` after ${report.compile.attempts} attempts` : ''}${check?.pages ? `, ${check.pages} pages` : ''}; logs in ${report.compile.dir}`);
+        if (check) {
+            lines.push(check.ok ? 'check: no errors' : 'check: FAILED');
+            check.problems.forEach(problem => lines.push(`  ${problem}`));
+            check.notes.forEach(note => lines.push(`  note: ${note}`));
+            if (check.warnings.length) {
+                lines.push('warnings by kind:');
+                check.warnings.slice(0, 20).forEach(w => lines.push(`  ${String(w.count).padStart(5)} ${w.kind}`));
+            }
+        }
+    }
+    if (report.hook) {
+        lines.push(`overleaf.landCheck (${report.hook.command}) exited with ${report.hook.status}${report.hook.output ? ':' : ''}`);
+        if (report.hook.output) { lines.push(...report.hook.output.split('\n').map(line => `  ${line}`)); }
+    }
+    process.stdout.write(lines.join('\n') + '\n');
+    return landedCleanly(report) ? 0 : 3;
+}
+
 async function main(argv: string[]): Promise<number> {
     const { values, lists, flags, positional } = parseArgs(argv);
     const command = positional[0];
@@ -334,7 +424,14 @@ async function main(argv: string[]): Promise<number> {
     if (GIT_AND_INFO_COMMANDS.includes(command)) {
         return gitAndInfoCommand(command, values, flags, positional);
     }
-    if (!['init', 'status', 'compile', 'plan', 'ranges', 'push-check', 'replica-sync', 'replica-status'].includes(command)) { throw new UsageError(`unknown command ${command}`); }
+    if (!['init', 'status', 'compile', 'plan', 'ranges', 'push-check', 'replica-sync', 'replica-status', 'replica-land'].includes(command)) { throw new UsageError(`unknown command ${command}`); }
+    if (command === 'replica-land') {
+        if (!values.replica) { throw new UsageError('--replica is required'); }
+        if (positional.length > 2) { throw new UsageError(`unexpected argument ${positional[2]}`); }
+        const timeoutS = Number(values.timeout ?? 600);
+        if (!(timeoutS > 0)) { throw new UsageError('--timeout takes a number of seconds'); }
+        return await replicaLand(path.resolve(values.replica), positional[1], { main: values.main, compile: !flags.has('no-compile'), timeoutS, json: flags.has('json'), stateDb: values['state-db'] });
+    }
     if (positional.length > 1) { throw new UsageError(`unexpected argument ${positional[1]}`); }
     if (command === 'ranges' || command === 'push-check') {
         const { serverName, projectId } = serverAndProject(values);

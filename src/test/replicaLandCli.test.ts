@@ -1,0 +1,220 @@
+/* eslint-disable @typescript-eslint/naming-convention -- file paths and Overleaf's field names as keys */
+import * as assert from 'assert';
+import { spawnSync } from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { Repo } from '../gitbridge/plumbing';
+import { checkBuild } from '../sandbox/buildCheck';
+import { AskWindow, LandClient, LandError, landCommit, landedCleanly } from '../sandbox/land';
+
+const OVERLEAF_REF = 'refs/remotes/overleaf/main';
+
+function git(dir: string, ...args: string[]): string {
+    const result = spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8' });
+    if (result.status !== 0) { throw new Error(`git ${args.join(' ')}: ${result.stderr}`); }
+    return result.stdout.trim();
+}
+
+const LOG_OK = 'This is pdfTeX\nLaTeX Warning: Reference `a\' on page 3 undefined on input line 12.\nLaTeX Warning: Reference `b\' on page 4 undefined on input line 40.\nOutput written on output.pdf (812 pages, 123 bytes).\n';
+
+/** A project on Overleaf in memory, as joinProject and joinDoc show it, with a compile. */
+class Overleaf implements LandClient {
+    docs = new Map<string, string>();
+    files = new Map<string, string>();
+    reads = 0;
+    compiles: string[] = [];
+    /** what the next compiles answer, first to last; then "success" */
+    statuses: string[] = [];
+    outputs: Record<string, string> = { 'output.log': LOG_OK, 'output.stdout': 'Latexmk: All targets are up-to-date\n', 'output.aux': '\\relax\n', 'output.pdf': '%PDF' };
+    /** run before each read of the project, e.g. to let a push arrive late */
+    beforeRead?: () => void;
+
+    async readProject(projectId: string) {
+        this.beforeRead?.();
+        this.reads += 1;
+        const root: any = { _id: 'root', name: 'rootFolder', docs: [], fileRefs: [], folders: [] };
+        const folderOf = (p: string) => {
+            let folder = root;
+            for (const name of p.split('/').slice(0, -1)) {
+                let sub = folder.folders.find((f: any) => f.name === name);
+                if (!sub) { sub = { _id: name, name, docs: [], fileRefs: [], folders: [] }; folder.folders.push(sub); }
+                folder = sub;
+            }
+            return folder;
+        };
+        for (const p of this.docs.keys()) { folderOf(p).docs.push({ _id: `doc-${p}`, name: p.split('/').pop() }); }
+        for (const [p, hash] of this.files) { folderOf(p).fileRefs.push({ _id: `file-${p}`, name: p.split('/').pop(), hash }); }
+        return {
+            joined: { project: { _id: projectId, name: 'Book', rootFolder: [root], rootDoc_id: 'doc-main.tex', owner: {}, members: [], invites: [] }, permissionsLevel: 'owner' } as any,
+            ranges: { projectId, docs: [...this.docs].map(([p, text]) => ({ path: p, docId: `doc-${p}`, text, comments: [], changes: [] })), trackChanges: false, users: {} },
+        };
+    }
+    async compile(_projectId: string, request: { rootResourcePath: string }) {
+        this.compiles.push(request.rootResourcePath);
+        const status = this.statuses.shift() ?? 'success';
+        return { response: { status, outputFiles: Object.keys(this.outputs).map(p => ({ path: p, url: `/build/${p}`, type: p.split('.').pop(), build: 'b' })) } } as any;
+    }
+    async outputFile(file: { path: string }) { return new TextEncoder().encode(this.outputs[file.path]); }
+}
+
+describe('replica-land', function () {
+    this.timeout(20000);
+    let scratch: string;
+    beforeEach(() => { scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'replica-land-cli-')); });
+    afterEach(() => { fs.rmSync(scratch, { recursive: true, force: true }); });
+
+    /** A replica whose repository holds Overleaf's state, an IDE window that pushes as the extension does, and Overleaf. */
+    function setup() {
+        const folder = path.join(scratch, 'replica');
+        fs.mkdirSync(folder);
+        git(folder, 'init', '--quiet', '--initial-branch=main');
+        git(folder, 'config', 'user.name', 'Local User');
+        git(folder, 'config', 'user.email', 'local@example.com');
+        fs.writeFileSync(path.join(folder, 'main.tex'), 'main v1\n');
+        fs.mkdirSync(path.join(folder, 'slike'));
+        fs.writeFileSync(path.join(folder, 'slike', 'a.png'), 'PNG');
+        fs.writeFileSync(path.join(folder, 'main.aux'), 'a build product, left out');
+        git(folder, 'add', 'main.tex', 'slike/a.png');
+        git(folder, 'commit', '--quiet', '-m', 'Overleaf\'s state');
+        const head = git(folder, 'rev-parse', 'HEAD');
+        git(folder, 'update-ref', OVERLEAF_REF, head);
+        const overleaf = new Overleaf();
+        overleaf.docs.set('main.tex', 'main v1\n');
+        overleaf.files.set('slike/a.png', git(folder, 'rev-parse', 'HEAD:slike/a.png'));
+        const asked: string[] = [];
+        const window = { connected: true, pushLater: false };
+        const ask: AskWindow = async (request) => {
+            asked.push(request.op === 'land' ? `land ${request.commit.slice(0, 7)}` : request.op);
+            const state = () => ({ head: git(folder, 'rev-parse', 'HEAD'), overleaf: git(folder, 'rev-parse', OVERLEAF_REF), branch: 'main', unmerged: [] });
+            if (request.op === 'sync') { return { ok: true, connected: window.connected, git: state() }; }
+            if (request.op === 'land') {
+                git(folder, 'merge', '--ff-only', '--quiet', request.commit);
+                const apply = () => {
+                    for (const p of git(folder, 'diff', '--name-only', head, request.commit).split('\n').filter(Boolean)) {
+                        const exists = fs.existsSync(path.join(folder, p));
+                        if (!exists) { overleaf.docs.delete(p); overleaf.files.delete(p); continue; }
+                        if (p.endsWith('.png')) { overleaf.files.set(p, git(folder, 'rev-parse', `${request.commit}:${p}`)); } else { overleaf.docs.set(p, fs.readFileSync(path.join(folder, p), 'utf8')); }
+                    }
+                };
+                if (window.pushLater) { overleaf.beforeRead = () => { if (overleaf.reads >= 2) { apply(); } }; } else { apply(); }
+                git(folder, 'update-ref', OVERLEAF_REF, request.commit);
+                return { ok: true, landed: request.commit, overleaf: request.commit, summary: { uploaded: ['/main.tex'], renamed: [] } };
+            }
+            return { ok: true, git: state() };
+        };
+        const commit = (files: Record<string, string>, message: string) => {
+            const index = path.join(scratch, 'index');
+            const env = { ...process.env, GIT_INDEX_FILE: index };
+            const run = (args: string[], input?: string) => {
+                const r = spawnSync('git', ['-C', folder, ...args], { encoding: 'utf8', env, input });
+                if (r.status !== 0) { throw new Error(r.stderr); }
+                return r.stdout.trim();
+            };
+            run(['read-tree', 'HEAD']);
+            for (const [p, content] of Object.entries(files)) {
+                run(['update-index', '--add', '--cacheinfo', `100644,${run(['hash-object', '-w', '--stdin'], content)},${p}`]);
+            }
+            const tree = run(['write-tree']);
+            fs.rmSync(index, { force: true });
+            return run(['commit-tree', tree, '-p', 'HEAD', '-m', message]);
+        };
+        const options = {
+            folder, projectId: 'p'.repeat(24), windowTimeoutMs: 1000, verifyIntervalMs: 1, sleep: async () => {},
+            isIgnored: (p: string) => p.endsWith('.aux') || p.startsWith('/.overleaf'), log: () => {},
+        };
+        return { folder, head, overleaf, ask, asked, window, commit, options, repo: new Repo(folder) };
+    }
+
+    it('lands a commit: the window pushes it, Overleaf holds it, the project compiles without errors, and the project\'s check runs', async () => {
+        const t = setup();
+        const commit = t.commit({ 'main.tex': 'main v2\n', 'tests/01.t': 'ok\n' }, 'A book commit');
+        git(t.folder, 'config', 'overleaf.landCheck', 'printf "%s %s %s %s" "$OVERLEAF_COMMIT" "$OVERLEAF_PARENT" "$(basename "$OVERLEAF_COMPILE")" "$(basename "$OVERLEAF_PARENT_COMPILE")"');
+        const report = await landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit });
+        assert.deepStrictEqual(t.asked, ['sync', `land ${commit.slice(0, 7)}`]);
+        assert.strictEqual(report.pushed, true);
+        assert.strictEqual(report.overleaf, commit);
+        assert.strictEqual(report.verified, 3);
+        // the parent was compiled first, for the check to compare with
+        assert.deepStrictEqual(t.overleaf.compiles, ['main.tex', 'main.tex']);
+        assert.strictEqual(report.parentCompile?.status, 'success');
+        assert.strictEqual(report.compile?.status, 'success');
+        assert.strictEqual(report.compile?.check?.ok, true);
+        assert.strictEqual(report.compile?.check?.pages, 812);
+        const gitDir = path.join(t.folder, '.git');
+        assert.ok(fs.existsSync(path.join(gitDir, 'overleaf', 'compiles', commit, 'output.log')));
+        assert.ok(!fs.existsSync(path.join(gitDir, 'overleaf', 'compiles', commit, 'output.pdf')));
+        assert.strictEqual(report.hook?.output, `${commit} ${t.head} ${commit} ${t.head}`);
+        assert.strictEqual(landedCleanly(report), true);
+        assert.match(fs.readFileSync(path.join(gitDir, 'overleaf', 'landings.log'), 'utf8'), new RegExp(`${commit} parent ${t.head} pushed, compile success, no errors, landCheck exit 0`));
+    });
+
+    it('waits until Overleaf shows the pushed commit', async () => {
+        const t = setup();
+        t.window.pushLater = true;
+        const commit = t.commit({ 'main.tex': 'main v2\n' }, 'Late');
+        const report = await landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit, compile: false });
+        assert.strictEqual(report.verified, 2);
+        assert.ok(t.overleaf.reads >= 3);
+    });
+
+    it('stops before pushing when Overleaf does not hold the parent, and says which files differ', async () => {
+        const t = setup();
+        t.overleaf.docs.set('main.tex', 'edited on Overleaf, not synced yet\n');
+        const commit = t.commit({ 'main.tex': 'main v2\n' }, 'Late');
+        await assert.rejects(landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit }), (error: any) =>
+            error instanceof LandError && /does not hold/.test(error.message) && error.details[0] === 'main.tex: the document on Overleaf differs');
+        assert.deepStrictEqual(t.asked, ['sync']);
+    });
+
+    it('stops when Overleaf\'s state is not the checked-out commit, or the commit does not descend from it', async () => {
+        const t = setup();
+        const sibling = t.commit({ 'main.tex': 'main v2\n' }, 'One');
+        git(t.folder, 'commit', '--quiet', '--allow-empty', '-m', 'local, not on Overleaf');
+        await assert.rejects(landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit: sibling }), /is not the checked-out commit/);
+        git(t.folder, 'update-ref', OVERLEAF_REF, 'HEAD');
+        await assert.rejects(landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit: sibling }), /does not descend from Overleaf's state/);
+    });
+
+    it('compiles again while another compile runs, and fails the landing on a LaTeX error', async () => {
+        const t = setup();
+        t.overleaf.statuses = ['compile-in-progress', 'compile-in-progress'];
+        t.overleaf.outputs['output.log'] = 'stuff\n! Undefined control sequence.\nl.42 \\foo\n   bar\nOutput written on output.pdf (3 pages).\n';
+        const report = await landCommit(t.repo, t.overleaf, t.ask, t.options);
+        assert.strictEqual(report.pushed, false);
+        assert.strictEqual(report.compile?.attempts, 3);
+        assert.strictEqual(report.compile?.check?.ok, false);
+        assert.match(report.compile!.check!.problems[0], /1 LaTeX errors in output.log; the first:\n {2}! Undefined control sequence.\n {2}l.42 \\foo\n {5}bar$/);
+        assert.strictEqual(landedCleanly(report), false);
+    });
+
+    describe('the build check', () => {
+        const dir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'build-check-'));
+        it('passes a clean build and counts the warnings by kind', () => {
+            const d = dir();
+            fs.writeFileSync(path.join(d, 'output.log'), LOG_OK);
+            const check = checkBuild(d);
+            assert.deepStrictEqual({ ok: check.ok, pages: check.pages, warnings: check.warnings }, {
+                ok: true, pages: 812, warnings: [{ kind: 'LaTeX Warning: Reference `a\' on page N undefined', count: 1 }, { kind: 'LaTeX Warning: Reference `b\' on page N undefined', count: 1 }],
+            });
+            fs.rmSync(d, { recursive: true });
+        });
+        it('fails on latexmk\'s error summary, a failed automatic index, and an index that was not built', () => {
+            const d = dir();
+            fs.writeFileSync(path.join(d, 'output.log'), `${LOG_OK}The index was not built: upmendex failed\n`);
+            fs.writeFileSync(path.join(d, 'output.stdout'), 'Latexmk: ...\nCollected error summary (may duplicate other messages):\n  pdflatex: Command for \'pdflatex\' gave return code 1\n');
+            fs.writeFileSync(path.join(d, 'output.stderr'), 'Automatic index: autoindex.pl failed\n');
+            const check = checkBuild(d);
+            assert.strictEqual(check.ok, false);
+            assert.strictEqual(check.problems.length, 3);
+            fs.rmSync(d, { recursive: true });
+        });
+        it('fails when output.log is missing or does not say the PDF was written', () => {
+            const d = dir();
+            assert.match(checkBuild(d).problems[0], /output.log is missing/);
+            fs.writeFileSync(path.join(d, 'output.log'), 'This is pdfTeX\n');
+            assert.deepStrictEqual(checkBuild(d).problems, ['output.log does not say that output.pdf was written']);
+            fs.rmSync(d, { recursive: true });
+        });
+    });
+});

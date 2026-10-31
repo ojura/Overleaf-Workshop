@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/naming-convention -- environment variable names */
+/* eslint-disable @typescript-eslint/naming-convention -- environment variable names and file paths as keys */
 import * as assert from 'assert';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
