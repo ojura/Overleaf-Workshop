@@ -28,12 +28,6 @@ function failureOf(record: CompileRecord | undefined): string {
     return status === 'success' ? 'the compile made no output.pdf' : `Overleaf's status is "${status}"`;
 }
 
-const pdfViewRecord: {
-    [key: string]: {
-        [key: string]: { doc: PdfDocument, webviewPanel: vscode.WebviewPanel }
-    }
-} = {};
-
 class CompileDiagnosticProvider {
     private diagnosticCollection = vscode.languages.createDiagnosticCollection(ROOT_NAME);
     constructor(private readonly vfsm: RemoteFileSystemProvider) {};
@@ -144,6 +138,8 @@ export class CompileManager {
     cachedBuildShown: Promise<void> = Promise.resolve();
     /** the event listeners of the constructor, which `triggers` hands on for disposal */
     private readonly listeners: vscode.Disposable[] = [];
+    /** the open PDF viewers, by viewerKey */
+    private readonly viewers = new Map<string, { doc: PdfDocument, webviewPanel: vscode.WebviewPanel }>();
 
     constructor(
         private vfsm: RemoteFileSystemProvider,
@@ -160,21 +156,27 @@ export class CompileManager {
                 this.cachedBuildShown = this.showCachedBuild(uri);
             }
         }));
-        // listen pdf open event
+        // a PDF viewer opens; it leaves the record when it closes, so that a jump to the PDF opens
+        // the PDF again rather than writing to the closed viewer
         this.listeners.push(EventBus.on('pdfWillOpenEvent', ({uri, doc, webviewPanel}) => {
-            const {identifier,pathParts} = parseUri(uri);
-            const filePath = pathParts.join('/');
-            if (pdfViewRecord[identifier]) {
-                pdfViewRecord[identifier][filePath] = {doc, webviewPanel};
-            } else {
-                pdfViewRecord[identifier] = {[filePath]:{doc, webviewPanel}};
-            }
+            const key = CompileManager.viewerKey(uri);
+            const viewer = {doc, webviewPanel};
+            this.viewers.set(key, viewer);
+            webviewPanel.onDidDispose(() => {
+                if (this.viewers.get(key) === viewer) { this.viewers.delete(key); }
+            });
         }));
     }
 
     /** whether a compile runs: from the request (compile) to its end (run) */
     get inCompiling(): boolean {
         return this.running !== undefined;
+    }
+
+    /** The key of the viewer of `uri`, a file of a project, in `viewers`. */
+    private static viewerKey(uri: vscode.Uri): string {
+        const {identifier, pathParts} = parseUri(uri);
+        return `${identifier}:${pathParts.join('/')}`;
     }
 
     static async check(uri?: vscode.Uri) {
@@ -411,18 +413,49 @@ export class CompileManager {
         }
     }
 
-    async openPdf() {
-        const uri = await CompileManager.check();
+    /**
+     * Open the build's PDF of the project of `target`, else of the active editor or the workspace
+     * (check). Settles when VS Code has opened its viewer, or did not open it.
+     */
+    async openPdf(target?: vscode.Uri) {
+        const uri = await CompileManager.check(target);
         if (uri) {
-            const rootPath = uri.path.split('/', 2)[1];
-            const pdfUri = uri.with({
-                path: `/${rootPath}/${OUTPUT_FOLDER_NAME}/output.pdf`,
-            });
-            vscode.commands.executeCommand('vscode.openWith', pdfUri,
+            await vscode.commands.executeCommand('vscode.openWith', CompileManager.buildPdfOf(uri),
                 `${ROOT_NAME}.pdfViewer`,
                 { preview: false, viewColumn: vscode.ViewColumn.Beside }
             );
         }
+    }
+
+    /** The build's output.pdf of the project of `uri`. */
+    private static buildPdfOf(uri: vscode.Uri): vscode.Uri {
+        const rootPath = uri.path.split('/', 2)[1];
+        return uri.with({ path: `/${rootPath}/${OUTPUT_FOLDER_NAME}/output.pdf` });
+    }
+
+    /**
+     * The viewer of the build's PDF of the project of `uri`, opened when it is not open. VS Code's
+     * vscode.openWith settles only after the custom editor's resolveCustomEditor, which records the
+     * viewer (pdfWillOpenEvent) before its first await (VS Code 1.107.0: editorCommands.ts:517-525,
+     * editorGroupView.ts:1254-1260, editorPanes.ts:463-465, webviewEditor.ts:152-153,
+     * mainThreadCustomEditors.ts:144-215). A viewer that is not recorded by then did not open, and
+     * the user is told.
+     */
+    private async buildViewerOf(uri: vscode.Uri) {
+        const key = CompileManager.viewerKey(CompileManager.buildPdfOf(uri));
+        const open = this.viewers.get(key);
+        if (open) { return open; }
+        try {
+            await this.openPdf(uri);
+        } catch (error) {
+            vscode.window.showWarningMessage( vscode.l10n.t('The PDF could not be opened for the jump: {error}', {error: String((error as Error)?.message ?? error)}) );
+            return undefined;
+        }
+        const opened = this.viewers.get(key);
+        if (!opened) {
+            vscode.window.showWarningMessage( vscode.l10n.t('The PDF did not open, so the jump to it was not made.') );
+        }
+        return opened;
     }
 
     /** The path inside the project of `docUri`: a document of the project, or a file of its local replica. */
@@ -472,20 +505,13 @@ export class CompileManager {
             vscode.window.showInformationMessage( vscode.l10n.t('This file is not part of the Overleaf project.') );
             return;
         }
-        const { identifier } = parseUri(uri);
         const startPoint = editor.selection.start;
         const vfs = await this.vfsm.prefetch(uri);
         // SyncTeX counts lines from 1, as the web editor sends them
         const res = await vfs.syncCode(filePath, startPoint.line + 1, startPoint.character);
         if (!res) { return; }
-        const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
-        if (!pdfViewRecord[identifier]?.[pdfPath]) {
-            await this.openPdf();
-            for (let i = 0; i < 50 && !pdfViewRecord[identifier]?.[pdfPath]; i++) {
-                await new Promise(resolve => setTimeout(resolve, 100));
-            }
-        }
-        pdfViewRecord[identifier]?.[pdfPath]?.webviewPanel.webview.postMessage({
+        const viewer = await this.buildViewerOf(uri);
+        viewer?.webviewPanel.webview.postMessage({
             type: 'syncCode',
             content: res,
         });
