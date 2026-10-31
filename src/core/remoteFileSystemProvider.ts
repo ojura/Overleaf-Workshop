@@ -4,7 +4,7 @@ import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, COMPILERS, CompileResponseSchema, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import type { CompileRecord } from '../compile/outputFiles';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
-import { opsFor } from '../utils/docUpdate';
+import { opsFor, TrackChangesState, updateMeta } from '../utils/docUpdate';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { ClientManager } from '../collaboration/clientManager';
@@ -116,6 +116,8 @@ export interface ProjectEntity {
     owner: MemberEntity,
     features: {[key:string]:any},
     settings: ProjectSettingsSchema,
+    /** for whom Overleaf records edits as tracked changes; kept current by toggle-track-changes */
+    trackChangesState?: TrackChangesState,
 }
 
 export class File implements vscode.FileStat {
@@ -689,6 +691,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                     this.initializing = this.initializingPromise;
                 }, 1000);
             },
+            onTrackChangesToggled: (state:TrackChangesState) => {
+                if (this.root) { this.root.trackChangesState = state; }
+            },
             onConnectionAccepted: (publicId:string) => {
                 this.retryConnection = 0;
                 this.reconnectingNotification = false;
@@ -1146,6 +1151,11 @@ export class VirtualFileSystem extends vscode.Disposable {
                 // placed as Overleaf places edits (semantic cleanup), so comments and tracked
                 // changes next to the edit move as with the same edit in the editor or a git push
                 op: opsFor(doc.remoteCache!, mergeRes),
+                // tracked, as the editor's updates are, when track changes is on for this user
+                ...(()=>{
+                    const meta = updateMeta(this.root?.trackChangesState, this.userId);
+                    return meta ? {meta} : {};
+                })(),
             };
             if (update.op.length>0) { this.isDirty = true; }
             if (update.op.length===0) {

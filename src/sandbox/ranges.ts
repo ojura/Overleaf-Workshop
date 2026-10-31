@@ -19,7 +19,9 @@
  *   alike.
  */
 import { overleafText } from './plan';
-import { semanticDiff } from '../utils/docUpdate';
+import { semanticDiff, trackChangesFor, TrackChangesState } from '../utils/docUpdate';
+
+export { trackChangesFor };
 
 export interface CommentRange { id: string; threadId: string; p: number; text: string; userId?: string; }
 export interface TrackedChange { id: string; kind: 'insertion' | 'deletion'; p: number; text: string; userId?: string; }
@@ -36,8 +38,8 @@ export interface DocRanges {
 export interface ProjectRanges {
     projectId: string;
     docs: DocRanges[];
-    /** project.trackChangesState: on or off for everyone, or on per user id */
-    trackChanges: boolean | Record<string, boolean>;
+    /** project.trackChangesState */
+    trackChanges: TrackChangesState;
     /** the names of the project's owner and members, by user id */
     users: Record<string, string>;
 }
@@ -51,12 +53,6 @@ export function rangesOf(ranges: any): { comments: CommentRange[], changes: Trac
         ? { id: c.id, kind: 'insertion' as const, p: c.op.p, text: c.op.i, userId: c.metadata?.user_id }
         : { id: c.id, kind: 'deletion' as const, p: c.op?.p ?? 0, text: c.op?.d ?? '', userId: c.metadata?.user_id });
     return { comments, changes };
-}
-
-/** Whether track changes is on for `userId` in a project's trackChangesState. */
-export function trackChangesFor(state: ProjectRanges['trackChanges'], userId?: string): boolean {
-    if (typeof state === 'boolean') { return state; }
-    return !!(userId && state?.[userId]);
 }
 
 /** One change of a document: the text from `from` to `to` replaced by `inserted`, in the positions of the text before it. */

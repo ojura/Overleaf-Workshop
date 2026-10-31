@@ -4,6 +4,7 @@ import { FileEntity, DocumentEntity, FileRefEntity, FileType, FolderEntity, Proj
 import { EventBus } from '../utils/eventBus';
 import { SocketIOAlt } from './socketioAlt';
 import { decodePackedUtf8 } from './packedUtf8';
+import type { TrackChangesState } from '../utils/docUpdate';
 
 
 /** Render a socket.io error payload as something readable instead of `[object Object]`. */
@@ -58,9 +59,10 @@ export interface UpdateSchema {
     hash?: string, //(not needed if lastV is provided)
     dupIfSource?: string[], //publicIds an earlier submission of this update may have come from
     meta?: {
-        source: string, //socketio client id
-        ts: number, //unix timestamp
-        user_id: string,
+        source?: string, //socketio client id, in updates from the server
+        ts?: number, //unix timestamp, in updates from the server
+        user_id?: string, //in updates from the server
+        tc?: string, //the seed of the tracked changes this update makes (see utils/docUpdate)
     }
 }
 
@@ -81,6 +83,7 @@ export interface EventsHandler {
     onSpellCheckLanguageUpdated?: (language:string) => void,
     onCompilerUpdated?: (compiler:string) => void,
     onRootDocUpdated?: (rootDocId:string) => void,
+    onTrackChangesToggled?: (state:TrackChangesState) => void,
 }
 
 type ConnectionScheme = 'Alt' | 'v1' | 'v2';
@@ -382,6 +385,12 @@ export class SocketIOAPI {
                 case handlers.onRootDocUpdated:
                     this.socket.on('rootDocUpdated', (rootDocId:string) => {
                         handler(rootDocId);
+                    });
+                    break;
+                case handlers.onTrackChangesToggled:
+                    // the whole new trackChangesState: false, true, or {userId: true, ...}
+                    this.socket.on('toggle-track-changes', (state:TrackChangesState) => {
+                        handler(state);
                     });
                     break;
                 default:

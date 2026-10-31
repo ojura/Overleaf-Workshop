@@ -121,7 +121,7 @@ function setup(initialContent: string) {
     handlers.onConnectionAccepted(server.publicId);
 
     return {
-        server, doc, editor,
+        server, doc, editor, vfs, handlers,
         open: async () => new TextDecoder().decode(await vfs.openFile(uri)),
         save: (text: string) => vfs.writeFile(uri, new TextEncoder().encode(text), false, true),
         /** another client (e.g. the web editor) inserts `text` at `p` */
@@ -236,6 +236,61 @@ describe('VirtualFileSystem.writeFile: the placement of edits', () => {
         await settle();
         assert.deepStrictEqual(t.server.emitted[0].op, [{ p: 7, d: 'L10 y.\n' }]);
         assert.strictEqual(t.server.content, 'L09 x.\nL11 z.\n');
+    });
+});
+
+describe('VirtualFileSystem.writeFile: tracked changes', () => {
+    const ackTimeout = VirtualFileSystem.ownUpdateAckTimeoutMs;
+    before(() => { VirtualFileSystem.ownUpdateAckTimeoutMs = 20; });
+    after(() => { VirtualFileSystem.ownUpdateAckTimeoutMs = ackTimeout; });
+
+    const user = (t: ReturnType<typeof setup>, trackChangesState: any) => {
+        t.vfs.userId = 'u1';
+        t.vfs.root = { trackChangesState };
+    };
+
+    it('sends its edits untracked while track changes is off', async () => {
+        const t = setup('hello');
+        user(t, false);
+        await t.open();
+        await t.save('hello a');
+        await settle();
+        assert.strictEqual(t.server.content, 'hello a');
+        assert.strictEqual(t.server.emitted[0].meta, undefined);
+    });
+
+    it('marks its updates for tracking when track changes is on for its user, as the editor does', async () => {
+        const t = setup('hello');
+        user(t, { u1: true });
+        await t.open();
+        await t.save('hello a');
+        await settle();
+        assert.deepStrictEqual(Object.keys(t.server.emitted[0].meta), ['tc']);
+        assert.match(t.server.emitted[0].meta.tc, /^[0-9a-f]{18}$/);
+    });
+
+    it('does not track its edits when track changes is on only for others', async () => {
+        const t = setup('hello');
+        user(t, { u2: true });
+        await t.open();
+        await t.save('hello a');
+        await settle();
+        assert.strictEqual(t.server.emitted[0].meta, undefined);
+    });
+
+    it('follows toggle-track-changes from the server', async () => {
+        const t = setup('hello');
+        user(t, false);
+        await t.open();
+        t.handlers.onTrackChangesToggled({ u1: true });
+        await t.save('hello a');
+        await settle();
+        assert.match(t.server.emitted[0].meta.tc, /^[0-9a-f]{18}$/);
+        t.handlers.onTrackChangesToggled(false);
+        await t.save('hello a b');
+        await settle();
+        assert.strictEqual(t.server.emitted[1].meta, undefined);
+        assert.strictEqual(t.server.content, 'hello a b');
     });
 });
 

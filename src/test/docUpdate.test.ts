@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import * as DiffMatchPatch from 'diff-match-patch';
-import { opsFor, semanticDiff, TextOp } from '../utils/docUpdate';
+import { opsFor, semanticDiff, TextOp, trackChangesFor, trackedChangesSeed, updateMeta } from '../utils/docUpdate';
 
 /** Apply ops one after the other, as Overleaf does. */
 function apply(text: string, ops: TextOp[]): string {
@@ -34,5 +34,28 @@ describe('docUpdate: the ops of an update', () => {
         // the plain diff, which the extension used before: from the middle of one line to the middle of the next
         assert.deepStrictEqual(new DiffMatchPatch().diff_main(before, after).filter(d => d[0] !== 0), [[-1, '0 y.\nL1']]);
         assert.deepStrictEqual(semanticDiff(before, after).filter(d => d[0] !== 0), [[-1, 'L10 y.\n']]);
+    });
+});
+
+describe('docUpdate: tracked updates', () => {
+    it('knows for whom track changes is on', () => {
+        assert.strictEqual(trackChangesFor(true, 'u1'), true);
+        assert.strictEqual(trackChangesFor(false, 'u1'), false);
+        assert.strictEqual(trackChangesFor({ u1: true }, 'u1'), true);
+        assert.strictEqual(trackChangesFor({ u1: false, u2: true }, 'u1'), false);
+        assert.strictEqual(trackChangesFor(undefined, 'u1'), false);
+        assert.strictEqual(trackChangesFor({ u1: true }, undefined), false);
+    });
+    it('gives an update a fresh seed when track changes is on for its user, and no meta otherwise', () => {
+        const a = updateMeta({ u1: true }, 'u1'), b = updateMeta(true, 'u1');
+        assert.match(a!.tc, /^[0-9a-f]{18}$/);
+        assert.notStrictEqual(a!.tc, b!.tc);
+        assert.strictEqual(updateMeta({ u2: true }, 'u1'), undefined);
+        assert.strictEqual(updateMeta(false, 'u1'), undefined);
+        assert.strictEqual(updateMeta(undefined, 'u1'), undefined);
+    });
+    it('makes a seed that begins with the time in seconds, as an ObjectId does', () => {
+        const seconds = parseInt(trackedChangesSeed().slice(0, 8), 16);
+        assert.ok(Math.abs(seconds - Date.now() / 1000) < 5);
     });
 });
