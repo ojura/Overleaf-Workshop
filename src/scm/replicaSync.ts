@@ -27,6 +27,10 @@ import { gitMergeText } from './replicaGit';
  * rename or a move, is renamed on Overleaf, so that the document keeps its comments and its
  * history there.
  *
+ * Without uploads (the push mode "bridge"), local changes stay local until a push through
+ * the git bridge brings them to Overleaf; changes made on Overleaf still come in, merged
+ * into the local files.
+ *
  * This module does not import 'vscode', so that it can be tested in plain Node.
  */
 
@@ -149,6 +153,8 @@ export interface SyncSummary {
     keptAside: {path: string, copy: string}[],
     /** text files that now hold conflict markers */
     conflicts: string[],
+    /** local changes that wait for a push, when the sync does not upload */
+    held: string[],
     /** local files that are not on Overleaf and were left alone */
     untracked: string[],
     /** deletions that were not confirmed */
@@ -162,7 +168,7 @@ export interface SyncSummary {
 function emptySummary(): SyncSummary {
     return {
         downloaded: [], uploaded: [], renamed: [], merged: [], deletedLocal: [], deletedRemote: [],
-        keptAside: [], conflicts: [], untracked: [], skippedDeletions: [], failed: [], unchanged: 0, notChecked: 0,
+        keptAside: [], conflicts: [], held: [], untracked: [], skippedDeletions: [], failed: [], unchanged: 0, notChecked: 0,
     };
 }
 
@@ -273,6 +279,9 @@ export class ReplicaSync {
     private holds = 0;
     private heldPaths = new Set<string>();
     private readonly merge: MergeText;
+    /** whether local changes are uploaded; without, they wait for a push through the git bridge */
+    private readonly uploads: boolean;
+    private readonly onRecorded?: (result: {waiting?: boolean}) => void;
 
     constructor(
         private readonly remote: ReplicaRemote,
@@ -280,9 +289,11 @@ export class ReplicaSync {
         private readonly store: ReplicaStore,
         private readonly ui: ReplicaUI,
         private readonly isIgnored: (path: string) => boolean,
-        options: {merge?: MergeText} = {},
+        options: {merge?: MergeText, uploads?: boolean, onRecorded?: (result: {waiting?: boolean}) => void} = {},
     ) {
         this.merge = options.merge ?? gitMergeText;
+        this.uploads = options.uploads ?? true;
+        this.onRecorded = options.onRecorded;
     }
 
     private load(): Promise<void> {
@@ -720,6 +731,8 @@ export class ReplicaSync {
             mode.collected!.remote.push(path);
         } else if (await this.isUnmerged(path)) {
             this.blocked(path);
+        } else if (!this.uploads) {
+            summary.held.push(path);
         } else {
             await this.transfers.run(() => this.remote.remove(path));
             delete this.state.entries[path];
@@ -762,6 +775,10 @@ export class ReplicaSync {
             this.blocked(path);
             return;
         }
+        if (!this.uploads) {
+            summary.held.push(path);
+            return;
+        }
         let kind: EntryKind;
         let text: string | undefined;
         if (remote?.kind==='doc') {
@@ -801,6 +818,15 @@ export class ReplicaSync {
             summary.conflicts.push(path);
             this.warnedConflicts.delete(path);
             this.ui.log(`${path}: changed on both sides in the same place; the conflicts are marked in the file`);
+            return;
+        }
+        if (!this.uploads) {
+            // Overleaf's changes go into the local file; the local ones wait for a push
+            const written = merged.content!==localText ? await this.local.write(path, encoder.encode(merged.content)) : stat;
+            await this.setEntry(path, {kind: 'doc', base: textHash(remoteText), ...seen(written)}, 'remote', remoteText);
+            summary.merged.push(path);
+            if (merged.content!==remoteText) { summary.held.push(path); }
+            this.ui.log(`${path}: merged the changes made on Overleaf into the local file`);
             return;
         }
         if (merged.content!==remoteText) {
@@ -856,7 +882,7 @@ export class ReplicaSync {
      * content. Undefined when there is none, or the remote side cannot rename.
      */
     private async renamedFrom(path: string, hash: string): Promise<string | undefined> {
-        if (!this.remote.rename) { return undefined; }
+        if (!this.remote.rename || !this.uploads) { return undefined; }
         for (const [from, entry] of Object.entries(this.state.entries)) {
             if (from===path || entry.base!==hash || entry.conflict || !this.tracked(from)) { continue; }
             if (await this.local.stat(from)!==undefined) { continue; }
@@ -975,6 +1001,7 @@ export class ReplicaSync {
             const state: SavedState = JSON.parse(JSON.stringify(this.state));
             await this.store.save(state);
             const result = await this.store.record!(state);
+            this.onRecorded?.(result);
             if (!result.waiting) {
                 // the changes noted before the record are in it; later ones wait for the next
                 const changes = this.state.changes ?? {};
@@ -1010,6 +1037,7 @@ export function describe(summary: SyncSummary): string {
         [summary.deletedRemote.length, 'deleted on Overleaf'],
         [summary.keptAside.length, 'local versions kept aside'],
         [summary.conflicts.length, 'with conflict markers'],
+        [summary.held.length, 'local changes waiting for a push'],
         [summary.untracked.length, 'local-only files left alone'],
         [summary.skippedDeletions.length, 'deletions not confirmed'],
         [summary.failed.length, 'failed'],

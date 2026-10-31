@@ -538,6 +538,43 @@ describe('local replica: git as the merge backend', function () {
         await sync.stop();
     });
 
+    it('without uploads, keeps local changes for a push through the bridge and records the state that push makes', async () => {
+        const t = await world();
+        t.remote.docs.set('/main.tex', text);
+        t.update(ME);
+        const sync = new ReplicaSync(t.remote, t.local, t.store, t.ui, (p: string) => p.endsWith('.aux'), { uploads: false });
+        await sync.syncAll();
+        await sync.recordNow();
+        const first = t.g('rev-parse', 'HEAD');
+
+        // a local edit stays local; an edit on Overleaf elsewhere in the file comes in
+        t.write('/main.tex', text.replace('line 1', 'line one, local'));
+        await sync.localChanged('/main.tex');
+        assert.strictEqual(t.remote.count('writeDoc'), 0);
+        t.remote.docs.set('/main.tex', text.replace('line 5', 'line five, Overleaf'));
+        t.update(BOB);
+        const summary = await sync.flush(true);
+        assert.deepStrictEqual(summary.held, ['/main.tex']);
+        assert.strictEqual(t.read('/main.tex'), text.replace('line 1', 'line one, local').replace('line 5', 'line five, Overleaf'));
+        assert.strictEqual(t.remote.count('writeDoc'), 0);
+        await sync.recordNow();
+        const overleaf = t.g('rev-parse', OVERLEAF_REF);
+        assert.strictEqual(t.g('show', `${overleaf}:main.tex`), text.replace('line 5', 'line five, Overleaf').trimEnd());
+        assert.strictEqual(t.g('rev-parse', `${overleaf}^`), first);
+        assert.match(t.g('status', '--porcelain'), /^M main.tex$/m);
+
+        // the user commits; a push through the bridge brings the commit to Overleaf
+        t.g('commit', '--quiet', '-am', 'A local edit');
+        const commit = t.g('rev-parse', 'HEAD');
+        t.remote.docs.set('/main.tex', t.read('/main.tex'));
+        t.update(ME);
+        await sync.remoteChanged('/main.tex', false);
+        await sync.recordNow();
+        assert.strictEqual(t.g('rev-parse', OVERLEAF_REF), commit);
+        assert.strictEqual(t.remote.count('writeDoc'), 0);
+        await sync.stop();
+    });
+
     it('makes the sync state kept before git the first commit, and shows local differences as changes', async () => {
         const t = await world();
         const saved = text, edited = text.replace('line 1', 'edited locally');

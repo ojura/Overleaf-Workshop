@@ -16,6 +16,9 @@ import { DEFAULT_IGNORE_PATTERNS } from '../scm/ignorePatterns';
 import { Repo } from '../gitbridge/plumbing';
 import { minimatch } from 'minimatch';
 import { LandError, landCommit, landedCleanly, LandReport } from './land';
+import { anchorBridge } from '../gitbridge/anchor';
+import { bridgeBranch, pushToBridge } from '../gitbridge/flow';
+import { addBridgeRemote, rangesCheck } from '../gitbridge/overleaf';
 import {
     createSandbox, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions, sandboxStatus, sandboxUrl,
     settingsOf,
@@ -39,7 +42,7 @@ usage:
   node out/sandbox/cli.js git-credential get|store|erase --server <name> --bridge <url>
   node out/sandbox/cli.js replica-sync   --replica <folder> [--timeout <s>] [--json]
   node out/sandbox/cli.js replica-status --replica <folder> [--json]
-  node out/sandbox/cli.js replica-land   --replica <folder> [<commit>] [--main <file>] [--no-compile] [--timeout <s>] [--json]
+  node out/sandbox/cli.js replica-land   --replica <folder> [<commit>] [--push native|bridge] [--main <file>] [--no-compile] [--timeout <s>] [--json]
 
 --replica <folder>  the shared project's local replica. Its .overleaf/settings.json names
                     the project; .overleaf/sandbox.json records the private copy.
@@ -165,6 +168,15 @@ replica-land    Lands <commit> of the replica's git repository in the project, t
                 OVERLEAF_COMMIT and OVERLEAF_PARENT, e.g. a check of where the pages of the
                 contents fall. Without <commit>, the checked-out commit is checked and
                 compiled. <git dir>/overleaf/landings.log lists the landings.
+--push bridge   push through the git bridge instead: the branch fast-forwards to the
+                commit, the bridge's newest commit is joined with an anchor merge (as
+                node out/gitbridge/cli.js replica-bridge does), and git pushes the branch to
+                the remote "bridge" (added when missing) after the check of comments and
+                tracked changes (push-check). Overleaf shows the push as one version "via
+                Git", and every file of the commit goes into the project, also the ones the
+                replica's ignore patterns leave out. The window must not upload meanwhile:
+                its overleaf-workshop.localReplica.pushMode must be "bridge". Without a
+                window it works from the repository's refs.
 --main <file>   the main document; by default the project's
 --no-compile    land and check, without the compile
 Exit status: 0 landed and compiled without errors; 3 landed, but the compile or a check
@@ -185,7 +197,7 @@ names the database. The environment variable OVERLEAF_LOGIN, a JSON object
 
 const VALUE_FLAGS = new Set(['replica', 'dir', 'main', 'out', 'keep', 'ignore', 'include', 'lock-timeout', 'purpose', 'name', 'state-db',
     'project', 'repo', 'from', 'to', 'user', 'server', 'into', 'bridge',
-    'timeout']);
+    'timeout', 'push']);
 const GIT_AND_INFO_COMMANDS = ['project-info', 'git-token', 'git-clone', 'git-fetch', 'git-credential'];
 const OBJECT_ID = /^[0-9a-f]{24}$/;
 const REPEATABLE = new Set(['keep', 'ignore', 'include']);
@@ -358,7 +370,7 @@ async function replicaCommand(command: 'replica-sync' | 'replica-status', folder
 
 /** replica-land: land a commit of the replica's repository through the IDE window, verify it on Overleaf, compile. */
 async function replicaLand(folder: string, commit: string | undefined,
-                           options: { main?: string, compile: boolean, timeoutS: number, json: boolean, stateDb?: string }): Promise<number> {
+                           options: { main?: string, compile: boolean, timeoutS: number, json: boolean, stateDb?: string, push: 'native' | 'bridge' }): Promise<number> {
     const replica = readReplica(folder);
     const login = readStoredLogin(replica.serverName, options.stateDb);
     const client = new OverleafClient(login.url, login.identity);
@@ -367,7 +379,23 @@ async function replicaLand(folder: string, commit: string | undefined,
     try {
         report = await landCommit(new Repo(folder), client, (request, timeoutMs) => requestReplica(folder, request, timeoutMs), {
             commit, folder, projectId: replica.projectId, isIgnored, windowTimeoutMs: options.timeoutS * 1000,
-            compile: options.compile, main: options.main, log,
+            compile: options.compile, main: options.main, log, push: options.push,
+            bridgePush: async (repo) => {
+                const remote = 'bridge';
+                if (repo.run(['remote', 'get-url', remote], { allowFailure: true }).status !== 0) {
+                    log(`added the remote ${remote}: ${addBridgeRemote(repo, { remote, projectId: replica.projectId, serverName: replica.serverName }).url}`);
+                }
+                repo.run(['fetch', '--quiet', remote]);
+                const fetched = bridgeBranch(repo, remote);
+                const joined = anchorBridge(repo, `refs/remotes/${remote}/${fetched.branch}`, p => !isIgnored(`/${p}`), { log });
+                if (joined.outcome === 'newer' || joined.outcome === 'diverged') {
+                    throw new LandError(joined.outcome === 'newer'
+                        ? 'the bridge has changes the replica has not recorded yet; let the replica sync, then land again'
+                        : 'the checked-out branch lacks the replica\'s recorded state');
+                }
+                const pushed = await pushToBridge(repo, remote, { check: rangesCheck({ serverName: replica.serverName, projectId: replica.projectId, acceptWarnings: false }), log });
+                return { pushed: pushed.pushed, head: pushed.head };
+            },
         });
     } catch (error: any) {
         if (error instanceof NoReplicaWindowError) { log(error.message); return 4; }
@@ -430,7 +458,9 @@ async function main(argv: string[]): Promise<number> {
         if (positional.length > 2) { throw new UsageError(`unexpected argument ${positional[2]}`); }
         const timeoutS = Number(values.timeout ?? 600);
         if (!(timeoutS > 0)) { throw new UsageError('--timeout takes a number of seconds'); }
-        return await replicaLand(path.resolve(values.replica), positional[1], { main: values.main, compile: !flags.has('no-compile'), timeoutS, json: flags.has('json'), stateDb: values['state-db'] });
+        const push = values.push ?? 'native';
+        if (push !== 'native' && push !== 'bridge') { throw new UsageError('--push takes native or bridge'); }
+        return await replicaLand(path.resolve(values.replica), positional[1], { main: values.main, compile: !flags.has('no-compile'), timeoutS, json: flags.has('json'), stateDb: values['state-db'], push });
     }
     if (positional.length > 1) { throw new UsageError(`unexpected argument ${positional[1]}`); }
     if (command === 'ranges' || command === 'push-check') {

@@ -83,11 +83,11 @@ describe('replica-land', function () {
         overleaf.docs.set('main.tex', 'main v1\n');
         overleaf.files.set('slike/a.png', git(folder, 'rev-parse', 'HEAD:slike/a.png'));
         const asked: string[] = [];
-        const window = { connected: true, pushLater: false };
+        const window = { connected: true, pushLater: false, push: 'native' };
         const ask: AskWindow = async (request) => {
             asked.push(request.op === 'land' ? `land ${request.commit.slice(0, 7)}` : request.op);
             const state = () => ({ head: git(folder, 'rev-parse', 'HEAD'), overleaf: git(folder, 'rev-parse', OVERLEAF_REF), branch: 'main', unmerged: [] });
-            if (request.op === 'sync') { return { ok: true, connected: window.connected, git: state() }; }
+            if (request.op === 'sync') { return { ok: true, connected: window.connected, modes: { fetch: 'native', push: window.push }, git: state() }; }
             if (request.op === 'land') {
                 git(folder, 'merge', '--ff-only', '--quiet', request.commit);
                 const apply = () => {
@@ -186,6 +186,26 @@ describe('replica-land', function () {
         assert.strictEqual(report.compile?.check?.ok, false);
         assert.match(report.compile!.check!.problems[0], /1 LaTeX errors in output.log; the first:\n {2}! Undefined control sequence.\n {2}l.42 \\foo\n {5}bar$/);
         assert.strictEqual(landedCleanly(report), false);
+    });
+
+    it('pushes through the bridge when the window does not upload, and refuses while it does', async () => {
+        const t = setup();
+        const commit = t.commit({ 'main.tex': 'main v2\n' }, 'Through the bridge');
+        const pushes: string[] = [];
+        const bridgePush = async (repo: Repo) => {
+            const head = repo.mustCommit('HEAD');
+            pushes.push(head);
+            t.overleaf.docs.set('main.tex', 'main v2\n');
+            return { pushed: true, head };
+        };
+        await assert.rejects(landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit, push: 'bridge', bridgePush }), /push mode native/);
+        assert.deepStrictEqual(pushes, []);
+        t.window.push = 'bridge';
+        const report = await landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit, push: 'bridge', bridgePush, compile: false });
+        assert.deepStrictEqual(pushes, [commit]);
+        assert.strictEqual(git(t.folder, 'rev-parse', 'HEAD'), commit);
+        assert.strictEqual(report.verified, 2);
+        assert.ok(!t.asked.includes(`land ${commit.slice(0, 7)}`), 'the window does not push');
     });
 
     describe('the build check', () => {

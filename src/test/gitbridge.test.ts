@@ -10,6 +10,7 @@ import { findStartVersion, HistorySource, HistoryUpdate, readZip, treeAtVersion,
 import { answerFromFindings } from '../gitbridge/overleaf';
 import { gitDate, Repo } from '../gitbridge/plumbing';
 import { connectReplica, CONNECT_REF } from '../gitbridge/replicaConnect';
+import { anchorBridge } from '../gitbridge/anchor';
 
 /** a time in seconds that git reads as one: git takes small numbers for something else */
 const T = 1_700_000_000;
@@ -476,5 +477,58 @@ describe('git bridge: connecting a development history with a local replica\'s r
         const { replica } = replicaOf(s);
         commit(replica, { 'main.tex': 'a local change\n' }, 'Local', s.t0 + 700);
         await assert.rejects(connectReplica(replica, { historyRepo: s.local.dir, ref: 'master', history: s.history }), /is not the replica's checked-out commit/);
+    });
+});
+
+describe('git bridge: joining the bridge\'s commits with a replica\'s', () => {
+    const isProjectFile = (p: string) => !p.startsWith('.') && !p.endsWith('.aux');
+    /** A replica whose branch and Overleaf's ref hold `files`, recorded at `seconds`; a bridge with its own history. */
+    function setup(files: Record<string, string>, seconds: number) {
+        const dir = tmp();
+        const replica = newRepo(path.join(dir, 'replica'));
+        const recorded = commit(replica, files, 'Overleaf version 7', seconds, 'Collaborator <c@example.com>');
+        replica.run(['update-ref', 'refs/remotes/overleaf/main', recorded]);
+        const bridge = newRepo(path.join(dir, 'bridge'));
+        const fetchBridge = () => {
+            replica.run(['fetch', '--quiet', bridge.dir, '+master:refs/remotes/bridge/master']);
+            return 'refs/remotes/bridge/master';
+        };
+        return { replica, recorded, bridge, fetchBridge };
+    }
+
+    it('joins the bridge\'s commit for the replica\'s state with an anchor merge that keeps the tree', () => {
+        const s = setup({ 'main.tex': 'v2\n', 'fig.png': 'png' }, T + 100);
+        commit(s.bridge, { 'main.tex': 'v1\n', 'fig.png': 'png' }, 'Update on Overleaf.', T);
+        // the bridge's tree also has a file that the replica leaves out
+        const b = commit(s.bridge, { 'main.tex': 'v2\n', '.latexmkrc': 'x' }, 'Update on Overleaf.', T + 100);
+        const result = anchorBridge(s.replica, s.fetchBridge(), isProjectFile);
+        assert.strictEqual(result.outcome, 'anchored');
+        assert.strictEqual(result.twin, s.recorded);
+        const anchor = s.replica.mustCommit('HEAD');
+        assert.strictEqual(result.commit, anchor);
+        assert.deepStrictEqual(s.replica.commitInfo(anchor).parents, [s.recorded, b]);
+        assert.strictEqual(s.replica.commitInfo(anchor).tree, s.replica.commitInfo(s.recorded).tree);
+        assert.strictEqual(anchorBridge(s.replica, 'refs/remotes/bridge/master', isProjectFile).outcome, 'up-to-date');
+    });
+
+    it('joins a bridge commit for a state older than the replica\'s, and leaves one with newer changes', () => {
+        const s = setup({ 'main.tex': 'v3\n' }, T + 300);
+        // a state between two that the replica recorded together
+        commit(s.bridge, { 'main.tex': 'v2\n' }, 'Update on Overleaf.', T + 200);
+        assert.strictEqual(anchorBridge(s.replica, s.fetchBridge(), isProjectFile).outcome, 'anchored');
+        const anchored = s.replica.mustCommit('HEAD');
+        // an edit the replica has not seen yet
+        commit(s.bridge, { 'main.tex': 'v4\n' }, 'Update on Overleaf.', T + 400);
+        const result = anchorBridge(s.replica, s.fetchBridge(), isProjectFile);
+        assert.strictEqual(result.outcome, 'newer');
+        assert.strictEqual(s.replica.mustCommit('HEAD'), anchored);
+    });
+
+    it('leaves a branch alone that does not contain the replica\'s recorded state', () => {
+        const s = setup({ 'main.tex': 'v2\n' }, T + 100);
+        commit(s.bridge, { 'main.tex': 'v2\n' }, 'Update on Overleaf.', T + 100);
+        const elsewhere = s.replica.commitTree(s.replica.commitInfo(s.recorded).tree, [], 'A state on another line', { person: 'X <x@example.com>', date: `${T} +0000` }, { person: 'X <x@example.com>', date: `${T} +0000` });
+        s.replica.run(['update-ref', 'refs/remotes/overleaf/main', elsewhere]);
+        assert.strictEqual(anchorBridge(s.replica, s.fetchBridge(), isProjectFile).outcome, 'diverged');
     });
 });

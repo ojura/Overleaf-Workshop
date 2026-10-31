@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
+import { execFile } from 'child_process';
 import * as fs from 'fs';
+import * as path from 'path';
 import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { FileRefEntity, FolderEntity, VirtualFileSystem, __OUTPUTS_ID, parseUri } from '../core/remoteFileSystemProvider';
@@ -67,7 +69,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private localWatcher?: vscode.FileSystemWatcher;
     /** what reports changes of the local folder: Node's watcher, or the IDE's */
     private watchedBy: 'node' | 'ide' = 'node';
-    /** the fetch and push modes in effect (src/scm/replicaModes.ts); only native is implemented so far */
+    /** the fetch and push modes in effect (src/scm/replicaModes.ts) */
     private modes: ReplicaModes = {fetch: 'native', push: 'native'};
     private scanning?: Promise<void>;
     /** the files synced in the last RECENT_MS, newest last */
@@ -417,6 +419,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             liveResult: (summary) => {
                 this.remember(summary);
                 this.report(summary);
+                // in the fetch mode "mixed", the bridge's commit joins a conflict, so that it is between shareable commits
+                if (summary.conflicts.length && this.modes.fetch==='mixed') { this.fetchBridge('a conflict'); }
             },
         };
     }
@@ -627,6 +631,53 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return this.scanning;
     }
 
+    /**
+     * After the sync recorded Overleaf's state: in the fetch mode "bridge", every new state also
+     * gets the git bridge's commit, joined with the replica's; in "mixed", only a state that git
+     * could not merge into the branch.
+     */
+    private afterRecord(result: {waiting?: boolean, made?: string[], notMerged?: string}) {
+        if (this.modes.fetch==='bridge' && result.made?.length) {
+            this.fetchBridge('Overleaf\'s new state');
+        } else if (this.modes.fetch==='mixed' && result.notMerged) {
+            this.fetchBridge('a merge that git could not make');
+        }
+    }
+
+    private bridgeFetching?: Promise<void>;
+    private bridgeFetchAgain = false;
+
+    /**
+     * Fetch the git bridge's newest commit and join it with the replica's commits
+     * (node out/gitbridge/cli.js replica-bridge), in a process of its own: a request to the
+     * bridge takes from seconds to a minute. One at a time; a request meanwhile runs after it.
+     */
+    private fetchBridge(reason: string, label?: string): Promise<void> {
+        if (this.bridgeFetching) {
+            this.bridgeFetchAgain = true;
+            return this.bridgeFetching;
+        }
+        const cli = path.join(__dirname, '..', 'gitbridge', 'cli.js');
+        const args = [cli, 'replica-bridge', '--replica', this.baseUri.fsPath, ...(label!==undefined ? ['--label', label] : [])];
+        log(`[${this.vfs.projectName}] Fetching the git bridge's commit (${reason}).`);
+        this.bridgeFetching = new Promise<void>(resolve => {
+            // the extension host's binary runs as Node with this variable
+            // eslint-disable-next-line @typescript-eslint/naming-convention
+            execFile(process.execPath, args, {env: {...process.env, ELECTRON_RUN_AS_NODE: '1'}, timeout: 10 * 60 * 1000}, (error, stdout, stderr) => {
+                const said = `${stdout}${stderr}`.trim().split('\n').filter(line => line && !/DEP0044|trace-deprecation/.test(line));
+                log(`[${this.vfs.projectName}] The git bridge: ${said.join(' | ') || (error ? String(error) : 'done')}`);
+                resolve();
+            });
+        }).finally(() => {
+            this.bridgeFetching = undefined;
+            if (this.bridgeFetchAgain) {
+                this.bridgeFetchAgain = false;
+                void this.fetchBridge('a request made meanwhile');
+            }
+        });
+        return this.bridgeFetching;
+    }
+
     /** The replica's git state, for tools: the checked-out commit, Overleaf's, and the unmerged paths. */
     private async gitState() {
         const git = this.store?.git;
@@ -760,8 +811,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             log(`[${this.vfs.projectName}] The replica's git repository could not be opened: ${error}`);
             throw error;
         }
+        const replicaSettings = vscode.workspace.getConfiguration('overleaf-workshop.localReplica');
+        const {modes, notices} = replicaModes({fetch: replicaSettings.get('fetchMode'), push: replicaSettings.get('pushMode')});
+        this.modes = modes;
         const sync = new ReplicaSync(this.remoteSide(), this.localSide(), store, this.userInterface(),
-                                     path => this.matchIgnorePatterns(path));
+                                     path => this.matchIgnorePatterns(path), {
+                                         // with pushes through the git bridge, local changes wait for git push
+                                         uploads: modes.push==='native',
+                                         onRecorded: result => this.afterRecord(result),
+                                     });
         const record: {sync: ReplicaSync, stopped?: Promise<void>} = {sync};
         folderSyncs.set(key, record);
         this.sync = sync;
@@ -770,9 +828,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const syncOnFileChange = vscode.workspace
             .getConfiguration('overleaf-workshop.localReplica.syncOnFileChange')
             .get<boolean>('enabled', false);
-        const replicaSettings = vscode.workspace.getConfiguration('overleaf-workshop.localReplica');
-        const {modes, notices} = replicaModes({fetch: replicaSettings.get('fetchMode'), push: replicaSettings.get('pushMode')});
-        this.modes = modes;
         log(`[${this.vfs.projectName}] Fetch mode ${modes.fetch}, push mode ${modes.push}.`);
         for (const notice of notices) {
             log(`[${this.vfs.projectName}] ${notice}`);

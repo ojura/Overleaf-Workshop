@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
 import { Repo } from '../gitbridge/plumbing';
-import type { ControlAnswer, ControlRequest } from '../scm/replicaControl';
+import { ControlAnswer, ControlRequest, NoReplicaWindowError } from '../scm/replicaControl';
 import { OVERLEAF_REF } from '../scm/replicaGit';
 import { BuildCheck, checkBuild } from './buildCheck';
 import type { CompileResult, JoinedProject } from './client';
@@ -29,6 +29,12 @@ import type { ProjectRanges } from './ranges';
  *    the parent's, e.g. a project's own check of where its pages fall.
  *
  * Without a commit, it checks and compiles the checked-out commit: steps 1, 2, 5 and 6.
+ *
+ * With the push through the git bridge, step 3 is git's: the branch fast-forwards to the
+ * commit, the bridge's newest commit is joined with an anchor merge (src/gitbridge/anchor.ts),
+ * and git pushes the branch after the check of comments and tracked changes. The window must
+ * not upload meanwhile (its push mode "bridge"); without a window, the replica's repository
+ * says what Overleaf's state is.
  */
 
 export type Logger = (message: string) => void;
@@ -60,6 +66,10 @@ export interface LandOptions {
     compile?: boolean;
     /** the main document, relative to the project; the project's main document by default */
     main?: string;
+    /** how the commit goes to Overleaf: through the window's uploads (default), or a git push through the bridge */
+    push?: 'native' | 'bridge';
+    /** the push through the bridge of the checked-out branch, which holds the commit */
+    bridgePush?: (repo: Repo) => Promise<{ pushed: boolean, head: string }>;
     log: Logger;
     sleep?: (ms: number) => Promise<void>;
 }
@@ -176,9 +186,20 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
     const compiles = path.join(gitDir, 'overleaf', 'compiles');
 
     // 1. the window syncs, and Overleaf's state is the checked-out commit
-    const synced = await ask({ op: 'sync' }, options.windowTimeoutMs) as any;
+    const bridge = options.push === 'bridge';
+    let synced: any;
+    try {
+        synced = await ask({ op: 'sync' }, options.windowTimeoutMs);
+    } catch (error) {
+        if (!(bridge && error instanceof NoReplicaWindowError)) { throw error; }
+        log('no IDE window keeps the replica in sync; its repository says what Overleaf holds');
+        synced = { ok: true, connected: true, window: false, git: { head: repo.commit('HEAD'), overleaf: repo.commit(OVERLEAF_REF), unmerged: [] } };
+    }
     if (!synced.ok) { throw new LandError(`the IDE window could not sync the replica: ${synced.error}`); }
     if (!synced.connected) { throw new LandError('the IDE window is not connected to Overleaf'); }
+    if (bridge && synced.window !== false && synced.modes?.push !== 'bridge') {
+        throw new LandError('the IDE window uploads the files a commit changes (push mode native); for a push through the bridge set overleaf-workshop.localReplica.pushMode to "bridge", or land without --push bridge');
+    }
     const head = synced.git?.head as string | undefined;
     const overleaf = synced.git?.overleaf as string | undefined;
     if (!head || head !== overleaf) {
@@ -211,18 +232,31 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
         }
     }
 
-    // 3. the push, through the window
+    // 3. the push, through the window or through the bridge
     if (commit !== head) {
-        log(`pushing ${commit.slice(0, 7)} through the IDE window`);
-        const answer = await ask({ op: 'land', commit }, options.windowTimeoutMs) as any;
-        report.push = answer;
-        report.pushed = true;
-        if (!answer.ok) { throw new LandError(`the push failed: ${answer.error}`); }
-        report.overleaf = answer.overleaf;
-        log(`the window pushed ${commit.slice(0, 7)}; ${OVERLEAF_REF} is ${String(answer.overleaf).slice(0, 7)}${answer.editedSince ? ', with edits made on Overleaf meanwhile on top' : ''}`);
+        let expect = commit;
+        if (bridge) {
+            if (!options.bridgePush) { throw new LandError('no push through the bridge is available'); }
+            if (repo.text(['status', '--porcelain', '--untracked-files=no'])) { throw new LandError('the replica folder has changes that are not committed'); }
+            repo.run(['merge', '--ff-only', '--quiet', commit]);
+            log(`pushing ${commit.slice(0, 7)} through the git bridge`);
+            const pushed = await options.bridgePush(repo);
+            report.pushed = true;
+            report.push = { ok: true, ...pushed };
+            log(`${pushed.pushed ? 'pushed' : 'nothing to push:'} ${pushed.head.slice(0, 7)} through the bridge`);
+        } else {
+            log(`pushing ${commit.slice(0, 7)} through the IDE window`);
+            const answer = await ask({ op: 'land', commit }, options.windowTimeoutMs) as any;
+            report.push = answer;
+            report.pushed = true;
+            if (!answer.ok) { throw new LandError(`the push failed: ${answer.error}`); }
+            report.overleaf = answer.overleaf;
+            log(`the window pushed ${commit.slice(0, 7)}; ${OVERLEAF_REF} is ${String(answer.overleaf).slice(0, 7)}${answer.editedSince ? ', with edits made on Overleaf meanwhile on top' : ''}`);
+            // with edits made meanwhile, Overleaf holds the window's newer state
+            if (answer.editedSince) { expect = answer.overleaf; }
+        }
 
-        // 4. Overleaf holds the commit; with edits made meanwhile, it holds the window's newer state
-        const expect = answer.editedSince ? answer.overleaf : commit;
+        // 4. Overleaf holds the commit
         const end = Date.now() + (options.verifyTimeoutMs ?? 180_000);
         for (;;) {
             const after = await overleafDifferences(repo, expect, client, options.projectId, options.isIgnored);
@@ -231,10 +265,18 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
                 log(`Overleaf holds ${expect.slice(0, 7)} (${after.checked} files compared)`);
                 break;
             }
+            if (bridge && synced.window !== false) {
+                // the window downloads what the bridge changed, then records it
+                await ask({ op: 'sync' }, options.windowTimeoutMs).catch(() => undefined);
+            }
             if (Date.now() > end) {
                 throw new LandError(`the window pushed ${commit.slice(0, 7)}, but Overleaf still differs from it`, after.differing);
             }
             await sleep(options.verifyIntervalMs ?? 10_000);
+        }
+        if (bridge && synced.window !== false) {
+            const after = await ask({ op: 'sync' }, options.windowTimeoutMs).catch(() => undefined) as any;
+            report.overleaf = after?.git?.overleaf;
         }
     } else {
         report.overleaf = head;
