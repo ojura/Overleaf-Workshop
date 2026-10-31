@@ -6,12 +6,14 @@ import * as os from 'os';
 import * as path from 'path';
 import type { HistoryUpdate } from '../gitbridge/history';
 import { changedPaths, Entry, FlatTree, GitError } from '../gitbridge/plumbing';
+import { REPLICA_OWN_FOLDERS } from './ignorePatterns';
 import type { Origin, ReplicaStore, SavedState } from './replicaSync';
 
 /*
  * The git repository of a local replica: the sync's only merge backend
  * (docs/replica-workflows.md). The replica folder is the repository's work tree, with `.git`
- * at the folder's root; the sync never uploads dot folders, so the repository stays local.
+ * at the folder's root; the sync leaves the replica's own folders out (REPLICA_OWN_FOLDERS),
+ * whatever the ignore patterns say, so the repository stays local.
  * In it:
  *
  *   refs/remotes/overleaf/main  Overleaf's states as the replica saw them, one commit per state
@@ -303,7 +305,8 @@ export async function ensureRepository(folder: string, ignorePatterns: readonly 
     try { text = await fsp.readFile(exclude, 'utf8'); } catch { /* none yet */ }
     const start = text.indexOf(EXCLUDE_START), end = text.indexOf(EXCLUDE_END);
     if (start >= 0 && end > start) { text = text.slice(0, start) + text.slice(end + EXCLUDE_END.length).replace(/^\n/, ''); }
-    const block = [EXCLUDE_START, '/.overleaf/', ...new Set(ignorePatterns.map(gitignoreLine)), EXCLUDE_END].join('\n') + '\n';
+    const own = REPLICA_OWN_FOLDERS.map(folder => `${folder}/`);
+    const block = [EXCLUDE_START, ...own, ...new Set(ignorePatterns.map(gitignoreLine)), EXCLUDE_END].join('\n') + '\n';
     const updated = (text && !text.endsWith('\n') ? `${text}\n` : text) + block;
     await fsp.mkdir(path.dirname(exclude), { recursive: true });
     await fsp.writeFile(exclude, updated);
@@ -349,7 +352,14 @@ export interface RecordResult {
     waiting?: boolean;
 }
 
-interface Sidecar { project: string; state: SavedState; }
+/** The content of `<git dir>/overleaf/state.json`. */
+interface StateFile { project: string; state: SavedState; }
+
+/**
+ * The saved sync state exists but cannot be used. The replica does not sync then: a first sync
+ * would take Overleaf's version of every file that differs, and keep the local one only aside.
+ */
+export class ReplicaStateError extends Error {}
 
 /** Paths of the sync ('/dir/name') and of git ('dir/name'). */
 const gitPath = (p: string) => p.replace(/^\//, '');
@@ -412,18 +422,57 @@ export class GitReplicaStore implements ReplicaStore {
 
     // ---- ReplicaStore
 
+    /**
+     * The saved sync state. Without the state file: the bases of Overleaf's last recorded state,
+     * else the state kept before git (.overleaf/sync); without either, undefined, and the sync
+     * starts as a first sync. A state file that cannot be read, or that belongs to another
+     * project, rejects with ReplicaStateError.
+     */
     async load(): Promise<SavedState | undefined> {
         const file = await this.stateFile();
+        let text: string;
         try {
-            const saved = JSON.parse(await fsp.readFile(file, 'utf8')) as Sidecar;
-            if (saved.project === this.options.projectId) { return this.lastState = saved.state; }
-            this.options.log(`${file} is the state of another project (${saved.project}); starting without saved state`);
-            return undefined;
-        } catch {
-            const imported = await this.importLegacyState();
-            if (imported) { this.lastState = imported; }
-            return imported;
+            text = await fsp.readFile(file, 'utf8');
+        } catch (error: any) {
+            if (error?.code !== 'ENOENT') { throw await this.stateError(file, `it cannot be read (${error?.message ?? error})`); }
+            // a recorded state is newer than the state kept before git, which its first record turned into commits
+            const state = await this.recordedState(file) ?? await this.importLegacyState();
+            if (state) { this.lastState = state; }
+            return state;
         }
+        let saved: StateFile;
+        try {
+            saved = JSON.parse(text);
+        } catch (error: any) {
+            throw await this.stateError(file, `it is not valid JSON (${error?.message ?? error})`);
+        }
+        if (saved?.project !== this.options.projectId) {
+            throw await this.stateError(file, `it is the state of another project (${String(saved?.project)})`);
+        }
+        return this.lastState = saved.state;
+    }
+
+    private async stateError(file: string, problem: string): Promise<ReplicaStateError> {
+        const recorded = await this.git.commit(OVERLEAF_REF);
+        return new ReplicaStateError(`The replica's saved sync state ${file} cannot be used: ${problem}. `
+            + `The replica does not sync until the file is fixed or removed; without it, the replica takes its bases from `
+            + (recorded ? `Overleaf's last recorded state, ${OVERLEAF_REF} (${recorded.slice(0, 7)}).` : 'a first sync, which keeps the local versions that differ from Overleaf aside.'));
+    }
+
+    /**
+     * The bases of Overleaf's last recorded state, for a replica without its state file; undefined
+     * without a recorded state. Each base is the blob that the commit holds: the sync compares its
+     * id with the hash of a local file's bytes, and the next sync takes each file's kind from Overleaf.
+     */
+    private async recordedState(file: string): Promise<SavedState | undefined> {
+        const recorded = await this.git.commit(OVERLEAF_REF);
+        if (!recorded) { return undefined; }
+        const entries: SavedState['entries'] = {};
+        for (const [p, e] of this.projectFiles(await this.git.flatTree(recorded))) {
+            entries[syncPath(p)] = { kind: 'file', base: e.oid };
+        }
+        this.options.log(`${file} does not exist; the bases are those of Overleaf's last recorded state, ${OVERLEAF_REF} (${recorded.slice(0, 7)}): ${Object.keys(entries).length} files.`);
+        return { version: 1, entries, untracked: [], restored: true };
     }
 
     save(state: SavedState): Promise<void> {
@@ -432,7 +481,7 @@ export class GitReplicaStore implements ReplicaStore {
             const file = await this.stateFile();
             await fsp.mkdir(path.dirname(file), { recursive: true });
             const tmp = `${file}.${process.pid}.tmp`;
-            await fsp.writeFile(tmp, JSON.stringify({ project: this.options.projectId, state } satisfies Sidecar));
+            await fsp.writeFile(tmp, JSON.stringify({ project: this.options.projectId, state } satisfies StateFile));
             await fsp.rename(tmp, file);
             this.lastState = state;
         });

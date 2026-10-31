@@ -16,7 +16,9 @@ import * as path from 'path';
  *   {"op":"status"}  the replica's state
  *   {"op":"sync"}    look for files changed on disk, upload them, wait for Overleaf's
  *                    acknowledgement of every change so far, record Overleaf's state in the
- *                    replica's git repository, and answer what was done
+ *                    replica's git repository, and answer what was done; deletions of more
+ *                    than ReplicaSync.deletionThreshold files on one side are not made, and
+ *                    the answer is not ok until the user confirms them in the window
  *   {"op":"land","commit":"<id>"}
  *                    push a commit that descends from the checked-out one: fast-forward the
  *                    branch to it, upload what it changed and wait for Overleaf's acknowledgements
