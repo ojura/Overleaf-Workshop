@@ -34,10 +34,14 @@ import { gitMergeText } from './replicaGit';
  * `deletionThreshold` files deleted on one side and still synced on the other need the user's
  * confirmation in the window, and a tool's request does not make them.
  *
- * Every sync, and every deletion, record and save, first checks that the local folder is still
- * the one the sync started with (`ReplicaLocal.verify`): a folder moved away, or another folder
- * at its path, is not read or written, and its files do not reach Overleaf. The sync goes on once
- * the folder it started with is back.
+ * Every sync, and every deletion and record, first asks `mayAct` whether it may act on the folder
+ * as it is now. The folder must still be the one the sync started with (`ReplicaLocal.verify`):
+ * a folder moved away, or another folder at its path, is not read or written, and its files do
+ * not reach Overleaf; the sync goes on once that folder is back. And git must not be in the
+ * middle of an operation there (a rebase, a merge, ...), and the checked-out commit must contain
+ * Overleaf's recorded state (`ReplicaStore.workTree`): otherwise the folder holds a state that git
+ * is in the middle of making, or an older one, and its differences from Overleaf are not edits,
+ * so the sync waits. When it may act again, a full sync catches up. Saves check the folder alone.
  *
  * Without uploads (the push mode "bridge"), local changes and deletions stay local until a push
  * through the git bridge brings them to Overleaf, and a local deletion does not count toward
@@ -136,6 +140,9 @@ export interface SavedState {
     restored?: boolean,
 }
 
+/** What keeps the sync from acting on the folder as git has it now (`ReplicaStore.workTree`). */
+export type WorkTreeState = {operation: string} | {head: string, overleaf: string};
+
 /** Storage for the sync state; the git store (replicaGit.ts) keeps it in the replica's repository. */
 export interface ReplicaStore {
     load(): Promise<SavedState | undefined>,
@@ -164,6 +171,13 @@ export interface ReplicaStore {
      * of each new path that git pairs. Without it, every new file is uploaded as a new file.
      */
     renames?(removed: Map<string, string>, added: string[]): Promise<Map<string, string>>,
+    /**
+     * What keeps the sync from acting on the folder as git has it now: a git operation under way
+     * there (`operation`, e.g. 'a rebase'), or a checked-out commit (`head`) that does not contain
+     * Overleaf's recorded state (`overleaf`); undefined when the sync may act. A store without it
+     * never makes the sync wait.
+     */
+    workTree?(): Promise<WorkTreeState | undefined>,
 }
 
 export interface ReplicaUI {
@@ -175,6 +189,15 @@ export interface ReplicaUI {
     conflictBlocked(path: string): void,
     /** What the sync did for changes reported by events (not for `syncAll`). */
     liveResult(summary: SyncSummary): void,
+    /**
+     * The checked-out commit `head` does not contain Overleaf's recorded state `overleaf`, as
+     * after a checkout of an older commit: whether the user wants the folder's files put on
+     * Overleaf. The sync waits meanwhile, and without this method, or without an answer, it
+     * keeps waiting.
+     */
+    confirmCheckout?(head: string, overleaf: string): Promise<boolean>,
+    /** The sync waits, and why (`reason`), or acts again after waiting (undefined). */
+    waiting?(reason: string | undefined): void,
 }
 
 export interface SyncSummary {
@@ -202,6 +225,8 @@ export interface SyncSummary {
     /** for a tool's request: the deletions that a question open in the window asks about, which the request did not wait for */
     question?: Deletions,
     failed: {path: string, error: string}[],
+    /** why the sync did not act on the folder: it waits (`ReplicaSync.waitingFor`) */
+    waitingFor?: string,
     unchanged: number,
     /** files a cancelled `syncAll` did not get to */
     notChecked: number,
@@ -374,6 +399,11 @@ export class ReplicaSync {
     private question?: Deletions;
     /** who waits for a question to open (`questionOpened`), told the question when it opens */
     private readonly questionListeners = new Set<(question: Deletions) => void>();
+    /** why the sync waits instead of acting on the folder (`mayAct`); undefined while it acts */
+    private waitReason?: string;
+    /** the checked-out commit that the user agreed to put on Overleaf, and the last one asked about */
+    private agreedHead?: string;
+    private askedHead?: string;
     private readonly merge: MergeText;
     /** whether local changes are uploaded; without, they wait for a push through the git bridge */
     private readonly uploads: boolean;
@@ -425,6 +455,57 @@ export class ReplicaSync {
         return {opened, dispose: () => { this.questionListeners.delete(listener); }};
     }
 
+    /** Why the sync waits instead of acting on the folder, e.g. for a tool's status; undefined while it acts. */
+    get waitingFor(): string | undefined {
+        return this.waitReason;
+    }
+
+    /**
+     * The one check before the sync acts on the folder: every kind of sync, every deletion and
+     * every record asks it. Rejects when the folder is not the one the sync started with. Answers
+     * why the sync waits: git is in the middle of an operation in the folder, or the checked-out
+     * commit does not contain Overleaf's recorded state and the user has not agreed to put its
+     * files on Overleaf; undefined when the sync may act. In the window the user is asked once
+     * about each such commit; a tool (`by`) is not asked. When the sync may act again after
+     * waiting, a full sync catches up with what changed meanwhile.
+     */
+    private async mayAct(by?: 'tool' | 'user'): Promise<string | undefined> {
+        await this.local.verify();
+        const tree = await this.store.workTree?.();
+        let reason: string | undefined;
+        if (tree!==undefined && 'operation' in tree) {
+            reason = `git is in the middle of ${tree.operation} in the folder`;
+        } else if (tree!==undefined && tree.head!==this.agreedHead) {
+            reason = `the checked-out commit ${tree.head.slice(0, 7)} does not contain Overleaf's recorded state ${tree.overleaf.slice(0, 7)}`;
+            if (by!=='tool' && this.uploads && this.askedHead!==tree.head && this.ui.confirmCheckout) {
+                const head = tree.head;
+                this.askedHead = head;
+                this.ui.confirmCheckout(head, tree.overleaf).then(async agreed => {
+                    if (!agreed || this.stopped) { return; }
+                    this.agreedHead = head;
+                    await this.mayAct();
+                }).catch(error => this.ui.log(`Acting on the answer about ${head.slice(0, 7)} failed: ${errorText(error)}`));
+            }
+        }
+        if (reason!==undefined) {
+            if (this.waitReason!==reason) {
+                this.waitReason = reason;
+                this.ui.log(`The sync waits: ${reason}.`);
+                this.ui.waiting?.(reason);
+            }
+        } else if (this.waitReason!==undefined) {
+            this.waitReason = undefined;
+            this.ui.log('The sync acts again; a full sync catches up with what changed while it waited.');
+            this.ui.waiting?.(undefined);
+            // a full sync that runs now, e.g. the one that asked, catches up itself
+            if (!this.stopped && this.fullSync===undefined) {
+                this.syncAll().then(summary => this.ui.liveResult(summary),
+                                    error => this.ui.log(`The full sync after waiting failed: ${errorText(error)}`));
+            }
+        }
+        return reason;
+    }
+
     private load(): Promise<void> {
         this.loaded ??= (async () => {
             const saved = await this.store.load();
@@ -472,7 +553,8 @@ export class ReplicaSync {
     private async runSyncAll(): Promise<SyncSummary> {
         this.cancelled = false;
         await this.load();
-        await this.local.verify();
+        const waiting = await this.mayAct();
+        if (waiting!==undefined) { return {...emptySummary(), waitingFor: waiting}; }
         // the user asks again about the deletions declined before
         this.declined.local.clear();
         this.declined.remote.clear();
@@ -576,7 +658,8 @@ export class ReplicaSync {
         const mode: Mode = {...collecting(emptySummary(), {live: true}), remoteMove: true};
         try {
             await this.load();
-            await this.local.verify();
+            // while the sync waits, the full sync after the wait finds both paths as they are then
+            if (await this.mayAct()!==undefined) { return; }
             const prefix = `${from}/`;
             const moves: [string, string][] = this.state.entries[from]!==undefined ? [[from, to]]
                 : Object.keys(this.state.entries).filter(p => p.startsWith(prefix)).map(p => [p, `${to}${p.slice(from.length)}`]);
@@ -633,7 +716,8 @@ export class ReplicaSync {
         await this.load();
         const mode = collecting(emptySummary(), {live: true});
         try {
-            await this.local.verify();
+            // while the sync waits, the full sync after the wait takes this change in
+            if (await this.mayAct()!==undefined) { return; }
             const paths = await this.expand(path, remote);
             await this.scheduleAll(paths.filter(p => this.tracked(p)), mode);
             await this.applyDeletions(mode);
@@ -688,8 +772,9 @@ export class ReplicaSync {
         skipRecentMs?: number, now?: number, record?: boolean, by?: 'tool' | 'user', approved?: ReadonlySet<string>, question?: Deletions,
     } = {}): Promise<SyncSummary> {
         await this.load();
-        await this.local.verify();
         const summary = emptySummary();
+        summary.waitingFor = await this.mayAct(by);
+        if (summary.waitingFor!==undefined) { return summary; }
         if (by==='user') {
             this.declined.local.clear();
             this.declined.remote.clear();
@@ -766,7 +851,8 @@ export class ReplicaSync {
     /** Upload local files that the first sync left alone because they were not on Overleaf. */
     async uploadUntracked(): Promise<SyncSummary> {
         await this.load();
-        await this.local.verify();
+        const waiting = await this.mayAct();
+        if (waiting!==undefined) { return {...emptySummary(), waitingFor: waiting}; }
         const paths = this.state.untracked;
         this.state.untracked = [];
         const summary = emptySummary();
@@ -927,7 +1013,12 @@ export class ReplicaSync {
                 }
                 requested[where].filter(path => declined.has(path)).forEach(path => open.delete(path));
                 if (apply.length===0) { continue; }
-                await this.local.verify();
+                const waiting = await this.mayAct(mode.tool ? 'tool' : undefined);
+                if (waiting!==undefined) {
+                    // the full sync after the wait makes these deletions, or finds them gone
+                    summary.waitingFor = waiting;
+                    return;
+                }
                 const applying: Mode = {deletions: 'apply', summary};
                 apply.forEach(path => open.delete(path));
                 await Promise.all(apply.map(path => this.schedule(path, applying)));
@@ -1394,13 +1485,17 @@ export class ReplicaSync {
             .catch(error => this.ui.log(`${folder}: removing the empty folder on Overleaf failed: ${errorText(error)}`));
     }
 
-    /** The git index changed, e.g. conflicts were resolved: sync the files that waited for that. */
-    async indexChanged(): Promise<void> {
+    /**
+     * The repository's git folder changed: its index, HEAD, or the files of an operation under
+     * way. Check again whether the sync may act (`mayAct`), and sync the files that waited for
+     * their conflicts to be resolved.
+     */
+    async gitChanged(): Promise<void> {
         const paths = Object.entries(this.state.entries).filter(([, entry]) => entry.conflict).map(([path]) => path);
         paths.push(...[...this.warnedConflicts].filter(path => !paths.includes(path)));
         const mode = collecting(emptySummary(), {live: true});
         try {
-            await this.local.verify();
+            if (await this.mayAct()!==undefined) { return; }
             await this.scheduleAll(paths, mode);
             await this.applyDeletions(mode);
         } catch (error) {
@@ -1477,9 +1572,10 @@ export class ReplicaSync {
                 await Promise.all([...this.slots.values()].map(slot => slot.tail));
             }
         }
-        const run = this.recording.then(async () => {
+        const run = this.recording.then(async (): Promise<{waiting?: boolean}> => {
             await this.saving;
-            await this.local.verify();
+            // while the sync waits, the record waits too: the changes stay noted for the record after the wait
+            if (await this.mayAct()!==undefined) { return {waiting: true}; }
             const state: SavedState = JSON.parse(JSON.stringify(this.state));
             await this.store.save(state);
             const result = await this.store.record!(state);
@@ -1529,5 +1625,6 @@ export function describe(summary: SyncSummary): string {
         [summary.notChecked, 'not checked'],
     ].filter(([count]) => count!==0).map(([count, what]) => `${count} ${what}`);
     parts.push(`${summary.unchanged} unchanged`);
+    if (summary.waitingFor) { parts.push(`waits: ${summary.waitingFor}`); }
     return parts.join(', ');
 }

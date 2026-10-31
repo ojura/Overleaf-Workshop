@@ -7,7 +7,7 @@ import { POINTER_FILE } from '../scm/replicaControl';
 import { OVERLEAF_REF } from '../scm/replicaGit';
 import { Cleanup, Uri, load, world } from './replicaTestWorld';
 
-const git = (dir: string, ...args: string[]) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' }).trim();
+const git = (dir: string, ...args: string[]) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const read = (file: string) => fs.readFileSync(file, 'utf8');
 /** The files of Overleaf's last recorded state, by git path. */
 const recorded = (folder: string) => git(folder, 'ls-tree', '-r', '--name-only', OVERLEAF_REF).split('\n').filter(Boolean);
@@ -420,6 +420,85 @@ describe('local replica: what it deletes and what it never syncs', function () {
             await start(t);
             assert.doesNotMatch(read(path.join(t.folder, '.git', 'config')), /written on Overleaf/);
             assert.strictEqual(read(path.join(t.folder, 'main.tex')), 'v1\n');
+        });
+    });
+
+    describe('git in the replica folder', () => {
+        /** A replica with main.tex at v2 in a commit of the user's, which Overleaf holds. */
+        async function committedV2(t: ReturnType<typeof host>, files: Record<string, string> = {}) {
+            project(t, { '/main.tex': 'v1\n', ...files });
+            const started = await start(t);
+            fs.writeFileSync(path.join(t.folder, 'main.tex'), 'v2\n');
+            await started.scm.syncNow();
+            assert.strictEqual(t.w.remote.get('/main.tex'), 'v2\n');
+            assert.strictEqual(git(t.folder, 'rev-parse', OVERLEAF_REF), git(t.folder, 'rev-parse', 'HEAD'), 'Overleaf holds the commit');
+            return started;
+        }
+
+        it('does not upload the files of an older commit that git checks out', async () => {
+            const t = host();
+            const { scm, requestReplica } = await committedV2(t);
+            git(t.folder, 'checkout', '--quiet', '--detach', 'HEAD~1');
+            const older = git(t.folder, 'rev-parse', 'HEAD');
+            const summary = await scm.syncNow();
+            assert.strictEqual(t.w.remote.get('/main.tex'), 'v2\n', 'Overleaf keeps the newer content');
+            assert.strictEqual(git(t.folder, 'rev-parse', 'HEAD'), older, 'the checked-out commit stays checked out');
+            assert.match(String(summary.waitingFor), /does not contain Overleaf's recorded state/);
+            // a tool learns why
+            await cleanup.fileAppears(path.join(t.folder, POINTER_FILE));
+            const answer: any = await requestReplica(t.folder, { op: 'sync' }, 10000);
+            assert.strictEqual(answer.ok, false, JSON.stringify(answer));
+            assert.match(answer.error, /does not contain Overleaf's recorded state/);
+            assert.strictEqual(t.w.remote.get('/main.tex'), 'v2\n');
+        });
+
+        it('uploads the files of an older commit once the user agrees', async () => {
+            const t = host();
+            const questions: string[] = [];
+            t.mock.window.showWarningMessage = async (message: string, ...items: any[]) => {
+                if (items.includes('Upload to Overleaf')) { questions.push(message); return 'Upload to Overleaf'; }
+                return undefined;
+            };
+            const { scm } = await committedV2(t);
+            const vfs = t.vfs as any;
+            const write = vfs.writeFile;
+            const uploaded = new Promise<void>(resolve => {
+                vfs.writeFile = async (...args: any[]) => {
+                    await write(...args);
+                    if (t.w.remote.get('/main.tex') === 'v1\n') { resolve(); }
+                };
+            });
+            git(t.folder, 'checkout', '--quiet', '--detach', 'HEAD~1');
+            await scm.syncNow();
+            await uploaded;
+            assert.strictEqual(questions.length, 1, 'the user is asked once');
+            assert.strictEqual(t.w.remote.get('/main.tex'), 'v1\n');
+            // the record joins the two lines, so that the checked-out commit is Overleaf's state again
+            await scm.syncNow();
+            execFileSync('git', ['-C', t.folder, 'merge-base', '--is-ancestor', OVERLEAF_REF, 'HEAD']);
+        });
+
+        it('does not take a change made on Overleaf into a rebase that stopped to edit a commit', async () => {
+            const t = host();
+            const { scm } = await committedV2(t, { '/other.tex': 'o1\n' });
+            git(t.folder, 'config', 'user.name', 'Local User');
+            git(t.folder, 'config', 'user.email', 'local@example.com');
+            // git rebase -i HEAD~1, with "edit" for the commit: it stops there, HEAD detached
+            const editor = path.join(cleanup.tempDir('ow-safety-editor-'), 'edit.js');
+            fs.writeFileSync(editor, 'const fs = require("fs"); const f = process.argv[2]; fs.writeFileSync(f, fs.readFileSync(f, "utf8").replace(/^pick /gm, "edit "));\n');
+            git(t.folder, '-c', `sequence.editor=${JSON.stringify(process.execPath)} ${JSON.stringify(editor)}`, 'rebase', '--quiet', '-i', 'HEAD~1');
+            const stopped = git(t.folder, 'rev-parse', 'HEAD');
+            assert.ok(fs.existsSync(path.join(t.folder, '.git', 'rebase-merge')), 'the rebase stopped to edit');
+            // a collaborator edits on Overleaf, then a full sync and a sync that records run
+            t.remoteChange('/other.tex', 'o2, edited on Overleaf\n');
+            await scm.settingItems[0].callback();
+            await scm.syncNow();
+            assert.strictEqual(git(t.folder, 'rev-parse', 'HEAD'), stopped, 'HEAD stays where the rebase stopped');
+            assert.strictEqual(read(path.join(t.folder, 'other.tex')), 'o1\n', 'the rebase\'s work tree is left alone');
+            // once the rebase is over, the change made on Overleaf comes in
+            git(t.folder, 'rebase', '--abort');
+            await scm.settingItems[0].callback();
+            assert.strictEqual(read(path.join(t.folder, 'other.tex')), 'o2, edited on Overleaf\n');
         });
     });
 

@@ -548,7 +548,7 @@ describe('local replica: git as the merge backend', function () {
         assert.deepStrictEqual(t.ui.blocked, ['/main.tex']);
 
         t.g('add', 'main.tex');
-        await sync.indexChanged();
+        await sync.gitChanged();
         assert.strictEqual(t.remote.docs.get('/main.tex'), resolved);
         await sync.recordNow();
         assert.strictEqual(t.g('show', `${OVERLEAF_REF}:main.tex`), resolved.trimEnd());
@@ -572,9 +572,10 @@ describe('local replica: git as the merge backend', function () {
         spawnSync('git', ['-C', t.folder, 'merge', '--no-edit', theirs]);
         assert.match(t.read('/main.tex'), /<<<<<<< HEAD/);
 
-        await sync.flush(true);
+        // the sync waits while the merge is under way
+        const during = await sync.flush(true);
         assert.strictEqual(t.remote.docs.get('/main.tex'), text.replace('line 2', 'ours'));
-        assert.deepStrictEqual(t.ui.blocked, ['/main.tex']);
+        assert.match(String(during.waitingFor), /in the middle of a merge/);
 
         // nor does a change on Overleaf go into it meanwhile: the merge's stages stay the user's
         const conflicted = t.read('/main.tex');

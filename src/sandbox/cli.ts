@@ -402,6 +402,7 @@ async function replicaCommand(command: 'replica-sync' | 'replica-status', folder
     } else {
         const a = answer as any;
         const lines = [`${a.folder ?? folder}: ${a.connected ? 'connected to' : 'not connected to'} ${a.project?.server ?? 'Overleaf'} ("${a.project?.name ?? '?'}"), changes reported by ${a.watcher === 'node' ? "Node's watcher" : "the IDE's file events"}${a.modes ? `, fetch mode ${a.modes.fetch}, push mode ${a.modes.push}` : ''}${a.fullSyncRunning ? ', a full sync is running' : ''}`];
+        if (a.waiting) { lines.push(a.waiting.message); }
         if (a.question) { lines.push(`${a.question.message}: ${a.question.paths.join(', ')}`); }
         if (a.git) {
             const g = a.git as { head?: string, overleaf?: string, branch?: string, unmerged?: string[] };

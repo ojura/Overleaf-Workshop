@@ -63,6 +63,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private fullSyncRunning = false;
     /** a notice about files that failed to sync is open */
     private failureNoticeOpen = false;
+    /** the status bar message that says why the sync waits (ReplicaSync.waitingFor) */
+    private waitingMessage?: vscode.Disposable;
     private running = 0;
     /** the IDE's watcher of the local folder, only where Node's watcher cannot watch it */
     private localWatcher?: vscode.FileSystemWatcher;
@@ -486,6 +488,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 const detail = paths.slice(0, 20).join('\n') + (paths.length>20 ? '\n...' : '');
                 return await vscode.window.showWarningMessage(message, {modal: true, detail}, action)===action;
             },
+            confirmCheckout: async (head, overleaf) => {
+                const upload = vscode.l10n.t('Upload to Overleaf');
+                const keepWaiting = vscode.l10n.t('Keep Waiting');
+                const choice = await vscode.window.showWarningMessage(vscode.l10n.t(
+                    'The checked-out commit {head} in "{folder}" does not contain Overleaf\'s recorded state {overleaf} ({ref}), as after a git checkout or reset to an older commit. The replica waits, so that the files of {head} are not uploaded as edits. Upload them to Overleaf, or keep waiting until a commit that contains {overleaf} is checked out?',
+                    {head: head.slice(0, 7), overleaf: overleaf.slice(0, 7), ref: OVERLEAF_REF, folder: this.baseUri.fsPath}),
+                    upload, keepWaiting);
+                return choice===upload;
+            },
+            waiting: (reason) => {
+                this.waitingMessage?.dispose();
+                this.waitingMessage = reason===undefined ? undefined : vscode.window.setStatusBarMessage(`$(debug-pause) ${this.waitingText(reason)}`);
+            },
             conflictBlocked: (path) => {
                 const open = vscode.l10n.t('Open');
                 vscode.window.showWarningMessage(
@@ -723,6 +738,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 {count: paths.length, side, threshold: ReplicaSync.deletionThreshold});
     }
 
+    /** What a tool's answer, the status and the window say while the sync waits instead of acting on the folder (ReplicaSync.waitingFor). */
+    private waitingText(reason: string): string {
+        return vscode.l10n.t('The local replica waits: {reason}', {reason});
+    }
+
     /** What a tool's answer and the window say about deletions that the user declined in the window. */
     private deletionsDeclined(count: number): string {
         return vscode.l10n.t('{count} deletions were not confirmed in the IDE window; the next full sync or "Sync Local Replica Now" asks again', {count});
@@ -736,6 +756,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             ...(summary.question ? [`${this.deletionsWaiting(summary.question, true)}: ${summary.question.paths.join(', ')}`] : []),
             ...summary.deletionsToConfirm.map(deletions => `${this.deletionsWaiting(deletions, false)}: ${deletions.paths.join(', ')}`),
             ...(summary.skippedDeletions.length ? [this.deletionsDeclined(summary.skippedDeletions.length)] : []),
+            ...(summary.waitingFor ? [this.waitingText(summary.waitingFor)] : []),
         ];
     }
 
@@ -830,6 +851,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     /** Answer a tool's request on the control socket (src/scm/replicaControl.ts). */
     private async answerTool(request: ControlRequest): Promise<ControlAnswer> {
         const question = this.sync?.openQuestion;
+        const waiting = this.sync?.waitingFor;
         const state = {
             folder: this.baseUri.fsPath,
             project: {id: this.vfs.projectId, name: this.vfs.projectName, server: this.vfs.serverName},
@@ -838,6 +860,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             modes: this.modes,
             fullSyncRunning: this.fullSyncRunning,
             question: question && {...question, message: this.deletionsWaiting(question, true)},
+            waiting: waiting && {reason: waiting, message: this.waitingText(waiting)},
         };
         if (request.op==='status') {
             return {ok: true, ...state, git: await this.gitState(), recent: [...this.recent]};
@@ -1056,19 +1079,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             },
             isReplicaOwnPath,
         );
-        // The repository's index, which git replaces with a new file at each change: conflicts
-        // resolved with git add, the files that waited for that sync then.
+        // The repository's git folder: git replaces the index with a new file at each change, and
+        // keeps HEAD and the files of an operation under way there. A change checks again whether
+        // the sync may act, and syncs the files that waited for their conflicts to be resolved.
         try {
             let timer: NodeJS.Timeout | undefined;
-            const indexWatcher = fs.watch(gitDir, {persistent: false}, (_event, name) => {
-                if (name!=='index') { return; }
+            const gitWatcher = fs.watch(gitDir, {persistent: false}, () => {
                 clearTimeout(timer);
-                timer = setTimeout(() => { void sync.indexChanged(); }, LocalFolderWatcher.quietMs);
+                timer = setTimeout(() => { void sync.gitChanged(); }, LocalFolderWatcher.quietMs);
             });
-            indexWatcher.on('error', () => indexWatcher.close());
-            listeners.push({dispose: () => { clearTimeout(timer); indexWatcher.close(); }});
+            gitWatcher.on('error', error => {
+                log(`[${this.vfs.projectName}] Watching the git folder stopped (${error}); the sync checks git's state when it next acts.`);
+                gitWatcher.close();
+            });
+            listeners.push({dispose: () => { clearTimeout(timer); gitWatcher.close(); }});
         } catch (error) {
-            log(`[${this.vfs.projectName}] The repository's index cannot be watched (${error}); resolved conflicts sync at the next scan.`);
+            log(`[${this.vfs.projectName}] The git folder cannot be watched (${error}); the sync checks git's state when it next acts.`);
         }
         const watching = folderWatcher.start();
         if (watching.ok) {
@@ -1100,6 +1126,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         listeners.push(
             {dispose: () => control.dispose()},
             {dispose: () => {
+                this.waitingMessage?.dispose();
+                this.waitingMessage = undefined;
                 providers.delete(this);
                 record.stopped ??= sync.stop();
                 record.stopped.finally(() => {
