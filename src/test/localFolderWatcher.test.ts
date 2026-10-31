@@ -65,6 +65,51 @@ describe('LocalFolderWatcher, on a real folder', () => {
         assert.deepStrictEqual(changes, ['/slike/photo.jpg']);
     });
 
+    it('keeps reporting a file that another program replaced, as an atomic save or a git checkout does', async () => {
+        const file = path.join(dir, 'main.tex');
+        fs.writeFileSync(file, 'v1');
+        await wait(SETTLE_MS);
+        // an editor's atomic save: a new file renamed over the old one
+        fs.writeFileSync(`${file}.tmp`, 'v2');
+        fs.renameSync(`${file}.tmp`, file);
+        await wait(SETTLE_MS);
+        assert.ok(changes.includes('/main.tex'), `got ${JSON.stringify(changes)}`);
+        changes.length = 0;
+        // then a write in place, and another replacement, as git checkout makes (unlink, create)
+        fs.writeFileSync(file, 'v3');
+        await wait(SETTLE_MS);
+        assert.deepStrictEqual(changes, ['/main.tex']);
+        changes.length = 0;
+        fs.unlinkSync(file);
+        fs.writeFileSync(file, 'v4');
+        await wait(SETTLE_MS);
+        fs.writeFileSync(file, 'v5');
+        await wait(SETTLE_MS);
+        assert.ok(changes.length >= 2 && changes.every(p => p === '/main.tex'), `got ${JSON.stringify(changes)}`);
+    }).timeout(10000);
+
+    it('keeps reporting a file in a subfolder that was replaced, and the files of a folder moved in', async () => {
+        fs.mkdirSync(path.join(dir, 'chapters'));
+        const file = path.join(dir, 'chapters', 'one.tex');
+        fs.writeFileSync(file, 'v1');
+        await wait(SETTLE_MS);
+        fs.writeFileSync(`${file}.tmp`, 'v2');
+        fs.renameSync(`${file}.tmp`, file);
+        await wait(SETTLE_MS);
+        changes.length = 0;
+        fs.writeFileSync(file, 'v3');
+        await wait(SETTLE_MS);
+        assert.deepStrictEqual(changes, ['/chapters/one.tex']);
+        changes.length = 0;
+        const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-outside-folder-'));
+        fs.writeFileSync(path.join(outside, 'fig.png'), 'png');
+        fs.renameSync(outside, path.join(dir, 'figures'));
+        await wait(SETTLE_MS);
+        fs.writeFileSync(path.join(dir, 'figures', 'fig.png'), 'png, changed');
+        await wait(SETTLE_MS);
+        assert.ok(changes.includes('/figures/fig.png'), `got ${JSON.stringify(changes)}`);
+    }).timeout(10000);
+
     it('leaves out the paths it is told to skip', async () => {
         fs.writeFileSync(path.join(dir, '.overleaf', 'state.json'), '{}');
         fs.writeFileSync(path.join(dir, 'main.tex'), 'x');
