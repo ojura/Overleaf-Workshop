@@ -187,13 +187,77 @@ export class PdfFetchBridge {
  * temporary file next to `file` as it arrives, which then takes `file`'s name, so a large PDF does
  * not have to fit in memory and a failed download leaves `file` as it was.
  */
+/** numbers the downloads of this process, so that two downloads of one file do not share a part file */
+let downloads = 0;
+
+/**
+ * Download `url`, a file of `size` bytes, to `file` in ranges, a few at a time, retrying each
+ * range. One long response of a large build was cut off: the download domain ended the 885 MB
+ * book's response after 81 s in the IDE (undici: "terminated", 2026-10-31), while Overleaf's
+ * viewer and the viewers that load in ranges ask for ranges. Holds at most `parallel` ranges in
+ * memory.
+ */
+export async function downloadInRanges(url: string, file: string, size: number, signal?: AbortSignal,
+    { chunk = 8 * 1024 * 1024, parallel = 4, attempts = 3 } = {}) {
+    const tmp = `${file}.${process.pid}-${++downloads}.part`;
+    // stops every range when one fails for good or the caller aborts
+    const stop = new AbortController();
+    const onAbort = () => stop.abort();
+    signal?.addEventListener('abort', onAbort);
+    if (signal?.aborted) { stop.abort(); }
+    const out = await fs.promises.open(tmp, 'w');
+    const fetchRange = async (start: number) => {
+        const end = Math.min(start + chunk, size) - 1;
+        for (let attempt = 1; ; attempt++) {
+            try {
+                const res = await fetch(url, { signal: stop.signal, dispatcher: PdfFetchBridge.dispatcher, headers: { range: `bytes=${start}-${end}` } });
+                if (res.status !== 206) {
+                    throw new Error(`the download of ${path.basename(file)} failed: bytes ${start}-${end}: ${res.status} ${res.statusText}`);
+                }
+                const body = new Uint8Array(await res.arrayBuffer());
+                if (body.byteLength !== end - start + 1) {
+                    throw new Error(`the download of ${path.basename(file)} failed: bytes ${start}-${end} came as ${body.byteLength} bytes`);
+                }
+                await out.write(body, 0, body.byteLength, start);
+                return;
+            } catch (error) {
+                if (stop.signal.aborted || attempt >= attempts) { throw error; }
+            }
+        }
+    };
+    try {
+        let next = 0;
+        await Promise.all(Array.from({ length: Math.min(parallel, Math.ceil(size / chunk)) }, async () => {
+            try {
+                while (next < size && !stop.signal.aborted) {
+                    const start = next;
+                    next += chunk;
+                    await fetchRange(start);
+                }
+            } catch (error) {
+                stop.abort();
+                throw error;
+            }
+        }));
+        if (signal?.aborted) { throw new Error(`the download of ${path.basename(file)} was stopped`); }
+        await out.close();
+        await fs.promises.rename(tmp, file);
+    } catch (error) {
+        await out.close().catch(() => {});
+        await fs.promises.unlink(tmp).catch(() => {});
+        throw error;
+    } finally {
+        signal?.removeEventListener('abort', onAbort);
+    }
+}
+
 export async function downloadTo(url: string, file: string, signal?: AbortSignal, onProgress?: (received: number, total?: number) => void) {
     const res = await fetch(url, { signal, dispatcher: PdfFetchBridge.dispatcher });
     if (res.status !== 200 || !res.body) {
         throw new Error(`the download of ${path.basename(file)} failed: ${res.status} ${res.statusText}`);
     }
     const total = Number(res.headers.get('content-length')) || undefined;
-    const tmp = `${file}.${process.pid}.part`;
+    const tmp = `${file}.${process.pid}-${++downloads}.part`;
     const out = fs.createWriteStream(tmp);
     let received = 0;
     try {

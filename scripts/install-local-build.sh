@@ -46,8 +46,10 @@ for ext in "$HOME"/.antigravity-ide/extensions/iamhyc.overleaf-workshop-* \
     fi
     rsync -a --exclude '*.map' --exclude 'test/' out/ "$ext/out/"
     # the PDF viewers that load in ranges (setting overleaf-workshop.pdfViewer.engine), and the
-    # pdf.js release they run on; the legacy viewer's files stay as installed
+    # pdf.js release they run on; of the legacy viewer, only its page script, which opens a
+    # build that the extension downloaded to a file
     mkdir -p "$ext/views/pdf-viewer"
+    cp views/pdf-viewer/index.js "$ext/views/pdf-viewer/index.js"
     rsync -a --delete views/pdf-viewer/dist/ "$ext/views/pdf-viewer/dist/"
     if [ -d views/pdf-viewer/vendor/pdfjs-5.1.91 ]; then
         rsync -a --delete --exclude '*.map' views/pdf-viewer/vendor/pdfjs-5.1.91/ "$ext/views/pdf-viewer/vendor/pdfjs-5.1.91/"

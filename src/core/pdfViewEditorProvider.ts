@@ -6,19 +6,26 @@ import { EventBus } from '../utils/eventBus';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { parseUri } from './remoteFileSystemProvider';
 import type { PdfOutput, VirtualFileSystem } from './remoteFileSystemProvider';
-import { downloadTo, outputsOf, PdfFetchBridge, PieceCache } from './pdfFetchBridge';
+import { downloadInRanges, downloadTo, outputsOf, PdfFetchBridge, PieceCache } from './pdfFetchBridge';
 import { completeViewerPage, isBuildPath, PDF_VIEWER_ENGINES, PdfViewerEngine } from './pdfViewerPages';
 
 export class PdfDocument implements vscode.CustomDocument {
     cache: Uint8Array = new Uint8Array(0);
     /** for the build's output.pdf in a viewer that loads in ranges: the build to load */
     output?: PdfOutput;
+    /** for the build's output.pdf in the legacy viewer: the build, downloaded to this file */
+    file?: vscode.Uri;
+    /** the legacy viewer's download of a build that runs now */
+    private downloading?: { build: string, abort: AbortController, done: Promise<vscode.Uri | 'superseded' | undefined> };
 
     private readonly _onDidChange = new vscode.EventEmitter<{}>();
     readonly onDidChange = this._onDidChange.event;
 
-    /** `engine`: the viewer that shows this document (setting overleaf-workshop.pdfViewer.engine) */
-    constructor(readonly uri: vscode.Uri, private _engine: PdfViewerEngine = 'legacy') {
+    /**
+     * `engine`: the viewer that shows this document (setting overleaf-workshop.pdfViewer.engine).
+     * `buildFolder`: where the legacy viewer's builds are downloaded to.
+     */
+    constructor(readonly uri: vscode.Uri, private _engine: PdfViewerEngine = 'legacy', private readonly buildFolder?: vscode.Uri) {
         this.uri = uri;
     }
 
@@ -55,21 +62,42 @@ export class PdfDocument implements vscode.CustomDocument {
         return this.isProjectFile && isBuildPath(parseUri(this.uri).pathParts, OUTPUT_FOLDER_NAME);
     }
 
-    dispose() { }
+    dispose() {
+        this.downloading?.abort.abort();
+    }
 
     async refresh(): Promise<Uint8Array> {
         // The viewers other than the legacy one load a build in ranges, as Overleaf's viewer
         // loads it: they need only its address, not its content. Other PDFs are read whole.
-        if (this.engine !== 'legacy' && this.isBuild) {
+        if (this.isBuild) {
             const vfs = await vscode.commands.executeCommand<VirtualFileSystem>('remoteFileSystem.prefetch', this.uri).then(v => v, () => undefined);
-            this.output = vfs?.pdfOutput();
-            if (this.output) {
+            const output = vfs?.pdfOutput();
+            if (output && this.engine !== 'legacy') {
+                this.output = output;
+                this.file = undefined;
                 this.cache = new Uint8Array();
-                this._onDidChange.fire({output: this.output});
+                this._onDidChange.fire({output});
+                return this.cache;
+            }
+            // The legacy viewer reads a build whole. It is downloaded to a file, which the
+            // viewer's page opens itself. Read through the IDE, the build would cross the
+            // extension host's channel to the window three times, with up to three copies held
+            // in the extension host (2 to 3 GB for the 845 MB book).
+            const file = output && vfs && await this.downloadBuild(output, vfs);
+            if (file === 'superseded') {
+                return this.cache; // a refresh for a newer build shows that one
+            }
+            if (file) {
+                const unchanged = this.file?.toString() === file.toString();
+                this.output = undefined;
+                this.file = file;
+                this.cache = new Uint8Array();
+                if (!unchanged) { this._onDidChange.fire({file}); }
                 return this.cache;
             }
         }
         this.output = undefined;
+        this.file = undefined;
         try {
             this.cache = new Uint8Array(await vscode.workspace.fs.readFile(this.uri));
         } catch {
@@ -77,6 +105,57 @@ export class PdfDocument implements vscode.CustomDocument {
         }
         this._onDidChange.fire({content:this.cache});
         return this.cache;
+    }
+
+    /**
+     * Download the build to a file of its own in the build folder, and remove the project's
+     * older builds there. A refresh for the build that is downloading waits for that download;
+     * one for another build stops it, and the stopped one answers 'superseded'.
+     *
+     * The build comes in ranges from the download domain. When that fails, the project reads it
+     * as the IDE would, with its fallback to the web server, but in the extension host, without
+     * the round trip through the window. Undefined when that fails too: the build is then read
+     * through the IDE and sent to the page, as before.
+     */
+    private downloadBuild(output: PdfOutput, vfs: VirtualFileSystem): Promise<vscode.Uri | 'superseded' | undefined> {
+        const folder = this.buildFolder;
+        const build = output.file.build;
+        const size = output.file.size;
+        if (folder === undefined || !build || !size) { return Promise.resolve(undefined); }
+        if (this.downloading?.build === build) { return this.downloading.done; }
+        this.downloading?.abort.abort();
+        const abort = new AbortController();
+        const name = `${output.projectId}-${build}.pdf`;
+        const target = vscode.Uri.joinPath(folder, name);
+        const done = (async (): Promise<vscode.Uri | 'superseded' | undefined> => {
+            try {
+                await vscode.workspace.fs.createDirectory(folder);
+                try {
+                    await vscode.workspace.fs.stat(target); // downloaded before, e.g. for another viewer
+                } catch {
+                    try {
+                        await downloadInRanges(output.url, target.fsPath, size, abort.signal);
+                    } catch (error: any) {
+                        if (abort.signal.aborted) { throw error; }
+                        console.warn(`overleaf-workshop: downloading the build in ranges failed (${error?.message ?? error}); reading it through the project`);
+                        await vscode.workspace.fs.writeFile(target, await vfs.openFile(this.uri));
+                    }
+                }
+                for (const [other] of await vscode.workspace.fs.readDirectory(folder)) {
+                    if (other !== name && other.startsWith(`${output.projectId}-`) && !other.endsWith('.part')) {
+                        await Promise.resolve(vscode.workspace.fs.delete(vscode.Uri.joinPath(folder, other))).catch(() => {});
+                    }
+                }
+                return abort.signal.aborted ? 'superseded' : target;
+            } catch (error: any) {
+                if (abort.signal.aborted) { return 'superseded'; }
+                console.warn(`overleaf-workshop: downloading the build for the legacy viewer failed (${error?.message ?? error}); reading it through the IDE`);
+                return undefined;
+            }
+        })();
+        this.downloading = { build, abort, done };
+        void done.finally(() => { if (this.downloading?.done === done) { this.downloading = undefined; } });
+        return done;
     }
 }
 
@@ -95,6 +174,11 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         this.pieces = new PieceCache(path.join(context.globalStorageUri.fsPath, 'pdf-pieces'), Math.max(0, sizeMB) * 1024 * 1024);
     }
 
+    /** where the legacy viewer's builds are downloaded to, one file per project */
+    private get buildFolder(): vscode.Uri {
+        return vscode.Uri.joinPath(this.context.globalStorageUri, 'legacy-viewer-builds');
+    }
+
     public saveCustomDocument(document: PdfDocument, cancellation: vscode.CancellationToken): Thenable<void> {
         return Promise.resolve();
     }
@@ -109,7 +193,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
     }
 
     public async openCustomDocument(uri: vscode.Uri): Promise<PdfDocument> {
-        const doc = new PdfDocument(uri, await this.engine());
+        const doc = new PdfDocument(uri, await this.engine(), this.buildFolder);
         await doc.refresh();
         return doc;
     }
@@ -171,6 +255,8 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         const updateWebview = () => {
             if (doc.output) {
                 webviewPanel.webview.postMessage({type:'load', output:doc.output});
+            } else if (doc.file) {
+                webviewPanel.webview.postMessage({type:'updateUrl', url:webviewPanel.webview.asWebviewUri(doc.file).toString()});
             } else if (doc.cache.buffer.byteLength !== 0) {
                 webviewPanel.webview.postMessage({type:'update', content:doc.cache.buffer});
             }
@@ -204,7 +290,8 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             this.editors.delete(editor);
         });
 
-        webviewPanel.webview.options = {enableScripts:true};
+        // the legacy viewer's page opens a downloaded build from the build folder
+        webviewPanel.webview.options = {enableScripts:true, localResourceRoots:[this.context.extensionUri, this.buildFolder]};
         await editor.render();
 
         // register event listeners

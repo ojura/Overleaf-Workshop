@@ -148,9 +148,10 @@
         container.insertBefore(button, firstChild);
     }
 
+    // `pdf`: the PDF's content, or {url}: a file the extension downloaded the build to
     async function updatePdf(pdf) {
         const doc = await pdfjsLib.getDocument({
-            data: pdf,
+            ...(pdf && pdf.url ? {url: pdf.url} : {data: pdf}),
             cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.10.111/cmaps/',
             cMapPacked: true
         }).promise;
@@ -233,6 +234,9 @@
             switch (message.type) {
                 case 'update':
                     updatePdf(message.content);
+                    break;
+                case 'updateUrl':
+                    updatePdf({url: message.url});
                     break;
                 case 'syncCode':
                     syncCode(message.content);
