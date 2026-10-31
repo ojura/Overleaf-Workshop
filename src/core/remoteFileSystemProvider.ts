@@ -23,6 +23,15 @@ const FolderKeys: {[_type:string]: FolderKey} = {
     'outputs': 'outputs',
 };
 
+/**
+ * A change of the project's files. A rename or a move made on Overleaf is a Deleted event of the
+ * old path and a Created event of the new one, in one batch; the Created event names the old
+ * path in `renamedFrom`, so that a listener can take the two as one change.
+ */
+export interface ProjectFileChange extends vscode.FileChangeEvent {
+    renamedFrom?: vscode.Uri;
+}
+
 export interface FileEntity {
     _id: string,
     name: string,
@@ -219,8 +228,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     private compileGroup?: string;
     private clsiServerId?: string;
     private pdfDownloadDomain?: string;
-    private notify: (events:vscode.FileChangeEvent[])=>void;
-    private readonly changes = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
+    private notify: (events:ProjectFileChange[])=>void;
+    private readonly changes = new vscode.EventEmitter<ProjectFileChange[]>();
     /**
      * The changes of this project's files, as they are reported to the IDE. Listeners in the
      * extension host get them here directly: a file system watcher gets them only after a round
@@ -753,11 +762,12 @@ export class VirtualFileSystem extends vscode.Disposable {
                 const res = this._resolveById(entityId);
                 if (res) {
                     const {fileEntity} = res;
-                    const oldName = fileEntity.name;
                     fileEntity.name = newName;
+                    // the path with its last name replaced; a folder's path ends with "/"
+                    const renamed = res.path.replace(/[^/]+(\/?)$/, (_name, slash) => newName + slash);
                     this.notify([
                         {type: vscode.FileChangeType.Deleted, uri: this.pathToUri(res.path)},
-                        {type: vscode.FileChangeType.Created, uri: this.pathToUri(res.path.replace(oldName, newName))}
+                        {type: vscode.FileChangeType.Created, uri: this.pathToUri(renamed), renamedFrom: this.pathToUri(res.path)}
                     ]);
                 }
             },
@@ -780,7 +790,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                     this.removeEntity(oldPath.parentFolder, oldPath.fileType, oldPath.fileEntity);
                     this.notify([
                         {type: vscode.FileChangeType.Deleted, uri: this.pathToUri(oldPath.path)},
-                        {type: vscode.FileChangeType.Created, uri: this.pathToUri(newPath.path, oldPath.fileEntity.name)}
+                        {type: vscode.FileChangeType.Created, uri: this.pathToUri(newPath.path, oldPath.fileEntity.name), renamedFrom: this.pathToUri(oldPath.path)}
                     ]);
                 }
             },

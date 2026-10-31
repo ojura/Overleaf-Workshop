@@ -341,3 +341,41 @@ describe('SocketIOAPI.applyOtUpdate', () => {
         assert.strictEqual(emitted.length, 0);
     });
 });
+
+describe('VirtualFileSystem: a rename or a move made on Overleaf', () => {
+    /** A project with a folder "chapters" holding the document "ch", and a folder "parts"; its events as paths. */
+    function project() {
+        const handlers: any = {};
+        const vfs = Object.create(VirtualFileSystem.prototype);
+        vfs.socket = { isUsingAlternativeConnectionScheme: false, updateEventHandlers(h: any) { Object.assign(handlers, h); } };
+        const batches: { type: number, path: string, renamedFrom?: string }[][] = [];
+        vfs.notify = (events: any[]) => batches.push(events.map(e => ({ type: e.type, path: e.uri.path, ...(e.renamedFrom ? { renamedFrom: e.renamedFrom.path } : {}) })));
+        vfs.pathToUri = (...parts: string[]) => ({ path: parts.join('/').replace(/\/+/g, '/') });
+        vfs.root = { rootFolder: [{ _id: 'root', name: 'rootFolder', docs: [], fileRefs: [], folders: [
+            { _id: 'chapters', name: 'chapters', docs: [{ _id: 'ch', name: 'ch' }], fileRefs: [], folders: [] },
+            { _id: 'parts', name: 'parts', docs: [], fileRefs: [], folders: [] },
+        ] }] };
+        vfs.connections = [];
+        vfs.remoteWatch();
+        return { handlers, batches };
+    }
+    const { Created, Deleted } = vscodeMock.FileChangeType;
+
+    it('reports a renamed file at its new path, with the path it had, also when a folder name holds the file name', () => {
+        const t = project();
+        t.handlers.onFileRenamed('ch', 'intro');
+        assert.deepStrictEqual(t.batches, [[{ type: Deleted, path: '/chapters/ch' }, { type: Created, path: '/chapters/intro', renamedFrom: '/chapters/ch' }]]);
+    });
+
+    it('reports a renamed folder at its new path, with the path it had', () => {
+        const t = project();
+        t.handlers.onFileRenamed('chapters', 'parts2');
+        assert.deepStrictEqual(t.batches, [[{ type: Deleted, path: '/chapters/' }, { type: Created, path: '/parts2/', renamedFrom: '/chapters/' }]]);
+    });
+
+    it('reports a moved file at its new path, with the path it had', () => {
+        const t = project();
+        t.handlers.onFileMoved('ch', 'parts');
+        assert.deepStrictEqual(t.batches, [[{ type: Deleted, path: '/chapters/ch' }, { type: Created, path: '/parts/ch', renamedFrom: '/chapters/ch' }]]);
+    });
+});
