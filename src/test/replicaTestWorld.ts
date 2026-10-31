@@ -131,6 +131,12 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
         },
         openFile: async (uri: Uri) => new TextEncoder().encode(w.remote.get(rel(uri)) ?? ''),
         writeFile: async (uri: Uri, content: Uint8Array) => { w.remote.set(rel(uri), new TextDecoder().decode(content)); w.remoteWrites.push(rel(uri)); },
+        // as the VFS does: only a document that is there is written
+        writeDoc: async (uri: Uri, content: Uint8Array) => {
+            if (!w.remote.has(rel(uri))) { throw Object.assign(new Error(`${uri.path} is not a document`), { code: 'FileNotFound' }); }
+            w.remote.set(rel(uri), new TextDecoder().decode(content));
+            w.remoteWrites.push(rel(uri));
+        },
         createFile: async (uri: Uri, content: Uint8Array) => {
             w.remote.set(rel(uri), new TextDecoder().decode(content));
             w.remoteWrites.push(rel(uri));

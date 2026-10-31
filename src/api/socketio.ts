@@ -72,6 +72,8 @@ export interface EventsHandler {
     onFileRemoved?: (entityId:string) => void,
     onFileMoved?: (entityId:string, newParentFolderId:string) => void,
     onFileChanged?: (update:UpdateSchema) => void,
+    /** otUpdateError: Overleaf could not apply an update of the doc `docId` */
+    onUpdateError?: (docId:string|undefined, error:string) => void,
     //
     onDisconnected?: () => void,
     onConnectionAccepted?: (publicId:string) => void,
@@ -245,13 +247,6 @@ export class SocketIOAPI {
             console.error('SocketIOAPI: socket error', err?.message || err);
             this.onConnectionProblem?.(`socket error: ${stringifyError(err)}`);
         });
-        // The server reports a rejected document update on its own channel and sends no
-        // ack for the emit, so without this the real reason (stale version, hash
-        // mismatch, lost session) is invisible and surfaces only as a generic timeout.
-        this.socket.on('otUpdateError', (err:any, update?:any) => {
-            console.error('SocketIOAPI: otUpdateError', stringifyError(err),
-                          update!==undefined ? stringifyError(update) : '');
-        });
 
         if (this.scheme==='v2') {
             // The server joins the project when the connection is made and answers with
@@ -340,6 +335,14 @@ export class SocketIOAPI {
                 case handlers.onFileChanged:
                     this.socket.on('otUpdateApplied', (update: UpdateSchema) => {
                         handler(update);
+                    });
+                    break;
+                case handlers.onUpdateError:
+                    // Sent to the connections that joined the doc, or for an update too large
+                    // to queue to its sender, which real-time then disconnects; `message` names
+                    // the doc (DocumentUpdaterController, WebsocketController.applyOtUpdate).
+                    this.socket.on('otUpdateError', (error:any, message?:{doc_id?: string}) => {
+                        handler(message?.doc_id, stringifyError(error));
                     });
                     break;
                 case handlers.onDisconnected:
