@@ -83,33 +83,37 @@ export async function readFile(p: PathLike): Promise<Uint8Array> {
     return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 }
 
-/** The temporary files of the writes under way, by absolute path. */
-const writing = new Set<string>();
-
-/** Whether `p` is the temporary file of a write under way, which a listing leaves out. */
-export function isWriting(p: PathLike): boolean {
-    return writing.has(fsPath(p));
-}
-
 /**
- * Write a file, creating its parent folders. The content goes into a temporary file in the
- * target's folder, which then replaces the target in one rename: a reader, or a crash, sees the
- * old content or the new one, never a part of it. The target keeps its mode. A symbolic link to
- * a file stays as it is, and the file it points to is the one replaced.
+ * Write a file, creating its parent folders.
+ *
+ * With `temporaryFolder`, a folder on the target's file system (the replica's own
+ * REPLICA_TEMPORARY_FOLDER), a regular file is replaced in one rename: the content goes into a
+ * new file there, named independently of the target, which then is renamed over the target. A
+ * reader, or a crash, sees the old content or the new one, never a part of it. The new file gets
+ * the target's mode, but it is a new inode owned by this user: extended attributes and ACLs of
+ * the old file stay behind. A file that a rename would change in other ways is written in place,
+ * as without `temporaryFolder`: a symbolic link, dangling or not (the file it names is written),
+ * a file with other names (hard links), one owned by another user, and a target on another file
+ * system than the temporary folder (EXDEV).
  */
-export async function writeFile(p: PathLike, content: Uint8Array): Promise<void> {
+export async function writeFile(p: PathLike, content: Uint8Array, temporaryFolder?: string): Promise<void> {
     const file = fsPath(p);
     await fsp.mkdir(path.dirname(file), { recursive: true });
-    let target = file;
     let mode: number | undefined;
+    let inPlace = temporaryFolder === undefined;
     try {
-        if ((await fsp.lstat(file)).isSymbolicLink()) { target = await fsp.realpath(file); }
-        mode = (await fsp.stat(target)).mode & 0o7777;
+        const target = await fsp.lstat(file);
+        mode = target.mode & 0o7777;
+        if (target.isSymbolicLink() || target.nlink > 1 || (process.getuid !== undefined && target.uid !== process.getuid())) { inPlace = true; }
     } catch (error) {
         if (!isMissing(error)) { throw error; }
     }
-    const temporary = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}-${randomBytes(4).toString('hex')}.tmp`);
-    writing.add(temporary);
+    if (inPlace) {
+        await fsp.writeFile(file, content);
+        return;
+    }
+    await fsp.mkdir(temporaryFolder!, { recursive: true });
+    const temporary = path.join(temporaryFolder!, `${process.pid}-${randomBytes(8).toString('hex')}.tmp`);
     try {
         const handle = await fsp.open(temporary, 'wx');
         try {
@@ -120,12 +124,11 @@ export async function writeFile(p: PathLike, content: Uint8Array): Promise<void>
         } finally {
             await handle.close();
         }
-        await fsp.rename(temporary, target);
+        await fsp.rename(temporary, file);
     } catch (error) {
         await fsp.rm(temporary, { force: true });
-        throw error;
-    } finally {
-        writing.delete(temporary);
+        if ((error as NodeJS.ErrnoException)?.code !== 'EXDEV') { throw error; }
+        await fsp.writeFile(file, content);
     }
 }
 

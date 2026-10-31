@@ -5,6 +5,12 @@
  */
 export const REPLICA_OWN_FOLDERS: readonly string[] = ['/.overleaf', '/.git'];
 
+/**
+ * Where the replica writes a file before it renames it over its target (localFolderFs.writeFile):
+ * inside its own folder, so on the folder's file system, and left out of the sync.
+ */
+export const REPLICA_TEMPORARY_FOLDER = '/.overleaf/tmp';
+
 /** Whether `path` (like '/dir/name') is one of the replica's own folders or inside one. */
 export function isReplicaOwnPath(path: string): boolean {
     return REPLICA_OWN_FOLDERS.some(folder => path === folder || path.startsWith(`${folder}/`));

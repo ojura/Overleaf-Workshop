@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { execFile } from 'child_process';
 import * as fs from 'fs';
+import * as fsp from 'fs/promises';
 import * as path from 'path';
 import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
@@ -9,7 +10,7 @@ import {
     deletionsNeedConfirmation, describe, LocalStat, NotConnectedError, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync,
     ReplicaUI, SyncSummary, syncProblems,
 } from './replicaSync';
-import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath } from './ignorePatterns';
+import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath, REPLICA_TEMPORARY_FOLDER } from './ignorePatterns';
 import * as localFs from './localFolderFs';
 import { LocalFolderWatcher } from './localFolderWatcher';
 import { ControlAnswer, ControlRequest, ReplicaControlServer } from './replicaControl';
@@ -351,7 +352,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     }
                     await Promise.all(items.map(async ([name, type]) => {
                         const path = dir + name;
-                        if (this.leftOut(path) || fs.isWriting(uri(path))) { return; }
+                        if (this.leftOut(path)) { return; }
                         if (type & localFs.fileType.directory) {
                             if (!(type & localFs.fileType.symbolicLink)) { await walk(`${path}/`); }
                         } else if (type & localFs.fileType.file) {
@@ -391,7 +392,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             },
             write: async (path, content) => {
                 await fs.createDirectory(vscode.Uri.joinPath(uri(path), '..'));
-                await fs.writeFile(uri(path), content);
+                await fs.writeFile(uri(path), content, this.temporaryFolder);
                 return statOf(await fs.stat(uri(path)));
             },
             remove: async (path) => {
@@ -423,6 +424,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 }
             },
         };
+    }
+
+    /** Where the local writes go before the rename over their target (localFolderFs.writeFile). */
+    private get temporaryFolder(): string {
+        return vscode.Uri.joinPath(this.baseUri, REPLICA_TEMPORARY_FOLDER).fsPath;
     }
 
     /** Whether the sync leaves `path` out: the replica's own folders, and the ignored paths. */
@@ -893,7 +899,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     'enableCompileNPreview': false,
                     'projectName': this.vfs.projectName,
                 }, null, 4)
-            ));
+            ), this.temporaryFolder);
         }
 
         // One sync per folder: a reconnect creates a new provider for the same folder, and
@@ -903,6 +909,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (previous) {
             await (previous.stopped ??= previous.sync.stop());
         }
+        // Remove the temporary files that writes of an earlier run left behind, e.g. at a crash,
+        // once the previous sync of this window has stopped. A second window that syncs the same
+        // folder may have a write under way: that write fails, the window reports the failure,
+        // and its next full sync downloads the file again, since the sync's entry for the file
+        // changes only after the write succeeds.
+        await fsp.rm(this.temporaryFolder, {recursive: true, force: true});
         // the folder as the replica starts: before deleting anything, the sync checks that it still is
         const identity = await localFs.identity(this.baseUri.fsPath);
         const store = this.gitStore();
@@ -1044,7 +1056,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     writeFile(relPath: string, content: Uint8Array): Thenable<void> {
-        return localFs.writeFile(vscode.Uri.joinPath(this.baseUri, relPath), content);
+        return localFs.writeFile(vscode.Uri.joinPath(this.baseUri, relPath), content, this.temporaryFolder);
     }
 
     readFile(relPath: string): Thenable<Uint8Array|undefined> {
