@@ -630,6 +630,27 @@ describe('the build in use, from Overleaf to the window', function () {
         });
     });
 
+    describe('opening the project', () => {
+        it('shows the latest compile from Overleaf\'s cache when it is current, and compiles nothing', async () => {
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            await vfs.joined(tree());
+            await vfs.builds.opened();
+            assert.strictEqual(vfs.builds.build.id, 'b-web');
+            assert.deepStrictEqual(overleaf.to('/project/p1/compile'), []);
+        });
+
+        it('compiles when the project changed after Overleaf\'s latest compile (410)', async () => {
+            overleaf.latest = { status: 410 };
+            overleaf.compiles.push(ownAnswer(overleaf, 'b-new'));
+            const ended = compileEnd();
+            await vfs.joined(tree());
+            await vfs.builds.opened();
+            assert.deepStrictEqual((await ended).outcome, { result: 'success' });
+            assert.strictEqual(vfs.builds.build.id, 'b-new');
+            assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
+        });
+    });
+
     describe('5. the replica\'s .overleaf/output', () => {
         it('follows the build in use, also another client\'s from Overleaf\'s cache', async () => {
             const replica = path.join(scratch, 'replica');

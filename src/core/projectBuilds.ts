@@ -243,6 +243,9 @@ function notify<T>(listeners: Set<(value: T) => void>, value: T) {
  * replaced. Overleaf answered Y because the project had not changed since Y, so Y shows the same
  * project as X. The window shows X's successors again after its next compile.
  *
+ * When the project opens, the window shows Overleaf's latest compile if it is current and of the
+ * window's settings, and compiles otherwise (opened).
+ *
  * A viewer reports the build in use gone when its files are gone from the compile server and
  * from Overleaf's cache (reportGone). With no build to show, either gone or none known, as after
  * a window reload, a check that finds no newer build starts one compile through the window's
@@ -267,6 +270,8 @@ export class ProjectBuilds {
     private compile: CompileState = { state: 'idle' };
     private readonly viewers = new Set<BuildViewer>();
     private readonly checks = new CoalescedRuns(() => this.runCheck());
+    /** the handling of the project's opening (opened) */
+    private opening?: Promise<void>;
     private shown: BuildStatus = { state: 'none' };
     private readonly buildListeners = new Set<(build: Build) => void>();
     private readonly statusListeners = new Set<(status: BuildStatus) => void>();
@@ -302,6 +307,20 @@ export class ProjectBuilds {
     /** Ask Overleaf for the latest compile; settles when a check that started after this call has ended. */
     check(): Promise<void> {
         return this.checks.request();
+    }
+
+    /**
+     * The project was opened in this window. Overleaf's latest compile is shown when it is current
+     * and was compiled as the window compiles; else the project is compiled, also when Overleaf
+     * could not be asked, as Overleaf's editor does when it opens a project
+     * (local-compile-context.tsx:383-425). Every call answers with the same promise.
+     */
+    opened(): Promise<void> {
+        this.opening ??= (async () => {
+            await this.check();
+            await this.startCompile();
+        })();
+        return this.opening;
     }
 
     /**
@@ -401,7 +420,14 @@ export class ProjectBuilds {
 
     /** Start the one compile that makes a build to show, while a viewer of the build is visible. */
     private async compileIfNeeded(): Promise<void> {
-        if (this.hasBuildToShow() || this.compile.state !== 'idle' || ![...this.viewers].some(viewer => viewer.visible)) {
+        if ([...this.viewers].some(viewer => viewer.visible)) {
+            await this.startCompile();
+        }
+    }
+
+    /** Start the one compile that makes a build to show, unless there is one to show or a compile was asked for. */
+    private async startCompile(): Promise<void> {
+        if (this.hasBuildToShow() || this.compile.state !== 'idle') {
             return;
         }
         const request: CompileState = { state: 'running', started: false };

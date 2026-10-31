@@ -342,6 +342,48 @@ describe('the build in use (ProjectBuilds)', () => {
         assert.deepStrictEqual(statuses, []);
     });
 
+    describe('when the project opens', () => {
+        it('shows Overleaf\'s latest compile when it is current, and compiles nothing', async () => {
+            const { host, builds } = setup({ visible: false });
+            host.answers.push({ kind: 'build', build: fromCache('y') });
+            await builds.opened();
+            assert.strictEqual(builds.build?.id, 'y');
+            assert.strictEqual(host.compiles, 0);
+        });
+
+        it('compiles when Overleaf has no current compile, also with no viewer of the build', async () => {
+            const { host, builds } = setup({ visible: false });
+            host.answers.push({ kind: 'none' });
+            await builds.opened();
+            assert.strictEqual(host.compiles, 1);
+        });
+
+        it('compiles when the latest compile typeset another main document', async () => {
+            const { host, builds } = setup({ visible: false });
+            host.answers.push({ kind: 'build', build: fromCache('y', { options: { rootResourcePath: 'chapters/one.tex' } }) });
+            await builds.opened();
+            assert.strictEqual(builds.build, undefined);
+            assert.strictEqual(host.compiles, 1);
+        });
+
+        it('compiles when Overleaf could not be asked', async () => {
+            const { host, builds } = setup({ visible: false });
+            host.answers.push({ kind: 'failed', detail: 'fetch failed' });
+            await builds.opened();
+            assert.strictEqual(host.compiles, 1);
+            assert.deepStrictEqual(builds.status, { state: 'compiling' });
+        });
+
+        it('does it once, whoever asks', async () => {
+            const { host, builds } = setup({ visible: false });
+            host.answers.push({ kind: 'none' });
+            assert.strictEqual(builds.opened(), builds.opened());
+            await builds.opened();
+            assert.strictEqual(host.checks, 1);
+            assert.strictEqual(host.compiles, 1);
+        });
+    });
+
     it('ignores a report about a build that is no longer in use', async () => {
         const { host, builds } = setup();
         builds.useOwn(own('x'));

@@ -200,7 +200,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
     private userId: string;
     private isDirty: boolean = true;
-    /** the project has been compiled once since it was opened */
+    /** the window has shown or compiled the project's build since it was opened (ProjectBuilds.opened) */
     private compileStarted: boolean = false;
     private initializing?: Promise<ProjectEntity>;
     /** How long a file operation waits for a lost connection to come back before it fails. */
@@ -471,11 +471,12 @@ export class VirtualFileSystem extends vscode.Disposable {
                 triggers: scmCollection.triggers,
             };
         }
-        // Compile when the project is opened. A reconnect, e.g. after the network
-        // dropped or the machine resumed, does not start another compile.
+        // When the project is opened, show Overleaf's latest compile if it is current, else compile
+        // (ProjectBuilds.opened). A reconnect, e.g. after the network dropped or the machine
+        // resumed, does not do it again.
         if (!this.compileStarted) {
             this.compileStarted = true;
-            vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
+            void this.builds.opened();
         }
         // documents may have changed on the server while disconnected: have them read again
         if (adopted.length > 0) {
