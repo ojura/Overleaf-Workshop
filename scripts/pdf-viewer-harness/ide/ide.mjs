@@ -9,6 +9,7 @@ import path from 'node:path';
 import { onCleanup, sleep } from '../../lib/cleanup.mjs';
 import { answerWithin, evaluate, waitForTarget, waitUntil, notWithinLimit } from '../../lib/devtools.mjs';
 import { checkInstanceFolder, connectWindow, drawsExpression, instanceHome, readRunningInstance, workbenchTarget } from '../../lib/test-instance.mjs';
+import { checker } from '../common.mjs';
 
 export { evaluate, waitUntil, notWithinLimit, onCleanup, sleep };
 
@@ -329,10 +330,5 @@ export const windowDraws = (wb) => wb.E(drawsExpression);
 /** A script for viewerPage's beforeLoad: requestAnimationFrame on a 16 ms timer, for a window that does not draw. */
 export const rafOnTimer = 'window.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 16); window.cancelAnimationFrame = (id) => clearTimeout(id);';
 
-/** Record a check: prints PASS or FAIL with its detail. results() lists them. */
-export function checker() {
-    const all = [];
-    const check = (name, ok, detail = '') => { all.push(!!ok); console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`); };
-    const summary = () => { const ok = all.length > 0 && all.every(Boolean); console.log(ok ? 'ALL PASS' : 'SOME FAILED'); process.exitCode = ok ? 0 : 1; };
-    return { check, summary };
-}
+/** The checks of a driver (common.mjs). */
+export { checker };

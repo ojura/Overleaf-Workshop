@@ -45,6 +45,30 @@ export const arg = (name, fallback) => {
     return argv[i + 1];
 };
 
+/**
+ * The checks of a script: check(name, ok, detail) prints PASS or FAIL and records the check;
+ * measure(name, detail) prints a measurement, which does not count as a check; summary() prints ALL
+ * PASS, or SOME FAILED with the count, and sets the exit status: 0 when every check passed and
+ * there was at least one, 1 otherwise. `results` holds { name, ok, detail } for each check.
+ */
+export function checker() {
+    const results = [];
+    const check = (name, ok, detail = '') => {
+        results.push({ name, ok: !!ok, detail });
+        console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`);
+        return !!ok;
+    };
+    const measure = (name, detail) => { console.log(`MEASURED  ${name}  (${detail})`); };
+    const summary = () => {
+        const failed = results.filter(r => !r.ok).length;
+        const passed = results.length > 0 && failed === 0;
+        console.log(passed ? 'ALL PASS' : `SOME FAILED (${failed} of ${results.length})`);
+        process.exitCode = passed ? 0 : 1;
+        return passed;
+    };
+    return { check, measure, summary, results };
+}
+
 /** A file in the work folder's shots/ folder, which is created when missing. */
 export function shotPath(name) {
     const dir = path.join(work, 'shots');

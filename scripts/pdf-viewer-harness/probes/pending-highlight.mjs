@@ -1,14 +1,15 @@
 // The Overleaf viewer: is a forward SyncTeX search drawn when it arrives before the first document,
-// and when it arrives during a reload?
+// and when it arrives during a reload? Each is a check; the exit status is 1 when one fails.
 //   node probes/pending-highlight.mjs [--ext DIR] [--port 8766]
 import { notWithinLimit } from '../../lib/devtools.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
-import { openHarness } from '../common.mjs';
+import { checker, openHarness } from '../common.mjs';
 
 const options = scriptOptions({ ext: 'value', port: 'number' });
 
 const h = await openHarness({ name: 'pending-highlight', port: options.get('port', 8766), ext: options.get('ext'), latency: 80 });
 const { page } = h;
+const { check, summary } = checker();
 try {
     const V = 'window.overleafViewer.wrapper.viewer';
     const yellow = `[...document.querySelectorAll('.page > div, .pdfViewer > div')].some(d => d.style.backgroundColor === 'rgb(255, 255, 0)')`;
@@ -18,13 +19,16 @@ try {
     await page.evaluate(`harness.syncCode([{ page: 40, h: 72, v: 300, width: 320, height: 14 }]); true`);
     const first = await page.waitFor(yellow, 20000).then(() => true, (error) => notWithinLimit(error) ?? false);
     await new Promise(r => setTimeout(r, 1500));
-    console.log('search before the first document: drawn', first, 'current page', await page.evaluate(`${V}.currentPageNumber`));
+    check('a search that arrives before the first document is drawn', first, `current page ${await page.evaluate(`${V}.currentPageNumber`)}`);
     // 2. during a reload
     await page.evaluate(`window.__old = ${V}.pdfDocument; harness.load('b'); harness.syncCode([{ page: 70, h: 72, v: 300, width: 320, height: 14 }]); true`);
     await page.waitFor(`${V}.pdfDocument !== window.__old`, 30000);
     const second = await page.waitFor(yellow, 20000).then(() => true, (error) => notWithinLimit(error) ?? false);
     await new Promise(r => setTimeout(r, 1500));
-    console.log('search during a reload: drawn after the swap', second, 'current page', await page.evaluate(`${V}.currentPageNumber`));
+    check('a search that arrives during a reload is drawn after the swap', second, `current page ${await page.evaluate(`${V}.currentPageNumber`)}`);
+} catch (error) {
+    check('run', false, String(error?.message ?? error));
 } finally {
+    summary();
     await h.close();
 }

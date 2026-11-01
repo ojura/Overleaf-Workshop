@@ -10,7 +10,7 @@
 import path from 'node:path';
 import { notWithinLimit } from '../../lib/devtools.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
-import { openHarness, themeBook } from '../common.mjs';
+import { checker, openHarness, themeBook } from '../common.mjs';
 
 const options = scriptOptions({ engine: 'value', ext: 'value', port: 'number', project: 'value', response: 'value', seconds: 'number' });
 
@@ -29,6 +29,7 @@ const h = await openHarness({
 });
 h.server.stderr.on('data', d => process.stdout.write(String(d)));
 const { page } = h;
+const { check, summary } = checker();
 const logs = [];
 page.on('Runtime.consoleAPICalled', (p) => { if (p.type === 'error' || p.type === 'warning') { logs.push(`${p.type}: ${p.args.map(a => a.value ?? a.description).join(' ').slice(0, 2500)}`); } });
 page.on('Runtime.exceptionThrown', (p) => logs.push(`exception: ${(p.exceptionDetails.exception?.description ?? p.exceptionDetails.text).slice(0, 300)}`));
@@ -47,8 +48,11 @@ try {
     await page.useFrame();
     const ok = await page.waitFor(`(() => { const v = ${V}; return !!v && v.getPageView(v.currentPageNumber - 1)?.renderingState === 3; })()`, seconds * 1000, 200)
         .then(() => true, (error) => notWithinLimit(error) ?? false);
-    console.log(ok ? `the first page was drawn after ${Date.now() - t0} ms` : `the first page was still not drawn after ${seconds} s`);
+    check(`the first page is drawn within ${seconds} s`, ok, ok ? `after ${Date.now() - t0} ms` : `still not drawn after ${seconds} s`);
+} catch (error) {
+    check('run', false, String(error?.message ?? error));
 } finally {
-    console.log('console problems:', logs.length ? logs.slice(0, 12).join('\n') : 'none');
+    console.log(`console problems (${logs.length}):`, logs.slice(0, 12).join('\n'));
+    summary();
     await h.close();
 }

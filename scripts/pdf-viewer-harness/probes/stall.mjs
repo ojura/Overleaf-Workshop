@@ -4,6 +4,7 @@
 // stall. --steps chooses which of update, load and sync run. The reload loads build A after an
 // update, and build B without one, since the viewer keeps a build that is already in view.
 //   node probes/stall.mjs [--ext DIR] [--latency 150] [--steps update,load,sync] [--port 8767]
+// It prints what it sees, for a person to read; its exit status says only whether it ran to its end.
 import { openHarness } from '../common.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 

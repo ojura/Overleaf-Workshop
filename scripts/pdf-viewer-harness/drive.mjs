@@ -13,7 +13,7 @@ import path from 'node:path';
 import { notWithinLimit } from '../lib/devtools.mjs';
 import { scriptOptions } from '../lib/options.mjs';
 import { launchChrome } from './cdp.mjs';
-import { book, defaultExt, startServer, work } from './common.mjs';
+import { book, checker, defaultExt, startServer, work } from './common.mjs';
 
 const options = scriptOptions({ ext: 'value', engine: 'value', frame: 'flag', latency: 'number', shots: 'value', port: 'number', json: 'value' });
 
@@ -27,12 +27,9 @@ fs.mkdirSync(shots, { recursive: true });
 
 const { origin, stop: stopServer } = await startServer({ name: `drive-${engine}`, port, ext, bookDir: book(), latency });
 
-const results = [];
+// a measurement follows a wait that fails the run when it does not end, so it is not a check of its own
+const { check, measure, summary, results } = checker();
 const metrics = {};
-const check = (name, ok, detail = '') => {
-    results.push({ name, ok: !!ok, detail });
-    console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`);
-};
 const stats = async () => (await fetch(`${origin}/stats`)).json();
 const resetStats = () => fetch(`${origin}/stats/reset`, { method: 'POST' });
 const mb = (bytes) => `${(bytes / 1048576).toFixed(2)} MB`;
@@ -64,7 +61,7 @@ try {
     if (framed) { await page.useFrame(); }
     const first = await page.waitFor(rendered(1), 60000);
     let s = await stats();
-    check('build A: first page rendered', true, `${first.ms} ms after navigation; ${traffic(s)}`);
+    measure('build A: first page rendered', `${first.ms} ms after navigation; ${traffic(s)}`);
     metrics.firstPageMs = first.ms; metrics.firstPageBridgeMB = +(s.bridgeBytes / 1048576).toFixed(2);
     check('build A: the whole file was not requested', s.outputWholeRequests === 0);
     await page.screenshot(path.join(shots, '1-first-page.png'));
@@ -76,7 +73,7 @@ try {
     await page.evaluate(`${V}.currentPageNumber = 60; ${V}.container.scrollTop += 250; true`);
     const p60 = await page.waitFor(rendered(60), 30000);
     s = await stats();
-    check('page 60 rendered', true, `${p60.ms} ms; ${traffic(s)}`);
+    measure('page 60 rendered', `${p60.ms} ms; ${traffic(s)}`);
     metrics.page60Ms = p60.ms; metrics.page60BridgeMB = +(s.bridgeBytes / 1048576).toFixed(2);
     await new Promise(r => setTimeout(r, 700)); // the position is stored 500 ms after scrolling
     const where = `(() => { const v = ${VIEWER}; const n = v.currentPageNumber; const div = v.getPageView(n - 1).div; return { page: n, px: Math.round(v.container.scrollTop - div.offsetTop), scale: v.currentScale }; })()`;
@@ -98,7 +95,7 @@ try {
     await page.waitFor(rendered(60), 30000);
     const reloadMs = Date.now() - t0;
     s = await stats();
-    check('reload: page 60 of build B rendered', true, `swap after ${swapped} ms, rendered after ${reloadMs} ms; ${traffic(s)}`);
+    measure('reload: page 60 of build B rendered', `swap after ${swapped} ms, rendered after ${reloadMs} ms; ${traffic(s)}`);
     metrics.reloadSwapMs = swapped; metrics.reloadRenderedMs = reloadMs; metrics.reloadBridgeMB = +(s.bridgeBytes / 1048576).toFixed(2); metrics.reloadServerMB = +((s.outputBytes + s.contentBytes) / 1048576).toFixed(2);
     check('reload: the image pieces come from the piece cache', s.contentRequests === 0, `${s.contentRequests} pieces from the server`);
     await new Promise(r => setTimeout(r, 300));
@@ -123,7 +120,7 @@ try {
     await page.waitFor(`${VIEWER}.pdfDocument && ${VIEWER}.pdfDocument !== window.__oldDoc && ${VIEWER}.pagesCount === 120`, 60000);
     await page.waitFor(rendered(await page.evaluate(`${VIEWER}.currentPageNumber`)), 30000);
     s = await stats();
-    check('update: a PDF read whole is shown', true, `${traffic(s)}`);
+    measure('update: a PDF read whole is shown', traffic(s));
     if (engine === 'overleaf') {
         await new Promise(r => setTimeout(r, 500));
         const alive = await page.evaluate('window.overleafViewer.documents.owned.size');
@@ -240,7 +237,7 @@ try {
         check('find: the viewer asks before a search downloads the PDF', consent !== null, consent ?? 'the viewer searched without asking');
         await new Promise(r => setTimeout(r, 10000));
         s = await stats();
-        check('find: what a search for a missing word downloads in 10 s', true, traffic(s));
+        measure('find: what a search for a missing word downloads in 10 s', traffic(s));
         metrics.find10sBridgeMB = +(s.bridgeBytes / 1048576).toFixed(2);
     }
 
@@ -249,7 +246,7 @@ try {
     check('state: zoom and position were saved for the host', saved?.scale === 'page-width' && saved?.position?.page >= 0, JSON.stringify({ scale: saved?.scale, page: saved?.position?.page }));
 } catch (error) {
     check('run', false, String(error?.stack ?? error));
-    await page.screenshot(path.join(shots, 'failure.png')).catch(() => {});
+    await page.screenshot(path.join(shots, 'failure.png')).catch((error) => console.log(`the screenshot of the failure could not be taken: ${error.message}`));
 } finally {
     console.log(`\nconsole errors and warnings in the page (${problems.length}):`);
     for (const p of [...new Set(problems)].slice(0, 30)) { console.log(`  ${p}`); }
@@ -257,7 +254,7 @@ try {
     const jsonFile = options.get('json');
     if (jsonFile) { fs.writeFileSync(jsonFile, JSON.stringify({ engine, framed, latency: Number(latency), metrics, results, problems: [...new Set(problems)] }, null, 1)); }
     console.log(`\n${results.length - failed} passed, ${failed} failed; screenshots in ${shots}`);
+    summary();
     await close();
     await stopServer();
-    process.exitCode = failed ? 1 : 0;
 }

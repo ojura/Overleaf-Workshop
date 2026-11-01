@@ -2,6 +2,7 @@
 // page's console messages and the server's errors.
 //   node probes/debug-load.mjs [--ext DIR] [--engine pdfjs|overleaf] [--book DIR] [--port 8794]
 // --book is a folder of make_book.py or theme_book.py; the default is the 120-page test book.
+// It prints what it sees, for a person to read; its exit status says only whether it ran to its end.
 import { openHarness } from '../common.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 

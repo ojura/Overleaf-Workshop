@@ -1,7 +1,7 @@
 // Tests the PDF viewer of the hidden IDE (ide.mjs) on a local PDF, which the viewer reads whole.
 // It opens the PDF with Quick Open, as a user would, and checks that the page in view and the
 // last page are drawn, that pdf.js 5.1.91 runs in its own worker, that Ctrl+= zooms the PDF by 1.25
-// and leaves the window's zoom alone, that Ctrl+P in the viewer opens Quick Open, and, in the
+// and leaves the window's zoom alone (its devicePixelRatio), that Ctrl+P in the viewer opens Quick Open, and, in the
 // pdfjs viewer, that Ctrl+F finds text without asking first. With --theme-book the PDF is the page
 // of theme_book.py, and the colors of the dark theme are checked too.
 //   node ide/drive-local-pdf.mjs --pdf <path> --pages N [--find TEXT] [--theme-book]
@@ -105,14 +105,20 @@ try {
     await intoViewer();
     await sleep(300);
     const scale0 = await E(`${V}.currentScale`);
+    // the IDE zooms its window with Electron's webFrame, which changes the workbench page's
+    // devicePixelRatio (View: Zoom In took it from 1 to 1.2) and leaves CSS zoom at 1
+    const windowZoom = () => wb.E('new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(window.devicePixelRatio))))');
+    const zoom0 = await windowZoom();
+    // the viewer's next scale, from pdf.js's event bus; 5 s is the last resort for a key that the viewer does not get
+    await E(`(() => { window.__scaleChange = new Promise((resolve) => { ${V}.eventBus.on('scalechanging', (event) => resolve(event.scale), { once: true }); setTimeout(() => resolve(undefined), 5000); }); return true; })()`);
     await key(wb.session, '=', 'Equal', 187, 2);
-    await sleep(500);
-    const scale1 = await E(`${V}.currentScale`);
+    const scale1 = (await E('window.__scaleChange')) ?? scale0;
     check('Ctrl+= in the viewer zooms the PDF by 1.25', Math.abs(scale1 / scale0 - 1.25) < 0.02, `${scale0.toFixed(3)} -> ${scale1.toFixed(3)}`);
-    const bodyZoom = await wb.E(`getComputedStyle(document.body).zoom || '1'`);
-    check('the window keeps its zoom', bodyZoom === '1' || bodyZoom === 'normal', `body zoom ${bodyZoom}`);
+    const zoom1 = await windowZoom();
+    check('the window keeps its zoom', zoom1 === zoom0, `the workbench's devicePixelRatio ${zoom0} -> ${zoom1}`);
+    await E(`(() => { window.__scaleChange = new Promise((resolve) => { ${V}.eventBus.on('scalechanging', (event) => resolve(event.scale), { once: true }); setTimeout(() => resolve(undefined), 5000); }); return true; })()`);
     await key(wb.session, '-', 'Minus', 189, 2);
-    await sleep(300);
+    await E('window.__scaleChange');
 
     // Ctrl+P in the viewer opens Quick Open
     await intoViewer();

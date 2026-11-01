@@ -1,8 +1,9 @@
 // The pdfjs viewer: does a build that is in view stay when the host sends it again, does a new
 // build still load, and do the zoom buttons and Ctrl+= step by 1.25?
 //   node probes/pdfjs-same-build-zoom.mjs [--ext DIR] [--port 8798]
-import { openHarness } from '../common.mjs';
+import { notWithinLimit } from '../../lib/devtools.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
+import { checker, openHarness } from '../common.mjs';
 
 const options = scriptOptions({ ext: 'value', port: 'number' });
 
@@ -11,8 +12,7 @@ const { page, origin } = h;
 const problems = [];
 page.on('Runtime.consoleAPICalled', (p) => { if (p.type === 'error' || p.type === 'warning') { problems.push(p.args.map(a => a.value ?? a.description).join(' ').slice(0, 200)); } });
 page.on('Runtime.exceptionThrown', (p) => problems.push(`exception: ${p.exceptionDetails.exception?.description?.slice(0, 200)}`));
-const results = [];
-const check = (name, ok, detail = '') => { results.push(ok); console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`); };
+const { check, summary } = checker();
 const stats = async () => (await fetch(`${origin}/stats`)).json();
 const resetStats = () => fetch(`${origin}/stats/reset`, { method: 'POST' });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -37,9 +37,9 @@ try {
     // a new build still loads
     await resetStats();
     await page.evaluate(`harness.load('b'); true`);
-    await page.waitFor(`${A}.pdfDocument && ${A}.pdfDocument !== window.__shown && ${A}.pdfViewer.getPageView(0)?.renderingState === 3`, 60000);
+    const loaded = await page.waitFor(`${A}.pdfDocument && ${A}.pdfDocument !== window.__shown && ${A}.pdfViewer.getPageView(0)?.renderingState === 3`, 60000).catch(notWithinLimit);
     s = await stats();
-    check('a new build loads', true, `${s.bridgeRequests} bridge requests`);
+    check('a new build loads, and its first page is drawn within 60 s', loaded, `${s.bridgeRequests} bridge requests`);
     // and when it comes again while it is in view, it stays too
     await page.evaluate(`window.__shown = ${A}.pdfDocument; true`);
     await sleep(1000);
@@ -74,7 +74,6 @@ try {
     check('Ctrl+= stays with the viewer, VS Code does not get it', reachedVsCode === '0', `${reachedVsCode} seen by VS Code's listener`);
 } finally {
     console.log('console problems:', problems.length ? problems : 'none');
-    console.log(results.length && results.every(Boolean) ? 'ALL PASS' : 'SOME FAILED');
+    summary();
     await h.close();
-    process.exitCode = results.length && results.every(Boolean) ? 0 : 1;
 }
