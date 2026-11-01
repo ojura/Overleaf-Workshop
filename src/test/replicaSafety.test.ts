@@ -151,15 +151,28 @@ describe('local replica: what it deletes and what it never syncs', function () {
     describe('deletions on Overleaf', () => {
         const eight = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`/chapter${i}.tex`, `chapter ${i}\n`]));
 
-        it('are not made when the replica folder is gone', async () => {
+        it('are not made while the replica folder is gone, nothing is written at its path, and the replica syncs again once the folder is back', async () => {
             const t = host();
-            project(t, eight);
+            // fewer files than the threshold, which would otherwise hold the deletions back
+            project(t, { '/a.tex': 'a\n', '/b.tex': 'b\n', '/c.tex': 'c\n' });
             const { scm } = await start(t);
             const moved = `${t.folder}-moved`;
             fs.renameSync(t.folder, moved);
             undo.push(() => fs.rmSync(moved, { recursive: true, force: true }));
-            await scm.syncNow().catch(() => { /* the sync fails: the folder cannot be read */ });
-            assert.strictEqual(t.w.remote.size, 8, 'every file is still on Overleaf');
+            const error = await scm.syncNow().then(() => undefined, (e: any) => e);
+            assert.strictEqual(error?.reason, 'gone', String(error));
+            assert.strictEqual(t.w.remote.size, 3, 'every file is still on Overleaf');
+            // a change on Overleaf meanwhile, as the project reports it to the sync
+            t.w.remote.set('/b.tex', 'b, edited on Overleaf\n');
+            await scm.sync.remoteChanged('/b.tex', false);
+            assert.strictEqual(fs.existsSync(t.folder), false, 'nothing is written at the replica\'s path');
+            fs.renameSync(moved, t.folder);
+            fs.writeFileSync(path.join(t.folder, 'a.tex'), 'a, edited while the folder was away\n');
+            const summary = await scm.syncNow();
+            assert.deepStrictEqual(summary.uploaded, ['/a.tex']);
+            await scm.settingItems[0].callback(); // Sync now, a full sync
+            assert.strictEqual(read(path.join(t.folder, 'b.tex')), 'b, edited on Overleaf\n');
+            assert.strictEqual(t.w.remote.size, 3);
         });
 
         it('are not made, and the other folder\'s files stay local, when another folder is at the replica\'s path', async () => {
@@ -177,7 +190,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             const error = await scm.syncNow().then(() => undefined, (e: Error) => e);
             assert.strictEqual(t.w.remote.size, 3, 'every file is still on Overleaf');
             assert.strictEqual(t.w.remote.get('/a.tex'), 'a\n', 'the other folder\'s file is not uploaded');
-            assert.match(String(error), /not the folder this replica started with: another folder is at its path/);
+            assert.strictEqual((error as any)?.reason, 'replaced', String(error));
         });
 
         it('are not made when a folder cannot be read', async function () {

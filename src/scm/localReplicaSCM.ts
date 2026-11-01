@@ -7,7 +7,7 @@ import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { FileRefEntity, FolderEntity, VirtualFileSystem, __OUTPUTS_ID, parseUri } from '../core/remoteFileSystemProvider';
 import {
-    deletionsNeedConfirmation, describe, LocalStat, NotConnectedError, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync,
+    deletionsNeedConfirmation, describe, FolderChange, FolderChangedError, LocalStat, NotConnectedError, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync,
     ReplicaUI, SyncSummary, syncProblems,
 } from './replicaSync';
 import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath, REPLICA_CONFLICTS_FOLDER, REPLICA_SETTINGS_FILE, REPLICA_TEMPORARY_FOLDER } from './ignorePatterns';
@@ -377,14 +377,23 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 } catch (error) {
                     if (!fs.isMissing(error)) { throw error; }
                 }
-                const problem = now===undefined ? 'it is gone'
-                    : now.dev!==start.identity.dev || now.ino!==start.identity.ino ? 'another folder is at its path'
-                    : !await fs.exists(start.gitDir) ? `its git folder ${start.gitDir} is gone`
-                    : !await fs.exists(uri(REPLICA_SETTINGS_FILE)) ? `its ${uri(REPLICA_SETTINGS_FILE).fsPath} is gone`
+                const settings = uri(REPLICA_SETTINGS_FILE).fsPath;
+                const reason: FolderChange | undefined = now===undefined ? 'gone'
+                    : now.dev!==start.identity.dev || now.ino!==start.identity.ino ? 'replaced'
+                    : !await fs.exists(start.gitDir) ? 'gitFolderGone'
+                    : !await fs.exists(settings) ? 'settingsGone'
                     : undefined;
-                if (problem!==undefined) {
-                    throw new Error(`"${folder}" is not the folder this replica started with: ${problem}. The replica does not sync until the window is reloaded`);
-                }
+                if (reason===undefined) { return; }
+                const problem = {
+                    gone: vscode.l10n.t('it is gone'),
+                    replaced: vscode.l10n.t('another folder is at its path'),
+                    gitFolderGone: vscode.l10n.t('its git folder {folder} is gone', {folder: start.gitDir}),
+                    settingsGone: vscode.l10n.t('its settings file {file} is gone', {file: settings}),
+                }[reason];
+                // verify runs before every step of the sync, so the steps go ahead again once the folder is back
+                throw new FolderChangedError(reason, vscode.l10n.t(
+                    '"{folder}" is not the folder this replica started with: {problem}. The replica syncs again once that folder is back at this path, with its git folder and its settings file. To sync another folder at this path, reload the window.',
+                    {folder, problem}));
             },
             write: async (path, content) => {
                 await fs.createDirectory(vscode.Uri.joinPath(uri(path), '..'));

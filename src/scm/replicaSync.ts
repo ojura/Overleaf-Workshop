@@ -34,7 +34,8 @@ import { gitMergeText } from './replicaGit';
  *
  * Every sync, and every deletion, record and save, first checks that the local folder is still
  * the one the sync started with (`ReplicaLocal.verify`): a folder moved away, or another folder
- * at its path, is not read or written, and its files do not reach Overleaf.
+ * at its path, is not read or written, and its files do not reach Overleaf. The sync goes on once
+ * the folder it started with is back.
  *
  * Without uploads (the push mode "bridge"), local changes stay local until a push through
  * the git bridge brings them to Overleaf; changes made on Overleaf still come in, merged
@@ -90,7 +91,7 @@ export interface ReplicaLocal {
     write(path: string, content: Uint8Array): Promise<LocalStat>,
     remove(path: string): Promise<void>,
     removeFolderIfEmpty(path: string): Promise<void>,
-    /** Rejects, saying why, when the folder is no longer the one the sync started with; cheap enough for every sync. */
+    /** Rejects with a FolderChangedError when the folder is no longer the one the sync started with; cheap enough for every sync. */
     verify(): Promise<void>,
 }
 
@@ -227,6 +228,21 @@ function errorText(error: any): string {
 /** Overleaf does not answer now, e.g. while the connection is made again: the sync decides from Overleaf's side once it answers. */
 export class NotConnectedError extends Error {
     constructor() { super('not connected to Overleaf'); }
+}
+
+/**
+ * How the local folder differs from the one the sync started with (`ReplicaLocal.verify`): it is
+ * gone from its path, another folder is there, or its git folder or its settings file is gone.
+ */
+export type FolderChange = 'gone' | 'replaced' | 'gitFolderGone' | 'settingsGone';
+
+/**
+ * The local folder is not the one the sync started with (`ReplicaLocal.verify`). Every step of
+ * the sync, and every deletion, record and save, stops with this error until that folder is back
+ * at its path, with its git folder and its settings file.
+ */
+export class FolderChangedError extends Error {
+    constructor(readonly reason: FolderChange, message: string) { super(message); }
 }
 
 /** Why a tool's sync did not make the deletions: more than `deletionThreshold` on one side need the user's confirmation. */
