@@ -56,7 +56,10 @@
 //                       are refused, and so is a display that another X server holds
 //   --screen WxH        the virtual screen, default 1600x1000
 // When start fails, or gets a signal, it stops what it started and deletes the login copy
-// (scripts/lib/cleanup.mjs).
+// (scripts/lib/cleanup.mjs), as stop does: when one of the instance's processes outlives SIGTERM,
+// what comes after it stays, the display, the saved state and the runtime folder, for a stop that
+// ends that process. A start in the folder of an instance that ended without stop first ends what
+// that instance left: its X server, its saved state and its runtime folder.
 //
 // The test projects: the user lists in ${XDG_CONFIG_HOME:-~/.config}/overleaf-workshop/test-projects,
 // once, the Overleaf projects made for tests, one project id per line ("#" starts a comment).
@@ -69,7 +72,8 @@
 // ~/.antigravity-ide) is the instance's. XDG_RUNTIME_DIR, where the session bus's, the IDE's and
 // the replica's control sockets are, is a new folder of the instance's own in /tmp (the record's
 // run), short so that a socket's path stays within the system's limit however long the instance's
-// folder is; start makes it with mode 700, and stop and a failed start remove it. The IDE runs
+// folder is; start records its path, then makes it with mode 700, and stop and a failed start remove
+// it, only when it has the form that start gives it. The IDE runs
 // under dbus-run-session, on a session bus of its own that does not start
 // services on demand (its configuration leaves out the service folders), so a file dialog, a
 // notification or a keyring prompt that the IDE asks for on its session bus does not reach the
@@ -101,6 +105,7 @@
 // Exit status: 0 done; 1 failed; 2 the page or the main process did not answer within
 // ANSWER_LIMIT_MS; 64 wrong usage.
 import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -248,14 +253,39 @@ function stopProcesses(args) {
 }
 
 /**
- * A new runtime folder for the instance, made with mode 700. It is in /tmp, not in the instance's
- * folder or in TMPDIR, so that the paths of the sockets in it stay short.
+ * The path of a runtime folder, as start makes one: /tmp/hidden-ide-run- and six letters or digits.
+ * It is in /tmp, not in the instance's folder or in TMPDIR, so that the paths of the sockets in it
+ * stay short.
  */
-const makeRuntimeFolder = () => fs.mkdtempSync('/tmp/hidden-ide-run-');
+const RUNTIME_FOLDER = /^\/tmp\/hidden-ide-run-[A-Za-z0-9]{6}$/;
 
-/** Remove the runtime folder `runtime` (a record's run), when it is given and exists. */
-function removeRuntimeFolder(runtime) {
-    if (runtime) { fs.rmSync(runtime, { recursive: true, force: true }); }
+/**
+ * A new path for a runtime folder (RUNTIME_FOLDER). start records it before it makes the folder,
+ * so that a start that a SIGKILL ends leaves the folder in a record, for the next start or stop.
+ */
+function runtimeFolderName() {
+    const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    return `/tmp/hidden-ide-run-${Array.from({ length: 6 }, () => characters[crypto.randomInt(characters.length)]).join('')}`;
+}
+
+/** Make the runtime folder `run` with mode 700; fails when something exists at that path. */
+const makeRuntimeFolder = (run) => fs.mkdirSync(run, { mode: 0o700 });
+
+/**
+ * Remove the runtime folder `run` that a record names, when it exists. The record could name any
+ * path, so only a folder of the form that start makes (RUNTIME_FOLDER) goes, when this user owns it
+ * and it is not a symbolic link; for any other path it throws, with the reason.
+ */
+function removeRuntimeFolder(run) {
+    if (!run) { return; }
+    if (typeof run !== 'string' || !RUNTIME_FOLDER.test(run)) {
+        throw new Error(`refusing to delete ${run}, which the record names as the runtime folder: start makes runtime folders as /tmp/hidden-ide-run-XXXXXX`);
+    }
+    const stat = fs.lstatSync(run, { throwIfNoEntry: false });
+    if (!stat) { return; }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) { throw new Error(`refusing to delete ${run}: it is ${stat.isSymbolicLink() ? 'a symbolic link' : 'not a folder'}`); }
+    if (stat.uid !== process.getuid()) { throw new Error(`refusing to delete ${run}: user ${stat.uid} owns it`); }
+    fs.rmSync(run, { recursive: true, force: true });
 }
 
 /** Delete the instance's saved state, which holds the login copy in --project mode. */
@@ -469,7 +499,13 @@ async function start(...argv) {
     if (previous && instanceProcesses(previous).length > 0) {
         throw new Error(`an instance is already running in ${home} (process group ${previous.group}); stop it first`);
     }
-    removeRuntimeFolder(previous?.run); // left by an instance that ended without stop
+    if (previous) {
+        // what an instance that ended without stop leaves: its X server, which runs in a process
+        // group of its own, its saved state and its runtime folder
+        const xvfbLeft = isRecordedProcess(previous.xvfb, previous.xvfbStart, previous.boot);
+        endInstance(home, previous);
+        if (xvfbLeft) { console.log(`stopped the X server of the previous instance in ${home} (process ${previous.xvfb} on ${previous.display}), whose IDE had ended`); }
+    }
     let { project, folder } = options;
     if (folder) {
         if (project) { throw new UsageError('give --project or --folder, not both'); }
@@ -511,36 +547,48 @@ async function start(...argv) {
     }
     writeSettings(home);
 
-    // From here on, start stops what it started when it fails, and when the script ends before
-    // start has finished, as after a signal (scripts/lib/cleanup.mjs).
-    const started = [];
-    let runtime;
+    // From here on, start ends what it started when it fails, and when the script ends before start
+    // has finished, as after a signal (scripts/lib/cleanup.mjs), through endInstance with the record
+    // as it is at that moment, as stop would: the IDE's process group, then the X server, then the
+    // saved state and the runtime folder; when a process outlives its SIGTERM, the rest stays for a
+    // stop. The record names the runtime folder before the folder exists, and each process only once
+    // it runs, so that it never names a process that start did not start.
+    const run = runtimeFolderName();
+    const boot = bootId();
+    let record = { boot, run, frozen: false, project: project ?? null, replica: project ? folder : null, folder, profile: path.join(home, 'profile'), ide };
+    /** the child processes that start holds, which must not keep this process from ending */
+    const children = [];
     const abandonment = onCleanup(() => {
-        for (const stopIt of started.reverse()) { stopIt(); }
-        deleteSavedState(home);
-        removeRuntimeFolder(runtime);
+        try {
+            endInstance(home, record);
+        } catch (error) {
+            process.stderr.write(`hidden-ide: ${error.message}\n`);
+        }
+        for (const child of children) { child.unref(); }
     });
     try {
-        runtime = makeRuntimeFolder();
+        writeInstance(home, record);
+        makeRuntimeFolder(run);
         writeSavedState(home, project, options['project-name']);
         if (!project) { console.log(`the instance opens ${folder}; start did not copy the login`); }
-        const boot = bootId();
         const { display, xvfb } = await startDisplay(options.display, options.screen ?? '1600x1000', home);
-        started.push(() => stopProcesses(['--pid', String(xvfb.pid)]));
-        let record = {
-            boot, xvfb: xvfb.pid, xvfbStart: processStat(xvfb.pid)?.start, display, run: runtime, frozen: false,
-            project: project ?? null, replica: project ? folder : null, folder, profile: path.join(home, 'profile'), ide,
-        };
+        children.push(xvfb);
+        record = { ...record, xvfb: xvfb.pid, xvfbStart: processStat(xvfb.pid)?.start, display };
         writeInstance(home, record);
-        const session = startIde(home, runtime, ide, display, folder);
-        started.push(() => stopProcesses(['--group', String(session.pid)]));
-        const ended = new Promise((resolve, reject) => {
-            session.once('exit', (code, signal) => resolve(signal ?? `exit code ${code}`));
-            session.once('error', reject);
+        const session = startIde(home, run, ide, display, folder);
+        children.push(session);
+        // a program that cannot be started gets no pid, so the record names the group only once it runs
+        await new Promise((resolve, reject) => {
+            session.once('spawn', resolve);
+            session.once('error', (error) => reject(new Error(`dbus-run-session, which starts the IDE, could not run: ${error.message}`)));
         });
         // recorded at once, so that stop finds the instance also when the wait below fails
         record = { ...record, group: session.pid, groupStart: processStat(session.pid)?.start };
         writeInstance(home, record);
+        const ended = new Promise((resolve, reject) => {
+            session.once('exit', (code, signal) => resolve(signal ?? `exit code ${code}`));
+            session.once('error', reject);
+        });
         const found = await Promise.race([
             waitForInstance(home, session.pid, START_LIMIT_MS, ended),
             ended.then((how) => { throw new Error(`the IDE exited (${how}; see ${home}/ide.log)`); }),
@@ -557,11 +605,13 @@ async function start(...argv) {
     }
 }
 
-/** stop: see the usage at the top. */
-function stop() {
-    const home = instanceFolder();
-    const record = recordIfAny(home);
-    if (!record) { throw new Error(`${home} does not hold an instance (instance.json)`); }
+/**
+ * End what the record `record` of the instance in `home` names: its process group and its X server,
+ * each while it is still the process that start recorded, then its saved state and its runtime
+ * folder. When a process still runs STOP_LIMIT_S s after SIGTERM, it throws, and the saved state and
+ * the runtime folder stay, since the instance may still use them.
+ */
+function endInstance(home, record) {
     if (instanceProcesses(record).length > 0 && !stopProcesses(['--group', String(record.group)])) {
         throw new Error(`the instance's processes still run ${STOP_LIMIT_S} s after SIGTERM (listed above); its display and its saved state stay. Run stop again, or end those processes`);
     }
@@ -570,6 +620,14 @@ function stop() {
     }
     deleteSavedState(home);
     removeRuntimeFolder(record.run);
+}
+
+/** stop: see the usage at the top. */
+function stop() {
+    const home = instanceFolder();
+    const record = recordIfAny(home);
+    if (!record) { throw new Error(`${home} does not hold an instance (instance.json)`); }
+    endInstance(home, record);
     writeInstance(home, { ...record, run: null, frozen: false });
     console.log('stopped; deleted the instance\'s saved state (state.vscdb, which holds the login copy in --project mode) and its runtime folder');
 }
