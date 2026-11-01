@@ -54,7 +54,9 @@ describe('the control socket of a local replica', () => {
 
     it('says plainly when the operating system shortens the socket\'s path, and tools say so too', async function () {
         if (process.platform === 'win32') { this.skip(); }
-        // a runtime folder whose path makes the socket's path longer than a socket's may be
+        // a runtime folder with a path so long that the socket's path is longer than a socket's
+        // address can hold: Node makes the socket at the first 108 bytes of the path (104 on
+        // macOS), a name in `runtime` beside `long`
         const long = path.join(runtime, 'a-runtime-folder-with-a-long-name-'.repeat(3));
         fs.mkdirSync(long, { mode: 0o700 });
         process.env.XDG_RUNTIME_DIR = long;
@@ -65,7 +67,8 @@ describe('the control socket of a local replica', () => {
         await assert.rejects(requestReplica(folder, { op: 'status' }, 5000),
             (error: Error) => error instanceof ReplicaUnreachableError && error.message === `the IDE window that keeps ${folder} in sync cannot answer tools: ${reason}`,
             'a tool\'s answer');
-        assert.deepStrictEqual(fs.readdirSync(path.join(long, 'overleaf-workshop')), [], 'the socket folder after the server closed');
+        assert.deepStrictEqual(fs.readdirSync(runtime), [path.basename(long)],
+            'the runtime folder, where Node made the socket at the shortened path, after the server closed');
     });
 
     it('lets a test that waits for the server fail at once with the reason it cannot listen', async function () {
