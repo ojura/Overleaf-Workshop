@@ -37,23 +37,43 @@ export function shotPath(name) {
     return path.join(dir, name);
 }
 
-/** A test book of make_book.py in the work folder, written the first time it is asked for. */
-export function book(name = 'book', pages = 120, imageKb = 1024) {
+/**
+ * The book `name` in the work folder, which the Python script `writer` writes, with `args`, the
+ * first time it is asked for. A book is complete once its builds.json exists, which the script
+ * writes last. The script writes into a new folder next to the book's, which then takes the
+ * book's name, so that a run that is cut short cannot leave a book without some of its files
+ * under that name; a folder of that name without builds.json is left from an older version of
+ * this function, and is replaced. The scripts write the same bytes every time (make_book.py seeds
+ * its random data), so when two first runs write a book at once, it does not matter whose folder
+ * ends up under the name.
+ */
+function writtenBook(name, writer, args = []) {
     const dir = path.join(work, name);
-    if (!fs.existsSync(path.join(dir, 'builds.json'))) {
-        execFileSync('python3', ['-I', path.join(here, 'make_book.py'), dir, String(pages), String(imageKb)], { stdio: 'inherit' });
+    if (fs.existsSync(path.join(dir, 'builds.json'))) { return dir; }
+    const fresh = fs.mkdtempSync(`${dir}.new-`);
+    const removal = onCleanup(() => fs.rmSync(fresh, { recursive: true, force: true }));
+    try {
+        execFileSync('python3', ['-I', path.join(here, writer), fresh, ...args], { stdio: 'inherit' });
+        if (!fs.existsSync(path.join(fresh, 'builds.json'))) { throw new Error(`${writer} ended without writing builds.json into ${fresh}`); }
+        // the rename fails while a folder of that name is not empty: a leftover without builds.json,
+        // which goes, or the book of another run that renamed its folder first, which stays
+        if (!fs.existsSync(path.join(dir, 'builds.json'))) { fs.rmSync(dir, { recursive: true, force: true }); }
+        try {
+            fs.renameSync(fresh, dir);
+        } catch (error) {
+            if (!['ENOTEMPTY', 'EEXIST'].includes(error.code) || !fs.existsSync(path.join(dir, 'builds.json'))) { throw error; }
+        }
+    } finally {
+        removal.run();
     }
     return dir;
 }
 
-/** The one-page book of theme_book.py, for the color themes. */
-export function themeBook() {
-    const dir = path.join(work, 'book-theme');
-    if (!fs.existsSync(path.join(dir, 'builds.json'))) {
-        execFileSync('python3', ['-I', path.join(here, 'theme_book.py'), dir], { stdio: 'inherit' });
-    }
-    return dir;
-}
+/** The test book of make_book.py, 120 pages with an image of 1 MB on each, in the folder book/ of the work folder. */
+export const book = () => writtenBook('book', 'make_book.py', ['120', '1024']);
+
+/** The one-page book of theme_book.py, for the color themes, in the folder book-theme/ of the work folder. */
+export const themeBook = () => writtenBook('book-theme', 'theme_book.py');
 
 /**
  * The extension's fetch bridge and piece cache (src/core/pdfFetchBridge.ts), bundled for Node with
