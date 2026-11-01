@@ -40,14 +40,13 @@ export class EmitTimeoutError extends Error {
 }
 
 /**
- * Whether `error` is real-time's refusal to read a doc from a version when document-updater no
- * longer keeps the ops since that version. Real-time raises ClientRequestedMissingOpsError, with
- * the message 'doc updater could not load requested ops' (services/real-time/app/js/Errors.js),
- * and Router._handleError forwards only that message to the client, so the message is the one
- * value that tells this refusal from the others. Should Overleaf change the text, this answers
- * false: the write that VirtualFileSystem.settleUnconfirmed asks about then stays unconfirmed,
- * and each read of its doc from Overleaf and each write of it fails with the refusal until the
- * window is reloaded; the edit is neither applied twice nor dropped.
+ * Whether `error` is real-time's refusal 'doc updater could not load requested ops'
+ * (ClientRequestedMissingOpsError, services/real-time/app/js/Errors.js). Real-time sends it when
+ * document-updater could not load the doc (404), or the ops since the version asked for (422)
+ * (DocumentUpdaterManager.getDocument), and Router._handleError forwards only that message, so
+ * the message is the one value that tells this refusal from the others. It chooses only the
+ * wording of what the user is told: VirtualFileSystem.settleUnconfirmed takes any refusal of the
+ * read as an outcome that cannot be determined, so a change of the text changes that wording.
  */
 export function isMissingOpsRefusal(error: unknown): boolean {
     return error instanceof EmitRefusedError && (error.answer as {message?: unknown} | undefined)?.message === 'doc updater could not load requested ops';
