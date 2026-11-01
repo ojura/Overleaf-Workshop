@@ -306,6 +306,13 @@ class SyncWaitsError extends Error {
     constructor(readonly reason: string) { super(`the sync waits: ${reason}`); }
 }
 
+/**
+ * A reconcile found right before a write that git held its index lock, or was in the middle of
+ * an operation, and the sync may act again once that is over (`beforeWrite`). git may have
+ * written the file since the reconcile read it, so the reconcile reads both sides again (`reported`).
+ */
+class StaleReadError extends Error {}
+
 class Semaphore {
     private waiting: (() => void)[] = [];
     constructor(private available: number) {}
@@ -1012,33 +1019,49 @@ export class ReplicaSync {
     /**
      * Right before a reconcile writes to either side, or trashes or moves a file. A step asks
      * mayAct when it starts; a git operation, or another program's index lock, that comes during
-     * the step is found here, and the reconcile then leaves its path (SyncWaitsError) to the full
-     * sync after the wait. When neither is there, the check is the existence of their files.
+     * the step is found here. While the sync waits, the reconcile leaves its path (SyncWaitsError)
+     * to the full sync after the wait. When the lock is gone, or the operation is over, by the
+     * time mayAct answers, git may have written the file since the reconcile read it, and the
+     * reconcile reads both sides again (StaleReadError). When neither is there, the check is the
+     * existence of their files.
      */
     private async beforeWrite(): Promise<void> {
         const [operation, lock] = await Promise.all([this.store.operation?.(), this.store.foreignIndexLock?.()]);
         if (operation===undefined && lock===undefined) { return; }
         const reason = await this.mayAct();
         if (reason!==undefined) { throw new SyncWaitsError(reason); }
+        throw new StaleReadError(`${lock!==undefined ? `git held its index lock ${lock}` : `git was in the middle of ${operation}`} when the sync was about to write; it reads both sides again`);
     }
 
     /**
      * Run `work` on `path`; a failure goes into the summary and the log. Answers why the work
-     * stopped to wait for the sync (`SyncWaitsError`), undefined when it ran or failed.
+     * stopped to wait for the sync (`SyncWaitsError`), undefined when it ran or failed. Work that
+     * found git's lock or operation right before a write, over by then (`StaleReadError`), runs
+     * again from its reads. Each attempt after the first comes after a lock or an operation of
+     * git's that has ended, so the work runs again only as often as git's commands came during it.
      */
     private async reported(path: string, mode: Mode, work: () => Promise<void>): Promise<string | undefined> {
-        try {
-            await work();
-        } catch (error) {
-            if (error instanceof SyncWaitsError) {
-                // not a failure: the full sync after the wait takes the path in
-                mode.summary.waitingFor ??= error.reason;
-                return error.reason;
+        for (;;) {
+            try {
+                await work();
+                return undefined;
+            } catch (error) {
+                if (error instanceof StaleReadError) {
+                    // Every write of the work comes after a check, so what it decided before is not
+                    // carried out; only the copy that keepAside keeps before its download's check stays.
+                    this.ui.log(`${path}: ${error.message}`);
+                    continue;
+                }
+                if (error instanceof SyncWaitsError) {
+                    // not a failure: the full sync after the wait takes the path in
+                    mode.summary.waitingFor ??= error.reason;
+                    return error.reason;
+                }
+                mode.summary.failed.push({path, error: errorText(error)});
+                this.ui.log(`${path}: sync failed: ${errorText(error)}`);
+                return undefined;
             }
-            mode.summary.failed.push({path, error: errorText(error)});
-            this.ui.log(`${path}: sync failed: ${errorText(error)}`);
         }
-        return undefined;
     }
 
     /**

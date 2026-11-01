@@ -348,6 +348,55 @@ describe('local replica: git as the merge backend', function () {
         assert.strictEqual(await t.store.foreignIndexLock(), undefined, 'after the lock');
     });
 
+    it('reads both sides again when another program held git\'s index lock at the sync\'s write, and keeps the local change written during the lock', async () => {
+        const t = await world();
+        const v1 = Array.from({ length: 10 }, (_, i) => `Line ${i + 1} of a.tex.\n`).join('');
+        const changedOnOverleaf = (s: string) => s.replace('Line 9 of a.tex.', 'Line 9 of a.tex, changed on Overleaf.');
+        const writtenByGit = (s: string) => s.replace('Line 1 of a.tex.', 'Line 1 of a.tex, written by git during its lock.');
+        t.remote.docs.set('/a.tex', v1);
+        t.update(ME);
+        const sync = t.start();
+        await sync.syncAll();
+        await sync.recordNow();
+        t.remote.docs.set('/a.tex', changedOnOverleaf(v1));
+        t.update(ALICE);
+        // While the sync reads Overleaf's text, another program's git takes the index lock and
+        // writes a local change into a.tex, as `git stash pop` does.
+        const lock = path.join(t.folder, '.git', 'index.lock');
+        const readDoc = t.remote.readDoc;
+        let gitWrote = false;
+        t.remote.readDoc = async (p: string) => {
+            if (p === '/a.tex' && !gitWrote) {
+                gitWrote = true;
+                fs.writeFileSync(lock, '');
+                t.write('/a.tex', writtenByGit(v1));
+            }
+            return readDoc.call(t.remote, p);
+        };
+        // git's command ends, and removes the lock, once the sync waits for it
+        const indexLockReleased = t.store.indexLockReleased;
+        let waited = false;
+        t.store.indexLockReleased = (file: string) => {
+            const watch = indexLockReleased.call(t.store, file);
+            waited = true;
+            fs.rmSync(lock);
+            return watch;
+        };
+        try {
+            await sync.remoteChanged('/a.tex', false);
+        } finally {
+            t.remote.readDoc = readDoc;
+            t.store.indexLockReleased = indexLockReleased;
+            fs.rmSync(lock, { force: true });
+        }
+        assert.deepStrictEqual([gitWrote, waited], [true, true], 'git wrote a.tex during its lock, and the sync waited for the lock');
+        const both = changedOnOverleaf(writtenByGit(v1));
+        assert.strictEqual(t.read('/a.tex'), both, 'the local file: git\'s change, merged with Overleaf\'s');
+        assert.strictEqual(t.remote.docs.get('/a.tex'), both, 'Overleaf: the merge');
+        assert.ok(!fs.existsSync(path.join(t.folder, '.overleaf/conflicts')), 'nothing is kept aside');
+        await sync.stop();
+    });
+
     it('turns the replica\'s ignore patterns into gitignore lines', () => {
         assert.strictEqual(gitignoreLine('**/*.aux'), '*.aux');
         assert.strictEqual(gitignoreLine('**/.*'), '.*');
