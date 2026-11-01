@@ -45,15 +45,18 @@
 //                       .overleaf/settings.json or lies inside one, is refused: only --project opens
 //                       a replica, of a project that the user listed
 //   --project-name N    the project's name, if the extension's saved login does not list it
-//   --build DIR         build that checkout of this extension (its TypeScript and its PDF viewers,
-//                       on the checkout's pdf.js release) and install the build into the instance;
-//                       without it, the instance runs a copy of the installed extension. A step of
-//                       the build that fails fails start
+//   --build DIR         build that checkout of this extension as npm run compile does, into a
+//                       temporary folder, and make the instance's copy of the extension hold
+//                       exactly the checkout's package (scripts/lib/install-build.mjs); without
+//                       it, the instance runs a copy of the installed extension. The checkout
+//                       needs what npm's postinstall downloads, and npm ci in views/chat-view. A
+//                       step of the build that fails fails start
 //   --ide PATH          the Antigravity binary, else the environment variable HIDDEN_IDE_BINARY
 //   --display :N        the virtual display; by default the first free one from :99 up. :0 and :1
 //                       are refused, and so is a display that another X server holds
 //   --screen WxH        the virtual screen, default 1600x1000
-// When start fails, or gets a signal, it stops what it started and deletes the login copy.
+// When start fails, or gets a signal, it stops what it started and deletes the login copy
+// (scripts/lib/cleanup.mjs).
 //
 // The test projects: the user lists in ${XDG_CONFIG_HOME:-~/.config}/overleaf-workshop/test-projects,
 // once, the Overleaf projects made for tests, one project id per line ("#" starts a comment).
@@ -102,8 +105,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { onCleanup, run } from './lib/cleanup.mjs';
 import { answerWithin, evaluate, removeActivePort, WaitLimitError } from './lib/devtools.mjs';
-import { buildCheckout, installedExtension, installInto } from './lib/install-build.mjs';
+import { buildCheckout, EXTENSION_ID, IDES, installedExtension, installInto } from './lib/install-build.mjs';
 import {
     bootId, checkInstanceFolder, connectMainProcess, connectWindow, inMainProcess, instanceHome, instanceProcesses, isRecordedProcess,
     drawsExpression, processStat, readInstance, readRunningInstance, waitForInstance, workbenchTarget, writeInstance,
@@ -127,8 +131,9 @@ const FIRST_DISPLAY = 99;
 /** How many displays from FIRST_DISPLAY up start tries. */
 const DISPLAYS_TRIED = 100;
 
-const userState = process.env.HIDDEN_IDE_USER_STATE ?? path.join(os.homedir(), '.config', 'Antigravity IDE', 'User', 'globalStorage', 'state.vscdb');
-const userExtensions = process.env.HIDDEN_IDE_USER_EXTENSIONS ?? path.join(os.homedir(), '.antigravity-ide', 'extensions');
+const antigravity = IDES.find(ide => ide.name === 'Antigravity IDE');
+const userState = process.env.HIDDEN_IDE_USER_STATE ?? path.join(antigravity.data[0], 'User', 'globalStorage', 'state.vscdb');
+const userExtensions = process.env.HIDDEN_IDE_USER_EXTENSIONS ?? antigravity.extensions;
 const testProjects = path.join(process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), '.config'), 'overleaf-workshop', 'test-projects');
 
 /** A wrong use of a command: the error, and then the usage, with exit status 64. */
@@ -153,13 +158,6 @@ function parseOptions(argv, names) {
         values[option[1]] = value;
     }
     return values;
-}
-
-/** Run `program` to its end, with its output on this process's stderr; fail with what failed and how. */
-function run(what, program, args) {
-    const result = spawnSync(program, args, { stdio: ['ignore', process.stderr, process.stderr] });
-    if (result.error) { throw new Error(`${what}: ${program} could not run: ${result.error.message}`); }
-    if (result.status !== 0) { throw new Error(`${what} failed: ${program} ended with ${result.signal ?? `status ${result.status}`}`); }
 }
 
 /** Write `text` to `file` through a new file that is renamed over it, readable only by this user. */
@@ -395,12 +393,12 @@ function startIde(home, runtime, ide, display, folder) {
  * a folder that an earlier start copied as well as the IDE's own list there, extensions.json, which
  * the IDE writes again from the folders. Returns Overleaf Workshop's folder in the instance.
  */
-function copyExtensions(home) {
-    const source = installedExtension(userExtensions, 'iamhyc.overleaf-workshop');
-    if (!source) { throw new Error(`${userExtensions}/extensions.json does not list Overleaf Workshop (iamhyc.overleaf-workshop)`); }
+async function copyExtensions(home) {
+    const source = installedExtension(userExtensions, EXTENSION_ID);
+    if (!source) { throw new Error(`${userExtensions}/extensions.json does not list Overleaf Workshop (${EXTENSION_ID})`); }
     const chosen = [source, ...['james-yu.latex-workshop'].map(id => installedExtension(userExtensions, id)).filter(Boolean)];
     const included = chosen.flatMap(folder => ['--include', `/${path.basename(folder)}/***`]);
-    run('copying the installed extensions', 'rsync',
+    await run('copying the installed extensions', 'rsync',
         ['-a', '--delete', '--delete-excluded', ...included, '--exclude', '*', `${userExtensions}/`, `${path.join(home, 'extensions')}/`]);
     fs.chmodSync(path.join(home, 'extensions'), 0o700); // rsync gave it the mode of the user's extensions folder
     return path.join(home, 'extensions', path.basename(source));
@@ -518,32 +516,27 @@ async function start(...argv) {
     for (const dir of [['profile', 'User', 'globalStorage'], ['extensions'], ['home'], ...(project ? [['replica', '.overleaf']] : [])]) {
         fs.mkdirSync(path.join(home, ...dir), { recursive: true, mode: 0o700 });
     }
-    const ext = copyExtensions(home);
+    const ext = await copyExtensions(home);
     if (build) {
         const built = await buildCheckout(build);
         try {
-            installInto(built, ext, { sameVersion: false });
+            const files = await installInto(built, ext, { sameVersion: false });
+            console.log(`installed the package of ${build} (${built.label}, ${files} files) into the instance`);
         } finally {
             built.remove();
         }
-        console.log(`installed the build of ${build} (${built.label}) into the instance; the chat view is the installed extension's`);
     }
     writeSettings(home);
 
-    // From here on, start stops what it started when it fails or gets a signal.
+    // From here on, start stops what it started when it fails, and when the script ends before
+    // start has finished, as after a signal (scripts/lib/cleanup.mjs).
     const started = [];
     let runtime;
-    const abandon = () => {
+    const abandonment = onCleanup(() => {
         for (const stopIt of started.reverse()) { stopIt(); }
         deleteSavedState(home);
         removeRuntimeFolder(runtime);
-    };
-    const handlers = [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]].map(([signal, code]) => [signal, () => {
-        process.stderr.write(`hidden-ide: start got ${signal}; stopping what it started\n`);
-        abandon();
-        process.exit(code);
-    }]);
-    handlers.forEach(([signal, handler]) => process.on(signal, handler));
+    });
     try {
         runtime = makeRuntimeFolder();
         writeSavedState(home, project, options['project-name']);
@@ -571,14 +564,13 @@ async function start(...argv) {
         ]);
         writeInstance(home, { ...record, ...found, pidStart: processStat(found.pid)?.start });
         // the instance runs on its own: this process does not wait for it
+        abandonment.cancel();
         session.unref();
         xvfb.unref();
         console.log(`started: pid ${found.pid} on ${display}, folder ${folder}`);
     } catch (error) {
-        abandon();
+        abandonment.run();
         throw error;
-    } finally {
-        handlers.forEach(([signal, handler]) => process.removeListener(signal, handler));
     }
 }
 
