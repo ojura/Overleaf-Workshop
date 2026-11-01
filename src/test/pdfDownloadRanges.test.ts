@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
-import { DownloadError, downloadInRanges } from '../core/pdfFetchBridge';
+import { DownloadError, downloadInRanges, retryAfterMs } from '../core/pdfFetchBridge';
 
 describe('downloadInRanges', () => {
     const body = Buffer.from(Array.from({ length: 1000 }, (_, i) => i % 251));
@@ -18,6 +18,8 @@ describe('downloadInRanges', () => {
     let missing: Set<number>;
     /** how many times to send a range cut off, by its start */
     let cutOff: Map<number, number>;
+    /** how many times to answer 429 for a range, by its start, with the Retry-After header to send */
+    let limited: Map<number, { times: number, retryAfter?: string }>;
 
     beforeEach(async () => {
         folder = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-ranges-'));
@@ -25,6 +27,7 @@ describe('downloadInRanges', () => {
         failures = new Map();
         missing = new Set();
         cutOff = new Map();
+        limited = new Map();
         server = http.createServer((req, res) => {
             const m = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range ?? '')!;
             const [start, end] = [Number(m[1]), Number(m[2])];
@@ -32,6 +35,13 @@ describe('downloadInRanges', () => {
             const left = failures.get(start) ?? 0;
             if (left > 0) { failures.set(start, left - 1); res.writeHead(500); res.end(); return; }
             if (missing.has(start)) { res.writeHead(404); res.end(); return; }
+            const limit = limited.get(start);
+            if (limit && limit.times > 0) {
+                limit.times -= 1;
+                res.writeHead(429, limit.retryAfter === undefined ? {} : { 'retry-after': limit.retryAfter });
+                res.end();
+                return;
+            }
             const short = cutOff.get(start) ?? 0;
             if (short > 0) {
                 cutOff.set(start, short - 1);
@@ -77,6 +87,52 @@ describe('downloadInRanges', () => {
             (error: unknown) => error instanceof DownloadError && error.status === 404);
         assert.strictEqual(requests.filter(r => r === '128-255').length, 1);
         assert.deepStrictEqual(fs.readdirSync(folder), []);
+    });
+
+    it('asks again for a range answered 429 after the time that the answer names (Retry-After)', async () => {
+        limited.set(128, { times: 1, retryAfter: '2' });
+        const waits: number[] = [];
+        const file = path.join(folder, 'build.pdf');
+        await downloadInRanges(url, file, body.byteLength, undefined, { chunk: 128, parallel: 1, attempts: 3, wait: async (ms) => { waits.push(ms); } });
+        assert.deepStrictEqual(fs.readFileSync(file), body);
+        assert.strictEqual(requests.filter(r => r === '128-255').length, 2);
+        assert.deepStrictEqual(waits, [2000]);
+    });
+
+    it('does not ask again for a range answered 429 without a time to ask again, and says so with the status', async () => {
+        limited.set(128, { times: 1 });
+        const file = path.join(folder, 'build.pdf');
+        await assert.rejects(downloadInRanges(url, file, body.byteLength, undefined, { chunk: 128, parallel: 1, attempts: 3 }),
+            (error: unknown) => error instanceof DownloadError && error.status === 429);
+        assert.strictEqual(requests.filter(r => r === '128-255').length, 1);
+        assert.deepStrictEqual(fs.readdirSync(folder), []);
+    });
+
+    it('stops waiting to ask again when the caller aborts, with the answer\'s error', async () => {
+        limited.set(0, { times: 1, retryAfter: '60' });
+        const abort = new AbortController();
+        const file = path.join(folder, 'build.pdf');
+        // the wait that the answer asks for begins: the caller aborts during it
+        const wait = (_ms: number, signal: AbortSignal) => new Promise<void>((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+            abort.abort();
+        });
+        await assert.rejects(downloadInRanges(url, file, body.byteLength, abort.signal, { chunk: 128, parallel: 1, wait }),
+            (error: unknown) => error instanceof DownloadError && error.status === 429);
+        assert.strictEqual(requests.filter(r => r === '0-127').length, 1);
+        assert.deepStrictEqual(fs.readdirSync(folder), []);
+    });
+
+    it('reads the time to ask again from Retry-After, in seconds or as a date', () => {
+        const now = Date.parse('2026-11-01T05:00:00Z');
+        assert.strictEqual(retryAfterMs('120', now), 120_000);
+        assert.strictEqual(retryAfterMs(' 0 ', now), 0);
+        assert.strictEqual(retryAfterMs('Sun, 01 Nov 2026 05:00:30 GMT', now), 30_000);
+        // a date that has passed: ask again at once
+        assert.strictEqual(retryAfterMs('Sun, 01 Nov 2026 04:59:00 GMT', now), 0);
+        assert.strictEqual(retryAfterMs('soon', now), undefined);
+        assert.strictEqual(retryAfterMs('-5', now), undefined);
+        assert.strictEqual(retryAfterMs(null, now), undefined);
     });
 
     it('asks again for a range that came cut off', async () => {
