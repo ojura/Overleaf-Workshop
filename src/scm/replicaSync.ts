@@ -747,10 +747,11 @@ export class ReplicaSync {
             const moves: [string, string][] = this.state.entries[from]!==undefined ? [[from, to]]
                 : Object.keys(this.state.entries).filter(p => p.startsWith(prefix)).map(p => [p, `${to}${p.slice(from.length)}`]);
             // each file moves, after the check that the sync may act on the folder (`mayAct`), and
-            // then both of its paths sync as they are, in the queues of both
+            // then both of its paths sync as they are, in the queues of both; a move that finds the
+            // sync waiting at either check, the first or the one right before it moves the file, waits
             const moving = moves.map(([a, b]) => this.inQueues([a, b], async () => {
-                if (await this.mayAct()!==undefined) { waits = true; return; }
-                await this.reported(a, mode, () => this.moveLocally(a, b, mode.summary));
+                const waitsFor = await this.mayAct() ?? await this.reported(a, mode, () => this.moveLocally(a, b, mode.summary));
+                if (waitsFor!==undefined) { waits = true; return; }
                 await this.reconcileReported(a, mode);
                 if (this.tracked(b)) { await this.reconcileReported(b, mode); }
             }));
@@ -1004,8 +1005,8 @@ export class ReplicaSync {
     }
 
     /** Reconcile `path`, in its queue already; a failure goes into the summary and the log. */
-    private reconcileReported(path: string, mode: Mode): Promise<void> {
-        return this.reported(path, mode, () => this.reconcile(path, mode));
+    private async reconcileReported(path: string, mode: Mode): Promise<void> {
+        await this.reported(path, mode, () => this.reconcile(path, mode));
     }
 
     /**
@@ -1021,19 +1022,23 @@ export class ReplicaSync {
         if (reason!==undefined) { throw new SyncWaitsError(reason); }
     }
 
-    /** Run `work` on `path`; a failure goes into the summary and the log. */
-    private async reported(path: string, mode: Mode, work: () => Promise<void>): Promise<void> {
+    /**
+     * Run `work` on `path`; a failure goes into the summary and the log. Answers why the work
+     * stopped to wait for the sync (`SyncWaitsError`), undefined when it ran or failed.
+     */
+    private async reported(path: string, mode: Mode, work: () => Promise<void>): Promise<string | undefined> {
         try {
             await work();
         } catch (error) {
             if (error instanceof SyncWaitsError) {
                 // not a failure: the full sync after the wait takes the path in
                 mode.summary.waitingFor ??= error.reason;
-                return;
+                return error.reason;
             }
             mode.summary.failed.push({path, error: errorText(error)});
             this.ui.log(`${path}: sync failed: ${errorText(error)}`);
         }
+        return undefined;
     }
 
     /**
@@ -1305,7 +1310,7 @@ export class ReplicaSync {
                         return;
                     }
                     // the rename, in the queues of both paths, after this reconcile
-                    (mode.queued ??= []).push(this.inQueues([from, path], () => this.reported(path, mode, () => this.renameLocalPair(from, path, renames, mode))));
+                    (mode.queued ??= []).push(this.inQueues([from, path], async () => { await this.reported(path, mode, () => this.renameLocalPair(from, path, renames, mode)); }));
                 }
             } else if (!mode.remoteMove && this.movingOnOverleaf(path)) {
                 // renamed on Overleaf: the move takes the local file, with its local changes

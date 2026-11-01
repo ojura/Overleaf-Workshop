@@ -1037,6 +1037,42 @@ describe('local replica: git as the merge backend', function () {
             await t.sync.stop();
         });
 
+        it('moves the local file when Overleaf renames it and git starts an operation while the move looks up the new path, once the operation ends', async () => {
+            const t = await synced({ '/chapter.tex': chapter });
+            const id = t.remote.idOf('/chapter.tex');
+            // a change saved, which no event has reported yet
+            t.write('/chapter.tex', edited);
+            await t.remote.rename('/chapter.tex', '/intro.tex');
+            t.remote.calls.length = 0;
+            t.update(ALICE);
+            // A merge starts after the move's first check, while the move looks up the new path on
+            // Overleaf: the check right before the move finds it.
+            const mergeHead = path.join(t.folder, '.git', 'MERGE_HEAD');
+            const entry = t.remote.entry;
+            let mergeStarted = false;
+            t.remote.entry = async (p: string) => {
+                if (p === '/intro.tex' && !mergeStarted) {
+                    mergeStarted = true;
+                    fs.writeFileSync(mergeHead, `${t.g('rev-parse', 'HEAD')}\n`);
+                }
+                return entry.call(t.remote, p);
+            };
+            try {
+                await t.sync.remoteRenamed('/chapter.tex', '/intro.tex');
+            } finally {
+                t.remote.entry = entry;
+            }
+            assert.ok(mergeStarted, 'the merge started during the move');
+            assert.deepStrictEqual([t.read('/chapter.tex'), fs.existsSync(path.join(t.folder, 'intro.tex'))], [edited, false], 'the local files while the sync waits');
+            // the merge ends; the full sync after the wait catches up
+            fs.rmSync(mergeHead);
+            await t.sync.syncAll();
+            assert.deepStrictEqual([fs.existsSync(path.join(t.folder, 'chapter.tex')), t.read('/intro.tex')], [false, edited], 'the local files: the moved file keeps the local change');
+            assert.ok(!fs.existsSync(path.join(t.folder, '.overleaf/conflicts')), 'nothing is kept aside');
+            assert.deepStrictEqual([t.remote.ids.get('/intro.tex'), t.remote.docs.get('/intro.tex')], [id, edited], 'the document on Overleaf: the renamed one, with the local change');
+            await t.sync.stop();
+        });
+
         it('moves the files of a folder that Overleaf moved, with a local change in one of them', async () => {
             const two = lines(i => `The second chapter, paragraph ${i}.`);
             const t = await world();
