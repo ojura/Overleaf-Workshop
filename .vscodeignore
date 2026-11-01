@@ -7,7 +7,7 @@ docs/**
 scripts/**
 .gitignore
 .yarnrc
-.mocharc.json
+.mocharc.cjs
 CLAUDE.md
 CLAUDE.local.md
 .local-install/**

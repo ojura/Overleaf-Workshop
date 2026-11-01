@@ -60,7 +60,7 @@ test('the repository\'s .vscodeignore lets the run-time files through and keeps 
     ];
     const left = [
         'src/extension.ts', 'out/test/a.test.js', 'out/extension.js.map', 'node_modules/undici/index.d.ts', 'scripts/hidden-ide.mjs',
-        '.mocharc.json', 'CLAUDE.md', 'docs/wiki.md', 'package-lock.json', 'data/vendor/package.json', 'views/chat-view/src/App.vue',
+        '.mocharc.cjs', 'CLAUDE.md', 'docs/wiki.md', 'package-lock.json', 'data/vendor/package.json', 'views/chat-view/src/App.vue',
         'views/pdf-viewer/src/pdfjs/index.html', 'views/pdf-viewer/vendor/pdfjs-5.1.91-dist.patch', 'views/pdf-viewer/tsconfig.json',
         'views/pdf-viewer/vendor/pdfjs-5.1.91/web/compressed.tracemonkey-pldi-09.pdf', '.local-install/a', 'CLAUDE.local.md',
     ];

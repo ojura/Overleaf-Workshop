@@ -1,3 +1,0 @@
-{
-    "require": ["./scripts/lib/report-unhandled-rejections.cjs"]
-}
