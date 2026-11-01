@@ -222,6 +222,8 @@ const world = {
     activeEditor: undefined as { document: { uri: Uri } } | undefined,
     /** the texts of the compile's status bar item, first to last */
     statusTexts: [] as string[],
+    /** the lines of the window's log of the builds (VirtualFileSystem's log channel) */
+    buildsLog: [] as string[],
     /** the project's file system, for 'remoteFileSystem.prefetch' and the workspace's reads */
     vfs: undefined as any,
     overleaf: undefined as unknown as Overleaf,
@@ -277,6 +279,7 @@ const vscodeStandIn = strict('vscode', {
         },
         onDidChangeWindowState: () => disposable,
         registerCustomEditorProvider: () => disposable,
+        createOutputChannel: (_name: string, _options: { log: true }) => ({ info: (line: string) => world.buildsLog.push(line) }),
     }),
     commands: strict('vscode.commands', {
         registerCommand: (id: string, handler: (...args: any[]) => any) => { world.commands.set(id, handler); return disposable; },
@@ -406,6 +409,7 @@ describe('the build in use, from Overleaf to the window', function () {
         world.settings = {};
         world.activeEditor = undefined;
         world.statusTexts = [];
+        world.buildsLog = [];
         scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'build-in-use-'));
         vfs = new VirtualFileSystem({ globalState: { get: (_key: string, value: unknown) => value } }, projectUri, () => {});
         vfs.root = tree();
@@ -956,6 +960,12 @@ describe('the build in use, from Overleaf to the window', function () {
             await vfs.builds.opened();
             assert.strictEqual(vfs.builds.build.id, 'b-web');
             assert.deepStrictEqual(overleaf.to('/project/p1/compile'), []);
+            // what Overleaf answered and what the window did, in the window's log of the builds
+            assert.deepStrictEqual(world.buildsLog, [
+                'Book: opening: asks Overleaf for its latest compile',
+                `Book: check: Overleaf names build b-web of editor ${WEB_EDITOR}, compiled with main.tex, draft off, not stopping at the first error; the window takes it`,
+                'Book: opening: does not compile: it shows build b-web',
+            ]);
         });
 
         it('compiles when the project changed after Overleaf\'s latest compile (410)', async () => {
@@ -967,6 +977,13 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.deepStrictEqual((await ended).outcome, { result: 'success' });
             assert.strictEqual(vfs.builds.build.id, 'b-new');
             assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
+            assert.deepStrictEqual(world.buildsLog, [
+                'Book: opening: asks Overleaf for its latest compile',
+                'Book: check: Overleaf answers 410: the project changed after its latest compile, or its compiler or TeX Live image is not the compile\'s',
+                'Book: viewer: does not compile: no viewer of the build is visible',
+                'Book: opening: compiles',
+                'Book: compile ended: success',
+            ]);
         });
     });
 

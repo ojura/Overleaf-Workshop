@@ -60,6 +60,8 @@ class Host implements BuildsHost {
     /** what the next compile requests answer; a compile starts when none is given */
     starts: CompileStart[] = [];
     window: CompileSettings = MAIN;
+    /** the lines of the log of the builds (BuildsHost.log) */
+    lines: string[] = [];
     /** the waiters for the next compile request */
     private readonly compileWaiters: Array<() => void> = [];
 
@@ -72,6 +74,7 @@ class Host implements BuildsHost {
         return Promise.resolve(answer);
     }
     settings() { return this.window; }
+    log(line: string) { this.lines.push(line); }
     async compile(): Promise<CompileStart> {
         this.compiles += 1;
         this.compileWaiters.splice(0).forEach(resolve => resolve());
@@ -586,6 +589,34 @@ describe('the build in use (ProjectBuilds)', () => {
             await builds.opened();
             assert.strictEqual(host.compiles, 1);
             assert.deepStrictEqual(builds.status, { state: 'compiling' });
+        });
+
+        it('logs Overleaf\'s answer and what the window did with it, so that each opening can be read later', async () => {
+            const opening = async (answer: LatestAnswer) => {
+                const { host, builds } = setup({ visible: false });
+                host.answers.push(answer);
+                await builds.opened();
+                return host.lines;
+            };
+            const asks = 'opening: asks Overleaf for its latest compile';
+            const noViewer = 'viewer: does not compile: no viewer of the build is visible';
+            assert.deepStrictEqual(await opening({ kind: 'build', build: fromCache('y') }), [
+                asks,
+                'check: Overleaf names build y of editor web-editor, compiled with main.tex, draft off, not stopping at the first error; the window takes it',
+                'opening: does not compile: it shows build y',
+            ]);
+            assert.deepStrictEqual(await opening({ kind: 'none', said: 'Overleaf answers 410: the project changed after its latest compile' }), [
+                asks, 'check: Overleaf answers 410: the project changed after its latest compile', noViewer, 'opening: compiles',
+            ]);
+            assert.deepStrictEqual(await opening({ kind: 'build', build: fromCache('y', { options: { rootResourcePath: 'chapters/one.tex' } }) }), [
+                asks,
+                'check: Overleaf names build y of editor web-editor, compiled with chapters/one.tex, draft off, not stopping at the first error; '
+                    + 'the window does not take it: the window compiles with main.tex, draft off, not stopping at the first error',
+                noViewer, 'opening: compiles',
+            ]);
+            assert.deepStrictEqual(await opening({ kind: 'failed', detail: 'fetch failed: connect ECONNREFUSED 127.0.0.1:443' }), [
+                asks, 'check: failed: fetch failed: connect ECONNREFUSED 127.0.0.1:443', 'opening: compiles',
+            ]);
         });
 
         it('does it once, whoever asks', async () => {
