@@ -798,13 +798,23 @@ export class ReplicaSync {
         }
     }
 
-    /** The synced files that a deletion on each side would remove now: there, and missing on the other side. */
+    /**
+     * The synced files that a deletion on each side would remove now: there, and missing on the
+     * other side. A synced file that the local listing lacks is looked up with stat, as the
+     * reconcile looks it up: the listing does not walk symbolically linked folders, while stat
+     * follows links, so a file in a linked folder is there for both.
+     */
     private async deletable(): Promise<{local: string[], remote: string[]}> {
         const [localFiles, remoteFiles] = await Promise.all([this.local.list(), this.remote.list()]);
+        const paths = Object.keys(this.state.entries).filter(path => this.tracked(path));
+        const foundByStat = new Set<string>();
+        await Promise.all(paths.filter(path => !localFiles.has(path)).map(async path => {
+            const stat = await this.local.stat(path);
+            if (stat!==undefined && stat!=='folder') { foundByStat.add(path); }
+        }));
         const deletable = {local: [] as string[], remote: [] as string[]};
-        for (const path of Object.keys(this.state.entries)) {
-            if (!this.tracked(path)) { continue; }
-            const local = localFiles.has(path), remote = remoteFiles.has(path);
+        for (const path of paths) {
+            const local = localFiles.has(path) || foundByStat.has(path), remote = remoteFiles.has(path);
             if (local && !remote) { deletable.local.push(path); }
             if (remote && !local) { deletable.remote.push(path); }
         }

@@ -206,6 +206,23 @@ describe('local replica: what it deletes and what it never syncs', function () {
             assert.match(String(error), /EACCES/);
         });
 
+        it('count the files in a symbolically linked folder as there, so that deleting another file goes ahead', async function () {
+            if (process.platform === 'win32') { this.skip(); } // a link to a folder needs rights there
+            const t = host();
+            const figs = Array.from({ length: 6 }, (_, i) => `/figs/f${i}.tex`);
+            project(t, { ...Object.fromEntries(figs.map(p => [p, `${p}\n`])), '/main.tex': 'main\n', '/extra.tex': 'extra\n' });
+            // the figures are in another folder that the replica links to
+            const outside = tempDir('ow-safety-linked-');
+            fs.symlinkSync(outside, path.join(t.folder, 'figs'));
+            const { requestReplica } = await start(t);
+            assert.strictEqual(fs.readdirSync(outside).length, 6, 'the first sync writes the figures through the link');
+            await fileAppears(path.join(t.folder, POINTER_FILE));
+            fs.rmSync(path.join(t.folder, 'extra.tex'));
+            const answer: any = await requestReplica(t.folder, { op: 'sync' }, 10000);
+            assert.strictEqual(answer.ok, true, JSON.stringify(answer));
+            assert.deepStrictEqual([...t.w.remote.keys()].sort(), [...figs, '/main.tex'].sort(), 'only extra.tex is deleted on Overleaf');
+        });
+
         it('are refused to a tool when more than the threshold would go at once, naming the count', async () => {
             const t = host();
             project(t, eight);
