@@ -5,6 +5,7 @@ import { PdfDocument } from '../core/pdfViewEditorProvider';
 import { LatexParser, ErrorSchema } from './compileLogParser';
 import { EventBus } from '../utils/eventBus';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
+import { isReplicaOwnPath } from '../scm/ignorePatterns';
 import { CompileRecord, REPLICA_OUTPUT_FOLDER, saveCompileOutputs } from './outputFiles';
 import { windowCompileSettings } from './compileSettings';
 import { NO_OUTPUT_PDF, type CompileOutcome, type CompileStart } from '../core/projectBuilds';
@@ -485,14 +486,17 @@ export class CompileManager {
         return opened;
     }
 
-    /** The path inside the project of `docUri`: a document of the project, or a file of its local replica. */
+    /**
+     * The path inside the project of `docUri`: a document of the project, or a file of its local
+     * replica outside the replica's own folders (its state and its git repository).
+     */
     static async projectPathOf(docUri: vscode.Uri): Promise<string | undefined> {
         if (docUri.scheme===ROOT_NAME) {
             return parseUri(docUri).pathParts.join('/');
         }
         if (docUri.scheme==='file') {
             const path = await LocalReplicaSCMProvider.uriToPath(docUri); // like '/dir/name.tex'
-            if (path!==undefined && path.startsWith('/') && !path.startsWith('/.overleaf/')) {
+            if (path!==undefined && path.startsWith('/') && !isReplicaOwnPath(path)) {
                 return path.slice(1);
             }
         }

@@ -98,9 +98,11 @@ describe('SyncTeX', () => {
         } finally { server.close(); }
     });
 
-    it('finds the project path of a replica file, and of nothing outside the replica or in .overleaf', async () => {
+    it('finds the project path of a replica file, and of nothing outside the replica or in its own folders', async () => {
         assert.strictEqual(await CompileManager.projectPathOf(Uri.file(`${REPLICA}/chapters/intro.tex`)), 'chapters/intro.tex');
         assert.strictEqual(await CompileManager.projectPathOf(Uri.file(`${REPLICA}/.overleaf/output/output.log`)), undefined);
+        // the replica's git repository, where the IDE opens COMMIT_EDITMSG for a commit message
+        assert.strictEqual(await CompileManager.projectPathOf(Uri.file(`${REPLICA}/.git/COMMIT_EDITMSG`)), undefined);
         assert.strictEqual(await CompileManager.projectPathOf(Uri.file('/elsewhere/x.tex')), undefined);
         assert.strictEqual(await CompileManager.projectPathOf(projectUri.with({ path: '/Book/chapters/intro.tex' })), 'chapters/intro.tex');
     });
