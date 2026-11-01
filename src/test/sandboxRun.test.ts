@@ -198,6 +198,16 @@ describe('a sandbox run', () => {
     });
     afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
+    it('says in the status why it could not join the copy or the shared project, with the cause that fetch reports', async () => {
+        // what Node's fetch throws when it cannot reach the server: the reason is in the cause
+        server.join = async () => { throw Object.assign(new TypeError('fetch failed'), { cause: new Error('connect ECONNREFUSED 127.0.0.1:443') }); };
+        const status = await sandboxStatus(server as any, readReplica(replica), USER);
+        if (!status.record) { assert.fail('the sandbox is recorded'); }
+        const text = formatSandboxStatus(status, [], '/r/.overleaf/sandbox-runs.jsonl');
+        assert.match(text, /^could not join the copy: fetch failed: connect ECONNREFUSED 127\.0\.0\.1:443$/m);
+        assert.match(text, /^could not join the shared project: fetch failed: connect ECONNREFUSED 127\.0\.0\.1:443$/m);
+    });
+
     it('writes the status: the copy and the shared project as joined, the safety checks, the lock and the latest runs', async () => {
         const status = await sandboxStatus(server as any, readReplica(replica), USER);
         if (!status.record) { assert.fail('the sandbox is recorded'); }

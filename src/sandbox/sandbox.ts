@@ -277,13 +277,13 @@ export async function sandboxStatus(client: OverleafClient, replica: Replica, us
 export function formatSandboxStatus(status: SandboxStatus, runs: any[], runLog: string): string {
     const lines = [`sandbox: "${status.record.projectName}", ${sandboxUrl(status.record)}, created ${status.record.createdAt}`];
     if (status.copy instanceof Error) {
-        lines.push(`could not join the copy: ${status.copy.message}`);
+        lines.push(`could not join the copy: ${errorMessage(status.copy)}`);
     } else {
         const s = settingsOf(status.copy);
         lines.push(`copy: compiler ${s.compiler}, image ${s.imageName}, main document ${s.rootDoc}, compile timeout ${status.copy.project.features?.compileTimeout} s, compile group ${status.copy.project.features?.compileGroup}`);
     }
     if (status.shared instanceof Error) {
-        lines.push(`could not join the shared project: ${status.shared.message}`);
+        lines.push(`could not join the shared project: ${errorMessage(status.shared)}`);
     } else {
         const s = settingsOf(status.shared);
         lines.push(`shared project: compiler ${s.compiler}, image ${s.imageName}, main document ${s.rootDoc}`);
