@@ -1,10 +1,10 @@
 // Runs a viewer through the harness in headless Chrome, on the 120-page test book, and prints
 // what it measured and checked.
 //   node drive.mjs [--ext <views/pdf-viewer dir>] [--engine overleaf|pdfjs] [--latency 40] [--frame]
-//                  [--port 8765] [--cdp 10333] [--shots DIR] [--json FILE]
+//                  [--port 8765] [--shots DIR] [--json FILE]
 // --ext defaults to the checkout's views/pdf-viewer. --frame runs the page in a same-origin iframe
-// with the sandbox and allow lists of VS Code's webview, as VS Code does. Use another --port (and
-// --cdp) to run two drives at once. Screenshots go to --shots, by default shots/<engine> in the
+// with the sandbox and allow lists of VS Code's webview, as VS Code does. Use another --port to
+// run two drives at once. Screenshots go to --shots, by default shots/<engine> in the
 // work folder (common.mjs); --json writes the measurements and checks to a file.
 // The checks that need the viewer's objects read them from window.overleafViewer in the Overleaf
 // viewer and from window.PDFViewerApplication in the pdfjs viewer.
@@ -39,7 +39,7 @@ const VIEWER = engine === 'overleaf' ? 'window.overleafViewer?.wrapper?.viewer' 
 const V = engine === 'overleaf' ? 'window.overleafViewer.wrapper.viewer' : 'window.PDFViewerApplication.pdfViewer';
 const rendered = (page) => `(() => { const v = ${VIEWER}; return !!v && v.pagesCount > 0 && v.getPageView(${page - 1})?.renderingState === 3; })()`;
 
-const { page, close } = await launchChrome({ profile: path.join(work, `chrome-profile-drive-${engine}-${port}`), port: Number(arg('cdp', String(port + 1568))) });
+const { page, close } = await launchChrome({ dir: work });
 const problems = [];
 page.on('Runtime.consoleAPICalled', (p) => {
     if (p.type === 'error' || p.type === 'warning' || p.type === 'warn') {

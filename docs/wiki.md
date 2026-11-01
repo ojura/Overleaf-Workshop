@@ -348,7 +348,7 @@ The window answers on a local socket that only your account on the computer can 
 The local replica is a git repository (`.git` in its folder, never uploaded), and git merges the changes made on both sides:
 - Overleaf's states are commits on `refs/remotes/overleaf/main`, made about ten seconds after a change: by the person the project's history names for an edit made on Overleaf, and by you (`user.name` and `user.email`) for an upload from the folder. The checked-out branch takes them as a fast-forward, or as a merge when it has commits of its own.
 - A document changed on both sides in the same place has git's conflict markers, and its path is unmerged in git's index. It is not uploaded until you resolve it and stage it (`git add`) or commit it.
-- A file renamed or moved locally is renamed or moved on Overleaf, so the document keeps its comments.
+- A file renamed or moved locally, edited or not, is renamed or moved on Overleaf when git shows the change as a rename, so the document keeps its comments; [Renames and moves](replica-workflows.md#renames-and-moves) gives the rule.
 
 A commit lands on Overleaf, is checked there file for file and is compiled with:
 ```

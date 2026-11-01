@@ -1,32 +1,21 @@
 // What the IDE scripts share. They drive only the window of an Antigravity instance that
-// scripts/hidden-ide.sh started on a virtual display, through the window's debugging port: the
-// instance that instance.json describes in $HIDDEN_IDE_HOME (default /tmp/hidden-ide-<uid>), or in
-// the folder that --instance names.
-import { execFileSync } from 'node:child_process';
+// scripts/hidden-ide.sh started on a virtual display: the instance that instance.json describes in
+// the folder that --instance names, or else in $HIDDEN_IDE_HOME (there is no default). They
+// connect to the DevTools endpoint that start recorded, and only after the instance's IDE has
+// answered there as itself (scripts/lib/test-instance.mjs); the workbench page and the viewers'
+// frames are sessions of that one connection.
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { connectWindow, evaluate, instanceHome, readInstance, workbenchTarget } from '../../lib/test-instance.mjs';
 import { arg } from '../common.mjs';
+
+export { evaluate };
 
 export const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/**
- * The instance: its main process, debugging port, display, profile and replica folder. The main
- * process must hold the debugging port, so a script cannot reach a window that took the port of an
- * instance that has stopped.
- */
+/** The instance: its record in instance.json (pid, devtools, display, profile, replica, ...) and its folder, home. */
 export function instance() {
-    const home = path.resolve(arg('instance') ?? process.env.HIDDEN_IDE_HOME ?? `/tmp/hidden-ide-${os.userInfo().uid}`);
-    const file = path.join(home, 'instance.json');
-    if (!fs.existsSync(file)) {
-        throw new Error(`${file} does not exist: start an instance with scripts/hidden-ide.sh start, or name its folder with --instance or HIDDEN_IDE_HOME`);
-    }
-    const info = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const listener = execFileSync('ss', ['-ltnpH', `sport = :${info.cdp}`], { encoding: 'utf8' });
-    if (!listener.includes(`pid=${info.pid},`)) {
-        throw new Error(`port ${info.cdp} does not belong to the instance's process ${info.pid}: ${listener.trim() || 'the port is closed'}`);
-    }
-    return { home, pid: Number(info.pid), port: Number(info.cdp), display: info.display, profile: info.profile, replica: info.replica };
+    return readInstance(instanceHome(arg('instance')));
 }
 
 /**
@@ -48,44 +37,6 @@ export function settings(inst) {
     };
 }
 
-/** The debugging targets of the instance on `port`, as /json/list lists them. */
-export async function targets(port) {
-    return (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
-}
-
-/** A DevTools Protocol connection to one target: send(method, params), on(event, fn), close(). */
-export async function connect(wsUrl) {
-    const ws = new WebSocket(wsUrl);
-    await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
-    let next = 1;
-    const pending = new Map();
-    const listeners = new Map();
-    ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        if (msg.id && pending.has(msg.id)) {
-            const { resolve, reject } = pending.get(msg.id);
-            pending.delete(msg.id);
-            msg.error ? reject(new Error(msg.error.message)) : resolve(msg.result);
-        } else if (msg.method) {
-            for (const fn of listeners.get(msg.method) ?? []) { fn(msg.params); }
-        }
-    };
-    const send = (method, params = {}) => new Promise((resolve, reject) => {
-        const id = next++;
-        pending.set(id, { resolve, reject });
-        ws.send(JSON.stringify({ id, method, params }));
-    });
-    const on = (method, fn) => listeners.set(method, [...(listeners.get(method) ?? []), fn]);
-    return { send, on, close: () => ws.close() };
-}
-
-/** Evaluate an expression in a session, in the context `contextId` or the default one, and return its value. */
-export async function evaluate(session, expression, contextId) {
-    const r = await session.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true, ...(contextId ? { contextId } : {}) });
-    if (r.exceptionDetails) { throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text); }
-    return r.result.value;
-}
-
 /** Press and release a key; modifiers add up from 1 Alt, 2 Ctrl, 4 Meta and 8 Shift. */
 export async function key(session, keyChar, code, vk, modifiers = 0) {
     for (const type of ['rawKeyDown', 'keyUp']) {
@@ -100,13 +51,21 @@ export async function click(session, x, y) {
     }
 }
 
-/** The instance's workbench page, connected, with the Runtime domain enabled; E(expression) evaluates in it. */
-export async function workbench(port) {
-    const target = (await targets(port)).find(t => t.type === 'page' && t.url.includes('/workbench/workbench.html'));
-    if (!target) { throw new Error(`the instance on port ${port} does not show a workbench window`); }
-    const session = await connect(target.webSocketDebuggerUrl);
-    await session.send('Runtime.enable');
-    return { session, E: (expression) => evaluate(session, expression), close: () => session.close() };
+/**
+ * The instance's workbench window: `browser`, the checked connection to the instance's IDE,
+ * `session` on the workbench page with the Runtime domain enabled, and E(expression), which
+ * evaluates in that page. close() closes the connection, and with it every session of the script.
+ */
+export async function workbench(inst) {
+    const browser = await connectWindow(inst);
+    try {
+        const session = await browser.attach((await workbenchTarget(browser)).targetId);
+        await session.send('Runtime.enable');
+        return { browser, session, E: (expression) => evaluate(session, expression), close: () => browser.close() };
+    } catch (error) {
+        browser.close();
+        throw error;
+    }
 }
 
 /** Run a command of the Command Palette by its title; returns whether the palette found it. */
@@ -151,9 +110,9 @@ export async function associatePdfs(config) {
  * opens, or undefined. Quick Open opens an absolute path outside the workspace too. A tab of the
  * file that is open already is closed first, so that the file opens in a new viewer webview.
  */
-export async function openWithQuickOpen(wb, port, file, timeoutMs = 15000) {
+export async function openWithQuickOpen(wb, file, timeoutMs = 15000) {
     await closeTab(wb, path.basename(file));
-    const before = new Set((await viewerFrames(port)).map(t => t.id));
+    const before = new Set((await viewerFrames(wb)).map(t => t.targetId));
     await focusWorkbench(wb);
     await key(wb.session, 'p', 'KeyP', 80, 2);
     await sleep(500);
@@ -167,31 +126,32 @@ export async function openWithQuickOpen(wb, port, file, timeoutMs = 15000) {
     await key(wb.session, 'Enter', 'Enter', 13);
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
-        const frame = (await viewerFrames(port)).find(t => !before.has(t.id));
+        const frame = (await viewerFrames(wb)).find(t => !before.has(t.targetId));
         if (frame) { return frame; }
         await sleep(50);
     }
     return undefined;
 }
 
-/** The webviews of the extension's PDF viewers, newest last. */
-export async function viewerFrames(port) {
-    return (await targets(port)).filter(t => t.type === 'iframe' && t.url.includes('extensionId=iamhyc.overleaf-workshop'));
+/** The targets of the webviews of the extension's PDF viewers in the workbench `wb`, newest last. */
+export async function viewerFrames(wb) {
+    const { targetInfos } = await wb.browser.send('Target.getTargets');
+    return targetInfos.filter(t => t.type === 'iframe' && t.url.includes('extensionId=iamhyc.overleaf-workshop'));
 }
 
 /** The viewer object of a page, by the viewer it runs: an expression for the page. */
 export const viewerOf = (engine) => engine === 'overleaf' ? 'window.overleafViewer.wrapper.viewer' : 'window.PDFViewerApplication.pdfViewer';
 
 /**
- * Connect to a viewer's webview. VS Code runs the viewer page in the webview's inner frame named
+ * Attach to a viewer's webview, a target of viewerFrames(wb). VS Code runs the viewer page in the webview's inner frame named
  * active-frame, and a new frame replaces it when the page reloads, as after a switch of viewer.
  * E(expression) evaluates in the page that the webview shows now; engine() says which viewer that
  * is (pdfjs or overleaf), or undefined while it shows neither. The page's console errors, warnings
  * and exceptions collect in `problems`. `beforeLoad` is a script that runs in every page the
  * webview loads from now on, before the page's own scripts.
  */
-export async function viewerPage(frameTarget, { beforeLoad } = {}) {
-    const session = await connect(frameTarget.webSocketDebuggerUrl);
+export async function viewerPage(wb, frameTarget, { beforeLoad } = {}) {
+    const session = await wb.browser.attach(frameTarget.targetId);
     const contexts = [];
     const problems = [];
     session.on('Runtime.executionContextCreated', (p) => contexts.push(p.context));
@@ -228,7 +188,7 @@ export async function viewerPage(frameTarget, { beforeLoad } = {}) {
         }
         return undefined;
     };
-    return { session, problems, context, E, engine, drawn, close: () => session.close() };
+    return { session, problems, context, E, engine, drawn, close: () => session.detach() };
 }
 
 /** Close the editor tab whose label starts with `label`; returns whether such a tab was open. */
@@ -243,14 +203,14 @@ export async function closeTab(wb, label) {
  * Editor, and return the new viewer webview's target; undefined when the tab was not open, or
  * when it did not open again within `timeoutMs`.
  */
-export async function reopenTab(wb, port, label, timeoutMs = 10000) {
-    const before = new Set((await viewerFrames(port)).map(t => t.id));
+export async function reopenTab(wb, label, timeoutMs = 10000) {
+    const before = new Set((await viewerFrames(wb)).map(t => t.targetId));
     if (!(await closeTab(wb, label))) { return undefined; }
     await focusWorkbench(wb);
     await key(wb.session, 'T', 'KeyT', 84, 2 | 8);
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
-        const frame = (await viewerFrames(port)).find(t => !before.has(t.id));
+        const frame = (await viewerFrames(wb)).find(t => !before.has(t.targetId));
         if (frame) { return frame; }
         await sleep(30);
     }

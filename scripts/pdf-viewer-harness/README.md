@@ -79,11 +79,14 @@ node scripts/pdf-viewer-harness/probes/theme-colors.mjs --engine overleaf
 ```
 
 Every script takes `--ext DIR` for another `views/pdf-viewer` folder, such as another checkout's,
-and `--port N` for the server; Chrome's debugging port follows from it. Scripts on different ports
-can run at the same time. The usage of each script is in its first comment.
+and `--port N` for the server. Scripts on different ports can run at the same time. The usage of
+each script is in its first comment.
 
 Each script starts its own server and Chrome, with a new Chrome profile and an empty piece cache,
-and stops both when it ends, also after Ctrl+C or a timeout. Generated files go to the work
+and stops both when it ends, also after Ctrl+C or a timeout. Chrome picks a free DevTools port
+itself and writes it into its profile, and the script connects through what Chrome wrote there
+(`scripts/lib/devtools.mjs`), so it drives only the Chrome it started. Chrome's own messages go to
+the script's stderr, after `chrome: `. Generated files go to the work
 folder, `$PDF_VIEWER_HARNESS_WORK` or by default `pdf-viewer-harness` in the system's temporary
 folder:
 
@@ -112,10 +115,11 @@ repository.
 
 The scripts in `ide/` drive the viewers in Antigravity itself, in the window of an instance that
 `scripts/hidden-ide.sh` started on a virtual display, and only there. They read the instance's
-`instance.json` in `$HIDDEN_IDE_HOME` (default `/tmp/hidden-ide-<uid>`), or in the folder that
-`--instance` names, and check that the instance's main process holds its debugging port before
-they connect. The settings they change are the instance's own (`profile/User/settings.json`), and
-they restore them when they end.
+`instance.json` in the folder that `--instance` names, or else in `$HIDDEN_IDE_HOME` (there is no
+default), connect to the DevTools endpoint that the instance's start recorded there, and
+go on only when the instance's IDE answers as itself (`scripts/lib/test-instance.mjs`). The
+settings they change are the instance's own (`profile/User/settings.json`), and they restore them
+when they end.
 
 An instance opens either a folder of PDFs, without a login (`--folder`), or the local replica of an
 Overleaf project meant for tests (`--project`), whose `output.pdf` the viewer loads in ranges:

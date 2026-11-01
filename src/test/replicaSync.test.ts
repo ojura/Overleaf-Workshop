@@ -9,6 +9,7 @@ const dec = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 
 /** Overleaf, in memory: docs hold text, files hold bytes and report their hash. */
 class FakeRemote implements ReplicaRemote {
+    connected() { return true; }
     docs = new Map<string, string>();
     files = new Map<string, Uint8Array>();
     folders = new Set<string>();
@@ -81,6 +82,7 @@ class FakeRemote implements ReplicaRemote {
 
 /** The local folder, in memory, with a clock for modification times. */
 class FakeLocal implements ReplicaLocal {
+    async verify() {}
     files = new Map<string, {content: Uint8Array, mtime: number}>();
     clock = 1_000_000;
     reads: string[] = [];
@@ -132,12 +134,16 @@ class FakeStore implements ReplicaStore {
 class FakeUI implements ReplicaUI {
     logs: string[] = [];
     confirm = true;
+    /** while set, the answer to a question, e.g. one that never comes */
+    answer?: Promise<boolean>;
+    /** told when a question is asked */
+    onAsk?: () => void;
     asked: string[][] = [];
     blocked: string[] = [];
     live: SyncSummary[] = [];
     log(message: string) { this.logs.push(message); }
     progress() {}
-    async confirmDeletions(_where: 'local' | 'remote', paths: string[]) { this.asked.push(paths); return this.confirm; }
+    async confirmDeletions(_where: 'local' | 'remote', paths: string[]) { this.asked.push(paths); this.onAsk?.(); return this.answer ?? this.confirm; }
     conflictBlocked(path: string) { this.blocked.push(path); }
     liveResult(summary: SyncSummary) { this.live.push(summary); }
 }
@@ -333,6 +339,63 @@ describe('ReplicaSync', () => {
         assert.strictEqual(t.ui.asked.length, 1);
         assert.strictEqual(summary.skippedDeletions.length, 7);
         assert.strictEqual(t.remote.files.size, 7);
+    });
+
+    it('counts deletions that events report one at a time together, and asks once before making many', async () => {
+        const saved = ReplicaSync.localDeleteDelayMs;
+        ReplicaSync.localDeleteDelayMs = 0;
+        try {
+            const t = setup();
+            for (let i = 0; i < 8; i++) { t.remote.files.set(`/f${i}.png`, new Uint8Array([i])); }
+            const sync = t.start();
+            await sync.syncAll();
+            // six files deleted at once, as by a git checkout, and reported one by one
+            for (let i = 0; i < 6; i++) { t.local.files.delete(`/f${i}.png`); }
+            t.ui.confirm = false;
+            await sync.localChanged('/f0.png');
+            assert.strictEqual(t.ui.asked.length, 1);
+            assert.deepStrictEqual([...t.ui.asked[0]].sort(), ['/f0.png', '/f1.png', '/f2.png', '/f3.png', '/f4.png', '/f5.png']);
+            assert.strictEqual(t.remote.files.size, 8, 'every file stays on Overleaf');
+            await sync.localChanged('/f1.png');
+            assert.strictEqual(t.ui.asked.length, 1, 'the user is not asked again about deletions they declined');
+            assert.strictEqual(t.remote.files.size, 8);
+        } finally {
+            ReplicaSync.localDeleteDelayMs = saved;
+        }
+    });
+
+    it('finishes the steps without deletions while a question about others waits for an answer', async () => {
+        const t = setup();
+        for (let i = 0; i < 6; i++) { t.remote.files.set(`/fig/f${i}.png`, new Uint8Array([i])); }
+        t.remote.docs.set('/main.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        // a collaborator deletes the six figures; the question about them is never answered
+        for (let i = 0; i < 6; i++) { t.remote.files.delete(`/fig/f${i}.png`); }
+        t.ui.answer = new Promise(() => { /* the user is away */ });
+        const asked = new Promise<void>(resolve => { t.ui.onAsk = resolve; });
+        void sync.remoteChanged('/fig', true);
+        await asked;
+        // a local edit meanwhile is uploaded and reported
+        t.local.set('/main.tex', text + 'line 6\n');
+        await sync.localChanged('/main.tex');
+        assert.strictEqual(t.remote.docs.get('/main.tex'), text + 'line 6\n');
+        assert.deepStrictEqual(t.ui.live.at(-1)!.uploaded, ['/main.tex']);
+        assert.strictEqual(t.ui.asked.length, 1);
+    });
+
+    it('asks before deleting the many local files of a folder deleted on Overleaf', async () => {
+        const t = setup();
+        for (let i = 0; i < 7; i++) { t.remote.files.set(`/fig/f${i}.png`, new Uint8Array([i])); }
+        t.remote.docs.set('/main.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        for (let i = 0; i < 7; i++) { t.remote.files.delete(`/fig/f${i}.png`); }
+        t.ui.confirm = false;
+        await sync.remoteChanged('/fig', true);
+        assert.strictEqual(t.ui.asked.length, 1);
+        assert.strictEqual(t.ui.asked[0].length, 7);
+        assert.strictEqual(t.local.files.size, 8, 'the local files stay');
     });
 
     it('deletes locally what was deleted on Overleaf, keeping local changes aside', async () => {

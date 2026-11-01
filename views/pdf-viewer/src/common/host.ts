@@ -8,6 +8,9 @@
  *   { type: 'syncPdf', content: { page, h, v, identifier } }   SyncTeX from the PDF to the source;
  *                                        page counts from 1, h and v are PDF points from the top left
  *   { type: 'recompile' }                compile the project again
+ *   { type: 'buildGone', build }         the files of build `build` are gone from Overleaf's servers
+ *                                        and its cache: the host asks Overleaf for the latest
+ *                                        compile, and compiles when there is none to show
  *   { type: 'download' }                 save the PDF to a file the user picks
  *   { type: 'switchViewer', engine }     show the PDFs in the viewer `engine` ('pdfjs' or
  *                                        'overleaf'): the host sets overleaf-workshop.pdfViewer.engine,
@@ -18,6 +21,8 @@
  *   { type: 'initState', content?, colorThemes?, defaults? }
  *   { type: 'load', output }             a build, to load in ranges (output.ts)
  *   { type: 'update', content }          a PDF read whole, as an ArrayBuffer
+ *   { type: 'buildState', state, detail? }   what happens to the project's build
+ *                                        (src/core/projectBuilds.ts, BuildStatus; banner.ts)
  *   { type: 'syncCode', content }        SyncTeX from the source to the PDF (synctex.ts)
  *   { type: 'fetchResponse' | 'fetchError', ... }   answers to the loader's requests
  */

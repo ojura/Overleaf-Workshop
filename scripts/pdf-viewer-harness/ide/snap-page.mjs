@@ -7,18 +7,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { arg, work } from '../common.mjs';
-import { instance, viewerFrames, viewerOf, viewerPage } from './ide.mjs';
+import { instance, viewerFrames, viewerOf, viewerPage, workbench } from './ide.mjs';
 
 const page = Number(arg('page'));
 if (!page) { console.error('usage: node ide/snap-page.mjs --page N [--out PREFIX]'); process.exit(2); }
 const prefix = path.resolve(arg('out', path.join(work, 'shots', `page-${page}`)));
 fs.mkdirSync(path.dirname(prefix), { recursive: true });
 const inst = instance();
-const frame = (await viewerFrames(inst.port)).at(-1);
-if (!frame) { console.error('the instance does not show a PDF viewer'); process.exit(1); }
-const view = await viewerPage(frame);
+const wb = await workbench(inst);
+const frame = (await viewerFrames(wb)).at(-1);
+if (!frame) { console.error('the instance does not show a PDF viewer'); wb.close(); process.exit(1); }
+const view = await viewerPage(wb, frame);
 const shown = await view.drawn(undefined, 30000);
-if (!shown) { console.error('the webview does not show a drawn viewer page'); view.close(); process.exit(1); }
+if (!shown) { console.error('the webview does not show a drawn viewer page'); wb.close(); process.exit(1); }
 const V = viewerOf(shown.engine);
 const button = shown.engine === 'overleaf' ? `document.getElementById('themeToggle')` : `document.getElementById('themeButton')`;
 const shots = await view.E(`(async () => {
@@ -39,4 +40,4 @@ for (const [theme, s] of Object.entries(shots)) {
     fs.writeFileSync(file, Buffer.from(s.url.split(',')[1], 'base64'));
     console.log(file, JSON.stringify({ ...s, url: undefined }));
 }
-view.close();
+wb.close();

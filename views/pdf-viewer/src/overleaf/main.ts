@@ -2,7 +2,7 @@
 import '../common/transport';
 import PDFJSWrapper from '@/features/pdf-preview/util/pdf-js-wrapper';
 import { onMessage, post, ready, savedState, saveState, type Position } from '../common/host';
-import { clearError, errorKind, showError } from '../common/banner';
+import { documentShown, showBuildState, showLoadError } from '../common/banner';
 import { goToCode, listenForDoubleClick, showHighlights, type SyncBox } from '../common/synctex';
 import { applyTheme, themesFrom, type Theme } from '../common/theme';
 import { Documents } from './documents';
@@ -39,8 +39,6 @@ let restorePending = false;
  */
 let pendingHighlights: { boxes: SyncBox[], at: number } | undefined;
 const PENDING_HIGHLIGHTS_MS = 30_000;
-
-const errorText = (error: any) => String(error?.message ?? error);
 
 function currentPosition(): Position | undefined {
     if (!initialised || !wrapper.isVisible()) { return undefined; }
@@ -138,19 +136,19 @@ const documents = new Documents(wrapper, {
         // the position to restore in the new build: where the reader is now
         storePosition();
     },
-    loaded(doc) {
-        clearError();
+    loaded(doc, build) {
+        documentShown(build);
         toolbar.setPagesCount(doc.numPages);
         void outline.render(doc);
     },
-    failed(error, aborted) {
+    failed(error, aborted, build) {
         if (aborted) { return; }
         console.error('pdf viewer:', error);
-        showError(errorKind(error), errorText(error));
+        showLoadError(error, build);
     },
-    fetchFailed(error) {
+    fetchFailed(error, build) {
         // as pdf-js-viewer.tsx:181-189: a missing output means the build is gone from Overleaf
-        showError(errorKind(error), errorText(error));
+        showLoadError(error, build);
     },
 });
 
@@ -219,6 +217,7 @@ toolbar.setOutlineOpen(outline.open);
 // the host sends these after 'initState'; host.ts keeps them until a handler is set
 onMessage('load', (message) => documents.load(message.output));
 onMessage('update', (message) => documents.loadData(message.content));
+onMessage('buildState', (message) => showBuildState(message));
 onMessage('syncCode', (message) => {
     if (initialised && !documents.loading) {
         showHighlights(wrapper.viewer, message.content);

@@ -11,14 +11,14 @@ const inst = instance();
 const config = settings(inst);
 const original = config.get(SETTING);
 const { check, summary } = checker();
-const wb = await workbench(inst.port);
+const wb = await workbench(inst);
 let view;
 try {
     const draws = await windowDraws(wb);
     console.log(`the window ${draws ? 'draws' : 'does not draw: the viewer pages get a 16 ms timer for requestAnimationFrame'}`);
-    const frame = (await viewerFrames(inst.port)).at(-1);
+    const frame = (await viewerFrames(wb)).at(-1);
     if (!frame) { throw new Error('the instance does not show a PDF viewer: open output.pdf first'); }
-    view = await viewerPage(frame, { beforeLoad: draws ? undefined : rafOnTimer });
+    view = await viewerPage(wb, frame, { beforeLoad: draws ? undefined : rafOnTimer });
     const start = await view.drawn(undefined, 30000);
     if (!start) { throw new Error('the webview does not show a drawn viewer page'); }
     console.log(`output.pdf is in the ${start.engine} viewer; the setting is ${original ?? '(not set)'}`);

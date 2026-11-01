@@ -1,74 +1,84 @@
-// A small Chrome DevTools Protocol client for the harness: starts headless Chrome on a profile of
-// its own in the work folder, opens one page and evaluates expressions in it. The browser is
-// google-chrome, or the one the environment variable CHROME names.
+// Headless Chrome for the harness: starts it on a profile of its own in the work folder, opens one
+// page and evaluates expressions in it. The browser is google-chrome, or the one the environment
+// variable CHROME names. Chrome picks its DevTools port itself, and the harness connects through
+// the endpoint that Chrome wrote into the profile (scripts/lib/devtools.mjs), so it drives only the
+// Chrome it started.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
+import { connect, waitForActivePort } from '../lib/devtools.mjs';
+
+/** The last resort for a Chrome that runs but never opens DevTools; it opens them within a second or two. */
+const DEVTOOLS_LIMIT_MS = 30000;
+
+/** Write each line that `stream` gives to this process's stderr, after `prefix`; empty lines are left out. */
+function forwardLines(stream, prefix) {
+    let rest = '';
+    stream.setEncoding('utf8');
+    stream.on('data', (chunk) => {
+        const lines = (rest + chunk).split('\n');
+        rest = lines.pop();
+        for (const line of lines.filter(Boolean)) { process.stderr.write(`${prefix}${line}\n`); }
+    });
+    stream.on('end', () => { if (rest) { process.stderr.write(`${prefix}${rest}\n`); } });
+}
 
 /**
- * Start headless Chrome on a fresh profile and connect to its page. close() stops Chrome and
- * deletes the profile; when this process exits before that, it kills Chrome and deletes the
- * profile on the way out.
+ * Start headless Chrome on a new profile in the folder `dir` and connect to its page. close()
+ * stops Chrome and deletes the profile; when this process exits before that, it kills Chrome and
+ * deletes the profile on the way out. Chrome's own messages go to this process's stderr, each line
+ * after "chrome: ".
  */
-export async function launchChrome({ port = 9333, profile, width = 1200, height = 900 }) {
-    fs.rmSync(profile, { recursive: true, force: true });
+export async function launchChrome({ dir, width = 1200, height = 900 }) {
+    const profile = fs.mkdtempSync(path.join(dir, 'chrome-profile-'));
     const chrome = spawn(process.env.CHROME || 'google-chrome', [
-        '--headless=new', `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`,
+        '--headless=new', `--user-data-dir=${profile}`, '--remote-debugging-port=0',
         '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-background-networking',
         `--window-size=${width},${height}`, 'about:blank',
     ], { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
+    forwardLines(chrome.stderr, 'chrome: ');
+    /** settles when Chrome's process has ended, with how it ended */
+    const ended = new Promise((resolve, reject) => {
+        chrome.once('exit', (code, signal) => resolve(signal ?? `exit code ${code}`));
+        chrome.once('error', reject);
+    });
     // Chrome leads its own process group, with its renderer and GPU processes in it
     const stop = (signal = 'SIGTERM') => { try { process.kill(-chrome.pid, signal); } catch { chrome.kill(signal); } };
+    const removeProfile = () => fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     const onExit = () => {
         stop('SIGKILL');
-        try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); } catch { /* the next start deletes it */ }
+        try { removeProfile(); } catch { /* the work folder can be deleted at any time */ }
     };
     process.once('exit', onExit);
-    let target;
-    for (let i = 0; i < 100 && !target; i++) {
-        await new Promise(r => setTimeout(r, 100));
-        try {
-            const list = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
-            target = list.find(t => t.type === 'page');
-        } catch { /* not up yet */ }
-    }
-    if (!target) { stop(); throw new Error(`headless Chrome did not start (port ${port})`); }
-    const page = await connect(target.webSocketDebuggerUrl);
-    const close = () => new Promise((resolve) => {
-        const removeProfile = () => {
-            fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-            resolve();
-        };
-        page.close();
+    let browser;
+    let page;
+    try {
+        browser = await connect(await waitForActivePort(profile, { ended, limitMs: DEVTOOLS_LIMIT_MS }));
+        const { targetInfos } = await browser.send('Target.getTargets');
+        const target = targetInfos.find(t => t.type === 'page');
+        if (!target) { throw new Error(`headless Chrome (pid ${chrome.pid}) has no page`); }
+        page = pageOf(await browser.attach(target.targetId));
+    } catch (error) {
+        browser?.close();
         process.removeListener('exit', onExit);
-        if (chrome.exitCode !== null || chrome.signalCode !== null) { removeProfile(); return; }
-        chrome.once('exit', removeProfile);
+        stop('SIGKILL');
+        await ended.catch(() => {});
+        removeProfile();
+        throw error;
+    }
+    const close = async () => {
+        process.removeListener('exit', onExit);
+        browser.close();
         stop();
-    });
+        await ended.catch(() => {});
+        removeProfile();
+    };
     return { chrome, page, close };
 }
 
-async function connect(url) {
-    const ws = new WebSocket(url);
-    await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
-    let next = 1;
-    const pending = new Map();
-    const listeners = new Map();
-    ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        if (msg.id && pending.has(msg.id)) {
-            const { resolve, reject } = pending.get(msg.id);
-            pending.delete(msg.id);
-            msg.error ? reject(new Error(msg.error.message)) : resolve(msg.result);
-        } else if (msg.method) {
-            for (const fn of listeners.get(msg.method) ?? []) { fn(msg.params); }
-        }
-    };
-    const send = (method, params = {}) => new Promise((resolve, reject) => {
-        const id = next++;
-        pending.set(id, { resolve, reject });
-        ws.send(JSON.stringify({ id, method, params }));
-    });
-    const on = (method, fn) => listeners.set(method, [...(listeners.get(method) ?? []), fn]);
+/** The harness's helpers on a session with a page. */
+function pageOf(session) {
+    const { send, on } = session;
     let contextId; // set by useFrame: evaluate in a child frame's page
     const evaluate = async (expression) => {
         const r = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, ...(contextId ? { contextId } : {}) });
@@ -104,5 +114,5 @@ async function connect(url) {
             await new Promise(r => setTimeout(r, 50));
         }
     };
-    return { send, on, evaluate, waitFor, screenshot, useFrame, close: () => ws.close() };
+    return { send, on, evaluate, waitFor, screenshot, useFrame, close: () => session.detach() };
 }

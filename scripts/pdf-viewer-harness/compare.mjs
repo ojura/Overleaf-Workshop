@@ -29,7 +29,7 @@ for (const engine of engines) {
         const json = path.join(outDir, `${name}.json`);
         fs.rmSync(json, { force: true });
         const args = [path.join(here, 'drive.mjs'), '--ext', path.resolve(exts[engine]), '--engine', engine, '--latency', String(run.latency),
-            '--port', String(port), '--cdp', String(port + 1568), '--json', json, '--shots', path.join(outDir, `shots-${name}`)];
+            '--port', String(port), '--json', json, '--shots', path.join(outDir, `shots-${name}`)];
         if (run.framed) { args.push('--frame'); }
         console.log(`running ${name} ...`);
         const result = spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 600000 });

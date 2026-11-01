@@ -75,6 +75,53 @@ it. A file written by another program, an editor's atomic save or a git checkout
 replica's folder watcher (src/scm/localFolderWatcher.ts), which on Linux watches every folder on
 its own; Node's recursive watching there stops reporting a file once it was replaced.
 
+## Renames and moves
+
+A file gone from the folder and a new file in it are one file renamed or moved when git's rename
+detection pairs them, as `git log`, `git show` and `git log --follow` show the history: `git diff
+-M`, at git's default similarity of 50%. The sync asks git itself (`TREE_DIFF_ARGS` in
+src/gitbridge/plumbing.ts, and `GitReplicaStore.renames`): it writes a tree of the removed files'
+bases and a tree of the new files' content, stored byte for byte as every base is, and takes the
+pairs that `git diff-tree -M` makes of the two. git pairs a removed path only with a new one, so
+a file changed in place stays a change of its path, and two files that swap their content are
+two edits. A removed path takes part while Overleaf still has it, and a new path while Overleaf
+does not have it yet. These are the removals and additions that the commit of the uploads
+records, so git shows the same renames there; a document that the sync merges with an edit made
+on Overleaf meanwhile holds that edit too in the commit.
+
+Each pair is renamed or moved on Overleaf, so the file keeps its id there, and a document its
+comments, tracked changes and history. A change of the content then syncs as for any file. A
+document's change is an edit of it, which leaves the comments on the text it does not touch
+where they are, and is merged with edits made on Overleaf meanwhile. A binary file's new content
+is uploaded over it: Overleaf keeps the rename in its history, and records the upload as a
+removal of the renamed file and an addition of a new one, with a new id, at the new path
+(Overleaf's source at e039ad26; a binary file has no comments or tracked changes). A folder moved
+with its files is the moves of its files, edited or not, and the folder that held them is
+removed on Overleaf once it is empty, as after a deletion of its last file. A new file that git
+does not pair is uploaded as a new document, and a removed one is deleted on Overleaf, with its
+comments, tracked changes and history there.
+
+The order in which events report the two paths does not matter: the sync leaves the old path on
+Overleaf while git pairs it with a file in the folder, and the event of the new path renames it.
+A deletion that an event reports waits a second first, for a program that deletes a file before
+it writes the new one, as a git checkout does; a scan that finds a new file written in the last
+two seconds, which may be half written, leaves the deletions for the next scan.
+
+Renames happen in the push mode `native`, which replica-land uses without `--push bridge`. In the
+push mode `bridge` the sync does not upload; a push through the bridge deletes a renamed document
+and creates a new one, losing its comments and tracked changes (measured 2026-10-31, see
+src/sandbox/ranges.ts), and push-check, which pairs the push's paths by the same rule, refuses
+such a push for a document with comments or tracked changes.
+
+A rename or a move made on Overleaf is one change in the project's events (the editor's rename
+and move), which the extension reports with the old and the new path. The sync moves the local
+file and its saved base to the new path, so local changes that are not uploaded yet, or that
+wait for a push, stay in the file and then sync as for any file; the commit of Overleaf's state
+shows the rename, and an edit made on Overleaf with it. A folder moved on Overleaf moves the
+local files that the sync has synced; files that it leaves out stay in the old folder. Where a
+file cannot move, because it was never synced, its local file is gone, or the folder already
+has a file at the new path, its two paths sync as a deletion and a new file.
+
 ## Landing a commit
 
 ```
@@ -88,9 +135,9 @@ A commit that descends from the checked-out one lands in these steps:
 2. Overleaf must hold that commit file for file: documents by their text as the editor reads
    them, binary files by the hash Overleaf reports;
 3. the window pushes the commit (the control socket's land request): it fast-forwards the
-   branch, uploads what the commit changed and waits for Overleaf's acknowledgements. A file
-   renamed or moved in the commit is renamed or moved on Overleaf, so the document keeps its
-   comments and its history there (the document keeps its id);
+   branch, uploads what the commit changed and waits for Overleaf's acknowledgements. The
+   renames and moves that git shows in the commit, edited or not, are renamed or moved on
+   Overleaf, and the documents keep their ids, comments and history (see "Renames and moves");
 4. Overleaf must hold the commit, checked as in step 2, for up to three minutes;
 5. one compile of the project, repeated while Overleaf answers that another compile runs; its
    logs are checked for error lines, a missing PDF, latexmk's error summary, a failed automatic

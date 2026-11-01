@@ -15,9 +15,9 @@ window) are in CLAUDE.local.md, which git leaves out.
   while no tool runs.
 - Build, test and lint:
   - `node node_modules/typescript/bin/tsc -p ./`
-  - `node node_modules/.bin/mocha "out/test/**/*.test.js"`. Most test files load the extension's
-    modules through their own copy of a 'vscode' stand-in, and those copies only work when the
-    tests are compiled into a folder named out.
+  - `node node_modules/.bin/mocha "out/test/**/*.test.js"`. The test files load the extension's
+    modules against a stand-in for 'vscode' through one loader, src/test/standIn.ts, which leaves
+    require.cache as it found it, so the tests run from any compiled folder and in any order.
   - `npx eslint src --ext ts`
 - A new test fails on the code before the fix and passes with it; report both runs. Tests wait for
   the events or awaited calls they need, not for sleeps or polling with a time limit, and close
@@ -44,4 +44,12 @@ window) are in CLAUDE.local.md, which git leaves out.
 - Experiments never write into a shared project or into a live local replica. Use a private copy
   of the project (`node out/sandbox/cli.js init`) and a test instance of the IDE
   (scripts/hidden-ide.sh).
-- Never turn on shell tracing (`set -x`) where a session cookie or a token is expanded.
+- Never print a secret's value: a session cookie, a CSRF token, or an API, git or messaging token.
+  That rules out shell tracing (`set -x`, `bash -x`) in a command that expands one, dumps of an
+  environment with its values (`env`, `printenv`, `/proc/<pid>/environ`), echoes through
+  `${VAR-...}` or `${VAR:-...}`, which print the value whenever the variable is set, and the
+  command line of a process that takes a token as an option (`ps -o args`, `pgrep -a`,
+  `/proc/<pid>/cmdline`): Antigravity's agent hub, `agy --hub`, has its CSRF token there, and a
+  line cut short can still end inside the token. Record variable names, a secret's length, or a
+  process's pid and name. What a command prints stays in the agent's transcript, and the only
+  remedy is to invalidate the secret.

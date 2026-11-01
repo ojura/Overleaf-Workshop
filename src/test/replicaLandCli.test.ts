@@ -4,6 +4,7 @@ import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import type { CompileRequest } from '../api/base';
 import { Repo } from '../gitbridge/plumbing';
 import { checkBuild } from '../sandbox/buildCheck';
 import { AskWindow, fetchCommitFrom, LandClient, LandError, landCommit, landedCleanly } from '../sandbox/land';
@@ -24,6 +25,8 @@ class Overleaf implements LandClient {
     files = new Map<string, string>();
     reads = 0;
     compiles: string[] = [];
+    /** the main document's ID that each compile named */
+    rootDocIds: Array<string | undefined> = [];
     /** what the next compiles answer, first to last; then "success" */
     statuses: string[] = [];
     outputs: Record<string, string> = { 'output.log': LOG_OK, 'output.stdout': 'Latexmk: All targets are up-to-date\n', 'output.aux': '\\relax\n', 'output.pdf': '%PDF' };
@@ -50,8 +53,9 @@ class Overleaf implements LandClient {
             ranges: { projectId, docs: [...this.docs].map(([p, text]) => ({ path: p, docId: `doc-${p}`, text, comments: [], changes: [] })), trackChanges: false, users: {} },
         };
     }
-    async compile(_projectId: string, request: { rootResourcePath: string }) {
-        this.compiles.push(request.rootResourcePath);
+    async compile(_projectId: string, request: CompileRequest) {
+        this.compiles.push(request.rootResourcePath!);
+        this.rootDocIds.push(request.rootDocId);
         const status = this.statuses.shift() ?? 'success';
         return { response: { status, outputFiles: Object.keys(this.outputs).map(p => ({ path: p, url: `/build/${p}`, type: p.split('.').pop(), build: 'b' })) } } as any;
     }
@@ -137,6 +141,8 @@ describe('replica-land', function () {
         assert.strictEqual(report.verified, 3);
         // the parent was compiled first, for the check to compare with
         assert.deepStrictEqual(t.overleaf.compiles, ['main.tex', 'main.tex']);
+        // by ID too: without it Overleaf compiles the project's main document whatever the path says
+        assert.deepStrictEqual(t.overleaf.rootDocIds, ['doc-main.tex', 'doc-main.tex']);
         assert.strictEqual(report.parentCompile?.status, 'success');
         assert.strictEqual(report.compile?.status, 'success');
         assert.strictEqual(report.compile?.check?.ok, true);

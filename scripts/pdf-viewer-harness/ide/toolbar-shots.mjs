@@ -28,16 +28,16 @@ const inst = instance();
 const config = settings(inst);
 const originalEngine = config.get(SETTING);
 const restoreAssociation = await associatePdfs(config);
-const wb = await workbench(inst.port);
+const wb = await workbench(inst);
 let view;
 let problems = 0;
 try {
     for (const title of ['View: Close All Editors', 'View: Close Primary Side Bar', 'View: Hide Secondary Side Bar', 'View: Hide Panel']) {
         console.log(`${title}: ${await runCommand(wb, title) ? 'ran' : 'not offered by the Command Palette now (the part may be hidden already)'}`);
     }
-    const frame = await openWithQuickOpen(wb, inst.port, path.resolve(pdf));
+    const frame = await openWithQuickOpen(wb, path.resolve(pdf));
     if (!frame) { throw new Error('the PDF did not open in the viewer'); }
-    view = await viewerPage(frame);
+    view = await viewerPage(wb, frame);
     /** the elements in `selector`'s element whose right edge is past the pane's */
     const past = (selector) => view.E(`(() => { const w = document.documentElement.clientWidth; const root = document.querySelector(${JSON.stringify(selector)}); return root ? [...root.querySelectorAll('*')].filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.right > w + 0.5 && getComputedStyle(e).visibility !== 'hidden'; }).map(e => e.id || e.className || e.tagName).slice(0, 5) : []; })()`);
     const shots = async (engine) => {

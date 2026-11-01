@@ -6,16 +6,17 @@
 // text's color, and they are among the first only.
 //   node ide/probe-page-colors.mjs --page N
 import { arg } from '../common.mjs';
-import { instance, viewerFrames, viewerOf, viewerPage } from './ide.mjs';
+import { instance, viewerFrames, viewerOf, viewerPage, workbench } from './ide.mjs';
 
 const page = Number(arg('page'));
 if (!page) { console.error('usage: node ide/probe-page-colors.mjs --page N'); process.exit(2); }
 const inst = instance();
-const frame = (await viewerFrames(inst.port)).at(-1);
-if (!frame) { console.error('the instance does not show a PDF viewer'); process.exit(1); }
-const view = await viewerPage(frame);
+const wb = await workbench(inst);
+const frame = (await viewerFrames(wb)).at(-1);
+if (!frame) { console.error('the instance does not show a PDF viewer'); wb.close(); process.exit(1); }
+const view = await viewerPage(wb, frame);
 const shown = await view.drawn(undefined, 30000);
-if (!shown) { console.error('the webview does not show a drawn viewer page'); view.close(); process.exit(1); }
+if (!shown) { console.error('the webview does not show a drawn viewer page'); wb.close(); process.exit(1); }
 const V = viewerOf(shown.engine);
 const button = shown.engine === 'overleaf' ? `document.getElementById('themeToggle')` : `document.getElementById('themeButton')`;
 console.log(JSON.stringify(await view.E(`(async () => {
@@ -58,4 +59,4 @@ console.log(JSON.stringify(await view.E(`(async () => {
     out.ops = byKind;
     return out;
 })()`), null, 1));
-view.close();
+wb.close();

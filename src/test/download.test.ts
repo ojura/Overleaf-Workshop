@@ -2,7 +2,7 @@
 import * as assert from 'assert';
 import * as http from 'http';
 import { AddressInfo } from 'net';
-import Module = require('module');
+import { loadWithVscode } from './standIn';
 
 // The VFS imports 'vscode', which only exists inside the extension host. Serve the few
 // parts that openFile touches.
@@ -35,14 +35,10 @@ const vscodeMock = withStubs({
     workspace: withStubs({ getConfiguration: () => ({ get: (_key: string, value: any) => value }) }),
     l10n: { t: (message: string) => message },
 });
-const moduleAny = Module as any;
-const originalLoad = moduleAny._load;
-moduleAny._load = function (request: string, ...rest: any[]) {
-    return request === 'vscode' ? vscodeMock : originalLoad.call(this, request, ...rest);
-};
-const { BaseAPI } = require('../api/base');
-const { VirtualFileSystem } = require('../core/remoteFileSystemProvider');
-moduleAny._load = originalLoad;
+const { BaseAPI, VirtualFileSystem } = loadWithVscode(vscodeMock, () => ({
+    BaseAPI: require('../api/base').BaseAPI,
+    VirtualFileSystem: require('../core/remoteFileSystemProvider').VirtualFileSystem,
+}));
 
 type Handler = (req: http.IncomingMessage, res: http.ServerResponse) => void;
 
