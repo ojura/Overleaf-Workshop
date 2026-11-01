@@ -1,23 +1,10 @@
 /**
  * What the extension host writes into a viewer page's #viewer-config element
- * (src/core/pdfViewerPages.ts): which viewer the page is, and the webview URLs of pdf.js's files.
+ * (src/core/pdfViewerPages.ts): which viewer the page is, the page's ID, and the webview URLs of
+ * pdf.js's files (ViewerConfig).
  */
+import type { ViewerConfig } from './protocol';
 
-/** Absolute webview URLs, each ending in '/'. */
-export interface PdfjsResources {
-    /** the folder of pdf.mjs and pdf.worker.mjs */
-    build: string;
-    cMapUrl: string;
-    standardFontDataUrl: string;
-    wasmUrl: string;
-    iccUrl: string;
-    imageResourcesPath: string;
-}
-
-export interface ViewerConfig {
-    engine: 'pdfjs' | 'overleaf';
-    pdfjs: PdfjsResources;
-}
 
 function read(): ViewerConfig {
     const text = document.getElementById('viewer-config')?.textContent;

@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention -- mirrors the 'vscode' export names and Overleaf's fields */
 import * as assert from 'assert';
+import { EventEmitter as NodeEventEmitter, once } from 'events';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as os from 'os';
@@ -40,6 +41,13 @@ class Overleaf {
     readonly compiles: unknown[] = [];
     /** what the servers send, by path */
     readonly files = new Map<string, Buffer>();
+    /**
+     * 'held' when a request of a held path arrives (hold), and 'closed' when the asker closes the
+     * connection of a held request before its answer
+     */
+    readonly events = new NodeEventEmitter();
+    /** the paths whose answers wait for release(path), with the answers waiting */
+    private readonly holding = new Map<string, Array<() => void>>();
     base = '';
     private readonly server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -66,9 +74,32 @@ class Overleaf {
         return this.requests.filter(r => r.path.startsWith(prefix));
     }
 
+    /** Hold the answers to `path` until release(path). */
+    hold(path: string) {
+        this.holding.set(path, []);
+    }
+
+    release(path: string) {
+        const waiting = this.holding.get(path) ?? [];
+        this.holding.delete(path);
+        waiting.forEach(answer => answer());
+    }
+
     private answer(req: http.IncomingMessage, body: string, res: http.ServerResponse) {
         const url = new URL(req.url!, 'http://x');
         this.requests.push({ method: req.method!, path: url.pathname, query: url.searchParams, cookie: req.headers.cookie, range: req.headers.range, body: body ? JSON.parse(body) : undefined });
+        const waiting = this.holding.get(url.pathname);
+        if (waiting) {
+            res.on('close', () => { if (!res.writableFinished) { this.events.emit('closed', url.pathname); } });
+            waiting.push(() => this.route(req, res, url));
+            this.events.emit('held', url.pathname);
+            return;
+        }
+        this.route(req, res, url);
+    }
+
+    /** Answer a request as the server does at its path. */
+    private route(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
         const json = (status: number, value: unknown) => {
             res.writeHead(status, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(value));
@@ -80,6 +111,12 @@ class Overleaf {
             } else {
                 json(this.latest.status, this.latest.body);
             }
+            return;
+        }
+        if (url.pathname === '/project/p1/compile/stop') {
+            // as Overleaf's web server answers it (CompileController.stopCompile)
+            res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('OK');
             return;
         }
         if (url.pathname === '/project/p1/compile') {
@@ -95,6 +132,11 @@ class Overleaf {
             json(200, { code: [{ file: 'main.tex', line: 7, column: 0 }] });
             return;
         }
+        this.send(req, res, url);
+    }
+
+    /** Send the file at `url`'s path, whole or the range asked for; 404 when there is none. */
+    private send(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
         const content = this.files.get(url.pathname);
         if (!content) {
             res.writeHead(404);
@@ -174,6 +216,12 @@ const world = {
     saveTarget: undefined as Uri | undefined,
     /** the save of the editors before a compile (vscode.workspace.saveAll) */
     saveAll: async () => true as boolean,
+    /** the settings that the test sets, by name, e.g. 'engine' */
+    settings: {} as Record<string, unknown>,
+    /** the editor that is active, with its document */
+    activeEditor: undefined as { document: { uri: Uri } } | undefined,
+    /** the texts of the compile's status bar item, first to last */
+    statusTexts: [] as string[],
     /** the project's file system, for 'remoteFileSystem.prefetch' and the workspace's reads */
     vfs: undefined as any,
     overleaf: undefined as unknown as Overleaf,
@@ -211,7 +259,7 @@ const vscodeStandIn = strict('vscode', {
         },
     }),
     window: strict('vscode.window', {
-        activeTextEditor: undefined,
+        get activeTextEditor() { return world.activeEditor; },
         visibleTextEditors: [],
         showInformationMessage: show('information'),
         showWarningMessage: show('warning'),
@@ -219,7 +267,14 @@ const vscodeStandIn = strict('vscode', {
         showSaveDialog: async () => world.saveTarget,
         withProgress: async (_options: unknown, task: (progress: unknown, token: unknown) => Promise<unknown>) =>
             task({ report() {} }, { onCancellationRequested: () => disposable }),
-        createStatusBarItem: () => ({ text: '', tooltip: undefined, command: undefined, backgroundColor: undefined, show() {}, hide() {}, dispose() {} }),
+        createStatusBarItem: () => {
+            let text = '';
+            return {
+                get text() { return text; },
+                set text(value: string) { text = value; world.statusTexts.push(value); },
+                tooltip: undefined, command: undefined, backgroundColor: undefined, show() {}, hide() {}, dispose() {},
+            };
+        },
         onDidChangeWindowState: () => disposable,
         registerCustomEditorProvider: () => disposable,
     }),
@@ -239,7 +294,7 @@ const vscodeStandIn = strict('vscode', {
         saveAll: () => world.saveAll(),
         onDidSaveTextDocument: () => disposable,
         onDidChangeConfiguration: () => disposable,
-        getConfiguration: () => ({ get: (_key: string, value: unknown) => value }),
+        getConfiguration: () => ({ get: (key: string, value: unknown) => world.settings[key] ?? value }),
         // main.tex, whose first line the log's error names
         openTextDocument: async () => ({ getText: () => '\\foo', lineCount: 1 }),
         fs: strict('vscode.workspace.fs', {
@@ -255,14 +310,16 @@ const vscodeStandIn = strict('vscode', {
     }),
 });
 
-const { VirtualFileSystem, PdfDocument, PdfViewEditorProvider, CompileManager, LocalReplicaSCMProvider, EventBus, EDITOR_ID, BaseAPI, PLACEHOLDER } = loadWithVscode(vscodeStandIn, () => ({
+const { VirtualFileSystem, PdfDocument, PdfViewEditorProvider, CompileManager, LocalReplicaSCMProvider, EventBus, EDITOR_ID, BaseAPI, downloadDomainUrl, PLACEHOLDER, pdfjsReleaseOf } = loadWithVscode(vscodeStandIn, () => ({
     ...require('../utils/eventBus'),
     ...require('../core/remoteFileSystemProvider'),
     ...require('../core/pdfViewEditorProvider'),
     ...require('../compile/compileManager'),
     ...require('../scm/localReplicaSCM'),
     ...require('../api/base'),
+    ...require('../api/downloadDomain'),
     ...require('../core/pdfViewerPages'),
+    ...require('../core/viewerProtocol'),
 }), {
     // the login and the API of this test's Overleaf, without a socket.io connection
     '../utils/globalStateManager': {
@@ -277,6 +334,8 @@ const { VirtualFileSystem, PdfDocument, PdfViewEditorProvider, CompileManager, L
     '../scm/scmCollectionProvider': { SCMCollectionProvider: class { triggers = []; } },
 });
 
+/** the extension's package.json, as VS Code gives it to the extension (ExtensionContext.extension.packageJSON) */
+const packageJSON = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', '..', 'package.json'), 'utf8'));
 const projectUri = Uri.parse('overleaf-workshop://www.overleaf.com/Book?user%3Du1%26project%3Dp1');
 const inProject = (file: string) => Uri.joinPath(projectUri, file);
 const buildUri = inProject('.output/output.pdf');
@@ -312,6 +371,8 @@ class Panel {
     /** the page sends `message` */
     send(message: any) { this.receive!(message); }
     setVisible(visible: boolean) { this.visible = visible; this.viewState!({ webviewPanel: this }); }
+    /** the panel gains or loses the focus, as when the focus moves between it and an editor */
+    setActive(active: boolean) { this.active = active; this.viewState!({ webviewPanel: this }); }
     close() { this.closing.forEach(listener => listener()); }
     /** the first message of `type` that the provider posted, or posts */
     first(type: string): Promise<any> {
@@ -342,6 +403,9 @@ describe('the build in use, from Overleaf to the window', function () {
         world.commands.clear();
         world.saveTarget = undefined;
         world.saveAll = async () => true;
+        world.settings = {};
+        world.activeEditor = undefined;
+        world.statusTexts = [];
         scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'build-in-use-'));
         vfs = new VirtualFileSystem({ globalState: { get: (_key: string, value: unknown) => value } }, projectUri, () => {});
         vfs.root = tree();
@@ -350,7 +414,7 @@ describe('the build in use, from Overleaf to the window', function () {
         LocalReplicaSCMProvider.readSettings = async () => undefined;
         manager = new CompileManager({ prefetch: async () => vfs });
         managerTriggers = manager.triggers;
-        provider = new PdfViewEditorProvider({ globalStorageUri: Uri.file(path.join(scratch, 'storage')), extensionUri: Uri.file('/extension') });
+        provider = new PdfViewEditorProvider({ globalStorageUri: Uri.file(path.join(scratch, 'storage')), extensionUri: Uri.file('/extension'), extension: { packageJSON } });
     });
 
     afterEach(async () => {
@@ -383,27 +447,31 @@ describe('the build in use, from Overleaf to the window', function () {
 
     describe('1. SyncTeX', () => {
         it('asks in both directions about the build in use, with its compile server and its editor, also for another client\'s build', async () => {
-            overleaf.compiles.push(ownAnswer(overleaf, 'b-own'));
+            // build IDs of Overleaf's form: the other client's compile began after the window's
+            const own = '19a3e9d4000-0123456789abcdef';
+            const web = '19a3e9d4010-fedcba9876543210';
+            overleaf.compiles.push(ownAnswer(overleaf, own));
             assert.strictEqual(await vfs.compile(true), true);
             await vfs.syncCode('main.tex', 7, 0);
             await vfs.syncPdf(3, 72, 100);
-            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, web) };
             await vfs.builds.check();
             await vfs.syncCode('main.tex', 7, 0);
             await vfs.syncPdf(3, 72, 100);
             const asked = overleaf.to('/project/p1/sync/').map(r => [r.path, r.query.get('buildId'), r.query.get('editorId'), r.query.get('clsiserverid')]);
             assert.deepStrictEqual(asked, [
-                ['/project/p1/sync/code', 'b-own', EDITOR_ID, 'clsi-vm-2'],
-                ['/project/p1/sync/pdf', 'b-own', EDITOR_ID, 'clsi-vm-2'],
-                ['/project/p1/sync/code', 'b-web', WEB_EDITOR, 'clsi-vm-1'],
-                ['/project/p1/sync/pdf', 'b-web', WEB_EDITOR, 'clsi-vm-1'],
+                ['/project/p1/sync/code', own, EDITOR_ID, 'clsi-vm-2'],
+                ['/project/p1/sync/pdf', own, EDITOR_ID, 'clsi-vm-2'],
+                ['/project/p1/sync/code', web, WEB_EDITOR, 'clsi-vm-1'],
+                ['/project/p1/sync/pdf', web, WEB_EDITOR, 'clsi-vm-1'],
             ]);
         });
 
         it('says that there is no build yet, and asks Overleaf nothing, before any build', async () => {
             assert.strictEqual(await vfs.syncCode('main.tex', 7, 0), undefined);
             assert.deepStrictEqual(overleaf.to('/project/p1/sync/'), []);
-            assert.strictEqual(world.shown.length, 1);
+            assert.deepStrictEqual(world.shown.map(shown => shown.kind), ['information']);
+            assert.match(world.shown[0].message, /no build/);
         });
     });
     describe('2. the output folder and the Problems view', () => {
@@ -473,21 +541,46 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.deepStrictEqual(partFiles(), []);
         });
 
-        it('saves another client\'s build whole from Overleaf\'s cache when the compile server has deleted it', async () => {
+        /** the requests for `path` on the download domain, with their ranges and compile servers */
+        const rangesOf = (path: string) => overleaf.to(path).map(r => [r.range !== undefined, r.query.get('clsiserverid')]);
+
+        it('saves another client\'s build in ranges from Overleaf\'s cache on the download domain when the compile server has deleted it', async () => {
             overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
-            overleaf.files.set(`/download/project/p1/build/${WEB_EDITOR}-b-web/output/cached/output.pdf`, PDF);
+            // as Overleaf's loader asks the cache: build/<editor>-<build>/, with the cache's shard
+            const cached = `/cdn/project/p1/user/u1/build/${WEB_EDITOR}-b-web/output/output.pdf`;
+            overleaf.files.set(cached, PDF);
             const { doc, panel } = await open();
             await panel.first('load');
             await provider.download(doc);
             assert.deepStrictEqual(fs.readFileSync(target()), PDF);
-            const whole = overleaf.to('/download/project/p1/build/').filter(r => r.path.endsWith('/output.pdf'));
-            assert.deepStrictEqual(whole.map(r => [r.path, r.range, r.cookie]), [[`/download/project/p1/build/${WEB_EDITOR}-b-web/output/cached/output.pdf`, undefined, identity.cookies]]);
+            const asked = rangesOf(cached);
+            assert.ok(asked.length > 0 && asked.every(([range, server]) => range && server === 'cache-1'), JSON.stringify(asked));
+            // not the web server's route, which sends the whole file (the Problems view reads output.log there)
+            assert.deepStrictEqual(overleaf.to('/download/').filter(r => r.path.endsWith('/output.pdf')), []);
             assert.deepStrictEqual(partFiles(), []);
         });
 
-        it('saves this window\'s build through the web server, with the window\'s editor, when the compile server has deleted it', async () => {
+        it('saves this window\'s build in ranges from Overleaf\'s cache when the compile server has deleted it', async () => {
             overleaf.latest = { status: 404 };
             overleaf.compiles.push(ownAnswer(overleaf, 'b-own'));
+            const cached = `/cdn/project/p1/user/u1/build/${EDITOR_ID}-b-own/output/output.pdf`;
+            overleaf.files.set(cached, PDF);
+            const ended = compileEnd();
+            const { doc, panel } = await open();
+            await panel.first('load');
+            await ended;
+            await provider.download(doc);
+            assert.deepStrictEqual(fs.readFileSync(target()), PDF);
+            const asked = rangesOf(cached);
+            assert.ok(asked.length > 0 && asked.every(([range, server]) => range && server === 'cache-1'), JSON.stringify(asked));
+            assert.deepStrictEqual(overleaf.to('/project/p1/user/u1/build/b-own/output/output.pdf'), []);
+        });
+
+        it('saves a build whose compile named no shard of the cache whole through the web server, with the window\'s editor, when the compile server has deleted it', async () => {
+            overleaf.latest = { status: 404 };
+            const answer: any = ownAnswer(overleaf, 'b-own');
+            delete answer.clsiCacheShard;
+            overleaf.compiles.push(answer);
             overleaf.files.set('/project/p1/user/u1/build/b-own/output/output.pdf', PDF);
             const ended = compileEnd();
             const { doc, panel } = await open();
@@ -527,6 +620,8 @@ describe('the build in use, from Overleaf to the window', function () {
             const load = await panel.first('load');
             assert.strictEqual(load.output.file.build, 'b-web');
             assert.strictEqual(load.output.file.editorId, WEB_EDITOR);
+            // the address that Overleaf's viewer uses: the compile server that made the build, as the answer names it
+            assert.strictEqual(load.output.url, downloadDomainUrl(overleaf.downloadDomain, '/project/p1/user/u1/build/b-web/output/output.pdf', 'clsi-vm-1', 'priority'));
             assert.strictEqual(load.output.clsiCacheShard, 'cache-1');
             assert.deepStrictEqual(overleaf.to('/project/p1/compile'), []);
             assert.ok(!panel.types.includes('update'));
@@ -563,6 +658,64 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.strictEqual(panel.posted.filter(message => message.type === 'load').pop().output.file.build, 'b-new');
         });
 
+        it('says quietly over the PDF that it could not ask Overleaf for a newer compile, and keeps the PDF', async () => {
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            const { panel } = await open();
+            await panel.first('load');
+            overleaf.latest = { status: 503 };
+            await vfs.builds.check();
+            assert.strictEqual(vfs.builds.status.state, 'unchecked');
+            assert.strictEqual(panel.posted.filter(message => message.type === 'buildState').pop().state, 'unchecked');
+            assert.strictEqual(vfs.builds.build.id, 'b-web');
+            assert.deepStrictEqual(overleaf.to('/project/p1/compile'), []);
+        });
+
+        it('asks Overleaf for the latest compile when the viewer becomes visible, and not when only its focus changes', async () => {
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            const { panel } = await open();
+            await panel.first('load');
+            const asked = () => overleaf.to('/project/p1/output/cached/output.overleaf.json').length;
+            // after the opening's check
+            await vfs.builds.check();
+            const before = asked();
+            // the focus moves between an editor and the visible viewer
+            panel.setActive(false);
+            panel.setActive(true);
+            panel.setActive(false);
+            panel.setActive(true);
+            await vfs.builds.check();
+            assert.strictEqual(asked(), before + 1, 'only the test\'s own check');
+            // hidden, and shown again: one check, then the test's
+            panel.setVisible(false);
+            panel.setVisible(true);
+            await vfs.builds.check();
+            assert.strictEqual(asked(), before + 3);
+        });
+
+        it('compiles on its own once when builds are reported gone one after another, until the viewer shows one', async () => {
+            overleaf.latest = { status: 404 };
+            overleaf.compiles.push(ownAnswer(overleaf, 'b1'), ownAnswer(overleaf, 'b2'), ownAnswer(overleaf, 'b3'));
+            let ended = compileEnd();
+            const { panel } = await open();
+            await ended;
+            // the page shows b1, which then goes
+            panel.send({ type: 'buildShown', build: 'b1' });
+            ended = compileEnd();
+            panel.send({ type: 'buildGone', build: 'b1' });
+            await ended;
+            assert.strictEqual(vfs.builds.build.id, 'b2');
+            // b2 goes before the page has shown it: the next compile is the user's
+            panel.send({ type: 'buildGone', build: 'b2' });
+            await vfs.builds.check();
+            assert.deepStrictEqual(vfs.builds.status, { state: 'gone' });
+            assert.strictEqual(overleaf.to('/project/p1/compile').length, 2);
+            ended = compileEnd();
+            panel.send({ type: 'recompile' });
+            await ended;
+            assert.strictEqual(vfs.builds.build.id, 'b3');
+            assert.strictEqual(overleaf.to('/project/p1/compile').length, 3);
+        });
+
         it('says why there is no PDF when the compile fails, and offers no second compile on its own', async () => {
             overleaf.latest = { status: 404 };
             overleaf.compiles.push({ status: 'failure', compileGroup: 'priority', clsiServerId: 'clsi-vm-2', outputFiles: [] });
@@ -592,6 +745,54 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.deepStrictEqual(vfs.builds.status, { state: 'ready' });
         });
 
+        it('says that it compiles while a compile that it did not ask for runs, also after a failed compile', async () => {
+            overleaf.latest = { status: 404 };
+            overleaf.compiles.push({ status: 'failure', compileGroup: 'priority', clsiServerId: 'clsi-vm-2', outputFiles: [] }, ownAnswer(overleaf, 'b-new'));
+            let ended = compileEnd();
+            const { panel } = await open();
+            await ended;
+            assert.strictEqual(vfs.builds.status.state, 'compile-failed');
+            // the compile command, as an editor's menu, a key or a save runs it
+            overleaf.hold('/project/p1/compile');
+            const held = once(overleaf.events, 'held');
+            ended = compileEnd();
+            assert.deepStrictEqual(await manager.compile(true, false, projectUri), { kind: 'started' });
+            await held;
+            assert.deepStrictEqual(vfs.builds.status, { state: 'compiling' });
+            assert.deepStrictEqual(panel.posted.filter(message => message.type === 'buildState').pop(), { type: 'buildState', state: 'compiling' });
+            overleaf.release('/project/p1/compile');
+            assert.deepStrictEqual((await ended).outcome, { result: 'success' });
+            assert.deepStrictEqual(vfs.builds.status, { state: 'ready' });
+        });
+
+        it('says that it compiles from the click on Recompile, and compiles once the compile that kept it waiting has ended', async () => {
+            overleaf.latest = { status: 404 };
+            overleaf.compiles.push({ status: 'failure', compileGroup: 'priority', clsiServerId: 'clsi-vm-2', outputFiles: [] }, ownAnswer(overleaf, 'b-new'));
+            let ended = compileEnd();
+            const { panel } = await open();
+            await ended;
+            assert.strictEqual(vfs.builds.status.state, 'compile-failed');
+            // a compile of a file outside any Overleaf project keeps the window busy while the editors are saved
+            let saved!: () => void;
+            world.saveAll = () => new Promise<boolean>(resolve => { saved = () => resolve(true); });
+            const other = manager.compile(true, false, Uri.file('/elsewhere/notes.tex'));
+            world.saveAll = async () => true;
+            const compiling = new Promise<void>(resolve => {
+                const stop = vfs.builds.onDidChangeStatus((status: any) => { if (status.state === 'compiling') { stop(); resolve(); } });
+            });
+            panel.send({ type: 'recompile' });
+            await compiling;
+            // a second click while the request waits changes nothing
+            panel.send({ type: 'recompile' });
+            ended = compileEnd();
+            saved();
+            await other;
+            assert.deepStrictEqual((await ended).outcome, { result: 'success' });
+            assert.strictEqual(overleaf.to('/project/p1/compile').length, 2);
+            assert.strictEqual((await panel.first('load')).output.file.build, 'b-new');
+            assert.deepStrictEqual(vfs.builds.status, { state: 'ready' });
+        });
+
         it('compiles once the compile that kept it from starting has ended, also one that found no project to compile', async () => {
             // the user compiles a file outside any Overleaf project, which waits while the editors are saved
             let saved!: () => void;
@@ -614,6 +815,20 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
         });
 
+        it('says what came when the compile command\'s answer is a value that JSON cannot write', async () => {
+            const answer: any = { kind: 'busy', size: BigInt(1) };
+            answer.self = answer;
+            world.commands.set('overleaf-workshop.compileManager.compile', async () => answer);
+            overleaf.latest = { status: 404 };
+            const unavailable = new Promise<any>(resolve => {
+                const stop = vfs.builds.onDidChangeStatus((status: any) => {
+                    if (status.state === 'compile-unavailable') { stop(); resolve(status); }
+                });
+            });
+            await open();
+            assert.match((await unavailable).detail, /^the compile command answered .*kind: 'busy'.*, not how the compile started$/);
+        });
+
         it('says why it does not compile when the compile command\'s answer has lost the end of the running compile', async () => {
             // 'busy' as a copy of the answer would bring it, without its promise
             world.commands.set('overleaf-workshop.compileManager.compile', async () => ({ kind: 'busy', ended: {} }));
@@ -624,9 +839,147 @@ describe('the build in use, from Overleaf to the window', function () {
                 });
             });
             const { panel } = await open();
-            const detail = 'the compile command answered {"kind":"busy","ended":{}}, not how the compile started';
+            const detail = 'the compile command answered { kind: \'busy\', ended: {} }, not how the compile started';
             assert.deepStrictEqual(await unavailable, { state: 'compile-unavailable', detail });
             assert.deepStrictEqual(panel.posted.filter(message => message.type === 'buildState').pop(), { type: 'buildState', state: 'compile-unavailable', detail });
+        });
+    });
+
+    describe('the viewer\'s requests through the extension host', () => {
+        const pdfPath = '/cdn/project/p1/user/u1/build/b-web/output/output.pdf';
+        const pdfUrl = () => `${overleaf.downloadDomain}/project/p1/user/u1/build/b-web/output/output.pdf`;
+        /** the configuration of the page that the panel shows now */
+        const configOf = (panel: Panel) => JSON.parse(/<script id="viewer-config" type="application\/json">(.*?)<\/script>/.exec(panel.webview.html)![1]);
+        const pageOf = (panel: Panel) => configOf(panel).page;
+
+        it('stop the requests of a page that a new page replaced, and are answered only to the page that asked', async () => {
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            overleaf.files.set(pdfPath, PDF);
+            const { panel } = await open();
+            await panel.first('load');
+            const first = pageOf(panel);
+            overleaf.hold(pdfPath);
+            const held = once(overleaf.events, 'held');
+            const closed = once(overleaf.events, 'closed');
+            panel.send({ type: 'fetch', page: first, id: 1, url: pdfUrl(), headers: [['range', 'bytes=0-99']] });
+            await held;
+            // the other viewer: the panel shows a new page, which numbers its requests from 1 again
+            world.settings.engine = 'overleaf';
+            await provider.applyEngine();
+            await closed;
+            const second = pageOf(panel);
+            assert.notStrictEqual(second, first);
+            // pdf.js's files come from the release that the extension's package.json pins
+            assert.ok(configOf(panel).pdfjs.build.endsWith(`/views/pdf-viewer/${pdfjsReleaseOf(packageJSON)}/build/`), configOf(panel).pdfjs.build);
+            overleaf.release(pdfPath);
+            // a request that the replaced page sent late is not sent on
+            panel.send({ type: 'fetch', page: first, id: 2, url: pdfUrl(), headers: [['range', 'bytes=0-99']] });
+            panel.send({ type: 'fetch', page: second, id: 1, url: pdfUrl(), headers: [['range', 'bytes=0-99']] });
+            const answer = await panel.first('fetchResponse');
+            assert.deepStrictEqual([answer.page, answer.id, answer.status], [second, 1, 206]);
+            assert.deepStrictEqual(panel.posted.filter(message => message.page === first), []);
+            assert.strictEqual(overleaf.to(pdfPath).length, 2, 'the stopped request and the new page\'s');
+        });
+
+        it('stop when the panel closes', async () => {
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            overleaf.files.set(pdfPath, PDF);
+            const { panel } = await open();
+            await panel.first('load');
+            overleaf.hold(pdfPath);
+            const held = once(overleaf.events, 'held');
+            const closed = once(overleaf.events, 'closed');
+            panel.send({ type: 'fetch', page: pageOf(panel), id: 1, url: pdfUrl(), headers: [['range', 'bytes=0-99']] });
+            await held;
+            panel.close();
+            await closed;
+            assert.deepStrictEqual(panel.posted.filter(message => message.type === 'fetchResponse'), []);
+        });
+    });
+
+    describe('opening the project', () => {
+        it('shows the latest compile from Overleaf\'s cache when it is current, and compiles nothing', async () => {
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            await vfs.joined(tree());
+            await vfs.builds.opened();
+            assert.strictEqual(vfs.builds.build.id, 'b-web');
+            assert.deepStrictEqual(overleaf.to('/project/p1/compile'), []);
+        });
+
+        it('compiles when the project changed after Overleaf\'s latest compile (410)', async () => {
+            overleaf.latest = { status: 410 };
+            overleaf.compiles.push(ownAnswer(overleaf, 'b-new'));
+            const ended = compileEnd();
+            await vfs.joined(tree());
+            await vfs.builds.opened();
+            assert.deepStrictEqual((await ended).outcome, { result: 'success' });
+            assert.strictEqual(vfs.builds.build.id, 'b-new');
+            assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
+        });
+    });
+
+    describe('which document a compile from an editor typesets', () => {
+        /** Compile from the editor of document `name` with text `text`; the main documents that Overleaf was asked for. */
+        async function compileFrom(name: string, text: string) {
+            vfs.root.rootFolder[0].docs.push({ _id: `doc-${name}`, name });
+            const openFile = vfs.openFile.bind(vfs);
+            vfs.openFile = async (uri: Uri) => uri.path.endsWith(`/${name}`) ? new TextEncoder().encode(text) : openFile(uri);
+            overleaf.compiles.push(ownAnswer(overleaf, 'b-new'));
+            const ended = compileEnd();
+            assert.deepStrictEqual(await manager.compile(true, false, inProject(name)), { kind: 'started' });
+            await ended;
+            return overleaf.to('/project/p1/compile').map(r => [r.body.rootDoc_id, r.body.rootResourcePath]);
+        }
+
+        it('typesets a main document on its own', async () => {
+            assert.deepStrictEqual(await compileFrom('letter.tex', '\\documentclass{letter}\n\\begin{document}\nx\n\\end{document}\n'), [['doc-letter.tex', 'letter.tex']]);
+        });
+
+        it('typesets the project\'s main document from a subfiles chapter', async () => {
+            assert.deepStrictEqual(await compileFrom('chapter1.tex', '\\documentclass[../main.tex]{subfiles}\n\\begin{document}\nx\n\\end{document}\n'), [['doc-main', 'main.tex']]);
+        });
+
+        it('typesets the project\'s main document from a document whose \\documentclass is commented out', async () => {
+            assert.deepStrictEqual(await compileFrom('notes.tex', '% \\documentclass{article}\nSome notes.\n'), [['doc-main', 'main.tex']]);
+        });
+    });
+
+    describe('Stop compilation', () => {
+        /**
+         * Start a compile of the project whose answer Overleaf holds; settles when Overleaf has the
+         * request, with `ended`, the compile's end (in an object: an async function that returns a
+         * promise settles only when that promise does)
+         */
+        async function heldCompile() {
+            overleaf.hold('/project/p1/compile');
+            overleaf.compiles.push(ownAnswer(overleaf, 'b-new'));
+            const held = once(overleaf.events, 'held');
+            const ended = compileEnd();
+            assert.deepStrictEqual(await manager.compile(true, false, projectUri), { kind: 'started' });
+            await held;
+            return { ended };
+        }
+        const stops = () => overleaf.requests.filter(r => r.path === '/project/p1/compile/stop');
+
+        it('asks Overleaf to stop the running compile, and leaves the status to the compile\'s end', async () => {
+            world.activeEditor = { document: { uri: inProject('main.tex') } };
+            const { ended } = await heldCompile();
+            const before = world.statusTexts.length;
+            await manager.stopCompile();
+            assert.deepStrictEqual(stops().map(r => r.method), ['POST']);
+            // as in the IDE test, the stop reached a compile server that does not run the compile, which goes on
+            overleaf.release('/project/p1/compile');
+            assert.deepStrictEqual((await ended).outcome, { result: 'success' });
+            const after = world.statusTexts.slice(before);
+            assert.ok(!after.some(text => text.includes('$(x)')), `the status said that the compile failed: ${JSON.stringify(after)}`);
+        });
+
+        it('stops the running compile of its project also when no editor of the project is active', async () => {
+            const { ended } = await heldCompile();
+            await manager.stopCompile();
+            assert.strictEqual(stops().length, 1);
+            overleaf.release('/project/p1/compile');
+            await ended;
         });
     });
 

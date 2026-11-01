@@ -1,10 +1,12 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
+import { inspect } from 'util';
 import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, COMPILERS, CompileRequest, CompileResponseSchema, EDITOR_ID, MemberEntity, ProjectSettingsSchema } from '../api/base';
+import { cachedDownloadDomainUrl, downloadDomainUrl } from '../api/downloadDomain';
 import type { CompileRecord } from '../compile/outputFiles';
 import { windowCompileSettings } from '../compile/compileSettings';
-import { cachedBuild, CompileSettings, CompileStart, isCompileStart, LatestAnswer, ownBuild, ProjectBuilds } from './projectBuilds';
+import { cachedBuild, CompileSettings, CompileStart, fromCache, isCompileStart, LatestAnswer, ownBuild, ProjectBuilds } from './projectBuilds';
 import { EmitRefusedError, isMissingOpsRefusal, SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { applyOps, opsFor, overleafLineEndings, TrackChangesState, updateMeta } from '../utils/docUpdate';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
@@ -14,6 +16,7 @@ import { EventBus } from '../utils/eventBus';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
 import { DownloadError, downloadInRanges, downloadWhole } from './pdfFetchBridge';
+import type { PdfOutput, PdfOutputFile } from './viewerProtocol';
 
 export const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
@@ -142,33 +145,10 @@ export interface FileRefEntity extends FileEntity {
     hash?: string, //git blob SHA-1 of the content
 }
 
-export interface OutputFileEntity extends FileEntity {
-    path: string, //output file name
-    url: string, // `project/${projectId}/user/${userId}/output/${build}/output/${path}`
-    type: string, //output file type (postfix)
-    build: string, //build id
-    // for output.pdf, when the compile asked for PDF caching: its size, and the pieces of the
-    // PDF that the download domain serves by their SHA-256 under /content/<contentId>/
-    size?: number,
-    ranges?: Array<{start: number, end: number, hash: string, objectId?: string}>,
-    contentId?: string,
-    createdAt?: string,
-    // for output.pdf: the editor whose compile made the build; with the build ID it names the
-    // build in Overleaf's cache of compile outputs
-    editorId?: string,
-    // for a compile from Overleaf's cache of compile outputs: the web server's route to the file
+/** An output file of a compile, in the project's output folder (listBuildOutputs). */
+export interface OutputFileEntity extends FileEntity, PdfOutputFile {
+    /** for a compile from Overleaf's cache of compile outputs: the web server's route to the file */
     downloadURL?: string,
-}
-
-/** A build's output.pdf, as Overleaf's PDF viewer loads it: in ranges from the download domain. */
-export interface PdfOutput {
-    /** output.pdf on the download domain, with the query Overleaf's viewer uses */
-    url: string,
-    downloadDomain: string,
-    projectId: string,
-    file: OutputFileEntity,
-    /** the shard of Overleaf's cache of compile outputs that keeps the build, for when the compile server has deleted it */
-    clsiCacheShard?: string,
 }
 
 export interface FolderEntity extends FileEntity {
@@ -278,7 +258,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
     private userId: string;
     private isDirty: boolean = true;
-    /** the project has been compiled once since it was opened */
+    /** the window has shown or compiled the project's build since it was opened (ProjectBuilds.opened) */
     private compileStarted: boolean = false;
     private initializing?: Promise<ProjectEntity>;
     /** How long a file operation waits for a lost connection to come back before it fails. */
@@ -383,10 +363,14 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.builds.onDidChangeBuild((build) => {
                 this.listBuildOutputs();
                 // the viewers load the build; the Problems view and the replica's logs follow (CompileManager)
-                EventBus.fire('buildChangedEvent', {uri: this.pathToUri(), fromCache: build.record.response.fromCache === true});
+                EventBus.fire('buildChangedEvent', {uri: this.pathToUri(), fromCache: fromCache(build)});
             }),
             this.builds.onDidChangeStatus((status) => EventBus.fire('buildStatusEvent', {uri: this.pathToUri(), status})),
         );
+        const compileStarted = EventBus.on('compileStartedEvent', ({uri}) => {
+            this.builds.compileStarted(parseUri(uri).projectId===this.projectId);
+        });
+        this.buildListeners.push(() => compileStarted.dispose());
         const compileEnded = EventBus.on('compileEndedEvent', ({uri, outcome}) => {
             this.builds.compileEnded(outcome, parseUri(uri).projectId===this.projectId);
         });
@@ -557,11 +541,12 @@ export class VirtualFileSystem extends vscode.Disposable {
                 triggers: scmCollection.triggers,
             };
         }
-        // Compile when the project is opened. A reconnect, e.g. after the network
-        // dropped or the machine resumed, does not start another compile.
+        // When the project is opened, show Overleaf's latest compile if it is current, else compile
+        // (ProjectBuilds.opened). A reconnect, e.g. after the network dropped or the machine
+        // resumed, does not do it again.
         if (!this.compileStarted) {
             this.compileStarted = true;
-            vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
+            void this.builds.opened();
         }
         // documents may have changed on the server while disconnected: have them read again
         if (adopted.length > 0) {
@@ -1877,9 +1862,9 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     /**
      * Compile this project through the window's compile path (CompileManager.compile), whichever
-     * editor is active: the compile that ProjectBuilds starts for a missing build, and the PDF
-     * viewers' Recompile. The path gets the project's folder, so Overleaf compiles the project's
-     * main document.
+     * editor is active: the compiles that ProjectBuilds asks for, for a missing build, at the
+     * project's opening, and for a viewer's Recompile. The path gets the project's folder, so
+     * Overleaf compiles the project's main document.
      *
      * The answer comes through vscode.commands.executeCommand, and a 'busy' answer carries a
      * promise. executeCommand "resolves to the returned value of the given command" (vscode.d.ts,
@@ -1894,7 +1879,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     async compileProject(): Promise<CompileStart> {
         const start = await vscode.commands.executeCommand<unknown>(`${ROOT_NAME}.compileManager.compile`, this.pathToUri());
         if (!isCompileStart(start)) {
-            throw new Error(`the compile command answered ${JSON.stringify(start)}, not how the compile started`);
+            // inspect describes any value, a circular one or a BigInt too
+            throw new Error(`the compile command answered ${inspect(start, { depth: 2, breakLength: Infinity })}, not how the compile started`);
         }
         return start;
     }
@@ -1920,9 +1906,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             const resolvedRootDocId = rootDocId ?? this.root?.rootDoc_id ?? undefined;
             let rootResourcePath: string | null = null;
             if (resolvedRootDocId) {
-                const rootEntry = this._resolveById(resolvedRootDocId);
-                if (rootEntry?.path) {
-                    rootResourcePath = rootEntry.path.replace(/^\//, '');
+                const path = this.rootResourcePathOf(resolvedRootDocId);
+                if (path) {
+                    rootResourcePath = path;
                 } else {
                     console.warn(`Unable to resolve root document id '${resolvedRootDocId}' to a path; compiling without explicit rootResourcePath.`);
                 }
@@ -1950,12 +1936,22 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     /**
+     * The path of document `docId` relative to the project's folder, as a compile names its main
+     * document (rootResourcePath, e.g. 'main.tex'); undefined for a document that the project
+     * does not have. A compile's settings and the compile request take it from here, so that
+     * sameSettings compares like with like.
+     */
+    private rootResourcePathOf(docId: string): string | undefined {
+        return this._resolveById(docId)?.path.replace(/^\//, '');
+    }
+
+    /**
      * What this window compiles, which a build from Overleaf's cache must match (sameSettings):
      * the main document of its last compile, else the project's, and the window's compile settings.
      */
     private compileSettings(): CompileSettings {
         const rootDocId = this.root?.rootDoc_id;
-        const projectRoot = rootDocId ? this._resolveById(rootDocId)?.path.replace(/^\//, '') : undefined;
+        const projectRoot = rootDocId ? this.rootResourcePathOf(rootDocId) : undefined;
         return {
             rootResourcePath: this.lastCompile?.rootResourcePath ?? projectRoot ?? null,
             draft: windowCompileSettings.draft,
@@ -1997,12 +1993,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         const response = build?.record.response;
         const file = response?.outputFiles?.find(f => f.path==='output.pdf');
         if (!build || !response || !file?.size || !response.pdfDownloadDomain) { return undefined; }
-        const query = new URLSearchParams();
-        if (response.compileGroup) { query.set('compileGroup', response.compileGroup); }
-        if (response.clsiServerId) { query.set('clsiserverid', response.clsiServerId); }
-        query.set('enable_pdf_caching', 'true');
         return {
-            url: `${response.pdfDownloadDomain}${file.url}?${query}`,
+            url: downloadDomainUrl(response.pdfDownloadDomain, file.url, response.clsiServerId, response.compileGroup),
             downloadDomain: response.pdfDownloadDomain,
             projectId: this.projectId,
             file: { ...file, editorId: build.editorId },
@@ -2012,23 +2004,33 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     /**
      * Save the build in use's output.pdf to `target`: from the download domain in ranges
-     * (downloadInRanges); when the compile server has deleted the build and the download domain
-     * answers 404, whole from the web server, which sends it from Overleaf's cache of compile
-     * outputs (BaseAPI.webRouteOf). Either way the PDF goes to a part file first, which takes
+     * (downloadInRanges). When the compile server has deleted the build and the download domain
+     * answers 404, from Overleaf's cache of compile outputs, in ranges on the download domain as
+     * the viewers' loader reads it (cachedDownloadDomainUrl), when the build names the cache's
+     * shard and its editor; else whole from the web server, which passes the request on to the
+     * cache (BaseAPI.webRouteOf), and ends a response after 10 minutes, too short for 885 MB on a
+     * link slower than about 1.5 MB/s. Each way the PDF goes to a part file first, which takes
      * `target`'s name when it is complete.
      */
     async savePdf(target: string, signal: AbortSignal, onProgress: (received: number) => void) {
         const build = this.builds.build;
         const output = this.pdfOutput();
-        if (!build || !output?.file.size) {
+        const file = build?.record.response.outputFiles?.find(f => f.path==='output.pdf');
+        if (!build || !file || !output?.file.size) {
             throw new Error(vscode.l10n.t('There is no build of the PDF to save.'));
         }
         const size = output.file.size;
         try {
             await downloadInRanges(output.url, target, size, signal, { onProgress });
         } catch (error) {
-            const route = BaseAPI.webRouteOf(output.file, build.record.response, build.editorId);
-            if (signal.aborted || (error as DownloadError).status!==404 || route===undefined) { throw error; }
+            if (signal.aborted || (error as DownloadError).status!==404) { throw error; }
+            if (output.clsiCacheShard && build.editorId) {
+                const cached = cachedDownloadDomainUrl(output.downloadDomain, file.url, build.id, build.editorId, output.clsiCacheShard, build.record.response.compileGroup);
+                await downloadInRanges(cached, target, size, signal, { onProgress });
+                return;
+            }
+            const route = BaseAPI.webRouteOf(file, build.record.response, build.editorId);
+            if (route===undefined) { throw error; }
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
             await downloadWhole(this.api.serverUrl + route, target, { headers: {'Cookie': identity.cookies}, size, signal, onProgress });
         }

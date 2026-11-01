@@ -1,11 +1,11 @@
-import type { BuildState, BuildStatus } from '../../../../src/core/projectBuilds';
+import type { BuildState, BuildStatus } from './protocol';
 import { post } from './host';
 
 /**
  * The line across the top of a viewer page that says what happens to the project's build, or why
  * the PDF cannot be shown, as Overleaf's viewer shows its errors
  * (features/pdf-preview/components/pdf-preview-error.tsx). Its `data-state` attribute names the
- * state: one of the host's build states (src/core/projectBuilds.ts, BuildState), which the host's
+ * state: one of the host's build states (BuildState, src/core/viewerProtocol.ts), which the host's
  * 'buildState' messages carry, or 'failed' when the document could not be shown. The viewer
  * finds 'gone' itself too, when the loader reports the build's files missing from Overleaf's
  * servers and from its cache; it then tells the host (reportGone).
@@ -13,14 +13,17 @@ import { post } from './host';
 export type BannerState = Exclude<BuildState, 'ready'> | 'failed';
 
 /**
- * Each state's text, from the state's detail. The states in which the project has no PDF and
- * nothing more happens on its own offer Recompile; the others say what is under way.
+ * Each state's text, from the state's detail. The states in which the project has no PDF to show
+ * offer Recompile: while a viewer is visible, the window rests in them only when it does not
+ * compile on its own (ProjectBuilds); 'checking' and 'compiling' say what is under way, and
+ * 'unchecked' says quietly, over a PDF that is shown, that it may not be the latest.
  */
 const STATES: Record<BannerState, { text: (detail?: string) => string, recompile: boolean }> = {
-    'none': { text: () => 'There is no build of this PDF yet.', recompile: false },
-    'gone': { text: () => 'This build of the PDF is no longer on Overleaf\'s servers.', recompile: false },
+    'none': { text: () => 'There is no build of this PDF yet.', recompile: true },
+    'gone': { text: () => 'This build of the PDF is no longer on Overleaf\'s servers.', recompile: true },
     'checking': { text: () => 'Asking Overleaf for the latest compile of the project…', recompile: false },
     'compiling': { text: () => 'Compiling the project on Overleaf…', recompile: false },
+    'unchecked': { text: (detail) => `This PDF may not be the latest: Overleaf could not be asked for the latest compile: ${detail}`, recompile: false },
     'check-failed': { text: (detail) => `Overleaf could not be asked for the latest compile: ${detail}`, recompile: true },
     'compile-failed': { text: (detail) => `The compile ended without a PDF: ${detail}`, recompile: true },
     'compile-unavailable': { text: (detail) => `The project could not be compiled: ${detail}`, recompile: true },
@@ -96,12 +99,16 @@ export function showBuildState({ state, detail }: BuildStatus) {
 }
 
 /**
- * The document of build `build`, or a PDF read whole, was shown: a line about an earlier
- * document's failure, or its build being gone, goes. The page's data-shown-build attribute names
- * the build shown, for the harness's probes (scripts/pdf-viewer-harness).
+ * The document of build `build`, or a PDF read whole, was shown: the host is told which build
+ * (ProjectBuilds.buildShown), and a line about an earlier document's failure, or its build being
+ * gone, goes. The page's data-shown-build attribute names the build shown, for the harness's
+ * probes (scripts/pdf-viewer-harness).
  */
 export function documentShown(build: string | undefined) {
     document.documentElement.dataset.shownBuild = build ?? '';
+    if (build !== undefined) {
+        post({ type: 'buildShown', build });
+    }
     if (banner?.dataset.state === 'failed' || banner?.dataset.state === 'gone') {
         clearBanner();
     }

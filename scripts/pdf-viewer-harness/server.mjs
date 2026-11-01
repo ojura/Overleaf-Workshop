@@ -15,12 +15,14 @@
 // - The webview: GET /page?engine=overleaf|pdfjs serves <ext>/dist/<engine>.html with
 //   <!--viewer-config--> replaced as the provider replaces it, VS Code's default styles for
 //   webviews, and stub.js, which stands in for acquireVsCodeApi and the host's messages.
-// --ext is a views/pdf-viewer folder (with dist/ and vendor/pdfjs-5.1.91/), by default the
+// --ext is a views/pdf-viewer folder (with dist/ and the pdf.js release that package.json pins,
+// scripts/viewer-protocol.mjs's pdfjsReleaseFolder), by default the
 // checkout's; --book defaults to the 120-page test book in the work folder (common.mjs).
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { arg, book, bridgeModule, defaultExt, here, work } from './common.mjs';
+import { pdfjsReleaseFolder } from '../viewer-protocol.mjs';
 // the extension's bridge, bundled as CommonJS
 const { PdfFetchBridge, PieceCache, outputsOf } = bridgeModule();
 
@@ -222,7 +224,7 @@ function servePage(res, engine, doc) {
         res.writeHead(404).end(`${extDir}/dist/${engine}.html does not exist: npm run build-pdf-viewer writes it`);
         return;
     }
-    const vendor = `${origin}/ext/vendor/pdfjs-5.1.91`;
+    const vendor = `${origin}/ext/${pdfjsReleaseFolder}`;
     const config = {
         engine,
         pdfjs: {

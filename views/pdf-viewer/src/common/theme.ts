@@ -27,8 +27,8 @@ export function themesFrom(init: Pick<InitState, 'colorThemes'>): Theme[] {
 const isPlain = (theme: Theme) => /^(black|#000000)$/i.test(theme.fontColor) && /^(white|#ffffff)$/i.test(theme.bgColor);
 
 /**
- * Draw the pages in `theme`'s colors. The extension's patch to pdf.js
- * (vendor/pdfjs-5.1.91-dist.patch) reads globalThis.pdfjsViewerColorTheme whenever it draws a
+ * Draw the pages in `theme`'s colors. The extension's patch to pdf.js's release
+ * (views/pdf-viewer/vendor/pdfjs-<version>-dist.patch) reads globalThis.pdfjsViewerColorTheme whenever it draws a
  * page: black text and lines outside form XObjects take the theme's text color, and the page's
  * background the theme's background color. Images and colored content keep their colors, which
  * pdf.js's own page colors would map too.

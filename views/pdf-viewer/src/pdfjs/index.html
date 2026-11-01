@@ -21,9 +21,10 @@ Adobe CMap resources are covered by their own copyright but the same license:
 See https://github.com/adobe-type-tools/cmap-resources
 -->
 <!--
-pdf.js 5.1.91's web/viewer.html, the page of its viewer app, with the extension's head: the
-files come from the pdf.js release in views/pdf-viewer/vendor/pdfjs-5.1.91/ and the
-extension's page script from views/pdf-viewer/dist/. The body is unchanged.
+pdf.js's web/viewer.html, the page of its viewer app, with the extension's head: the files come
+from the folder of pdf.js's release in views/pdf-viewer/, which scripts/build-pdf-viewer.mjs writes
+into the URLs below (the release that package.json pins as pdfjs-dist), and the extension's page
+script from views/pdf-viewer/dist/. The body is unchanged.
 -->
 <html dir="ltr" mozdisallowselectionprint>
   <head>
@@ -34,16 +35,16 @@ extension's page script from views/pdf-viewer/dist/. The body is unchanged.
 
 <!-- the base URL (views/pdf-viewer/) and the page's configuration, from the extension -->
 <!--viewer-config-->
-<link rel="resource" type="application/l10n" href="vendor/pdfjs-5.1.91/web/locale/locale.json">
-<script src="vendor/pdfjs-5.1.91/build/pdf.mjs" type="module"></script>
+<link rel="resource" type="application/l10n" href="{{pdfjs-release}}/web/locale/locale.json">
+<script src="{{pdfjs-release}}/build/pdf.mjs" type="module"></script>
 
-    <link rel="stylesheet" href="vendor/pdfjs-5.1.91/web/viewer.css">
+    <link rel="stylesheet" href="{{pdfjs-release}}/web/viewer.css">
     <link rel="stylesheet" href="dist/pdfjs.css">
 
   <!-- the extension's page script runs before the viewer app, so that it can set the app's
        options when the app starts (views/pdf-viewer/src/pdfjs/main.ts) -->
   <script src="dist/pdfjs.mjs" type="module"></script>
-  <script src="vendor/pdfjs-5.1.91/web/viewer.mjs" type="module"></script>
+  <script src="{{pdfjs-release}}/web/viewer.mjs" type="module"></script>
   </head>
 
   <body tabindex="0">

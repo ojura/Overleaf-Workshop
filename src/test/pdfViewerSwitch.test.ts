@@ -1,7 +1,11 @@
 /* eslint-disable @typescript-eslint/naming-convention -- mirrors the 'vscode' export names */
 import * as assert from 'assert';
+import * as fs from 'fs';
 import * as path from 'path';
 import { loadWithVscode } from './standIn';
+
+/** the extension's package.json, as VS Code gives it to the extension (ExtensionContext.extension.packageJSON) */
+const packageJSON = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', '..', 'package.json'), 'utf8'));
 
 function stub(): any {
     const f: any = function () { return stub(); };
@@ -103,7 +107,7 @@ describe('the button that switches between the pdfjs and the overleaf viewer', (
         world.updates = [];
         world.configListeners = [];
         world.deleted = [];
-        provider = new PdfViewEditorProvider({ extensionUri: Uri.file('/ext'), globalStorageUri: Uri.file('/storage') });
+        provider = new PdfViewEditorProvider({ extensionUri: Uri.file('/ext'), globalStorageUri: Uri.file('/storage'), extension: { packageJSON } });
         void provider.triggers;
     });
 

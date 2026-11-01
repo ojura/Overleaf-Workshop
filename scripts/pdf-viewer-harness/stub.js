@@ -62,17 +62,19 @@
                 const res = await fetch('/bridge', { method: 'POST', body: JSON.stringify(message) });
                 const error = res.headers.get('x-bridge-error');
                 if (error) {
-                    deliver({ type: 'fetchError', id: message.id, message: decodeURIComponent(error) });
+                    deliver({ type: 'fetchError', page: message.page, id: message.id, message: decodeURIComponent(error) });
                     log('fetchError', { message: decodeURIComponent(error) });
                     break;
                 }
                 const meta = JSON.parse(res.headers.get('x-bridge'));
                 const body = await res.arrayBuffer();
-                deliver({ type: 'fetchResponse', ...meta, body });
+                // the answer names the page that asked, as the extension host's does
+                deliver({ type: 'fetchResponse', ...meta, page: message.page, body });
                 break;
             }
             case 'buildGone':
-                log('buildGone', { build: message.build });
+            case 'buildShown':
+                log(message.type, { build: message.build });
                 break;
             case 'fetchAbort':
                 fetch('/bridge-abort', { method: 'POST', body: JSON.stringify({ id: message.id }) });

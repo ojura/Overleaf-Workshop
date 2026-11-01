@@ -1,64 +1,22 @@
 /**
- * The messages between a viewer page and the extension host (src/core/pdfViewEditorProvider.ts).
- *
- * The page posts:
- *   { type: 'ready' }                    once it can take the document; the host answers with
- *                                        'initState', then 'load' or 'update'
- *   { type: 'saveState', content }       the document's viewer state, kept per document URI
- *   { type: 'syncPdf', content: { page, h, v, identifier } }   SyncTeX from the PDF to the source;
- *                                        page counts from 1, h and v are PDF points from the top left
- *   { type: 'recompile' }                compile the project again
- *   { type: 'buildGone', build }         the files of build `build` are gone from Overleaf's servers
- *                                        and its cache: the host asks Overleaf for the latest
- *                                        compile, and compiles when there is none to show
- *   { type: 'download' }                 save the PDF to a file the user picks
- *   { type: 'switchViewer', engine }     show the PDFs in the viewer `engine` ('pdfjs' or
- *                                        'overleaf'): the host sets overleaf-workshop.pdfViewer.engine,
- *                                        and the open viewers reload with that viewer's page
- *   { type: 'fetch' | 'fetchAbort', ... } the loader's requests (bridge-fetch.ts)
- *
- * The host posts:
- *   { type: 'initState', content?, colorThemes?, defaults? }
- *   { type: 'load', output }             a build, to load in ranges (output.ts)
- *   { type: 'update', content }          a PDF read whole, as an ArrayBuffer
- *   { type: 'buildState', state, detail? }   what happens to the project's build
- *                                        (src/core/projectBuilds.ts, BuildStatus; banner.ts)
- *   { type: 'syncCode', content }        SyncTeX from the source to the PDF (synctex.ts)
- *   { type: 'fetchResponse' | 'fetchError', ... }   answers to the loader's requests
+ * The page's side of the messages between a viewer page and the extension host
+ * (src/core/pdfViewEditorProvider.ts). The messages and their types are in src/core/viewerProtocol.ts
+ * (HostMessage, ViewerMessage).
  */
+import type { HostMessage, SavedState, ViewerMessage } from './protocol';
 
-/** A position in the document as PDFJSWrapper.currentPosition gives it. */
-export interface Position {
-    /** counts from 0 */
-    page: number;
-    offset: { top: number, left: number };
-    pageSize: { height: number, width: number };
-}
+/** the host's answer to 'ready' */
+export type InitState = Extract<HostMessage, { type: 'initState' }>;
 
-/** The viewer state of one document, which both viewers share. */
-export interface SavedState {
-    colorTheme?: string;
-    scale?: string;
-    position?: Position;
-    scrollMode?: number;
-    spreadMode?: number;
-    sidebarView?: number;
-    [other: string]: unknown;
-}
-
-export interface InitState {
-    type: 'initState';
-    content?: SavedState;
-    colorThemes?: Record<string, { fontColor: string, bgColor: string }>;
-    defaults?: { scrollMode?: string, spreadMode?: string };
-}
+/** the host's messages that a handler takes; bridge-fetch.ts takes the answers to the page's requests */
+type Handled = Exclude<HostMessage['type'], 'fetchResponse' | 'fetchError'>;
 
 declare function acquireVsCodeApi(): { postMessage(message: unknown): void, getState(): any, setState(state: unknown): void };
 
 // acquireVsCodeApi may be called only once per page
 const vscode = acquireVsCodeApi();
 
-export function post(message: object) {
+export function post(message: ViewerMessage) {
     vscode.postMessage(message);
 }
 
@@ -81,7 +39,7 @@ window.addEventListener('message', (event: MessageEvent) => {
 });
 
 /** Handle the host's messages of `type`; one handler per type, the last one set wins. */
-export function onMessage(type: string, handler: (message: any) => void) {
+export function onMessage<T extends Handled>(type: T, handler: (message: Extract<HostMessage, { type: T }>) => void) {
     handlers.set(type, handler);
     const waiting = early.get(type);
     early.delete(type);

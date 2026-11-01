@@ -1,9 +1,10 @@
 // Overleaf's caching flags must be set before its loader modules run: keep this import first.
 import '../common/transport';
 import PDFJSWrapper from '@/features/pdf-preview/util/pdf-js-wrapper';
-import { onMessage, post, ready, savedState, saveState, type Position } from '../common/host';
+import { onMessage, post, ready, savedState, saveState } from '../common/host';
+import type { Position, SyncBox } from '../common/protocol';
 import { documentShown, showBuildState, showLoadError } from '../common/banner';
-import { goToCode, listenForDoubleClick, showHighlights, type SyncBox } from '../common/synctex';
+import { goToCode, listenForDoubleClick, showHighlights } from '../common/synctex';
 import { applyTheme, themesFrom, type Theme } from '../common/theme';
 import { Documents } from './documents';
 import { Outline } from './outline';

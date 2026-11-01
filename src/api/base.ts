@@ -4,12 +4,9 @@ import { randomUUID } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { Agent, Dispatcher, fetch, FormData } from 'undici';
 import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
-
-function errorMessage(error: any): string {
-    const cause = error?.cause?.message;
-    const message = error?.message ?? String(error);
-    return cause ? `${message}: ${cause}` : message;
-}
+import type { SyncBox } from '../core/viewerProtocol';
+import { errorMessage } from '../utils/errorMessage';
+import { downloadDomainUrl } from './downloadDomain';
 
 /** Extract set-cookie headers from an undici/Response object. */
 function getSetCookie(res: any): string[] {
@@ -73,15 +70,8 @@ export interface SyncPdfResponseSchema {
     column: number
 }
 
-export interface SyncCodeResponseSchema {
-    pdf: Array<{
-        page: number,
-        h: number,
-        v: number,
-        width: number,
-        height: number,
-    }>
-}
+/** the PDF boxes of a source position, as Overleaf's sync/code answer lists them under `pdf` */
+export type SyncCodeResponseSchema = SyncBox[];
 
 export interface SnippetItemSchema {
     meta: string,
@@ -890,7 +880,8 @@ export class BaseAPI {
      * use the cache (ol-canUseClsiCache), and shows that PDF instead of compiling when the
      * compile's settings match its own (local-compile-context.tsx:219-223, 383-425). Overleaf
      * answers 404 when the cache has no compile, and 410 when the project changed after the
-     * latest one (ClsiCacheController.getLatestBuildFromCache); the error's `status` says which.
+     * latest one, or when the project's compiler or TeX Live image is not the cached compile's
+     * (ClsiCacheManager.mjs:52, 108, 141-143); the error's `status` says which.
      */
     async getLatestCompileFromCache(identity:Identity, projectId:string) {
         this.setIdentity(identity);
@@ -1001,6 +992,13 @@ export class BaseAPI {
      * and the editor, for which the web server passes the request on to the compile server, and
      * on to Overleaf's cache when the compile server answers 404 (CompileController.mjs,
      * canTryClsiCacheFallback). Undefined when Overleaf's answer gives no downloadURL.
+     *
+     * These routes send a file whole, whatever the request's Range header says: the web server
+     * fetches the file without it and passes on the status, the length and the type
+     * (ClsiCacheController.mjs:113-152; CompileController.mjs, _proxyToClsi). Asked for bytes 0-99
+     * of the book's output.pdf at its cached route, Overleaf answered 200 with all 885,588,853 bytes
+     * (the IDE test of 2026-11-01). The window reads them whole on purpose; ranges of a build come
+     * from the download domain (downloadDomainUrl, cachedDownloadDomainUrl).
      */
     static webRouteOf(file:OutputFileEntity, response:CompileResponseSchema, editorId?:string): string | undefined {
         if (response.fromCache) {
@@ -1035,12 +1033,7 @@ export class BaseAPI {
         // The CDN is cross-origin, so we must NOT send web frontend cookies.
         if (pdfDownloadDomain && clsiServerId) {
             try {
-                const query = new URLSearchParams();
-                if (compileGroup) { query.set('compileGroup', compileGroup); }
-                query.set('clsiserverid', clsiServerId);
-                query.set('enable_pdf_caching', 'true');
-                const cdnUrl = `${pdfDownloadDomain.replace(/\/+$/, '')}/${url.replace(/^\/+/g, '')}?${query}`;
-                const content = await this._downloadAbsolute(cdnUrl, false);
+                const content = await this._downloadAbsolute(downloadDomainUrl(pdfDownloadDomain, url, clsiServerId, compileGroup), false);
                 return { type: 'success', content: new Uint8Array(content) };
             } catch (error) {
                 // The download domain does not serve every output file: it answered HTTP 503
