@@ -7,10 +7,12 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { onCleanup } from '../lib/cleanup.mjs';
-import { connect, evaluate, waitFor, waitForActivePort, WaitLimitError } from '../lib/devtools.mjs';
+import { connect, evaluate, waitFor, waitForActivePort, waitForTarget, WaitLimitError } from '../lib/devtools.mjs';
 
-/** The last resort for a Chrome that runs but never opens DevTools; it opens them within a second or two. */
+/** The last resort for a Chrome that runs but never opens DevTools and its first page; it opens them within a second or two. */
 const DEVTOOLS_LIMIT_MS = 30000;
+/** The last resort for a Chrome that does not end after SIGTERM: then it gets SIGKILL. */
+const EXIT_LIMIT_MS = 10000;
 
 /** Write each line that `stream` gives to this process's stderr, after `prefix`; empty lines are left out. */
 function forwardLines(stream, prefix) {
@@ -27,16 +29,29 @@ function forwardLines(stream, prefix) {
 /**
  * Start headless Chrome on a new profile in the folder `dir` and connect to its page. close()
  * stops Chrome and deletes the profile; when the script ends before that, its clean-up kills
- * Chrome and deletes the profile (scripts/lib/cleanup.mjs). Chrome's own messages go to this process's stderr, each line
- * after "chrome: ".
+ * Chrome and deletes the profile (scripts/lib/cleanup.mjs). Chrome's own messages go to this
+ * process's stderr, each line after "chrome: ".
+ *
+ * Chrome runs outside the caller's desktop session, as the test instance of the IDE does
+ * (scripts/hidden-ide.mjs): of the caller's environment it gets PATH and LANG, its HOME and XDG
+ * folders are in the profile, so it does not find the user's session bus, and it keeps the
+ * secrets it encrypts in the profile (--password-store=basic) instead of the user's keyring.
  */
 export async function launchChrome({ dir, width = 1200, height = 900 }) {
     const profile = fs.mkdtempSync(path.join(dir, 'chrome-profile-'));
+    const home = path.join(profile, 'home');
     const chrome = spawn(process.env.CHROME || 'google-chrome', [
-        '--headless=new', `--user-data-dir=${profile}`, '--remote-debugging-port=0',
+        '--headless=new', `--user-data-dir=${profile}`, '--remote-debugging-port=0', '--password-store=basic',
         '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-background-networking',
         `--window-size=${width},${height}`, 'about:blank',
-    ], { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
+    ], {
+        stdio: ['ignore', 'ignore', 'pipe'], detached: true,
+        env: {
+            PATH: process.env.PATH, LANG: process.env.LANG ?? 'C.UTF-8', HOME: home,
+            XDG_CONFIG_HOME: path.join(home, '.config'), XDG_DATA_HOME: path.join(home, '.local', 'share'),
+            XDG_CACHE_HOME: path.join(home, '.cache'), XDG_STATE_HOME: path.join(home, '.local', 'state'),
+        },
+    });
     forwardLines(chrome.stderr, 'chrome: ');
     /** settles when Chrome's process has ended, with how it ended */
     const ended = new Promise((resolve, reject) => {
@@ -47,27 +62,36 @@ export async function launchChrome({ dir, width = 1200, height = 900 }) {
     const stop = (signal = 'SIGTERM') => { try { process.kill(-chrome.pid, signal); } catch { chrome.kill(signal); } };
     const removeProfile = () => fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     const cleanup = onCleanup(() => { stop('SIGKILL'); removeProfile(); });
+    /** stop Chrome with `signal`, and with SIGKILL when it has not ended within EXIT_LIMIT_MS */
+    const end = async (signal) => {
+        stop(signal);
+        let timer;
+        const limit = new Promise((resolve) => { timer = setTimeout(() => resolve('limit'), EXIT_LIMIT_MS); });
+        if ((await Promise.race([ended.catch(() => 'ended'), limit])) === 'limit') {
+            process.stderr.write(`chrome: still running ${EXIT_LIMIT_MS / 1000} s after ${signal}; sending SIGKILL\n`);
+            stop('SIGKILL');
+            await ended.catch(() => {});
+        }
+        clearTimeout(timer);
+    };
     let browser;
     let page;
     try {
         browser = await connect(await waitForActivePort(profile, { ended, limitMs: DEVTOOLS_LIMIT_MS }));
-        const { targetInfos } = await browser.send('Target.getTargets');
-        const target = targetInfos.find(t => t.type === 'page');
-        if (!target) { throw new Error(`headless Chrome (pid ${chrome.pid}) has no page`); }
+        // the page that Chrome opens for about:blank, from its targets or from the event of its creation
+        const target = await waitForTarget(browser, t => t.type === 'page', { what: "Chrome's first page", limitMs: DEVTOOLS_LIMIT_MS });
         page = pageOf(await browser.attach(target.targetId));
     } catch (error) {
         browser?.close();
         cleanup.cancel();
-        stop('SIGKILL');
-        await ended.catch(() => {});
+        await end('SIGKILL');
         removeProfile();
         throw error;
     }
     const close = async () => {
         cleanup.cancel();
         browser.close();
-        stop();
-        await ended.catch(() => {});
+        await end('SIGTERM');
         removeProfile();
     };
     return { chrome, page, close };

@@ -66,7 +66,13 @@ export function waitForActivePort(profile, { ended, limitMs }) {
         let timer;
         const finish = (settle, value) => { clearTimeout(timer); watcher.close(); settle(value); };
         const look = () => {
-            const url = activePortUrl(profile);
+            let url;
+            try {
+                url = activePortUrl(profile);
+            } catch (error) {
+                finish(reject, error); // the file exists and cannot be read
+                return;
+            }
             if (url) { finish(resolve, url); }
         };
         timer = setTimeout(() => finish(reject, new Error(`the browser of ${profile} did not open DevTools within ${limitMs / 1000} s`)), limitMs);
