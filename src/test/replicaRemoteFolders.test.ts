@@ -48,6 +48,7 @@ function projectTree(t: ReturnType<typeof world>, tree: any, VirtualFileSystem: 
         documentUpdatesSettled: async () => {},
         createFile: async (uri: Uri) => { asked.push(`create ${rel(uri)}`); throw new Error('not sent in this test'); },
         writeFile: async (uri: Uri) => { asked.push(`write ${rel(uri)}`); throw new Error('not sent in this test'); },
+        writeDoc: async (uri: Uri) => { asked.push(`write ${rel(uri)}`); throw new Error('not sent in this test'); },
         remove: async (uri: Uri) => { asked.push(`remove ${rel(uri)}`); throw new Error('not sent in this test'); },
         rename: async (from: Uri, to: Uri) => { asked.push(`rename ${rel(from)} ${rel(to)}`); throw new Error('not sent in this test'); },
         mkdir: async (uri: Uri) => { asked.push(`mkdir ${rel(uri)}`); throw new Error('not sent in this test'); },

@@ -1066,7 +1066,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                         if ((outcome==='applied' || outcome==='resent') && write.fromEditor && editor!==undefined && !editor.isDirty) {
                             // The editor dropped the unsaved text of its save: a save that Overleaf
                             // has not confirmed leaves the editor with unsaved changes until then.
-                            vscode.window.showInformationMessage(`${doc.name}: the update of ${VirtualFileSystem.timeOf(write)} that the editor dropped is in Overleaf's text: ${outcome==='applied' ? 'Overleaf had applied it' : 'Overleaf had not applied it, and Overleaf Workshop sent it again when the editor read the file'}. Undo it in the file if you meant to drop it.`);
+                            vscode.window.showInformationMessage(`${doc.name}: the update of ${VirtualFileSystem.timeOf(write)} that the editor dropped is in Overleaf's text: ${outcome==='applied' ? 'Overleaf had applied it' : 'Overleaf had not applied it, and Overleaf Workshop sent it again when the file was read from Overleaf'}. Undo it in the file if you meant to drop it.`);
                         }
                     }
                     return doc.remoteCache ?? (await this.readDoc(doc)).content;
@@ -1330,7 +1330,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             if (undetermined) {
                 if (!undetermined.replace) {
                     this.tellUndetermined(uri, doc);
-                    throw vscode.FileSystemError.Unavailable(`${uri.path}: Overleaf Workshop cannot tell whether Overleaf applied the update of ${VirtualFileSystem.timeOf(undetermined.write)} (${undetermined.reason}), so it does not merge this text with Overleaf's. Compare it with Overleaf's text. ${VirtualFileSystem.replaceChoice} in the notice about ${doc.name} makes the editor's text Overleaf's text at the next save, which deletes what others changed in the file since this editor loaded it.`);
+                    throw vscode.FileSystemError.Unavailable(`${uri.path}: Overleaf Workshop cannot tell whether Overleaf applied the update of ${VirtualFileSystem.timeOf(undetermined.write)} (${undetermined.reason}), so it does not merge this text with Overleaf's. Compare it with Overleaf's text. ${VirtualFileSystem.replaceChoice} in the notice about ${doc.name} replaces Overleaf's text of the file with the editor's text at the next save, which deletes what others changed in the file since this editor loaded it.`);
                 }
                 // the user chose to replace Overleaf's text with this one: base it on Overleaf's text as it is now
                 doc.localCache = doc.remoteCache;
@@ -1630,7 +1630,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         const open = vscode.workspace.textDocuments.some((d) => d.uri.toString()===uri.toString());
         const {compareChoice, replaceChoice} = VirtualFileSystem;
         const shown = open
-            ? vscode.window.showWarningMessage(`${what} The editor keeps your text. Compare it with Overleaf's text first. ${replaceChoice} makes Overleaf's text of ${doc.name} the editor's text at the next save: it deletes what others added or changed in ${doc.name} since this editor loaded it, unless the editor's text has those changes too.`, compareChoice, replaceChoice)
+            ? vscode.window.showWarningMessage(`${what} The editor keeps your text. Compare it with Overleaf's text first. ${replaceChoice} replaces Overleaf's text of ${doc.name} with the editor's text at the next save: it deletes what others added or changed in ${doc.name} since this editor loaded it, unless the editor's text has those changes too.`, compareChoice, replaceChoice)
             : vscode.window.showWarningMessage(`${what} The next read of the file takes Overleaf's text as it is then; check the file.`);
         Promise.resolve(shown).then((choice) => {
             state.shown = false;
@@ -1670,10 +1670,11 @@ export class VirtualFileSystem extends vscode.Disposable {
     /**
      * Resolves once Overleaf has confirmed every document write made so far. Waits for the
      * writes going on and, while the project is joined on a working connection (see connected),
-     * settles each write that Overleaf has not confirmed (see settleUnconfirmed). Rejects with
-     * UnconfirmedWritesError naming the documents with a write that Overleaf has still not
-     * confirmed, or with an outcome that cannot be determined; during a reconnect, the documents
-     * are those of the tree from before the connection was lost.
+     * settles each write that Overleaf has not confirmed (see settleUnconfirmed), and reads a doc
+     * with an outcome that cannot be determined when no editor is open on it, which ends that
+     * state. Rejects with UnconfirmedWritesError naming the documents with a write that Overleaf
+     * has still not confirmed, or with an outcome that cannot be determined; during a reconnect,
+     * the documents are those of the tree from before the connection was lost.
      */
     async documentUpdatesSettled(): Promise<void> {
         const docs = this.walk(entity => entity._type==='doc', this.root ?? this.previousRoot);
@@ -1684,9 +1685,11 @@ export class VirtualFileSystem extends vscode.Disposable {
                 const uri = this.pathToUri(path);
                 try {
                     if (doc.unconfirmed) { await this.settleUnconfirmed(uri, doc); }
-                    if (doc.undetermined && this.editorOf(uri)?.isDirty!==true) {
-                        // Without an editor holding unsaved changes, read the doc as a reader that
-                        // is not an editor: its base is Overleaf's text again (see takeRead).
+                    if (doc.undetermined && this.editorOf(uri)===undefined) {
+                        // Without an editor open on the doc, read it as a reader that is not an
+                        // editor: its base is Overleaf's text again (see takeRead). An open editor
+                        // keeps the state until its own read or save ends it: this read would not
+                        // reach it, and its next save would be based on text that it does not show.
                         this.takeRead(doc, uri, (await this.readDoc(doc)).content);
                     }
                 } catch {

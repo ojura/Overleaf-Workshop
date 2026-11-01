@@ -576,7 +576,7 @@ describe('VirtualFileSystem: deciding from Overleaf\'s history whether it applie
         assert.match(notices.shown[0], /main\.tex: Overleaf Workshop cannot tell whether Overleaf applied the update/);
         // Compare comes first, and the notice says what replacing Overleaf's text does
         assert.deepStrictEqual(notices.choices[0], ['Compare With Overleaf', 'Replace Overleaf\'s Text']);
-        assert.match(notices.shown[0], /it deletes what others added or changed in main\.tex since this editor loaded it/);
+        assert.match(notices.shown[0], /Replace Overleaf's Text replaces Overleaf's text of main\.tex with the editor's text at the next save: it deletes what others added or changed in main\.tex since this editor loaded it/);
         // a save does not merge the editor's text with Overleaf's
         notices.choice = 'Replace Overleaf\'s Text';
         await assert.rejects(t.save('hello a b'), /cannot tell whether Overleaf applied the update/);
@@ -653,7 +653,7 @@ describe('VirtualFileSystem: deciding from Overleaf\'s history whether it applie
         t.editor.isDirty = false;                 // reverted: VS Code reads the file again
         assert.strictEqual(await t.open(), 'hello a');
         assert.strictEqual(t.doc.unconfirmed, undefined);
-        assert.match(notices.told[0], /^main\.tex: the update of .+ that the editor dropped is in Overleaf's text: Overleaf had not applied it, and Overleaf Workshop sent it again when the editor read the file\./);
+        assert.match(notices.told[0], /^main\.tex: the update of .+ that the editor dropped is in Overleaf's text: Overleaf had not applied it, and Overleaf Workshop sent it again when the file was read from Overleaf\./);
     });
 
     it('tells the user when an edit that the editor dropped (Revert) had been applied', async () => {
@@ -768,8 +768,9 @@ describe('VirtualFileSystem: a history read that Overleaf refuses, and the reaso
         assert.strictEqual(t.server.emitted.length, 1);
     });
 
-    it('ends at settled() an outcome it cannot determine by reading the doc, unless an editor holds unsaved changes', async () => {
+    it('ends at settled() an outcome it cannot determine by reading the doc, when no editor is open on it', async () => {
         const t = setup('hello');
+        vscodeMock.workspace.textDocuments = [];  // only the local replica reads and writes the doc
         await t.open();
         t.server.dropAfterApply = true;
         await assert.rejects(t.save('hello a'), /has not confirmed/);
@@ -781,6 +782,21 @@ describe('VirtualFileSystem: a history read that Overleaf refuses, and the reaso
         assert.strictEqual(notices.shown.length, 1);
         await t.vfs.writeDoc(t.uri, new TextEncoder().encode('hello a b'));
         assert.strictEqual(t.server.content, 'hello a b');
+    });
+
+    it('keeps an outcome it cannot determine while an editor is open on the doc, so that the editor\'s save does not delete others\' edits (S1)', async () => {
+        const t = setup('hello');
+        await t.open();                           // the editor shows 'hello'
+        t.server.neverApply = true;               // the replica's write is queued and not applied, and its callback is lost
+        t.server.loseNextCallback = () => {};
+        await assert.rejects(t.vfs.writeDoc(t.uri, new TextEncoder().encode('hello a')), /has not confirmed/);
+        t.server.neverApply = false;
+        await t.collaborator(0, '# ');            // the copy was dropped: the open editor is not told
+        t.server.refuseHistory = 'Something went wrong in real-time service';
+        await assert.rejects(t.vfs.documentUpdatesSettled(), namesMainTex(/^cannot be determined \(Overleaf refused to read the document's updates since then/));
+        t.editor.isDirty = true;                  // the user types in the editor, which still shows 'hello'
+        await assert.rejects(t.save('hello z'), /cannot tell whether Overleaf applied the update/);
+        assert.strictEqual(t.server.content, '# hello');
     });
 
     it('names a write that it could not ask Overleaf about with both reasons, each once', async () => {

@@ -100,7 +100,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
         const vfs = t.vfs as any;
         vfs.connected = false;
         const message = 'Not connected to www.overleaf.com; reconnecting in the background.';
-        const keys = options.treeAnswers ? ['getUpdates'] : ['init', '_resolveUri', 'openFile', 'writeFile', 'createFile', 'remove', 'rename', 'mkdir', 'getUpdates'];
+        const keys = options.treeAnswers ? ['getUpdates'] : ['init', '_resolveUri', 'openFile', 'writeFile', 'writeDoc', 'createFile', 'remove', 'rename', 'mkdir', 'getUpdates'];
         for (const key of keys) {
             const original = vfs[key];
             vfs[key] = async (...args: any[]) => { if (!vfs.connected) { throw new Error(message); } return original(...args); };
