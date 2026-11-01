@@ -866,7 +866,7 @@ export class ReplicaSync {
         if (this.stopped || open.size===0) { return; }
         try {
             const deletable = await this.deletable();
-            const renamed = await this.renamedPaths(mode);
+            const renamed = await this.renamedPaths();
             for (const where of ['local', 'remote'] as const) {
                 if (requested[where].length===0 || this.stopped) { continue; }
                 const side = where==='local' ? 'in the local folder' : 'on Overleaf';
@@ -922,11 +922,13 @@ export class ReplicaSync {
 
     /**
      * The synced paths that a rename takes away, not a deletion: the old paths that git pairs with
-     * a new local file (`localRenames`), and the paths of renames made on Overleaf that
-     * `remoteRenamed` is applying. They are neither counted nor deleted.
+     * a new local file, and the paths of renames made on Overleaf that `remoteRenamed` is
+     * applying. They are neither counted nor deleted. The pairing is made when the deletion step
+     * decides (`currentRenames`), not taken from the batch: a pair whose rename Overleaf refused,
+     * and whose new file is uploaded since, is not a pair any more, and its old path is a deletion.
      */
-    private async renamedPaths(mode: Mode): Promise<Set<string>> {
-        const paths = new Set((await this.localRenames(mode)).values());
+    private async renamedPaths(): Promise<Set<string>> {
+        const paths = new Set((await this.currentRenames()).values());
         for (const path of Object.keys(this.state.entries)) {
             if (this.movingOnOverleaf(path)) { paths.add(path); }
         }
@@ -1254,29 +1256,31 @@ export class ReplicaSync {
         }
     }
 
+    /** git's pairing of the local renames and moves (`currentRenames`), which the reconciles of one mode ask for once. */
+    private localRenames(mode: Mode): Promise<Map<string, string>> {
+        mode.renames ??= this.currentRenames();
+        return mode.renames;
+    }
+
     /**
      * git's pairing of the synced files gone from the folder with the new files in it, by new
-     * path (the store's `renames`; docs/replica-workflows.md, "Renames and moves"). The reconciles
-     * of one mode ask for it once. A pairing reads the folder, the saved state and Overleaf after
-     * the requests it answers: a request joins the next pairing while that one has not started,
-     * and otherwise starts one after the running one. The requests that come while a pairing runs
-     * share the next one, so a burst of events, such as for the files of a moved folder, lists the
-     * folder and runs git about twice, not once per file.
+     * path (the store's `renames`; docs/replica-workflows.md, "Renames and moves"), as the folder,
+     * the saved state and Overleaf are after this request: a request joins the next pairing
+     * while that one has not started, and otherwise starts one after the running one. The
+     * requests that come while a pairing runs share the next one, so a burst of events, such as
+     * for the files of a moved folder, lists the folder and runs git about twice, not once per file.
      */
-    private localRenames(mode: Mode): Promise<Map<string, string>> {
-        if (mode.renames===undefined) {
-            let run = this.renamesWaiting;
-            if (run===undefined) {
-                run = this.renamesTail.then(() => {
-                    this.renamesWaiting = undefined;
-                    return this.pairRenames();
-                });
-                this.renamesWaiting = run;
-                this.renamesTail = run.catch(() => {});
-            }
-            mode.renames = run;
+    private currentRenames(): Promise<Map<string, string>> {
+        let run = this.renamesWaiting;
+        if (run===undefined) {
+            run = this.renamesTail.then(() => {
+                this.renamesWaiting = undefined;
+                return this.pairRenames();
+            });
+            this.renamesWaiting = run;
+            this.renamesTail = run.catch(() => {});
         }
-        return mode.renames;
+        return run;
     }
 
     /**

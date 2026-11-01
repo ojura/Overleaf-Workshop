@@ -122,8 +122,11 @@ class Remote implements ReplicaRemote {
         this.files.set(p, content);
         return { kind: 'file', hash: gitBlobHash(content) };
     }
+    /** while set, Overleaf refuses every rename */
+    refuseRenames = false;
     async rename(from: string, to: string) {
         this.calls.push(`rename ${from} ${to}`);
+        if (this.refuseRenames) { throw new Error(`Overleaf refused to rename ${from}`); }
         const id = this.idOf(from);
         if (this.docs.has(from)) { this.docs.set(to, this.docs.get(from)!); this.docs.delete(from); }
         else if (this.files.has(from)) { this.files.set(to, this.files.get(from)!); this.files.delete(from); }
@@ -818,6 +821,17 @@ describe('local replica: git as the merge backend', function () {
             assert.match(t.g('diff', '--name-status', '-M', first, 'HEAD'), /^R100\tchapter.tex\tintro.tex$/m, 'git\'s view of the recorded state');
             assert.strictEqual(t.g('status', '--porcelain'), 'M intro.tex', 'git status: the local change, still to push');
             await sync.stop();
+        });
+
+        it('deletes the old path of a rename that Overleaf refuses in the same step, once the new file is uploaded', async () => {
+            const t = await synced({ '/a.tex': chapter });
+            move(t, 'a.tex', 'b.tex');
+            fs.writeFileSync(path.join(t.folder, 'b.tex'), edited);
+            t.remote.refuseRenames = true;
+            const summary = await t.sync.flush(true);
+            assert.deepStrictEqual([...t.remote.calls].sort(), ['remove /a.tex', 'rename /a.tex /b.tex', 'upload /b.tex'], 'what the sync asked of Overleaf: the refused rename, a new document and the deletion');
+            assert.deepStrictEqual([summary.renamed, summary.uploaded, summary.deletedRemote], [[], ['/b.tex'], ['/a.tex']], 'the summary of the step');
+            await t.sync.stop();
         });
 
         it('renames the six files that one checkout renames, beside a deletion, without a question about deletions', async () => {
