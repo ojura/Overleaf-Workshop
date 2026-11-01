@@ -144,16 +144,24 @@ export class SCMCollectionProvider extends vscode.Disposable {
             });
         }
         // insert into collection
+        const triggers = enabled ? await this.start(scm) : [];
+        if (triggers===undefined) { return undefined; }
+        this.scms.push({scm,enabled,triggers});
+        this.updateStatus();
+        return scm;
+    }
+
+    /**
+     * Start `scm`: its triggers, or undefined when it did not start. The one notice of the failure,
+     * with its reason, is shown here, wherever the start comes from (the project's settings, a new
+     * source control, Enable); the source control's log has the details.
+     */
+    private async start(scm: BaseSCM): Promise<vscode.Disposable[] | undefined> {
         try {
-            const triggers = enabled ? await scm.triggers : [];
-            this.scms.push({scm,enabled,triggers});
-            this.updateStatus();
-            return scm;
+            return await scm.triggers;
         } catch (error) {
-            // permanently remove failed scm
-            // this.vfs.setProjectSCMPersist(scm.scmKey, undefined);
-            // the one notice of the failure, with its reason; the source control's log has the details
-            vscode.window.showErrorMessage(vscode.l10n.t('"{scm}" creation failed: {error}', {scm: scmProto.label, error: String((error as Error)?.message ?? error)}));
+            const label = (scm.constructor as {label?: string}).label;
+            vscode.window.showErrorMessage(vscode.l10n.t('"{scm}" creation failed: {error}', {scm: label, error: String((error as Error)?.message ?? error)}));
             return undefined;
         }
     }
@@ -227,7 +235,16 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     const scmIndex = this.scms.indexOf(scmItem);
                     this.scms[scmIndex].enabled = persist.enabled;
                     if (persist.enabled) {
-                        scmItem.triggers = await scmItem.scm.triggers;
+                        const triggers = await this.start(scmItem.scm);
+                        if (triggers===undefined) {
+                            // it did not start, which start() has told: it stays disabled
+                            persist.enabled = false;
+                            this.vfs.setProjectSCMPersist(scmItem.scm.scmKey, persist);
+                            this.scms[scmIndex].enabled = false;
+                            this.updateStatus();
+                            break;
+                        }
+                        scmItem.triggers = triggers;
                     } else {
                         scmItem.triggers.forEach(trigger => trigger.dispose());
                         scmItem.triggers = [];
