@@ -409,6 +409,13 @@ export class ReplicaSync {
      * keep waiting for the lock's removal.
      */
     static staleLockMs = 10_000;
+    /**
+     * How long a tool's request waits for another program's git index lock to go before it
+     * answers that the sync waits. The IDE's own git takes the lock for a few milliseconds when it
+     * refreshes the index, e.g. after the sync wrote files, so a tool's request right after a sync
+     * can meet it. A lock that stays never goes, and this limit is the last resort for it.
+     */
+    static toolLockWaitMs = 2_000;
 
     private state: SavedState = {version: 1, entries: {}, untracked: []};
     private loaded?: Promise<void>;
@@ -532,10 +539,16 @@ export class ReplicaSync {
         // While another program holds git's index lock, git writes the work tree and the index, as
         // in a checkout, which moves HEAD last. A window step waits until the lock is gone and asks
         // again, without the full sync that ends a wait: the step itself goes on. A tool's request
-        // answers at once that the sync waits.
+        // waits up to toolLockWaitMs, and then answers that the sync waits; for a lock that stays
+        // (`lockReason`), it answers at once.
         for (let lock = await this.store.foreignIndexLock?.(); lock!==undefined; lock = await this.store.foreignIndexLock?.()) {
-            if (by==='tool') { return (await this.lockReason(lock)).reason; }
-            await this.indexLockReleased(lock);
+            if (by==='tool') {
+                const {reason, stays} = await this.lockReason(lock);
+                if (stays) { return reason; }
+                if (!await this.indexLockGoesWithin(lock, ReplicaSync.toolLockWaitMs)) { return (await this.lockReason(lock)).reason; }
+            } else {
+                await this.indexLockReleased(lock);
+            }
             if (this.stopped) { return 'the sync stopped'; }
         }
         const tree = await this.store.workTree?.();
@@ -587,9 +600,21 @@ export class ReplicaSync {
         return {reason: `git holds its index lock ${file}: it is writing the folder, e.g. for a checkout`, stays: false, staysFrom};
     }
 
+    /** Whether another program's index lock `file` goes, or the sync stops, within `ms` (`indexLockReleased`). */
+    private async indexLockGoesWithin(file: string, ms: number): Promise<boolean> {
+        let timer: NodeJS.Timeout | undefined;
+        const limit = new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), ms); });
+        try {
+            return await Promise.race([this.indexLockReleased(file).then(() => true), limit]);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
     /**
      * Resolves once another program's index lock `file` is gone (the store's event), or the sync
-     * stops; the window's steps that wait for it share one wait. When the lock stays
+     * stops; the steps that wait for it, the window's and a tool's (`indexLockGoesWithin`), share
+     * one wait. When the lock stays
      * (`lockReason`), the user is told, with the file, as git's own message about the lock names
      * it; the steps keep waiting.
      */
@@ -605,6 +630,8 @@ export class ReplicaSync {
             if (over || staysFrom===undefined) { return; }
             if (!stays) {
                 timer = setTimeout(look, staysFrom - Date.now());
+                // the wait itself keeps the work that waits; the look alone does not keep a process alive
+                timer.unref?.();
                 return;
             }
             wait.stale = reason;
@@ -794,7 +821,7 @@ export class ReplicaSync {
             // then both of its paths sync as they are, in the queues of both; a move that finds the
             // sync waiting at either check, the first or the one right before it moves the file, waits
             const moving = moves.map(([a, b]) => this.inQueues([a, b], async () => {
-                const waitsFor = await this.mayAct() ?? await this.reported(a, mode, () => this.moveLocally(a, b, mode.summary));
+                const waitsFor = await this.mayAct() ?? await this.reported(a, mode, () => this.moveLocally(a, b, mode));
                 if (waitsFor!==undefined) { waits = true; return; }
                 await this.reconcileReported(a, mode);
                 if (this.tracked(b)) { await this.reconcileReported(b, mode); }
@@ -829,14 +856,14 @@ export class ReplicaSync {
     }
 
     /** Move the local file at `from` and its saved entry to `to`, as Overleaf moved it; nothing when it cannot move. */
-    private async moveLocally(from: string, to: string, summary: SyncSummary): Promise<void> {
+    private async moveLocally(from: string, to: string, mode: Mode): Promise<void> {
         const entry = this.state.entries[from];
         if (!this.local.move || entry===undefined || this.state.entries[to]!==undefined || !this.tracked(to)) { return; }
         const [localFrom, localTo, remoteFrom, remoteTo] = await Promise.all([
             this.local.stat(from), this.local.stat(to), this.remote.entry(from), this.remote.entry(to)]);
         if (localFrom===undefined || localFrom==='folder' || localTo!==undefined || remoteFrom!==undefined || remoteTo?.kind!==entry.kind) { return; }
         if (await this.isUnmerged(from) || await this.isUnmerged(to)) { return; }
-        await this.beforeWrite();
+        await this.beforeWrite(mode);
         await this.local.move(from, to);
         // The entry keeps the size and time the file had when it held the base. A hard link keeps
         // the file itself, with them, so they still tell whether it holds the base; a copy, where
@@ -846,7 +873,7 @@ export class ReplicaSync {
         this.noteChange(from, 'remote');
         this.noteChange(to, 'remote');
         this.scheduleSave();
-        summary.renamedLocally.push({from, to});
+        mode.summary.renamedLocally.push({from, to});
         this.ui.log(`${from}: renamed to ${to} locally, as on Overleaf`);
         if (parentOf(from)!==parentOf(to)) { await this.local.removeFolderIfEmpty(parentOf(from)); }
     }
@@ -1059,13 +1086,15 @@ export class ReplicaSync {
      * the step is found here. While the sync waits, the reconcile leaves its path (SyncWaitsError)
      * to the full sync after the wait. When the lock is gone, or the operation is over, by the
      * time mayAct answers, git may have written the file since the reconcile read it, and the
-     * reconcile reads both sides again (StaleReadError). When neither is there, the check is the
-     * existence of their files.
+     * reconcile reads both sides again (StaleReadError). mayAct is asked as at the start of the
+     * step: for a tool's request (`mode.tool`) as a tool, which waits for a lock up to
+     * toolLockWaitMs and does not ask the window about a checked-out commit. When neither is
+     * there, the check is the existence of their files.
      */
-    private async beforeWrite(): Promise<void> {
+    private async beforeWrite(mode: Mode): Promise<void> {
         const [operation, lock] = await Promise.all([this.store.operation?.(), this.store.foreignIndexLock?.()]);
         if (operation===undefined && lock===undefined) { return; }
-        const reason = await this.mayAct();
+        const reason = await this.mayAct(mode.tool ? 'tool' : undefined);
         if (reason!==undefined) { throw new SyncWaitsError(reason); }
         throw new StaleReadError(`${lock!==undefined ? `git held its index lock ${lock}` : `git was in the middle of ${operation}`} when the sync was about to write; it reads both sides again`);
     }
@@ -1323,7 +1352,7 @@ export class ReplicaSync {
         if (localHash!==undefined && remoteHash!==undefined) {
             if (base===undefined || this.firstRunLocalOnly.has(path)) {
                 // No saved state tells which side changed: keep the local version aside.
-                await this.keepAside(path, localContent ?? await this.local.read(path), remote!, remoteText, remoteContent, summary);
+                await this.keepAside(path, localContent ?? await this.local.read(path), remote!, remoteText, remoteContent, mode);
                 return;
             }
             if (entry.conflict) {
@@ -1334,7 +1363,7 @@ export class ReplicaSync {
                 if (hasConflictMarkers(localText) || await this.isUnmerged(path)) {
                     if (remoteHash!==base && remote!.kind==='doc') {
                         // Overleaf changed again: take that into the file, markers and all.
-                        await this.mergeDoc(path, entry, localText, remoteText!, localStat, summary);
+                        await this.mergeDoc(path, entry, localText, remoteText!, localStat, mode);
                     } else {
                         this.blocked(path);
                     }
@@ -1343,14 +1372,14 @@ export class ReplicaSync {
                 this.warnedConflicts.delete(path);
             }
             if (remoteHash===base) {
-                await this.upload(path, localContent ?? await this.local.read(path), localStat, remote!, summary);
+                await this.upload(path, localContent ?? await this.local.read(path), localStat, remote!, mode);
             } else if (localHash===base) {
-                await this.download(path, remote!, remoteText, remoteContent, summary);
+                await this.download(path, remote!, remoteText, remoteContent, mode);
             } else if (remote!.kind==='doc') {
                 localContent ??= await this.local.read(path);
-                await this.mergeDoc(path, entry!, decoder.decode(localContent), remoteText!, localStat, summary);
+                await this.mergeDoc(path, entry!, decoder.decode(localContent), remoteText!, localStat, mode);
             } else {
-                await this.keepAside(path, localContent ?? await this.local.read(path), remote!, remoteText, remoteContent, summary);
+                await this.keepAside(path, localContent ?? await this.local.read(path), remote!, remoteText, remoteContent, mode);
             }
             return;
         }
@@ -1366,7 +1395,7 @@ export class ReplicaSync {
                     const renames = await this.localRenames(mode);
                     const from = renames.get(path);
                     if (from===undefined) {
-                        await this.upload(path, localContent ?? await this.local.read(path), localStat, undefined, summary);
+                        await this.upload(path, localContent ?? await this.local.read(path), localStat, undefined, mode);
                         return;
                     }
                     // the rename, in the queues of both paths, after this reconcile
@@ -1378,7 +1407,7 @@ export class ReplicaSync {
             } else if (mode.deletions==='collect') {
                 mode.collected!.local.push(path);
             } else if (localHash===base) {
-                await this.beforeWrite();
+                await this.beforeWrite(mode);
                 await this.local.remove(path);
                 delete this.state.entries[path];
                 this.noteChange(path, 'remote');
@@ -1387,7 +1416,7 @@ export class ReplicaSync {
                 await this.local.removeFolderIfEmpty(parentOf(path));
             } else {
                 // deleted on Overleaf, changed locally: follow Overleaf and keep the local version aside
-                await this.beforeWrite();
+                await this.beforeWrite(mode);
                 const copy = await this.store.keepCopy(path, localContent ?? await this.local.read(path) ?? new Uint8Array());
                 await this.local.remove(path);
                 delete this.state.entries[path];
@@ -1409,7 +1438,7 @@ export class ReplicaSync {
             return;
         }
         if (base===undefined || remoteHash!==base) {
-            await this.download(path, remote!, remoteText, remoteContent, summary);
+            await this.download(path, remote!, remoteText, remoteContent, mode);
         } else if (mode.deletions==='collect' && this.uploads) {
             // without uploads the deletion waits for a push and is not made here (below), so it does not count or ask
             mode.collected!.remote.push(path);
@@ -1418,7 +1447,7 @@ export class ReplicaSync {
         } else if (!this.uploads) {
             summary.held.push(path);
         } else {
-            await this.transfers.run(async () => { await this.beforeWrite(); await this.remote.remove(path); });
+            await this.transfers.run(async () => { await this.beforeWrite(mode); await this.remote.remove(path); });
             delete this.state.entries[path];
             this.noteChange(path, 'local');
             summary.deletedRemote.push(path);
@@ -1428,7 +1457,7 @@ export class ReplicaSync {
     }
 
     /** Download `path` and write it locally; returns the content. */
-    private async download(path: string, remote: RemoteEntry, text?: string, content?: Uint8Array, summary?: SyncSummary): Promise<Uint8Array> {
+    private async download(path: string, remote: RemoteEntry, text?: string, content?: Uint8Array, mode?: Mode): Promise<Uint8Array> {
         let hash: string;
         if (remote.kind==='doc') {
             text ??= await this.transfers.run(() => this.remote.readDoc(path));
@@ -1441,20 +1470,21 @@ export class ReplicaSync {
                 throw new Error(`the downloaded content does not match the hash Overleaf reports (${hash} instead of ${remote.hash})`);
             }
         }
-        if (summary===undefined) {
+        if (mode===undefined) {
             return content; // only needed for comparing
         }
-        await this.beforeWrite();
+        await this.beforeWrite(mode);
         const stat = await this.local.write(path, content);
         await this.setEntry(path, {kind: remote.kind, base: hash, ...stat, checked: Date.now()}, 'remote', text, content);
-        summary.downloaded.push(path);
+        mode.summary.downloaded.push(path);
         this.ui.log(`${path}: downloaded`);
         return content;
     }
 
     /** Upload `content`, read from the local file after its stat `stat` was taken. */
     private async upload(path: string, content: Uint8Array | undefined, stat: LocalStat | undefined,
-                         remote: RemoteEntry | undefined, summary: SyncSummary) {
+                         remote: RemoteEntry | undefined, mode: Mode) {
+        const summary = mode.summary;
         if (content===undefined) { return; }
         if (await this.isUnmerged(path)) {
             this.blocked(path);
@@ -1472,10 +1502,10 @@ export class ReplicaSync {
                 return;
             }
             const sent = text;
-            await this.transfers.run(async () => { await this.beforeWrite(); await this.remote.writeDoc(path, sent); });
+            await this.transfers.run(async () => { await this.beforeWrite(mode); await this.remote.writeDoc(path, sent); });
             kind = 'doc';
         } else {
-            const created = await this.transfers.run(async () => { await this.beforeWrite(); return this.remote.upload(path, content); });
+            const created = await this.transfers.run(async () => { await this.beforeWrite(mode); return this.remote.upload(path, content); });
             kind = created.kind;
             if (kind==='doc') { text = decoder.decode(content); }
         }
@@ -1486,14 +1516,15 @@ export class ReplicaSync {
     }
 
     private async mergeDoc(path: string, entry: SavedEntry, localText: string, remoteText: string,
-                           stat: LocalStat | undefined, summary: SyncSummary) {
+                           stat: LocalStat | undefined, mode: Mode) {
+        const summary = mode.summary;
         const baseText = await this.baseText(entry.base);
         if (baseText===undefined) {
-            await this.keepAside(path, encoder.encode(localText), {kind: 'doc'}, remoteText, undefined, summary);
+            await this.keepAside(path, encoder.encode(localText), {kind: 'doc'}, remoteText, undefined, mode);
             return;
         }
         const merged = await this.merge(baseText, localText, remoteText);
-        await this.beforeWrite();
+        await this.beforeWrite(mode);
         // Markers left from an earlier conflict merge cleanly with new changes, but must not be
         // uploaded either; nor a merge into a file that git's index still has unmerged
         if (merged.hasConflict || (entry.conflict && (hasConflictMarkers(merged.content) || await this.isUnmerged(path)))) {
@@ -1517,7 +1548,7 @@ export class ReplicaSync {
         }
         if (merged.content!==remoteText) {
             const sent = merged.content;
-            await this.transfers.run(async () => { await this.beforeWrite(); await this.remote.writeDoc(path, sent); });
+            await this.transfers.run(async () => { await this.beforeWrite(mode); await this.remote.writeDoc(path, sent); });
         }
         const written = merged.content!==localText ? await this.local.write(path, encoder.encode(merged.content)) : stat;
         await this.setEntry(path, {kind: 'doc', base: textHash(merged.content), ...seen(written)}, 'merge', merged.content);
@@ -1527,10 +1558,11 @@ export class ReplicaSync {
 
     /** Put Overleaf's version in place and keep a copy of the local one. */
     private async keepAside(path: string, localContent: Uint8Array | undefined, remote: RemoteEntry,
-                            remoteText: string | undefined, remoteContent: Uint8Array | undefined, summary: SyncSummary) {
-        await this.beforeWrite();
+                            remoteText: string | undefined, remoteContent: Uint8Array | undefined, mode: Mode) {
+        const summary = mode.summary;
+        await this.beforeWrite(mode);
         const copy = await this.store.keepCopy(path, localContent ?? new Uint8Array());
-        await this.download(path, remote, remoteText, remoteContent, summary);
+        await this.download(path, remote, remoteText, remoteContent, mode);
         summary.downloaded.pop();
         summary.keptAside.push({path, copy});
         this.ui.log(`${path}: differs from Overleaf and the saved state cannot tell which side changed; Overleaf's version is in place, the local one is kept at ${copy}`);
@@ -1619,7 +1651,7 @@ export class ReplicaSync {
      * gone, not while it waits (e.g. for its conflicts to be resolved).
      */
     private async renameLocalPair(from: string, to: string, renames: Map<string, string>, mode: Mode) {
-        if (await this.renameOnOverleaf(from, to, mode.summary)) {
+        if (await this.renameOnOverleaf(from, to, mode)) {
             // the base moved with the file: the content syncs as for any file, a change as an edit of it
             await this.reconcile(to, mode);
             return;
@@ -1643,7 +1675,7 @@ export class ReplicaSync {
      * e039ad26: ProjectEntityMongoUpdateHandler.replaceFileWithNew); a binary file has no
      * comments or tracked changes. False when the pair no longer holds, or Overleaf refused.
      */
-    private async renameOnOverleaf(from: string, to: string, summary: SyncSummary): Promise<boolean> {
+    private async renameOnOverleaf(from: string, to: string, mode: Mode): Promise<boolean> {
         const entry = this.state.entries[from];
         const [remoteFrom, remoteTo, localFrom, localTo] = await Promise.all([
             this.remote.entry(from), this.remote.entry(to), this.local.stat(from), this.local.stat(to)]);
@@ -1651,7 +1683,7 @@ export class ReplicaSync {
             && remoteTo===undefined && localFrom===undefined && localTo!==undefined && localTo!=='folder';
         if (!still || await this.isUnmerged(from) || await this.isUnmerged(to)) { return false; }
         // before the try: a rename that the check stops waits for the full sync after the wait, and is not taken for one that Overleaf refused
-        await this.beforeWrite();
+        await this.beforeWrite(mode);
         try {
             await this.transfers.run(() => this.remote.rename!(from, to));
         } catch (error) {
@@ -1663,7 +1695,7 @@ export class ReplicaSync {
         this.noteChange(from, 'local');
         this.noteChange(to, 'local');
         this.scheduleSave();
-        summary.renamed.push({from, to});
+        mode.summary.renamed.push({from, to});
         this.ui.log(`${from}: renamed to ${to} on Overleaf, as in the folder`);
         if (parentOf(from)!==parentOf(to)) { await this.removeEmptyRemoteFolder(parentOf(from)); }
         return true;

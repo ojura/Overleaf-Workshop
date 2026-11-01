@@ -154,6 +154,8 @@ class FakeUI implements ReplicaUI {
     /** what the sync said about waiting, in order; `onWaiting` is told each time */
     waits: (string | undefined)[] = [];
     onWaiting?: () => void;
+    /** while set, the window's question about a checked-out commit */
+    confirmCheckout?: (head: string, overleaf: string) => Promise<boolean>;
     waiting(reason: string | undefined) { this.waits.push(reason); this.onWaiting?.(); }
     /** the notices about a lock that stays; `onLockStays` is told of each */
     lockNotices: string[] = [];
@@ -511,12 +513,74 @@ describe('ReplicaSync', () => {
             assert.deepStrictEqual(t.ui.waits, [], 'nothing is said about a wait');
         });
 
-        it('answers a tool at once that the sync waits, naming the lock, and uploads nothing', async () => {
+        it('answers a tool that the sync waits, naming the lock, when the lock is still there after toolLockWaitMs, and uploads nothing', async () => {
+            const saved = ReplicaSync.toolLockWaitMs;
+            ReplicaSync.toolLockWaitMs = 0;
+            try {
+                const t = await locked();
+                t.local.set('/a.tex', 'an older text\n');
+                const summary = await t.sync.flush(true, { by: 'tool' });
+                assert.ok(String(summary.waitingFor).includes('/replica/.git/index.lock'), summary.waitingFor);
+                assert.deepStrictEqual(t.remote.calls, []);
+                t.store.release();
+            } finally {
+                ReplicaSync.toolLockWaitMs = saved;
+            }
+        });
+
+        /** The lock is taken while the step reads Overleaf's a.tex, after the check at the step's start. */
+        function lockDuringRead(t: Awaited<ReturnType<typeof locked>>) {
+            t.store.lock = undefined;
+            const readDoc = t.remote.readDoc.bind(t.remote);
+            t.remote.readDoc = async (path: string) => {
+                t.remote.readDoc = readDoc;
+                t.store.lock = '/replica/.git/index.lock';
+                return readDoc(path);
+            };
+        }
+
+        it('answers a tool\'s request once toolLockWaitMs is over when its step meets a lock in its middle, as at the step\'s start', async () => {
+            const saved = ReplicaSync.toolLockWaitMs;
+            ReplicaSync.toolLockWaitMs = 0;
+            try {
+                const t = await locked();
+                t.local.set('/a.tex', 'an edit\n');
+                lockDuringRead(t);
+                const summary = await t.sync.flush(true, { by: 'tool' });
+                assert.ok(String(summary.waitingFor).includes('/replica/.git/index.lock'), summary.waitingFor);
+                assert.strictEqual(t.remote.docs.get('/a.tex'), text, 'Overleaf keeps its text');
+                t.store.release();
+            } finally {
+                ReplicaSync.toolLockWaitMs = saved;
+            }
+        });
+
+        it('does not ask the window about the commit that a checkout leaves when a tool\'s request meets the checkout\'s lock in the middle of its step', async () => {
             const t = await locked();
+            let asked = 0;
+            t.ui.confirmCheckout = async () => { asked += 1; return false; };
             t.local.set('/a.tex', 'an older text\n');
-            const summary = await t.sync.flush(true, { by: 'tool' });
-            assert.ok(String(summary.waitingFor).includes('/replica/.git/index.lock'), summary.waitingFor);
-            assert.deepStrictEqual(t.remote.calls, []);
+            lockDuringRead(t);
+            const request = t.sync.flush(true, { by: 'tool' });
+            await t.store.waitStarted;
+            // the checkout moves HEAD to an older commit last, then removes the lock
+            t.store.tree = { head: 'older', overleaf: 'recorded' };
+            t.store.release();
+            const summary = await request;
+            assert.strictEqual(asked, 0, 'the window is not asked during a tool\'s request');
+            assert.ok(String(summary.waitingFor).includes('older'), summary.waitingFor);
+            assert.strictEqual(t.remote.docs.get('/a.tex'), text, 'Overleaf keeps its text');
+        });
+
+        it('waits in a tool\'s request for a short lock to go, and then syncs', async () => {
+            const t = await locked();
+            t.local.set('/a.tex', 'an edit\n');
+            const request = t.sync.flush(true, { by: 'tool' });
+            await Promise.race([request, t.store.waitStarted]);
+            t.store.release(); // e.g. the IDE's own git status, which refreshes the index
+            const summary = await request;
+            assert.strictEqual(summary.waitingFor, undefined, 'the request waited for the lock');
+            assert.strictEqual(t.remote.docs.get('/a.tex'), 'an edit\n', 'the edit is uploaded once the lock is gone');
         });
 
         it('reports a lock that stays to the user, naming the file, in the status bar and in a notice, and goes on once it is gone', async () => {
