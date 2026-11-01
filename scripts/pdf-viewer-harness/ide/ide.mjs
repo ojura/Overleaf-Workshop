@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { onCleanup, sleep } from '../../lib/cleanup.mjs';
-import { answerWithin, evaluate, waitUntil, notWithinLimit } from '../../lib/devtools.mjs';
+import { answerWithin, evaluate, waitForTarget, waitUntil, notWithinLimit } from '../../lib/devtools.mjs';
 import { checkInstanceFolder, connectWindow, drawsExpression, instanceHome, readRunningInstance, workbenchTarget } from '../../lib/test-instance.mjs';
 
 export { evaluate, waitUntil, notWithinLimit, onCleanup, sleep };
@@ -135,37 +135,69 @@ export async function associatePdfs(config) {
 }
 
 /**
- * Open a file with Quick Open, as a user would, and return the webview target of the viewer that
- * opens, or undefined. Quick Open opens an absolute path outside the workspace too. A tab of the
- * file that is open already is closed first, so that the file opens in a new viewer webview.
+ * The last resort for the workbench's own changes that the drivers wait for: Quick Open's input,
+ * its list of files, which a new window fills within a few seconds, and a tab that closes.
  */
-export async function openWithQuickOpen(wb, file, timeoutMs = 15000) {
+const WORKBENCH_CHANGE_LIMIT_MS = 15000;
+/** The last resort for a viewer that does not open after Enter in Quick Open. */
+const VIEWER_OPEN_LIMIT_MS = 15000;
+
+/**
+ * The value of `condition`, an expression for the workbench page, once it is truthy: the page
+ * evaluates it again on each change of its DOM (a MutationObserver). After `limitMs` the page
+ * answers undefined.
+ */
+function untilInPage(wb, condition, limitMs = WORKBENCH_CHANGE_LIMIT_MS) {
+    return wb.E(`new Promise((resolve) => {
+        const value = () => (${condition});
+        let observer;
+        let timer;
+        const done = (result) => { observer?.disconnect(); clearTimeout(timer); resolve(result); };
+        const first = value();
+        if (first) { done(first); return; }
+        observer = new MutationObserver(() => { const now = value(); if (now) { done(now); } });
+        observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true });
+        timer = setTimeout(() => done(undefined), ${Number(limitMs)});
+    })`);
+}
+
+/**
+ * Open the file `file`, an absolute path, with Quick Open, as a user would, and return the
+ * webview target of the viewer that opens. Quick Open opens an absolute path outside the workspace
+ * too. A tab of the file that is open already is closed first, so that the file opens in a new
+ * viewer webview. Enter goes to Quick Open only once its focused row is the file, by its name and
+ * its folder, so that a row of another file with the same name, which Quick Open's history can
+ * put first, is not opened. Fails, naming Quick Open's focused row, when that does not happen
+ * within WORKBENCH_CHANGE_LIMIT_MS, and when the viewer does not open within VIEWER_OPEN_LIMIT_MS.
+ */
+export async function openWithQuickOpen(wb, file) {
     await closeTab(wb, path.basename(file));
     const before = new Set((await viewerFrames(wb)).map(t => t.targetId));
     await focusWorkbench(wb);
     await key(wb.session, 'p', 'KeyP', 80, 2);
-    await sleep(500);
+    if (!(await untilInPage(wb, `document.activeElement?.closest('.quick-input-widget') ? true : undefined`))) {
+        throw new Error(`Quick Open did not take the keyboard focus within ${WORKBENCH_CHANGE_LIMIT_MS / 1000} s of Ctrl+P`);
+    }
     await wb.session.send('Input.insertText', { text: file });
-    // wait for the file among Quick Open's results, which take a while in a new window
-    const name = JSON.stringify(path.basename(file));
-    for (let i = 0; i < 100; i++) {
-        if (await wb.E(`[...document.querySelectorAll('.quick-input-widget .monaco-list-row.focused')].some(r => r.textContent.includes(${name}))`)) { break; }
-        await sleep(100);
+    const want = JSON.stringify({ name: path.basename(file), folder: path.dirname(file) });
+    const focusedRow = `document.querySelector('.quick-input-widget .monaco-list-row.focused')`;
+    const isFile = `(() => { const row = ${focusedRow}; const want = ${want}; return row && row.querySelector('.label-name')?.textContent === want.name && row.querySelector('.label-description')?.textContent === want.folder ? true : undefined; })()`;
+    if (!(await untilInPage(wb, isFile))) {
+        const row = await wb.E(`${focusedRow}?.getAttribute('aria-label') ?? '(Quick Open does not focus a row)'`);
+        await key(wb.session, 'Escape', 'Escape', 27);
+        throw new Error(`Quick Open did not focus ${file} within ${WORKBENCH_CHANGE_LIMIT_MS / 1000} s; its focused row is ${row}`);
     }
     await key(wb.session, 'Enter', 'Enter', 13);
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeoutMs) {
-        const frame = (await viewerFrames(wb)).find(t => !before.has(t.targetId));
-        if (frame) { return frame; }
-        await sleep(50);
-    }
-    return undefined;
+    return waitForTarget(wb.browser, (t) => isViewerFrame(t) && !before.has(t.targetId), { what: `a viewer of ${file}`, limitMs: VIEWER_OPEN_LIMIT_MS });
 }
+
+/** Whether the DevTools target `t` is the webview of one of the extension's PDF viewers. */
+const isViewerFrame = (t) => t.type === 'iframe' && t.url.includes('extensionId=iamhyc.overleaf-workshop');
 
 /** The targets of the webviews of the extension's PDF viewers in the workbench `wb`, newest last. */
 export async function viewerFrames(wb) {
     const { targetInfos } = await wb.browser.send('Target.getTargets');
-    return targetInfos.filter(t => t.type === 'iframe' && t.url.includes('extensionId=iamhyc.overleaf-workshop'));
+    return targetInfos.filter(isViewerFrame);
 }
 
 /** The viewer object of a page, by the viewer it runs: an expression for the page. */
@@ -259,10 +291,16 @@ export async function newestViewer(wb, { beforeLoad, limitMs = 30000 } = {}) {
     return { view, engine: shown.engine, V: viewerOf(shown.engine) };
 }
 
-/** Close the editor tab with a label that starts with `label`; returns whether such a tab was open. */
+/**
+ * Close the editor tab with a label that starts with `label`, and wait until the workbench has
+ * removed it; returns whether such a tab was open.
+ */
 export async function closeTab(wb, label) {
-    const closed = await wb.E(`(() => { const tab = [...document.querySelectorAll('.tabs-container .tab')].find(t => (t.getAttribute('aria-label') || '').startsWith(${JSON.stringify(label)})); if (!tab) { return false; } tab.querySelector('.tab-actions .action-label, .codicon-close').click(); return true; })()`);
-    if (closed) { await sleep(800); }
+    const tab = `[...document.querySelectorAll('.tabs-container .tab')].find(t => (t.getAttribute('aria-label') || '').startsWith(${JSON.stringify(label)}))`;
+    const closed = await wb.E(`(() => { const tab = ${tab}; if (!tab) { return false; } tab.querySelector('.tab-actions .action-label, .codicon-close').click(); return true; })()`);
+    if (closed && !(await untilInPage(wb, `${tab} ? undefined : true`))) {
+        throw new Error(`the tab ${label} is still open ${WORKBENCH_CHANGE_LIMIT_MS / 1000} s after its close button was clicked`);
+    }
     return closed;
 }
 

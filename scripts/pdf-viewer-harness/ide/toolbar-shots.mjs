@@ -42,7 +42,6 @@ try {
         console.log(`${title}: ${await runCommand(wb, title) ? 'ran' : 'not offered by the Command Palette now (the part may be hidden already)'}`);
     }
     const frame = await openWithQuickOpen(wb, path.resolve(pdf));
-    if (!frame) { throw new Error('the PDF did not open in the viewer'); }
     view = await viewerPage(wb, frame);
     /** the elements in `selector`'s element whose right edge is past the pane's */
     const past = (selector) => view.E(`(() => { const w = document.documentElement.clientWidth; const root = document.querySelector(${JSON.stringify(selector)}); return root ? [...root.querySelectorAll('*')].filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.right > w + 0.5 && getComputedStyle(e).visibility !== 'hidden'; }).map(e => e.id || e.className || e.tagName).slice(0, 5) : []; })()`);
