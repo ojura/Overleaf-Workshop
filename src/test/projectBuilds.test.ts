@@ -16,6 +16,9 @@ function deferred<T>() {
 
 const MAIN: CompileSettings = { rootResourcePath: 'main.tex', draft: false, stopOnFirstError: false };
 
+/** A build ID of Overleaf's form, of a compile begun `seconds` after 2026-11-01 00:00 UTC (buildTimeOf). */
+const at = (seconds: number) => `${(Date.parse('2026-11-01T00:00:00Z') + seconds * 1000).toString(16)}-0123456789abcdef`;
+
 /** Overleaf's answer about the latest compile, as ClsiCacheController.getLatestBuildFromCache gives it. */
 function cachedResponse(id: string, { editorId = 'web-editor', shard = 'cache-1' as string | undefined, options = {} as Partial<CompileSettings> } = {}) {
     const response = {
@@ -94,13 +97,13 @@ function setup({ visible = true } = {}) {
 }
 
 describe('the build in use (ProjectBuilds)', () => {
-    it('takes another client\'s build that the window has not had', async () => {
+    it('takes another client\'s build that the window has not had, begun after its own', async () => {
         const { host, builds, changes } = setup();
-        builds.useOwn(own('x'));
-        host.answers.push({ kind: 'build', build: fromCache('y') });
+        builds.useOwn(own(at(0)));
+        host.answers.push({ kind: 'build', build: fromCache(at(10)) });
         await builds.check();
-        assert.strictEqual(builds.build?.id, 'y');
-        assert.deepStrictEqual(changes, ['x', 'y']);
+        assert.strictEqual(builds.build?.id, at(10));
+        assert.deepStrictEqual(changes, [at(0), at(10)]);
         assert.deepStrictEqual(builds.status, { state: 'ready' });
     });
 
@@ -116,27 +119,61 @@ describe('the build in use (ProjectBuilds)', () => {
         assert.deepStrictEqual(changes, ['w', 'x']);
     });
 
-    it('takes y, stored in the cache before the window\'s x, and ignores x afterwards, until the next compile (the known case)', async () => {
+    it('keeps its own build x, which has the last edit, while the cache still names the earlier y (the known case)', async () => {
         const { host, builds, changes } = setup();
-        builds.useOwn(own('x'));
-        // Overleaf stores x after it answered the compile; the cache still names y, which it stored before
-        host.answers.push({ kind: 'build', build: fromCache('y') });
+        // y began before x and before the edit; Overleaf stores x in its cache after it answered
+        // x's compile, so a check before that store answers y, which Overleaf takes for current
+        // since its copy was written after the edit
+        const x = at(20);
+        const y = at(10);
+        builds.useOwn(own(x));
+        host.answers.push({ kind: 'build', build: fromCache(y) });
         await builds.check();
-        assert.strictEqual(builds.build?.id, 'y');
-        host.answers.push({ kind: 'build', build: fromCache('x', { editorId: 'this-window' }) });
+        assert.strictEqual(builds.build?.id, x);
+        // once Overleaf has stored x, its answer names the build in use
+        host.answers.push({ kind: 'build', build: fromCache(x, { editorId: 'this-window' }) });
         await builds.check();
-        assert.strictEqual(builds.build?.id, 'y', 'x was replaced, so an answer naming it is older than the build in use');
-        builds.useOwn(own('z'));
-        assert.strictEqual(builds.build?.id, 'z');
-        assert.deepStrictEqual(changes, ['x', 'y', 'z']);
+        assert.strictEqual(builds.build?.id, x);
+        assert.deepStrictEqual(changes, [x]);
+        assert.deepStrictEqual(builds.status, { state: 'ready' });
+    });
+
+    it('compares the times only with its own build: after another client\'s build, it takes any build that it has not had', async () => {
+        const { host, builds } = setup();
+        // the cache's stores are not ordered: another client's earlier compile can be stored after a later one
+        host.answers.push({ kind: 'build', build: fromCache(at(20)) }, { kind: 'build', build: fromCache(at(10)) });
+        await builds.check();
+        await builds.check();
+        assert.strictEqual(builds.build?.id, at(10));
+    });
+
+    it('with a build ID of another form, takes a build that it has not had, and says once that it cannot compare them', async () => {
+        const warnings: string[] = [];
+        const warn = console.warn;
+        console.warn = (message: string) => { warnings.push(message); };
+        try {
+            const { host, builds } = setup();
+            builds.useOwn(own('x'));
+            host.answers.push({ kind: 'build', build: fromCache(at(10)) });
+            await builds.check();
+            assert.strictEqual(builds.build?.id, at(10));
+            builds.useOwn(own(at(30)));
+            host.answers.push({ kind: 'build', build: fromCache('w') });
+            await builds.check();
+            assert.strictEqual(builds.build?.id, 'w');
+            assert.strictEqual(warnings.length, 1);
+            assert.match(warnings[0], /x and .* are not both of Overleaf's form/);
+        } finally {
+            console.warn = warn;
+        }
     });
 
     it('takes another client\'s build after one whose compile named no shard of the cache', async () => {
         const { host, builds } = setup();
-        builds.useOwn(own('x', { shard: undefined }));
-        host.answers.push({ kind: 'build', build: fromCache('y') });
+        builds.useOwn(own(at(0), { shard: undefined }));
+        host.answers.push({ kind: 'build', build: fromCache(at(10)) });
         await builds.check();
-        assert.strictEqual(builds.build?.id, 'y');
+        assert.strictEqual(builds.build?.id, at(10));
     });
 
     describe('takes a build only if it was compiled as the window compiles (sameSettings)', () => {
@@ -151,11 +188,11 @@ describe('the build in use (ProjectBuilds)', () => {
         for (const [what, build, window, taken] of cases) {
             it(`${taken ? 'takes' : 'ignores'} a build ${what}`, async () => {
                 const { host, builds } = setup();
-                builds.useOwn(own('x'));
+                builds.useOwn(own(at(0)));
                 host.window = { ...MAIN, ...window };
-                host.answers.push({ kind: 'build', build: fromCache('y', { options: build }) });
+                host.answers.push({ kind: 'build', build: fromCache(at(10), { options: build }) });
                 await builds.check();
-                assert.strictEqual(builds.build?.id, taken ? 'y' : 'x');
+                assert.strictEqual(builds.build?.id, taken ? at(10) : at(0));
                 assert.strictEqual(sameSettings({ ...MAIN, ...build }, { ...MAIN, ...window }), taken);
             });
         }

@@ -420,20 +420,23 @@ describe('the build in use, from Overleaf to the window', function () {
 
     describe('1. SyncTeX', () => {
         it('asks in both directions about the build in use, with its compile server and its editor, also for another client\'s build', async () => {
-            overleaf.compiles.push(ownAnswer(overleaf, 'b-own'));
+            // build IDs of Overleaf's form: the other client's compile began after the window's
+            const own = '19a3e9d4000-0123456789abcdef';
+            const web = '19a3e9d4010-fedcba9876543210';
+            overleaf.compiles.push(ownAnswer(overleaf, own));
             assert.strictEqual(await vfs.compile(true), true);
             await vfs.syncCode('main.tex', 7, 0);
             await vfs.syncPdf(3, 72, 100);
-            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, web) };
             await vfs.builds.check();
             await vfs.syncCode('main.tex', 7, 0);
             await vfs.syncPdf(3, 72, 100);
             const asked = overleaf.to('/project/p1/sync/').map(r => [r.path, r.query.get('buildId'), r.query.get('editorId'), r.query.get('clsiserverid')]);
             assert.deepStrictEqual(asked, [
-                ['/project/p1/sync/code', 'b-own', EDITOR_ID, 'clsi-vm-2'],
-                ['/project/p1/sync/pdf', 'b-own', EDITOR_ID, 'clsi-vm-2'],
-                ['/project/p1/sync/code', 'b-web', WEB_EDITOR, 'clsi-vm-1'],
-                ['/project/p1/sync/pdf', 'b-web', WEB_EDITOR, 'clsi-vm-1'],
+                ['/project/p1/sync/code', own, EDITOR_ID, 'clsi-vm-2'],
+                ['/project/p1/sync/pdf', own, EDITOR_ID, 'clsi-vm-2'],
+                ['/project/p1/sync/code', web, WEB_EDITOR, 'clsi-vm-1'],
+                ['/project/p1/sync/pdf', web, WEB_EDITOR, 'clsi-vm-1'],
             ]);
         });
 

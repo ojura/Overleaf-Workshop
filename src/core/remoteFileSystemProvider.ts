@@ -4,7 +4,7 @@ import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, COMPILERS, CompileRequest, CompileResponseSchema, downloadDomainUrl, EDITOR_ID, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import type { CompileRecord } from '../compile/outputFiles';
 import { windowCompileSettings } from '../compile/compileSettings';
-import { cachedBuild, CompileSettings, CompileStart, isCompileStart, LatestAnswer, ownBuild, ProjectBuilds } from './projectBuilds';
+import { cachedBuild, CompileSettings, CompileStart, fromCache, isCompileStart, LatestAnswer, ownBuild, ProjectBuilds } from './projectBuilds';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { opsFor, overleafLineEndings, TrackChangesState, updateMeta } from '../utils/docUpdate';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
@@ -278,7 +278,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.builds.onDidChangeBuild((build) => {
                 this.listBuildOutputs();
                 // the viewers load the build; the Problems view and the replica's logs follow (CompileManager)
-                EventBus.fire('buildChangedEvent', {uri: this.pathToUri(), fromCache: build.record.response.fromCache === true});
+                EventBus.fire('buildChangedEvent', {uri: this.pathToUri(), fromCache: fromCache(build)});
             }),
             this.builds.onDidChangeStatus((status) => EventBus.fire('buildStatusEvent', {uri: this.pathToUri(), status})),
         );
