@@ -1550,7 +1550,15 @@ export class ReplicaSync {
             const sent = merged.content;
             await this.transfers.run(async () => { await this.beforeWrite(mode); await this.remote.writeDoc(path, sent); });
         }
-        const written = merged.content!==localText ? await this.local.write(path, encoder.encode(merged.content)) : stat;
+        let written = stat;
+        if (merged.content!==localText) {
+            // Checked again after the upload, during which git may have taken its lock and written
+            // the file. A rerun then reads Overleaf's side with the merged text, and the saved base
+            // is still the one before the merge: it merges what git wrote into the merged text, and
+            // the local changes, which the merged text holds, are not sent again.
+            await this.beforeWrite(mode);
+            written = await this.local.write(path, encoder.encode(merged.content));
+        }
         await this.setEntry(path, {kind: 'doc', base: textHash(merged.content), ...seen(written)}, 'merge', merged.content);
         summary.merged.push(path);
         this.ui.log(`${path}: merged changes from both sides`);

@@ -572,6 +572,30 @@ describe('ReplicaSync', () => {
             assert.strictEqual(t.remote.docs.get('/a.tex'), text, 'Overleaf keeps its text');
         });
 
+        it('keeps what git writes into a file during the upload of its merge, at the merged text\'s local write', async () => {
+            const t = await locked();
+            t.store.lock = undefined;
+            const local = text.replace('line 1', 'line 1, edited locally');
+            t.local.set('/a.tex', local);
+            t.remote.docs.set('/a.tex', text.replace('line 5', 'line 5, edited on Overleaf'));
+            // During the upload of the merge, git takes its lock and writes a change into a.tex.
+            const writeDoc = t.remote.writeDoc.bind(t.remote);
+            t.remote.writeDoc = async (path: string, sent: string) => {
+                t.remote.writeDoc = writeDoc;
+                t.store.lock = '/replica/.git/index.lock';
+                t.local.set('/a.tex', local.replace('line 3', 'line 3, written by git during the upload'));
+                return writeDoc(path, sent);
+            };
+            const run = t.sync.syncAll();
+            await Promise.race([run, t.store.waitStarted]);
+            t.store.release();
+            await run;
+            const all = text.replace('line 1', 'line 1, edited locally').replace('line 3', 'line 3, written by git during the upload').replace('line 5', 'line 5, edited on Overleaf');
+            assert.strictEqual(t.local.text('/a.tex'), all, 'the local file: git\'s change, merged with the merged text');
+            assert.strictEqual(t.remote.docs.get('/a.tex'), all, 'Overleaf: the same');
+            assert.strictEqual(t.remote.calls.filter(call => call.startsWith('writeDoc')).length, 2, 'the merge, then git\'s change');
+        });
+
         it('waits in a tool\'s request for a short lock to go, and then syncs', async () => {
             const t = await locked();
             t.local.set('/a.tex', 'an edit\n');
