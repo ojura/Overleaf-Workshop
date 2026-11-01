@@ -8,7 +8,7 @@ signal still counts, sends the signal (to the whole group with --group), and wai
 until every process has ended. A group is listed again after its members have ended, for a process
 that joined it meanwhile. SECONDS is the last resort for a process that ignores the signal.
 
-Exit status 0 when every process has ended (also when there was none), 1 when some still run
+Exit status 0 when every process has ended (also when they had ended before), 1 when some still run
 after the limit (listed on stderr), 2 on wrong usage.
 """
 import argparse

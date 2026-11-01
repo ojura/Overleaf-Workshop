@@ -29,7 +29,7 @@ while [ $# -gt 0 ]; do
 done
 # the instance's record, read by hidden-ide.sh, which names the instance's folder by HIDDEN_IDE_HOME
 replica=$("$ide" field replica) && project=$("$ide" field project) && profile=$("$ide" field profile) || exit 64
-[ -n "$replica" ] && [ -n "$project" ] || { echo "the test instance has no replica; start it with --project" >&2; exit 64; }
+[ -n "$replica" ] && [ -n "$project" ] || { echo "the test instance does not have a replica; start it with --project" >&2; exit 64; }
 [ -f "$cli" ] || { echo "build this checkout first: $cli is missing" >&2; exit 64; }
 
 now() { date +%s.%N; }
@@ -37,7 +37,7 @@ elapsed() { python3 -I -c 'import sys; print(f"{float(sys.argv[2]) - float(sys.a
 replica_log() { ls -t "$profile"/logs/*/window1/exthost/output_logging_*/*Local*Replica*.log 2>/dev/null | head -1; }
 "$ide" window state > /dev/null || exit 64
 [ -n "$(replica_log)" ] || { echo "the test instance has not written a Local Replica log yet" >&2; exit 64; }
-# wait_log PATTERN FROM_LINE: the seconds until the replica's log has PATTERN after FROM_LINE, or nothing
+# wait_log PATTERN FROM_LINE: the seconds until the replica's log has PATTERN after FROM_LINE; exit status 1 when it does not within the limit
 wait_log() {
     local start log
     start=$(now); log=$(replica_log)

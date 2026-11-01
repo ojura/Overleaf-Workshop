@@ -67,7 +67,7 @@ export function sleep(ms) {
 /**
  * spawn() for a program that must not outlive this process, such as the harness's headless Chrome
  * and server: it runs under util-linux's setpriv with --pdeathsig KILL, so that the kernel sends
- * it SIGKILL when this process ends, also by a SIGKILL, after which none of its clean-ups run.
+ * it SIGKILL when this process ends, also by a SIGKILL, which ends it before its clean-ups can run.
  * setpriv executes the program in its own process, so the child's pid is the program's.
  */
 export function spawnTied(program, args, options) {

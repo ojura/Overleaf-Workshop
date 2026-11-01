@@ -108,7 +108,7 @@ function isRunning(pid) {
 
 /**
  * Remove the folders that builds which ended before they finished left next to `outdir`, its
- * .new-<pid> and .old-<pid> folders (buildViewers), when their process no longer runs; the folder of
+ * .new-<pid> and .old-<pid> folders (buildViewers), when their process has ended; the folder of
  * a process that runs belongs to a build in progress, and stays. git ignores these folders in the
  * checkout (.gitignore: views/pdf-viewer/dist.*).
  */

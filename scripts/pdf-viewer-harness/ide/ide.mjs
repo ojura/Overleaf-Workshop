@@ -171,19 +171,19 @@ export async function viewerFrames(wb) {
 /** The viewer object of a page, by the viewer it runs: an expression for the page. */
 export const viewerOf = (engine) => engine === 'overleaf' ? 'window.overleafViewer.wrapper.viewer' : 'window.PDFViewerApplication.pdfViewer';
 
-/** Whether the page in view is drawn in the viewer `engine`: an expression that is false while the viewer has no document. */
+/** Whether the page in view is drawn in the viewer `engine`: an expression that is false until the viewer has a document. */
 const pageInViewDrawn = (engine) => `(() => { const v = ${viewerOf(engine).replaceAll('.', '?.')}; return !!v && v.pagesCount > 0 && v.getPageView(v.currentPageNumber - 1)?.renderingState === 3; })()`;
 
-/** The webview shows no viewer page at the moment, for example while a new page replaces the old one. */
+/** The webview does not show a viewer page at the moment, for example while a new page replaces the old one. */
 export class NoPageError extends Error {}
 
 /**
  * Attach to a viewer's webview, a target of viewerFrames(wb). VS Code runs the viewer page in the webview's inner frame named
  * active-frame, and a new frame replaces it when the page reloads, as after a switch of viewer.
  * E(expression) evaluates in the page that the webview shows now, and fails with a NoPageError
- * while it shows none, or when the page goes away during the evaluation; that is known from the
+ * while it does not show one, or when the page goes away during the evaluation; that is known from the
  * page's context events, not from the error. engine() says which viewer the page runs (pdfjs or
- * overleaf), or undefined while the webview shows no viewer page. The page's console errors,
+ * overleaf), or undefined while the webview does not show a viewer page. The page's console errors,
  * warnings and exceptions collect in `problems`. `beforeLoad` is a script that runs in every page
  * the webview loads from now on, before the page's own scripts.
  */

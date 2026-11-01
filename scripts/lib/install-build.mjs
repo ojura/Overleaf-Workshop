@@ -19,7 +19,7 @@
 // Of what the extension folder held, the install keeps only the installer's metadata, which the
 // IDE wrote when it installed the extension from its gallery: __metadata in package.json, and the
 // file .vsixmanifest. Antigravity's code does not read .vsixmanifest; it stays because it is the
-// installer's, as __metadata is, and keeping it costs nothing.
+// installer's, as __metadata is.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -100,7 +100,7 @@ export function globMatcher(pattern) {
  * The paths of `files` (relative to the package's root, with /) that vsce packages, by its lists
  * and the lines of `vscodeignore`, as vsce 2.15.0 reads them (its collectFiles): each line that is
  * not blank or a comment is a pattern; a line that does not end in a segment with * also stands for
- * the files below it (line/**); a file is packaged when it matches no pattern without !, or when it
+ * the files below it (line/**); a file is packaged when it does not match a pattern without !, or when it
  * matches a pattern with ! (after the !).
  */
 export function vscePackaged(files, vscodeignore) {
@@ -114,7 +114,7 @@ export function vscePackaged(files, vscodeignore) {
 
 /**
  * The files below `dir`, as paths relative to it with /, in the way vsce's glob finds them: dot
- * files too, a link to a file as a file, and neither links to folders nor the folders named in
+ * files too, a link to a file as a file, but not links to folders or the folders named in
  * `skip` (relative paths) below them.
  */
 function filesBelow(dir, skip = []) {
@@ -223,7 +223,7 @@ export async function packageFiles(build) {
     const files = new Map([...sources].filter(([file]) => packaged.has(file)));
     // vsce's LicenseProcessor: unless package.json's license says "SEE LICENSE IN <file>", the license
     // file at the top (LICENSE, LICENSE.md or LICENSE.txt, in any case) goes into the package, and
-    // gets .txt when it has no extension
+    // gets .txt when it lacks an extension
     const { license } = JSON.parse(fs.readFileSync(path.join(checkout, 'package.json'), 'utf8'));
     if (!/^SEE LICENSE IN (.*)$/.test(license ?? '')) {
         const licenses = [...files.keys()].filter(file => /^license(\.(md|txt))?$/i.test(file));

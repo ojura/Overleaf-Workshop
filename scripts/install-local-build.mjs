@@ -76,7 +76,7 @@ async function main(args) {
         targets.push({ ide, ext });
     }
     if (!targets.length) {
-        console.error(`${check ? 'would not install' : 'did not install'}: none of ${IDES.map(ide => ide.name).join(', ')} has Overleaf Workshop ${version} installed`);
+        console.error(`${check ? 'would not install' : 'did not install'}: Overleaf Workshop ${version} is not installed in ${IDES.map(ide => ide.name).join(', ')}`);
         return 1;
     }
     const build = await buildCheckout(checkout);

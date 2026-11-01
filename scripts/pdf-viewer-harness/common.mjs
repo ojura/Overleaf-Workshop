@@ -22,8 +22,8 @@ fs.mkdirSync(work, { recursive: true });
 
 // Ctrl+C, and the SIGTERM of a time limit, end a script as scripts/lib/cleanup.mjs describes: the
 // command that it awaits fails, its finally blocks run, and the server and Chrome that it started
-// are stopped also when it ends without them. When a SIGKILL ends the script, which no clean-up
-// outlives, the kernel kills the server and Chrome (spawnTied), and their folders stay in the work
+// are stopped also when it ends without them. When a SIGKILL ends the script before its clean-ups
+// can run, the kernel kills the server and Chrome (spawnTied), and their folders stay in the work
 // folder.
 
 /**

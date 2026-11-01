@@ -6,7 +6,7 @@
 // (frame) at 40 and 150 ms per request, and as a plain page at 40 ms. The results go to --out, by
 // default compare/ in the work folder (common.mjs): <engine>-<mode>-<latency>.json and .log for
 // each run, and table.md. Exit status 0 when every run passed all its checks, 1 when a run failed
-// a check, failed itself or wrote no result; a run that a signal ended stops the comparison, with
+// a check, failed itself or did not write a result; a run that a signal ended stops the comparison, with
 // that run's status.
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';

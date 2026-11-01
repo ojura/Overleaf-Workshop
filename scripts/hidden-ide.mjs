@@ -103,8 +103,8 @@
 // with status 1 and keeps the display and the saved state.
 //
 // The login: the IDE's own saved Overleaf login is copied into the instance's profile, with only
-// the chosen project in it, readable only by this user, and deleted again by "stop". Nothing in
-// this program prints it.
+// the chosen project in it, readable only by this user, and deleted again by "stop". This program
+// does not print it.
 //
 // Exit status: 0 done; 1 failed; 2 the page or the main process did not answer within
 // ANSWER_LIMIT_MS; 64 wrong usage.
@@ -120,7 +120,7 @@ import { buildCheckout, EXTENSION_ID, IDES, installedExtension, installInto } fr
 import { parseOptions, usageOf, UsageError } from './lib/options.mjs';
 import {
     bootId, checkFoldersAbove, checkInstanceFolder, connectMainProcess, connectWindow, inMainProcess, instanceHome, instanceProcesses, isRecordedProcess,
-    drawsExpression, processStat, readInstance, readRunningInstance, waitForInstance, workbenchTarget, writeInstance,
+    drawsExpression, processStat, readInstance, readRunningInstance, waitForInstance, workbenchTarget, writeInstance, writePrivately,
 } from './lib/test-instance.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -158,12 +158,6 @@ const failure = (message, status) => Object.assign(new Error(message), { status 
 
 /** The usage: the comment at the top of this file. */
 const usage = () => usageOf(fileURLToPath(import.meta.url));
-
-/** Write `text` to `file` through a new file that is renamed over it, readable only by this user. */
-function writePrivately(file, text) {
-    fs.writeFileSync(`${file}.new`, text, { mode: 0o600 });
-    fs.renameSync(`${file}.new`, file);
-}
 
 /**
  * The instance's folder (HIDDEN_IDE_HOME), checked before any command reads it
@@ -228,7 +222,7 @@ function checkTestProject(project) {
 
 /**
  * The local replica that `folder` is or lies in: the first folder from `folder` up that holds
- * .overleaf/settings.json; undefined when there is none.
+ * .overleaf/settings.json; undefined when `folder` is not in a replica.
  */
 function replicaAround(folder) {
     for (let dir = folder; ; dir = path.dirname(dir)) {
@@ -246,7 +240,7 @@ function recordIfAny(home) {
     if (!fs.existsSync(path.join(home, 'instance.json'))) { return undefined; }
     const record = readInstance(home);
     if (record.boot === undefined) {
-        throw new Error(`${home}/instance.json was written by an earlier hidden-ide.sh, without the start times that tell its processes from others (it names process group ${record.group ?? 'none'}, IDE ${record.pid ?? 'none'}, Xvfb ${record.xvfb ?? 'none'}). Stop that instance with the version that started it, or end those processes, then delete the file`);
+        throw new Error(`${home}/instance.json was written by an earlier hidden-ide.sh, without the start times that tell its processes from others (it names ${[['process group', record.group], ['IDE', record.pid], ['Xvfb', record.xvfb]].filter(([, pid]) => pid).map(([name, pid]) => `${name} ${pid}`).join(', ')}). Stop that instance with the version that started it, or end those processes, then delete the file`);
     }
     return record;
 }
@@ -371,7 +365,7 @@ async function startDisplay(requested, screen, home) {
         fs.closeSync(log);
         const outcome = await new Promise((resolve) => {
             let text = '';
-            const timer = setTimeout(() => resolve({ ready: false, how: `no display reported within ${DISPLAY_LIMIT_MS / 1000} s` }), DISPLAY_LIMIT_MS);
+            const timer = setTimeout(() => resolve({ ready: false, how: `it did not report a display within ${DISPLAY_LIMIT_MS / 1000} s` }), DISPLAY_LIMIT_MS);
             xvfb.stdio[3].on('data', (chunk) => {
                 text += chunk;
                 if (text.includes('\n')) { clearTimeout(timer); resolve({ ready: true }); }
@@ -454,7 +448,7 @@ async function copyExtensions(home) {
     return path.join(home, 'extensions', path.basename(source));
 }
 
-/** The instance's settings: no updates, no telemetry, no trust prompt. */
+/** The instance's settings: updates, telemetry and the trust prompt turned off. */
 function writeSettings(home) {
     writePrivately(path.join(home, 'profile', 'User', 'settings.json'), `${JSON.stringify({
         'overleaf-workshop.localReplica.syncOnFileChange.enabled': true,
@@ -614,7 +608,7 @@ async function start(...argv) {
         writeInstance(home, record);
         const session = startIde(home, run, ide, display, folder);
         children.push(session);
-        // a program that cannot be started gets no pid, so the record names the group only once it runs
+        // a program that cannot be started does not get a pid, so the record names the group only once it runs
         await new Promise((resolve, reject) => {
             session.once('spawn', resolve);
             session.once('error', (error) => reject(new Error(`dbus-run-session, which starts the IDE, could not run: ${error.message}`)));
@@ -707,7 +701,7 @@ async function setLifecycle(instance, state) {
 /**
  * Whether the instance's workbench page runs a task within FROZEN_LIMIT_MS: a message that it posts
  * to itself through a MessageChannel arrives. A page that DevTools froze still runs DevTools' own
- * evaluations, so an evaluation that needs nothing else answers there too, but it does not run the
+ * evaluations, so a plain evaluation answers there too, but it does not run the
  * tasks of its queues, timers and messages among them. Measured on the instance: the message
  * arrived within 1 to 15 ms in a shown page, a hidden one and one made active again, and within 3 s
  * on the frozen page it did not, while an evaluation without it answered there after 1.6 s.

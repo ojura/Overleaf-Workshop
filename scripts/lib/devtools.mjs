@@ -94,14 +94,14 @@ export function waitForActivePort(profile, { ended, limitMs }) {
  *   with the same send and on for that target, and detach();
  * - discoverTargets() asks the browser for its target events (Target.targetCreated, ...), once;
  * - close(reason) closes the connection: the commands that wait for answers fail with `reason`,
- *   or with the connection's close when none is given; `closed` resolves with the reason when the
+ *   or with the connection's close when the caller does not give one; `closed` resolves with the reason when the
  *   connection has closed.
  * A Node inspector's endpoint does not have targets: use send and on alone there.
  * A command that waits for its answer fails when the connection closes, and a session's command
  * also when its target detaches or crashes; the error names the command and the reason.
  */
 export async function connect(url) {
-    if (refusal !== undefined) { throw new Error(`no connection to ${url}: ${refusal}`); }
+    if (refusal !== undefined) { throw new Error(`could not connect to ${url}: ${refusal}`); }
     const ws = new WebSocket(url);
     await new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -289,7 +289,7 @@ export async function answerWithin(connection, what, limitMs, work) {
     let timer;
     const limit = new Promise((_, reject) => {
         timer = setTimeout(() => {
-            const error = new WaitLimitError(`${what}: no answer within ${limitMs / 1000} s`);
+            const error = new WaitLimitError(`${what}: did not answer within ${limitMs / 1000} s`);
             connection.close(error.message);
             reject(error);
         }, limitMs);

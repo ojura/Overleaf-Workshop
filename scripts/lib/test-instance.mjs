@@ -24,9 +24,9 @@ export function instanceHome(explicit, option) {
 }
 
 /**
- * Whether the group `gid` holds no user but this one: no other user has it as the primary group,
- * and its list of members names only this user (getent, so that the system's user databases
- * answer).
+ * Whether this user is the only user in the group `gid`: every other user has another primary group,
+ * and the group's list of members names only this user (getent, so that the system's user
+ * databases answer).
  */
 function groupHoldsOnlyThisUser(gid) {
     const group = spawnSync('getent', ['group', String(gid)], { encoding: 'utf8' });
@@ -68,8 +68,8 @@ export function checkInstanceFolder(home) {
  * Fail unless the folders above `home`, which need not exist yet, are closed to other users: each
  * must belong to root or to this user, and other users must not be able to write it, except a
  * folder with the sticky bit (as /tmp has), in which they cannot rename or remove what is not
- * theirs. A folder that its group can write counts as closed to others when the group holds no user
- * but this one. The check walks the folders of the path as it is named and of the path with its
+ * theirs. A folder that its group can write counts as closed to others when this user is the
+ * group's only user. The check walks the folders of the path as it is named and of the path with its
  * symbolic links resolved, since a link in a folder that others can write could be replaced; a
  * folder that does not exist yet is skipped, as mkdir makes it for this user with mode 700.
  * What the check does not see: an ACL entry that lets another user write a folder. The check reads
@@ -123,12 +123,19 @@ export function readInstance(home) {
     return { ...JSON.parse(text), home };
 }
 
-/** Replace the record of the instance in `home` with `record`, through a new file that is renamed over it. */
-export function writeInstance(home, record) {
-    const file = path.join(home, 'instance.json');
-    const { home: _, ...fields } = record;
-    fs.writeFileSync(`${file}.new`, `${JSON.stringify(fields, null, 2)}\n`, { mode: 0o600 });
+/**
+ * Write `text` to `file` through a new file that is renamed over it, so that a reader finds the old
+ * text or the new one, readable only by this user.
+ */
+export function writePrivately(file, text) {
+    fs.writeFileSync(`${file}.new`, text, { mode: 0o600 });
     fs.renameSync(`${file}.new`, file);
+}
+
+/** Replace the record of the instance in `home` with `record` (writePrivately). */
+export function writeInstance(home, record) {
+    const { home: _, ...fields } = record;
+    writePrivately(path.join(home, 'instance.json'), `${JSON.stringify(fields, null, 2)}\n`);
 }
 
 /**
@@ -169,7 +176,7 @@ async function checkBrowserProcess(browser, pid) {
 
 /**
  * The state, the process group and the start time (in clock ticks after the boot) of process
- * `pid`, from /proc/<pid>/stat, or undefined when no such process exists.
+ * `pid`, from /proc/<pid>/stat, or undefined when the process does not exist.
  */
 export function processStat(pid) {
     let stat;
@@ -288,7 +295,7 @@ export async function workbenchTarget(browser) {
     const { targetInfos } = await browser.send('Target.getTargets');
     const pages = targetInfos.filter(isWorkbench);
     if (pages.length !== 1) {
-        throw new Error(`the IDE shows ${pages.length} workbench windows, not one: ${pages.map(t => t.url).join(', ') || 'none'}`);
+        throw new Error(`the IDE shows ${pages.length} workbench windows, not one${pages.length ? `: ${pages.map(t => t.url).join(', ')}` : ''}`);
     }
     return pages[0];
 }
