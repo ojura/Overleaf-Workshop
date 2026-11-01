@@ -112,6 +112,8 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
     const origin = new Uri('overleaf-workshop', '/project', 'www.overleaf.com', 'user=u&project=p');
     const changes = new Emitter<{ type: number, uri: Uri }[]>();
     const rel = (uri: Uri) => uri.path.slice(origin.path.length);
+    /** Whether the project has the folder `p`: made by mkdir, or holding a file or a folder. */
+    const hasFolder = (p: string) => w.remoteFolders.has(p) || [...w.remote.keys(), ...w.remoteFolders].some(other => other.startsWith(`${p}/`));
     const vfs = {
         origin, serverName: 'www.overleaf.com', projectName: 'project', projectId: 'p', connected: true, _userId: 'u',
         onDidChangeFiles: changes.event,
@@ -119,9 +121,15 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
         getProjectSCMPersist: () => ({ settings: {} }),
         setProjectSCMPersist: () => {},
         init: async () => ({ rootFolder: [{ _id: 'root', name: 'rootFolder', docs: [...w.remote.keys()].map(p => ({ _id: p, name: p.slice(1) })), fileRefs: [], folders: [] }] }),
-        _resolveUri: async (uri: Uri) => w.remote.has(rel(uri)) ? { fileType: 'doc', fileEntity: {} }
-            : w.remoteFolders.has(rel(uri)) ? { fileType: 'folder', fileEntity: { docs: [], fileRefs: [], folders: [] } }
-            : { fileType: undefined, fileEntity: undefined },
+        // as the VFS's: a path in a folder that the project does not have is vscode.FileSystemError.FileNotFound
+        _resolveUri: async (uri: Uri) => {
+            const p = rel(uri);
+            const parent = path.posix.dirname(p);
+            if (p !== '' && parent !== '/' && !hasFolder(parent)) { throw Object.assign(new Error(`${uri.toString()}: not found`), { code: 'FileNotFound' }); }
+            return w.remote.has(p) ? { fileType: 'doc', fileEntity: {} }
+                : w.remoteFolders.has(p) ? { fileType: 'folder', fileEntity: { docs: [], fileRefs: [], folders: [] } }
+                : { fileType: undefined, fileEntity: undefined };
+        },
         // as Overleaf does: a folder that exists already is refused, and the request takes a moment
         mkdir: async (uri: Uri) => {
             if (w.remoteFolders.has(rel(uri))) { throw new Error(`${uri.path}: 400: file already exists`); }

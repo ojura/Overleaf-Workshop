@@ -148,6 +148,20 @@ describe('local replica: what it deletes and what it never syncs', function () {
         });
     });
 
+    describe('deletions made on Overleaf', () => {
+        it('delete the local files of a folder deleted on Overleaf, which the project tree answers as not found', async () => {
+            const t = host();
+            project(t, { '/main.tex': 'main\n', '/old/a.tex': 'a\n', '/old/b.tex': 'b\n' });
+            const { scm } = await start(t);
+            // a collaborator deletes the folder: a lookup of a path in it is FileNotFound, as the VFS answers it
+            t.w.remote.delete('/old/a.tex');
+            t.w.remote.delete('/old/b.tex');
+            await scm.settingItems[0].callback(); // Sync now, a full sync
+            assert.deepStrictEqual(['a.tex', 'b.tex'].filter(name => fs.existsSync(path.join(t.folder, 'old', name))), []);
+            assert.strictEqual(read(path.join(t.folder, 'main.tex')), 'main\n');
+        });
+    });
+
     describe('deletions on Overleaf', () => {
         const eight = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`/chapter${i}.tex`, `chapter ${i}\n`]));
 
@@ -203,7 +217,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             undo.push(() => fs.chmodSync(figs, 0o755));
             const error = await scm.syncNow().then(() => undefined, (e: Error) => e);
             assert.strictEqual(t.w.remote.has('/figs/a.tex') && t.w.remote.has('/figs/b.tex'), true, 'the files are still on Overleaf');
-            assert.match(String(error), /EACCES/);
+            assert.strictEqual((error as NodeJS.ErrnoException | undefined)?.code, 'EACCES', String(error));
         });
 
         it('count the files in a symbolically linked folder as there, so that deleting another file goes ahead', async function () {
