@@ -420,6 +420,45 @@ describe('local replica: what it deletes and what it never syncs', function () {
             assert.strictEqual(read(writing), 'half a download');
         });
 
+        /** Start a replica of `t`'s folder that fails to start: the error, and the lines of the replica's log. */
+        async function failedStart(t: ReturnType<typeof host>) {
+            const lines: string[] = [];
+            t.mock.window.createOutputChannel = () => ({ appendLine: (line: string) => lines.push(line), show() {}, dispose() {} });
+            const { LocalReplicaSCMProvider } = load(t.mock);
+            const scm = new LocalReplicaSCMProvider(t.vfs, Uri.file(t.folder));
+            const error = await scm.triggers.then((triggers: { dispose(): void }[]) => {
+                undo.push(async () => { triggers.forEach(trigger => trigger.dispose()); await scm.sync?.stop(); });
+                return undefined;
+            }, (e: NodeJS.ErrnoException) => e);
+            return { error, lines };
+        }
+
+        it('say in the log why the start failed when the temporary folder cannot be read', async function () {
+            if (process.platform === 'win32' || process.getuid?.() === 0) { this.skip(); } // permissions do not stop this user
+            const t = host();
+            project(t, { '/main.tex': 'v1\n' });
+            const temporary = path.join(t.folder, '.overleaf', 'tmp');
+            fs.mkdirSync(temporary, { recursive: true });
+            fs.chmodSync(temporary, 0o000);
+            undo.push(() => fs.chmodSync(temporary, 0o755));
+            const { error, lines } = await failedStart(t);
+            assert.strictEqual(error?.code, 'EACCES', String(error));
+            assert.ok(lines.some(line => line.includes(temporary) && line.includes(String(error))), JSON.stringify(lines));
+        });
+
+        it('say in the log why the start failed when the settings file cannot be written', async function () {
+            if (process.platform === 'win32' || process.getuid?.() === 0) { this.skip(); }
+            const t = host();
+            project(t, { '/main.tex': 'v1\n' });
+            const own = path.join(t.folder, '.overleaf');
+            fs.mkdirSync(own);
+            fs.chmodSync(own, 0o555);
+            undo.push(() => fs.chmodSync(own, 0o755));
+            const { error, lines } = await failedStart(t);
+            assert.strictEqual(error?.code, 'EACCES', String(error));
+            assert.ok(lines.some(line => line.includes(path.join(own, 'settings.json')) && line.includes(String(error))), JSON.stringify(lines));
+        });
+
         it('never download into the replica\'s git repository, whatever the ignore patterns say', async () => {
             const t = host();
             project(t, { '/main.tex': 'v1\n', '/.git/config': '# written on Overleaf\n[core]\n\tbare = true\n' });

@@ -930,9 +930,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private async initWatch() {
+        /** A step of the start: when it fails, the log says which step and why, and the replica does not start. */
+        const step = async <T>(failed: string, run: () => Promise<T>): Promise<T> => {
+            try {
+                return await run();
+            } catch (error) {
+                log(`[${this.vfs.projectName}] ${failed}: ${error}`);
+                throw error;
+            }
+        };
         // write the settings file if it does not exist
         const settingUri = vscode.Uri.joinPath(this.baseUri, REPLICA_SETTINGS_FILE);
-        if (!await localFs.exists(settingUri)) {
+        await step(`The replica's settings file ${settingUri.fsPath} could not be written`, async () => {
+            if (await localFs.exists(settingUri)) { return; }
             await localFs.writeFile(settingUri, Buffer.from(
                 JSON.stringify({
                     'uri': this.vfs.origin.toString(),
@@ -941,7 +951,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     'projectName': this.vfs.projectName,
                 }, null, 4)
             ), this.temporaryFolder);
-        }
+        });
 
         // One sync per folder: a reconnect creates a new provider for the same folder, and
         // its sync starts only after the previous one has stopped.
@@ -953,17 +963,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // the temporary files that writes of processes that no longer run left behind, e.g. at a
         // crash; a running writer keeps its files, as another replica of this folder that starts
         // at the same time in this window, or one in another window
-        await localFs.removeLeftoverWrites(this.temporaryFolder);
+        await step(`The leftovers of earlier writes in ${this.temporaryFolder} could not be removed`,
+                   () => localFs.removeLeftoverWrites(this.temporaryFolder));
         // the folder as the replica starts: before deleting anything, the sync checks that it still is
-        const identity = await localFs.identity(this.baseUri.fsPath);
+        const identity = await step(`The replica folder ${this.baseUri.fsPath} could not be read`, () => localFs.identity(this.baseUri.fsPath));
         const store = this.gitStore();
-        let gitDir: string;
-        try {
-            gitDir = await store.open();
-        } catch (error) {
-            log(`[${this.vfs.projectName}] The replica's git repository could not be opened: ${error}`);
-            throw error;
-        }
+        const gitDir = await step('The replica\'s git repository could not be opened', () => store.open());
         const replicaSettings = vscode.workspace.getConfiguration('overleaf-workshop.localReplica');
         const {modes, notices} = replicaModes({fetch: replicaSettings.get('fetchMode'), push: replicaSettings.get('pushMode')});
         this.modes = modes;
