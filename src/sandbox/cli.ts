@@ -11,21 +11,26 @@ import { SandboxSafetyError } from './guard';
 import { LockTimeoutError } from './lock';
 import { describeFindings, describeRanges, exitStatusOf, pushCheck, RANGES_HELP } from './rangesCli';
 import { ControlAnswer, NoReplicaWindowError, ReplicaTimeoutError, requestReplica } from '../scm/replicaControl';
-import { describe, SyncSummary } from '../scm/replicaSync';
-import { DEFAULT_IGNORE_PATTERNS } from '../scm/ignorePatterns';
+import { describe, ReplicaSync, SyncSummary } from '../scm/replicaSync';
+import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath, REPLICA_SETTINGS_FILE } from '../scm/ignorePatterns';
 import { Repo } from '../gitbridge/plumbing';
 import { minimatch } from 'minimatch';
-import { fetchCommitFrom, LandError, landCommit, landedCleanly, LandReport } from './land';
+import { fetchCommitFrom, LAND_COMPILES_FOLDER, LandError, landCommit, landedCleanly, LANDINGS_LOG, LandReport } from './land';
 import { anchorBridge } from '../gitbridge/anchor';
 import { bridgeBranch, pushToBridge } from '../gitbridge/flow';
 import { OverleafHistory, Pacer } from '../gitbridge/history';
 import { addBridgeRemote, rangesCheck } from '../gitbridge/overleaf';
 import { connectReplica, CONNECT_REF } from '../scm/replicaConnect';
+import { OVERLEAF_REF } from '../scm/replicaGit';
 import { BaseAPI } from '../api/base';
+import { errorMessage } from '../utils/errorMessage';
 import {
-    createSandbox, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions, sandboxStatus, sandboxUrl,
-    settingsOf,
+    createSandbox, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions, SANDBOX_RECORD_FILE,
+    SANDBOX_RUN_LOG_FILE, sandboxStatus, sandboxUrl, settingsOf,
 } from './sandbox';
+
+/** A path of the sync ('/dir/name'), as the help names it: relative to the replica's folder. */
+const inReplica = (file: string) => file.slice(1);
 
 const HELP = `Compile a local directory on Overleaf, in a private copy of a shared project;
 describe a project; reach it through Overleaf's git bridge, and check what a push
@@ -49,8 +54,8 @@ usage:
   node out/sandbox/cli.js replica-connect --replica <folder> --history <repo> [--ref <branch>] [--start-version <n>] [--not-own <glob>] [--pace <ms>] [--json]
   node out/sandbox/cli.js replica-bridge  --replica <folder> [--label <comment>] [--remote <name>] [--bridge <url>] [--json]
 
---replica <folder>  the shared project's local replica. Its .overleaf/settings.json names
-                    the project; .overleaf/sandbox.json records the private copy.
+--replica <folder>  the shared project's local replica. Its ${inReplica(REPLICA_SETTINGS_FILE)} names
+                    the project; ${inReplica(SANDBOX_RECORD_FILE)} records the private copy.
 
 init     Clones the shared project once into a new project of this account, named
          "<project> (sandbox)" unless --name says otherwise, sets the copy's compiler
@@ -124,7 +129,7 @@ compile and plan options:
   --purpose <text>        what this run is for, shown to runs that wait for it
   --json                  print run.json instead of the summary
 
-Each run adds its start and its end to .overleaf/sandbox-runs.jsonl in the replica:
+Each run adds its start and its end to ${inReplica(SANDBOX_RUN_LOG_FILE)} in the replica:
 what it was for, the directory, the main document, its status and where its results
 are. status shows the latest entries.
 
@@ -143,27 +148,35 @@ replica-sync    Asks the IDE window that keeps the replica in sync with Overleaf
                 acknowledged every local change so far; e.g. after a program wrote files
                 into the folder. The window answers on a local socket, also while it is in
                 the background, and does not come to the front. It also scans when
-                overleaf-workshop.localReplica.syncOnFileChange is off.
+                overleaf-workshop.localReplica.syncOnFileChange is off. It deletes at most
+                ${ReplicaSync.deletionThreshold} files on one side, as the window does without asking; more wait
+                for the user's confirmation in the window. While a question about
+                deletions is open there, the window answers at once with the question,
+                without looking for changed files: answer it, then run replica-sync again.
 replica-status  Shows whether the window is connected to Overleaf, how it watches the
                 folder, what it synced in the last 10 minutes, and the replica's git state:
-                the checked-out commit and Overleaf's state (refs/remotes/overleaf/main).
+                the checked-out commit and Overleaf's state (${OVERLEAF_REF}).
 --timeout <s>   how long to wait for the window's answer; default 300
 Exit status of both: 0 in sync (replica-status: the window answered); 3 a file could not
-be synced or has conflict markers, listed; 4 no IDE window keeps the folder in sync (the
-IDE is not running, or it has not opened the folder as a replica); 5 the window did not
-answer in time; 1 the tool failed; 2 wrong arguments.
+be synced, has conflict markers, or waits for a deletion to be confirmed, listed; 4 an IDE
+window does not keep the folder in sync (the IDE is not running, or it has not opened the
+folder as a replica); 5 the window did not answer in time; 1 the tool failed; 2 wrong
+arguments.
 
 replica-land    Lands <commit> of the replica's git repository in the project, then compiles
                 the project. The commit must descend from the checked-out commit, which
                 must be Overleaf's state: the window syncs first, and the tool checks that
                 Overleaf holds that commit file for file (documents by their text, binary
                 files by the hash Overleaf reports). Then the window pushes the commit: it
-                fast-forwards the branch, uploads what the commit changed (a rename as a
-                rename on Overleaf, so documents keep their comments) and waits for
-                Overleaf's acknowledgements. The tool checks again that Overleaf holds the
-                commit, for up to three minutes, and compiles the project once (again while
-                Overleaf answers that another compile of yours runs). The compile's logs are
-                kept in <git dir>/overleaf/compiles/<commit>/ and checked: an error line
+                fast-forwards the branch, uploads what the commit changed (a rename or move
+                that git shows, edited or not, as a rename on Overleaf, so documents keep
+                their comments; docs/replica-workflows.md, "Renames and moves") and waits for
+                Overleaf's acknowledgements. The files the commit deletes are deleted with
+                it; other deletions follow replica-sync's rule. The tool checks again that
+                Overleaf holds the commit, for up to three minutes, and compiles the
+                project once (again while Overleaf answers that another compile of yours
+                runs). It keeps the logs of the compile in a folder of its own,
+                <git dir>/${LAND_COMPILES_FOLDER}/<commit>/, and checks them: an error line
                 ("! ") in output.log, no "Output written on output.pdf", latexmk's
                 "Collected error summary", an "Automatic index:" line in output.stderr, or
                 "The index was not built/sorted" fails the landing. The warnings are listed
@@ -172,7 +185,7 @@ replica-land    Lands <commit> of the replica's git repository in the project, t
                 OVERLEAF_PARENT_COMPILE (the parent's, compiled first when missing),
                 OVERLEAF_COMMIT and OVERLEAF_PARENT, e.g. a check of where the pages of the
                 contents fall. Without <commit>, the checked-out commit is checked and
-                compiled. <git dir>/overleaf/landings.log lists the landings.
+                compiled. <git dir>/${LANDINGS_LOG} lists the landings.
 --from <repo>   take <commit> from that repository, e.g. a clone of the replica's
                 repository where the work happens: <commit> is resolved there (HEAD by
                 default) and fetched into the replica's repository first
@@ -196,8 +209,8 @@ replica-connect Connects a development history with the replica's repository, fo
                 master) of --history, which it only reads, writes its commits again on top of
                 the project's state where the history started (from the project's history,
                 or --start-version), each with a Rewritten-from trailer, and merges them with
-                Overleaf's state as the replica recorded it (refs/remotes/overleaf/main). The
-                result is in refs/connect/merge, on top of the replica's checked-out commit;
+                Overleaf's state as the replica recorded it (${OVERLEAF_REF}). The
+                result is in ${CONNECT_REF}, on top of the replica's checked-out commit;
                 replica-land lands it, which uploads the files the history adds to the
                 project. It lists those files, and the project files the history changes. The
                 replica must be in sync: its checked-out commit is Overleaf's state. Running
@@ -221,7 +234,7 @@ replica-bridge  Brings the git bridge's newest commit into the replica's reposit
                 Labels tab, so that the bridge's commit holds exactly that version. Exit
                 status 3 when nothing was joined.
 
-Safety: the tool writes only to the project recorded in .overleaf/sandbox.json, which
+Safety: the tool writes only to the project recorded in ${inReplica(SANDBOX_RECORD_FILE)}, which
 init created, and refuses the shared project's id and every other one. Before each
 write it joins the copy again and stops unless this account owns it, it has no
 collaborators and no pending invites, link sharing is off, and its name is the
@@ -394,9 +407,11 @@ async function replicaCommand(command: 'replica-sync' | 'replica-status', folder
     } else {
         const a = answer as any;
         const lines = [`${a.folder ?? folder}: ${a.connected ? 'connected to' : 'not connected to'} ${a.project?.server ?? 'Overleaf'} ("${a.project?.name ?? '?'}"), changes reported by ${a.watcher === 'node' ? "Node's watcher" : "the IDE's file events"}${a.modes ? `, fetch mode ${a.modes.fetch}, push mode ${a.modes.push}` : ''}${a.fullSyncRunning ? ', a full sync is running' : ''}`];
+        if (a.waiting) { lines.push(a.waiting.message); }
+        if (a.question) { lines.push(`${a.question.message}: ${a.question.paths.join(', ')}`); }
         if (a.git) {
             const g = a.git as { head?: string, overleaf?: string, branch?: string, unmerged?: string[] };
-            lines.push(`git: ${g.branch ?? 'detached HEAD'} at ${g.head?.slice(0, 7) ?? 'no commit'}, Overleaf's state (refs/remotes/overleaf/main) ${g.overleaf?.slice(0, 7) ?? 'not recorded yet'}${g.head && g.head === g.overleaf ? ', the same' : ''}${g.unmerged?.length ? `; conflicts to resolve in ${g.unmerged.join(', ')}` : ''}`);
+            lines.push(`git: ${g.branch ?? 'detached HEAD'} at ${g.head?.slice(0, 7) ?? 'no commit'}, Overleaf's state (${OVERLEAF_REF}) ${g.overleaf?.slice(0, 7) ?? 'not recorded yet'}${g.head && g.head === g.overleaf ? ', the same' : ''}${g.unmerged?.length ? `; conflicts to resolve in ${g.unmerged.join(', ')}` : ''}`);
         }
         if (a.summary) { lines.push(`this sync: ${describe(a.summary as SyncSummary)}`); }
         if (!answer.ok) { lines.push(`not in sync: ${answer.error}`); }
@@ -410,8 +425,8 @@ async function replicaCommand(command: 'replica-sync' | 'replica-status', folder
     return answer.ok ? 0 : 3;
 }
 
-/** The paths the replica leaves out, by its default ignore patterns; '/dir/name' */
-const replicaIgnored = (p: string) => p === '/.overleaf' || p.startsWith('/.overleaf/') || DEFAULT_IGNORE_PATTERNS.some(g => minimatch(p, g, { dot: true }));
+/** The paths the replica leaves out: its own folders, and its default ignore patterns; '/dir/name' */
+const replicaIgnored = (p: string) => isReplicaOwnPath(p) || DEFAULT_IGNORE_PATTERNS.some(g => minimatch(p, g, { dot: true }));
 
 /** replica-connect: join a development history with the replica's repository (src/scm/replicaConnect.ts). */
 async function replicaConnectCommand(folder: string, values: Record<string, string>, notOwn: string[], json: boolean): Promise<number> {
@@ -720,7 +735,7 @@ if (require.main === module) {
                 process.exit(2);
             }
             const kind = error instanceof SandboxSafetyError ? 'refused' : error instanceof LockTimeoutError ? 'lock' : 'error';
-            process.stderr.write(`${kind}: ${error?.message ?? error}\n`);
+            process.stderr.write(`${kind}: ${errorMessage(error)}\n`);
             process.exit(1);
         });
 }

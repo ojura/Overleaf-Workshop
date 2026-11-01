@@ -1,7 +1,7 @@
 import * as assert from 'assert';
 import {
     gitBlobHash, LocalStat, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaStore, ReplicaSync,
-    ReplicaUI, SavedState, SyncSummary,
+    ReplicaUI, SavedState, SyncSummary, WorkTreeState,
 } from '../scm/replicaSync';
 
 const enc = (text: string) => new TextEncoder().encode(text);
@@ -9,6 +9,9 @@ const dec = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 
 /** Overleaf, in memory: docs hold text, files hold bytes and report their hash. */
 class FakeRemote implements ReplicaRemote {
+    /** the error that Overleaf's requests get while it does not answer; undefined while it answers */
+    lost?: Error;
+    disconnected() { return this.lost; }
     docs = new Map<string, string>();
     files = new Map<string, Uint8Array>();
     folders = new Set<string>();
@@ -73,12 +76,15 @@ class FakeRemote implements ReplicaRemote {
         this.files.delete(path);
     }
     async removeFolderIfEmpty() {}
-    async settled() {}
+    /** settled() rejects with this while set, as the VFS does with documents that Overleaf has not confirmed */
+    settleFailure?: Error;
+    async settled() { if (this.settleFailure) { throw this.settleFailure; } }
     count(prefix: string) { return this.calls.filter(call => call.startsWith(prefix)).length; }
 }
 
 /** The local folder, in memory, with a clock for modification times. */
 class FakeLocal implements ReplicaLocal {
+    async verify() {}
     files = new Map<string, {content: Uint8Array, mtime: number}>();
     clock = 1_000_000;
     reads: string[] = [];
@@ -88,7 +94,10 @@ class FakeLocal implements ReplicaLocal {
         this.files.set(path, {content: typeof content==='string' ? enc(content) : content, mtime: this.clock});
     }
     text(path: string) { const f = this.files.get(path); return f && dec(f.content); }
+    /** while set, every listing waits for it, e.g. so that two scans list the folder at the same moment */
+    listGate?: Promise<void>;
     async list() {
+        if (this.listGate) { await this.listGate; }
         const all = new Map<string, LocalStat>();
         for (const [path, f] of this.files) { all.set(path, {size: f.content.byteLength, mtime: f.mtime}); }
         return all;
@@ -111,6 +120,8 @@ class FakeLocal implements ReplicaLocal {
 
 class FakeStore implements ReplicaStore {
     state?: SavedState;
+    /** set by a test that watches what the sync records */
+    record?: (state: SavedState) => Promise<{waiting?: boolean}>;
     bases = new Map<string, string>();
     copies = new Map<string, Uint8Array>();
     async load() { return this.state && JSON.parse(JSON.stringify(this.state)); }
@@ -128,14 +139,53 @@ class FakeStore implements ReplicaStore {
 class FakeUI implements ReplicaUI {
     logs: string[] = [];
     confirm = true;
+    /** while set, the answer to a question, e.g. one that never comes */
+    answer?: Promise<boolean>;
+    /** told when a question is asked */
+    onAsk?: () => void;
     asked: string[][] = [];
     blocked: string[] = [];
     live: SyncSummary[] = [];
     log(message: string) { this.logs.push(message); }
     progress() {}
-    async confirmDeletions(_where: 'local' | 'remote', paths: string[]) { this.asked.push(paths); return this.confirm; }
+    async confirmDeletions(_where: 'local' | 'remote', paths: string[]) { this.asked.push(paths); this.onAsk?.(); return this.answer ?? this.confirm; }
     conflictBlocked(path: string) { this.blocked.push(path); }
     liveResult(summary: SyncSummary) { this.live.push(summary); }
+    /** what the sync said about waiting, in order; `onWaiting` is told each time */
+    waits: (string | undefined)[] = [];
+    onWaiting?: () => void;
+    waiting(reason: string | undefined) { this.waits.push(reason); this.onWaiting?.(); }
+}
+
+/** A store with git's index lock held by another program while `lock` is set, and git's state of the work tree. */
+class LockedStore extends FakeStore {
+    lock?: string = '/replica/.git/index.lock';
+    tree?: WorkTreeState;
+    private watches: (() => void)[] = [];
+    /** resolves when the sync starts to wait for the lock */
+    waitStarted: Promise<void>;
+    private started!: () => void;
+    constructor() {
+        super();
+        this.waitStarted = new Promise<void>(resolve => { this.started = resolve; });
+    }
+    /** the git operation under way in the folder, e.g. 'a merge' */
+    op?: string;
+    async operation() { return this.op; }
+    async foreignIndexLock() { return this.lock; }
+    indexLockReleased() {
+        let resolve!: () => void;
+        const released = new Promise<void>(r => { resolve = r; });
+        this.watches.push(resolve);
+        this.started();
+        return {released, dispose: () => {}};
+    }
+    async workTree() { return this.op ? { operation: this.op } : this.tree; }
+    /** git removes the lock: the sync's watch learns of it */
+    release() {
+        this.lock = undefined;
+        this.watches.splice(0).forEach(resolve => resolve());
+    }
 }
 
 function setup() {
@@ -331,6 +381,274 @@ describe('ReplicaSync', () => {
         assert.strictEqual(t.remote.files.size, 7);
     });
 
+    it('does not take a file missing on Overleaf for deleted while Overleaf does not answer, and fails with Overleaf\'s reason', async () => {
+        const t = setup();
+        t.remote.docs.set('/a.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        // the project tree lacks the file, but Overleaf does not answer: the tree may be old
+        t.remote.docs.delete('/a.tex');
+        t.remote.lost = new Error('Not connected to Overleaf, as the test has it');
+        const summary = await sync.syncAll();
+        assert.deepStrictEqual(summary.failed, [{ path: '/a.tex', error: t.remote.lost.message }]);
+        assert.strictEqual(t.local.text('/a.tex'), text, 'the local file stays');
+    });
+
+    it('counts deletions that events report one at a time together, and asks once before making many', async () => {
+        const saved = ReplicaSync.localDeleteDelayMs;
+        ReplicaSync.localDeleteDelayMs = 0;
+        try {
+            const t = setup();
+            for (let i = 0; i < 8; i++) { t.remote.files.set(`/f${i}.png`, new Uint8Array([i])); }
+            const sync = t.start();
+            await sync.syncAll();
+            // six files deleted at once, as by a git checkout, and reported one by one
+            for (let i = 0; i < 6; i++) { t.local.files.delete(`/f${i}.png`); }
+            t.ui.confirm = false;
+            await sync.localChanged('/f0.png');
+            assert.strictEqual(t.ui.asked.length, 1);
+            assert.deepStrictEqual([...t.ui.asked[0]].sort(), ['/f0.png', '/f1.png', '/f2.png', '/f3.png', '/f4.png', '/f5.png']);
+            assert.strictEqual(t.remote.files.size, 8, 'every file stays on Overleaf');
+            await sync.localChanged('/f1.png');
+            assert.strictEqual(t.ui.asked.length, 1, 'the user is not asked again about deletions they declined');
+            assert.strictEqual(t.remote.files.size, 8);
+        } finally {
+            ReplicaSync.localDeleteDelayMs = saved;
+        }
+    });
+
+    it('without uploads, holds local deletions for a push without asking, also when a tool asks', async () => {
+        const saved = ReplicaSync.localDeleteDelayMs;
+        ReplicaSync.localDeleteDelayMs = 0;
+        try {
+            const t = setup();
+            for (let i = 0; i < 8; i++) { t.remote.files.set(`/f${i}.png`, new Uint8Array([i])); }
+            const sync = new ReplicaSync(t.remote, t.local, t.store, t.ui, (p: string) => p.endsWith('.aux'), { uploads: false });
+            await sync.syncAll();
+            // six files deleted at once, as by a git checkout, and reported one by one
+            for (let i = 0; i < 6; i++) { t.local.files.delete(`/f${i}.png`); }
+            await sync.localChanged('/f0.png');
+            const summary = await sync.flush(true, { by: 'tool' });
+            assert.deepStrictEqual(t.ui.asked, [], 'the user is not asked');
+            assert.deepStrictEqual(summary.deletionsToConfirm, [], 'the tool is not refused');
+            assert.deepStrictEqual([...summary.held].sort(), ['/f0.png', '/f1.png', '/f2.png', '/f3.png', '/f4.png', '/f5.png']);
+            assert.strictEqual(t.remote.files.size, 8, 'every file stays on Overleaf until a push');
+        } finally {
+            ReplicaSync.localDeleteDelayMs = saved;
+        }
+    });
+
+    it('decides the deletions that a tool\'s request finds in the request\'s own step, also when another step has a reconcile of the same files waiting', async () => {
+        const t = setup();
+        const paths = Array.from({ length: 6 }, (_, i) => `/f${i}.png`);
+        paths.forEach((p, i) => t.remote.files.set(p, new Uint8Array([i])));
+        const sync = t.start();
+        await sync.syncAll();
+        // the files are deleted locally, as a landing's checkout deletes the files of its commit
+        for (const p of paths) { t.local.files.delete(p); }
+        // the window's question about them is never answered
+        t.ui.answer = new Promise(() => { /* the user is away */ });
+        // A periodic scan and a landing's request list the folder at the same moment. The scan
+        // schedules its reconciles first, and the request schedules its own before they start.
+        let release!: () => void;
+        t.local.listGate = new Promise<void>(resolve => { release = resolve; });
+        void sync.flush(true); // waits for the answer
+        const landing = sync.flush(true, { by: 'tool', approved: new Set(paths) });
+        t.local.listGate = undefined;
+        release();
+        const summary = await landing;
+        assert.deepStrictEqual([...summary.deletedRemote].sort(), paths);
+        assert.deepStrictEqual([...t.remote.files.keys()], [], 'the deletions that the request approves are made');
+    });
+
+    describe('while another program holds git\'s index lock, as a checkout under way does', () => {
+        async function locked() {
+            const t = setup();
+            const store = new LockedStore();
+            t.remote.docs.set('/a.tex', text);
+            const sync = new ReplicaSync(t.remote, t.local, store, t.ui, (p: string) => p.endsWith('.aux'));
+            store.lock = undefined;
+            await sync.syncAll();
+            store.lock = '/replica/.git/index.lock';
+            t.remote.calls.length = 0;
+            return { ...t, store, sync };
+        }
+
+        it('waits in a window step, and acts on the folder as the end of the lock leaves it', async () => {
+            const t = await locked();
+            // the checkout writes a.tex of an older commit, and the event of the file comes
+            t.local.set('/a.tex', 'an older text\n');
+            const step = t.sync.localChanged('/a.tex');
+            await Promise.race([step, t.store.waitStarted]);
+            assert.deepStrictEqual(t.remote.calls, [], 'nothing goes to Overleaf while the lock is held');
+            // git moves HEAD to the older commit last, then removes the lock
+            t.store.tree = { head: 'older', overleaf: 'recorded' };
+            t.store.release();
+            await step;
+            assert.deepStrictEqual(t.remote.calls, [], 'the sync waits for the checked-out commit');
+            assert.strictEqual(t.remote.docs.get('/a.tex'), text, 'Overleaf keeps the newer text');
+        });
+
+        it('goes on after a short lock, without the full sync that ends a wait', async () => {
+            const t = await locked();
+            const syncAll = t.sync.syncAll.bind(t.sync);
+            let fullSyncs = 0;
+            t.sync.syncAll = () => { fullSyncs += 1; return syncAll(); };
+            t.local.set('/a.tex', 'an edit\n');
+            const step = t.sync.localChanged('/a.tex');
+            await t.store.waitStarted;
+            t.store.release(); // e.g. git status of another program
+            await step;
+            assert.strictEqual(t.remote.docs.get('/a.tex'), 'an edit\n', 'the edit is uploaded once the lock is gone');
+            assert.strictEqual(fullSyncs, 0);
+            assert.deepStrictEqual(t.ui.waits, [], 'nothing is said about a wait');
+        });
+
+        it('answers a tool at once that the sync waits, naming the lock, and uploads nothing', async () => {
+            const t = await locked();
+            t.local.set('/a.tex', 'an older text\n');
+            const summary = await t.sync.flush(true, { by: 'tool' });
+            assert.ok(String(summary.waitingFor).includes('/replica/.git/index.lock'), summary.waitingFor);
+            assert.deepStrictEqual(t.remote.calls, []);
+        });
+
+        it('tells the user about a lock that stays, naming the file, and goes on once it is gone', async () => {
+            const saved = ReplicaSync.staleLockMs;
+            ReplicaSync.staleLockMs = 0;
+            try {
+                const t = await locked();
+                const told = new Promise<void>(resolve => { t.ui.onWaiting = resolve; });
+                t.local.set('/a.tex', 'an edit\n');
+                const step = t.sync.localChanged('/a.tex');
+                await told;
+                assert.ok(String(t.ui.waits[0]).includes('/replica/.git/index.lock'), String(t.ui.waits[0]));
+                assert.ok(String(t.sync.waitingFor).includes('/replica/.git/index.lock'), 'the status says why the sync waits');
+                t.store.release();
+                await step;
+                assert.deepStrictEqual(t.ui.waits.slice(1), [undefined], 'the wait ends');
+                assert.strictEqual(t.remote.docs.get('/a.tex'), 'an edit\n');
+            } finally {
+                ReplicaSync.staleLockMs = saved;
+            }
+        });
+    });
+
+    describe('a step that started before a git operation in the folder', () => {
+        async function synced(n: number) {
+            const t = setup();
+            const store = new LockedStore();
+            store.lock = undefined;
+            const docs = Array.from({ length: n }, (_, i) => `/d${i}.tex`);
+            for (const p of docs) { t.remote.docs.set(p, `${p} v1\n`); }
+            const sync = new ReplicaSync(t.remote, t.local, store, t.ui, (p: string) => p.endsWith('.aux'));
+            await sync.syncAll();
+            t.remote.calls.length = 0;
+            return { ...t, store, sync, docs };
+        }
+
+        it('leaves the downloads it has not written yet to the full sync after the operation', async () => {
+            const t = await synced(3);
+            for (const p of t.docs) { t.remote.docs.set(p, `${p} v2, edited on Overleaf\n`); }
+            // a merge starts in the folder while the full sync reads the first document
+            const readDoc = t.remote.readDoc.bind(t.remote);
+            t.remote.readDoc = async (path: string) => { t.store.op = 'a merge'; return readDoc(path); };
+            const during = await t.sync.syncAll();
+            assert.deepStrictEqual(t.docs.map(p => t.local.text(p)), t.docs.map(p => `${p} v1\n`), 'nothing is written into the folder during the merge');
+            assert.deepStrictEqual([during.downloaded, during.failed], [[], []]);
+            assert.strictEqual(during.waitingFor, 'git is in the middle of a merge in the folder');
+            // the merge ends; the full sync after it takes the documents in
+            t.remote.readDoc = readDoc;
+            t.store.op = undefined;
+            await t.sync.syncAll();
+            assert.deepStrictEqual(t.docs.map(p => t.local.text(p)), t.docs.map(p => `${p} v2, edited on Overleaf\n`));
+        });
+
+        it('leaves the uploads it has not made yet to the full sync after the operation', async () => {
+            // one transfer at a time, so that the uploads go out one after the other
+            const concurrency = ReplicaSync.concurrency;
+            ReplicaSync.concurrency = 1;
+            const t = await synced(3).finally(() => { ReplicaSync.concurrency = concurrency; });
+            for (const p of t.docs) { t.local.set(p, `${p} v2, edited locally\n`); }
+            // a merge starts in the folder while the first document is uploaded
+            const writeDoc = t.remote.writeDoc.bind(t.remote);
+            t.remote.writeDoc = async (path: string, text: string) => { t.store.op = 'a merge'; return writeDoc(path, text); };
+            const during = await t.sync.flush(true);
+            assert.strictEqual(t.remote.calls.filter(call => call.startsWith('writeDoc')).length, 1, 'one upload had started before the merge');
+            assert.deepStrictEqual(during.failed, []);
+            assert.strictEqual(during.waitingFor, 'git is in the middle of a merge in the folder');
+            t.remote.writeDoc = writeDoc;
+            t.store.op = undefined;
+            await t.sync.syncAll();
+            assert.deepStrictEqual(t.docs.map(p => t.remote.docs.get(p)), t.docs.map(p => `${p} v2, edited locally\n`));
+        });
+
+        it('reads both sides again when the operation that the check before a write found is over by the time the sync may act, and keeps what the operation wrote', async () => {
+            const t = await synced(0);
+            t.remote.docs.set('/a.tex', text);
+            await t.sync.syncAll();
+            t.remote.docs.set('/a.tex', text.replace('line 5', 'line 5, edited on Overleaf'));
+            // While the sync reads Overleaf's text, a merge writes a local change into a.tex. It ends
+            // right after the check before the download finds it, before mayAct looks at the folder.
+            const readDoc = t.remote.readDoc.bind(t.remote);
+            t.remote.readDoc = async (path: string) => {
+                t.remote.readDoc = readDoc;
+                t.store.op = 'a merge';
+                t.local.set('/a.tex', text.replace('line 1', 'line 1, written by the merge'));
+                return readDoc(path);
+            };
+            const operation = t.store.operation.bind(t.store);
+            let found = 0;
+            t.store.operation = async () => {
+                const op = await operation();
+                if (op !== undefined) {
+                    found += 1;
+                    t.store.op = undefined;
+                }
+                return op;
+            };
+            const summary = await t.sync.syncAll();
+            assert.strictEqual(found, 1, 'the check before the download found the merge');
+            const both = text.replace('line 1', 'line 1, written by the merge').replace('line 5', 'line 5, edited on Overleaf');
+            assert.strictEqual(t.local.text('/a.tex'), both, 'the local file: the merge\'s change, merged with Overleaf\'s');
+            assert.strictEqual(t.remote.docs.get('/a.tex'), both);
+            assert.deepStrictEqual([summary.merged, summary.downloaded, summary.failed], [['/a.tex'], [], []]);
+        });
+    });
+
+    it('finishes the steps without deletions while a question about others waits for an answer', async () => {
+        const t = setup();
+        for (let i = 0; i < 6; i++) { t.remote.files.set(`/fig/f${i}.png`, new Uint8Array([i])); }
+        t.remote.docs.set('/main.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        // a collaborator deletes the six figures; the question about them is never answered
+        for (let i = 0; i < 6; i++) { t.remote.files.delete(`/fig/f${i}.png`); }
+        t.ui.answer = new Promise(() => { /* the user is away */ });
+        const asked = new Promise<void>(resolve => { t.ui.onAsk = resolve; });
+        void sync.remoteChanged('/fig', true);
+        await asked;
+        // a local edit meanwhile is uploaded and reported
+        t.local.set('/main.tex', text + 'line 6\n');
+        await sync.localChanged('/main.tex');
+        assert.strictEqual(t.remote.docs.get('/main.tex'), text + 'line 6\n');
+        assert.deepStrictEqual(t.ui.live.at(-1)!.uploaded, ['/main.tex']);
+        assert.strictEqual(t.ui.asked.length, 1);
+    });
+
+    it('asks before deleting the many local files of a folder deleted on Overleaf', async () => {
+        const t = setup();
+        for (let i = 0; i < 7; i++) { t.remote.files.set(`/fig/f${i}.png`, new Uint8Array([i])); }
+        t.remote.docs.set('/main.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        for (let i = 0; i < 7; i++) { t.remote.files.delete(`/fig/f${i}.png`); }
+        t.ui.confirm = false;
+        await sync.remoteChanged('/fig', true);
+        assert.strictEqual(t.ui.asked.length, 1);
+        assert.strictEqual(t.ui.asked[0].length, 7);
+        assert.strictEqual(t.local.files.size, 8, 'the local files stay');
+    });
+
     it('deletes locally what was deleted on Overleaf, keeping local changes aside', async () => {
         const t = setup();
         t.remote.docs.set('/a.tex', 'a');
@@ -499,3 +817,23 @@ describe('ReplicaSync', () => {
     });
 });
 
+describe('ReplicaSync and the updates that Overleaf has not confirmed', () => {
+    before(() => { ReplicaSync.remoteDeleteDelayMs = 0; ReplicaSync.saveDelayMs = 0; });
+
+    it('does not record the state while Overleaf has not confirmed the document updates', async () => {
+        const t = setup();
+        t.remote.docs.set('/main.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        const recorded: SavedState[] = [];
+        t.store.record = async (state: SavedState) => { recorded.push(state); return {}; };
+        t.remote.settleFailure = new Error('Overleaf has not confirmed these updates: /main.tex: not confirmed (the connection was lost (disconnected))');
+        t.local.set('/main.tex', text + 'line 6\n');
+        await assert.rejects(sync.flush(true, {record: true}), /has not confirmed these updates: \/main\.tex/);
+        assert.deepStrictEqual(recorded, []);
+        t.remote.settleFailure = undefined;
+        await sync.flush(true, {record: true});
+        assert.strictEqual(recorded.length, 1);
+        assert.strictEqual(t.remote.docs.get('/main.tex'), text + 'line 6\n');
+    });
+});

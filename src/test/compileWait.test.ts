@@ -1,55 +1,49 @@
 /* eslint-disable @typescript-eslint/naming-convention -- mirrors the 'vscode' export names */
 import * as assert from 'assert';
-import Module = require('module');
-
-/** Stands in for anything else: callable, constructible, and every member is one again. */
-function stub(): any {
-    const f: any = function () { return stub(); };
-    return new Proxy(f, {
-        get(target, key) {
-            if (key === 'then') { return undefined; }
-            if (!(key in target)) { target[key] = stub(); }
-            return target[key];
-        },
-        construct() { return stub(); },
-    });
-}
-const withStubs = (target: any): any => new Proxy(target, {
-    get: (t, key) => (key in t ? t[key] : stub()),
-});
+import { loadWithVscode, strict } from './standIn';
 
 const warnings: string[] = [];
-const vscodeMock = withStubs({
+/** the save of the editors before a compile (vscode.workspace.saveAll) */
+let saveAll = async () => true;
+const disposable = { dispose() {} };
+const vscodeStandIn = strict('vscode', {
     Disposable: class { dispose() {} },
-    EventEmitter: class { event = () => ({ dispose() {} }); fire() {} dispose() {} },
+    EventEmitter: class { event = () => disposable; fire() {} dispose() {} },
+    // classes that the extension's modules extend when they load
     TreeItem: class {},
+    QuickPickItem: class {},
     MarkdownString: class { appendMarkdown() { return this; } },
-    Uri: { parse: (value: string) => ({ scheme: 'overleaf-workshop', path: '/project', toString: () => value }) },
-    l10n: { t: (message: string) => message },
-    window: withStubs({
+    ThemeColor: class {},
+    StatusBarAlignment: { Left: 1, Right: 2 },
+    DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2, Hint: 3 },
+    Uri: { parse: (value: string) => ({ scheme: 'overleaf-workshop', path: '/project', query: 'user=u&project=p', toString: () => value }) },
+    l10n: strict('vscode.l10n', { t: (message: string) => message }),
+    languages: strict('vscode.languages', { createDiagnosticCollection: () => ({ clear() {}, set() {}, dispose() {} }) }),
+    window: strict('vscode.window', {
+        activeTextEditor: undefined,
         showWarningMessage: async (message: string) => { warnings.push(message); return undefined; },
-        createStatusBarItem: () => withStubs({ show() {}, hide() {} }),
+        createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
     }),
-    workspace: withStubs({
-        saveAll: async () => true,
-        getConfiguration: () => ({ get: (_key: string, value: any) => value }),
-        textDocuments: [],
+    workspace: strict('vscode.workspace', {
+        workspaceFolders: undefined,
+        saveAll: () => saveAll(),
+        getConfiguration: () => ({ get: (_key: string, value: unknown) => value }),
+    }),
+    commands: strict('vscode.commands', {
+        // the compile of a project from a folder, which reads no log
+        executeCommand: async (command: string) => { throw new Error(`the test has no command ${command}`); },
     }),
 });
-const moduleAny = Module as any;
-const originalLoad = moduleAny._load;
-moduleAny._load = function (request: string, ...rest: any[]) {
-    return request === 'vscode' ? vscodeMock : originalLoad.call(this, request, ...rest);
-};
-const { CompileManager } = require('../compile/compileManager');
-const { LocalReplicaSCMProvider } = require('../scm/localReplicaSCM');
-moduleAny._load = originalLoad;
-// The modules just loaded hold this file's stand-in for 'vscode': keep them out of other tests.
-for (const key of Object.keys(require.cache)) {
-    if (/[\\/]out[\\/](?!test[\\/])/.test(key)) { delete require.cache[key]; }
-}
+const { CompileManager, LocalReplicaSCMProvider, EventBus, isMainDocument } = loadWithVscode(vscodeStandIn, () => ({
+    ...require('../compile/compileManager'),
+    ...require('../scm/localReplicaSCM'),
+    ...require('../utils/eventBus'),
+}));
 
-const settle = async () => { for (let i = 0; i < 50; i++) { await new Promise(resolve => setImmediate(resolve)); } };
+/** The end of the next compile in the window. */
+const compileEnd = () => new Promise<any>(resolve => {
+    const listener = EventBus.on('compileEndedEvent', (event: any) => { listener.dispose(); resolve(event); });
+});
 
 describe('CompileManager with a local replica', () => {
     const flushAll = LocalReplicaSCMProvider.flushAll;
@@ -59,17 +53,19 @@ describe('CompileManager with a local replica', () => {
         LocalReplicaSCMProvider.flushAll = flushAll;
         LocalReplicaSCMProvider.readSettings = readSettings;
         CompileManager.uploadWaitMs = waitMs;
+        saveAll = async () => true;
         warnings.length = 0;
     });
 
-    function setup(flush: () => Promise<void>) {
+    function setup(flush: () => Promise<void>, { replica = true } = {}) {
         const events: string[] = [];
-        LocalReplicaSCMProvider.readSettings = async () => ({ uri: 'overleaf-workshop://server/project?user=u&project=p', enableCompileNPreview: true });
+        LocalReplicaSCMProvider.readSettings = async () => (replica ? { uri: 'overleaf-workshop://server/project?user=u&project=p', enableCompileNPreview: true } : undefined);
         LocalReplicaSCMProvider.flushAll = async () => { events.push('flush started'); await flush(); events.push('flush done'); };
         const vfs = {
             getRootDocName: () => '/main.tex',
             getCompiler: () => ({ name: 'pdfLaTeX' }),
             _resolveUri: async () => ({ fileType: 'folder', fileId: 'root' }),
+            // nothing changed since the last compile: no log to read
             compile: async (_force: boolean, _draft: boolean, _stop: boolean, _root: string, fromScratch?: boolean) => {
                 events.push(fromScratch ? 'compile from scratch' : 'compile');
                 return undefined;
@@ -81,31 +77,107 @@ describe('CompileManager with a local replica', () => {
 
     it('compiles only after the local changes have been uploaded', async () => {
         let release!: () => void;
-        const { events, manager } = setup(() => new Promise<void>(resolve => { release = resolve; }));
-        manager.compile(true);
-        await settle();
+        let flushing!: () => void;
+        const flushStarted = new Promise<void>(resolve => { flushing = resolve; });
+        const { events, manager } = setup(() => { flushing(); return new Promise<void>(resolve => { release = resolve; }); });
+        const ended = compileEnd();
+        assert.deepStrictEqual(await manager.compile(true), { kind: 'started' });
+        await flushStarted;
         assert.deepStrictEqual(events, ['flush started'], 'the compile waits for the uploads');
         release();
-        await settle();
+        await ended;
         assert.deepStrictEqual(events, ['flush started', 'flush done', 'compile']);
     });
 
     it('clears the compile output on Overleaf only for Recompile from Scratch', async () => {
         const { events, manager } = setup(async () => {});
+        let ended = compileEnd();
         await manager.compile(true);
-        await settle();
+        await ended;
+        ended = compileEnd();
         await manager.compile(true, true);
-        await settle();
+        await ended;
         assert.deepStrictEqual(events.filter(e => e.startsWith('compile')), ['compile', 'compile from scratch']);
     });
 
     it('compiles anyway when the uploads take too long, and says so', async () => {
         CompileManager.uploadWaitMs = 20;
         const { events, manager } = setup(() => new Promise<void>(() => {}));
-        manager.compile(true);
-        await new Promise(resolve => setTimeout(resolve, 100));
-        await settle();
+        const ended = compileEnd();
+        await manager.compile(true);
+        assert.deepStrictEqual((await ended).outcome, { result: 'skipped' });
         assert.deepStrictEqual(events, ['flush started', 'compile']);
         assert.strictEqual(warnings.length, 1);
     });
+
+    it('answers that it is busy while a compile runs, with the end of that compile, which comes after the compile\'s end event', async () => {
+        let release!: () => void;
+        const { manager } = setup(() => new Promise<void>(resolve => { release = resolve; }));
+        const order: string[] = [];
+        const listener = EventBus.on('compileEndedEvent', () => order.push('compileEndedEvent'));
+        try {
+            assert.deepStrictEqual(await manager.compile(true), { kind: 'started' });
+            const busy = await manager.compile(true);
+            assert.strictEqual(busy.kind, 'busy');
+            const waited = busy.ended.then(() => order.push('busy ended'));
+            release();
+            await waited;
+            assert.deepStrictEqual(order, ['compileEndedEvent', 'busy ended']);
+            assert.strictEqual(manager.inCompiling, false);
+        } finally {
+            listener.dispose();
+        }
+    });
+
+    it('answers that no compile is available without a project to compile', async () => {
+        const { manager } = setup(async () => {}, { replica: false });
+        assert.deepStrictEqual(await manager.compile(true), { kind: 'unavailable' });
+        assert.strictEqual(manager.inCompiling, false);
+    });
+
+    it('ends the compile that a busy answer waits for also when that compile finds no project to compile', async () => {
+        const { manager } = setup(async () => {}, { replica: false });
+        let saved!: () => void;
+        saveAll = () => new Promise<boolean>(resolve => { saved = () => resolve(true); });
+        const first = manager.compile(true);
+        const busy = await manager.compile(true);
+        assert.strictEqual(busy.kind, 'busy');
+        saved();
+        assert.deepStrictEqual(await first, { kind: 'unavailable' });
+        await busy.ended;
+        assert.strictEqual(manager.inCompiling, false);
+    });
+
+    it('ends the compile that a busy answer waits for also when that compile fails before it starts', async () => {
+        const { manager } = setup(async () => {});
+        let failed!: (error: Error) => void;
+        saveAll = () => new Promise<boolean>((_resolve, reject) => { failed = reject; });
+        const first = manager.compile(true);
+        const busy = await manager.compile(true);
+        assert.strictEqual(busy.kind, 'busy');
+        failed(new Error('a save failed'));
+        await assert.rejects(first, /a save failed/);
+        await busy.ended;
+        assert.strictEqual(manager.inCompiling, false);
+    });
+});
+
+describe('which documents a compile from their editor typesets on their own (isMainDocument)', () => {
+    const cases: Array<[string, string, boolean]> = [
+        ['a \\documentclass line', '\\documentclass{article}\n\\begin{document}\n', true],
+        ['after spaces, with options', '   \\documentclass[a4paper]{book}\n', true],
+        ['with its options on the following lines', '\\documentclass[\n  a4paper,\n  12pt\n]{article}\n', true],
+        ['a line that begins with \\documentclass and names no class, as Overleaf counts it', '\\documentclass\n', true],
+        ['a subfiles chapter', '\\documentclass[../main.tex]{subfiles}\n\\begin{document}\n', false],
+        ['a subfiles chapter, its option and class on the following lines', '\\documentclass\n[../main.tex]\n{ subfiles }\n', false],
+        ['a commented-out \\documentclass', '% \\documentclass{article}\nSome notes.\n', false],
+        ['\\documentclass after other text on its line', 'See \\documentclass{article} there.\n', false],
+        ['a longer command that begins with documentclass', '\\documentclassx{article}\n', false],
+        ['no \\documentclass', '\\section{One}\n', false],
+    ];
+    for (const [what, content, main] of cases) {
+        it(`${main ? 'counts' : 'does not count'} ${what}`, () => {
+            assert.strictEqual(isMainDocument(content), main);
+        });
+    }
 });

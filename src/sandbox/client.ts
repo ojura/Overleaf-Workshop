@@ -1,9 +1,10 @@
 /* eslint-disable @typescript-eslint/naming-convention -- Overleaf's field names */
-import { BaseAPI, CommentThreadSchema, CompileResponseSchema, GitTokenInfo, Identity } from '../api/base';
+import { BaseAPI, CommentThreadSchema, CompileRequest, CompileResponseSchema, EDITOR_ID, GitTokenInfo, Identity } from '../api/base';
 import type { FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
-import { CompileRequest, EntityType, JoinedView, ProjectView, ProjectWriter } from './guard';
+import { EntityType, JoinedView, ProjectView, ProjectWriter } from './guard';
 import { decodePackedUtf8 } from '../api/packedUtf8';
 import { DocRanges, ProjectRanges, rangesOf } from './ranges';
+import { errorMessage } from '../utils/errorMessage';
 
 /** What joinProject returns for a project, as far as the tool reads it. */
 export interface JoinedProject extends JoinedView {
@@ -39,27 +40,6 @@ class SandboxAPI extends BaseAPI {
         this.setIdentity(identity);
         const content = await this.download(`project/${projectId}`);
         return content.toString('utf8');
-    }
-
-    /**
-     * A compile as the editor's Recompile button starts it, not an automatic one. As the editor
-     * and the extension's own compile (BaseAPI.compile) do, it asks for Overleaf's PDF caching:
-     * the response then lists the pieces of output.pdf, which the extension's PDF viewers fetch
-     * from the download domain and keep in their cache.
-     */
-    async compileProject(identity: Identity, projectId: string, request: CompileRequest) {
-        this.setIdentity(identity);
-        const body = {
-            check: 'silent',
-            draft: request.draft,
-            incrementalCompilesEnabled: true,
-            rootResourcePath: request.rootResourcePath,
-            stopOnFirstError: request.stopOnFirstError,
-        };
-        return this.request('POST', `project/${projectId}/compile?enable_pdf_caching=true`, body, (res) => {
-            const compile = JSON.parse(res!) as CompileResponseSchema;
-            return { compile };
-        }, { 'X-Csrf-Token': identity.csrfToken }, BaseAPI.compileRequestOptions);
     }
 }
 
@@ -109,9 +89,9 @@ export class OverleafClient implements ProjectWriter {
                     finish(undefined, { project: res.project, permissionsLevel: res.permissionsLevel });
                 }
             });
-            socket.on('connectionRejected', (err: any) => finish(new Error(`Overleaf rejected joining project ${projectId}: ${err?.message ?? err} (has the login expired? Log in again with the extension.)`)));
+            socket.on('connectionRejected', (err: any) => finish(new Error(`Overleaf rejected joining project ${projectId}: ${errorMessage(err)} (has the login expired? Log in again with the extension.)`)));
             socket.on('connect_failed', () => finish(new Error(`could not connect to ${origin}`)));
-            socket.on('error', (err: any) => finish(new Error(`connection to ${origin} failed: ${err?.message ?? err}`)));
+            socket.on('error', (err: any) => finish(new Error(`connection to ${origin} failed: ${errorMessage(err)}`)));
             socket.on('disconnect', () => finish(new Error(`the connection to ${origin} closed before project ${projectId} was joined`)));
         });
     }
@@ -145,7 +125,7 @@ export class OverleafClient implements ProjectWriter {
             const timer = setTimeout(() => reject(new Error(`${args[0]} took more than ${this.joinTimeoutMs/1000} s`)), this.joinTimeoutMs);
             socket.emit(...args, (err: any, ...rest: any[]) => {
                 clearTimeout(timer);
-                err ? reject(new Error(`${args[0]}: ${err?.message ?? JSON.stringify(err)}`)) : resolve(rest);
+                err ? reject(new Error(`${args[0]}: ${errorMessage(err)}`)) : resolve(rest);
             });
         });
         try {
@@ -208,10 +188,9 @@ export class OverleafClient implements ProjectWriter {
         return res.content;
     }
 
-    /** An output file of a compile, as the extension's PDF viewer gets it. */
+    /** An output file of this tool's compile, as the extension gets one (BaseAPI.getOutputFile). */
     async outputFile(file: OutputFileEntity, response: CompileResult['response']): Promise<Uint8Array> {
-        const res = await this.api.getFileFromClsi(this.identity, file.url, response.compileGroup || 'standard',
-                                                   response.clsiServerId, response.pdfDownloadDomain);
+        const res = await this.api.getOutputFile(this.identity, file, response as CompileResponseSchema, EDITOR_ID);
         if (res.type !== 'success' || !res.content) {
             throw new Error(`the download of ${file.path} failed: ${res.message}`);
         }
@@ -266,8 +245,9 @@ export class OverleafClient implements ProjectWriter {
         }
     }
 
+    /** A compile as the web editor's Recompile button starts it, not an automatic one (BaseAPI.compile). */
     async compile(projectId: string, request: CompileRequest): Promise<CompileResult> {
-        const res = await this.api.compileProject(this.identity, projectId, request);
+        const res = await this.api.compile(this.identity, projectId, request, { auto: false });
         if (res.type !== 'success' || !res.compile) {
             throw new Error(`the compile request failed: ${res.message}`);
         }

@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
-import { downloadInRanges } from '../core/pdfFetchBridge';
+import { DownloadError, downloadInRanges } from '../core/pdfFetchBridge';
 
 describe('downloadInRanges', () => {
     const body = Buffer.from(Array.from({ length: 1000 }, (_, i) => i % 251));
@@ -14,17 +14,32 @@ describe('downloadInRanges', () => {
     let requests: string[];
     /** how many times to answer 500 for a range, by its start */
     let failures: Map<number, number>;
+    /** the ranges, by their start, that the server does not have: it answers 404 */
+    let missing: Set<number>;
+    /** how many times to send a range cut off, by its start */
+    let cutOff: Map<number, number>;
 
     beforeEach(async () => {
         folder = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-ranges-'));
         requests = [];
         failures = new Map();
+        missing = new Set();
+        cutOff = new Map();
         server = http.createServer((req, res) => {
             const m = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range ?? '')!;
             const [start, end] = [Number(m[1]), Number(m[2])];
             requests.push(`${start}-${end}`);
             const left = failures.get(start) ?? 0;
             if (left > 0) { failures.set(start, left - 1); res.writeHead(500); res.end(); return; }
+            if (missing.has(start)) { res.writeHead(404); res.end(); return; }
+            const short = cutOff.get(start) ?? 0;
+            if (short > 0) {
+                cutOff.set(start, short - 1);
+                const part = body.subarray(start, end);
+                res.writeHead(206, { 'content-length': part.byteLength, 'content-range': `bytes ${start}-${end}/${body.byteLength}` });
+                res.end(part);
+                return;
+            }
             const part = body.subarray(start, end + 1);
             res.writeHead(206, { 'content-length': part.byteLength, 'content-range': `bytes ${start}-${end}/${body.byteLength}` });
             // later ranges answer sooner, so they arrive out of order
@@ -53,6 +68,23 @@ describe('downloadInRanges', () => {
         await downloadInRanges(url, file, body.byteLength, undefined, { chunk: 128, parallel: 2, attempts: 3 });
         assert.deepStrictEqual(fs.readFileSync(file), body);
         assert.strictEqual(requests.filter(r => r === '256-383').length, 3);
+    });
+
+    it('does not ask again for a range that the server does not have, and says so with the status', async () => {
+        missing.add(128);
+        const file = path.join(folder, 'build.pdf');
+        await assert.rejects(downloadInRanges(url, file, body.byteLength, undefined, { chunk: 128, parallel: 1, attempts: 3 }),
+            (error: unknown) => error instanceof DownloadError && error.status === 404);
+        assert.strictEqual(requests.filter(r => r === '128-255').length, 1);
+        assert.deepStrictEqual(fs.readdirSync(folder), []);
+    });
+
+    it('asks again for a range that came cut off', async () => {
+        cutOff.set(0, 1);
+        const file = path.join(folder, 'build.pdf');
+        await downloadInRanges(url, file, body.byteLength, undefined, { chunk: 128, parallel: 1, attempts: 3 });
+        assert.deepStrictEqual(fs.readFileSync(file), body);
+        assert.strictEqual(requests.filter(r => r === '0-127').length, 2);
     });
 
     it('fails when a range keeps failing, stops the others, and leaves no part file', async () => {

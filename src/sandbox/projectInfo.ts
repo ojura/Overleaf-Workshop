@@ -5,6 +5,7 @@ import { formatGitTokenStatus, gitProjectUrl, GitTokenStatus, gitTokenStatus } f
 import type { JoinedProject } from './client';
 import type { DocRanges, ProjectRanges } from './ranges';
 import { trackChangesOn } from '../utils/docUpdate';
+import { errorMessage } from '../utils/errorMessage';
 
 /**
  * What project-info needs from a connection to Overleaf; OverleafClient has it. readProject is
@@ -135,7 +136,7 @@ export async function gatherProjectInfo(source: InfoSource, projectId: string, g
     try {
         meta = editorPageMeta(await source.editorPage(projectId));
     } catch (error: any) {
-        offeredError = error?.message ?? String(error);
+        offeredError = errorMessage(error);
     }
     const offered = offeredImages(meta);
     if (!offeredError && offered.length === 0) {
@@ -173,7 +174,7 @@ export async function gatherProjectInfo(source: InfoSource, projectId: string, g
         const threads = Object.values(await source.commentThreads(projectId));
         info.threads = { total: threads.length, resolved: threads.filter(thread => thread?.resolved).length };
     } catch (error: any) {
-        info.threadsError = error?.message ?? String(error);
+        info.threadsError = errorMessage(error);
     }
     if (git.token) {
         info.git.token = await gitTokenStatus(() => source.gitTokens(), git.token, bridgeUrl);

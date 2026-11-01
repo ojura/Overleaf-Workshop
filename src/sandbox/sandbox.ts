@@ -6,17 +6,18 @@ import * as path from 'path';
 import { minimatch } from 'minimatch';
 import type { FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
 import { gitBlobHash } from '../scm/replicaSync';
-import { DEFAULT_IGNORE_PATTERNS } from '../scm/ignorePatterns';
+import { DEFAULT_IGNORE_PATTERNS, REPLICA_FOLDER, REPLICA_SETTINGS_FILE } from '../scm/ignorePatterns';
 import { LatexParser } from '../compile/compileLogParser';
 import { GuardedSandbox, SandboxRecord, SandboxSafetyError, recordProblems, viewProblems } from './guard';
 import { acquireLock, HeldLock, LockOwner } from './lock';
 import { LocalFile, overleafText, Plan, planSync, RemoteTree } from './plan';
 import { mapLimit } from './mapLimit';
 import type { CompileResult, JoinedProject, OverleafClient } from './client';
+import { errorMessage } from '../utils/errorMessage';
 
 export type Logger = (message: string) => void;
 
-/** What a local replica's .overleaf/settings.json says about the project. */
+/** What a local replica's settings (REPLICA_SETTINGS_FILE) say about the project. */
 export interface Replica {
     folder: string;
     serverName: string;
@@ -28,12 +29,12 @@ export interface Replica {
 const OBJECT_ID = /^[0-9a-f]{24}$/;
 
 export function readReplica(folder: string): Replica {
-    const file = path.join(folder, '.overleaf', 'settings.json');
+    const file = path.join(folder, REPLICA_SETTINGS_FILE);
     let settings: any;
     try {
         settings = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch (error: any) {
-        throw new Error(`${folder} is not a local replica: cannot read ${file}: ${error?.message ?? error}`);
+        throw new Error(`${folder} is not a local replica: cannot read ${file}: ${errorMessage(error)}`);
     }
     // e.g. overleaf-workshop://www.overleaf.com/Name?user%3D<id>%26project%3D<id>
     const uri = new URL(settings.uri);
@@ -51,10 +52,17 @@ export function readReplica(folder: string): Replica {
     return replica;
 }
 
-export const recordFile = (folder: string) => path.join(folder, '.overleaf', 'sandbox.json');
-export const lockFile = (folder: string) => path.join(folder, '.overleaf', 'sandbox.lock');
+// The tool's files in the replica's own folder, which the sync leaves out, as paths of the sync
+// ('/dir/name'), and their paths in the replica `folder`.
+/** The record of the private copy that init created (SandboxRecord). */
+export const SANDBOX_RECORD_FILE = `${REPLICA_FOLDER}/sandbox.json`;
+/** The lock that a run holds while it uploads to the private copy and compiles it (lock.ts). */
+export const SANDBOX_LOCK_FILE = `${REPLICA_FOLDER}/sandbox.lock`;
 /** One line per event of a run, so that the runs of several agents on one copy can be traced. */
-export const runLogFile = (folder: string) => path.join(folder, '.overleaf', 'sandbox-runs.jsonl');
+export const SANDBOX_RUN_LOG_FILE = `${REPLICA_FOLDER}/sandbox-runs.jsonl`;
+export const recordFile = (folder: string) => path.join(folder, SANDBOX_RECORD_FILE);
+export const lockFile = (folder: string) => path.join(folder, SANDBOX_LOCK_FILE);
+export const runLogFile = (folder: string) => path.join(folder, SANDBOX_RUN_LOG_FILE);
 
 function logRun(folder: string, entry: Record<string, unknown>) {
     try {
@@ -78,7 +86,7 @@ export function readRecord(folder: string): SandboxRecord | undefined {
         return JSON.parse(fs.readFileSync(recordFile(folder), 'utf8'));
     } catch (error: any) {
         if (error?.code === 'ENOENT') { return undefined; }
-        throw new Error(`cannot read ${recordFile(folder)}: ${error?.message ?? error}`);
+        throw new Error(`cannot read ${recordFile(folder)}: ${errorMessage(error)}`);
     }
 }
 
@@ -185,7 +193,7 @@ export function sandboxUrl(record: SandboxRecord) {
 
 /**
  * Clone the replica's project into a new private project of this account and record it in
- * the replica's .overleaf/sandbox.json. The clone is the one request that names the shared
+ * the replica's SANDBOX_RECORD_FILE. The clone is the one request that names the shared
  * project; Overleaf reads it to make the copy and does not change it.
  */
 export async function createSandbox(client: OverleafClient, replica: Replica, userId: string, name: string, log: Logger) {
@@ -500,7 +508,7 @@ export async function runCompile(client: OverleafClient, replica: Replica, userI
             const folder = upload.path.slice(0, upload.path.lastIndexOf('/')) || '/';
             const name = upload.path.slice(upload.path.lastIndexOf('/') + 1);
             const entity = await guarded.upload(folderIds.get(folder)!, name, content);
-            return { path: upload.path, type: entity.type, hash: gitBlobHash(content), bytes: content.byteLength };
+            return { path: upload.path, type: entity.type, id: entity.id, hash: gitBlobHash(content), bytes: content.byteLength };
         }));
         await time('delete', () => mapLimit(plan.deletions, 4, (deletion) => guarded.remove(deletion.kind, deletion.id, deletion.path)));
         if (Object.keys(settings).length > 0) {
@@ -510,7 +518,11 @@ export async function runCompile(client: OverleafClient, replica: Replica, userI
             await time('clearOutput', () => guarded.clearOutput());
         }
 
-        // ---- compile
+        // ---- compile, naming the main document by its ID in the copy: an upload replaces a
+        // document with a new one, and Overleaf compiles the document the ID names (BaseAPI.compile)
+        const mainUpload = uploaded.find(u => u.path === `/${main}`);
+        const mainEntry = mainUpload ? { kind: mainUpload.type, id: mainUpload.id } : copyTree.files.get(`/${main}`);
+        const rootDocId = mainEntry?.kind === 'doc' ? mainEntry.id : undefined;
         let result: CompileResult | undefined;
         let attempts = 0;
         const compileStarted = Date.now();
@@ -519,7 +531,7 @@ export async function runCompile(client: OverleafClient, replica: Replica, userI
                 attempts += 1;
                 log(`compiling ${main} in "${record.projectName}"${attempts > 1 ? ` (attempt ${attempts})` : ''} ...`);
                 const t = Date.now();
-                const attempt = await guarded.compile({ rootResourcePath: main, draft: options.draft, stopOnFirstError: options.stopOnFirstError });
+                const attempt = await guarded.compile({ rootDocId, rootResourcePath: main, draft: options.draft, stopOnFirstError: options.stopOnFirstError });
                 result = attempt;
                 const status = attempt.response.status;
                 log(`compile status "${status}" after ${((Date.now() - t) / 1000).toFixed(1)} s`);
@@ -563,7 +575,7 @@ export async function runCompile(client: OverleafClient, replica: Replica, userI
                 await fsp.writeFile(target, content);
                 saved.push({ path: file.path, bytes: content.byteLength });
             } catch (error: any) {
-                failed.push({ path: file.path, error: String(error?.message ?? error) });
+                failed.push({ path: file.path, error: errorMessage(error) });
             }
         }));
         saved.sort((a, b) => a.path.localeCompare(b.path));
@@ -580,8 +592,8 @@ export async function runCompile(client: OverleafClient, replica: Replica, userI
         summary.checks = guarded.checks;
         return { summary, out, status: response.status };
     } catch (error: any) {
-        summary.error = String(error?.message ?? error);
-        throw Object.assign(error instanceof Error ? error : new Error(String(error)), { summary, out: outReady ? out : undefined });
+        summary.error = errorMessage(error);
+        throw Object.assign(error instanceof Error ? error : new Error(errorMessage(error)), { summary, out: outReady ? out : undefined });
     } finally {
         timings.total = Date.now() - started;
         summary.finishedAt = new Date().toISOString();

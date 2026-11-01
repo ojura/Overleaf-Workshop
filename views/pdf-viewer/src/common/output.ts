@@ -1,26 +1,5 @@
 import type { PDFFile } from '@ol-types/compile';
-
-/** output.pdf in a compile response, as the extension host passes it on (OutputFileEntity). */
-export interface OutputFile {
-    path: string;
-    url: string;
-    type: string;
-    build: string;
-    size?: number;
-    ranges?: { start: number, end: number, hash: string, objectId?: string }[];
-    contentId?: string;
-    createdAt?: string;
-    startXRefTable?: number;
-}
-
-/** A build's output.pdf, as the host's 'load' message carries it (src/core/remoteFileSystemProvider.ts). */
-export interface PdfOutput {
-    /** output.pdf on the download domain, with the query that Overleaf's viewer uses */
-    url: string;
-    downloadDomain: string;
-    projectId: string;
-    file: OutputFile;
-}
+import type { PdfOutput } from './protocol';
 
 /**
  * The file and URL that Overleaf's loader and PDFJSWrapper.loadDocument take, as
@@ -37,8 +16,10 @@ export function toPdfFile(output: PdfOutput): { url: string, pdfFile: PDFFile } 
         size: file.size ?? 0,
         ranges: (file.ranges ?? []).map(range => ({ ...range, objectId: range.objectId ?? '' })),
         contentId: file.contentId ?? '',
-        clsiCacheShard: '',
-        editorId: '',
+        // where the loader finds the build when the compile server has deleted it
+        // (pdf-caching-transport.ts, getOutputPDFURLFromCache)
+        clsiCacheShard: output.clsiCacheShard ?? '',
+        editorId: file.editorId ?? '',
     } as unknown as PDFFile;
     return { url: output.url, pdfFile };
 }

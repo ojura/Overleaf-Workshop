@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention -- environment variable names */
 import { spawnSync, SpawnSyncReturns } from 'child_process';
 import { gitProjectUrl } from '../api/gitBridge';
+import { errorMessage } from '../utils/errorMessage';
 
 /** git's credential protocol: one key=value per line, ended by an empty line or the input's end. */
 export function parseCredentialInput(text: string): Record<string, string> {
@@ -50,7 +51,7 @@ export const runGit: RunGit = args => spawnSync('git', args, {
 });
 
 function check(result: ReturnType<RunGit>, what: string) {
-    if (result.error) { throw new Error(`${what}: ${result.error.message}`); }
+    if (result.error) { throw new Error(`${what}: ${errorMessage(result.error)}`); }
     if (result.status !== 0) { throw new Error(`${what} failed with exit status ${result.status}`); }
 }
 

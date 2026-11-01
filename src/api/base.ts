@@ -1,14 +1,12 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import { Blob } from 'buffer';
+import { randomUUID } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { Agent, Dispatcher, fetch, FormData } from 'undici';
 import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
-
-function errorMessage(error: any): string {
-    const cause = error?.cause?.message;
-    const message = error?.message ?? String(error);
-    return cause ? `${message}: ${cause}` : message;
-}
+import type { SyncBox } from '../core/viewerProtocol';
+import { errorMessage } from '../utils/errorMessage';
+import { downloadDomainUrl } from './downloadDomain';
 
 /** Extract set-cookie headers from an undici/Response object. */
 function getSetCookie(res: any): string[] {
@@ -43,6 +41,16 @@ export interface CompileResponseSchema {
     status: 'success' | 'failure' | 'error';
     compileGroup: string;
     clsiServerId?: string;
+    /**
+     * the shard of Overleaf's cache of compile outputs that keeps this build too. The compile
+     * server deletes a build after 90 minutes, or once two newer builds exist
+     * (OutputCacheManager.js:110-111).
+     */
+    clsiCacheShard?: string;
+    /** set when the answer is the latest compile from that cache, not a compile just run */
+    fromCache?: boolean;
+    /** in an answer from that cache: what the compile typeset (ClsiCacheManager.getLatestCompileResult) */
+    options?: { rootResourcePath?: string, draft?: boolean, stopOnFirstError?: boolean };
     pdfDownloadDomain?: string;
     outputFiles: Array<OutputFileEntity>;
     stats: {
@@ -62,15 +70,8 @@ export interface SyncPdfResponseSchema {
     column: number
 }
 
-export interface SyncCodeResponseSchema {
-    pdf: Array<{
-        page: number,
-        h: number,
-        v: number,
-        width: number,
-        height: number,
-    }>
-}
+/** the PDF boxes of a source position, as Overleaf's sync/code answer lists them under `pdf` */
+export type SyncCodeResponseSchema = SyncBox[];
 
 export interface SnippetItemSchema {
     meta: string,
@@ -213,6 +214,8 @@ export interface ProjectSettingsSchema {
 
 export interface ResponseSchema {
     type: 'success' | 'error';
+    /** for an error that Overleaf answered: its HTTP status */
+    status?: number;
     raw?: ArrayBuffer;
     message?: string;
     userInfo?: {userId:string, userEmail:string};
@@ -236,6 +239,29 @@ export interface ResponseSchema {
     gitTokens?: GitTokenInfo[];
     gitToken?: string;
     threads?: {[threadId: string]: CommentThreadSchema};
+}
+
+/**
+ * This process's editor ID, which its compile requests send, as the web editor sends its
+ * EDITOR_SESSION_ID: the extension host's for a window, and each command-line tool's own.
+ * Overleaf's compile server keeps a compile in Overleaf's cache of compile outputs only when the
+ * compile request names an editor (clsi CompileController.js:152-157), files it there under
+ * <editor ID>-<build ID>, and finds it again by both. Overleaf takes a UUID (web
+ * CompileController.mjs, editorId: z.uuid()).
+ */
+export const EDITOR_ID = randomUUID();
+
+/**
+ * What a compile typesets, as the web editor's compile request names it (compiler.ts:137-150).
+ * Overleaf compiles the document `rootDocId` names; without it, the project's main document,
+ * whatever `rootResourcePath` says, unless the project has none (ClsiManager._finaliseRequest).
+ */
+export interface CompileRequest {
+    rootDocId?: string;
+    /** the main document's path in the project, e.g. 'main.tex' */
+    rootResourcePath: string | null;
+    draft: boolean;
+    stopOnFirstError: boolean;
 }
 
 /** How `BaseAPI.request` sends one request. */
@@ -509,6 +535,7 @@ export class BaseAPI {
                     try { errorBody = await resOrFallback.text(); } catch { errorBody = ''; }
                     return {
                         type: 'error',
+                        status: res?.status,
                         message: `${resOrFallback.status}: ${errorBody}`
                     };
                 }
@@ -533,6 +560,18 @@ export class BaseAPI {
             type: 'error',
             message: lastError.message || `Request failed after ${MAX_HTTP_RETRIES + 1} attempts`
         };
+    }
+
+    private static latestCompileAgent?: Agent;
+    /**
+     * Asks for the latest compile once, and gives up after 5 s without an answer, as Overleaf's
+     * editor does with the same request (local-compile-context.tsx:388-390). The time limit is
+     * the last resort for a server that never answers: the window asks one question at a time
+     * (ProjectBuilds), so one that hangs would hold up every later one.
+     */
+    protected static get latestCompileRequestOptions(): RequestOptions {
+        BaseAPI.latestCompileAgent ??= new Agent({headersTimeout: 5_000, bodyTimeout: 5_000});
+        return { dispatcher: BaseAPI.latestCompileAgent, retries: 0 };
     }
 
     /**
@@ -803,24 +842,53 @@ export class BaseAPI {
                             {folder_id:newParentFolderId}, undefined, {'X-Csrf-Token': identity.csrfToken});
     }
 
-    async compile(identity:Identity, projectId:string, rootResourcePath:string|null,
-        draft:boolean=false, stopOnFirstError:boolean=false
-    ) {
+    /**
+     * Compile the project on Overleaf, with the request the web editor sends (compiler.ts:137-150):
+     * the main document by ID and by path, and this process's EDITOR_ID, so that Overleaf keeps the
+     * build in its cache of compile outputs, where the web editor, other windows and
+     * getLatestCompileFromCache find it. enable_pdf_caching: the answer lists the pieces of
+     * output.pdf that the PDF viewers can take from earlier builds, as for the web editor. `auto`
+     * marks the compile automatic, as the extension's own compiles are sent: Overleaf counts those
+     * against its limit for automatic compiles and answers 'autocompile-backoff' when it is
+     * reached (CompileManager.mjs:39-46). The command-line tools' compiles are not automatic, as
+     * the web editor's Recompile button's are not.
+     */
+    async compile(identity:Identity, projectId:string, request:CompileRequest, {auto}:{auto:boolean}) {
         const body = {
             check: 'silent',
-            draft,
+            draft: request.draft,
+            editorId: EDITOR_ID,
             incrementalCompilesEnabled: true,
-            rootResourcePath,   // file path e.g. "main.tex"
-            stopOnFirstError
+            rootDoc_id: request.rootDocId,
+            rootResourcePath: request.rootResourcePath,
+            stopOnFirstError: request.stopOnFirstError,
         };
+        const query = new URLSearchParams(auto ? {auto_compile: 'true'} : {});
+        query.set('enable_pdf_caching', 'true');
 
         this.setIdentity(identity);
-        // enable_pdf_caching: the answer lists the pieces of output.pdf that the PDF viewer
-        // can take from earlier builds, as the web editor's compile requests do
-        return this.request('POST', `project/${projectId}/compile?auto_compile=true&enable_pdf_caching=true`, body, (res) => {
+        return this.request('POST', `project/${projectId}/compile?${query}`, body, (res) => {
             const compile = JSON.parse(res!) as CompileResponseSchema;
             return {compile};
         }, {'X-Csrf-Token': identity.csrfToken}, BaseAPI.compileRequestOptions);
+    }
+
+    /**
+     * The latest compile of the project by this user, from any client (the web editor, another
+     * window, a command-line tool), as Overleaf keeps it in its cache of compile outputs, with
+     * `fromCache` set. Overleaf's editor asks for it when it opens a project, if Overleaf lets it
+     * use the cache (ol-canUseClsiCache), and shows that PDF instead of compiling when the
+     * compile's settings match its own (local-compile-context.tsx:219-223, 383-425). Overleaf
+     * answers 404 when the cache has no compile, and 410 when the project changed after the
+     * latest one, or when the project's compiler or TeX Live image is not the cached compile's
+     * (ClsiCacheManager.mjs:52, 108, 141-143); the error's `status` says which.
+     */
+    async getLatestCompileFromCache(identity:Identity, projectId:string) {
+        this.setIdentity(identity);
+        return this.request('GET', `project/${projectId}/output/cached/output.overleaf.json`, undefined, (res) => {
+            const compile = JSON.parse(res!) as CompileResponseSchema;
+            return {compile};
+        }, {'Accept': 'application/json'}, BaseAPI.latestCompileRequestOptions);
     }
 
     async stopCompile(identity:Identity, projectId:string) {
@@ -895,17 +963,77 @@ export class BaseAPI {
         return this.request('POST', `project/${projectId}/settings`, setting);
     }
 
-    async getFileFromClsi(identity:Identity, url:string, compileGroup:string, clsiServerId?:string, pdfDownloadDomain?:string): Promise<ResponseSchema> {
+    /**
+     * Output file `file` of compile `response`, from where Overleaf says it is. A compile from
+     * Overleaf's cache of compile outputs (`fromCache`) lists each file's downloadURL, a route of
+     * the web server. Any other compile's file is at its url on the compile server that made the
+     * build (getFileFromClsi); `editorId`, the editor whose compile it was, lets the web server
+     * find the file in Overleaf's cache when the compile server has deleted the build.
+     */
+    async getOutputFile(identity:Identity, file:OutputFileEntity, response:CompileResponseSchema, editorId?:string): Promise<ResponseSchema> {
+        if (!response.fromCache) {
+            return this.getFileFromClsi(identity, file.url, response.compileGroup, response.clsiServerId, response.pdfDownloadDomain, editorId);
+        }
+        const route = BaseAPI.webRouteOf(file, response, editorId);
+        if (route===undefined) {
+            return {type: 'error', message: `Overleaf's answer gives no download location for ${file.path}`};
+        }
+        try {
+            this.setIdentity(identity);
+            return {type: 'success', content: new Uint8Array(await this.download(route))};
+        } catch (error) {
+            return {type: 'error', message: errorMessage(error)};
+        }
+    }
+
+    /**
+     * The web server's route for output file `file` of compile `response` (getOutputFile): the
+     * file's downloadURL for a compile from Overleaf's cache, else its url with the compile server
+     * and the editor, for which the web server passes the request on to the compile server, and
+     * on to Overleaf's cache when the compile server answers 404 (CompileController.mjs,
+     * canTryClsiCacheFallback). Undefined when Overleaf's answer gives no downloadURL.
+     *
+     * These routes send a file whole, whatever the request's Range header says: the web server
+     * fetches the file without it and passes on the status, the length and the type
+     * (ClsiCacheController.mjs:113-152; CompileController.mjs, _proxyToClsi). Asked for bytes 0-99
+     * of the book's output.pdf at its cached route, Overleaf answered 200 with all 885,588,853 bytes
+     * (the IDE test of 2026-11-01). The window reads them whole on purpose; ranges of a build come
+     * from the download domain (downloadDomainUrl, cachedDownloadDomainUrl).
+     */
+    static webRouteOf(file:OutputFileEntity, response:CompileResponseSchema, editorId?:string): string | undefined {
+        if (response.fromCache) {
+            return file.downloadURL?.replace(/^\/+/, '');
+        }
+        return BaseAPI.clsiRoute(file.url, response.clsiServerId, editorId);
+    }
+
+    /** The web server's route for output file `url` of a build that compile server `clsiServerId` made for editor `editorId`. */
+    private static clsiRoute(url:string, clsiServerId?:string, editorId?:string): string {
+        const route = url.replace(/^\/+/, '');
+        const query = new URLSearchParams();
+        if (clsiServerId) { query.set('clsiserverid', clsiServerId); }
+        if (editorId) { query.set('editorId', editorId); }
+        const parameters = query.toString();
+        return parameters ? `${route}${route.includes('?') ? '&' : '?'}${parameters}` : route;
+    }
+
+    /** the web server's address, which routes such as webRouteOf's are relative to */
+    get serverUrl(): string {
+        return this.url;
+    }
+
+    /**
+     * Output file `url` of a build that compile server `clsiServerId` made: from the download
+     * domain, with the query Overleaf's viewer sends there, else from the web server
+     * (clsiRoute). `compileGroup` is the compile's, when the compile response names one.
+     */
+    async getFileFromClsi(identity:Identity, url:string, compileGroup?:string, clsiServerId?:string, pdfDownloadDomain?:string, editorId?:string): Promise<ResponseSchema> {
         let cdnError: string | undefined;
         // If we have a CDN download domain, construct the full URL with required query params.
         // The CDN is cross-origin, so we must NOT send web frontend cookies.
         if (pdfDownloadDomain && clsiServerId) {
             try {
-                const cdnUrl = `${pdfDownloadDomain.replace(/\/+$/, '')}/${url.replace(/^\/+/g, '')}` +
-                    `?compileGroup=${encodeURIComponent(compileGroup)}` +
-                    `&clsiserverid=${encodeURIComponent(clsiServerId)}` +
-                    `&enable_pdf_caching=true`;
-                const content = await this._downloadAbsolute(cdnUrl, false);
+                const content = await this._downloadAbsolute(downloadDomainUrl(pdfDownloadDomain, url, clsiServerId, compileGroup), false);
                 return { type: 'success', content: new Uint8Array(content) };
             } catch (error) {
                 // The download domain does not serve every output file: it answered HTTP 503
@@ -914,9 +1042,10 @@ export class BaseAPI {
             }
         }
 
-        // The web frontend, which passes the request on to the compile server that made the build.
+        // The web frontend, which passes the request on to the compile server that made the build,
+        // and with the editor ID to Overleaf's cache when that server has deleted it.
         try {
-            const route = url.replace(/^\/+/g, '') + (clsiServerId ? `${url.includes('?') ? '&' : '?'}clsiserverid=${encodeURIComponent(clsiServerId)}` : '');
+            const route = BaseAPI.clsiRoute(url, clsiServerId, editorId);
             this.setIdentity(identity);
             const content = await this.download(route);
             return {
@@ -939,11 +1068,13 @@ export class BaseAPI {
 
     /**
      * The source position of point (h, v) on page `page` (from 1) of build `buildId`. The
-     * request names the compile server that made the build, as the web editor's does.
+     * request names the compile server that made the build and the editor whose compile it was
+     * (`editorId`), as the web editor's does: with both, Overleaf also finds a build that the
+     * compile server has deleted in its cache of compile outputs.
      */
-    async proxySyncPdf(identity:Identity, projectId:string, page:number, h:number, v:number, buildId:string, clsiServerId?:string) {
+    async proxySyncPdf(identity:Identity, projectId:string, page:number, h:number, v:number, buildId:string, editorId:string, clsiServerId?:string) {
         this.setIdentity(identity);
-        const query = new URLSearchParams({page: String(page), h: h.toFixed(2), v: v.toFixed(2), editorId: uuidv4(), buildId});
+        const query = new URLSearchParams({page: String(page), h: h.toFixed(2), v: v.toFixed(2), editorId, buildId});
         if (clsiServerId) { query.set('clsiserverid', clsiServerId); }
         return this.request('GET', `project/${projectId}/sync/pdf?${query}`,
                             undefined, (res) => {
@@ -954,11 +1085,11 @@ export class BaseAPI {
 
     /**
      * The PDF positions of `line` and `column` of `file`, a path inside the project. SyncTeX
-     * counts lines from 1, as the web editor sends them (row + 1).
+     * counts lines from 1, as the web editor sends them (row + 1). `editorId` as for proxySyncPdf.
      */
-    async proxySyncCode(identity:Identity, projectId:string, file:string, line:number, column:number, buildId:string, clsiServerId?:string) {
+    async proxySyncCode(identity:Identity, projectId:string, file:string, line:number, column:number, buildId:string, editorId:string, clsiServerId?:string) {
         this.setIdentity(identity);
-        const query = new URLSearchParams({file, line: String(line), column: String(column), editorId: uuidv4(), buildId});
+        const query = new URLSearchParams({file, line: String(line), column: String(column), editorId, buildId});
         if (clsiServerId) { query.set('clsiserverid', clsiServerId); }
         return this.request('GET', `project/${projectId}/sync/code?${query}`,
                             undefined, (res) => {

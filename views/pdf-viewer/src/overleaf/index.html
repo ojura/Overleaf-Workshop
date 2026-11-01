@@ -6,14 +6,15 @@
   at the start of <head> with a <base> pointing at views/pdf-viewer/ and the #viewer-config
   element, so the paths below are relative to views/pdf-viewer/.
   pdf.mjs comes first: pdf_viewer.mjs, bundled into dist/overleaf.mjs, takes pdf.js from
-  globalThis.pdfjsLib when it runs.
+  globalThis.pdfjsLib when it runs. scripts/build-pdf-viewer.mjs writes the folder of pdf.js's
+  release (the release that package.json pins as pdfjs-dist) into its URL.
 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <!--viewer-config-->
 <link rel="stylesheet" href="dist/overleaf.css">
-<script type="module" src="vendor/pdfjs-5.1.91/build/pdf.mjs"></script>
+<script type="module" src="{{pdfjs-release}}/build/pdf.mjs"></script>
 <script type="module" src="dist/overleaf.mjs"></script>
 </head>
 <body>

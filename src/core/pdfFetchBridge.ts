@@ -2,6 +2,7 @@ import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Agent, fetch } from 'undici';
+import type { BridgeRequest, BridgeResponse } from './viewerProtocol';
 
 /**
  * The PDF viewer loads compiled PDFs with Overleaf's loader, which fetches byte ranges and
@@ -11,21 +12,6 @@ import { Agent, fetch } from 'undici';
  */
 
 /** A request of the viewer's loader. */
-export interface BridgeRequest {
-    id: number;
-    url: string;
-    method?: string;
-    headers?: [string, string][];
-}
-
-export interface BridgeResponse {
-    id: number;
-    status: number;
-    statusText: string;
-    headers: [string, string][];
-    body: Uint8Array;
-}
-
 /** A piece of Overleaf's PDF caching: /content/<contentId>/<SHA-256 of the piece> */
 const PIECE = /\/content\/[^/]+\/([0-9a-f]{64})$/;
 /** the request headers the loader needs; others are not sent on */
@@ -138,6 +124,11 @@ export class PdfFetchBridge {
         this.running.get(id)?.abort();
     }
 
+    /** Stop every running request: the page that asked for them is gone. */
+    abortAll() {
+        this.running.forEach(controller => controller.abort());
+    }
+
     async handle(request: BridgeRequest): Promise<BridgeResponse> {
         const url = new URL(request.url);
         if (!this.allowed(url)) {
@@ -184,6 +175,18 @@ export class PdfFetchBridge {
 /** numbers the downloads of this process, so that two downloads of one file do not share a part file */
 let downloads = 0;
 
+/** the temporary file next to `file` that a download writes until it is complete */
+function partFile(file: string): string {
+    return `${file}.${process.pid}-${++downloads}.part`;
+}
+
+/** A download that the server refused, with the HTTP status of its answer. */
+export class DownloadError extends Error {
+    constructor(message: string, readonly status: number) {
+        super(message);
+    }
+}
+
 /**
  * Download `url`, a file of `size` bytes, to `file` in ranges, a few at a time, retrying each
  * range. One long response of a large build was cut off: the download domain ended the 885 MB
@@ -194,7 +197,7 @@ let downloads = 0;
  */
 export async function downloadInRanges(url: string, file: string, size: number, signal?: AbortSignal,
     { chunk = 8 * 1024 * 1024, parallel = 4, attempts = 3, onProgress = undefined as ((received: number) => void) | undefined } = {}) {
-    const tmp = `${file}.${process.pid}-${++downloads}.part`;
+    const tmp = partFile(file);
     // stops every range when one fails for good or the caller aborts
     const stop = new AbortController();
     const onAbort = () => stop.abort();
@@ -202,25 +205,37 @@ export async function downloadInRanges(url: string, file: string, size: number, 
     if (signal?.aborted) { stop.abort(); }
     const out = await fs.promises.open(tmp, 'w');
     let received = 0;
+    /** The bytes `start` to `end` from the server; throws a DownloadError for an answer other than 206. */
+    const fetchBytes = async (start: number, end: number): Promise<Uint8Array> => {
+        const res = await fetch(url, { signal: stop.signal, dispatcher: PdfFetchBridge.dispatcher, headers: { range: `bytes=${start}-${end}` } });
+        if (res.status !== 206) {
+            await res.body?.cancel();
+            throw new DownloadError(`the download of ${path.basename(file)} failed: bytes ${start}-${end}: ${res.status} ${res.statusText}`, res.status);
+        }
+        const body = new Uint8Array(await res.arrayBuffer());
+        if (body.byteLength !== end - start + 1) {
+            throw new Error(`the download of ${path.basename(file)} failed: bytes ${start}-${end} came as ${body.byteLength} bytes`);
+        }
+        return body;
+    };
     const fetchRange = async (start: number) => {
         const end = Math.min(start + chunk, size) - 1;
         for (let attempt = 1; ; attempt++) {
+            let body: Uint8Array;
             try {
-                const res = await fetch(url, { signal: stop.signal, dispatcher: PdfFetchBridge.dispatcher, headers: { range: `bytes=${start}-${end}` } });
-                if (res.status !== 206) {
-                    throw new Error(`the download of ${path.basename(file)} failed: bytes ${start}-${end}: ${res.status} ${res.statusText}`);
-                }
-                const body = new Uint8Array(await res.arrayBuffer());
-                if (body.byteLength !== end - start + 1) {
-                    throw new Error(`the download of ${path.basename(file)} failed: bytes ${start}-${end} came as ${body.byteLength} bytes`);
-                }
-                await out.write(body, 0, body.byteLength, start);
-                received += body.byteLength;
-                onProgress?.(received);
-                return;
+                body = await fetchBytes(start, end);
             } catch (error) {
-                if (stop.signal.aborted || attempt >= attempts) { throw error; }
+                // A network error, a range that came cut off and a 5xx answer can pass; any other
+                // answer, such as 404 for a build that is gone, comes again the same way.
+                const passing = !(error instanceof DownloadError) || error.status >= 500;
+                if (stop.signal.aborted || attempt >= attempts || !passing) { throw error; }
+                continue;
             }
+            // a failure to write the file is not the server's, and is not asked again
+            await out.write(body, 0, body.byteLength, start);
+            received += body.byteLength;
+            onProgress?.(received);
+            return;
         }
     };
     try {
@@ -246,5 +261,42 @@ export async function downloadInRanges(url: string, file: string, size: number, 
         throw error;
     } finally {
         signal?.removeEventListener('abort', onAbort);
+    }
+}
+
+/**
+ * Download `url`, a file of `size` bytes, to `file` in one response, sending `headers`. The
+ * response goes to a temporary file next to `file`, which takes `file`'s name once all `size`
+ * bytes have come, so a failed download leaves `file` as it was, as with downloadInRanges.
+ * `onProgress` gets the bytes written so far.
+ */
+export async function downloadWhole(url: string, file: string,
+    { headers = {}, size, signal, onProgress }: { headers?: Record<string, string>, size: number, signal?: AbortSignal, onProgress?: (received: number) => void }) {
+    const tmp = partFile(file);
+    const out = await fs.promises.open(tmp, 'w');
+    let body: { cancel(): Promise<void> } | undefined;
+    try {
+        const res = await fetch(url, { signal, headers, dispatcher: PdfFetchBridge.dispatcher });
+        body = res.body ?? undefined;
+        if (res.status !== 200 || !res.body) {
+            throw new DownloadError(`the download of ${path.basename(file)} failed: ${res.status} ${res.statusText}`, res.status);
+        }
+        let received = 0;
+        for await (const chunk of res.body) {
+            await out.write(chunk);
+            received += chunk.byteLength;
+            onProgress?.(received);
+        }
+        if (received !== size) {
+            throw new Error(`the download of ${path.basename(file)} failed: ${received} of its ${size} bytes came`);
+        }
+        await out.close();
+        await fs.promises.rename(tmp, file);
+    } catch (error) {
+        // the first error is the one to report; these only clean up after it
+        await body?.cancel().catch(() => {});
+        await out.close().catch(() => {});
+        await fs.promises.unlink(tmp).catch(() => {});
+        throw error;
     }
 }

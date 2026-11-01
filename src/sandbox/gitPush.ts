@@ -5,6 +5,7 @@
  * on Overleaf.
  */
 import { execFileSync } from 'child_process';
+import { parseTreeDiff, TREE_DIFF_ARGS } from '../gitbridge/plumbing';
 import { PushedFile } from './ranges';
 
 function git(repo: string, args: string[]): Buffer {
@@ -28,26 +29,20 @@ export function bridgeProjectId(repo: string, remote = 'origin'): string | undef
     return match?.[1];
 }
 
-/** The files the commits from `from` to `to` change, with their content at both ends. */
+/**
+ * The files the commits from `from` to `to` change, with their content at both ends; a rename
+ * or a move is the one git's rename detection pairs (TREE_DIFF_ARGS), as git log shows it.
+ */
 export function pushedFiles(repo: string, from: string, to: string): PushedFile[] {
-    const out = git(repo, ['diff', '--name-status', '-z', '--find-renames', from, to]).toString('utf8');
-    const fields = out.split('\0').filter((field, i, all) => i < all.length - 1 || field !== '');
+    const out = git(repo, [...TREE_DIFF_ARGS, from, to]).toString('utf8');
     const blob = (rev: string, path: string) => new Uint8Array(git(repo, ['cat-file', 'blob', `${rev}:${path}`]));
-    const files: PushedFile[] = [];
-    for (let i = 0; i < fields.length;) {
-        const status = fields[i++];
-        const kind = status[0];
-        if (kind === 'R' || kind === 'C') {
-            const oldPath = fields[i++], path = fields[i++];
-            if (kind === 'C') { files.push({ status: 'A', path, after: blob(to, path) }); continue; }
-            files.push({ status: 'R', path, oldPath, before: blob(from, oldPath), after: blob(to, path) });
-        } else {
-            const path = fields[i++];
-            if (kind === 'A') { files.push({ status: 'A', path, after: blob(to, path) }); }
-            else if (kind === 'D') { files.push({ status: 'D', path, before: blob(from, path) }); }
-            else if (kind === 'M' || kind === 'T') { files.push({ status: 'M', path, before: blob(from, path), after: blob(to, path) }); }
-            else { throw new Error(`git diff reported an unexpected status ${status} for ${path}`); }
+    return parseTreeDiff(out).map((change): PushedFile => {
+        const { path, oldPath } = change;
+        switch (change.status) {
+            case 'R': return { status: 'R', path, oldPath, before: blob(from, oldPath!), after: blob(to, path) };
+            case 'A': return { status: 'A', path, after: blob(to, path) };
+            case 'D': return { status: 'D', path, before: blob(from, path) };
+            default: return { status: 'M', path, before: blob(from, path), after: blob(to, path) };
         }
-    }
-    return files;
+    });
 }

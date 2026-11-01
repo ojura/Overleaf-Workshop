@@ -23,6 +23,24 @@ export function semanticDiff(before: string, after: string): DiffMatchPatch.Diff
 /** An op of an update: insert `i` or delete `d` at `p`, after the ops before it are applied. */
 export interface TextOp { p: number; i?: string; d?: string; }
 
+/**
+ * `text` with the ops of an update applied one after the other, as Overleaf applies them
+ * (document-updater's ShareJS text type); undefined when a delete does not match the text it
+ * deletes, which means that `text` is not the text the ops were made for. An op's `i` and `d`
+ * are text, counted in UTF-16 code units as `p` is (see api/packedUtf8.ts).
+ */
+export function applyOps(text: string, ops: readonly TextOp[]): string | undefined {
+    for (const op of ops) {
+        if (op.i !== undefined) {
+            text = text.slice(0, op.p) + op.i + text.slice(op.p);
+        } else if (op.d !== undefined) {
+            if (text.slice(op.p, op.p + op.d.length) !== op.d) { return undefined; }
+            text = text.slice(0, op.p) + text.slice(op.p + op.d.length);
+        }
+    }
+    return text;
+}
+
 /** The ops that turn `before` into `after`, applied one after the other, as the editor sends them. */
 export function opsFor(before: string, after: string): TextOp[] {
     const ops: TextOp[] = [];

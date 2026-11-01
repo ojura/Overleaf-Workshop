@@ -144,15 +144,24 @@ export class SCMCollectionProvider extends vscode.Disposable {
             });
         }
         // insert into collection
+        const triggers = enabled ? await this.start(scm) : [];
+        if (triggers===undefined) { return undefined; }
+        this.scms.push({scm,enabled,triggers});
+        this.updateStatus();
+        return scm;
+    }
+
+    /**
+     * Start `scm`: its triggers, or undefined when it did not start. The one notice of the failure,
+     * with its reason, is shown here, wherever the start comes from (the project's settings, a new
+     * source control, Enable); the source control's log has the details.
+     */
+    private async start(scm: BaseSCM): Promise<vscode.Disposable[] | undefined> {
         try {
-            const triggers = enabled ? await scm.triggers : [];
-            this.scms.push({scm,enabled,triggers});
-            this.updateStatus();
-            return scm;
+            return await scm.triggers;
         } catch (error) {
-            // permanently remove failed scm
-            // this.vfs.setProjectSCMPersist(scm.scmKey, undefined);
-            vscode.window.showErrorMessage( vscode.l10n.t('"{scm}" creation failed.', {scm:scmProto.label}) );
+            const label = (scm.constructor as {label?: string}).label;
+            vscode.window.showErrorMessage(vscode.l10n.t('"{scm}" creation failed: {error}', {scm: label, error: String((error as Error)?.message ?? error)}));
             return undefined;
         }
     }
@@ -191,11 +200,10 @@ export class SCMCollectionProvider extends vscode.Disposable {
         .then((uri) => scmProto.validateBaseUri(uri as string || '', this.vfs.projectName))
         .then(async (baseUri) => {
             if (baseUri) {
+                // createSCM tells a failure, with its reason
                 const scm = await this.createSCM(scmProto, baseUri, true);
                 if (scm) {
                     vscode.window.showInformationMessage( vscode.l10n.t('"{scm}" created: {uri}.', {scm:scmProto.label, uri: decodeURI(scm.baseUri.toString()) }) );
-                } else {
-                    vscode.window.showErrorMessage( vscode.l10n.t('"{scm}" creation failed.', {scm:scmProto.label}) );
                 }
             }
         });
@@ -215,8 +223,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
         return vscode.window.showQuickPick(quickPickItems, {
             ignoreFocusOut: true,
             title: vscode.l10n.t('Project Source Control Management'),
-        }).then(async (select) => {
-            if (select===undefined) { return; }
+        }).then(select => select===undefined ? undefined : this.runAction(scmItem.scm, select.label, async () => {
             switch (select.label) {
                 case 'Enable':
                 case 'Disable':
@@ -227,7 +234,16 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     const scmIndex = this.scms.indexOf(scmItem);
                     this.scms[scmIndex].enabled = persist.enabled;
                     if (persist.enabled) {
-                        scmItem.triggers = await scmItem.scm.triggers;
+                        const triggers = await this.start(scmItem.scm);
+                        if (triggers===undefined) {
+                            // it did not start, which start() has told: it stays disabled
+                            persist.enabled = false;
+                            this.vfs.setProjectSCMPersist(scmItem.scm.scmKey, persist);
+                            this.scms[scmIndex].enabled = false;
+                            this.updateStatus();
+                            break;
+                        }
+                        scmItem.triggers = triggers;
                     } else {
                         scmItem.triggers.forEach(trigger => trigger.dispose());
                         scmItem.triggers = [];
@@ -236,19 +252,29 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     vscode.window.showWarningMessage(`"${(scmItem.scm.constructor as any).label}" ${persist.enabled?'enabled':'disabled'}: ${baseUri}.`);
                     break;
                 case 'Remove':
-                    vscode.window.showWarningMessage(`${vscode.l10n.t('Remove')} ${baseUri}?`, 'Yes', 'No')
-                    .then((select) => {
-                        if (select==='Yes') {
-                            this.removeSCM(scmItem);
-                        }
-                    });
+                    if (await vscode.window.showWarningMessage(`${vscode.l10n.t('Remove')} ${baseUri}?`, 'Yes', 'No')==='Yes') {
+                        this.removeSCM(scmItem);
+                    }
                     break;
                 default:
-                    const settingItem = settingItems.find(item => item.label===select.label);
-                    settingItem?.callback();
+                    await settingItems.find(item => item.label===select.label)?.callback();
                     break;
             }
-        });
+        }));
+    }
+
+    /**
+     * Run `action`, chosen for `scm` in a quick pick. Nobody waits for the promise of a quick
+     * pick's handler, so a failure is shown here, in a notice with its reason, as a failed start
+     * is (`start`); without it, the user's choice would end without a word.
+     */
+    private async runAction(scm: BaseSCM, action: string, run: () => Promise<unknown>): Promise<void> {
+        try {
+            await run();
+        } catch (error) {
+            const label = (scm.constructor as {label?: string}).label;
+            vscode.window.showErrorMessage(vscode.l10n.t('"{scm}": {action} failed: {error}', {scm: label, action, error: String((error as Error)?.message ?? error)}));
+        }
     }
 
     showSCMConfiguration() {

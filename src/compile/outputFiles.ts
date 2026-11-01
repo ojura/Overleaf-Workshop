@@ -2,20 +2,31 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { CompileResponseSchema } from '../api/base';
 import type { OutputFileEntity } from '../core/remoteFileSystemProvider';
+import { REPLICA_FOLDER } from '../scm/ignorePatterns';
+import { errorMessage } from '../utils/errorMessage';
 
-/** One compile on Overleaf, whatever its status. */
+/**
+ * One compile on Overleaf, whatever its status: this window's, or another client's from Overleaf's
+ * cache of compile outputs, whose answer has `fromCache` set.
+ */
 export interface CompileRecord {
     /** Overleaf's answer; undefined when the request itself failed */
     response?: CompileResponseSchema;
     /** why the request failed */
     message?: string;
     rootResourcePath: string | null;
-    startedAt: number;
-    finishedAt: number;
+    /** for this window's compile: when the request was sent and answered */
+    startedAt?: number;
+    finishedAt?: number;
+    /** for a compile from Overleaf's cache: when Overleaf answered, which says nothing of when the compile ran */
+    answeredAt?: number;
 }
 
-/** Where a local replica keeps the logs of its last compile, relative to the replica's folder. */
-export const REPLICA_OUTPUT_FOLDER = '.overleaf/output';
+/**
+ * Where a local replica keeps the logs of its last compile: a folder in the replica's own folder,
+ * which the sync leaves out, as a path of the sync ('/dir/name').
+ */
+export const REPLICA_OUTPUT_FOLDER = `${REPLICA_FOLDER}/output`;
 
 /** The output files that a local replica keeps of each compile: the logs. */
 export const REPLICA_OUTPUT_FILES: readonly string[] = ['output.log', 'output.blg', 'output.ilg', 'output.stdout', 'output.stderr'];
@@ -38,7 +49,7 @@ export async function saveCompileOutputs(
         try {
             return { file, content: await download(file) };
         } catch (error: any) {
-            return { file, error: String(error?.message ?? error) };
+            return { file, error: errorMessage(error) };
         }
     }));
 
@@ -59,14 +70,17 @@ export async function saveCompileOutputs(
         if (compile.response) {
             await fs.promises.writeFile(path.join(staging, 'compile-response.json'), JSON.stringify(compile.response, null, 2) + '\n');
         }
+        const { startedAt, finishedAt, answeredAt } = compile;
         const summary = {
             status: compile.response?.status ?? 'request failed',
             message: compile.message,
             rootResourcePath: compile.rootResourcePath,
-            startedAt: new Date(compile.startedAt).toISOString(),
-            finishedAt: new Date(compile.finishedAt).toISOString(),
-            requestMs: compile.finishedAt - compile.startedAt,
+            ...(startedAt !== undefined ? { startedAt: new Date(startedAt).toISOString() } : {}),
+            ...(finishedAt !== undefined ? { finishedAt: new Date(finishedAt).toISOString() } : {}),
+            ...(startedAt !== undefined && finishedAt !== undefined ? { requestMs: finishedAt - startedAt } : {}),
             buildId: compile.response?.outputFiles?.[0]?.build,
+            ...(compile.response?.fromCache ? { fromCache: true } : {}),
+            ...(answeredAt !== undefined ? { answeredAt: new Date(answeredAt).toISOString() } : {}),
             saved,
             failed,
             notSaved: (compile.response?.outputFiles ?? []).map(file => file.path).filter(p => !names.includes(p)),

@@ -2,14 +2,15 @@
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import type { CompileRequest } from '../api/base';
 import type { FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
 import { Repo } from '../gitbridge/plumbing';
 import { ControlAnswer, ControlRequest, NoReplicaWindowError } from '../scm/replicaControl';
-import { OVERLEAF_REF } from '../scm/replicaGit';
+import { OVERLEAF_REF, REPLICA_FOLDER_IN_GIT_DIR } from '../scm/replicaGit';
 import { BuildCheck, checkBuild } from './buildCheck';
 import type { CompileResult, JoinedProject } from './client';
-import type { CompileRequest } from './guard';
 import type { ProjectRanges } from './ranges';
+import { errorMessage } from '../utils/errorMessage';
 
 /*
  * Landing a commit of a local replica's repository in its Overleaf project (replica-land):
@@ -19,12 +20,13 @@ import type { ProjectRanges } from './ranges';
  * 2. Overleaf must hold the parent file for file (a check of its own, as the editor reads the
  *    project: documents by their text, binary files by the hash Overleaf reports);
  * 3. the window pushes the commit (the land request of src/scm/replicaControl.ts): it
- *    fast-forwards the branch, uploads what the commit changed, renames as renames, and waits
- *    for Overleaf's acknowledgements;
+ *    fast-forwards the branch, uploads what the commit changed, with the renames and moves
+ *    that git shows as renames on Overleaf (the sync's rule: docs/replica-workflows.md,
+ *    "Renames and moves"), and waits for Overleaf's acknowledgements;
  * 4. Overleaf must hold the commit, checked as in 2, for up to three minutes;
  * 5. one compile of the project, repeated while Overleaf answers that another compile of the
- *    user runs; its logs are kept in <git dir>/overleaf/compiles/<commit>, and checked for
- *    errors (buildCheck.ts);
+ *    user runs; its logs are kept in a folder for the commit in LAND_COMPILES_FOLDER, and
+ *    checked for errors (buildCheck.ts);
  * 6. the command in git config overleaf.landCheck, if set, runs with the compile's folder and
  *    the parent's, e.g. a project's own check of where its pages fall.
  *
@@ -38,6 +40,12 @@ import type { ProjectRanges } from './ranges';
  */
 
 export type Logger = (message: string) => void;
+
+// The landing's files in the replica's own folder in its git folder, relative to the git folder.
+/** The logs of the compiles that the landing checks, in a folder for each commit. */
+export const LAND_COMPILES_FOLDER = `${REPLICA_FOLDER_IN_GIT_DIR}/compiles`;
+/** One line for each landing. */
+export const LANDINGS_LOG = `${REPLICA_FOLDER_IN_GIT_DIR}/landings.log`;
 
 /** What the landing needs of Overleaf. */
 export interface LandClient {
@@ -132,32 +140,39 @@ export async function overleafDifferences(repo: Repo, commit: string, client: La
     return { checked, differing, joined };
 }
 
+/** The project's documents by path, e.g. 'chapters/a.tex', with their IDs. */
+function docIds(joined: JoinedProject): Map<string, string> {
+    const ids = new Map<string, string>();
+    const walk = (folder: FolderEntity, prefix: string) => {
+        folder.docs?.forEach(doc => ids.set(prefix + doc.name, doc._id));
+        folder.folders?.forEach(sub => walk(sub, `${prefix}${sub.name}/`));
+    };
+    walk(joined.project.rootFolder[0], '');
+    return ids;
+}
+
 /** The path of the project's main document, from the joined project. */
 function mainDocument(joined: JoinedProject): string | undefined {
-    const find = (folder: FolderEntity, prefix: string): string | undefined => {
-        const doc = folder.docs?.find(d => d._id === joined.project.rootDoc_id);
-        if (doc) { return prefix + doc.name; }
-        for (const sub of folder.folders ?? []) {
-            const found = find(sub, `${prefix}${sub.name}/`);
-            if (found) { return found; }
-        }
-        return undefined;
-    };
-    return find(joined.project.rootFolder[0], '');
+    return [...docIds(joined)].find(([, id]) => id === joined.project.rootDoc_id)?.[0];
 }
 
 /** The outputs kept: the logs, and the files a check of the pages reads; the PDF stays on Overleaf. */
 const keepOutput = (file: OutputFileEntity) => /^output\.(log|stdout|stderr|blg|ilg|aux|toc|lof|lot|idx|ind|bbl)$/.test(file.path);
 
-/** Compile the project as it is on Overleaf, and save the outputs and Overleaf's answer in `dir`. */
-export async function compileProject(client: LandClient, projectId: string, main: string, dir: string, log: Logger,
+/**
+ * Compile the project as it is on Overleaf, with `main` as the main document, and save the outputs
+ * and Overleaf's answer in `dir`. `joined` is the project as Overleaf holds it now, where the
+ * compile request finds the main document's ID (BaseAPI.compile).
+ */
+export async function compileProject(client: LandClient, projectId: string, joined: JoinedProject, main: string, dir: string, log: Logger,
                                      sleep: (ms: number) => Promise<void>) {
     let attempts = 0;
     let result: CompileResult;
+    const rootDocId = docIds(joined).get(main);
     for (;;) {
         attempts += 1;
         const started = Date.now();
-        result = await client.compile(projectId, { rootResourcePath: main, draft: false, stopOnFirstError: false });
+        result = await client.compile(projectId, { rootDocId, rootResourcePath: main, draft: false, stopOnFirstError: false });
         const status = result.response.status;
         log(`compile status "${status}" after ${((Date.now() - started) / 1000).toFixed(1)} s`);
         if (status === 'too-recently-compiled' && attempts < 5) { await sleep(2000); continue; }
@@ -172,7 +187,7 @@ export async function compileProject(client: LandClient, projectId: string, main
         try {
             fs.writeFileSync(path.join(dir, file.path), await client.outputFile(file, response));
         } catch (error: any) {
-            log(`could not save ${file.path}: ${error?.message ?? error}`);
+            log(`could not save ${file.path}: ${errorMessage(error)}`);
         }
     }
     fs.writeFileSync(path.join(dir, 'compile-response.json'), JSON.stringify(response, null, 2) + '\n');
@@ -183,7 +198,7 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
     const log = options.log;
     const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
     const gitDir = repo.gitDir();
-    const compiles = path.join(gitDir, 'overleaf', 'compiles');
+    const compiles = path.join(gitDir, LAND_COMPILES_FOLDER);
 
     // 1. the window syncs, and Overleaf's state is the checked-out commit
     const bridge = options.push === 'bridge';
@@ -218,6 +233,8 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
         throw new LandError(`Overleaf does not hold ${head.slice(0, 7)}, which the replica recorded as its state`, before.differing);
     }
     log(`Overleaf holds ${head.slice(0, 7)} (${before.checked} files compared)`);
+    /** the project as Overleaf holds it: before the push, then as the last check read it */
+    let held = before.joined;
 
     // the main document, and a compile of the parent for the check hook to compare with
     const hook = repo.config('overleaf.landCheck');
@@ -228,7 +245,7 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
         const parentDir = path.join(compiles, head);
         if (hook && commit !== head && !fs.existsSync(path.join(parentDir, 'output.log'))) {
             log(`compiling ${head.slice(0, 7)} first, for overleaf.landCheck to compare with`);
-            report.parentCompile = await compileProject(client, options.projectId, main, parentDir, log, sleep);
+            report.parentCompile = await compileProject(client, options.projectId, before.joined, main, parentDir, log, sleep);
         }
     }
 
@@ -261,6 +278,7 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
         for (;;) {
             const after = await overleafDifferences(repo, expect, client, options.projectId, options.isIgnored);
             if (after.differing.length === 0) {
+                held = after.joined;
                 report.verified = after.checked;
                 log(`Overleaf holds ${expect.slice(0, 7)} (${after.checked} files compared)`);
                 break;
@@ -286,7 +304,7 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
     // 5. the compile, and its check
     if (options.compile !== false) {
         const dir = path.join(compiles, commit);
-        const compiled = await compileProject(client, options.projectId, main!, dir, log, sleep);
+        const compiled = await compileProject(client, options.projectId, held, main!, dir, log, sleep);
         report.compile = { ...compiled, check: compiled.status === 'success' ? checkBuild(dir) : undefined };
 
         // 6. the project's own check; a check of the checked-out commit compares with its parent's compile
@@ -307,8 +325,9 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
     const line = `${new Date().toISOString()} ${commit} parent ${head} ${report.pushed ? 'pushed' : 'checked'}`
         + `${report.compile ? `, compile ${report.compile.status}${report.compile.check ? (report.compile.check.ok ? ', no errors' : ', ERRORS') : ''}` : ''}`
         + `${report.hook ? `, landCheck exit ${report.hook.status}` : ''}\n`;
-    fs.mkdirSync(path.join(gitDir, 'overleaf'), { recursive: true });
-    fs.appendFileSync(path.join(gitDir, 'overleaf', 'landings.log'), line);
+    const landings = path.join(gitDir, LANDINGS_LOG);
+    fs.mkdirSync(path.dirname(landings), { recursive: true });
+    fs.appendFileSync(landings, line);
     return report;
 }
 
