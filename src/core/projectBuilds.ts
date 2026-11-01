@@ -10,6 +10,18 @@ import { errorMessage } from '../utils/errorMessage';
  * compile makes a new build that this window does not hear of. Overleaf keeps each user's latest
  * compile of a project in its cache of compile outputs and answers for it
  * (BaseAPI.getLatestCompileFromCache), so the window asks when the latest build may have changed.
+ *
+ * What the IDE test of 2026-11-01 found on overleaf.com, on the private copy of the book:
+ * - Its owner has the priority compile group, and Overleaf's cache kept this window's builds and
+ *   other clients' (each with its editor ID), older ones included, until an output deletion
+ *   (Recompile from Scratch) cleared them. Whether the shared book's owner has that group is not
+ *   determined. Without it, the cache does not keep a compile's PDF (CLSICacheHandler.js:197-224):
+ *   the window then shows only its own compiles, and a gone build only comes back by a compile.
+ * - One user's compiles ran on four compile servers. Each keeps the two newest builds of the
+ *   user's compile folder (OutputCacheManager.js:110-111), so a build is not deleted by newer
+ *   builds that another server made.
+ * - The book's output.pdf has 885,588,853 bytes and 456 pages, which is why the viewers and Save
+ *   PDF read a build in ranges.
  */
 
 /** What a compile typesets, as far as it decides whether a build shows what the window would compile. */
