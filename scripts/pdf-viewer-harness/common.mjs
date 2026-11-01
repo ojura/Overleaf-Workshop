@@ -78,34 +78,47 @@ export function shotPath(name) {
 
 /**
  * The book `name` in the work folder, which the Python script `writer` writes, with `args`, the
- * first time it is asked for. A book is complete once its builds.json exists, which the script
- * writes last. The script writes into a new folder next to the book's, which then takes the
- * book's name, so that a run that is cut short cannot leave a book without some of its files
- * under that name; a folder of that name without builds.json is left from an older version of
- * this function, and is replaced. The scripts write the same bytes every time (make_book.py seeds
- * its random data), so when two first runs write a book at once, it does not matter whose folder
- * ends up under the name.
+ * first time it is asked for. A book is complete once its book.json exists, which the script
+ * writes last (bookFacts). The script writes into a new folder next to the book's, which then takes
+ * the book's name, so that a run that is cut short cannot leave a book without some of its files
+ * under that name; a folder of that name without book.json is left from an older version of this
+ * function or of the writer, and is replaced. The scripts write the same bytes every time
+ * (make_book.py seeds its random data), so when two first runs write a book at once, it does not
+ * matter whose folder ends up under the name.
  */
 function writtenBook(name, writer, args = []) {
     const dir = path.join(work, name);
-    if (fs.existsSync(path.join(dir, 'builds.json'))) { return dir; }
+    const complete = (folder) => fs.existsSync(path.join(folder, 'book.json'));
+    if (complete(dir)) { return dir; }
     const fresh = fs.mkdtempSync(`${dir}.new-`);
     const removal = onCleanup(() => fs.rmSync(fresh, { recursive: true, force: true }));
     try {
         execFileSync('python3', ['-I', path.join(here, writer), fresh, ...args], { stdio: 'inherit' });
-        if (!fs.existsSync(path.join(fresh, 'builds.json'))) { throw new Error(`${writer} ended without writing builds.json into ${fresh}`); }
-        // the rename fails while a folder of that name is not empty: a leftover without builds.json,
+        if (!complete(fresh)) { throw new Error(`${writer} ended without writing book.json into ${fresh}`); }
+        // the rename fails while a folder of that name is not empty: a leftover without book.json,
         // which goes, or the book of another run that renamed its folder first, which stays
-        if (!fs.existsSync(path.join(dir, 'builds.json'))) { fs.rmSync(dir, { recursive: true, force: true }); }
+        if (!complete(dir)) { fs.rmSync(dir, { recursive: true, force: true }); }
         try {
             fs.renameSync(fresh, dir);
         } catch (error) {
-            if (!['ENOTEMPTY', 'EEXIST'].includes(error.code) || !fs.existsSync(path.join(dir, 'builds.json'))) { throw error; }
+            if (!['ENOTEMPTY', 'EEXIST'].includes(error.code) || !complete(dir)) { throw error; }
         }
     } finally {
         removal.run();
     }
     return dir;
+}
+
+/**
+ * What the writer of the book in the folder `dir` wrote into its book.json, for the scripts to
+ * check against: `pages`, `text`, a text that every page holds, and for make_book.py's books
+ * `chapters` ({ title, page } for each entry of the outline), for theme_book.py's `elements` (the
+ * box [x0, y0, x1, y1] in PDF points of each thing on its page).
+ */
+export function bookFacts(dir) {
+    const file = path.join(dir, 'book.json');
+    if (!fs.existsSync(file)) { throw new Error(`${file} does not exist: ${dir} is not a book of make_book.py or theme_book.py, or one that an older version of them wrote`); }
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
 /**

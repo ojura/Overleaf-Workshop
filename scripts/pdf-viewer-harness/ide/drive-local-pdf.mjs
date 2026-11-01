@@ -4,25 +4,26 @@
 // and leaves the window's zoom alone (its devicePixelRatio), that Ctrl+P in the viewer opens Quick Open, and, in the
 // pdfjs viewer, that Ctrl+F finds text without asking first. With --theme-book the PDF is the page
 // of theme_book.py, and the colors of the dark theme are checked too.
-//   node ide/drive-local-pdf.mjs --pdf <path> --pages N [--find TEXT] [--theme-book]
+//   node ide/drive-local-pdf.mjs --pdf <path> [--pages N] [--find TEXT] [--theme-book]
 // The viewer is the one that overleaf-workshop.pdfViewer.engine picks in the instance; *.pdf is
 // associated with it while the script runs (associatePdfs). Test books are in the work folder
-// (common.mjs) once a harness script has written them: book/build-a.pdf (120 pages, with the text
-// "quick brown") and book-theme/build-a.pdf (1 page, with the text "IIII").
+// (common.mjs) once a harness script has written them, book/build-a.pdf and book-theme/build-a.pdf;
+// for a PDF of a test book, --pages and --find default to what the book's book.json says, and
+// --theme-book takes the boxes of the things on the page from there.
 import fs from 'node:fs';
 import path from 'node:path';
 import { scriptOptions } from '../../lib/options.mjs';
+import { bookFacts } from '../common.mjs';
 import {
-    associatePdfs, checker, click, instance, INSTANCE_OPTION, key, openWithQuickOpen, rafOnTimer, settings, showPageFunction,
-    sleep, switchThemeFunction, viewerOf, viewerPage, windowDraws, workbench,
+    areaColorsFunction, associatePdfs, checker, click, instance, INSTANCE_OPTION, key, openWithQuickOpen, rafOnTimer, settings,
+    showPageFunction, sleep, switchThemeFunction, viewerOf, viewerPage, windowDraws, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, pdf: 'value', pages: 'number', find: 'value', 'theme-book': 'flag' });
 
 const pdf = options.get('pdf');
-const expectedPages = options.get('pages');
-if (!pdf || !expectedPages) {
-    console.error('usage: node ide/drive-local-pdf.mjs --pdf <path> --pages N [--find TEXT] [--theme-book]');
+if (!pdf) {
+    console.error('usage: node ide/drive-local-pdf.mjs --pdf <path> [--pages N] [--find TEXT] [--theme-book]');
     process.exit(2);
 }
 // Quick Open finds files by name, so a path that does not exist could open another file of that name
@@ -30,8 +31,19 @@ if (!fs.existsSync(path.resolve(pdf))) {
     console.error(`${path.resolve(pdf)} does not exist`);
     process.exit(2);
 }
+/** what the test book of the PDF says about it (common.mjs), when the PDF is one */
+const facts = fs.existsSync(path.join(path.dirname(path.resolve(pdf)), 'book.json')) ? bookFacts(path.dirname(path.resolve(pdf))) : undefined;
+const expectedPages = options.get('pages') ?? facts?.pages;
+if (!expectedPages) {
+    console.error(`--pages N is required: ${path.resolve(pdf)} is not a PDF of a test book with book.json`);
+    process.exit(2);
+}
 const isThemeBook = options.has('theme-book');
-const findText = options.get('find', isThemeBook ? 'IIII' : 'quick brown');
+if (isThemeBook && !facts?.elements) {
+    console.error(`--theme-book needs the page of theme_book.py, whose book.json lists the boxes of its things; ${path.resolve(pdf)} is not that page`);
+    process.exit(2);
+}
+const findText = options.get('find') ?? facts?.text;
 const inst = instance(options);
 const restoreAssociation = await associatePdfs(settings(inst));
 const { check, summary } = checker();
@@ -68,23 +80,8 @@ try {
     // the dark theme on the page of theme_book.py: the line takes the theme's text color, the
     // background its background color, and the image keeps its colors
     if (isThemeBook) {
-        const areas = { background: [560, 740, 600, 780], blackText: [72, 640, 330, 705], blackLine: [100, 598, 500, 602], redText: [72, 420, 300, 485], imageBlue: [340, 500, 500, 560], imageGreen: [340, 400, 500, 460] };
-        const sample = `(() => {
-            const view = ${V}.getPageView(0);
-            const canvas = view.canvas || view.div.querySelector('canvas');
-            const ctx = canvas.getContext('2d', { willReadFrequently: true });
-            const sx = canvas.width / view.viewport.width, sy = canvas.height / view.viewport.height;
-            const out = {};
-            for (const [name, [x0, y0, x1, y1]] of Object.entries(${JSON.stringify(areas)})) {
-                const [ax, ay] = view.viewport.convertToViewportPoint(x0, y1);
-                const [bx, by] = view.viewport.convertToViewportPoint(x1, y0);
-                const d = ctx.getImageData(Math.round(Math.min(ax, bx) * sx), Math.round(Math.min(ay, by) * sy), Math.max(1, Math.round(Math.abs(bx - ax) * sx)), Math.max(1, Math.round(Math.abs(by - ay) * sy))).data;
-                const counts = new Map();
-                for (let i = 0; i < d.length; i += 4) { const k = '#' + [d[i], d[i + 1], d[i + 2]].map(v => v.toString(16).padStart(2, '0')).join(''); counts.set(k, (counts.get(k) || 0) + 1); }
-                out[name] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
-            }
-            return out;
-        })()`;
+        // the most frequent color in the box of each thing on the page, 2 points inside its edges
+        const sample = `(() => Object.fromEntries(Object.entries((${areaColorsFunction(engine)})(1, ${JSON.stringify(facts.elements)})).map(([name, list]) => [name, list[0][0]])))()`;
         const toTheme = (theme) => E(`(${switchThemeFunction(engine)})(1, ${JSON.stringify(theme)})`);
         await toTheme('dark');
         const dark = await E(sample);
@@ -136,7 +133,9 @@ try {
         await sleep(500);
         const findOpen = await E(`(() => { const b = document.getElementById('findbar'); return !!b && !b.classList.contains('hidden'); })()`);
         check('Ctrl+F in the viewer opens pdf.js\'s find bar', findOpen);
-        if (findOpen) {
+        if (findOpen && !findText) {
+            check('find finds a text without asking first', false, 'there is no text to look for: give --find TEXT');
+        } else if (findOpen) {
             await view.session.send('Input.insertText', { text: findText });
             await sleep(1500);
             const count = await E(`(() => { const c = PDFViewerApplication.findController; return { matches: c?._matchesCountTotal ?? null, consent: !!document.getElementById('findConsent') }; })()`);

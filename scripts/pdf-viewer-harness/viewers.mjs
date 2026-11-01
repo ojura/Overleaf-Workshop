@@ -147,6 +147,35 @@ export const switchThemeFunction = (engine, limitMs = DRAW_LIMIT_MS) => `(async 
 })`;
 
 /**
+ * The source of a function for a page of the viewer `engine`, (pageNumber, boxes, inset) => colors:
+ * for each named box [x0, y0, x1, y1] in PDF points (origin at the bottom left), the three most
+ * frequent colors of the drawn canvas's pixels in it, as [['#rrggbb', share], ...] with the share
+ * from 0 to 1. Each box is first made smaller by `inset` points on each side, so that the
+ * anti-aliased edges of what the box holds stay out.
+ */
+export const areaColorsFunction = (engine) => `((pageNumber, boxes, inset = 2) => {
+    const view = ${viewerOf(engine)}.getPageView(pageNumber - 1);
+    const canvas = view.canvas || view.div.querySelector('canvas');
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    const sx = canvas.width / view.viewport.width, sy = canvas.height / view.viewport.height;
+    const out = {};
+    for (const [name, [x0, y0, x1, y1]] of Object.entries(boxes)) {
+        const [ax, ay] = view.viewport.convertToViewportPoint(x0 + inset, y1 - inset);
+        const [bx, by] = view.viewport.convertToViewportPoint(x1 - inset, y0 + inset);
+        const left = Math.round(Math.min(ax, bx) * sx), top = Math.round(Math.min(ay, by) * sy);
+        const width = Math.max(1, Math.round(Math.abs(bx - ax) * sx)), height = Math.max(1, Math.round(Math.abs(by - ay) * sy));
+        const data = context.getImageData(left, top, width, height).data;
+        const counts = new Map();
+        for (let i = 0; i < data.length; i += 4) {
+            const color = '#' + [data[i], data[i + 1], data[i + 2]].map(v => v.toString(16).padStart(2, '0')).join('');
+            counts.set(color, (counts.get(color) || 0) + 1);
+        }
+        out[name] = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([color, n]) => [color, n / (data.length / 4)]);
+    }
+    return out;
+})`;
+
+/**
  * The source of an async function for a page of the viewer `engine`, (pageNumber) => pixels: the
  * drawn canvas of page `pageNumber` as { width, height, data } (getImageData), with colored(x, y),
  * whether a pixel is colored (its channels differ by more than 40), and inImage(x, y), whether a

@@ -98,7 +98,10 @@ the script's stderr, after `chrome: `. Generated files go to the work
 folder, `$PDF_VIEWER_HARNESS_WORK` or by default `pdf-viewer-harness` in the system's temporary
 folder:
 
-- `book/` (120 pages, two builds of 126 MB each) and `book-theme/` (one page), written on first use;
+- `book/` (120 pages, two builds of 126 MB each) and `book-theme/` (one page), written on first use,
+  each with `book.json`, which its writer writes last: the number of pages, a text that every page
+  holds, and the outline's chapters (`make_book.py`) or the boxes of the things on the page
+  (`theme_book.py`), which the scripts check against;
 - `shots/`, the screenshots, and `compare/`, the results of `compare.mjs`;
 - the Chrome profiles and piece caches of the scripts that are running.
 

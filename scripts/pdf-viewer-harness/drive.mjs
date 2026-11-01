@@ -1,5 +1,6 @@
-// Runs a viewer through the harness in headless Chrome, on the 120-page test book, and prints
-// what it measured and checked.
+// Runs a viewer through the harness in headless Chrome, on the test book of book() in common.mjs,
+// and prints what it measured and checked; what it checks about the book comes from the book's
+// book.json (bookFacts).
 //   node drive.mjs [--ext <views/pdf-viewer dir>] [--engine overleaf|pdfjs] [--latency 40] [--frame]
 //                  [--port 8765] [--shots DIR] [--json FILE]
 // --ext defaults to the checkout's views/pdf-viewer. --frame runs the page in a same-origin iframe
@@ -12,7 +13,7 @@ import path from 'node:path';
 import { notWithinLimit } from '../lib/devtools.mjs';
 import { scriptOptions } from '../lib/options.mjs';
 import { launchChrome } from './cdp.mjs';
-import { book, checker, defaultExt, startServer, work } from './common.mjs';
+import { book, bookFacts, checker, defaultExt, startServer, work } from './common.mjs';
 import { OVERLEAF_DOCUMENTS, pageDrawn, SYNCTEX_HIGHLIGHT, viewerIfAny, viewerOf } from './viewers.mjs';
 
 const options = scriptOptions({ ext: 'value', engine: 'value', frame: 'flag', latency: 'number', shots: 'value', port: 'number', json: 'value' });
@@ -25,7 +26,10 @@ const shots = path.resolve(options.get('shots', path.join(work, 'shots', engine)
 const port = options.get('port', 8765);
 fs.mkdirSync(shots, { recursive: true });
 
-const { origin, stop: stopServer } = await startServer({ name: `drive-${engine}`, port, ext, bookDir: book(), latency });
+const bookDir = book();
+/** the book's pages, `text`, which every page holds, and `chapters` */
+const facts = bookFacts(bookDir);
+const { origin, stop: stopServer } = await startServer({ name: `drive-${engine}`, port, ext, bookDir, latency });
 
 // a measurement follows a wait that fails the run when it does not end, so it is not a check of its own
 const { check, measure, summary, results } = checker();
@@ -66,7 +70,7 @@ try {
     check('build A: the whole file was not requested', s.outputWholeRequests === 0);
     await page.screenshot(path.join(shots, '1-first-page.png'));
     const pages = await page.evaluate(`${VIEWER}.pagesCount`);
-    check('build A: 120 pages', pages === 120, `${pages}`);
+    check(`build A: ${facts.pages} pages`, pages === facts.pages, `${pages}`);
 
     // 2. read on at page 60
     await resetStats();
@@ -117,7 +121,7 @@ try {
     // 4. a PDF read whole ('update')
     await resetStats();
     await page.evaluate(`window.__oldDoc = ${VIEWER}.pdfDocument; harness.update('a'); true`);
-    await page.waitFor(`${VIEWER}.pdfDocument && ${VIEWER}.pdfDocument !== window.__oldDoc && ${VIEWER}.pagesCount === 120`, 60000);
+    await page.waitFor(`${VIEWER}.pdfDocument && ${VIEWER}.pdfDocument !== window.__oldDoc && ${VIEWER}.pagesCount === ${facts.pages}`, 60000);
     await page.waitFor(rendered(await page.evaluate(`${VIEWER}.currentPageNumber`)), 30000);
     s = await stats();
     measure('update: a PDF read whole is shown', traffic(s));
@@ -128,7 +132,7 @@ try {
     }
     // back to a build in ranges
     await page.evaluate(`harness.load('a'); true`);
-    await page.waitFor(`${VIEWER}.pdfDocument && ${VIEWER}.pagesCount === 120${engine === 'overleaf' ? ` && ${OVERLEAF_DOCUMENTS}.inFlight === undefined` : ''}`, 60000);
+    await page.waitFor(`${VIEWER}.pdfDocument && ${VIEWER}.pagesCount === ${facts.pages}${engine === 'overleaf' ? ` && ${OVERLEAF_DOCUMENTS}.inFlight === undefined` : ''}`, 60000);
 
     // 5. SyncTeX from the source: a highlight on page 30
     await page.evaluate(`harness.syncCode([{ page: 30, h: 72, v: 110, width: 320, height: 14 }]); true`);
@@ -150,8 +154,8 @@ try {
     const states = () => page.evaluate(`JSON.stringify({ current: ${VIEWER}.currentPageNumber, pages: [${at - 2},${at - 1},${at},${at + 1}].map(n => [n, ${VIEWER}.getPageView(n - 1)?.renderingState]), fetches: harness.messages('fetch').length, scrollTop: Math.round(${VIEWER}.container.scrollTop) })`);
     const text = await page.waitFor(`document.querySelector('.page[data-page-number="${at}"] .textLayer span')`, 15000).catch(async (e) => { console.log('  diagnostics:', await states()); throw e; });
     const dbl = await page.evaluate(`(() => {
-        const span = [...document.querySelectorAll('.page[data-page-number="${at}"] .textLayer span')].find(s => s.textContent.includes('quick'));
-        if (!span) { return 'the text layer does not contain "quick"'; }
+        const span = [...document.querySelectorAll('.page[data-page-number="${at}"] .textLayer span')].find(s => s.textContent.includes(${JSON.stringify(facts.text)}));
+        if (!span) { return ${JSON.stringify(`the text layer does not contain "${facts.text}"`)}; }
         const r = span.getBoundingClientRect();
         const before = harness.messages('syncPdf').length;
         span.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, clientX: r.left + 5, clientY: r.top + r.height / 2 }));
@@ -164,9 +168,9 @@ try {
     if (engine === 'overleaf') {
         await page.evaluate(`document.getElementById('outlineToggle').click(); true`);
         const items = await page.waitFor(`document.querySelectorAll('#outline .outline-item').length`, 10000);
-        check('outline: the chapters are listed', items.value === 12, `${items.value} items`);
+        check('outline: the chapters are listed', items.value === facts.chapters.length, `${items.value} items`);
         await page.evaluate(`document.querySelectorAll('#outline .outline-item')[2].click(); true`);
-        const ch3 = await page.waitFor(`${VIEWER}.currentPageNumber === 21`, 10000).catch(notWithinLimit);
+        const ch3 = await page.waitFor(`${VIEWER}.currentPageNumber === ${facts.chapters[2].page}`, 10000).catch(notWithinLimit);
         check('outline: a chapter opens its page', !!ch3, `page ${await page.evaluate(`${VIEWER}.currentPageNumber`)}`);
         await new Promise(r => setTimeout(r, 400));
         await page.screenshot(path.join(shots, '7-outline.png'));
