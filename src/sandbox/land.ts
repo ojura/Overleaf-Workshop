@@ -6,7 +6,7 @@ import type { CompileRequest } from '../api/base';
 import type { FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
 import { Repo } from '../gitbridge/plumbing';
 import { ControlAnswer, ControlRequest, NoReplicaWindowError } from '../scm/replicaControl';
-import { OVERLEAF_REF } from '../scm/replicaGit';
+import { OVERLEAF_REF, REPLICA_FOLDER_IN_GIT_DIR } from '../scm/replicaGit';
 import { BuildCheck, checkBuild } from './buildCheck';
 import type { CompileResult, JoinedProject } from './client';
 import type { ProjectRanges } from './ranges';
@@ -24,8 +24,8 @@ import type { ProjectRanges } from './ranges';
  *    "Renames and moves"), and waits for Overleaf's acknowledgements;
  * 4. Overleaf must hold the commit, checked as in 2, for up to three minutes;
  * 5. one compile of the project, repeated while Overleaf answers that another compile of the
- *    user runs; its logs are kept in <git dir>/overleaf/compiles/<commit>, and checked for
- *    errors (buildCheck.ts);
+ *    user runs; its logs are kept in a folder for the commit in LAND_COMPILES_FOLDER, and
+ *    checked for errors (buildCheck.ts);
  * 6. the command in git config overleaf.landCheck, if set, runs with the compile's folder and
  *    the parent's, e.g. a project's own check of where its pages fall.
  *
@@ -39,6 +39,12 @@ import type { ProjectRanges } from './ranges';
  */
 
 export type Logger = (message: string) => void;
+
+// The landing's files in the replica's own folder in its git folder, relative to the git folder.
+/** The logs of the compiles that the landing checks, in a folder for each commit. */
+export const LAND_COMPILES_FOLDER = `${REPLICA_FOLDER_IN_GIT_DIR}/compiles`;
+/** One line for each landing. */
+export const LANDINGS_LOG = `${REPLICA_FOLDER_IN_GIT_DIR}/landings.log`;
 
 /** What the landing needs of Overleaf. */
 export interface LandClient {
@@ -191,7 +197,7 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
     const log = options.log;
     const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
     const gitDir = repo.gitDir();
-    const compiles = path.join(gitDir, 'overleaf', 'compiles');
+    const compiles = path.join(gitDir, LAND_COMPILES_FOLDER);
 
     // 1. the window syncs, and Overleaf's state is the checked-out commit
     const bridge = options.push === 'bridge';
@@ -318,8 +324,9 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
     const line = `${new Date().toISOString()} ${commit} parent ${head} ${report.pushed ? 'pushed' : 'checked'}`
         + `${report.compile ? `, compile ${report.compile.status}${report.compile.check ? (report.compile.check.ok ? ', no errors' : ', ERRORS') : ''}` : ''}`
         + `${report.hook ? `, landCheck exit ${report.hook.status}` : ''}\n`;
-    fs.mkdirSync(path.join(gitDir, 'overleaf'), { recursive: true });
-    fs.appendFileSync(path.join(gitDir, 'overleaf', 'landings.log'), line);
+    const landings = path.join(gitDir, LANDINGS_LOG);
+    fs.mkdirSync(path.dirname(landings), { recursive: true });
+    fs.appendFileSync(landings, line);
     return report;
 }
 

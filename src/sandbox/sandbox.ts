@@ -6,7 +6,7 @@ import * as path from 'path';
 import { minimatch } from 'minimatch';
 import type { FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
 import { gitBlobHash } from '../scm/replicaSync';
-import { DEFAULT_IGNORE_PATTERNS, REPLICA_SETTINGS_FILE } from '../scm/ignorePatterns';
+import { DEFAULT_IGNORE_PATTERNS, REPLICA_FOLDER, REPLICA_SETTINGS_FILE } from '../scm/ignorePatterns';
 import { LatexParser } from '../compile/compileLogParser';
 import { GuardedSandbox, SandboxRecord, SandboxSafetyError, recordProblems, viewProblems } from './guard';
 import { acquireLock, HeldLock, LockOwner } from './lock';
@@ -16,7 +16,7 @@ import type { CompileResult, JoinedProject, OverleafClient } from './client';
 
 export type Logger = (message: string) => void;
 
-/** What a local replica's .overleaf/settings.json says about the project. */
+/** What a local replica's settings (REPLICA_SETTINGS_FILE) say about the project. */
 export interface Replica {
     folder: string;
     serverName: string;
@@ -51,10 +51,17 @@ export function readReplica(folder: string): Replica {
     return replica;
 }
 
-export const recordFile = (folder: string) => path.join(folder, '.overleaf', 'sandbox.json');
-export const lockFile = (folder: string) => path.join(folder, '.overleaf', 'sandbox.lock');
+// The tool's files in the replica's own folder, which the sync leaves out, as paths of the sync
+// ('/dir/name'), and their paths in the replica `folder`.
+/** The record of the private copy that init created (SandboxRecord). */
+export const SANDBOX_RECORD_FILE = `${REPLICA_FOLDER}/sandbox.json`;
+/** The lock that a run holds while it uploads to the private copy and compiles it (lock.ts). */
+export const SANDBOX_LOCK_FILE = `${REPLICA_FOLDER}/sandbox.lock`;
 /** One line per event of a run, so that the runs of several agents on one copy can be traced. */
-export const runLogFile = (folder: string) => path.join(folder, '.overleaf', 'sandbox-runs.jsonl');
+export const SANDBOX_RUN_LOG_FILE = `${REPLICA_FOLDER}/sandbox-runs.jsonl`;
+export const recordFile = (folder: string) => path.join(folder, SANDBOX_RECORD_FILE);
+export const lockFile = (folder: string) => path.join(folder, SANDBOX_LOCK_FILE);
+export const runLogFile = (folder: string) => path.join(folder, SANDBOX_RUN_LOG_FILE);
 
 function logRun(folder: string, entry: Record<string, unknown>) {
     try {
@@ -185,7 +192,7 @@ export function sandboxUrl(record: SandboxRecord) {
 
 /**
  * Clone the replica's project into a new private project of this account and record it in
- * the replica's .overleaf/sandbox.json. The clone is the one request that names the shared
+ * the replica's SANDBOX_RECORD_FILE. The clone is the one request that names the shared
  * project; Overleaf reads it to make the copy and does not change it.
  */
 export async function createSandbox(client: OverleafClient, replica: Replica, userId: string, name: string, log: Logger) {

@@ -108,6 +108,31 @@ describe('the PDF viewers\' range transport', function () {
         assert.strictEqual(loader.getPdfCachingMetrics().failedOnce, false);
     });
 
+    it('does not ask Overleaf\'s cache for a build whose compile named no shard of it', async () => {
+        const build = '19a0b1c2d3e-fedcba9876543210';
+        // the compile server deleted the build, and the compile answer named no shard of the cache
+        respond = async () => new (globalThis as any).Response('not found', { status: 404, statusText: 'Not Found' });
+        requests.length = 0;
+        const factory = loader.generatePdfCachingTransportFactory();
+        let reported!: () => void;
+        const failed = new Promise<void>(resolve => { reported = resolve; });
+        const transport = factory({
+            url: `https://dl.test/zone/d/project/p1/user/u1/build/${build}/output/output.pdf?compileGroup=standard&clsiserverid=clsi-vm-7&enable_pdf_caching=true`,
+            pdfFile: { path: 'output.pdf', url: `/project/p1/user/u1/build/${build}/output/output.pdf`, type: 'pdf', build, size: 1_000_000, ranges: [], contentId: 'c1', editorId: '', clsiCacheShard: '' },
+            abortController: new AbortController(),
+            handleFetchError: () => reported(),
+        });
+        const quiet = { warn: console.warn, error: console.error };
+        console.warn = console.error = () => {};
+        try {
+            transport.requestDataRange(0, 1024);
+            // the failure reaches the page, which reports the build gone
+            await failed;
+        } finally { Object.assign(console, quiet); }
+        const servers = requests.map(r => new URL(r.url).searchParams.get('clsiserverid'));
+        assert.ok(servers.length > 0 && servers.every(server => server === 'clsi-vm-7'), JSON.stringify(servers));
+    });
+
     it('fetches a range from Overleaf\'s cache of compile outputs when the compile server has deleted the build', async () => {
         const editorId = '0d9c1e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f';
         const build = '19a0b1c2d3e-0123456789abcdef';

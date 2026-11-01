@@ -3,16 +3,16 @@
  * compile unlanded versions in.
  *
  * The tool writes to exactly one project, the copy it created and recorded in the
- * replica's .overleaf/sandbox.json. Every write goes through `GuardedSandbox`, which is
- * bound to the recorded id and offers no way to name another project. Before each write
- * it joins the copy afresh and checks the server's answer: the project is the recorded
+ * replica's SANDBOX_RECORD_FILE (sandbox.ts). Every write goes through `GuardedSandbox`,
+ * which is bound to the recorded id and offers no way to name another project. Before each
+ * write it joins the copy afresh and checks the server's answer: the project is the recorded
  * one, this account owns it, it has no collaborators, no pending invites and link sharing
  * is off. The shared project's id is refused outright, whatever the record says.
  */
 
 import type { CompileRequest } from '../api/base';
 
-/** What .overleaf/sandbox.json holds. */
+/** What the replica's SANDBOX_RECORD_FILE holds. */
 export interface SandboxRecord {
     /** version of this file's format */
     version: 1;

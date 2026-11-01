@@ -12,12 +12,18 @@
  * plain range request. On the 885 MB book that happened on every few requests. Prefetching's other
  * part, fetching the cross-reference table with the first request, needs startXRefTable, which the
  * compile responses do not list. Download tracking stays off: it only reports metrics to Overleaf.
- * The fallback to Overleaf's cache of compile outputs is on. Overleaf's compile server deletes a
- * build after 90 minutes, or once two newer builds exist (OutputCacheManager.js:110-111), and the
- * cache keeps a copy of each build whose compile named an editor (clsi CompileController.js:152-157).
- * When the compile server answers 404, the loader asks the cache's shard for
- * /build/<editor>-<build>/output/output.pdf (getOutputPDFURLFromCache), from the build's editor ID
- * and shard, which the host passes on (output.ts).
+ * The fallback to Overleaf's cache of compile outputs is decided for each load, by whether the
+ * build names the cache's shard (caching-flags.ts, which the loader gets in place of Overleaf's
+ * flags module); 'ol-canUseClsiCache' is set only because Overleaf's flags module reads it when it
+ * loads, and getMeta looks for a meta tag in document.head for a key that the Map lacks. Overleaf's
+ * compile server deletes a build after 90 minutes, or once two newer builds exist
+ * (OutputCacheManager.js:110-111). The cache keeps a copy of a successful compile that named an
+ * editor, when Overleaf asks for it (populateClsiCache; clsi CompileController.js:150-156), and
+ * without the PDF, its log and its SyncTeX file for a standard-group user's compile
+ * (CLSICacheHandler.js:197-224). When the compile server answers
+ * 404, the loader asks the cache's shard for /build/<editor>-<build>/output/output.pdf
+ * (getOutputPDFURLFromCache), from the build's editor ID and shard, which the host passes on
+ * (output.ts).
  */
 const cache: Map<string, unknown> = (window as any).metaAttributesCache ??= new Map();
 
@@ -29,6 +35,6 @@ cache.set('ol-splitTestVariants', {
     'pdf-caching-cached-url-lookup': 'enabled',
     'track-pdf-download': 'disabled',
 });
-cache.set('ol-canUseClsiCache', true);
+cache.set('ol-canUseClsiCache', false);
 
 export {};

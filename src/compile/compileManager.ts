@@ -5,9 +5,12 @@ import { PdfDocument } from '../core/pdfViewEditorProvider';
 import { LatexParser, ErrorSchema } from './compileLogParser';
 import { EventBus } from '../utils/eventBus';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
+import { isReplicaOwnPath } from '../scm/ignorePatterns';
 import { CompileRecord, REPLICA_OUTPUT_FOLDER, saveCompileOutputs } from './outputFiles';
 import { windowCompileSettings } from './compileSettings';
-import type { CompileOutcome, CompileStart } from '../core/projectBuilds';
+import { NO_OUTPUT_PDF, type CompileOutcome, type CompileStart } from '../core/projectBuilds';
+import { errorMessage } from '../utils/errorMessage';
+import type { HostMessage } from '../core/viewerProtocol';
 
 // map string level to severity
 const severityMap: Record<string, vscode.DiagnosticSeverity> = {
@@ -16,8 +19,23 @@ const severityMap: Record<string, vscode.DiagnosticSeverity> = {
     information: vscode.DiagnosticSeverity.Information,
 };
 
-// Match the document class in the tex file
-const documentClassRegex = new RegExp(/\\documentclass(?:\[[^\[\]\{\}]*\])?\{([^\[\]\{\}]+)\}/);
+/**
+ * A line that begins with \documentclass, after spaces or tabs, as Overleaf tells a main document
+ * (DocumentHelper.mjs:39-55, contentHasDocumentclass), so a commented-out one does not count; with
+ * its options and its class, which may follow on the next lines.
+ */
+const DOCUMENT_CLASS = /^[ \t]*\\documentclass(?![A-Za-z])(?:\s*\[[^\]]*\])?(?:\s*\{\s*([^}]*?)\s*\})?/m;
+
+/**
+ * Whether the document with text `content` is a main document, which a compile from its editor
+ * typesets on its own: it has a \documentclass line (DOCUMENT_CLASS) whose class is not subfiles.
+ * A subfiles chapter names the project's main document as its class's option, and the project
+ * compiles it as part of that document.
+ */
+export function isMainDocument(content: string): boolean {
+    const match = DOCUMENT_CLASS.exec(content);
+    return match !== null && match[1] !== 'subfiles';
+}
 
 /** Why compile `record` made no build, as the viewers' banner says it. */
 function failureOf(record: CompileRecord | undefined): string {
@@ -25,14 +43,8 @@ function failureOf(record: CompileRecord | undefined): string {
     if (status === undefined) {
         return `the compile request failed: ${record?.message}`;
     }
-    return status === 'success' ? 'the compile made no output.pdf' : `Overleaf's status is "${status}"`;
+    return status === 'success' ? NO_OUTPUT_PDF : `Overleaf's status is "${status}"`;
 }
-
-const pdfViewRecord: {
-    [key: string]: {
-        [key: string]: { doc: PdfDocument, webviewPanel: vscode.WebviewPanel }
-    }
-} = {};
 
 class CompileDiagnosticProvider {
     private diagnosticCollection = vscode.languages.createDiagnosticCollection(ROOT_NAME);
@@ -130,10 +142,11 @@ export class CompileManager {
     static uploadWaitMs = 60 * 1000;
     readonly status: vscode.StatusBarItem;
     /**
-     * the compile that runs, from the request (compile) to its end (run); the promise settles when
-     * the compile has ended, however it ended
+     * the compile that runs, from the request (compile) to its end (run): `ended` settles when the
+     * compile has ended, however it ended, and `project` is the project that it compiles, once the
+     * request has found it
      */
-    private running?: Promise<void>;
+    private running?: { ended: Promise<void>, project?: vscode.Uri };
     private diagnosticProvider: CompileDiagnosticProvider;
     /** the saves of local replica logs, one after another */
     private outputSaves: Promise<void> = Promise.resolve();
@@ -144,6 +157,8 @@ export class CompileManager {
     cachedBuildShown: Promise<void> = Promise.resolve();
     /** the event listeners of the constructor, which `triggers` hands on for disposal */
     private readonly listeners: vscode.Disposable[] = [];
+    /** the open PDF viewers, by viewerKey */
+    private readonly viewers = new Map<string, { doc: PdfDocument, webviewPanel: vscode.WebviewPanel }>();
 
     constructor(
         private vfsm: RemoteFileSystemProvider,
@@ -160,21 +175,27 @@ export class CompileManager {
                 this.cachedBuildShown = this.showCachedBuild(uri);
             }
         }));
-        // listen pdf open event
+        // a PDF viewer opens; it leaves the record when it closes, so that a jump to the PDF opens
+        // the PDF again rather than writing to the closed viewer
         this.listeners.push(EventBus.on('pdfWillOpenEvent', ({uri, doc, webviewPanel}) => {
-            const {identifier,pathParts} = parseUri(uri);
-            const filePath = pathParts.join('/');
-            if (pdfViewRecord[identifier]) {
-                pdfViewRecord[identifier][filePath] = {doc, webviewPanel};
-            } else {
-                pdfViewRecord[identifier] = {[filePath]:{doc, webviewPanel}};
-            }
+            const key = CompileManager.viewerKey(uri);
+            const viewer = {doc, webviewPanel};
+            this.viewers.set(key, viewer);
+            webviewPanel.onDidDispose(() => {
+                if (this.viewers.get(key) === viewer) { this.viewers.delete(key); }
+            });
         }));
     }
 
     /** whether a compile runs: from the request (compile) to its end (run) */
     get inCompiling(): boolean {
         return this.running !== undefined;
+    }
+
+    /** The key of the viewer of `uri`, a file of a project, in `viewers`. */
+    private static viewerKey(uri: vscode.Uri): string {
+        const {identifier, pathParts} = parseUri(uri);
+        return `${identifier}:${pathParts.join('/')}`;
     }
 
     static async check(uri?: vscode.Uri) {
@@ -246,10 +267,10 @@ export class CompileManager {
      * fires no compileEndedEvent, and its end settles the promise of 'busy' all the same.
      */
     async compile(force:boolean=false, fromScratch:boolean=false, target?: vscode.Uri): Promise<CompileStart> {
-        if (this.running) { return { kind: 'busy', ended: this.running }; }
+        if (this.running) { return { kind: 'busy', ended: this.running.ended }; }
         // taken before the first wait, so that a request meanwhile finds the window busy
         let settle!: () => void;
-        const running = new Promise<void>(resolve => { settle = resolve; });
+        const running: { ended: Promise<void>, project?: vscode.Uri } = { ended: new Promise<void>(resolve => { settle = resolve; }) };
         this.running = running;
         const end = () => {
             if (this.running === running) { this.running = undefined; }
@@ -260,6 +281,7 @@ export class CompileManager {
             await vscode.workspace.saveAll(); // save all dirty files
             const uri = await this.update('compiling', target);
             if (!uri) { return { kind: 'unavailable' }; }
+            running.project = uri;
             started = true;
             void this.run(uri, force, fromScratch, end);
             return { kind: 'started' };
@@ -271,16 +293,18 @@ export class CompileManager {
     /** The compile of the project at `uri` that `compile` started, up to its diagnostics; it calls `end` when it ends. */
     private async run(uri: vscode.Uri, force: boolean, fromScratch: boolean, end: () => void) {
         let outcome: CompileOutcome = { result: 'failure', detail: 'the compile did not start' };
+        // before compile() answers 'started': the viewers say 'compiling' for this compile too
+        EventBus.fire('compileStartedEvent', { uri });
         try {
             const vfs = await this.vfsm.prefetch(uri);
             await this.waitForLocalReplica(vfs);
-            // Compile the open document as the main document when it has a
-            // \documentclass. For a local replica `uri` is the project folder.
+            // Compile the open document as the main document when it is one (isMainDocument),
+            // else the project's main document. For a local replica `uri` is the project folder.
             const {fileType, fileId} = await vfs._resolveUri(uri);
             let rootDocId: string | undefined = undefined;
             if (fileType==='doc') {
                 const content = new TextDecoder().decode( await vfs.openFile(uri) );
-                rootDocId = RegExp(documentClassRegex).exec(content) ? fileId : undefined;
+                rootDocId = isMainDocument(content) ? fileId : undefined;
             }
             const res = await vfs.compile(force, windowCompileSettings.draft, windowCompileSettings.stopOnFirstError, rootDocId, fromScratch);
             if (res===undefined) {
@@ -301,7 +325,7 @@ export class CompileManager {
             const hasError = await this.problemsOf(uri);
             await this.update(hasError ? 'failed' : 'success', uri);
         } catch (error) {
-            outcome = { result: 'failure', detail: String((error as Error)?.message ?? error) };
+            outcome = { result: 'failure', detail: errorMessage(error) };
             console.error(`${ELEGANT_NAME}: the compile failed:`, error);
             await this.update('failed', uri).catch((statusError) => console.error(`${ELEGANT_NAME}: showing the compile's status failed:`, statusError));
         } finally {
@@ -319,7 +343,7 @@ export class CompileManager {
         try {
             return await vscode.commands.executeCommand<boolean>(`${ROOT_NAME}.compileManager.compileErrorCheck`, uri);
         } catch (error) {
-            vscode.window.showWarningMessage( vscode.l10n.t('The compile log could not be read, so the Problems view does not show its errors: {error}', {error: String((error as Error)?.message ?? error)}) );
+            vscode.window.showWarningMessage( vscode.l10n.t('The compile log could not be read, so the Problems view does not show its errors: {error}', {error: errorMessage(error)}) );
             return false;
         }
     }
@@ -355,14 +379,14 @@ export class CompileManager {
                 vscode.window.showWarningMessage( vscode.l10n.t('Local changes are still being synced with Overleaf, so the PDF may not include all of them yet.') );
             }
         } catch (error) {
-            vscode.window.showWarningMessage( vscode.l10n.t('Some local changes could not be uploaded to Overleaf, so the PDF may not include them: {error}', {error: String((error as Error)?.message ?? error)}) );
+            vscode.window.showWarningMessage( vscode.l10n.t('Some local changes could not be uploaded to Overleaf, so the PDF may not include them: {error}', {error: errorMessage(error)}) );
         } finally {
             clearTimeout(timer);
         }
     }
 
     /**
-     * Keep the logs of a local replica's compile in the replica's .overleaf/output folder, so
+     * Keep the logs of a local replica's compile in the replica's REPLICA_OUTPUT_FOLDER, so
      * that editors and tools can read Overleaf's log locally. The replica never syncs that
      * folder. Saves run one after another, so the folder ends up with the last one's logs:
      * `compile` is this window's last compile, whatever its status, or another client's compile
@@ -402,37 +426,77 @@ export class CompileManager {
         }
     }
 
+    /**
+     * Stop compilation: ask Overleaf to stop the running compile, of whichever project it is. The
+     * compile's end then says how it ended (run): Overleaf answers a stopped compile 'terminated',
+     * and a compile that the stop did not reach ends as it would have. Overleaf sends a stop to
+     * the compile server that it keeps for the project and the user (ClsiManager.mjs:396-421),
+     * which need not be the one that runs the compile; that one answers at once, and the compile
+     * goes on (the compile server's CompileManager.js:410-423).
+     */
     async stopCompile() {
-        const uri = await CompileManager.check();
-        if (uri && this.inCompiling) {
-            const vfs = await this.vfsm.prefetch(uri);
-            await vfs.stopCompile();
-            await this.update('failed');
-        }
+        const project = this.running?.project;
+        if (!project) { return; }
+        const vfs = await this.vfsm.prefetch(project);
+        await vfs.stopCompile();
     }
 
-    async openPdf() {
-        const uri = await CompileManager.check();
+    /**
+     * Open the build's PDF of the project of `target`, else of the active editor or the workspace
+     * (check). Settles when VS Code has opened its viewer, or did not open it.
+     */
+    async openPdf(target?: vscode.Uri) {
+        const uri = await CompileManager.check(target);
         if (uri) {
-            const rootPath = uri.path.split('/', 2)[1];
-            const pdfUri = uri.with({
-                path: `/${rootPath}/${OUTPUT_FOLDER_NAME}/output.pdf`,
-            });
-            vscode.commands.executeCommand('vscode.openWith', pdfUri,
+            await vscode.commands.executeCommand('vscode.openWith', CompileManager.buildPdfOf(uri),
                 `${ROOT_NAME}.pdfViewer`,
                 { preview: false, viewColumn: vscode.ViewColumn.Beside }
             );
         }
     }
 
-    /** The path inside the project of `docUri`: a document of the project, or a file of its local replica. */
+    /** The build's output.pdf of the project of `uri`. */
+    private static buildPdfOf(uri: vscode.Uri): vscode.Uri {
+        const rootPath = uri.path.split('/', 2)[1];
+        return uri.with({ path: `/${rootPath}/${OUTPUT_FOLDER_NAME}/output.pdf` });
+    }
+
+    /**
+     * The viewer of the build's PDF of the project of `uri`, opened when it is not open. VS Code's
+     * vscode.openWith settles only after the custom editor's resolveCustomEditor, which records the
+     * viewer (pdfWillOpenEvent) before its first await (VS Code 1.107.0: editorCommands.ts:517-525,
+     * editorGroupView.ts:1254-1260, editorPanes.ts:463-465, webviewEditor.ts:152-153,
+     * mainThreadCustomEditors.ts:144-215). A viewer that is not recorded by then did not open, and
+     * the user is told.
+     */
+    private async buildViewerOf(uri: vscode.Uri) {
+        const key = CompileManager.viewerKey(CompileManager.buildPdfOf(uri));
+        const open = this.viewers.get(key);
+        if (open) { return open; }
+        try {
+            await this.openPdf(uri);
+        } catch (error) {
+            vscode.window.showWarningMessage( vscode.l10n.t('The PDF could not be opened for the jump: {error}', {error: errorMessage(error)}) );
+            return undefined;
+        }
+        const opened = this.viewers.get(key);
+        if (!opened) {
+            vscode.window.showWarningMessage( vscode.l10n.t('The PDF did not open, so the jump to it was not made.') );
+        }
+        return opened;
+    }
+
+    /**
+     * The path inside the project of `docUri`: a document of the project, or a file of its local
+     * replica outside the replica's own folders (its state and its git repository).
+     */
     static async projectPathOf(docUri: vscode.Uri): Promise<string | undefined> {
         if (docUri.scheme===ROOT_NAME) {
             return parseUri(docUri).pathParts.join('/');
         }
         if (docUri.scheme==='file') {
             const path = await LocalReplicaSCMProvider.uriToPath(docUri); // like '/dir/name.tex'
-            if (path!==undefined && path.startsWith('/') && !path.startsWith('/.overleaf/')) {
+            if (path!==undefined && path.startsWith('/') && !isReplicaOwnPath(path)) {
                 return path.slice(1);
             }
         }
@@ -472,23 +536,14 @@ export class CompileManager {
             vscode.window.showInformationMessage( vscode.l10n.t('This file is not part of the Overleaf project.') );
             return;
         }
-        const { identifier } = parseUri(uri);
         const startPoint = editor.selection.start;
         const vfs = await this.vfsm.prefetch(uri);
         // SyncTeX counts lines from 1, as the web editor sends them
         const res = await vfs.syncCode(filePath, startPoint.line + 1, startPoint.character);
         if (!res) { return; }
-        const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
-        if (!pdfViewRecord[identifier]?.[pdfPath]) {
-            await this.openPdf();
-            for (let i = 0; i < 50 && !pdfViewRecord[identifier]?.[pdfPath]; i++) {
-                await new Promise(resolve => setTimeout(resolve, 100));
-            }
-        }
-        pdfViewRecord[identifier]?.[pdfPath]?.webviewPanel.webview.postMessage({
-            type: 'syncCode',
-            content: res,
-        });
+        const viewer = await this.buildViewerOf(uri);
+        const jump: HostMessage = { type: 'syncCode', content: res };
+        viewer?.webviewPanel.webview.postMessage(jump);
     }
 
     private _revealSelectionInEditor(editor: vscode.TextEditor, targetLine: number, identifier: string) {

@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 import {EventEmitter} from 'events';
 import { PdfDocument } from '../core/pdfViewEditorProvider';
-import type { BuildStatus, CompileOutcome } from '../core/projectBuilds';
+import type { CompileOutcome } from '../core/projectBuilds';
+import type { BuildStatus } from '../core/viewerProtocol';
 import { StatusInfo } from '../scm';
 
 export type Events = {
@@ -19,6 +20,8 @@ export type Events = {
     'buildChangedEvent': {uri: vscode.Uri, fromCache: boolean},
     /** what the viewers of the build of the project at `uri` show changed (ProjectBuilds.status) */
     'buildStatusEvent': {uri: vscode.Uri, status: BuildStatus},
+    /** a compile of the project at `uri` started, whoever asked for it (CompileManager.compile) */
+    'compileStartedEvent': {uri: vscode.Uri},
     /** a compile of the project at `uri` ended (CompileManager.compile) */
     'compileEndedEvent': {uri: vscode.Uri, outcome: CompileOutcome},
 };

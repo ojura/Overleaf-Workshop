@@ -34,7 +34,7 @@ const vscodeStandIn = strict('vscode', {
         executeCommand: async (command: string) => { throw new Error(`the test has no command ${command}`); },
     }),
 });
-const { CompileManager, LocalReplicaSCMProvider, EventBus } = loadWithVscode(vscodeStandIn, () => ({
+const { CompileManager, LocalReplicaSCMProvider, EventBus, isMainDocument } = loadWithVscode(vscodeStandIn, () => ({
     ...require('../compile/compileManager'),
     ...require('../scm/localReplicaSCM'),
     ...require('../utils/eventBus'),
@@ -160,4 +160,24 @@ describe('CompileManager with a local replica', () => {
         await busy.ended;
         assert.strictEqual(manager.inCompiling, false);
     });
+});
+
+describe('which documents a compile from their editor typesets on their own (isMainDocument)', () => {
+    const cases: Array<[string, string, boolean]> = [
+        ['a \\documentclass line', '\\documentclass{article}\n\\begin{document}\n', true],
+        ['after spaces, with options', '   \\documentclass[a4paper]{book}\n', true],
+        ['with its options on the following lines', '\\documentclass[\n  a4paper,\n  12pt\n]{article}\n', true],
+        ['a line that begins with \\documentclass and names no class, as Overleaf counts it', '\\documentclass\n', true],
+        ['a subfiles chapter', '\\documentclass[../main.tex]{subfiles}\n\\begin{document}\n', false],
+        ['a subfiles chapter, its option and class on the following lines', '\\documentclass\n[../main.tex]\n{ subfiles }\n', false],
+        ['a commented-out \\documentclass', '% \\documentclass{article}\nSome notes.\n', false],
+        ['\\documentclass after other text on its line', 'See \\documentclass{article} there.\n', false],
+        ['a longer command that begins with documentclass', '\\documentclassx{article}\n', false],
+        ['no \\documentclass', '\\section{One}\n', false],
+    ];
+    for (const [what, content, main] of cases) {
+        it(`${main ? 'counts' : 'does not count'} ${what}`, () => {
+            assert.strictEqual(isMainDocument(content), main);
+        });
+    }
 });
