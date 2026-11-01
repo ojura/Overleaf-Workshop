@@ -3,7 +3,6 @@ import * as assert from 'assert';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { POINTER_FILE } from '../scm/replicaControl';
 import { Cleanup, Uri, load, until, world } from './replicaTestWorld';
 
 // While the IDE's window does not run (its page frozen in the background), every call of
@@ -27,7 +26,7 @@ describe('a local replica while the IDE\'s window does not answer', function () 
         const scm = new LocalReplicaSCMProvider(t.vfs, Uri.file(folder));
         await cleanup.start(scm);
         await scm.syncNow(); // the first sync downloads both files, and its state is recorded
-        await cleanup.fileAppears(path.join(folder, POINTER_FILE)); // the control socket listens
+        await cleanup.controlListens(folder);
         t.w.remoteWrites.length = 0;
         return { ...t, requestReplica };
     }

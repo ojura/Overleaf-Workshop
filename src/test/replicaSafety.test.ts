@@ -3,7 +3,6 @@ import * as assert from 'assert';
 import { execFileSync, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { POINTER_FILE } from '../scm/replicaControl';
 import { OVERLEAF_REF } from '../scm/replicaGit';
 import { Cleanup, Uri, load, world } from './replicaTestWorld';
 
@@ -117,7 +116,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
                 const t = host();
                 project(t, { '/main.tex': 'v1\n', '/other.tex': 'other\n' });
                 const { scm, requestReplica } = await start(t);
-                await cleanup.fileAppears(path.join(t.folder, POINTER_FILE));
+                await cleanup.controlListens(t.folder);
                 const vfs = t.vfs as any;
                 const writeDoc = vfs.writeDoc;
                 const error = rejection('/main.tex');
@@ -225,7 +224,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             fs.symlinkSync(outside, path.join(t.folder, 'figs'));
             const { requestReplica } = await start(t);
             assert.strictEqual(fs.readdirSync(outside).length, 6, 'the first sync writes the figures through the link');
-            await cleanup.fileAppears(path.join(t.folder, POINTER_FILE));
+            await cleanup.controlListens(t.folder);
             fs.rmSync(path.join(t.folder, 'extra.tex'));
             const answer: any = await requestReplica(t.folder, { op: 'sync' }, 10000);
             assert.strictEqual(answer.ok, true, JSON.stringify(answer));
@@ -236,7 +235,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             const t = host();
             project(t, eight);
             const { requestReplica } = await start(t);
-            await cleanup.fileAppears(path.join(t.folder, POINTER_FILE));
+            await cleanup.controlListens(t.folder);
             // as git checkout, git stash -u or git clean leave the folder
             for (let i = 0; i < 6; i++) { fs.rmSync(path.join(t.folder, `chapter${i}.tex`)); }
             const answer: any = await requestReplica(t.folder, { op: 'sync' }, 10000);
@@ -291,7 +290,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
                 return Promise.resolve(undefined);
             };
             const started = await start(t);
-            await cleanup.fileAppears(path.join(t.folder, POINTER_FILE));
+            await cleanup.controlListens(t.folder);
             const deleted = chapters.slice(0, 6);
             deleted.forEach(p => t.remoteDelete(p));
             await questionShown;
@@ -339,7 +338,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             const scm = new modules.LocalReplicaSCMProvider(t.vfs, Uri.file(t.folder));
             await cleanup.start(scm);
             await questionShown;
-            await cleanup.fileAppears(path.join(t.folder, POINTER_FILE));
+            await cleanup.controlListens(t.folder);
             const reply: any = await modules.requestReplica(t.folder, { op: 'sync' }, 10000);
             assert.strictEqual(reply.ok, false, JSON.stringify(reply));
             assert.deepStrictEqual([...(reply.summary.question?.paths ?? [])].sort(), deleted);
@@ -483,7 +482,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             assert.strictEqual(git(t.folder, 'rev-parse', 'HEAD'), older, 'the checked-out commit stays checked out');
             assert.match(String(summary.waitingFor), /does not contain Overleaf's recorded state/);
             // a tool learns why
-            await cleanup.fileAppears(path.join(t.folder, POINTER_FILE));
+            await cleanup.controlListens(t.folder);
             const answer: any = await requestReplica(t.folder, { op: 'sync' }, 10000);
             assert.strictEqual(answer.ok, false, JSON.stringify(answer));
             assert.match(answer.error, /does not contain Overleaf's recorded state/);
