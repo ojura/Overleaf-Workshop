@@ -12,7 +12,7 @@
 // folder next to the output folder, which then replaces it, so that the output folder holds only
 // what this build wrote. Exit status 1 when a viewer does not build.
 import * as esbuild from 'esbuild';
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 
@@ -96,11 +96,39 @@ export const bundleOptions = {
 export const engines = ['pdfjs', 'overleaf'];
 const enginePlugins = { pdfjs: [noViewerComponents], overleaf: [] };
 
+/** Whether the process `pid` runs: a process of another user counts as running. */
+function isRunning(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        return error.code === 'EPERM';
+    }
+}
+
+/**
+ * Remove the folders that builds which ended before they finished left next to `outdir`, its
+ * .new-<pid> and .old-<pid> folders (buildViewers), when their process no longer runs; the folder of
+ * a process that runs belongs to a build in progress, and stays. git ignores these folders in the
+ * checkout (.gitignore: views/pdf-viewer/dist.*).
+ */
+function removeLeftovers(outdir) {
+    const parent = path.dirname(outdir);
+    if (!existsSync(parent)) { return; }
+    const base = path.basename(outdir).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`^${base}\\.(?:new|old)-(\\d+)$`);
+    for (const name of readdirSync(parent)) {
+        const pid = pattern.exec(name)?.[1];
+        if (pid && !isRunning(Number(pid))) { rmSync(path.join(parent, name), { recursive: true, force: true }); }
+    }
+}
+
 /**
  * Build the page script and page of each viewer into `outdir`: into a new folder next to it,
  * which then replaces it. Fails when a viewer does not build.
  */
 export async function buildViewers(outdir = path.join(viewerRoot, 'dist')) {
+    removeLeftovers(outdir);
     const fresh = `${outdir}.new-${process.pid}`;
     rmSync(fresh, { recursive: true, force: true });
     mkdirSync(fresh, { recursive: true });
