@@ -341,7 +341,7 @@ A program that writes files into the folder can wait until they are on Overleaf.
 node out/sandbox/cli.js replica-sync --replica <folder>
 node out/sandbox/cli.js replica-status --replica <folder>
 ```
-The window answers on a local socket that only your account on the computer can reach, and names it in `.overleaf/control.json`. When the socket's path is longer than the operating system allows (107 bytes on Linux, 103 on macOS), the window does not listen, says why in its log and in that file, and the tools report it; a shorter `XDG_RUNTIME_DIR` fixes it.
+The window answers on a local socket that only your account on the computer can reach, and names it in `.overleaf/control.json`. When the socket's path is longer than the operating system allows (107 bytes on Linux, 103 on macOS, FreeBSD and OpenBSD), the window does not listen, says why in its log and in that file, and the tools report it; a shorter `XDG_RUNTIME_DIR` fixes it.
 
 #### The replica's git repository
 

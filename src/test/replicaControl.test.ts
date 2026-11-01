@@ -5,7 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import {
     ControlRequest, NoReplicaWindowError, POINTER_FILE, ReplicaControlServer, replicaSocketPath, ReplicaTimeoutError,
-    ReplicaUnreachableError, requestReplica,
+    ReplicaUnreachableError, requestReplica, SUN_PATH_BYTES,
 } from '../scm/replicaControl';
 import { Cleanup, SHORT_TEMP } from './replicaTestWorld';
 
@@ -65,9 +65,15 @@ describe('the control socket of a local replica', () => {
         return long;
     };
 
+    it('knows the size of sun_path on Linux, macOS, FreeBSD and OpenBSD', () => {
+        // unix(7) for Linux, and sys/un.h of xnu, FreeBSD and OpenBSD
+        assert.deepStrictEqual({ ...SUN_PATH_BYTES }, { linux: 108, darwin: 104, freebsd: 104, openbsd: 104 });
+        assert.strictEqual(ReplicaControlServer.sunPathBytes, SUN_PATH_BYTES[process.platform], 'the size on this system');
+    });
+
     it('does not listen on a socket path that is too long for the system, so that Node does not make a socket at a shortened path', async function () {
-        // the bytes of sun_path, with the path's NUL; other systems have the check after listen
-        const sunPath = ({ linux: 108, darwin: 104 } as Partial<Record<NodeJS.Platform, number>>)[process.platform];
+        // other systems have the check after listen
+        const sunPath = SUN_PATH_BYTES[process.platform];
         if (sunPath === undefined) { this.skip(); }
         const long = longRuntime();
         const socket = replicaSocketPath(folder);
@@ -85,7 +91,7 @@ describe('the control socket of a local replica', () => {
     });
 
     it('does not connect a tool to a socket path that is too long for the system, where another program can listen at the shortened path', async function () {
-        const sunPath = ({ linux: 108, darwin: 104 } as Partial<Record<NodeJS.Platform, number>>)[process.platform];
+        const sunPath = SUN_PATH_BYTES[process.platform];
         if (sunPath === undefined) { this.skip(); }
         longRuntime();
         const socket = replicaSocketPath(folder);
@@ -114,7 +120,7 @@ describe('the control socket of a local replica', () => {
     });
 
     it('listens on a socket path as long as the system allows, and not on one a byte longer', async function () {
-        const sunPath = ({ linux: 108, darwin: 104 } as Partial<Record<NodeJS.Platform, number>>)[process.platform];
+        const sunPath = SUN_PATH_BYTES[process.platform];
         if (sunPath === undefined) { this.skip(); }
         const added = Buffer.byteLength(replicaSocketPath(folder)) - Buffer.byteLength(runtime);
         /** a runtime folder that makes the socket's path `bytes` long */

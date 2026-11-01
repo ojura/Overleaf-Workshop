@@ -58,12 +58,14 @@ function prepareSocketFolder(socket: string): string | undefined {
 
 /**
  * The bytes of sun_path, the field of a Unix socket's address that holds the socket's path and its
- * terminating NUL: 108 on Linux (unix(7): "On Linux, sun_path is 108 bytes in size"), 104 on
- * macOS (xnu's bsd/sys/un.h: `char sun_path[104]`). unix(7) asks, for portability, that the path
- * and its NUL fit: Linux also binds a path of 108 bytes without the NUL, which Node's clients
- * reach but Python's refuse. On other systems, socketIsThere finds a path that Node shortened.
+ * terminating NUL: 108 on Linux (unix(7): "On Linux, sun_path is 108 bytes in size"), and 104 on
+ * macOS (xnu's bsd/sys/un.h: `char sun_path[104]`), FreeBSD (sys/sys/un.h: `#define SUNPATHLEN
+ * 104`, `char sun_path[SUNPATHLEN]`) and OpenBSD (sys/sys/un.h: `char sun_path[104]`). unix(7)
+ * asks, for portability, that the path and its NUL fit: Linux also binds a path of 108 bytes
+ * without the NUL, which Node's clients reach but Python's refuse. On other systems, socketIsThere
+ * finds a path that Node shortened.
  */
-const SUN_PATH_BYTES: Partial<Record<NodeJS.Platform, number>> = { linux: 108, darwin: 104 };
+export const SUN_PATH_BYTES: Readonly<Partial<Record<NodeJS.Platform, number>>> = { linux: 108, darwin: 104, freebsd: 104, openbsd: 104 };
 
 /**
  * Why `socket` cannot be a socket's path on this system, or undefined when it fits or when
