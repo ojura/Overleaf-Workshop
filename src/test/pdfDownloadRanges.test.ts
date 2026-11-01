@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
-import { DownloadError, downloadInRanges, retryAfterMs } from '../core/pdfFetchBridge';
+import { DownloadError, downloadInRanges, PdfFetchBridge, retryAfterMs } from '../core/pdfFetchBridge';
 
 describe('downloadInRanges', () => {
     const body = Buffer.from(Array.from({ length: 1000 }, (_, i) => i % 251));
@@ -97,6 +97,19 @@ describe('downloadInRanges', () => {
         assert.deepStrictEqual(fs.readFileSync(file), body);
         assert.strictEqual(requests.filter(r => r === '128-255').length, 2);
         assert.deepStrictEqual(waits, [2000]);
+    });
+
+    it('fails with the server\'s time when it asks to wait longer than the window waits for a server', async () => {
+        const seconds = PdfFetchBridge.idleTimeoutMs / 1000 + 1;
+        limited.set(128, { times: 1, retryAfter: String(seconds) });
+        const waits: number[] = [];
+        const file = path.join(folder, 'build.pdf');
+        await assert.rejects(downloadInRanges(url, file, body.byteLength, undefined, { chunk: 128, parallel: 1, attempts: 3, wait: async (ms) => { waits.push(ms); } }),
+            (error: unknown) => error instanceof DownloadError && error.status === 429
+                && error.message.includes(`asks to wait ${seconds} s before it is asked again, longer than the ${PdfFetchBridge.idleTimeoutMs / 1000} s`));
+        assert.deepStrictEqual(waits, []);
+        assert.strictEqual(requests.filter(r => r === '128-255').length, 1);
+        assert.deepStrictEqual(fs.readdirSync(folder), []);
     });
 
     it('does not ask again for a range answered 429 without a time to ask again, and says so with the status', async () => {
