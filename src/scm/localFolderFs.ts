@@ -114,7 +114,7 @@ export async function writeFile(p: PathLike, content: Uint8Array, temporaryFolde
         return;
     }
     await fsp.mkdir(temporaryFolder!, { recursive: true });
-    const temporary = path.join(temporaryFolder!, `${process.pid}-${randomBytes(8).toString('hex')}.tmp`);
+    const temporary = path.join(temporaryFolder!, temporaryName());
     try {
         const handle = await fsp.open(temporary, 'wx');
         try {
@@ -131,6 +131,54 @@ export async function writeFile(p: PathLike, content: Uint8Array, temporaryFolde
         if ((error as NodeJS.ErrnoException)?.code !== 'EXDEV') { throw error; }
         await fsp.writeFile(file, content);
     }
+}
+
+/** The name of a write's temporary file (writeFile): the writing process, then random hex. */
+function temporaryName(): string {
+    return `${process.pid}-${randomBytes(8).toString('hex')}.tmp`;
+}
+
+/** The process that wrote a temporary file, from its name (temporaryName); undefined for another name. */
+function writerOf(name: string): number | undefined {
+    const dash = name.indexOf('-');
+    const pid = Number(name.slice(0, dash));
+    return dash > 0 && name.endsWith('.tmp') && Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+/** Whether the process `pid` runs: signal 0 only checks, and EPERM answers that it runs as another user. */
+function processRuns(pid: number): boolean {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'EPERM';
+    }
+}
+
+/**
+ * Remove what writes of processes that no longer run left in `temporaryFolder`, e.g. at a crash,
+ * and anything else in it that writeFile did not name. The temporary files of a running process
+ * stay: it may be writing them, as another replica of the same folder does, in this process
+ * when two providers start at once, or in another window. A link or a file at the folder's path
+ * is removed itself, not what a link points to.
+ */
+export async function removeLeftoverWrites(temporaryFolder: string): Promise<void> {
+    let names: string[];
+    try {
+        if (!(await fsp.lstat(temporaryFolder)).isDirectory()) {
+            await fsp.rm(temporaryFolder, { force: true });
+            return;
+        }
+        names = await fsp.readdir(temporaryFolder);
+    } catch (error) {
+        if (isMissing(error)) { return; }
+        throw error;
+    }
+    const left = names.filter(name => {
+        const writer = writerOf(name);
+        return writer === undefined || !processRuns(writer);
+    });
+    await Promise.all(left.map(name => fsp.rm(path.join(temporaryFolder, name), { recursive: true, force: true })));
 }
 
 export async function createDirectory(p: PathLike): Promise<void> {
@@ -157,7 +205,8 @@ export async function rename(from: PathLike, to: PathLike): Promise<void> {
  * Move a file to a path where nothing is, creating its parent folders; fails with EEXIST when
  * something is there. A hard link to the new path, then the removal of the old one, keeps the
  * file itself, with its size and modification time; a rename would replace what is at the new
- * path. Where the file system has no hard links, a copy that refuses an existing target does it.
+ * path. Where the file system has no hard links, a copy that refuses an existing target does it,
+ * and the copy has a new modification time.
  */
 export async function moveFile(from: PathLike, to: PathLike): Promise<void> {
     const source = fsPath(from), target = fsPath(to);

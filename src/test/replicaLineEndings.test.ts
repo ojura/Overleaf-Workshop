@@ -7,7 +7,7 @@ const dec = (b: Uint8Array) => new TextDecoder().decode(b);
 
 /** Overleaf's side for one document: it stores the text with "\n", as the extension now sends it. */
 class Overleaf implements ReplicaRemote {
-    connected() { return true; }
+    disconnected() { return undefined; }
     docs = new Map<string, string>();
     writes: string[] = [];
     async list() { return new Map<string, RemoteEntry>([...this.docs.keys()].map(path => [path, { kind: 'doc' }])); }

@@ -19,6 +19,39 @@ function stringifyError(err: any): string {
     }
 }
 
+/**
+ * The server answered an emit with an error: it refused the request. Real-time refuses an
+ * update this way before it queues it (WebsocketController.applyOtUpdate); `answer` is what it
+ * sent, which for most refusals carries only a message (Router._handleError).
+ */
+export class EmitRefusedError extends Error {
+    constructor(readonly event: string, readonly answer: unknown) {
+        super(`'${event}' rejected: ${stringifyError(answer)}`);
+        this.name = 'EmitRefusedError';
+    }
+}
+
+/** An emit was not answered within SocketIOAPI.emitTimeoutMs; the request may or may not have arrived. */
+export class EmitTimeoutError extends Error {
+    constructor(readonly event: string, ms: number) {
+        super(`'${event}' timed out after ${ms}ms`);
+        this.name = 'EmitTimeoutError';
+    }
+}
+
+/**
+ * Whether `error` is real-time's refusal 'doc updater could not load requested ops'
+ * (ClientRequestedMissingOpsError, services/real-time/app/js/Errors.js). Real-time sends it when
+ * document-updater could not load the doc (404), or the ops since the version asked for (422)
+ * (DocumentUpdaterManager.getDocument), and Router._handleError forwards only that message, so
+ * the message is the one value that tells this refusal from the others. It chooses only the
+ * wording of what the user is told: VirtualFileSystem.settleUnconfirmed takes any refusal of the
+ * read as an outcome that cannot be determined, so a change of the text changes that wording.
+ */
+export function isMissingOpsRefusal(error: unknown): boolean {
+    return error instanceof EmitRefusedError && (error.answer as {message?: unknown} | undefined)?.message === 'doc updater could not load requested ops';
+}
+
 export interface UpdateUserSchema {
     id: string,
     user_id: string,
@@ -72,6 +105,8 @@ export interface EventsHandler {
     onFileRemoved?: (entityId:string) => void,
     onFileMoved?: (entityId:string, newParentFolderId:string) => void,
     onFileChanged?: (update:UpdateSchema) => void,
+    /** otUpdateError: Overleaf could not apply an update of the doc `docId` */
+    onUpdateError?: (docId:string|undefined, error:string) => void,
     //
     onDisconnected?: () => void,
     onConnectionAccepted?: (publicId:string) => void,
@@ -166,7 +201,7 @@ export class SocketIOAPI {
             let timer: NodeJS.Timeout;
             const timeoutPromise = new Promise((_, reject) => {
                 timer = setTimeout(() => {
-                    reject(new Error(`'${event}' timed out after ${SocketIOAPI.emitTimeoutMs}ms`));
+                    reject(new EmitTimeoutError(event, SocketIOAPI.emitTimeoutMs));
                     // No answer means the connection is gone, even when socket.io still takes it
                     // for open; unless this socket has been replaced meanwhile.
                     if (socket===this.socket) {
@@ -180,7 +215,7 @@ export class SocketIOAPI {
                     // emit leaks a live timer for the whole timeout window.
                     clearTimeout(timer);
                     if (err) {
-                        reject(err instanceof Error ? err : new Error(`'${event}' rejected: ${stringifyError(err)}`));
+                        reject(new EmitRefusedError(event, err));
                     } else {
                         resolve(data);
                     }
@@ -244,13 +279,6 @@ export class SocketIOAPI {
             // Log error instead of throwing to avoid crashing the extension
             console.error('SocketIOAPI: socket error', err?.message || err);
             this.onConnectionProblem?.(`socket error: ${stringifyError(err)}`);
-        });
-        // The server reports a rejected document update on its own channel and sends no
-        // ack for the emit, so without this the real reason (stale version, hash
-        // mismatch, lost session) is invisible and surfaces only as a generic timeout.
-        this.socket.on('otUpdateError', (err:any, update?:any) => {
-            console.error('SocketIOAPI: otUpdateError', stringifyError(err),
-                          update!==undefined ? stringifyError(update) : '');
         });
 
         if (this.scheme==='v2') {
@@ -340,6 +368,14 @@ export class SocketIOAPI {
                 case handlers.onFileChanged:
                     this.socket.on('otUpdateApplied', (update: UpdateSchema) => {
                         handler(update);
+                    });
+                    break;
+                case handlers.onUpdateError:
+                    // Sent to the connections that joined the doc, or for an update too large
+                    // to queue to its sender, which real-time then disconnects; `message` names
+                    // the doc (DocumentUpdaterController, WebsocketController.applyOtUpdate).
+                    this.socket.on('otUpdateError', (error:any, message?:{doc_id?: string}) => {
+                        handler(message?.doc_id, stringifyError(error));
                     });
                     break;
                 case handlers.onDisconnected:
@@ -467,8 +503,12 @@ export class SocketIOAPI {
      * @param {string} docId - The document id.
      * @returns {Promise}
      */
-    async joinDoc(docId:string) {
-        return this.emit('joinDoc', docId, { encodeRanges: true })
+    async joinDoc(docId:string, fromVersion?:number) {
+        // With `fromVersion`, Overleaf also returns the ops applied since that version, each
+        // with `meta.source`, the publicId of the connection that sent it (unpacked, unlike
+        // the lines); it refuses when it no longer keeps them (see isMissingOpsRefusal).
+        const args = fromVersion===undefined ? [docId, { encodeRanges: true }] : [docId, fromVersion, { encodeRanges: true }];
+        return this.emit('joinDoc', ...args)
             .then((returns: [Array<string>, number, Array<any>, any]) => {
                 const [docLinesAscii, version, updates, ranges] = returns;
                 const docLines = docLinesAscii.map((line) => decodePackedUtf8(line));
@@ -508,7 +548,7 @@ export class SocketIOAPI {
         // overleaf.com acknowledges an update that inserts "\r", does not apply it, and drops
         // the connection; the document writes send the text with "\n" (overleafLineEndings)
         if (update.op.some(op => op.i?.includes('\r') || op.d?.includes('\r'))) {
-            throw new Error('refused to send an update with a "\\r" character: Overleaf stores "\\n" line endings and drops the connection after such an update');
+            throw new EmitRefusedError('applyOtUpdate', 'refused to send an update with a "\\r" character: Overleaf stores "\\n" line endings and drops the connection after such an update');
         }
         return this.emit('applyOtUpdate', docId, update)
             .then(() => {

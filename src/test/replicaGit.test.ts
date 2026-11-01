@@ -49,7 +49,7 @@ function moveComments(comments: Comment[], ops: TextOp[]) {
  * for it (opsFor); a removal drops them.
  */
 class Remote implements ReplicaRemote {
-    connected() { return true; }
+    disconnected() { return undefined; }
     docs = new Map<string, string>();
     files = new Map<string, Uint8Array>();
     calls: string[] = [];
@@ -122,8 +122,11 @@ class Remote implements ReplicaRemote {
         this.files.set(p, content);
         return { kind: 'file', hash: gitBlobHash(content) };
     }
+    /** while set, Overleaf refuses every rename */
+    refuseRenames = false;
     async rename(from: string, to: string) {
         this.calls.push(`rename ${from} ${to}`);
+        if (this.refuseRenames) { throw new Error(`Overleaf refused to rename ${from}`); }
         const id = this.idOf(from);
         if (this.docs.has(from)) { this.docs.set(to, this.docs.get(from)!); this.docs.delete(from); }
         else if (this.files.has(from)) { this.files.set(to, this.files.get(from)!); this.files.delete(from); }
@@ -297,6 +300,34 @@ describe('local replica: git as the merge backend', function () {
                 if (saved === undefined) { delete process.env.GIT_CONFIG_GLOBAL; } else { process.env.GIT_CONFIG_GLOBAL = saved; }
             }
         });
+    });
+
+    it('saves the states of two stores of one folder at the same time, as when two replicas of the folder start together', async () => {
+        const t = await world();
+        const second = new GitReplicaStore({
+            folder: t.folder, projectId: 'p'.repeat(24), serverName: 'www.overleaf.com', ignorePatterns: DEFAULT_IGNORE_PATTERNS,
+            isIgnored: () => false, log: () => {},
+        });
+        await second.open();
+        const state = (path: string) => ({ version: 1 as const, entries: {}, untracked: [path] });
+        // the first save renames its file over the state file only once the second has written its own
+        const promises = require('fs/promises');
+        const rename = promises.rename;
+        let secondRenames!: () => void;
+        const secondRenaming = new Promise<void>(resolve => { secondRenames = resolve; });
+        let calls = 0;
+        promises.rename = async (from: string, to: string) => {
+            calls += 1;
+            if (calls === 1) { await secondRenaming; } else { secondRenames(); }
+            return rename(from, to);
+        };
+        try {
+            const saves = await Promise.allSettled([t.store.save(state('/first.tex')), second.save(state('/second.tex'))]);
+            assert.deepStrictEqual(saves.map(save => save.status === 'rejected' ? String(save.reason) : 'saved'), ['saved', 'saved']);
+        } finally {
+            promises.rename = rename;
+        }
+        assert.deepStrictEqual(fs.readdirSync(path.join(t.folder, '.git', 'overleaf', 'tmp')), [], 'the temporary files are gone');
     });
 
     it('turns the replica\'s ignore patterns into gitignore lines', () => {
@@ -520,7 +551,7 @@ describe('local replica: git as the merge backend', function () {
         assert.deepStrictEqual(t.ui.blocked, ['/main.tex']);
 
         t.g('add', 'main.tex');
-        await sync.indexChanged();
+        await sync.gitChanged();
         assert.strictEqual(t.remote.docs.get('/main.tex'), resolved);
         await sync.recordNow();
         assert.strictEqual(t.g('show', `${OVERLEAF_REF}:main.tex`), resolved.trimEnd());
@@ -544,9 +575,10 @@ describe('local replica: git as the merge backend', function () {
         spawnSync('git', ['-C', t.folder, 'merge', '--no-edit', theirs]);
         assert.match(t.read('/main.tex'), /<<<<<<< HEAD/);
 
-        await sync.flush(true);
+        // the sync waits while the merge is under way
+        const during = await sync.flush(true);
         assert.strictEqual(t.remote.docs.get('/main.tex'), text.replace('line 2', 'ours'));
-        assert.deepStrictEqual(t.ui.blocked, ['/main.tex']);
+        assert.match(String(during.waitingFor), /in the middle of a merge/);
 
         // nor does a change on Overleaf go into it meanwhile: the merge's stages stay the user's
         const conflicted = t.read('/main.tex');
@@ -820,6 +852,17 @@ describe('local replica: git as the merge backend', function () {
             await sync.stop();
         });
 
+        it('deletes the old path of a rename that Overleaf refuses in the same step, once the new file is uploaded', async () => {
+            const t = await synced({ '/a.tex': chapter });
+            move(t, 'a.tex', 'b.tex');
+            fs.writeFileSync(path.join(t.folder, 'b.tex'), edited);
+            t.remote.refuseRenames = true;
+            const summary = await t.sync.flush(true);
+            assert.deepStrictEqual([...t.remote.calls].sort(), ['remove /a.tex', 'rename /a.tex /b.tex', 'upload /b.tex'], 'what the sync asked of Overleaf: the refused rename, a new document and the deletion');
+            assert.deepStrictEqual([summary.renamed, summary.uploaded, summary.deletedRemote], [[], ['/b.tex'], ['/a.tex']], 'the summary of the step');
+            await t.sync.stop();
+        });
+
         it('renames the six files that one checkout renames, beside a deletion, without a question about deletions', async () => {
             const chapters = Array.from({ length: 7 }, (_, k) => lines(i => `Chapter ${k}, line ${i}, with a few words in it.`));
             const t = await synced(Object.fromEntries(chapters.map((text, k) => [`/chapter${k}.tex`, text])));
@@ -885,13 +928,23 @@ describe('local replica: git as the merge backend', function () {
             };
             const folder = t.sync.localChanged('/x.tex');
             await pairing;
-            // Overleaf reports the same rename: its move needs the queues of both paths
+            // Overleaf reports the same rename. Its move needs the queues of both paths, and
+            // remoteRenamed queues it before it first waits, the saved state being loaded.
             await t.remote.rename('/y.tex', '/x.tex');
             const overleaf = t.sync.remoteRenamed('/y.tex', '/x.tex');
-            // remoteRenamed queues its move after promise steps only, without I/O: one turn of the event loop has it queued
-            await new Promise(resolve => setImmediate(resolve));
             open();
-            await Promise.all([folder, overleaf]);
+            // Work that waits for itself in a circle never finishes, and only a limit tells "never"
+            // from "not yet": the test's last resort, far above the few hundred milliseconds the work takes.
+            const limitMs = 10_000;
+            let timer: NodeJS.Timeout | undefined;
+            const circle = new Promise<never>((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`the folder's rename and Overleaf's move did not finish within ${limitMs} ms: they wait for each other`)), limitMs);
+            });
+            try {
+                await Promise.race([Promise.all([folder, overleaf]), circle]);
+            } finally {
+                clearTimeout(timer);
+            }
             assert.deepStrictEqual([fs.existsSync(path.join(t.folder, 'y.tex')), t.read('/x.tex')], [false, chapter], 'the local files');
             assert.deepStrictEqual(t.remote.calls, ['rename /y.tex /x.tex'], 'what was asked of Overleaf: its own rename only');
             assert.strictEqual(t.remote.ids.get('/x.tex'), id, 'the document keeps its id');
@@ -941,6 +994,28 @@ describe('local replica: git as the merge backend', function () {
             assert.deepStrictEqual(t.remote.calls, ['writeDoc /intro.tex'], 'what the sync asked of Overleaf: the local change, as an edit of the renamed document');
             assert.deepStrictEqual([t.remote.ids.get('/intro.tex'), t.remote.docs.get('/intro.tex')], [id, edited], 'the document on Overleaf');
             assert.deepStrictEqual(t.remote.commentedText('/intro.tex'), [commented], 'the comment on the text that the change left alone');
+            await t.sync.stop();
+        });
+
+        it('moves the local file when Overleaf renames it while git is in the middle of an operation, once the operation ends', async () => {
+            const t = await synced({ '/chapter.tex': chapter });
+            const id = t.remote.idOf('/chapter.tex');
+            // a change saved, which no event has reported yet
+            t.write('/chapter.tex', edited);
+            // a merge is under way in the folder: the sync waits
+            const mergeHead = path.join(t.folder, '.git', 'MERGE_HEAD');
+            fs.writeFileSync(mergeHead, `${t.g('rev-parse', 'HEAD')}\n`);
+            await t.remote.rename('/chapter.tex', '/intro.tex');
+            t.remote.calls.length = 0;
+            t.update(ALICE);
+            await t.sync.remoteRenamed('/chapter.tex', '/intro.tex');
+            assert.deepStrictEqual([t.read('/chapter.tex'), fs.existsSync(path.join(t.folder, 'intro.tex'))], [edited, false], 'the local files while the sync waits');
+            // the merge ends; the full sync after the wait catches up
+            fs.rmSync(mergeHead);
+            await t.sync.syncAll();
+            assert.deepStrictEqual([fs.existsSync(path.join(t.folder, 'chapter.tex')), t.read('/intro.tex')], [false, edited], 'the local files: the moved file keeps the local change');
+            assert.ok(!fs.existsSync(path.join(t.folder, '.overleaf/conflicts')), 'nothing is kept aside');
+            assert.deepStrictEqual([t.remote.ids.get('/intro.tex'), t.remote.docs.get('/intro.tex')], [id, edited], 'the document on Overleaf: the renamed one, with the local change');
             await t.sync.stop();
         });
 

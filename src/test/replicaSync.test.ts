@@ -9,7 +9,9 @@ const dec = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 
 /** Overleaf, in memory: docs hold text, files hold bytes and report their hash. */
 class FakeRemote implements ReplicaRemote {
-    connected() { return true; }
+    /** the error that Overleaf's requests get while it does not answer; undefined while it answers */
+    lost?: Error;
+    disconnected() { return this.lost; }
     docs = new Map<string, string>();
     files = new Map<string, Uint8Array>();
     folders = new Set<string>();
@@ -74,7 +76,9 @@ class FakeRemote implements ReplicaRemote {
         this.files.delete(path);
     }
     async removeFolderIfEmpty() {}
-    async settled() {}
+    /** settled() rejects with this while set, as the VFS does with documents that Overleaf has not confirmed */
+    settleFailure?: Error;
+    async settled() { if (this.settleFailure) { throw this.settleFailure; } }
     count(prefix: string) { return this.calls.filter(call => call.startsWith(prefix)).length; }
 }
 
@@ -90,7 +94,10 @@ class FakeLocal implements ReplicaLocal {
         this.files.set(path, {content: typeof content==='string' ? enc(content) : content, mtime: this.clock});
     }
     text(path: string) { const f = this.files.get(path); return f && dec(f.content); }
+    /** while set, every listing waits for it, e.g. so that two scans list the folder at the same moment */
+    listGate?: Promise<void>;
     async list() {
+        if (this.listGate) { await this.listGate; }
         const all = new Map<string, LocalStat>();
         for (const [path, f] of this.files) { all.set(path, {size: f.content.byteLength, mtime: f.mtime}); }
         return all;
@@ -113,6 +120,8 @@ class FakeLocal implements ReplicaLocal {
 
 class FakeStore implements ReplicaStore {
     state?: SavedState;
+    /** set by a test that watches what the sync records */
+    record?: (state: SavedState) => Promise<{waiting?: boolean}>;
     bases = new Map<string, string>();
     copies = new Map<string, Uint8Array>();
     async load() { return this.state && JSON.parse(JSON.stringify(this.state)); }
@@ -337,6 +346,19 @@ describe('ReplicaSync', () => {
         assert.strictEqual(t.remote.files.size, 7);
     });
 
+    it('does not take a file missing on Overleaf for deleted while Overleaf does not answer, and fails with Overleaf\'s reason', async () => {
+        const t = setup();
+        t.remote.docs.set('/a.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        // the project tree lacks the file, but Overleaf does not answer: the tree may be old
+        t.remote.docs.delete('/a.tex');
+        t.remote.lost = new Error('Not connected to Overleaf, as the test has it');
+        const summary = await sync.syncAll();
+        assert.deepStrictEqual(summary.failed, [{ path: '/a.tex', error: t.remote.lost.message }]);
+        assert.strictEqual(t.local.text('/a.tex'), text, 'the local file stays');
+    });
+
     it('counts deletions that events report one at a time together, and asks once before making many', async () => {
         const saved = ReplicaSync.localDeleteDelayMs;
         ReplicaSync.localDeleteDelayMs = 0;
@@ -358,6 +380,50 @@ describe('ReplicaSync', () => {
         } finally {
             ReplicaSync.localDeleteDelayMs = saved;
         }
+    });
+
+    it('without uploads, holds local deletions for a push without asking, also when a tool asks', async () => {
+        const saved = ReplicaSync.localDeleteDelayMs;
+        ReplicaSync.localDeleteDelayMs = 0;
+        try {
+            const t = setup();
+            for (let i = 0; i < 8; i++) { t.remote.files.set(`/f${i}.png`, new Uint8Array([i])); }
+            const sync = new ReplicaSync(t.remote, t.local, t.store, t.ui, (p: string) => p.endsWith('.aux'), { uploads: false });
+            await sync.syncAll();
+            // six files deleted at once, as by a git checkout, and reported one by one
+            for (let i = 0; i < 6; i++) { t.local.files.delete(`/f${i}.png`); }
+            await sync.localChanged('/f0.png');
+            const summary = await sync.flush(true, { by: 'tool' });
+            assert.deepStrictEqual(t.ui.asked, [], 'the user is not asked');
+            assert.deepStrictEqual(summary.deletionsToConfirm, [], 'the tool is not refused');
+            assert.deepStrictEqual([...summary.held].sort(), ['/f0.png', '/f1.png', '/f2.png', '/f3.png', '/f4.png', '/f5.png']);
+            assert.strictEqual(t.remote.files.size, 8, 'every file stays on Overleaf until a push');
+        } finally {
+            ReplicaSync.localDeleteDelayMs = saved;
+        }
+    });
+
+    it('decides the deletions that a tool\'s request finds in the request\'s own step, also when another step has a reconcile of the same files waiting', async () => {
+        const t = setup();
+        const paths = Array.from({ length: 6 }, (_, i) => `/f${i}.png`);
+        paths.forEach((p, i) => t.remote.files.set(p, new Uint8Array([i])));
+        const sync = t.start();
+        await sync.syncAll();
+        // the files are deleted locally, as a landing's checkout deletes the files of its commit
+        for (const p of paths) { t.local.files.delete(p); }
+        // the window's question about them is never answered
+        t.ui.answer = new Promise(() => { /* the user is away */ });
+        // A periodic scan and a landing's request list the folder at the same moment. The scan
+        // schedules its reconciles first, and the request schedules its own before they start.
+        let release!: () => void;
+        t.local.listGate = new Promise<void>(resolve => { release = resolve; });
+        void sync.flush(true); // waits for the answer
+        const landing = sync.flush(true, { by: 'tool', approved: new Set(paths) });
+        t.local.listGate = undefined;
+        release();
+        const summary = await landing;
+        assert.deepStrictEqual([...summary.deletedRemote].sort(), paths);
+        assert.deepStrictEqual([...t.remote.files.keys()], [], 'the deletions that the request approves are made');
     });
 
     it('finishes the steps without deletions while a question about others waits for an answer', async () => {
@@ -562,3 +628,23 @@ describe('ReplicaSync', () => {
     });
 });
 
+describe('ReplicaSync and the updates that Overleaf has not confirmed', () => {
+    before(() => { ReplicaSync.remoteDeleteDelayMs = 0; ReplicaSync.saveDelayMs = 0; });
+
+    it('does not record the state while Overleaf has not confirmed the document updates', async () => {
+        const t = setup();
+        t.remote.docs.set('/main.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        const recorded: SavedState[] = [];
+        t.store.record = async (state: SavedState) => { recorded.push(state); return {}; };
+        t.remote.settleFailure = new Error('Overleaf has not confirmed these updates: /main.tex: not confirmed (the connection was lost (disconnected))');
+        t.local.set('/main.tex', text + 'line 6\n');
+        await assert.rejects(sync.flush(true, {record: true}), /has not confirmed these updates: \/main\.tex/);
+        assert.deepStrictEqual(recorded, []);
+        t.remote.settleFailure = undefined;
+        await sync.flush(true, {record: true});
+        assert.strictEqual(recorded.length, 1);
+        assert.strictEqual(t.remote.docs.get('/main.tex'), text + 'line 6\n');
+    });
+});

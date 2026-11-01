@@ -1,16 +1,15 @@
 import * as vscode from 'vscode';
 import { execFile } from 'child_process';
 import * as fs from 'fs';
-import * as fsp from 'fs/promises';
 import * as path from 'path';
 import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { FileRefEntity, FolderEntity, VirtualFileSystem, __OUTPUTS_ID, parseUri } from '../core/remoteFileSystemProvider';
 import {
-    deletionsNeedConfirmation, describe, LocalStat, NotConnectedError, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync,
-    ReplicaUI, SyncSummary, syncProblems,
+    Deletions, describe, FolderChange, FolderChangedError, LocalStat, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync,
+    ReplicaUI, SyncSummary,
 } from './replicaSync';
-import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath, REPLICA_TEMPORARY_FOLDER } from './ignorePatterns';
+import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath, REPLICA_CONFLICTS_FOLDER, REPLICA_SETTINGS_FILE, REPLICA_TEMPORARY_FOLDER } from './ignorePatterns';
 import * as localFs from './localFolderFs';
 import { LocalFolderWatcher } from './localFolderWatcher';
 import { ControlAnswer, ControlRequest, ReplicaControlServer } from './replicaControl';
@@ -19,10 +18,6 @@ import { GitReplicaStore, OVERLEAF_REF, Person } from './replicaGit';
 import type { HistoryUpdate } from '../gitbridge/history';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
-/** The replica's settings in its folder; that it exists also marks the folder as the replica's. */
-const SETTINGS_FILE = '.overleaf/settings.json';
-/** Where the sync keeps the local versions it replaced. Paths in `.overleaf` are never synced. */
-const CONFLICTS_FOLDER = '.overleaf/conflicts';
 
 /**
  * How often a replica that syncs the changes of other programs also scans its folder, in case a
@@ -68,6 +63,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private fullSyncRunning = false;
     /** a notice about files that failed to sync is open */
     private failureNoticeOpen = false;
+    /** the status bar message that says why the sync waits (ReplicaSync.waitingFor) */
+    private waitingMessage?: vscode.Disposable;
     private running = 0;
     /** the IDE's watcher of the local folder, only where Node's watcher cannot watch it */
     private localWatcher?: vscode.FileSystemWatcher;
@@ -137,7 +134,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
         if (workspaceRoot===undefined || workspaceRoot?.scheme!=='file') { return undefined; }
 
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, SETTINGS_FILE);
+        const settingUri = vscode.Uri.joinPath(workspaceRoot, REPLICA_SETTINGS_FILE);
         try {
             await vscode.workspace.fs.stat(settingUri);
             return vscode.Uri.joinPath(workspaceRoot, path);
@@ -150,7 +147,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
         if (workspaceRoot===undefined || workspaceRoot?.scheme!=='file') { return undefined; }
 
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, SETTINGS_FILE);
+        const settingUri = vscode.Uri.joinPath(workspaceRoot, REPLICA_SETTINGS_FILE);
         try {
             await vscode.workspace.fs.stat(settingUri);
             return uri.path.slice(workspaceRoot.path.length);
@@ -163,7 +160,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     public static async writeSettings(settings: any): Promise<void> {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
         if (workspaceRoot===undefined || workspaceRoot.scheme!=='file') { return; }
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, SETTINGS_FILE);
+        const settingUri = vscode.Uri.joinPath(workspaceRoot, REPLICA_SETTINGS_FILE);
         await vscode.workspace.fs.writeFile(settingUri, Buffer.from(JSON.stringify(settings, null, 4)));
     }
 
@@ -171,7 +168,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
         if (vscode.workspace.workspaceFolders?.length!==1 || workspaceRoot?.scheme!=='file') { return undefined; }
 
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, SETTINGS_FILE);
+        const settingUri = vscode.Uri.joinPath(workspaceRoot, REPLICA_SETTINGS_FILE);
         try {
             await vscode.workspace.fs.stat(settingUri);
             const content = await vscode.workspace.fs.readFile(settingUri);
@@ -213,7 +210,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
      * known to be absent on Overleaf.
      */
     private async resolveRemote(path: string) {
-        if (!this.vfs.connected) { throw new NotConnectedError(); }
+        if (!this.vfs.connected) { throw this.vfs.notConnectedError(); }
         try {
             return await this.vfs._resolveUri(this.vfs.pathToUri(path));
         } catch (error) {
@@ -257,9 +254,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const vfs = this.vfs;
         const uri = (path: string) => vfs.pathToUri(path);
         // while the project is not connected, a lookup cannot be answered
-        const online = () => { if (!vfs.connected) { throw new NotConnectedError(); } };
+        const online = () => { if (!vfs.connected) { throw vfs.notConnectedError(); } };
         return {
-            connected: () => vfs.connected,
+            disconnected: () => vfs.connected ? undefined : vfs.notConnectedError(),
             list: async () => {
                 online();
                 const root = await vfs.init();
@@ -286,7 +283,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             isFolder: async (path) => (await this.resolveRemote(path))?.fileType==='folder',
             readDoc: async (path) => { online(); return decoder.decode(await vfs.openFile(uri(path))); },
             readFile: async (path) => { online(); return vfs.openFile(uri(path)); },
-            writeDoc: (path, text) => vfs.writeFile(uri(path), encoder.encode(text), false, true),
+            writeDoc: (path, text) => vfs.writeDoc(uri(path), encoder.encode(text)),
             upload: async (path, content) => {
                 await this.ensureRemoteFolders(path);
                 const entity = await vfs.createFile(uri(path), content, true);
@@ -381,14 +378,23 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 } catch (error) {
                     if (!fs.isMissing(error)) { throw error; }
                 }
-                const problem = now===undefined ? 'it is gone'
-                    : now.dev!==start.identity.dev || now.ino!==start.identity.ino ? 'another folder is at its path'
-                    : !await fs.exists(start.gitDir) ? `its git folder ${start.gitDir} is gone`
-                    : !await fs.exists(uri(SETTINGS_FILE)) ? `its ${SETTINGS_FILE} is gone`
+                const settings = uri(REPLICA_SETTINGS_FILE).fsPath;
+                const reason: FolderChange | undefined = now===undefined ? 'gone'
+                    : now.dev!==start.identity.dev || now.ino!==start.identity.ino ? 'replaced'
+                    : !await fs.exists(start.gitDir) ? 'gitFolderGone'
+                    : !await fs.exists(settings) ? 'settingsGone'
                     : undefined;
-                if (problem!==undefined) {
-                    throw new Error(`"${folder}" is not the folder this replica started with: ${problem}. The replica does not sync until the window is reloaded`);
-                }
+                if (reason===undefined) { return; }
+                const problem = {
+                    gone: vscode.l10n.t('it is gone'),
+                    replaced: vscode.l10n.t('another folder is at its path'),
+                    gitFolderGone: vscode.l10n.t('its git folder {folder} is gone', {folder: start.gitDir}),
+                    settingsGone: vscode.l10n.t('its settings file {file} is gone', {file: settings}),
+                }[reason];
+                // verify runs before every step of the sync, so the steps go ahead again once the folder is back
+                throw new FolderChangedError(reason, vscode.l10n.t(
+                    '"{folder}" is not the folder this replica started with: {problem}. The replica syncs again once that folder is back at this path, with its git folder and its settings file. To sync another folder at this path, reload the window.',
+                    {folder, problem}));
             },
             write: async (path, content) => {
                 await fs.createDirectory(vscode.Uri.joinPath(uri(path), '..'));
@@ -461,7 +467,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             // when git has no user.name and user.email: the Overleaf account, as the project lists it
             fallbackUser: () => person,
             log: message => log(`[${vfs.projectName}] ${message}`),
-            copiesFolder: CONFLICTS_FOLDER,
         });
         void vfs.init().then(project => {
             const me = [project.owner, ...(project.members ?? [])].find(member => member?._id===vfs._userId);
@@ -482,6 +487,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     : vscode.l10n.t('{count} files were deleted in "{folder}" since the last sync. Delete them on Overleaf too?', {count: paths.length, folder});
                 const detail = paths.slice(0, 20).join('\n') + (paths.length>20 ? '\n...' : '');
                 return await vscode.window.showWarningMessage(message, {modal: true, detail}, action)===action;
+            },
+            confirmCheckout: async (head, overleaf) => {
+                const upload = vscode.l10n.t('Upload to Overleaf');
+                const keepWaiting = vscode.l10n.t('Keep Waiting');
+                const choice = await vscode.window.showWarningMessage(vscode.l10n.t(
+                    'The checked-out commit {head} in "{folder}" does not contain Overleaf\'s recorded state {overleaf} ({ref}), as after a git checkout or reset to an older commit. The replica waits, so that the files of {head} are not uploaded as edits. Upload them to Overleaf, or keep waiting until a commit that contains {overleaf} is checked out?',
+                    {head: head.slice(0, 7), overleaf: overleaf.slice(0, 7), ref: OVERLEAF_REF, folder: this.baseUri.fsPath}),
+                    upload, keepWaiting);
+                return choice===upload;
+            },
+            waiting: (reason) => {
+                this.waitingMessage?.dispose();
+                this.waitingMessage = reason===undefined ? undefined : vscode.window.setStatusBarMessage(`$(debug-pause) ${this.waitingText(reason)}`);
             },
             conflictBlocked: (path) => {
                 const open = vscode.l10n.t('Open');
@@ -509,7 +527,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             notes.push(vscode.l10n.t('{count} files were changed on both sides in the same place and have conflicts to resolve: {files}. They are uploaded once the markers are gone and the file is staged (git add).', {count: summary.conflicts.length, files: list(summary.conflicts)}));
         }
         if (summary.keptAside.length) {
-            notes.push(vscode.l10n.t('{count} local files differed from Overleaf without saved sync state to tell which side changed; Overleaf\'s version is in place and the local one is kept in {folder}: {files}.', {count: summary.keptAside.length, folder: CONFLICTS_FOLDER, files: list(summary.keptAside.map(k => k.path))}));
+            notes.push(vscode.l10n.t('{count} local files differed from Overleaf without saved sync state to tell which side changed; Overleaf\'s version is in place and the local one is kept in {folder}: {files}.', {count: summary.keptAside.length, folder: vscode.Uri.joinPath(this.baseUri, REPLICA_CONFLICTS_FOLDER).fsPath, files: list(summary.keptAside.map(k => k.path))}));
         }
         if (summary.failed.length) {
             notes.push(vscode.l10n.t('{count} files could not be synced and keep their local content: {files} ({error}). They are synced again when the connection is back, or with "Sync Now".', {count: summary.failed.length, files: list(summary.failed.map(f => f.path)), error: summary.failed[0].error}));
@@ -518,10 +536,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             notes.push(vscode.l10n.t('{count} local files are not on Overleaf and were not uploaded: {files}.', {count: summary.untracked.length, files: list(summary.untracked)}));
         }
         if (summary.skippedDeletions.length) {
-            notes.push(vscode.l10n.t('{count} deletions were not confirmed and wait for the next sync.', {count: summary.skippedDeletions.length}));
+            notes.push(`${this.deletionsDeclined(summary.skippedDeletions.length)}.`);
         }
-        for (const {where, paths} of summary.deletionsToConfirm) {
-            notes.push(`${deletionsNeedConfirmation(where, paths.length)}: ${list(paths)}.`);
+        for (const deletions of summary.deletionsToConfirm) {
+            notes.push(`${this.deletionsWaiting(deletions, false)}: ${list(deletions.paths)}.`);
         }
         if (summary.notChecked) {
             notes.push(vscode.l10n.t('The sync was cancelled before {count} files were checked.', {count: summary.notChecked}));
@@ -679,25 +697,67 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             throw new Error(vscode.l10n.t('This local replica has not started.'));
         }
         await this.ready;
-        if (by==='tool' && await this.questionComesFirst()) {
-            // the answer names the question at once (flush adds it for a tool) instead of waiting for the user
-            return await this.sync.flush(false, {by});
+        const question = by==='tool' ? await this.questionComesFirst() : undefined;
+        if (question) {
+            // the answer names the question at once instead of waiting for the user, also when the
+            // user answers it meanwhile
+            return await this.sync.flush(false, {by, question});
         }
         await this.fullSync;
         return await this.sync.flush(true, {record: true, by});
     }
 
     /**
-     * For a tool: whether a question about deletions is open in the window, or opens before the
-     * full sync under way is done, e.g. the full sync's own question. A tool waits for neither.
+     * For a tool: the deletions that a question open in the window asks about, or one that opens
+     * before the full sync under way is done, e.g. the full sync's own question; undefined when
+     * the full sync is done first. A tool waits for neither.
      */
-    private async questionComesFirst(): Promise<boolean> {
-        const question = this.sync!.questionOpened();
+    private async questionComesFirst(): Promise<Deletions | undefined> {
+        const sync = this.sync!;
+        // a question open now comes first, whether or not the full sync is done
+        const open = sync.openQuestion;
+        if (open) { return open; }
+        const question = sync.questionOpened();
         try {
-            return await Promise.race([question.opened.then(() => true), (this.fullSync ?? Promise.resolve()).then(() => false)]);
+            // when both have settled, Promise.race takes the first of the list: the question
+            return await Promise.race([question.opened, (this.fullSync ?? Promise.resolve()).then(() => undefined)]);
         } finally {
             question.dispose();
         }
+    }
+
+    /**
+     * What a tool's answer, the status and the window say about deletions that wait for the
+     * user: a question open in the window (`asked`), or a confirmation that the window has to ask for.
+     */
+    private deletionsWaiting({where, paths}: Deletions, asked: boolean): string {
+        const side = where==='local' ? vscode.l10n.t('in the local folder') : vscode.l10n.t('on Overleaf');
+        return asked
+            ? vscode.l10n.t('A question in the IDE window asks whether to delete {count} files {side}; answer it there', {count: paths.length, side})
+            : vscode.l10n.t('{count} files would be deleted {side}, more than {threshold} at once, and wait for a confirmation in the IDE window ("Sync Local Replica Now")',
+                {count: paths.length, side, threshold: ReplicaSync.deletionThreshold});
+    }
+
+    /** What a tool's answer, the status and the window say while the sync waits instead of acting on the folder (ReplicaSync.waitingFor). */
+    private waitingText(reason: string): string {
+        return vscode.l10n.t('The local replica waits: {reason}', {reason});
+    }
+
+    /** What a tool's answer and the window say about deletions that the user declined in the window. */
+    private deletionsDeclined(count: number): string {
+        return vscode.l10n.t('{count} deletions were not confirmed in the IDE window; the next full sync or "Sync Local Replica Now" asks again', {count});
+    }
+
+    /** What keeps a sync from being complete, one line each, for a tool's answer. */
+    private syncProblems(summary: SyncSummary): string[] {
+        return [
+            ...summary.failed.map(f => `${f.path}: ${f.error}`),
+            ...summary.conflicts.map(path => vscode.l10n.t('{path}: conflict markers to resolve', {path})),
+            ...(summary.question ? [`${this.deletionsWaiting(summary.question, true)}: ${summary.question.paths.join(', ')}`] : []),
+            ...summary.deletionsToConfirm.map(deletions => `${this.deletionsWaiting(deletions, false)}: ${deletions.paths.join(', ')}`),
+            ...(summary.skippedDeletions.length ? [this.deletionsDeclined(summary.skippedDeletions.length)] : []),
+            ...(summary.waitingFor ? [this.waitingText(summary.waitingFor)] : []),
+        ];
     }
 
     /** The command "Sync Local Replica Now", for every open replica. */
@@ -790,6 +850,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     /** Answer a tool's request on the control socket (src/scm/replicaControl.ts). */
     private async answerTool(request: ControlRequest): Promise<ControlAnswer> {
+        const question = this.sync?.openQuestion;
+        const waiting = this.sync?.waitingFor;
         const state = {
             folder: this.baseUri.fsPath,
             project: {id: this.vfs.projectId, name: this.vfs.projectName, server: this.vfs.serverName},
@@ -797,7 +859,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             watcher: this.watchedBy,
             modes: this.modes,
             fullSyncRunning: this.fullSyncRunning,
-            question: this.sync?.openQuestion,
+            question: question && {...question, message: this.deletionsWaiting(question, true)},
+            waiting: waiting && {reason: waiting, message: this.waitingText(waiting)},
         };
         if (request.op==='status') {
             return {ok: true, ...state, git: await this.gitState(), recent: [...this.recent]};
@@ -806,7 +869,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return {...await this.land(request.commit), ...state, recent: [...this.recent]};
         }
         const summary = await this.syncNow('tool');
-        const problems = syncProblems(summary);
+        const problems = this.syncProblems(summary);
         const git = await this.gitState();
         return problems.length===0
             ? {ok: true, ...state, summary, git, recent: [...this.recent]}
@@ -826,14 +889,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return {ok: false, error: vscode.l10n.t('This local replica has not started.')};
         }
         await this.ready;
-        if (await this.questionComesFirst()) {
-            const waiting = await sync.flush(false, {by: 'tool'});
-            return {ok: false, error: `the replica is not in sync: ${syncProblems(waiting).join('; ')}`, summary: waiting};
+        const question = await this.questionComesFirst();
+        if (question) {
+            const waiting = await sync.flush(false, {by: 'tool', question});
+            return {ok: false, error: `the replica is not in sync: ${this.syncProblems(waiting).join('; ')}`, summary: waiting};
         }
         await this.fullSync;
         const git = store.git;
         const before = await sync.flush(true, {record: true, by: 'tool'});
-        const problems = syncProblems(before);
+        const problems = this.syncProblems(before);
         if (problems.length) { return {ok: false, error: `the replica is not in sync: ${problems.join('; ')}`, summary: before}; }
         const [head, overleaf, target] = await Promise.all([git.commit('HEAD'), git.commit(OVERLEAF_REF), git.commit(commit)]);
         if (target===undefined) { return {ok: false, error: `${commit} names no commit in the replica's repository`}; }
@@ -856,7 +920,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 .stdout.toString('utf8').split('\0').filter(Boolean).map(p => `/${p}`);
             await git.run(['merge', '--ff-only', '--quiet', target]);
             const summary = await sync.flush(true, {by: 'tool', approved: new Set(deleted)});
-            const failed = syncProblems(summary);
+            const failed = this.syncProblems(summary);
             const recorded = await sync.recordNow({force: true});
             const after = await git.commit(OVERLEAF_REF);
             const held = after!==undefined && (after===target || await git.isAncestor(target, after));
@@ -892,9 +956,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private async initWatch() {
+        /** A step of the start: when it fails, the log says which step and why, and the replica does not start. */
+        const step = async <T>(failed: string, run: () => Promise<T>): Promise<T> => {
+            try {
+                return await run();
+            } catch (error) {
+                log(`[${this.vfs.projectName}] ${failed}: ${error}`);
+                throw error;
+            }
+        };
         // write the settings file if it does not exist
-        const settingUri = vscode.Uri.joinPath(this.baseUri, SETTINGS_FILE);
-        if (!await localFs.exists(settingUri)) {
+        const settingUri = vscode.Uri.joinPath(this.baseUri, REPLICA_SETTINGS_FILE);
+        await step(`The replica's settings file ${settingUri.fsPath} could not be written`, async () => {
+            if (await localFs.exists(settingUri)) { return; }
             await localFs.writeFile(settingUri, Buffer.from(
                 JSON.stringify({
                     'uri': this.vfs.origin.toString(),
@@ -903,7 +977,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     'projectName': this.vfs.projectName,
                 }, null, 4)
             ), this.temporaryFolder);
-        }
+        });
 
         // One sync per folder: a reconnect creates a new provider for the same folder, and
         // its sync starts only after the previous one has stopped.
@@ -912,22 +986,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (previous) {
             await (previous.stopped ??= previous.sync.stop());
         }
-        // Remove the temporary files that writes of an earlier run left behind, e.g. at a crash,
-        // once the previous sync of this window has stopped. A second window that syncs the same
-        // folder may have a write under way: that write fails, the window reports the failure,
-        // and its next full sync downloads the file again, since the sync's entry for the file
-        // changes only after the write succeeds.
-        await fsp.rm(this.temporaryFolder, {recursive: true, force: true});
+        // the temporary files that writes of processes that no longer run left behind, e.g. at a
+        // crash; a running writer keeps its files, as another replica of this folder that starts
+        // at the same time in this window, or one in another window
+        await step(`The leftovers of earlier writes in ${this.temporaryFolder} could not be removed`,
+                   () => localFs.removeLeftoverWrites(this.temporaryFolder));
         // the folder as the replica starts: before deleting anything, the sync checks that it still is
-        const identity = await localFs.identity(this.baseUri.fsPath);
+        const identity = await step(`The replica folder ${this.baseUri.fsPath} could not be read`, () => localFs.identity(this.baseUri.fsPath));
         const store = this.gitStore();
-        let gitDir: string;
-        try {
-            gitDir = await store.open();
-        } catch (error) {
-            log(`[${this.vfs.projectName}] The replica's git repository could not be opened: ${error}`);
-            throw error;
-        }
+        const gitDir = await step('The replica\'s git repository could not be opened', () => store.open());
         const replicaSettings = vscode.workspace.getConfiguration('overleaf-workshop.localReplica');
         const {modes, notices} = replicaModes({fetch: replicaSettings.get('fetchMode'), push: replicaSettings.get('pushMode')});
         this.modes = modes;
@@ -937,13 +1004,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                          uploads: modes.push==='native',
                                          onRecorded: result => this.afterRecord(result),
                                      });
-        // a saved state that cannot be used stops the replica here, before anything syncs
+        // a saved state that cannot be used stops the replica here, before anything syncs; the
+        // collection's notice of the failed start says why (scmCollectionProvider.ts)
         try {
             await sync.open();
         } catch (error) {
-            const message = String((error as Error)?.message ?? error);
-            log(`[${this.vfs.projectName}] ${message}`);
-            void vscode.window.showErrorMessage(vscode.l10n.t('The local replica "{folder}" does not sync: {error}', {folder: this.baseUri.fsPath, error: message}));
+            log(`[${this.vfs.projectName}] ${String((error as Error)?.message ?? error)}`);
             throw error;
         }
         const record: {sync: ReplicaSync, stopped?: Promise<void>} = {sync};
@@ -1012,19 +1078,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             },
             isReplicaOwnPath,
         );
-        // The repository's index, which git replaces with a new file at each change: conflicts
-        // resolved with git add, the files that waited for that sync then.
+        // The repository's git folder: git replaces the index with a new file at each change, and
+        // keeps HEAD and the files of an operation under way there. A change checks again whether
+        // the sync may act, and syncs the files that waited for their conflicts to be resolved.
         try {
             let timer: NodeJS.Timeout | undefined;
-            const indexWatcher = fs.watch(gitDir, {persistent: false}, (_event, name) => {
-                if (name!=='index') { return; }
+            const gitWatcher = fs.watch(gitDir, {persistent: false}, () => {
                 clearTimeout(timer);
-                timer = setTimeout(() => { void sync.indexChanged(); }, LocalFolderWatcher.quietMs);
+                timer = setTimeout(() => { void sync.gitChanged(); }, LocalFolderWatcher.quietMs);
             });
-            indexWatcher.on('error', () => indexWatcher.close());
-            listeners.push({dispose: () => { clearTimeout(timer); indexWatcher.close(); }});
+            gitWatcher.on('error', error => {
+                log(`[${this.vfs.projectName}] Watching the git folder stopped (${error}); the sync checks git's state when it next acts.`);
+                gitWatcher.close();
+            });
+            listeners.push({dispose: () => { clearTimeout(timer); gitWatcher.close(); }});
         } catch (error) {
-            log(`[${this.vfs.projectName}] The repository's index cannot be watched (${error}); resolved conflicts sync at the next scan.`);
+            log(`[${this.vfs.projectName}] The git folder cannot be watched (${error}); the sync checks git's state when it next acts.`);
         }
         const watching = folderWatcher.start();
         if (watching.ok) {
@@ -1056,6 +1125,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         listeners.push(
             {dispose: () => control.dispose()},
             {dispose: () => {
+                this.waitingMessage?.dispose();
+                this.waitingMessage = undefined;
                 providers.delete(this);
                 record.stopped ??= sync.stop();
                 record.stopped.finally(() => {

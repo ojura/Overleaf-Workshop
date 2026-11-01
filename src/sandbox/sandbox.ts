@@ -6,7 +6,7 @@ import * as path from 'path';
 import { minimatch } from 'minimatch';
 import type { FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
 import { gitBlobHash } from '../scm/replicaSync';
-import { DEFAULT_IGNORE_PATTERNS } from '../scm/ignorePatterns';
+import { DEFAULT_IGNORE_PATTERNS, REPLICA_SETTINGS_FILE } from '../scm/ignorePatterns';
 import { LatexParser } from '../compile/compileLogParser';
 import { GuardedSandbox, SandboxRecord, SandboxSafetyError, recordProblems, viewProblems } from './guard';
 import { acquireLock, HeldLock, LockOwner } from './lock';
@@ -28,7 +28,7 @@ export interface Replica {
 const OBJECT_ID = /^[0-9a-f]{24}$/;
 
 export function readReplica(folder: string): Replica {
-    const file = path.join(folder, '.overleaf', 'settings.json');
+    const file = path.join(folder, REPLICA_SETTINGS_FILE);
     let settings: any;
     try {
         settings = JSON.parse(fs.readFileSync(file, 'utf8'));

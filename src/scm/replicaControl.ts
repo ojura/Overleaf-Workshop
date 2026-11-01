@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
+import { REPLICA_FOLDER } from './ignorePatterns';
 
 /**
  * Lets programs outside the IDE talk to the window that keeps a local replica in sync, e.g. a
@@ -27,7 +28,7 @@ export type ControlRequest = { op: 'status' } | { op: 'sync' } | { op: 'land', c
 export type ControlAnswer = { ok: true, [key: string]: unknown } | { ok: false, error: string, [key: string]: unknown };
 
 /** The file in a replica's folder that names the socket of the window keeping the folder in sync. */
-export const POINTER_FILE = '.overleaf/control.json';
+export const POINTER_FILE = `${REPLICA_FOLDER}/control.json`;
 
 /** The socket path for `folder`, computed from the folder's real path. */
 export function replicaSocketPath(folder: string): string {
@@ -156,7 +157,7 @@ export class ReplicaControlServer {
             fs.mkdirSync(path.dirname(file), { recursive: true });
             fs.writeFileSync(file, JSON.stringify({ socket, pid: process.pid, since: new Date().toISOString() }, null, 4) + '\n');
         } catch (error: any) {
-            this.log(`Could not write ${POINTER_FILE}: ${error?.message ?? error}`);
+            this.log(`Could not write ${path.join(this.folder, POINTER_FILE)}: ${error?.message ?? error}`);
         }
     }
 

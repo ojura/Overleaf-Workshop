@@ -13,8 +13,9 @@ joins the git bridge's commits with the replica's).
 ## The repository
 
 The replica folder is the work tree of a repository of its own, with `.git` at the folder's
-root. The sync never uploads dot files and folders (`DEFAULT_IGNORE_PATTERNS` has `**/.*`), so
-the repository stays local. It holds every project file, images included. In it:
+root. The sync leaves the replica's own folders, `.git` and `.overleaf`, out in both directions,
+whatever the ignore patterns say (`isReplicaOwnPath` in src/scm/ignorePatterns.ts), so the
+repository stays local. It holds every project file, images included. In it:
 
 - `refs/remotes/overleaf/main`: Overleaf's states as the replica saw them, one commit per state;
 - `refs/notes/overleaf`: the Overleaf version of a commit that became Overleaf's state by a
@@ -29,6 +30,11 @@ time then. `.git/info/exclude` gets a block with the replica's ignore patterns, 
 `git status` lists neither `.overleaf` nor the products of a local build. replica-land keeps
 its compiles in `.git/overleaf/compiles/<commit>/` and lists its landings in
 `.git/overleaf/landings.log`.
+
+Without `state.json`, the sync takes the bases from Overleaf's last recorded state,
+`refs/remotes/overleaf/main`, and the next full sync leaves local-only files alone, as a first
+sync does. A `state.json` that cannot be read, or that belongs to another project, stops the
+replica, and the window says why.
 
 The first start of a replica with this backend makes the repository. When the folder has the
 sync state of an earlier version of the extension (`.overleaf/sync`), its bases become the first
@@ -74,6 +80,15 @@ Uploads still happen as files change: each upload batch becomes a commit, and th
 it. A file written by another program, an editor's atomic save or a git checkout is seen by the
 replica's folder watcher (src/scm/localFolderWatcher.ts), which on Linux watches every folder on
 its own; Node's recursive watching there stops reporting a file once it was replaced.
+
+While git is in the middle of an operation in the folder (a merge, a rebase, a cherry-pick, a
+revert, a bisect, git am), and while the checked-out commit does not contain
+`refs/remotes/overleaf/main`, as after a checkout or a reset to an older commit, the sync waits:
+it does not upload, download, move, delete or record, and a tool's sync answers that it waits.
+For an older commit in push mode native, the window asks whether to upload its files to
+Overleaf. When the sync may act again, a full sync catches up with what changed meanwhile; it
+first applies the renames and moves made on Overleaf while the sync waited, so that the local
+files move with their local changes.
 
 ## Renames and moves
 
@@ -159,8 +174,9 @@ conflict: edit the file and stage it (`git add`), or commit it; the replica watc
 and uploads the resolution at once. Changes Overleaf makes meanwhile go into the file, markers
 and all.
 
-A file that a git operation of the user's (a merge, a rebase) left unmerged is left alone:
-neither uploaded nor downloaded into until it is resolved.
+While git is in the middle of an operation in the folder, the whole sync waits (see above). A
+file that git left unmerged without an operation under way, as `git stash pop` does after a
+conflict, is left alone until it is resolved: neither uploaded nor downloaded into.
 
 A binary file changed on both sides keeps Overleaf's version in place and the local one in
 `.overleaf/conflicts/`.
