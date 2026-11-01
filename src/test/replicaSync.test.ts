@@ -321,6 +321,17 @@ describe('ReplicaSync', () => {
         assert.strictEqual(t.store.state!.entries['/main.tex'].conflict, undefined);
     });
 
+    it('reports a failure with its cause, as the failures of fetch carry one', async () => {
+        const t = setup();
+        t.remote.docs.set('/a.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        t.local.set('/a.tex', text + 'line 6\n');
+        t.remote.writeDoc = async () => { throw Object.assign(new Error('fetch failed'), { cause: new Error('connect ECONNREFUSED 127.0.0.1:443') }); };
+        const summary = await sync.flush(true);
+        assert.deepStrictEqual(summary.failed, [{ path: '/a.tex', error: 'fetch failed: connect ECONNREFUSED 127.0.0.1:443' }]);
+    });
+
     it('keeps the local version of a binary file changed on both sides', async () => {
         const t = setup();
         t.remote.files.set('/a.png', png);

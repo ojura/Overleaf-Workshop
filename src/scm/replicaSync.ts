@@ -292,10 +292,6 @@ function hasConflictMarkers(text: string): boolean {
     return CONFLICT_START.test(text) && CONFLICT_END.test(text);
 }
 
-function errorText(error: any): string {
-    return String(error?.message ?? error);
-}
-
 /**
  * How the local folder differs from the one the sync started with (`ReplicaLocal.verify`): it is
  * gone from its path, another folder is there, or its git folder or its settings file is gone.
@@ -573,7 +569,7 @@ export class ReplicaSync {
                     if (!agreed || this.stopped) { return; }
                     this.agreedHead = head;
                     await this.mayAct();
-                }).catch(error => this.ui.log(`Acting on the answer about ${head.slice(0, 7)} failed: ${errorText(error)}`));
+                }).catch(error => this.ui.log(`Acting on the answer about ${head.slice(0, 7)} failed: ${errorMessage(error)}`));
             }
         }
         if (reason!==undefined) {
@@ -589,7 +585,7 @@ export class ReplicaSync {
             // a full sync that runs now, e.g. the one that asked, catches up itself
             if (!this.stopped && this.fullSync===undefined) {
                 this.syncAll().then(summary => this.ui.liveResult(summary),
-                                    error => this.ui.log(`The full sync after waiting failed: ${errorText(error)}`));
+                                    error => this.ui.log(`The full sync after waiting failed: ${errorMessage(error)}`));
             }
         }
         return reason;
@@ -789,7 +785,7 @@ export class ReplicaSync {
         const paths = [...this.heldPaths];
         this.heldPaths.clear();
         for (const path of paths) {
-            this.localChanged(path).catch(error => this.ui.log(`${path}: sync failed: ${errorText(error)}`));
+            this.localChanged(path).catch(error => this.ui.log(`${path}: sync failed: ${errorMessage(error)}`));
         }
     }
 
@@ -847,8 +843,8 @@ export class ReplicaSync {
             await this.scheduleAll((await this.expand(to, true)).filter(p => !moved.has(p) && this.tracked(p)), mode);
         } catch (error) {
             // e.g. the folder is not the one the sync started with
-            mode.summary.failed.push({path: from, error: errorText(error)});
-            this.ui.log(`${from}: applying its rename to ${to} on Overleaf failed: ${errorText(error)}`);
+            mode.summary.failed.push({path: from, error: errorMessage(error)});
+            this.ui.log(`${from}: applying its rename to ${to} on Overleaf failed: ${errorMessage(error)}`);
         } finally {
             if (!waits && this.remoteMoves.get(from)===to) { this.remoteMoves.delete(from); }
         }
@@ -899,8 +895,8 @@ export class ReplicaSync {
             await this.applyDeletions(mode);
         } catch (error) {
             // e.g. Overleaf does not answer: the next full sync looks at the file again
-            mode.summary.failed.push({path, error: errorText(error)});
-            this.ui.log(`${path}: sync failed: ${errorText(error)}`);
+            mode.summary.failed.push({path, error: errorMessage(error)});
+            this.ui.log(`${path}: sync failed: ${errorMessage(error)}`);
         }
         this.scheduleSave();
         this.ui.liveResult(mode.summary);
@@ -1020,8 +1016,8 @@ export class ReplicaSync {
         this.recordTimer = undefined;
         // a state that could not be read is not saved over
         if (this.loaded && await this.loaded.then(() => true, () => false)) {
-            await this.saveNow().catch(error => this.ui.log(`Saving the sync state failed: ${errorText(error)}`));
-            await this.recordNow({stopping: true}).catch(error => this.ui.log(`Recording the state failed: ${errorText(error)}`));
+            await this.saveNow().catch(error => this.ui.log(`Saving the sync state failed: ${errorMessage(error)}`));
+            await this.recordNow({stopping: true}).catch(error => this.ui.log(`Recording the state failed: ${errorMessage(error)}`));
         }
     }
 
@@ -1138,8 +1134,8 @@ export class ReplicaSync {
                         mode.summary.waitingFor ??= error.reason;
                         return error.reason;
                     }
-                    mode.summary.failed.push({path, error: errorText(error)});
-                    this.ui.log(`${path}: sync failed: ${errorText(error)}`);
+                    mode.summary.failed.push({path, error: errorMessage(error)});
+                    this.ui.log(`${path}: sync failed: ${errorMessage(error)}`);
                     return undefined;
                 }
             }
@@ -1251,8 +1247,8 @@ export class ReplicaSync {
             }
         } catch (error) {
             // e.g. the folder is not the one the sync started with: the deletions not made yet wait
-            for (const path of open) { summary.failed.push({path, error: errorText(error)}); }
-            this.ui.log(`Deleting ${open.size} files failed: ${errorText(error)}`);
+            for (const path of open) { summary.failed.push({path, error: errorMessage(error)}); }
+            this.ui.log(`Deleting ${open.size} files failed: ${errorMessage(error)}`);
         }
     }
 
@@ -1726,7 +1722,7 @@ export class ReplicaSync {
         try {
             await this.transfers.run(() => this.remote.rename!(from, to));
         } catch (error) {
-            this.ui.log(`${from}: renaming it to ${to} on Overleaf failed (${errorText(error)}); ${to} syncs as a new file`);
+            this.ui.log(`${from}: renaming it to ${to} on Overleaf failed (${errorMessage(error)}); ${to} syncs as a new file`);
             return false;
         }
         delete this.state.entries[from];
@@ -1743,7 +1739,7 @@ export class ReplicaSync {
     /** Remove `folder` on Overleaf when it is empty, as after its last file was deleted or moved away locally. */
     private async removeEmptyRemoteFolder(folder: string) {
         await this.remote.removeFolderIfEmpty(folder)
-            .catch(error => this.ui.log(`${folder}: removing the empty folder on Overleaf failed: ${errorText(error)}`));
+            .catch(error => this.ui.log(`${folder}: removing the empty folder on Overleaf failed: ${errorMessage(error)}`));
     }
 
     /**
@@ -1760,7 +1756,7 @@ export class ReplicaSync {
             await this.scheduleAll(paths, mode);
             await this.applyDeletions(mode);
         } catch (error) {
-            mode.summary.failed.push(...paths.map(path => ({path, error: errorText(error)})));
+            mode.summary.failed.push(...paths.map(path => ({path, error: errorMessage(error)})));
         }
         this.scheduleSave();
         this.ui.liveResult(mode.summary);
@@ -1783,7 +1779,7 @@ export class ReplicaSync {
         if (this.stopped || this.saveTimer) { return; }
         this.saveTimer = setTimeout(() => {
             this.saveTimer = undefined;
-            this.saveNow().catch(error => this.ui.log(`Saving the sync state failed: ${errorText(error)}`));
+            this.saveNow().catch(error => this.ui.log(`Saving the sync state failed: ${errorMessage(error)}`));
         }, ReplicaSync.saveDelayMs);
     }
 
@@ -1817,7 +1813,7 @@ export class ReplicaSync {
                 this.scheduleRecord();
                 return;
             }
-            this.recordNow().catch(error => this.ui.log(`Recording the state failed: ${errorText(error)}`));
+            this.recordNow().catch(error => this.ui.log(`Recording the state failed: ${errorMessage(error)}`));
         }, ReplicaSync.recordQuietMs);
         this.recordTimer.unref?.();
     }
