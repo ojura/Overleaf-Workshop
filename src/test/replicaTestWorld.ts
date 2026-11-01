@@ -113,6 +113,20 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
     const origin = new Uri('overleaf-workshop', '/project', 'www.overleaf.com', 'user=u&project=p');
     const changes = new Emitter<{ type: number, uri: Uri, renamedFrom?: Uri }[]>();
     const rel = (uri: Uri) => uri.path.slice(origin.path.length);
+    /** whether the project has a folder at `p`: one created, or one that holds a document */
+    const isFolder = (p: string) => w.remoteFolders.has(p) || [...w.remote.keys()].some(q => q.startsWith(`${p}/`));
+    /** the folder at `p` as the project tree has it: the documents and the folders in it, by name */
+    const folderEntity = (p: string) => {
+        const prefix = `${p}/`;
+        const docs: { _id: string, name: string }[] = [];
+        const folders = new Set<string>();
+        for (const q of [...w.remote.keys(), ...w.remoteFolders]) {
+            if (!q.startsWith(prefix)) { continue; }
+            const rest = q.slice(prefix.length), slash = rest.indexOf('/');
+            if (slash >= 0) { folders.add(rest.slice(0, slash)); } else if (w.remote.has(q)) { docs.push({ _id: q, name: rest }); } else { folders.add(rest); }
+        }
+        return { docs, fileRefs: [], folders: [...folders].map(name => ({ _id: `${prefix}${name}`, name, docs: [], fileRefs: [], folders: [] })) };
+    };
     const vfs = {
         origin, serverName: 'www.overleaf.com', projectName: 'project', projectId: 'p', connected: true, _userId: 'u',
         onDidChangeFiles: changes.event,
@@ -121,13 +135,13 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
         setProjectSCMPersist: () => {},
         init: async () => ({ rootFolder: [{ _id: 'root', name: 'rootFolder', docs: [...w.remote.keys()].map(p => ({ _id: p, name: p.slice(1) })), fileRefs: [], folders: [] }] }),
         _resolveUri: async (uri: Uri) => w.remote.has(rel(uri)) ? { fileType: 'doc', fileEntity: {} }
-            : w.remoteFolders.has(rel(uri)) ? { fileType: 'folder', fileEntity: { docs: [], fileRefs: [], folders: [] } }
+            : isFolder(rel(uri)) ? { fileType: 'folder', fileEntity: folderEntity(rel(uri)) }
             : { fileType: undefined, fileEntity: undefined },
         // as Overleaf does: a folder that exists already is refused, and the request takes a moment
         mkdir: async (uri: Uri) => {
-            if (w.remoteFolders.has(rel(uri))) { throw new Error(`${uri.path}: 400: file already exists`); }
+            if (isFolder(rel(uri))) { throw new Error(`${uri.path}: 400: file already exists`); }
             await new Promise(resolve => setTimeout(resolve, 20));
-            if (w.remoteFolders.has(rel(uri))) { throw new Error(`${uri.path}: 400: file already exists`); }
+            if (isFolder(rel(uri))) { throw new Error(`${uri.path}: 400: file already exists`); }
             w.remoteFolders.add(rel(uri));
         },
         openFile: async (uri: Uri) => new TextEncoder().encode(w.remote.get(rel(uri)) ?? ''),
@@ -137,7 +151,12 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
             w.remoteWrites.push(rel(uri));
             return { _type: 'doc', _id: rel(uri), name: path.posix.basename(uri.path) };
         },
-        remove: async (uri: Uri) => { w.remote.delete(rel(uri)); },
+        // a document, or a folder with what it holds
+        remove: async (uri: Uri) => {
+            const p = rel(uri), inside = (q: string) => q === p || q.startsWith(`${p}/`);
+            [...w.remote.keys()].filter(inside).forEach(q => w.remote.delete(q));
+            [...w.remoteFolders].filter(inside).forEach(q => w.remoteFolders.delete(q));
+        },
         rename: async (from: Uri, to: Uri) => {
             if (!w.remote.has(rel(from)) || w.remote.has(rel(to))) { return; }
             w.remote.set(rel(to), w.remote.get(rel(from))!);
