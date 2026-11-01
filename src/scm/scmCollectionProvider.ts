@@ -126,9 +126,14 @@ export class SCMCollectionProvider extends vscode.Disposable {
         Object.values(scmPersists).forEach(async scmPersist => {
             const scmProto = supportedSCMs.find(scm => scm.label===scmPersist.label);
             if (scmProto!==undefined) {
-                const enabled = scmPersist.enabled ?? true;
-                const baseUri = vscode.Uri.parse(scmPersist.baseUri);
-                await this.createSCM(scmProto, baseUri, false, enabled);
+                // nobody waits for this callback: a failure to make the source control is shown here
+                try {
+                    const enabled = scmPersist.enabled ?? true;
+                    const baseUri = vscode.Uri.parse(scmPersist.baseUri);
+                    await this.createSCM(scmProto, baseUri, false, enabled);
+                } catch (error) {
+                    this.creationFailed(scmProto.label, error);
+                }
             }
         });
     }
@@ -161,10 +166,14 @@ export class SCMCollectionProvider extends vscode.Disposable {
         try {
             return await scm.triggers;
         } catch (error) {
-            const label = (scm.constructor as {label?: string}).label;
-            vscode.window.showErrorMessage(vscode.l10n.t('"{scm}" creation failed: {error}', {scm: label, error: String((error as Error)?.message ?? error)}));
+            this.creationFailed((scm.constructor as {label?: string}).label, error);
             return undefined;
         }
+    }
+
+    /** The notice that a source control `label` could not be made or started, with the reason. */
+    private creationFailed(label: string | undefined, error: unknown) {
+        vscode.window.showErrorMessage(vscode.l10n.t('"{scm}" creation failed: {error}', {scm: label, error: errorMessage(error)}));
     }
 
     private removeSCM(item: SCMRecord) {
@@ -198,14 +207,19 @@ export class SCMCollectionProvider extends vscode.Disposable {
                 }
             });
         })
-        .then((uri) => scmProto.validateBaseUri(uri as string || '', this.vfs.projectName))
+        // the provider's check shows why it refused a path, so its rejection is not shown again
+        .then((uri) => scmProto.validateBaseUri(uri as string || '', this.vfs.projectName).catch(() => undefined))
         .then(async (baseUri) => {
-            if (baseUri) {
-                // createSCM tells a failure, with its reason
+            if (!baseUri) { return; }
+            // Nobody waits for this promise when the quick pick starts it, so a failure to make the
+            // source control is shown here; start() shows a failed start.
+            try {
                 const scm = await this.createSCM(scmProto, baseUri, true);
                 if (scm) {
                     vscode.window.showInformationMessage( vscode.l10n.t('"{scm}" created: {uri}.', {scm:scmProto.label, uri: decodeURI(scm.baseUri.toString()) }) );
                 }
+            } catch (error) {
+                this.creationFailed(scmProto.label, error);
             }
         });
     }
