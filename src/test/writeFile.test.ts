@@ -2,6 +2,7 @@
 import * as assert from 'assert';
 import { EventEmitter } from 'events';
 import { loadWithVscode } from './standIn';
+import { errorMessage } from '../utils/errorMessage';
 
 // The modules under test import 'vscode', which only exists inside the extension host.
 // Serve a minimal stand-in so the save path can be driven from plain Node.
@@ -1110,6 +1111,15 @@ describe('SocketIOAPI: how an emit ends', () => {
         } finally {
             SocketIOAPI.emitTimeoutMs = saved;
         }
+    });
+});
+
+describe('SocketIOAPI: the text of an error that the connection reports', () => {
+    it('is errorMessage\'s: the message with its cause, and a long value without a message cut', () => {
+        const withCause = Object.assign(new Error('xhr poll error'), { cause: new Error('connect ECONNREFUSED 127.0.0.1:443') });
+        assert.strictEqual(new EmitRefusedError('joinDoc', withCause).message, '\'joinDoc\' rejected: xhr poll error: connect ECONNREFUSED 127.0.0.1:443');
+        const large = { error: 'x'.repeat(100_000) };
+        assert.strictEqual(new EmitRefusedError('joinDoc', large).message, `'joinDoc' rejected: ${errorMessage(large)}`);
     });
 });
 
