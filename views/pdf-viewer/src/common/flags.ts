@@ -13,8 +13,8 @@
  * part, fetching the cross-reference table with the first request, needs startXRefTable, which the
  * compile responses do not list. Download tracking stays off: it only reports metrics to Overleaf.
  * The fallback to Overleaf's cache of compile outputs is decided for each load, by whether the
- * build names the cache's shard (caching-flags.ts, which the loader gets in place of Overleaf's
- * flags module); 'ol-canUseClsiCache' is set only because Overleaf's flags module reads it when it
+ * load's build names the cache's shard (caching-flags.ts, canUseClsiCacheFor, which the build has
+ * the loader ask); 'ol-canUseClsiCache' is set only because Overleaf's flags module reads it when it
  * loads, and getMeta looks for a meta tag in document.head for a key that the Map lacks. Overleaf's
  * compile server deletes a build after 90 minutes, or once two newer builds exist
  * (OutputCacheManager.js:110-111). The cache keeps a copy of a successful compile that named an

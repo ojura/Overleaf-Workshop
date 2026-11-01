@@ -133,6 +133,43 @@ describe('the PDF viewers\' range transport', function () {
         assert.ok(servers.length > 0 && servers.every(server => server === 'clsi-vm-7'), JSON.stringify(servers));
     });
 
+    it('decides the fallback to Overleaf\'s cache by each load\'s own build, also for a request that fails after a newer load began', async () => {
+        // the older build's compile named no shard of the cache, the newer build's named one
+        const older = '19a0b1c2d3e-0000000000000001';
+        const newer = '19a0b1c2d4e-0000000000000002';
+        const notFound = () => new (globalThis as any).Response('not found', { status: 404, statusText: 'Not Found' });
+        // the older load's request waits until the newer load has begun, then the compile server answers 404
+        let answerOlder!: () => void;
+        const olderAnswer = new Promise<any>(resolve => { answerOlder = () => resolve(notFound()); });
+        respond = async (url: string) => new URL(url).pathname.includes(`/build/${older}/`) ? olderAnswer : notFound();
+        requests.length = 0;
+        const factory = loader.generatePdfCachingTransportFactory();
+        let reported!: () => void;
+        const failed = new Promise<void>(resolve => { reported = resolve; });
+        const olderLoad = factory({
+            url: `https://dl.test/zone/d/project/p1/user/u1/build/${older}/output/output.pdf?compileGroup=standard&clsiserverid=clsi-vm-7&enable_pdf_caching=true`,
+            pdfFile: { path: 'output.pdf', url: `/project/p1/user/u1/build/${older}/output/output.pdf`, type: 'pdf', build: older, size: 1_000_000, ranges: [], contentId: 'c1', editorId: '', clsiCacheShard: '' },
+            abortController: new AbortController(),
+            handleFetchError: () => reported(),
+        });
+        const quiet = { warn: console.warn, error: console.error };
+        console.warn = console.error = () => {};
+        try {
+            olderLoad.requestDataRange(0, 1024);
+            factory({
+                url: `https://dl.test/zone/d/project/p1/user/u1/build/${newer}/output/output.pdf?compileGroup=priority&clsiserverid=clsi-vm-8&enable_pdf_caching=true`,
+                pdfFile: { path: 'output.pdf', url: `/project/p1/user/u1/build/${newer}/output/output.pdf`, type: 'pdf', build: newer, size: 1_000_000, ranges: [], contentId: 'c2', editorId: '0d9c1e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f', clsiCacheShard: 'clsi-cache-shard-1' },
+                abortController: new AbortController(),
+                handleFetchError: () => {},
+            });
+            answerOlder();
+            await failed;
+        } finally { Object.assign(console, quiet); }
+        // the older load asks only the compile server: its build names no shard to ask
+        const servers = requests.map(r => new URL(r.url).searchParams.get('clsiserverid'));
+        assert.ok(servers.length > 0 && servers.every(server => server === 'clsi-vm-7'), JSON.stringify(servers));
+    });
+
     it('fetches a range from Overleaf\'s cache of compile outputs when the compile server has deleted the build', async () => {
         const editorId = '0d9c1e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f';
         const build = '19a0b1c2d3e-0123456789abcdef';

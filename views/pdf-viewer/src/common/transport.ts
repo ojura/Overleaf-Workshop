@@ -2,7 +2,6 @@
 import './flags';
 import { generatePdfCachingTransportFactory as overleafFactory } from '@/features/pdf-preview/util/pdf-caching-transport';
 import { getPdfCachingMetrics } from '@/features/pdf-preview/util/metrics';
-import { useClsiCacheFor } from './caching-flags';
 import type { PDFFile } from '@ol-types/compile';
 
 export interface TransportArgs {
@@ -31,8 +30,6 @@ export function generatePdfCachingTransportFactory(): (args: TransportArgs) => a
     const factory = overleafFactory();
     return (args: TransportArgs) => {
         (getPdfCachingMetrics() as { failedOnce?: boolean }).failedOnce = false;
-        // the fallback to Overleaf's cache, for a build that names its shard (caching-flags.ts)
-        useClsiCacheFor(args.pdfFile.clsiCacheShard);
         const transport = factory(args);
         if (!transport) {
             throw new Error('Overleaf\'s loader did not make a range transport; are its flags set (flags.ts)?');
