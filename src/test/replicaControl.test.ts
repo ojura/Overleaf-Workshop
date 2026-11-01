@@ -225,8 +225,17 @@ describe('the control socket of a local replica', () => {
         assert.deepStrictEqual(await requestReplica(folder, { op: 'sync' }, 5000), { ok: false, error: 'This local replica has not started.' });
     });
 
-    it('says when no window answers for the folder', async () => {
-        await assert.rejects(requestReplica(folder, { op: 'status' }, 5000), NoReplicaWindowError);
+    it('says when a window does not answer for the folder, and why', async () => {
+        const socket = replicaSocketPath(folder);
+        await assert.rejects(requestReplica(folder, { op: 'status' }, 5000),
+            (error: Error) => error instanceof NoReplicaWindowError && error.message === `an IDE window does not keep ${folder} in sync: ${socket} does not exist`,
+            'without a socket');
+        // what a window that ended can leave: the path is taken, and a server does not listen on it
+        fs.mkdirSync(path.dirname(socket), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(socket, '');
+        await assert.rejects(requestReplica(folder, { op: 'status' }, 5000),
+            (error: Error) => error instanceof NoReplicaWindowError && error.message === `an IDE window does not keep ${folder} in sync: a server does not listen on ${socket}`,
+            'with a path that a window left');
     });
 
     it('says when the window does not answer in time', async () => {

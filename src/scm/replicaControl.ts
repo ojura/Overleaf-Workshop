@@ -341,10 +341,12 @@ export function requestReplica(folder: string, request: ControlRequest, timeoutM
                 });
             }
         });
-        client.once('error', (error: NodeJS.ErrnoException) => finish(() => reject(
-            error.code === 'ENOENT' || error.code === 'ECONNREFUSED'
-                ? new NoReplicaWindowError(`no IDE window keeps ${folder} in sync (nothing answers at ${socket})`)
-                : error)));
+        client.once('error', (error: NodeJS.ErrnoException) => finish(() => {
+            if (error.code !== 'ENOENT' && error.code !== 'ECONNREFUSED') { reject(error); return; }
+            // ECONNREFUSED: the path is there, e.g. left by a window that ended, and a server does not listen on it
+            const why = error.code === 'ENOENT' ? `${socket} does not exist` : `a server does not listen on ${socket}`;
+            reject(new NoReplicaWindowError(`an IDE window does not keep ${folder} in sync: ${why}`));
+        }));
         client.once('close', () => finish(() => reject(new Error(`the IDE window closed the connection without answering (${socket})`))));
     });
 }
