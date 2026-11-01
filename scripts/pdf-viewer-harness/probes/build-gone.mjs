@@ -74,6 +74,8 @@ try {
     check('a build deleted from the compile server is shown from Overleaf\'s cache', s.cacheRequests > 0, `${s.cacheRequests} requests to the cache`);
     check('without a line about it', !(await page.evaluate(`Boolean(${banner})`)));
     check('without telling the host that the build is gone', (await page.evaluate(`harness.messages('buildGone').length`)) === 0);
+    const shownA = await page.evaluate(`harness.messages('buildShown').map(m => m.build)`);
+    check('and the page tells the host which build it shows', shownA.includes(id.a), JSON.stringify(shownA));
 
     // 2. gone from the cache as well
     await gone('a', 'everywhere');
@@ -81,6 +83,7 @@ try {
     await line('gone');
     const told = await first('buildGone');
     check('a build gone everywhere shows the gone line and tells the host, naming the build', told.build === id.a, `build ${told.build}`);
+    check('the gone line offers Recompile', await hasRecompile());
 
     // 3. the host's states: what it does about the missing build
     await page.evaluate(`harness.buildState('checking'); true`);
@@ -104,6 +107,8 @@ try {
     await shown(id.b);
     await noLine();
     check('the next build is shown, and the line goes', true);
+    const shownB = await page.evaluate(`harness.messages('buildShown').map(m => m.build)`);
+    check('the page tells the host that it shows the next build', shownB.includes(id.b), JSON.stringify(shownB));
     const reports = await page.evaluate(`harness.messages('buildGone').map(m => m.build)`);
     check('the host was told once that the build is gone', reports.length === 1 && reports[0] === id.a, JSON.stringify(reports));
 } catch (error) {

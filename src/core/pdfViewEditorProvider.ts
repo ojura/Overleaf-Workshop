@@ -304,6 +304,12 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     // also says how the compile goes
                     void builds?.recompile();
                     break;
+                case 'buildShown':
+                    // the page shows that build: the window compiles on its own again when one goes
+                    if (typeof e.build === 'string') {
+                        builds?.buildShown(e.build);
+                    }
+                    break;
                 case 'buildGone':
                     // the viewer found the build's files gone from Overleaf's servers
                     if (typeof e.build === 'string') {

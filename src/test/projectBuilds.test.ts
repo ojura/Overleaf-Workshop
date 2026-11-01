@@ -225,7 +225,63 @@ describe('the build in use (ProjectBuilds)', () => {
         builds.useOwn(own('z'));
         builds.compileEnded({ result: 'success' }, true);
         assert.strictEqual(builds.build?.id, 'z');
-        assert.deepStrictEqual(statuses.map(s => s.state), ['gone', 'checking', 'compiling', 'ready']);
+        // the check starts with the report, so 'gone' shows only when no compile follows
+        assert.deepStrictEqual(statuses.map(s => s.state), ['checking', 'compiling', 'ready']);
+    });
+
+    describe('compiles on its own once, until a viewer shows a build or the user compiles', () => {
+        /** A project whose build x a viewer showed, then reported gone; the window compiled y for it. */
+        async function goneOnce() {
+            const { host, builds } = setup();
+            builds.useOwn(own(at(0)));
+            builds.buildShown(at(0));
+            host.answers.push({ kind: 'none' }, { kind: 'none' });
+            await builds.reportGone(at(0));
+            assert.strictEqual(host.compiles, 1);
+            builds.useOwn(own(at(10)));
+            builds.compileEnded({ result: 'success' }, true);
+            return { host, builds };
+        }
+
+        it('does not compile on its own for a build that goes before a viewer has shown it, and leaves Recompile to the user', async () => {
+            const { host, builds } = await goneOnce();
+            await builds.reportGone(at(10));
+            assert.strictEqual(host.compiles, 1);
+            assert.deepStrictEqual(builds.status, { state: 'gone' });
+            await builds.recompile();
+            assert.strictEqual(host.compiles, 2);
+        });
+
+        it('compiles on its own again once a viewer has shown the build', async () => {
+            const { host, builds } = await goneOnce();
+            builds.buildShown(at(10));
+            await builds.reportGone(at(10));
+            assert.strictEqual(host.compiles, 2);
+        });
+
+        it('compiles on its own again after a compile that the user started elsewhere', async () => {
+            const { host, builds } = await goneOnce();
+            // the user compiles from an editor; its build too goes before a viewer shows it
+            builds.compileStarted(true);
+            builds.useOwn(own(at(20)));
+            builds.compileEnded({ result: 'success' }, true);
+            host.answers.push({ kind: 'none' });
+            await builds.reportGone(at(20));
+            assert.strictEqual(host.compiles, 2);
+        });
+
+        it('does not count the compile at the project\'s opening, while no viewer was visible', async () => {
+            const { host, builds, viewer } = setup({ visible: false });
+            host.answers.push({ kind: 'none' }, { kind: 'none' });
+            await builds.opened();
+            assert.strictEqual(host.compiles, 1);
+            builds.useOwn(own(at(0)));
+            builds.compileEnded({ result: 'success' }, true);
+            // the PDF opens later, when that build has gone
+            viewer.visible = true;
+            await builds.reportGone(at(0));
+            assert.strictEqual(host.compiles, 2);
+        });
     });
 
     it('compiles once when it knows no build and Overleaf has none, as after a reload', async () => {

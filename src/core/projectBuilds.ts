@@ -290,6 +290,12 @@ export class ProjectBuilds {
     private opening?: Promise<void>;
     /** whether a build ID of another form than Overleaf's was logged (laterThanOwn) */
     private loggedIdForm = false;
+    /**
+     * whether the window compiled on its own for a viewer without a build to show, since a viewer
+     * last showed a build or the user last compiled: then the next such compile is the user's, so
+     * that builds reported gone one after another do not each start a compile
+     */
+    private compiledForViewer = false;
     private shown: BuildStatus = { state: 'none' };
     private readonly buildListeners = new Set<(build: Build) => void>();
     private readonly statusListeners = new Set<(status: BuildStatus) => void>();
@@ -358,8 +364,21 @@ export class ProjectBuilds {
             return Promise.resolve();
         }
         this.gone = true;
+        // the check starts first, so that the viewers say 'checking', and 'gone' only when no
+        // compile follows on its own
+        const checked = this.check();
         this.update();
-        return this.check();
+        return checked;
+    }
+
+    /**
+     * A viewer shows the document of build `id`. Once the build in use has been shown, the window
+     * compiles on its own again for a viewer without a build to show (compiledForViewer).
+     */
+    buildShown(id: string) {
+        if (id === this.current?.id) {
+            this.compiledForViewer = false;
+        }
     }
 
     /** Follow `viewer` while it is open; returns the function to call when it closes. */
@@ -376,6 +395,8 @@ export class ProjectBuilds {
      */
     compileStarted(ofThisProject: boolean) {
         if (ofThisProject && this.compile.state !== 'running') {
+            // a compile that the user started, from an editor or with a save
+            this.compiledForViewer = false;
             this.compile = { state: 'running', started: true };
             this.update();
         }
@@ -498,8 +519,9 @@ export class ProjectBuilds {
     /**
      * Whether `asker` asks for a compile now: never while a compile of this project runs or was
      * asked for; the user always else; the others only while there is no build to show and no
-     * failure that waits for the user, at the project's opening, or while a viewer of the build
-     * is visible.
+     * failure that waits for the user: at the project's opening, or while a viewer of the build
+     * is visible and the window has not compiled for a viewer since a build was shown or the user
+     * compiled (compiledForViewer).
      */
     private asks(asker: Asker): boolean {
         if (this.compile.state === 'running') {
@@ -511,13 +533,19 @@ export class ProjectBuilds {
         if (this.hasBuildToShow() || this.compile.state !== 'idle') {
             return false;
         }
-        return asker === 'opening' || [...this.viewers].some(viewer => viewer.visible);
+        if (asker === 'opening') {
+            return true;
+        }
+        return !this.compiledForViewer && [...this.viewers].some(viewer => viewer.visible);
     }
 
     /** Ask the window's compile path for the compile that `asker` wants, if it asks now (asks). */
     private async startCompile(asker: Asker): Promise<void> {
         if (!this.asks(asker)) {
             return;
+        }
+        if (asker === 'user') {
+            this.compiledForViewer = false;
         }
         const request: CompileState = { state: 'running', started: false };
         this.compile = request;
@@ -538,6 +566,9 @@ export class ProjectBuilds {
             this.compile = { state: 'failed', status: { state: 'compile-unavailable', detail } };
             this.update();
         } else if (start.kind === 'started') {
+            if (asker === 'viewer') {
+                this.compiledForViewer = true;
+            }
             this.compile = { state: 'running', started: true };
         } else {
             // the window compiles one project at a time: once the running compile has ended,

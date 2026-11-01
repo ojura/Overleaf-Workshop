@@ -73,7 +73,8 @@
                 break;
             }
             case 'buildGone':
-                log('buildGone', { build: message.build });
+            case 'buildShown':
+                log(message.type, { build: message.build });
                 break;
             case 'fetchAbort':
                 fetch('/bridge-abort', { method: 'POST', body: JSON.stringify({ id: message.id }) });

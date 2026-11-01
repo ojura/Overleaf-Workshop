@@ -629,6 +629,30 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.strictEqual(panel.posted.filter(message => message.type === 'load').pop().output.file.build, 'b-new');
         });
 
+        it('compiles on its own once when builds are reported gone one after another, until the viewer shows one', async () => {
+            overleaf.latest = { status: 404 };
+            overleaf.compiles.push(ownAnswer(overleaf, 'b1'), ownAnswer(overleaf, 'b2'), ownAnswer(overleaf, 'b3'));
+            let ended = compileEnd();
+            const { panel } = await open();
+            await ended;
+            // the page shows b1, which then goes
+            panel.send({ type: 'buildShown', build: 'b1' });
+            ended = compileEnd();
+            panel.send({ type: 'buildGone', build: 'b1' });
+            await ended;
+            assert.strictEqual(vfs.builds.build.id, 'b2');
+            // b2 goes before the page has shown it: the next compile is the user's
+            panel.send({ type: 'buildGone', build: 'b2' });
+            await vfs.builds.check();
+            assert.deepStrictEqual(vfs.builds.status, { state: 'gone' });
+            assert.strictEqual(overleaf.to('/project/p1/compile').length, 2);
+            ended = compileEnd();
+            panel.send({ type: 'recompile' });
+            await ended;
+            assert.strictEqual(vfs.builds.build.id, 'b3');
+            assert.strictEqual(overleaf.to('/project/p1/compile').length, 3);
+        });
+
         it('says why there is no PDF when the compile fails, and offers no second compile on its own', async () => {
             overleaf.latest = { status: 404 };
             overleaf.compiles.push({ status: 'failure', compileGroup: 'priority', clsiServerId: 'clsi-vm-2', outputFiles: [] });

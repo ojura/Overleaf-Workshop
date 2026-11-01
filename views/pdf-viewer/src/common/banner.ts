@@ -13,12 +13,13 @@ import { post } from './host';
 export type BannerState = Exclude<BuildState, 'ready'> | 'failed';
 
 /**
- * Each state's text, from the state's detail. The states in which the project has no PDF and
- * nothing more happens on its own offer Recompile; the others say what is under way.
+ * Each state's text, from the state's detail. The states in which the project has no PDF to show
+ * offer Recompile: while a viewer is visible, the window rests in them only when it does not
+ * compile on its own (ProjectBuilds); 'checking' and 'compiling' say what is under way.
  */
 const STATES: Record<BannerState, { text: (detail?: string) => string, recompile: boolean }> = {
-    'none': { text: () => 'There is no build of this PDF yet.', recompile: false },
-    'gone': { text: () => 'This build of the PDF is no longer on Overleaf\'s servers.', recompile: false },
+    'none': { text: () => 'There is no build of this PDF yet.', recompile: true },
+    'gone': { text: () => 'This build of the PDF is no longer on Overleaf\'s servers.', recompile: true },
     'checking': { text: () => 'Asking Overleaf for the latest compile of the project…', recompile: false },
     'compiling': { text: () => 'Compiling the project on Overleaf…', recompile: false },
     'check-failed': { text: (detail) => `Overleaf could not be asked for the latest compile: ${detail}`, recompile: true },
@@ -96,12 +97,16 @@ export function showBuildState({ state, detail }: BuildStatus) {
 }
 
 /**
- * The document of build `build`, or a PDF read whole, was shown: a line about an earlier
- * document's failure, or its build being gone, goes. The page's data-shown-build attribute names
- * the build shown, for the harness's probes (scripts/pdf-viewer-harness).
+ * The document of build `build`, or a PDF read whole, was shown: the host is told which build
+ * (ProjectBuilds.buildShown), and a line about an earlier document's failure, or its build being
+ * gone, goes. The page's data-shown-build attribute names the build shown, for the harness's
+ * probes (scripts/pdf-viewer-harness).
  */
 export function documentShown(build: string | undefined) {
     document.documentElement.dataset.shownBuild = build ?? '';
+    if (build !== undefined) {
+        post({ type: 'buildShown', build });
+    }
     if (banner?.dataset.state === 'failed' || banner?.dataset.state === 'gone') {
         clearBanner();
     }

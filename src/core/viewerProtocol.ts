@@ -101,8 +101,10 @@ export interface PdfOutput {
  * What happens to the project's build (src/core/projectBuilds.ts), as the viewers' line about it
  * shows it (views/pdf-viewer/src/common/banner.ts has the texts):
  *   ready                the build in use, with nothing to report
- *   none                 no build to show; a compile starts when a viewer of the build is visible
- *   gone                 the build in use is gone from Overleaf's servers, the same
+ *   none                 no build to show: the window compiles on its own while a viewer of the
+ *                        build is visible, once until a viewer shows a build or the user compiles
+ *   gone                 the build in use is gone from Overleaf's servers and its cache; the
+ *                        window compiles as for none
  *   checking             no build to show while the window asks Overleaf for the latest compile
  *   compiling            no build to show while a compile runs that makes one
  *   check-failed         asking Overleaf for the latest compile failed; `detail` says why
@@ -195,6 +197,7 @@ export type HostMessage =
  *                 from the top left
  *   recompile     compile the project again
  *   buildGone     the files of build `build` are gone from Overleaf's servers and its cache
+ *   buildShown    the page shows the document of build `build`
  *   download      save the PDF to a file the user picks
  *   switchViewer  show the PDFs in the viewer `engine`: the host sets the setting, and the open
  *                 viewers reload with that viewer's page
@@ -206,6 +209,7 @@ export type ViewerMessage =
     | { type: 'syncPdf', content: { page: number, h: number, v: number, identifier: string } }
     | { type: 'recompile' }
     | { type: 'buildGone', build: string }
+    | { type: 'buildShown', build: string }
     | { type: 'download' }
     | { type: 'switchViewer', engine: PdfViewerEngine }
     | ({ type: 'fetch', page: string } & BridgeRequest)
