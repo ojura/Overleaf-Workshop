@@ -237,6 +237,25 @@ export async function viewerPage(wb, frameTarget, { beforeLoad } = {}) {
     return { session, problems, context, E, engine, drawn, close: () => session.detach() };
 }
 
+/**
+ * The newest PDF viewer in the workbench `wb` (the last of viewerFrames), attached with viewerPage
+ * and `beforeLoad`, once it has drawn the page in view: { view, engine, V }, where V is the
+ * expression for its viewer object (viewerOf). It fails when the workbench does not show a viewer,
+ * and when the viewer has not drawn the page in view within `limitMs`; that error lists the
+ * page's console problems.
+ */
+export async function newestViewer(wb, { beforeLoad, limitMs = 30000 } = {}) {
+    const frame = (await viewerFrames(wb)).at(-1);
+    if (!frame) { throw new Error('the instance does not show a PDF viewer: open a PDF in it first'); }
+    const view = await viewerPage(wb, frame, { beforeLoad });
+    const shown = await view.drawn(undefined, limitMs);
+    if (!shown) {
+        const problems = view.problems.length ? view.problems.slice(0, 8).join(' | ') : 'none';
+        throw new Error(`the newest viewer has not drawn the page in view within ${limitMs / 1000} s; console problems in its page: ${problems}`);
+    }
+    return { view, engine: shown.engine, V: viewerOf(shown.engine) };
+}
+
 /** Close the editor tab with a label that starts with `label`; returns whether such a tab was open. */
 export async function closeTab(wb, label) {
     const closed = await wb.E(`(() => { const tab = [...document.querySelectorAll('.tabs-container .tab')].find(t => (t.getAttribute('aria-label') || '').startsWith(${JSON.stringify(label)})); if (!tab) { return false; } tab.querySelector('.tab-actions .action-label, .codicon-close').click(); return true; })()`);

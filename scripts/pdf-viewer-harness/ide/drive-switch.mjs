@@ -4,7 +4,7 @@
 // same page, and writes the setting. At the end the setting is restored.
 //   node ide/drive-switch.mjs
 // Open output.pdf in the instance first, for example with Overleaf Workshop's View PDF command.
-import { checker, instance, rafOnTimer, settings, sleep, viewerFrames, viewerOf, viewerPage, waitUntil, windowDraws, workbench } from './ide.mjs';
+import { checker, instance, newestViewer, rafOnTimer, settings, sleep, viewerOf, waitUntil, windowDraws, workbench } from './ide.mjs';
 
 const SETTING = 'overleaf-workshop.pdfViewer.engine';
 const inst = instance();
@@ -17,11 +17,8 @@ let view;
 try {
     const draws = await windowDraws(wb);
     console.log(`the window ${draws ? 'draws' : 'does not draw: the viewer pages get a 16 ms timer for requestAnimationFrame'}`);
-    const frame = (await viewerFrames(wb)).at(-1);
-    if (!frame) { throw new Error('the instance does not show a PDF viewer: open output.pdf first'); }
-    view = await viewerPage(wb, frame, { beforeLoad: draws ? undefined : rafOnTimer });
-    const start = await view.drawn(undefined, 30000);
-    if (!start) { throw new Error('the webview does not show a drawn viewer page'); }
+    const start = await newestViewer(wb, { beforeLoad: draws ? undefined : rafOnTimer });
+    view = start.view;
     console.log(`output.pdf is in the ${start.engine} viewer; the setting is ${original ?? '(not set)'}`);
     const other = (engine) => (engine === 'pdfjs' ? 'overleaf' : 'pdfjs');
     const pages = await view.E(`${viewerOf(start.engine)}.pagesCount`);
