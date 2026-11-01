@@ -8,8 +8,8 @@ import * as localFs from '../scm/localFolderFs';
 // The local replica writes every download with localFolderFs.writeFile: the file must hold its
 // old content or the new one, never a part of the new one.
 describe('the local replica\'s writes into its folder', () => {
-    /** writeFile with its temporary folder, as the replica calls it */
-    const write = localFs.writeFile as (p: string, content: Uint8Array, temporaryFolder?: string) => Promise<void>;
+    /** writeFile, which the replica calls with its temporary folder */
+    const write = localFs.writeFile;
     const enc = (text: string) => new TextEncoder().encode(text);
     const read = (file: string) => fs.readFileSync(file, 'utf8');
     let dir: string;
@@ -83,12 +83,56 @@ describe('the local replica\'s writes into its folder', () => {
     it('write through a symbolic link, also a dangling one, and keep the link', async function () {
         if (process.platform === 'win32') { this.skip(); }
         const { replica, temporary } = layout();
+        // a dangling link: the file it names is created
         const outside = path.join(dir, 'library.bib');
         const link = path.join(replica, 'refs.bib');
         fs.symlinkSync(outside, link);
         await write(link, enc('@book{a}\n'), temporary);
         assert.ok(fs.lstatSync(link).isSymbolicLink(), 'the link stays');
         assert.strictEqual(read(outside), '@book{a}\n');
+        // a link to a file: that file is written in place
+        const inode = fs.statSync(outside).ino;
+        await write(link, enc('@book{b}\n'), temporary);
+        assert.ok(fs.lstatSync(link).isSymbolicLink(), 'the link stays');
+        assert.strictEqual(read(outside), '@book{b}\n');
+        assert.strictEqual(fs.statSync(outside).ino, inode, 'the file the link names is the same file');
+    });
+
+    it('write a file that another user owns in place, so that it keeps its owner', async function () {
+        if (process.getuid === undefined) { this.skip(); }
+        const { replica, temporary } = layout();
+        const file = path.join(replica, 'main.tex');
+        fs.writeFileSync(file, 'old\n');
+        const inode = fs.statSync(file).ino;
+        // only root can give a file to another user: for the write, this process answers another user id
+        const getuid = process.getuid;
+        process.getuid = () => getuid() + 1;
+        try {
+            await write(file, enc('new\n'), temporary);
+        } finally {
+            process.getuid = getuid;
+        }
+        assert.strictEqual(read(file), 'new\n');
+        assert.strictEqual(fs.statSync(file).ino, inode, 'the same file, written in place');
+    });
+
+    it('write the file in place when the rename finds it on another file system (EXDEV), and remove the temporary file', async () => {
+        const { replica, temporary } = layout();
+        const file = path.join(replica, 'main.tex');
+        fs.writeFileSync(file, 'old\n');
+        const inode = fs.statSync(file).ino;
+        // as a target in a folder linked to another file system: the rename into it fails
+        const promises = require('fs/promises');
+        const rename = promises.rename;
+        promises.rename = async () => { throw Object.assign(new Error('EXDEV: cross-device link not permitted, rename'), { code: 'EXDEV' }); };
+        try {
+            await write(file, enc('new\n'), temporary);
+        } finally {
+            promises.rename = rename;
+        }
+        assert.strictEqual(read(file), 'new\n');
+        assert.strictEqual(fs.statSync(file).ino, inode, 'the same file, written in place');
+        assert.deepStrictEqual(fs.readdirSync(temporary), []);
     });
 
     it('write a file with another name in place, so that both names hold the new content', async () => {
