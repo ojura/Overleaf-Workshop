@@ -128,6 +128,17 @@ describe('project info', () => {
         assert.match(formatProjectInfo(info), /git token: none stored/);
     });
 
+    it('says why it could not read the offered images or the comment threads, with the cause that fetch reports', async () => {
+        const client = source();
+        // what Node's fetch throws when it cannot reach the server: the reason is in the cause
+        const fetchFailure = () => Object.assign(new TypeError('fetch failed'), { cause: new Error('connect ECONNREFUSED 127.0.0.1:443') });
+        client.editorPage = async () => { throw fetchFailure(); };
+        client.commentThreads = async () => { throw fetchFailure(); };
+        const text = formatProjectInfo(await gatherProjectInfo(client, 'p'.repeat(24), {}));
+        assert.match(text, /^TeX Live images offered: unknown \(fetch failed: connect ECONNREFUSED 127\.0\.0\.1:443\)$/m);
+        assert.match(text, /\(threads: fetch failed: connect ECONNREFUSED 127\.0\.0\.1:443\)/);
+    });
+
     it('reads the offered images from the page', () => {
         const meta = editorPageMeta(page);
         assert.deepStrictEqual(offeredImages(meta).map(image => image.imageName), imageNames.map(image => image.imageName));

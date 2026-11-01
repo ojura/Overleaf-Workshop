@@ -4,6 +4,7 @@ import type { FolderEntity, OutputFileEntity } from '../core/remoteFileSystemPro
 import { EntityType, JoinedView, ProjectView, ProjectWriter } from './guard';
 import { decodePackedUtf8 } from '../api/packedUtf8';
 import { DocRanges, ProjectRanges, rangesOf } from './ranges';
+import { errorMessage } from '../utils/errorMessage';
 
 /** What joinProject returns for a project, as far as the tool reads it. */
 export interface JoinedProject extends JoinedView {
@@ -88,9 +89,9 @@ export class OverleafClient implements ProjectWriter {
                     finish(undefined, { project: res.project, permissionsLevel: res.permissionsLevel });
                 }
             });
-            socket.on('connectionRejected', (err: any) => finish(new Error(`Overleaf rejected joining project ${projectId}: ${err?.message ?? err} (has the login expired? Log in again with the extension.)`)));
+            socket.on('connectionRejected', (err: any) => finish(new Error(`Overleaf rejected joining project ${projectId}: ${errorMessage(err)} (has the login expired? Log in again with the extension.)`)));
             socket.on('connect_failed', () => finish(new Error(`could not connect to ${origin}`)));
-            socket.on('error', (err: any) => finish(new Error(`connection to ${origin} failed: ${err?.message ?? err}`)));
+            socket.on('error', (err: any) => finish(new Error(`connection to ${origin} failed: ${errorMessage(err)}`)));
             socket.on('disconnect', () => finish(new Error(`the connection to ${origin} closed before project ${projectId} was joined`)));
         });
     }
@@ -124,7 +125,7 @@ export class OverleafClient implements ProjectWriter {
             const timer = setTimeout(() => reject(new Error(`${args[0]} took more than ${this.joinTimeoutMs/1000} s`)), this.joinTimeoutMs);
             socket.emit(...args, (err: any, ...rest: any[]) => {
                 clearTimeout(timer);
-                err ? reject(new Error(`${args[0]}: ${err?.message ?? JSON.stringify(err)}`)) : resolve(rest);
+                err ? reject(new Error(`${args[0]}: ${errorMessage(err)}`)) : resolve(rest);
             });
         });
         try {

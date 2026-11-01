@@ -15,10 +15,8 @@
  * the anchor merge joins it the same way. A bridge commit newer than the replica's state has
  * changes the replica has not seen yet; it waits until the replica has synced.
  */
+import { OVERLEAF_REF } from '../scm/replicaGit';
 import { CommitInfo, FlatTree, gitNow, Repo } from './plumbing';
-
-/** Overleaf's states in a replica's repository (src/scm/replicaGit.ts). */
-const OVERLEAF_REF = 'refs/remotes/overleaf/main';
 
 export interface AnchorResult {
     /** the bridge's commit */

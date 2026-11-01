@@ -1,6 +1,7 @@
 import { isUtf8 } from 'buffer';
 import { mapLimit } from './mapLimit';
 import { overleafLineEndings } from '../utils/docUpdate';
+import { errorMessage } from '../utils/errorMessage';
 
 /**
  * Which writes make the sandbox hold the version to compile.
@@ -166,7 +167,7 @@ export async function planSync(
         try {
             return await decide(path);
         } catch (error: any) {
-            return { type: 'problem', message: `could not compare it: ${error?.message ?? error}` } as Decision;
+            return { type: 'problem', message: `could not compare it: ${errorMessage(error)}` } as Decision;
         }
     });
 
