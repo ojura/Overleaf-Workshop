@@ -613,7 +613,9 @@ export class ReplicaSync {
         if (localFrom===undefined || localFrom==='folder' || localTo!==undefined || remoteFrom!==undefined || remoteTo?.kind!==entry.kind) { return; }
         if (await this.isUnmerged(from) || await this.isUnmerged(to)) { return; }
         await this.local.move(from, to);
-        // the file is the same: its size and time still tell whether it holds the base
+        // The entry keeps the size and time the file had when it held the base. A hard link keeps
+        // the file itself, with them, so they still tell whether it holds the base; a copy, where
+        // the file system has no hard links, has a new time, and the next reconcile compares its content.
         delete this.state.entries[from];
         this.state.entries[to] = entry;
         this.noteChange(from, 'remote');
