@@ -117,6 +117,17 @@ export function writeInstance(home, record) {
  */
 const WORKBENCH_PAGE = '/workbench/workbench.html';
 
+/**
+ * How long a page may go without drawing a frame before it counts as not drawing. A page that
+ * draws runs its requestAnimationFrame callbacks within a frame, about 16 ms; a page in a hidden or
+ * throttled window does not run them at all, which only the absence of a frame within some time
+ * can show. This limit is that time.
+ */
+const DRAW_LIMIT_MS = 2000;
+
+/** An expression for a page: whether it draws, that is whether requestAnimationFrame fires within DRAW_LIMIT_MS. */
+export const drawsExpression = `Promise.race([new Promise(r => requestAnimationFrame(() => r(true))), new Promise(r => setTimeout(() => r(false), ${DRAW_LIMIT_MS}))])`;
+
 /** Whether a target is the page of the IDE's workbench window. */
 export const isWorkbench = (target) => target.type === 'page' && target.url.includes(WORKBENCH_PAGE);
 

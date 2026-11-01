@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { onCleanup, sleep } from '../../lib/cleanup.mjs';
 import { answerWithin, evaluate, waitUntil, notWithinLimit } from '../../lib/devtools.mjs';
-import { checkInstanceFolder, connectWindow, instanceHome, readRunningInstance, workbenchTarget } from '../../lib/test-instance.mjs';
+import { checkInstanceFolder, connectWindow, drawsExpression, instanceHome, readRunningInstance, workbenchTarget } from '../../lib/test-instance.mjs';
 import { arg } from '../common.mjs';
 
 export { evaluate, waitUntil, notWithinLimit, onCleanup, sleep };
@@ -263,8 +263,8 @@ export async function reopenTab(wb, label, timeoutMs = 10000) {
     return undefined;
 }
 
-/** Whether the window draws: requestAnimationFrame fires within 1.5 s. */
-export const windowDraws = (wb) => wb.E(`Promise.race([new Promise(r => requestAnimationFrame(() => r(true))), new Promise(r => setTimeout(() => r(false), 1500))])`);
+/** Whether the window draws (drawsExpression in scripts/lib/test-instance.mjs). */
+export const windowDraws = (wb) => wb.E(drawsExpression);
 
 /** A script for viewerPage's beforeLoad: requestAnimationFrame on a 16 ms timer, for a window that does not draw. */
 export const rafOnTimer = 'window.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 16); window.cancelAnimationFrame = (id) => clearTimeout(id);';

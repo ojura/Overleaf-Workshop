@@ -106,7 +106,7 @@ import { answerWithin, evaluate, removeActivePort, WaitLimitError } from './lib/
 import { buildCheckout, installedExtension, installInto } from './lib/install-build.mjs';
 import {
     bootId, checkInstanceFolder, connectMainProcess, connectWindow, inMainProcess, instanceHome, instanceProcesses, isRecordedProcess,
-    processStat, readInstance, readRunningInstance, waitForInstance, workbenchTarget, writeInstance,
+    drawsExpression, processStat, readInstance, readRunningInstance, waitForInstance, workbenchTarget, writeInstance,
 } from './lib/test-instance.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -670,8 +670,8 @@ const commands = {
             return;
         }
         console.log(JSON.stringify(await withPage(instance, 'probe', (page) => evaluate(page, `(async () => {
-            const frame = await Promise.race([new Promise(r => requestAnimationFrame(() => r('drawing'))), new Promise(r => setTimeout(() => r('no frame within 2 s'), 2000))]);
-            return { frozen: false, visibility: document.visibilityState, focus: document.hasFocus(), frame };
+            const draws = await ${drawsExpression};
+            return { frozen: false, visibility: document.visibilityState, focus: document.hasFocus(), draws };
         })()`))));
     },
     async freeze() {
@@ -697,8 +697,14 @@ const commands = {
         await withPage(runningInstance(), 'screenshot', async (page) => {
             // the page's size is set in the same session as the capture: the override ends with the session
             if (width && height) {
+                // The page lays itself out at the new size, then reports its resize event; a page
+                // that draws then draws twice. The listener is in place before the size changes.
+                const resized = await evaluate(page, `innerWidth !== ${Number(width)} || innerHeight !== ${Number(height)}
+                    ? (window.__hiddenIdeResized = new Promise(r => addEventListener('resize', () => document.visibilityState === 'visible'
+                        ? requestAnimationFrame(() => requestAnimationFrame(() => r(true))) : r(true), { once: true })), true)
+                    : false`);
                 await page.send('Emulation.setDeviceMetricsOverride', { width: Number(width), height: Number(height), deviceScaleFactor: 1, mobile: false });
-                await new Promise(r => setTimeout(r, 800)); // let the workbench lay itself out at the new size
+                if (resized) { await evaluate(page, 'window.__hiddenIdeResized'); }
             }
             const { data } = await page.send('Page.captureScreenshot', { format: 'png' });
             if (width && height) { await page.send('Emulation.clearDeviceMetricsOverride'); }
