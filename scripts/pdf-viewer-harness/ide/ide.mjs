@@ -22,7 +22,7 @@ export const INSTANCE_OPTION = { instance: 'value' };
  * before a driver changes a setting.
  */
 export function instance(options) {
-    const home = instanceHome(options.get('instance'));
+    const home = instanceHome(options.get('instance'), '--instance');
     checkInstanceFolder(home);
     return readRunningInstance(home);
 }

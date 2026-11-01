@@ -15,10 +15,10 @@ import { connect, evaluate, waitForActivePort, waitForTarget } from './devtools.
  * The instance's folder: `explicit`, else HIDDEN_IDE_HOME. The scripts require one of them and do
  * not fall back to a shared folder, so that two agents never share an instance.
  */
-export function instanceHome(explicit) {
+export function instanceHome(explicit, option) {
     const home = explicit ?? process.env.HIDDEN_IDE_HOME;
     if (!home) {
-        throw new Error('name the folder of the test instance with --instance DIR or HIDDEN_IDE_HOME; the scripts do not fall back to a shared folder, so that two agents never share an instance');
+        throw new Error(`name the folder of the test instance with ${option ? `${option} DIR or ` : ''}HIDDEN_IDE_HOME; the scripts do not fall back to a shared folder, so that two agents never share an instance`);
     }
     return path.resolve(home);
 }
@@ -44,10 +44,7 @@ function groupHoldsOnlyThisUser(gid) {
 /**
  * Fail unless `home` can hold an instance: it holds the login copy and the record that stop acts
  * on. It must be the folder itself (not a symbolic link), belong to this user and have mode 700,
- * and each folder above it must belong to root or to this user, and other users must not be able to
- * write it, except a folder with the sticky bit (as /tmp has), in which they cannot rename or
- * remove what is not theirs. A folder that its group can write counts as closed to others when the
- * group holds no user but this one.
+ * and the folders above it must pass checkFoldersAbove.
  */
 export function checkInstanceFolder(home) {
     const refuse = (reason) => { throw new Error(`refusing the instance's folder ${home}: ${reason}`); };
@@ -64,15 +61,40 @@ export function checkInstanceFolder(home) {
     if ((stat.mode & 0o777) !== 0o700) {
         refuse(`its mode is ${(stat.mode & 0o777).toString(8)}; it must be 700, so that only this user can enter, read and write it`);
     }
-    for (let dir = path.dirname(fs.realpathSync(home)); ; dir = path.dirname(dir)) {
-        const above = fs.statSync(dir);
-        const sticky = (above.mode & 0o1000) !== 0;
-        if (above.uid !== 0 && above.uid !== process.getuid()) { refuse(`the folder ${dir} above it belongs to another user`); }
-        if ((above.mode & 0o002) && !sticky) { refuse(`every user can write the folder ${dir} above it`); }
-        if ((above.mode & 0o020) && !sticky && !groupHoldsOnlyThisUser(above.gid)) {
-            refuse(`the members of group ${above.gid} can write the folder ${dir} above it, and other users are among them`);
+    checkFoldersAbove(home);
+}
+
+/**
+ * Fail unless the folders above `home`, which need not exist yet, are closed to other users: each
+ * must belong to root or to this user, and other users must not be able to write it, except a
+ * folder with the sticky bit (as /tmp has), in which they cannot rename or remove what is not
+ * theirs. A folder that its group can write counts as closed to others when the group holds no user
+ * but this one. The check walks the folders of the path as it is named and of the path with its
+ * symbolic links resolved, since a link in a folder that others can write could be replaced; a
+ * folder that does not exist yet is skipped, as mkdir makes it for this user with mode 700.
+ * What the check does not see: an ACL entry that lets another user write a folder. The check reads
+ * the mode bits, and with an ACL their group bits are the ACL's mask, so a folder whose group bits
+ * pass can hide such an entry (getfacl shows it).
+ */
+export function checkFoldersAbove(home) {
+    const refuse = (reason) => { throw new Error(`refusing the instance's folder ${home}: ${reason}`); };
+    const named = path.resolve(home);
+    let existing = path.dirname(named);
+    while (!fs.existsSync(existing)) { existing = path.dirname(existing); }
+    const chains = [path.dirname(named), fs.realpathSync(existing)];
+    for (const start of chains) {
+        for (let dir = start; ; dir = path.dirname(dir)) {
+            const above = fs.statSync(dir, { throwIfNoEntry: false });
+            if (above) {
+                const sticky = (above.mode & 0o1000) !== 0;
+                if (above.uid !== 0 && above.uid !== process.getuid()) { refuse(`the folder ${dir} above it belongs to another user`); }
+                if ((above.mode & 0o002) && !sticky) { refuse(`every user can write the folder ${dir} above it`); }
+                if ((above.mode & 0o020) && !sticky && !groupHoldsOnlyThisUser(above.gid)) {
+                    refuse(`the members of group ${above.gid} can write the folder ${dir} above it, and other users are among them`);
+                }
+            }
+            if (dir === path.dirname(dir)) { break; }
         }
-        if (dir === path.dirname(dir)) { break; }
     }
 }
 
@@ -244,17 +266,21 @@ export async function connectMainProcess(instance) {
  * The value that `statements` return, run in the main process as the body of an async function in
  * which `electron` is Electron's module and `w` the window that shows the workbench (WORKBENCH_PAGE).
  */
-export function inMainProcess(main, statements) {
-    return evaluate(main, `(async () => {
+export async function inMainProcess(main, statements) {
+    // a refusal comes back as a value, so that its message reaches the caller without the stack of
+    // the main process's code
+    const { refused, value } = await evaluate(main, `(async () => {
         // the main process is an ES module, and the inspector's context lacks require and import()
         const electron = typeof require === 'function' ? require('electron')
             : process.mainModule ? process.mainModule.require('electron')
             : process.getBuiltinModule('module').createRequire(process.execPath)('electron');
         const windows = electron.BrowserWindow.getAllWindows().filter(w => !w.isDestroyed() && w.webContents.getURL().includes(${JSON.stringify(WORKBENCH_PAGE)}));
-        if (windows.length !== 1) { throw new Error(\`the IDE shows \${windows.length} workbench windows, not one\`); }
+        if (windows.length !== 1) { return { refused: \`the IDE shows \${windows.length} workbench windows, not one\` }; }
         const w = windows[0];
-        ${statements}
+        return { value: await (async () => { ${statements} })() };
     })()`);
+    if (refused) { throw new Error(refused); }
+    return value;
 }
 
 /** The workbench window's page target of the browser on `browser`. */

@@ -119,7 +119,7 @@ import { answerWithin, evaluate, removeActivePort, WaitLimitError } from './lib/
 import { buildCheckout, EXTENSION_ID, IDES, installedExtension, installInto } from './lib/install-build.mjs';
 import { parseOptions, usageOf, UsageError } from './lib/options.mjs';
 import {
-    bootId, checkInstanceFolder, connectMainProcess, connectWindow, inMainProcess, instanceHome, instanceProcesses, isRecordedProcess,
+    bootId, checkFoldersAbove, checkInstanceFolder, connectMainProcess, connectWindow, inMainProcess, instanceHome, instanceProcesses, isRecordedProcess,
     drawsExpression, processStat, readInstance, readRunningInstance, waitForInstance, workbenchTarget, writeInstance,
 } from './lib/test-instance.mjs';
 
@@ -171,7 +171,11 @@ function writePrivately(file, text) {
  */
 function instanceFolder({ make = false } = {}) {
     const home = instanceHome();
-    if (make) { fs.mkdirSync(home, { recursive: true, mode: 0o700 }); }
+    if (make && !fs.lstatSync(home, { throwIfNoEntry: false })) {
+        // the folders above are checked before anything is made in them
+        checkFoldersAbove(home);
+        fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    }
     checkInstanceFolder(home);
     return home;
 }
@@ -306,19 +310,41 @@ function deleteSavedState(home) {
     }
 }
 
-/** The X server that holds display `n`, as "process N (command)", from its socket or its lock file. */
+/** The X server that holds display `n`, as "process N (name)", from its socket or its lock file. */
 function displayHolder(n) {
     const listing = spawnSync('ss', ['-lxpH'], { encoding: 'utf8' });
     const line = listing.stdout?.split('\n').find(l => l.includes(`/tmp/.X11-unix/X${n} `));
     let pid = /pid=(\d+)/.exec(line ?? '')?.[1];
     if (!pid && fs.existsSync(`/tmp/.X${n}-lock`)) { pid = fs.readFileSync(`/tmp/.X${n}-lock`, 'utf8').trim(); }
     if (pid && processStat(Number(pid))) {
-        return `process ${pid} (${fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replaceAll('\0', ' ').slice(0, 120).trim()})`;
+        return `process ${pid} (${fs.readFileSync(`/proc/${pid}/comm`, 'utf8').trim()})`;
     }
+    if (listensOn(`@/tmp/.X11-unix/X${n}`)) { return `a process listens on the abstract socket @/tmp/.X11-unix/X${n}`; }
     return `the socket /tmp/.X11-unix/X${n} or the lock file /tmp/.X${n}-lock is left from an X server that has ended`;
 }
 
-const displayInUse = (n) => fs.existsSync(`/tmp/.X11-unix/X${n}`) || fs.existsSync(`/tmp/.X${n}-lock`);
+/**
+ * Whether a socket listens on the Unix socket address `address` ("@..." for an abstract one), from
+ * the kernel's table /proc/net/unix: its Flags field has __SO_ACCEPTCON (0x10000) for a listening
+ * socket.
+ */
+function listensOn(address) {
+    return fs.readFileSync('/proc/net/unix', 'utf8').split('\n').slice(1).some((line) => {
+        const fields = line.trim().split(/\s+/);
+        return fields[7] === address && (parseInt(fields[3], 16) & 0x10000) !== 0;
+    });
+}
+
+/**
+ * Whether display :n is taken. What holds a display is an X server's listening abstract socket
+ * @/tmp/.X11-unix/X<n>, whose bind is exclusive, so a second X server on the display fails; that is
+ * also how start learns that another start took a display in the meantime (startDisplay). The
+ * socket file /tmp/.X11-unix/X<n> and the lock file /tmp/.X<n>-lock count too, as they can stay from
+ * an X server that ended. An X server started with -displayfd, as start starts Xvfb, does not write
+ * the lock file, so tools that look only at lock files, such as xvfb-run's find_free_servernum, take
+ * a test instance's display as free, and their X server then fails on it.
+ */
+const displayInUse = (n) => listensOn(`@/tmp/.X11-unix/X${n}`) || fs.existsSync(`/tmp/.X11-unix/X${n}`) || fs.existsSync(`/tmp/.X${n}-lock`);
 
 /**
  * Start Xvfb on display `requested` (":N"), or on the first free display from FIRST_DISPLAY up, and
