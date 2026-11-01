@@ -1,7 +1,6 @@
 import * as vscode from 'vscode';
 import { execFile } from 'child_process';
 import * as fs from 'fs';
-import * as fsp from 'fs/promises';
 import * as path from 'path';
 import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
@@ -951,12 +950,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (previous) {
             await (previous.stopped ??= previous.sync.stop());
         }
-        // Remove the temporary files that writes of an earlier run left behind, e.g. at a crash,
-        // once the previous sync of this window has stopped. A second window that syncs the same
-        // folder may have a write under way: that write fails, the window reports the failure,
-        // and its next full sync downloads the file again, since the sync's entry for the file
-        // changes only after the write succeeds.
-        await fsp.rm(this.temporaryFolder, {recursive: true, force: true});
+        // the temporary files that writes of processes that no longer run left behind, e.g. at a
+        // crash; a running writer keeps its files, as another replica of this folder that starts
+        // at the same time in this window, or one in another window
+        await localFs.removeLeftoverWrites(this.temporaryFolder);
         // the folder as the replica starts: before deleting anything, the sync checks that it still is
         const identity = await localFs.identity(this.baseUri.fsPath);
         const store = this.gitStore();

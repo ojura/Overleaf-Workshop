@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention -- the replica's class name, as the module exports it */
 import * as assert from 'assert';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -400,12 +400,24 @@ describe('local replica: what it deletes and what it never syncs', function () {
         it('remove the temporary files that writes of an earlier run left behind', async () => {
             const t = host();
             project(t, { '/main.tex': 'v1\n' });
-            const leftover = path.join(t.folder, '.overleaf', 'tmp', '1234-0badc0de0badc0de.tmp');
+            // the file of a write of a process that has ended
+            const leftover = path.join(t.folder, '.overleaf', 'tmp', `${spawnSync(process.execPath, ['-e', '']).pid}-0badc0de0badc0de.tmp`);
             fs.mkdirSync(path.dirname(leftover), { recursive: true });
             fs.writeFileSync(leftover, 'half a download');
             await start(t);
             assert.strictEqual(fs.existsSync(leftover), false);
             assert.deepStrictEqual([...t.w.remote.keys()], ['/main.tex']);
+        });
+
+        it('keep the temporary file of a write that a running process makes, as another replica of the folder that starts at the same moment', async () => {
+            const t = host();
+            project(t, { '/main.tex': 'v1\n' });
+            // this process writes it, as a second provider for the folder in the same window would
+            const writing = path.join(t.folder, '.overleaf', 'tmp', `${process.pid}-0badc0de0badc0de.tmp`);
+            fs.mkdirSync(path.dirname(writing), { recursive: true });
+            fs.writeFileSync(writing, 'half a download');
+            await start(t);
+            assert.strictEqual(read(writing), 'half a download');
         });
 
         it('never download into the replica\'s git repository, whatever the ignore patterns say', async () => {

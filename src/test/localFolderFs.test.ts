@@ -101,6 +101,30 @@ describe('the local replica\'s writes into its folder', () => {
         assert.strictEqual(read(other), 'new\n');
     });
 
+    it('remove what writes of processes that no longer run left in the temporary folder, and keep the files of a running one', async () => {
+        const { temporary } = layout();
+        fs.mkdirSync(temporary, { recursive: true });
+        // a process that has ended: Linux gives out process ids in increasing order up to pid_max, so its id stays free
+        const ended = spawnSync(process.execPath, ['-e', '']).pid;
+        const running = `${process.pid}-0123456789abcdef.tmp`;
+        for (const name of [running, `${ended}-0123456789abcdef.tmp`, 'notes.txt']) { fs.writeFileSync(path.join(temporary, name), 'x'); }
+        await localFs.removeLeftoverWrites(temporary);
+        assert.deepStrictEqual(fs.readdirSync(temporary), [running]);
+    });
+
+    it('remove a link at the temporary folder\'s path, and keep what it points to', async function () {
+        if (process.platform === 'win32') { this.skip(); }
+        const { temporary } = layout();
+        const elsewhere = path.join(dir, 'elsewhere');
+        fs.mkdirSync(elsewhere);
+        fs.writeFileSync(path.join(elsewhere, 'precious.txt'), 'x');
+        fs.mkdirSync(path.dirname(temporary), { recursive: true });
+        fs.symlinkSync(elsewhere, temporary);
+        await localFs.removeLeftoverWrites(temporary);
+        assert.strictEqual(fs.existsSync(temporary), false);
+        assert.deepStrictEqual(fs.readdirSync(elsewhere), ['precious.txt']);
+    });
+
     it('leave the old content in place when the new one cannot be written whole', function () {
         if (process.platform === 'win32') { this.skip(); }
         const { replica, temporary } = layout();

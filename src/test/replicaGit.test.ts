@@ -213,6 +213,34 @@ describe('local replica: git as the merge backend', function () {
         });
     });
 
+    it('saves the states of two stores of one folder at the same time, as when two replicas of the folder start together', async () => {
+        const t = await world();
+        const second = new GitReplicaStore({
+            folder: t.folder, projectId: 'p'.repeat(24), serverName: 'www.overleaf.com', ignorePatterns: DEFAULT_IGNORE_PATTERNS,
+            isIgnored: () => false, log: () => {},
+        });
+        await second.open();
+        const state = (path: string) => ({ version: 1 as const, entries: {}, untracked: [path] });
+        // the first save renames its file over the state file only once the second has written its own
+        const promises = require('fs/promises');
+        const rename = promises.rename;
+        let secondRenames!: () => void;
+        const secondRenaming = new Promise<void>(resolve => { secondRenames = resolve; });
+        let calls = 0;
+        promises.rename = async (from: string, to: string) => {
+            calls += 1;
+            if (calls === 1) { await secondRenaming; } else { secondRenames(); }
+            return rename(from, to);
+        };
+        try {
+            const saves = await Promise.allSettled([t.store.save(state('/first.tex')), second.save(state('/second.tex'))]);
+            assert.deepStrictEqual(saves.map(save => save.status === 'rejected' ? String(save.reason) : 'saved'), ['saved', 'saved']);
+        } finally {
+            promises.rename = rename;
+        }
+        assert.deepStrictEqual(fs.readdirSync(path.join(t.folder, '.git', 'overleaf', 'tmp')), [], 'the temporary files are gone');
+    });
+
     it('turns the replica\'s ignore patterns into gitignore lines', () => {
         assert.strictEqual(gitignoreLine('**/*.aux'), '*.aux');
         assert.strictEqual(gitignoreLine('**/.*'), '.*');

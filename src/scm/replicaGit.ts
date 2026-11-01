@@ -7,7 +7,7 @@ import * as path from 'path';
 import type { HistoryUpdate } from '../gitbridge/history';
 import { changedPaths, Entry, FlatTree, GitError } from '../gitbridge/plumbing';
 import { REPLICA_CONFLICTS_FOLDER, REPLICA_FOLDER, REPLICA_OWN_FOLDERS } from './ignorePatterns';
-import { isMissing } from './localFolderFs';
+import { isMissing, removeLeftoverWrites, writeFile } from './localFolderFs';
 import type { Origin, ReplicaStore, SavedState } from './replicaSync';
 
 /*
@@ -54,6 +54,8 @@ export const OVERLEAF_REF = 'refs/remotes/overleaf/main';
 /** The Overleaf version of commits that became Overleaf's state by a push. */
 export const NOTES_REF = 'refs/notes/overleaf';
 const NULL_OID = '0'.repeat(40);
+/** The replica's own folder in its git folder (<git dir>/overleaf): the sync state, and the tools' files. */
+export const REPLICA_FOLDER_IN_GIT_DIR = 'overleaf';
 /** Where the sync kept its state before it kept a git repository (`importLegacyState`). */
 const LEGACY_STATE_FOLDER = `${REPLICA_FOLDER}/sync`;
 
@@ -413,12 +415,22 @@ export class GitReplicaStore implements ReplicaStore {
 
     /** The repository's git folder, after making the folder a repository when it is not one. */
     open(): Promise<string> {
-        this.ready ??= ensureRepository(this.options.folder, this.options.ignorePatterns).then(dir => (this.gitDir = dir));
+        this.ready ??= ensureRepository(this.options.folder, this.options.ignorePatterns).then(async dir => {
+            this.gitDir = dir;
+            // what saves of processes that no longer run left behind (removeLeftoverWrites)
+            await removeLeftoverWrites(GitReplicaStore.stateTemporaryFolder(dir));
+            return dir;
+        });
         return this.ready;
     }
 
     private async stateFile(): Promise<string> {
-        return path.join(await this.open(), 'overleaf', 'state.json');
+        return path.join(await this.open(), REPLICA_FOLDER_IN_GIT_DIR, 'state.json');
+    }
+
+    /** Where `save` writes the state before it renames it over the state file: next to it, so on its file system. */
+    private static stateTemporaryFolder(gitDir: string): string {
+        return path.join(gitDir, REPLICA_FOLDER_IN_GIT_DIR, 'tmp');
     }
 
     // ---- ReplicaStore
@@ -477,13 +489,11 @@ export class GitReplicaStore implements ReplicaStore {
     }
 
     save(state: SavedState): Promise<void> {
-        // one save at a time, each a new file renamed over the old one, so that a crash cannot leave half a state
+        // One save at a time, each a new file renamed over the old one, so that a crash cannot leave
+        // half a state; its temporary name is its own, also when two stores of one folder save.
         const save = this.saving.then(async () => {
-            const file = await this.stateFile();
-            await fsp.mkdir(path.dirname(file), { recursive: true });
-            const tmp = `${file}.${process.pid}.tmp`;
-            await fsp.writeFile(tmp, JSON.stringify({ project: this.options.projectId, state } satisfies StateFile));
-            await fsp.rename(tmp, file);
+            const content = new TextEncoder().encode(JSON.stringify({ project: this.options.projectId, state } satisfies StateFile));
+            await writeFile(await this.stateFile(), content, GitReplicaStore.stateTemporaryFolder(await this.open()));
             this.lastState = state;
         });
         this.saving = save.catch(() => {});

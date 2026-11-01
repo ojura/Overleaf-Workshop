@@ -16,6 +16,7 @@ import * as path from 'path';
 import { ConnectError, merge, MergeResult, overleafCommitWithStart, rebase, RebaseResult, Start, startFromVersion } from '../gitbridge/connect';
 import { filesMatchVersion, findStartVersion, HistorySource, updateForVersion } from '../gitbridge/history';
 import { Repo } from '../gitbridge/plumbing';
+import { REPLICA_FOLDER_IN_GIT_DIR } from './replicaGit';
 
 /** Overleaf's states in a replica's repository (src/scm/replicaGit.ts). */
 const OVERLEAF_REF = 'refs/remotes/overleaf/main';
@@ -85,7 +86,7 @@ export async function connectReplica(repo: Repo, options: ConnectOptions): Promi
         start = await startFromVersion(repo, side, options.history, update, log);
     }
     const rebased = rebase(repo, local, start);
-    const mapFile = path.join(repo.gitDir(), 'overleaf', 'connect-map.txt');
+    const mapFile = path.join(repo.gitDir(), REPLICA_FOLDER_IN_GIT_DIR, 'connect-map.txt');
     fs.mkdirSync(path.dirname(mapFile), { recursive: true });
     fs.writeFileSync(mapFile, rebased.map.map(([o, n]) => `${o} ${n}`).join('\n') + '\n');
     repo.updateRef(START_REF, rebased.start);
