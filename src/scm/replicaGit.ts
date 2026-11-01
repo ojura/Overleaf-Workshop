@@ -89,14 +89,34 @@ function gitEnvironment(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
         'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_PREFIX']) {
         delete env[key];
     }
-    return { ...env, GIT_TERMINAL_PROMPT: '0', GIT_LITERAL_PATHSPECS: '1', ...extra };
+    // GIT_OPTIONAL_LOCKS=0: a command that only reads, as git status, does not take the index's
+    // lock to write its refreshed copy, so that the replica's own lock is only that of its writes
+    return { ...env, GIT_TERMINAL_PROMPT: '0', GIT_LITERAL_PATHSPECS: '1', GIT_OPTIONAL_LOCKS: '0', ...extra };
 }
 
 export interface GitResult { status: number; stdout: Buffer; stderr: string; }
 
 /** git in one folder, run without blocking: the extension host keeps serving the window meanwhile. */
 export class AsyncGit {
+    /** the index writes of this repository under way (ownIndexWrite), whose index lock is the replica's own */
+    private indexWrites = 0;
+
     constructor(readonly dir: string) {}
+
+    /** Whether an index write of this repository runs now (ownIndexWrite): an index lock is then the replica's own. */
+    get writesIndex(): boolean {
+        return this.indexWrites > 0;
+    }
+
+    /** Run `write`, a command that writes the repository's index, as one of the replica's own (writesIndex). */
+    async ownIndexWrite<T>(write: () => Promise<T>): Promise<T> {
+        this.indexWrites += 1;
+        try {
+            return await write();
+        } finally {
+            this.indexWrites -= 1;
+        }
+    }
 
     run(args: string[], options: { input?: string | Uint8Array, env?: Record<string, string>, allowFailure?: boolean } = {}): Promise<GitResult> {
         return new Promise((resolve, reject) => {
@@ -261,7 +281,7 @@ export class AsyncGit {
     async withIndexLock<T>(write: () => Promise<T>, waitMs = 10_000): Promise<T> {
         for (const end = Date.now() + waitMs; ;) {
             try {
-                return await write();
+                return await this.ownIndexWrite(write);
             } catch (error) {
                 if (!(error instanceof GitError) || !/index\.lock/.test(error.stderr) || Date.now() > end) { throw error; }
                 await new Promise(resolve => setTimeout(resolve, 200));
@@ -424,6 +444,8 @@ export class GitReplicaStore implements ReplicaStore {
     private unmerged?: { key: string, paths: Set<string> };
     /** where git keeps the files of GIT_OPERATIONS in this repository */
     private operationFiles?: Promise<{ file: string, what: string }[]>;
+    /** where git keeps the index's lock in this repository */
+    private indexLockFile?: Promise<string>;
     /** whether a checked-out commit contains Overleaf's recorded state, for the last pair asked about */
     private contains?: { key: string, value: boolean };
 
@@ -464,6 +486,33 @@ export class GitReplicaStore implements ReplicaStore {
             if (await exists(file)) { return what; }
         }
         return undefined;
+    }
+
+    /**
+     * The path of git's index lock (`git rev-parse --git-path index.lock`) while a program other
+     * than the replica holds it, as git does while it writes the work tree and the index; undefined
+     * while nobody holds it, or while one of the replica's own index writes runs (ownIndexWrite).
+     * The replica's other git commands do not take it (GIT_OPTIONAL_LOCKS=0).
+     */
+    async foreignIndexLock(): Promise<string | undefined> {
+        this.indexLockFile ??= (async () => {
+            await this.open();
+            return this.git.text(['rev-parse', '--path-format=absolute', '--git-path', 'index.lock']);
+        })();
+        const file = await this.indexLockFile;
+        return !this.git.writesIndex && await exists(file) ? file : undefined;
+    }
+
+    /** Resolves once the lock `file` is gone: at once when it is, else at the event of its folder that removes it. */
+    indexLockReleased(file: string): { released: Promise<void>, dispose(): void } {
+        let watcher: fs.FSWatcher | undefined;
+        const released = new Promise<void>((resolve, reject) => {
+            const check = () => { if (!fs.existsSync(file)) { watcher?.close(); resolve(); } };
+            watcher = fs.watch(path.dirname(file), check);
+            watcher.on('error', error => { watcher?.close(); reject(error); });
+            check();
+        });
+        return { released, dispose: () => watcher?.close() };
     }
 
     /**
@@ -994,7 +1043,7 @@ export class GitReplicaStore implements ReplicaStore {
         if (entries.size === 0 && unmerged.size === 0) {
             await this.git.withIndexLock(() => this.git.run(['read-tree', commit]));
             // the stat information, so that git status need not read every file again
-            await this.git.run(['update-index', '-q', '--refresh'], { allowFailure: true });
+            await this.git.ownIndexWrite(() => this.git.run(['update-index', '-q', '--refresh'], { allowFailure: true }));
         } else {
             this.options.log('The branch had no commit but the index had files; it now starts at Overleaf\'s state, and the index stays as it was.');
         }

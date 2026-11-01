@@ -179,6 +179,16 @@ export interface ReplicaStore {
      * never makes the sync wait.
      */
     workTree?(): Promise<WorkTreeState | undefined>,
+    /** The git operation under way in the folder, e.g. 'a merge', from the files that git keeps for it; undefined when none is. */
+    operation?(): Promise<string | undefined>,
+    /**
+     * The path of git's index lock while a program other than the store holds it, as git does
+     * while it writes the work tree and the index, e.g. during a checkout, which moves HEAD last;
+     * undefined while nobody holds it, or the store's own index write does.
+     */
+    foreignIndexLock?(): Promise<string | undefined>,
+    /** Resolves once the lock `file` is gone, at the event of its folder that removes it; `dispose` stops the watch before that. */
+    indexLockReleased?(file: string): {released: Promise<void>, dispose(): void},
 }
 
 export interface ReplicaUI {
@@ -291,6 +301,11 @@ export class FolderChangedError extends Error {
     constructor(readonly reason: FolderChange, message: string) { super(message); }
 }
 
+/** A reconcile found right before a write that the sync waits (`beforeWrite`): it leaves its path to the full sync after the wait. */
+class SyncWaitsError extends Error {
+    constructor(readonly reason: string) { super(`the sync waits: ${reason}`); }
+}
+
 class Semaphore {
     private waiting: (() => void)[] = [];
     constructor(private available: number) {}
@@ -371,6 +386,12 @@ export class ReplicaSync {
     static saveDelayMs = 1000;
     /** Record the state (the store's commits) once the sync has been idle this long. */
     static recordQuietMs = 10_000;
+    /**
+     * Tell the user about git's index lock once a window step has waited for it this long: a git
+     * that ended without removing it, e.g. at a crash, never answers, so the time limit is the
+     * only sign of it. The step keeps waiting for the lock's removal.
+     */
+    static staleLockMs = 10_000;
 
     private state: SavedState = {version: 1, entries: {}, untracked: []};
     private loaded?: Promise<void>;
@@ -404,6 +425,11 @@ export class ReplicaSync {
     private readonly questionListeners = new Set<(question: Deletions) => void>();
     /** why the sync waits instead of acting on the folder (`mayAct`); undefined while it acts */
     private waitReason?: string;
+    /** the index lock of another program that the window's steps wait for (`indexLockReleased`), and what is told about it once it is stale */
+    private lockWait?: {file: string, released: Promise<void>, stale?: string};
+    /** resolves when the sync stops, so that a step waiting for git's index lock ends then */
+    private readonly stopping: Promise<void>;
+    private markStopped!: () => void;
     /** the checked-out commit that the user agreed to put on Overleaf, and the last one asked about */
     private agreedHead?: string;
     private askedHead?: string;
@@ -436,6 +462,7 @@ export class ReplicaSync {
         private readonly isIgnored: (path: string) => boolean,
         options: {merge?: MergeText, uploads?: boolean, onRecorded?: (result: {waiting?: boolean}) => void} = {},
     ) {
+        this.stopping = new Promise<void>(resolve => { this.markStopped = resolve; });
         this.merge = options.merge ?? gitMergeText;
         this.uploads = options.uploads ?? true;
         this.onRecorded = options.onRecorded;
@@ -471,7 +498,7 @@ export class ReplicaSync {
 
     /** Why the sync waits instead of acting on the folder, e.g. for a tool's status; undefined while it acts. */
     get waitingFor(): string | undefined {
-        return this.waitReason;
+        return this.waitReason ?? this.lockWait?.stale;
     }
 
     /**
@@ -485,6 +512,15 @@ export class ReplicaSync {
      */
     private async mayAct(by?: 'tool' | 'user'): Promise<string | undefined> {
         await this.local.verify();
+        // While another program holds git's index lock, git writes the work tree and the index, as
+        // in a checkout, which moves HEAD last. A window step waits until the lock is gone and asks
+        // again, without the full sync that ends a wait: the step itself goes on. A tool's request
+        // answers at once that the sync waits.
+        for (let lock = await this.store.foreignIndexLock?.(); lock!==undefined; lock = await this.store.foreignIndexLock?.()) {
+            if (by==='tool') { return `git holds its index lock ${lock}: it is writing the folder, e.g. for a checkout`; }
+            await this.indexLockReleased(lock);
+            if (this.stopped) { return 'the sync stopped'; }
+        }
         const tree = await this.store.workTree?.();
         let reason: string | undefined;
         if (tree!==undefined && 'operation' in tree) {
@@ -518,6 +554,33 @@ export class ReplicaSync {
             }
         }
         return reason;
+    }
+
+    /**
+     * Resolves once another program's index lock `file` is gone (the store's event), or the sync
+     * stops; the window's steps that wait for it share one wait. When the lock stays for
+     * `staleLockMs`, the user is told, with the file, as git itself tells; the steps keep waiting.
+     */
+    private indexLockReleased(file: string): Promise<void> {
+        if (this.lockWait?.file===file) { return this.lockWait.released; }
+        const watch = this.store.indexLockReleased!(file);
+        const wait: {file: string, released: Promise<void>, stale?: string} = {file, released: Promise.resolve()};
+        const stale = setTimeout(() => {
+            wait.stale = `git's index lock ${file} has been there for ${ReplicaSync.staleLockMs/1000} s: a git command still runs in the folder, or one that ended without removing it left it, and git does not work there until it is removed`;
+            this.ui.log(`The sync waits: ${wait.stale}.`);
+            this.ui.waiting?.(wait.stale);
+        }, ReplicaSync.staleLockMs);
+        wait.released = Promise.race([watch.released, this.stopping]).finally(() => {
+            clearTimeout(stale);
+            watch.dispose();
+            if (this.lockWait===wait) { this.lockWait = undefined; }
+            if (wait.stale!==undefined) {
+                this.ui.log(`git's index lock ${file} is gone.`);
+                this.ui.waiting?.(this.waitReason);
+            }
+        });
+        this.lockWait = wait;
+        return wait.released;
     }
 
     private load(): Promise<void> {
@@ -684,10 +747,11 @@ export class ReplicaSync {
             const moves: [string, string][] = this.state.entries[from]!==undefined ? [[from, to]]
                 : Object.keys(this.state.entries).filter(p => p.startsWith(prefix)).map(p => [p, `${to}${p.slice(from.length)}`]);
             // each file moves, after the check that the sync may act on the folder (`mayAct`), and
-            // then both of its paths sync as they are, in the queues of both
+            // then both of its paths sync as they are, in the queues of both; a move that finds the
+            // sync waiting at either check, the first or the one right before it moves the file, waits
             const moving = moves.map(([a, b]) => this.inQueues([a, b], async () => {
-                if (await this.mayAct()!==undefined) { waits = true; return; }
-                await this.reported(a, mode, () => this.moveLocally(a, b, mode.summary));
+                const waitsFor = await this.mayAct() ?? await this.reported(a, mode, () => this.moveLocally(a, b, mode.summary));
+                if (waitsFor!==undefined) { waits = true; return; }
                 await this.reconcileReported(a, mode);
                 if (this.tracked(b)) { await this.reconcileReported(b, mode); }
             }));
@@ -728,6 +792,7 @@ export class ReplicaSync {
             this.local.stat(from), this.local.stat(to), this.remote.entry(from), this.remote.entry(to)]);
         if (localFrom===undefined || localFrom==='folder' || localTo!==undefined || remoteFrom!==undefined || remoteTo?.kind!==entry.kind) { return; }
         if (await this.isUnmerged(from) || await this.isUnmerged(to)) { return; }
+        await this.beforeWrite();
         await this.local.move(from, to);
         // The entry keeps the size and time the file had when it held the base. A hard link keeps
         // the file itself, with them, so they still tell whether it holds the base; a copy, where
@@ -865,6 +930,7 @@ export class ReplicaSync {
     /** Stop syncing: drop the queued work, wait for the running work and save the state. */
     async stop(): Promise<void> {
         this.stopped = true;
+        this.markStopped();
         await Promise.all([...this.slots.values()].map(slot => slot.tail));
         if (this.saveTimer) {
             clearTimeout(this.saveTimer);
@@ -939,18 +1005,40 @@ export class ReplicaSync {
     }
 
     /** Reconcile `path`, in its queue already; a failure goes into the summary and the log. */
-    private reconcileReported(path: string, mode: Mode): Promise<void> {
-        return this.reported(path, mode, () => this.reconcile(path, mode));
+    private async reconcileReported(path: string, mode: Mode): Promise<void> {
+        await this.reported(path, mode, () => this.reconcile(path, mode));
     }
 
-    /** Run `work` on `path`; a failure goes into the summary and the log. */
-    private async reported(path: string, mode: Mode, work: () => Promise<void>): Promise<void> {
+    /**
+     * Right before a reconcile writes to either side, or trashes or moves a file. A step asks
+     * mayAct when it starts; a git operation, or another program's index lock, that comes during
+     * the step is found here, and the reconcile then leaves its path (SyncWaitsError) to the full
+     * sync after the wait. When neither is there, the check is the existence of their files.
+     */
+    private async beforeWrite(): Promise<void> {
+        const [operation, lock] = await Promise.all([this.store.operation?.(), this.store.foreignIndexLock?.()]);
+        if (operation===undefined && lock===undefined) { return; }
+        const reason = await this.mayAct();
+        if (reason!==undefined) { throw new SyncWaitsError(reason); }
+    }
+
+    /**
+     * Run `work` on `path`; a failure goes into the summary and the log. Answers why the work
+     * stopped to wait for the sync (`SyncWaitsError`), undefined when it ran or failed.
+     */
+    private async reported(path: string, mode: Mode, work: () => Promise<void>): Promise<string | undefined> {
         try {
             await work();
         } catch (error) {
+            if (error instanceof SyncWaitsError) {
+                // not a failure: the full sync after the wait takes the path in
+                mode.summary.waitingFor ??= error.reason;
+                return error.reason;
+            }
             mode.summary.failed.push({path, error: errorText(error)});
             this.ui.log(`${path}: sync failed: ${errorText(error)}`);
         }
+        return undefined;
     }
 
     /**
@@ -1222,7 +1310,7 @@ export class ReplicaSync {
                         return;
                     }
                     // the rename, in the queues of both paths, after this reconcile
-                    (mode.queued ??= []).push(this.inQueues([from, path], () => this.reported(path, mode, () => this.renameLocalPair(from, path, renames, mode))));
+                    (mode.queued ??= []).push(this.inQueues([from, path], async () => { await this.reported(path, mode, () => this.renameLocalPair(from, path, renames, mode)); }));
                 }
             } else if (!mode.remoteMove && this.movingOnOverleaf(path)) {
                 // renamed on Overleaf: the move takes the local file, with its local changes
@@ -1230,6 +1318,7 @@ export class ReplicaSync {
             } else if (mode.deletions==='collect') {
                 mode.collected!.local.push(path);
             } else if (localHash===base) {
+                await this.beforeWrite();
                 await this.local.remove(path);
                 delete this.state.entries[path];
                 this.noteChange(path, 'remote');
@@ -1238,6 +1327,7 @@ export class ReplicaSync {
                 await this.local.removeFolderIfEmpty(parentOf(path));
             } else {
                 // deleted on Overleaf, changed locally: follow Overleaf and keep the local version aside
+                await this.beforeWrite();
                 const copy = await this.store.keepCopy(path, localContent ?? await this.local.read(path) ?? new Uint8Array());
                 await this.local.remove(path);
                 delete this.state.entries[path];
@@ -1268,7 +1358,7 @@ export class ReplicaSync {
         } else if (!this.uploads) {
             summary.held.push(path);
         } else {
-            await this.transfers.run(() => this.remote.remove(path));
+            await this.transfers.run(async () => { await this.beforeWrite(); await this.remote.remove(path); });
             delete this.state.entries[path];
             this.noteChange(path, 'local');
             summary.deletedRemote.push(path);
@@ -1294,6 +1384,7 @@ export class ReplicaSync {
         if (summary===undefined) {
             return content; // only needed for comparing
         }
+        await this.beforeWrite();
         const stat = await this.local.write(path, content);
         await this.setEntry(path, {kind: remote.kind, base: hash, ...stat, checked: Date.now()}, 'remote', text, content);
         summary.downloaded.push(path);
@@ -1321,10 +1412,10 @@ export class ReplicaSync {
                 return;
             }
             const sent = text;
-            await this.transfers.run(() => this.remote.writeDoc(path, sent));
+            await this.transfers.run(async () => { await this.beforeWrite(); await this.remote.writeDoc(path, sent); });
             kind = 'doc';
         } else {
-            const created = await this.transfers.run(() => this.remote.upload(path, content));
+            const created = await this.transfers.run(async () => { await this.beforeWrite(); return this.remote.upload(path, content); });
             kind = created.kind;
             if (kind==='doc') { text = decoder.decode(content); }
         }
@@ -1342,6 +1433,7 @@ export class ReplicaSync {
             return;
         }
         const merged = await this.merge(baseText, localText, remoteText);
+        await this.beforeWrite();
         // Markers left from an earlier conflict merge cleanly with new changes, but must not be
         // uploaded either; nor a merge into a file that git's index still has unmerged
         if (merged.hasConflict || (entry.conflict && (hasConflictMarkers(merged.content) || await this.isUnmerged(path)))) {
@@ -1365,7 +1457,7 @@ export class ReplicaSync {
         }
         if (merged.content!==remoteText) {
             const sent = merged.content;
-            await this.transfers.run(() => this.remote.writeDoc(path, sent));
+            await this.transfers.run(async () => { await this.beforeWrite(); await this.remote.writeDoc(path, sent); });
         }
         const written = merged.content!==localText ? await this.local.write(path, encoder.encode(merged.content)) : stat;
         await this.setEntry(path, {kind: 'doc', base: textHash(merged.content), ...seen(written)}, 'merge', merged.content);
@@ -1376,6 +1468,7 @@ export class ReplicaSync {
     /** Put Overleaf's version in place and keep a copy of the local one. */
     private async keepAside(path: string, localContent: Uint8Array | undefined, remote: RemoteEntry,
                             remoteText: string | undefined, remoteContent: Uint8Array | undefined, summary: SyncSummary) {
+        await this.beforeWrite();
         const copy = await this.store.keepCopy(path, localContent ?? new Uint8Array());
         await this.download(path, remote, remoteText, remoteContent, summary);
         summary.downloaded.pop();
@@ -1497,6 +1590,8 @@ export class ReplicaSync {
         const still = entry!==undefined && !entry.conflict && this.state.entries[to]===undefined && remoteFrom?.kind===entry.kind
             && remoteTo===undefined && localFrom===undefined && localTo!==undefined && localTo!=='folder';
         if (!still || await this.isUnmerged(from) || await this.isUnmerged(to)) { return false; }
+        // before the try: a rename that the check stops waits for the full sync after the wait, and is not taken for one that Overleaf refused
+        await this.beforeWrite();
         try {
             await this.transfers.run(() => this.remote.rename!(from, to));
         } catch (error) {

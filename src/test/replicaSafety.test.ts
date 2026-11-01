@@ -517,6 +517,22 @@ describe('local replica: what it deletes and what it never syncs', function () {
             execFileSync('git', ['-C', t.folder, 'merge-base', '--is-ancestor', OVERLEAF_REF, 'HEAD']);
         });
 
+        it('does not upload what a checkout under way writes, and tells a tool that it waits for git\'s index lock', async () => {
+            const t = host();
+            project(t, { '/main.tex': 'v1\n' });
+            const { requestReplica } = await start(t);
+            await cleanup.fileAppears(path.join(t.folder, POINTER_FILE));
+            // a checkout under way: git holds the index's lock while it writes the files
+            const lock = path.join(t.folder, '.git', 'index.lock');
+            fs.writeFileSync(lock, '');
+            cleanup.add(() => fs.rmSync(lock, { force: true }));
+            fs.writeFileSync(path.join(t.folder, 'main.tex'), 'v0, written by a checkout under way\n');
+            const answer: any = await requestReplica(t.folder, { op: 'sync' }, 15000);
+            assert.strictEqual(t.w.remote.get('/main.tex'), 'v1\n', 'Overleaf keeps its text');
+            assert.strictEqual(answer.ok, false, JSON.stringify(answer));
+            assert.ok(String(answer.summary?.waitingFor).includes(lock), JSON.stringify(answer));
+        });
+
         it('does not take a change made on Overleaf into a rebase that stopped to edit a commit', async () => {
             const t = host();
             const { scm } = await committedV2(t, { '/other.tex': 'o1\n' });

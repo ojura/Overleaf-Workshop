@@ -330,6 +330,24 @@ describe('local replica: git as the merge backend', function () {
         assert.deepStrictEqual(fs.readdirSync(path.join(t.folder, '.git', 'overleaf', 'tmp')), [], 'the temporary files are gone');
     });
 
+    it('tells git\'s index lock of another program, but not the lock of its own index write, and when the lock goes', async () => {
+        const t = await world();
+        const lock = path.join(t.folder, '.git', 'index.lock');
+        assert.strictEqual(await t.store.foreignIndexLock(), undefined, 'before the lock');
+        // another program's git takes the lock
+        fs.writeFileSync(lock, '');
+        assert.strictEqual(await t.store.foreignIndexLock(), lock);
+        assert.strictEqual(await t.store.git.ownIndexWrite(() => t.store.foreignIndexLock()), undefined, 'during the replica\'s own index write the lock is its own');
+        const { released, dispose } = t.store.indexLockReleased(lock);
+        try {
+            fs.rmSync(lock);
+            await released;
+        } finally {
+            dispose();
+        }
+        assert.strictEqual(await t.store.foreignIndexLock(), undefined, 'after the lock');
+    });
+
     it('turns the replica\'s ignore patterns into gitignore lines', () => {
         assert.strictEqual(gitignoreLine('**/*.aux'), '*.aux');
         assert.strictEqual(gitignoreLine('**/.*'), '.*');
@@ -1009,6 +1027,42 @@ describe('local replica: git as the merge backend', function () {
             t.remote.calls.length = 0;
             t.update(ALICE);
             await t.sync.remoteRenamed('/chapter.tex', '/intro.tex');
+            assert.deepStrictEqual([t.read('/chapter.tex'), fs.existsSync(path.join(t.folder, 'intro.tex'))], [edited, false], 'the local files while the sync waits');
+            // the merge ends; the full sync after the wait catches up
+            fs.rmSync(mergeHead);
+            await t.sync.syncAll();
+            assert.deepStrictEqual([fs.existsSync(path.join(t.folder, 'chapter.tex')), t.read('/intro.tex')], [false, edited], 'the local files: the moved file keeps the local change');
+            assert.ok(!fs.existsSync(path.join(t.folder, '.overleaf/conflicts')), 'nothing is kept aside');
+            assert.deepStrictEqual([t.remote.ids.get('/intro.tex'), t.remote.docs.get('/intro.tex')], [id, edited], 'the document on Overleaf: the renamed one, with the local change');
+            await t.sync.stop();
+        });
+
+        it('moves the local file when Overleaf renames it and git starts an operation while the move looks up the new path, once the operation ends', async () => {
+            const t = await synced({ '/chapter.tex': chapter });
+            const id = t.remote.idOf('/chapter.tex');
+            // a change saved, which no event has reported yet
+            t.write('/chapter.tex', edited);
+            await t.remote.rename('/chapter.tex', '/intro.tex');
+            t.remote.calls.length = 0;
+            t.update(ALICE);
+            // A merge starts after the move's first check, while the move looks up the new path on
+            // Overleaf: the check right before the move finds it.
+            const mergeHead = path.join(t.folder, '.git', 'MERGE_HEAD');
+            const entry = t.remote.entry;
+            let mergeStarted = false;
+            t.remote.entry = async (p: string) => {
+                if (p === '/intro.tex' && !mergeStarted) {
+                    mergeStarted = true;
+                    fs.writeFileSync(mergeHead, `${t.g('rev-parse', 'HEAD')}\n`);
+                }
+                return entry.call(t.remote, p);
+            };
+            try {
+                await t.sync.remoteRenamed('/chapter.tex', '/intro.tex');
+            } finally {
+                t.remote.entry = entry;
+            }
+            assert.ok(mergeStarted, 'the merge started during the move');
             assert.deepStrictEqual([t.read('/chapter.tex'), fs.existsSync(path.join(t.folder, 'intro.tex'))], [edited, false], 'the local files while the sync waits');
             // the merge ends; the full sync after the wait catches up
             fs.rmSync(mergeHead);
