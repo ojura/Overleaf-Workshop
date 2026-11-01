@@ -1,6 +1,6 @@
 // Does a viewer show the button to the other viewer, and what does a click send the host?
 // Saves a screenshot as shots/switch-<engine>.png in the work folder.
-//   node probes/switch-button.mjs [--ext DIR] [--engine pdfjs|overleaf] [--port 8850]
+//   node probes/switch-button.mjs [--ext DIR] [--engine pdfjs|overleaf] [--port N]
 import { checker, openHarness, shotPath, themeBook } from '../common.mjs';
 import { buttonOf, pageDrawn } from '../viewers.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
@@ -8,7 +8,7 @@ import { scriptOptions } from '../../lib/options.mjs';
 const options = scriptOptions({ engine: 'value', ext: 'value', port: 'number' });
 
 const engine = options.get('engine', 'pdfjs');
-const h = await openHarness({ name: `switch-${engine}`, port: options.get('port', 8850), ext: options.get('ext'), bookDir: themeBook(), latency: 5 });
+const h = await openHarness({ name: `switch-${engine}`, port: options.get('port'), ext: options.get('ext'), bookDir: themeBook(), latency: 5 });
 const { page } = h;
 const { check, summary } = checker();
 try {

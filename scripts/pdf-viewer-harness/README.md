@@ -85,8 +85,9 @@ node scripts/pdf-viewer-harness/probes/theme-colors.mjs --engine overleaf
 ```
 
 Every script takes `--ext DIR` for another `views/pdf-viewer` folder, such as another checkout's,
-and `--port N` for the server. Scripts on different ports can run at the same time. The usage of
-each script is in its first comment.
+and `--port N` for the server, which otherwise takes a port that is free when the script starts,
+so that scripts can run at the same time, also two runs of one script. The usage of each script is
+in its first comment.
 
 Each script starts its own server and Chrome, with a new Chrome profile and an empty piece cache,
 and stops both when it ends, also after Ctrl+C or a timeout. When a SIGKILL ends the script, the

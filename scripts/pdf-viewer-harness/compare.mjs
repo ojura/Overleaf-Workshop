@@ -1,7 +1,7 @@
 // Runs both viewers through drive.mjs and prints a side-by-side table: drive.mjs's measurements, and
 // each check that a run reported, by its name, with n/a for a run that did not report it (a check
 // of one viewer only).
-//   node compare.mjs [--ext <views/pdf-viewer dir>] [--overleaf DIR] [--pdfjs DIR] [--port 8785]
+//   node compare.mjs [--ext <views/pdf-viewer dir>] [--overleaf DIR] [--pdfjs DIR] [--port N]
 //                    [--engines overleaf,pdfjs] [--runs frame:40,frame:150,plain:40] [--out DIR]
 // --ext defaults to the checkout's views/pdf-viewer; --overleaf and --pdfjs take one viewer from
 // another folder, for example another checkout's. By default each viewer runs as VS Code shows it
@@ -28,7 +28,7 @@ const RUN_LIMIT_MS = 600000;
 const ext = options.get('ext', defaultExt);
 const exts = { overleaf: options.get('overleaf', ext), pdfjs: options.get('pdfjs', ext) };
 const engines = (options.get('engines', 'overleaf,pdfjs')).split(',');
-const port = options.get('port', 8785);
+const port = options.get('port');
 const runs = (options.get('runs', 'frame:40,frame:150,plain:40')).split(',').map(r => {
     const [mode, latency] = r.split(':');
     return { framed: mode === 'frame', latency: Number(latency) };
@@ -45,7 +45,7 @@ for (const engine of engines) {
         const json = path.join(outDir, `${name}.json`);
         fs.rmSync(json, { force: true });
         const args = [path.join(here, 'drive.mjs'), '--ext', path.resolve(exts[engine]), '--engine', engine, '--latency', String(run.latency),
-            '--port', String(port), '--json', json, '--shots', path.join(outDir, `shots-${name}`)];
+            ...(port ? ['--port', String(port)] : []), '--json', json, '--shots', path.join(outDir, `shots-${name}`)];
         if (run.framed) { args.push('--frame'); }
         console.log(`running ${name} ...`);
         // at the limit drive.mjs gets SIGTERM, ends as on Ctrl+C (scripts/lib/cleanup.mjs) and stops its Chrome

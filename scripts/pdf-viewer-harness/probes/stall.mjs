@@ -3,7 +3,7 @@
 // whether their text layer exists, and the number of fetches. Pages that stay unrendered show a
 // stall. --steps chooses which of update, load and sync run. The reload loads build A after an
 // update, and build B without one, since the viewer keeps a build that is already in view.
-//   node probes/stall.mjs [--ext DIR] [--latency 150] [--steps update,load,sync] [--port 8767]
+//   node probes/stall.mjs [--ext DIR] [--latency 150] [--steps update,load,sync] [--port N]
 // It prints what it sees, for a person to read; its exit status says only whether it ran to its end.
 import { book, bookFacts, openHarness } from '../common.mjs';
 import { OVERLEAF_DOCUMENTS, pageDrawn, viewerOf } from '../viewers.mjs';
@@ -12,7 +12,7 @@ import { scriptOptions } from '../../lib/options.mjs';
 const options = scriptOptions({ ext: 'value', latency: 'number', port: 'number', steps: 'value' });
 
 const bookDir = book();
-const h = await openHarness({ name: 'stall', port: options.get('port', 8767), ext: options.get('ext'), bookDir, latency: options.get('latency', 150) });
+const h = await openHarness({ name: 'stall', port: options.get('port'), ext: options.get('ext'), bookDir, latency: options.get('latency', 150) });
 const { page } = h;
 const problems = [];
 page.on('Runtime.consoleAPICalled', (p) => problems.push(`${p.type}: ${p.args.map(a => a.value ?? a.description ?? '').join(' ').slice(0, 200)}`));

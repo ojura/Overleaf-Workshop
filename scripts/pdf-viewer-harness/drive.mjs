@@ -2,11 +2,12 @@
 // and prints what it measured and checked; what it checks about the book comes from the book's
 // book.json (bookFacts).
 //   node drive.mjs [--ext <views/pdf-viewer dir>] [--engine overleaf|pdfjs] [--latency 40] [--frame]
-//                  [--port 8765] [--shots DIR] [--json FILE]
+//                  [--port N] [--shots DIR] [--json FILE]
 // --ext defaults to the checkout's views/pdf-viewer. --frame runs the page in a same-origin iframe
-// with the sandbox and allow lists of VS Code's webview, as VS Code does. Use another --port to
-// run two drives at once. Screenshots go to --shots, by default shots/<engine> in the
-// work folder (common.mjs); --json writes the measurements and checks to a file.
+// with the sandbox and allow lists of VS Code's webview, as VS Code does. The server takes a port
+// that is free when the script starts, or the one that --port names. Screenshots go to --shots, by
+// default shots/<engine> in the work folder (common.mjs); --json writes the measurements and checks
+// to a file.
 // The checks find the viewer's objects in the page through viewers.mjs.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -23,7 +24,7 @@ const engine = options.get('engine', 'overleaf');
 const framed = options.has('frame');
 const latency = options.get('latency', 40);
 const shots = path.resolve(options.get('shots', path.join(work, 'shots', engine)));
-const port = options.get('port', 8765);
+const port = options.get('port');
 fs.mkdirSync(shots, { recursive: true });
 
 const bookDir = book();

@@ -5,6 +5,7 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -148,13 +149,28 @@ export function bridgeModule() {
 }
 
 /**
- * Start server.mjs on `port` with an empty piece cache of its own (piece-cache-<name>-<port> in the
- * work folder) and wait until it listens. stop() stops the server and deletes the piece cache; when the
+ * A TCP port of 127.0.0.1 that is free at this moment: the one that the kernel gives a socket that
+ * listens on port 0, which then closes. Another process can take it before server.mjs listens on
+ * it; server.mjs then ends, and startServer fails, naming the port.
+ */
+async function freePort() {
+    const probe = net.createServer();
+    await new Promise((resolve, reject) => { probe.once('error', reject); probe.listen(0, '127.0.0.1', resolve); });
+    const { port } = probe.address();
+    await new Promise((resolve) => probe.close(resolve));
+    return port;
+}
+
+/**
+ * Start server.mjs on `port`, by default a port that is free when it starts (freePort), with an
+ * empty piece cache of its own (piece-cache-<name>-<port> in the work folder) and wait until it
+ * listens. stop() stops the server and deletes the piece cache; when the
  * script ends first, its clean-up kills the server and deletes the piece cache, and when a SIGKILL
  * ends the script, the kernel kills the server (spawnTied); the piece cache then stays. `args` are
  * more options for server.mjs; `stderr: 'pipe'` lets the caller read the server's errors.
  */
 export async function startServer({ name, port, ext = defaultExt, bookDir = book(), latency = 20, args = [], stderr = 'inherit' }) {
+    port ??= await freePort();
     const cache = path.join(work, `piece-cache-${name}-${port}`);
     fs.rmSync(cache, { recursive: true, force: true });
     const server = spawnTied(process.execPath, [path.join(here, 'server.mjs'), '--ext', ext, '--book', bookDir,

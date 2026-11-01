@@ -1,6 +1,6 @@
 // The Overleaf viewer: is a forward SyncTeX search drawn when it arrives before the first document,
 // and when it arrives during a reload? Each is a check; the exit status is 1 when one fails.
-//   node probes/pending-highlight.mjs [--ext DIR] [--port 8766]
+//   node probes/pending-highlight.mjs [--ext DIR] [--port N]
 import { notWithinLimit } from '../../lib/devtools.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 import { checker, openHarness } from '../common.mjs';
@@ -8,7 +8,7 @@ import { SYNCTEX_HIGHLIGHT, viewerOf } from '../viewers.mjs';
 
 const options = scriptOptions({ ext: 'value', port: 'number' });
 
-const h = await openHarness({ name: 'pending-highlight', port: options.get('port', 8766), ext: options.get('ext'), latency: 80 });
+const h = await openHarness({ name: 'pending-highlight', port: options.get('port'), ext: options.get('ext'), latency: 80 });
 const { page } = h;
 const { check, summary } = checker();
 try {

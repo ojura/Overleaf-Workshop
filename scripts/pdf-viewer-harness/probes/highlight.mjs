@@ -1,6 +1,6 @@
 // The Overleaf viewer: where does the highlight of a forward SyncTeX search land, relative to its
 // page and to the middle of the viewer?
-//   node probes/highlight.mjs [--ext DIR] [--port 8766]
+//   node probes/highlight.mjs [--ext DIR] [--port N]
 // It prints what it measures, for a person to read; its exit status says only whether it ran to its end.
 import { notWithinLimit } from '../../lib/devtools.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
@@ -9,7 +9,7 @@ import { pageDrawn, SYNCTEX_HIGHLIGHT, viewerOf } from '../viewers.mjs';
 
 const options = scriptOptions({ ext: 'value', port: 'number' });
 
-const h = await openHarness({ name: 'highlight', port: options.get('port', 8766), ext: options.get('ext'), latency: 20 });
+const h = await openHarness({ name: 'highlight', port: options.get('port'), ext: options.get('ext'), latency: 20 });
 const { page } = h;
 try {
     await page.send('Page.navigate', { url: `${h.origin}/page?engine=overleaf&doc=probe` });

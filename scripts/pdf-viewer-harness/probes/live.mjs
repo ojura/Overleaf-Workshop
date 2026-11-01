@@ -3,7 +3,7 @@
 // download domain serves a build by its URL, without a login. Prints the bridge's exchanges, how
 // long the first page took, and the page's console problems.
 //   node probes/live.mjs --response <compile-response.json> --project <project id>
-//                        [--ext DIR] [--engine pdfjs|overleaf] [--port 8820] [--seconds 60]
+//                        [--ext DIR] [--engine pdfjs|overleaf] [--port N] [--seconds 60]
 // The compile response is the JSON that Overleaf's compile endpoint answers, saved from a compile
 // of a project you may compile, such as a private copy for tests; its build stays on the download
 // domain for a limited time after the compile.
@@ -25,7 +25,7 @@ const engine = options.get('engine', 'pdfjs');
 const seconds = options.get('seconds', 60);
 // server.mjs reads a book at start; in live mode the pages show the compile response's build
 const h = await openHarness({
-    name: `live-${engine}`, port: options.get('port', 8820), ext: options.get('ext'), bookDir: themeBook(), latency: 0,
+    name: `live-${engine}`, port: options.get('port'), ext: options.get('ext'), bookDir: themeBook(), latency: 0,
     args: ['--live', path.resolve(response), '--live-project', project], stderr: 'pipe',
 });
 h.server.stderr.on('data', d => process.stdout.write(String(d)));

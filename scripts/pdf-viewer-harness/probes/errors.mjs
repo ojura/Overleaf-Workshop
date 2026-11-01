@@ -1,7 +1,7 @@
 // The Overleaf viewer: five reloads within a few milliseconds (the last build must stay, with one
 // document), the banner for a build that is gone from the server, and the Recompile button.
 // Each of these is a check; the exit status is 1 when one fails (common.mjs's checker).
-//   node probes/errors.mjs [--ext DIR] [--port 8766]
+//   node probes/errors.mjs [--ext DIR] [--port N]
 import { notWithinLimit } from '../../lib/devtools.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 import { checker, openHarness, shotPath } from '../common.mjs';
@@ -9,7 +9,7 @@ import { OVERLEAF_DOCUMENTS, pageDrawn, pageInViewDrawn, RENDERING_FINISHED, vie
 
 const options = scriptOptions({ ext: 'value', port: 'number' });
 
-const h = await openHarness({ name: 'errors', port: options.get('port', 8766), ext: options.get('ext'), latency: 30 });
+const h = await openHarness({ name: 'errors', port: options.get('port'), ext: options.get('ext'), latency: 30 });
 const { page } = h;
 const { check, summary } = checker();
 const problems = [];

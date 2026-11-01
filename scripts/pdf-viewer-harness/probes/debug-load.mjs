@@ -1,6 +1,6 @@
 // Opens a book in a viewer, waits 8 s, and prints the viewer's state, the stub's last events, the
 // page's console messages and the server's errors.
-//   node probes/debug-load.mjs [--ext DIR] [--engine pdfjs|overleaf] [--book DIR] [--port 8794]
+//   node probes/debug-load.mjs [--ext DIR] [--engine pdfjs|overleaf] [--book DIR] [--port N]
 // --book is a folder of make_book.py or theme_book.py; the default is the test book of book() in common.mjs.
 // It prints what it sees, for a person to read; its exit status says only whether it ran to its end.
 import { openHarness } from '../common.mjs';
@@ -10,7 +10,7 @@ import { scriptOptions } from '../../lib/options.mjs';
 const options = scriptOptions({ book: 'value', engine: 'value', ext: 'value', port: 'number' });
 
 const engine = options.get('engine', 'pdfjs');
-const h = await openHarness({ name: `debug-${engine}`, port: options.get('port', 8794), ext: options.get('ext'), bookDir: options.get('book'), latency: 5, stderr: 'pipe' });
+const h = await openHarness({ name: `debug-${engine}`, port: options.get('port'), ext: options.get('ext'), bookDir: options.get('book'), latency: 5, stderr: 'pipe' });
 let serverErrors = '';
 h.server.stderr.on('data', d => { serverErrors += d; });
 const logs = [];

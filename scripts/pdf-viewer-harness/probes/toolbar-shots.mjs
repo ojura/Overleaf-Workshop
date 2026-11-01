@@ -3,7 +3,7 @@
 // In the pdfjs viewer it also opens the find bar and the tools menu at each width and lists their
 // elements past the edge. The book has --pages pages (default 456), since the page count's digits
 // take room in the toolbar.
-//   node probes/toolbar-shots.mjs [--ext DIR] [--engine pdfjs|overleaf] [--pages 456] [--out DIR] [--port 8860]
+//   node probes/toolbar-shots.mjs [--ext DIR] [--engine pdfjs|overleaf] [--pages 456] [--out DIR] [--port N]
 // --out defaults to shots/toolbar-<engine> in the work folder.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -17,7 +17,7 @@ const engine = options.get('engine', 'pdfjs');
 const pages = options.get('pages', 456);
 const outDir = path.resolve(options.get('out', path.join(work, 'shots', `toolbar-${engine}`)));
 fs.mkdirSync(outDir, { recursive: true });
-const h = await openHarness({ name: `toolbar-${engine}`, port: options.get('port', 8860), ext: options.get('ext'), bookDir: book(`book-${pages}`, pages, 1), latency: 5, width: 1400, height: 500 });
+const h = await openHarness({ name: `toolbar-${engine}`, port: options.get('port'), ext: options.get('ext'), bookDir: book(`book-${pages}`, pages, 1), latency: 5, width: 1400, height: 500 });
 const { page } = h;
 /** the elements in `selector`'s element whose right edge is past the pane's */
 const past = (selector) => page.evaluate(pastRightEdge(selector));
