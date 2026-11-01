@@ -370,6 +370,8 @@ class Panel {
     /** the page sends `message` */
     send(message: any) { this.receive!(message); }
     setVisible(visible: boolean) { this.visible = visible; this.viewState!({ webviewPanel: this }); }
+    /** the panel gains or loses the focus, as when the focus moves between it and an editor */
+    setActive(active: boolean) { this.active = active; this.viewState!({ webviewPanel: this }); }
     close() { this.closing.forEach(listener => listener()); }
     /** the first message of `type` that the provider posted, or posts */
     first(type: string): Promise<any> {
@@ -627,6 +629,28 @@ describe('the build in use, from Overleaf to the window', function () {
             await ended;
             assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
             assert.strictEqual(panel.posted.filter(message => message.type === 'load').pop().output.file.build, 'b-new');
+        });
+
+        it('asks Overleaf for the latest compile when the viewer becomes visible, and not when only its focus changes', async () => {
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            const { panel } = await open();
+            await panel.first('load');
+            const asked = () => overleaf.to('/project/p1/output/cached/output.overleaf.json').length;
+            // after the opening's check
+            await vfs.builds.check();
+            const before = asked();
+            // the focus moves between an editor and the visible viewer
+            panel.setActive(false);
+            panel.setActive(true);
+            panel.setActive(false);
+            panel.setActive(true);
+            await vfs.builds.check();
+            assert.strictEqual(asked(), before + 1, 'only the test\'s own check');
+            // hidden, and shown again: one check, then the test's
+            panel.setVisible(false);
+            panel.setVisible(true);
+            await vfs.builds.check();
+            assert.strictEqual(asked(), before + 3);
         });
 
         it('compiles on its own once when builds are reported gone one after another, until the viewer shows one', async () => {

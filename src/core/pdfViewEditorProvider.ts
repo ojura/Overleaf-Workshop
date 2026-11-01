@@ -262,15 +262,19 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         void builds?.check();
 
         // register event listeners
+        // the panel's view state changes when it becomes visible or hidden, and also when it gains
+        // or loses the focus, which does not call for a check
+        let wasVisible = webviewPanel.visible;
         webviewPanel.onDidChangeViewState((e) => {
             if (e.webviewPanel.active && doc.isProjectFile) {
                 EventBus.fire('fileWillOpenEvent', {uri: doc.uri});
             }
             // shown again: another client (the web editor, another window, a command-line tool)
             // may have compiled meanwhile
-            if (e.webviewPanel.visible) {
+            if (e.webviewPanel.visible && !wasVisible) {
                 void builds?.check();
             }
+            wasVisible = e.webviewPanel.visible;
         });
         webviewPanel.webview.onDidReceiveMessage((e: ViewerMessage) => {
             switch (e.type) {
