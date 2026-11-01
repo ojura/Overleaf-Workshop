@@ -2,9 +2,12 @@
 // document), the banner for a build that is gone from the server, and the Recompile button.
 //   node probes/errors.mjs [--ext DIR] [--port 8766]
 import { notWithinLimit } from '../../lib/devtools.mjs';
-import { arg, openHarness, shotPath } from '../common.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
+import { openHarness, shotPath } from '../common.mjs';
 
-const h = await openHarness({ name: 'errors', port: Number(arg('port', '8766')), ext: arg('ext'), latency: 30 });
+const options = scriptOptions({ ext: 'value', port: 'number' });
+
+const h = await openHarness({ name: 'errors', port: options.get('port', 8766), ext: options.get('ext'), latency: 30 });
 const { page } = h;
 const problems = [];
 page.on('Runtime.consoleAPICalled', (p) => { if (p.type === 'error' || p.type === 'warning') { problems.push(`${p.type}: ${p.args.map(a => a.value ?? a.description ?? '').join(' ').slice(0, 200)}`); } });

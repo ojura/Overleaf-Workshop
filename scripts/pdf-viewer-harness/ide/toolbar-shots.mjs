@@ -13,18 +13,23 @@
 // switch buttons write.
 import fs from 'node:fs';
 import path from 'node:path';
-import { arg, work } from '../common.mjs';
-import { associatePdfs, instance, openWithQuickOpen, runCommand, settings, sleep, viewerPage, workbench } from './ide.mjs';
+import { work } from '../common.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
+import {
+    associatePdfs, instance, INSTANCE_OPTION, openWithQuickOpen, runCommand, settings, sleep, viewerPage, workbench,
+} from './ide.mjs';
 
-const pdf = arg('pdf');
+const options = scriptOptions({ ...INSTANCE_OPTION, pdf: 'value', widths: 'value', out: 'value' });
+
+const pdf = options.get('pdf');
 if (!pdf) { console.error('usage: node ide/toolbar-shots.mjs --pdf <path> [--widths ...] [--out DIR]'); process.exit(2); }
 // Quick Open finds files by name, so a path that does not exist could open another file of that name
 if (!fs.existsSync(path.resolve(pdf))) { console.error(`${path.resolve(pdf)} does not exist`); process.exit(2); }
-const widths = arg('widths', '1440,1085,900,760,600,450,340,262').split(',').map(Number);
-const outDir = path.resolve(arg('out', path.join(work, 'shots', 'ide-toolbars')));
+const widths = options.get('widths', '1440,1085,900,760,600,450,340,262').split(',').map(Number);
+const outDir = path.resolve(options.get('out', path.join(work, 'shots', 'ide-toolbars')));
 fs.mkdirSync(outDir, { recursive: true });
 const SETTING = 'overleaf-workshop.pdfViewer.engine';
-const inst = instance();
+const inst = instance(options);
 const config = settings(inst);
 // the switch buttons write the viewer setting; it is restored when the script ends
 const restoreEngine = config.guard(SETTING);

@@ -26,10 +26,23 @@ fs.mkdirSync(work, { recursive: true });
 // outlives, the kernel kills the server and Chrome (spawnTied), and their folders stay in the work
 // folder.
 
-/** The value of the option `--name`, or `fallback`. */
+/**
+ * The value of server.mjs's option `--name` (`--name value` or `--name=value`), or `fallback`; an
+ * option given without its value ends the script with exit status 64. server.mjs reads its options
+ * this way; the other scripts name theirs (scriptOptions in scripts/lib/options.mjs), which also
+ * refuses an option that the script does not have.
+ */
 export const arg = (name, fallback) => {
-    const i = process.argv.indexOf(`--${name}`);
-    return i > 0 ? process.argv[i + 1] : fallback;
+    const argv = process.argv.slice(2);
+    const inline = argv.find(a => a.startsWith(`--${name}=`));
+    if (inline !== undefined) { return inline.slice(name.length + 3); }
+    const i = argv.indexOf(`--${name}`);
+    if (i < 0) { return fallback; }
+    if (argv[i + 1] === undefined || argv[i + 1].startsWith('--')) {
+        console.error(`--${name} needs a value`);
+        process.exit(64);
+    }
+    return argv[i + 1];
 };
 
 /** A file in the work folder's shots/ folder, which is created when missing. */

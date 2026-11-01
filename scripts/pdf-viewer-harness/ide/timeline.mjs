@@ -3,14 +3,16 @@
 //   node ide/timeline.mjs [--seconds 25] [--tab output.pdf]
 // --tab is the start of the tab's label, for another PDF's tab. When the tab is not open, or the
 // viewer page does not appear in the new webview, it prints the error and exits with 1.
-import { arg } from '../common.mjs';
-import { evaluate, instance, reopenTab, sleep, viewerPage, workbench } from './ide.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
+import { evaluate, instance, INSTANCE_OPTION, reopenTab, sleep, viewerPage, workbench } from './ide.mjs';
 
-const seconds = Number(arg('seconds', '25'));
-const wb = await workbench(instance());
+const options = scriptOptions({ ...INSTANCE_OPTION, seconds: 'number', tab: 'value' });
+
+const seconds = options.get('seconds', 25);
+const wb = await workbench(instance(options));
 try {
     const t0 = Date.now();
-    const frame = await reopenTab(wb, arg('tab', 'output.pdf'));
+    const frame = await reopenTab(wb, options.get('tab', 'output.pdf'));
     if (!frame) { throw new Error('the tab is not open, or it did not open again in a new viewer webview'); }
     const log = [];
     const at = () => `${String(Date.now() - t0).padStart(6)} ms`;

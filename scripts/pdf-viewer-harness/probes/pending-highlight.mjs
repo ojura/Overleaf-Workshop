@@ -2,9 +2,12 @@
 // and when it arrives during a reload?
 //   node probes/pending-highlight.mjs [--ext DIR] [--port 8766]
 import { notWithinLimit } from '../../lib/devtools.mjs';
-import { arg, openHarness } from '../common.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
+import { openHarness } from '../common.mjs';
 
-const h = await openHarness({ name: 'pending-highlight', port: Number(arg('port', '8766')), ext: arg('ext'), latency: 80 });
+const options = scriptOptions({ ext: 'value', port: 'number' });
+
+const h = await openHarness({ name: 'pending-highlight', port: options.get('port', 8766), ext: options.get('ext'), latency: 80 });
 const { page } = h;
 try {
     const V = 'window.overleafViewer.wrapper.viewer';

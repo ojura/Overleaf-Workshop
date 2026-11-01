@@ -108,6 +108,7 @@ import { fileURLToPath } from 'node:url';
 import { onCleanup, run } from './lib/cleanup.mjs';
 import { answerWithin, evaluate, removeActivePort, WaitLimitError } from './lib/devtools.mjs';
 import { buildCheckout, EXTENSION_ID, IDES, installedExtension, installInto } from './lib/install-build.mjs';
+import { parseOptions, usageOf, UsageError } from './lib/options.mjs';
 import {
     bootId, checkInstanceFolder, connectMainProcess, connectWindow, inMainProcess, instanceHome, instanceProcesses, isRecordedProcess,
     drawsExpression, processStat, readInstance, readRunningInstance, waitForInstance, workbenchTarget, writeInstance,
@@ -136,29 +137,11 @@ const userState = process.env.HIDDEN_IDE_USER_STATE ?? path.join(antigravity.dat
 const userExtensions = process.env.HIDDEN_IDE_USER_EXTENSIONS ?? antigravity.extensions;
 const testProjects = path.join(process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), '.config'), 'overleaf-workshop', 'test-projects');
 
-/** A wrong use of a command: the error, and then the usage, with exit status 64. */
-class UsageError extends Error {}
 /** A failure with an exit status of its own. */
 const failure = (message, status) => Object.assign(new Error(message), { status });
 
 /** The usage: the comment at the top of this file. */
-function usage() {
-    const lines = fs.readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n');
-    return lines.slice(0, lines.findIndex(line => !line.startsWith('//'))).map(line => line.replace(/^\/\/ ?/, '')).join('\n');
-}
-
-/** The options of `argv` as { name: value }; each takes a value, as --name VALUE or --name=VALUE. */
-function parseOptions(argv, names) {
-    const values = {};
-    for (let i = 0; i < argv.length; i++) {
-        const option = /^--([a-z-]+)(?:=(.*))?$/s.exec(argv[i]);
-        if (!option || !names.includes(option[1])) { throw new UsageError(`unknown option ${argv[i]}`); }
-        const value = option[2] ?? argv[++i];
-        if (value === undefined) { throw new UsageError(`--${option[1]} needs a value`); }
-        values[option[1]] = value;
-    }
-    return values;
-}
+const usage = () => usageOf(fileURLToPath(import.meta.url));
 
 /** Write `text` to `file` through a new file that is renamed over it, readable only by this user. */
 function writePrivately(file, text) {
@@ -480,7 +463,7 @@ if project:
 
 /** start: see the usage at the top. */
 async function start(...argv) {
-    const options = parseOptions(argv, ['project', 'folder', 'project-name', 'build', 'ide', 'display', 'screen']);
+    const options = parseOptions({ project: 'value', folder: 'value', 'project-name': 'value', build: 'value', ide: 'value', display: 'value', screen: 'value' }, argv);
     const home = instanceFolder({ make: true });
     const previous = recordIfAny(home);
     if (previous && instanceProcesses(previous).length > 0) {

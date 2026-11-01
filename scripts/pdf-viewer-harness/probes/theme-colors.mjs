@@ -2,10 +2,13 @@
 // steps through the themes with the theme button and counts the pixel colors in each element's
 // area. Saves a screenshot per theme as shots/theme-<engine>-<theme>.png in the work folder.
 //   node probes/theme-colors.mjs [--ext DIR] [--engine pdfjs|overleaf] [--port 8790]
-import { arg, openHarness, shotPath, themeBook } from '../common.mjs';
+import { openHarness, shotPath, themeBook } from '../common.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
 
-const engine = arg('engine', 'pdfjs');
-const h = await openHarness({ name: `theme-${engine}`, port: Number(arg('port', '8790')), ext: arg('ext'), bookDir: themeBook(), latency: 5 });
+const options = scriptOptions({ engine: 'value', ext: 'value', port: 'number' });
+
+const engine = options.get('engine', 'pdfjs');
+const h = await openHarness({ name: `theme-${engine}`, port: options.get('port', 8790), ext: options.get('ext'), bookDir: themeBook(), latency: 5 });
 const { page } = h;
 const problems = [];
 page.on('Runtime.consoleAPICalled', (p) => { if (p.type === 'error' || p.type === 'warning') { problems.push(p.args.map(a => a.value ?? a.description).join(' ').slice(0, 200)); } });

@@ -11,15 +11,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { notWithinLimit } from '../lib/devtools.mjs';
+import { scriptOptions } from '../lib/options.mjs';
 import { launchChrome } from './cdp.mjs';
-import { arg, book, defaultExt, startServer, work } from './common.mjs';
+import { book, defaultExt, startServer, work } from './common.mjs';
 
-const ext = path.resolve(arg('ext', defaultExt));
-const engine = arg('engine', 'overleaf');
-const framed = process.argv.includes('--frame');
-const latency = arg('latency', '40');
-const shots = path.resolve(arg('shots', path.join(work, 'shots', engine)));
-const port = Number(arg('port', '8765'));
+const options = scriptOptions({ ext: 'value', engine: 'value', frame: 'flag', latency: 'number', shots: 'value', port: 'number', json: 'value' });
+
+const ext = path.resolve(options.get('ext', defaultExt));
+const engine = options.get('engine', 'overleaf');
+const framed = options.has('frame');
+const latency = options.get('latency', 40);
+const shots = path.resolve(options.get('shots', path.join(work, 'shots', engine)));
+const port = options.get('port', 8765);
 fs.mkdirSync(shots, { recursive: true });
 
 const { origin, stop: stopServer } = await startServer({ name: `drive-${engine}`, port, ext, bookDir: book(), latency });
@@ -251,7 +254,7 @@ try {
     console.log(`\nconsole errors and warnings in the page (${problems.length}):`);
     for (const p of [...new Set(problems)].slice(0, 30)) { console.log(`  ${p}`); }
     const failed = results.filter(r => !r.ok).length;
-    const jsonFile = arg('json');
+    const jsonFile = options.get('json');
     if (jsonFile) { fs.writeFileSync(jsonFile, JSON.stringify({ engine, framed, latency: Number(latency), metrics, results, problems: [...new Set(problems)] }, null, 1)); }
     console.log(`\n${results.length - failed} passed, ${failed} failed; screenshots in ${shots}`);
     await close();

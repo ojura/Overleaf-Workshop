@@ -9,17 +9,20 @@ import path from 'node:path';
 import { onCleanup, sleep } from '../../lib/cleanup.mjs';
 import { answerWithin, evaluate, waitUntil, notWithinLimit } from '../../lib/devtools.mjs';
 import { checkInstanceFolder, connectWindow, drawsExpression, instanceHome, readRunningInstance, workbenchTarget } from '../../lib/test-instance.mjs';
-import { arg } from '../common.mjs';
 
 export { evaluate, waitUntil, notWithinLimit, onCleanup, sleep };
 
+/** The option that every driver takes: --instance DIR, the instance's folder, else $HIDDEN_IDE_HOME. */
+export const INSTANCE_OPTION = { instance: 'value' };
+
 /**
  * The instance: its record in instance.json (pid, devtools, display, profile, replica, ...) and its
- * folder, home. The folder is checked first (checkInstanceFolder), and the instance must run
- * (readRunningInstance), before a driver changes a setting.
+ * folder, home, from the script's options (scripts/lib/options.mjs, with INSTANCE_OPTION). The
+ * folder is checked first (checkInstanceFolder), and the instance must run (readRunningInstance),
+ * before a driver changes a setting.
  */
-export function instance() {
-    const home = instanceHome(arg('instance'));
+export function instance(options) {
+    const home = instanceHome(options.get('instance'));
     checkInstanceFolder(home);
     return readRunningInstance(home);
 }

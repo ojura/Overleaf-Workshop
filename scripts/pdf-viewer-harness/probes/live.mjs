@@ -9,19 +9,22 @@
 // domain for a limited time after the compile.
 import path from 'node:path';
 import { notWithinLimit } from '../../lib/devtools.mjs';
-import { arg, openHarness, themeBook } from '../common.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
+import { openHarness, themeBook } from '../common.mjs';
 
-const response = arg('response');
-const project = arg('project');
+const options = scriptOptions({ engine: 'value', ext: 'value', port: 'number', project: 'value', response: 'value', seconds: 'number' });
+
+const response = options.get('response');
+const project = options.get('project');
 if (!response || !project) {
     console.error('usage: node probes/live.mjs --response <compile-response.json> --project <project id> [--engine pdfjs|overleaf]');
     process.exit(2);
 }
-const engine = arg('engine', 'pdfjs');
-const seconds = Number(arg('seconds', '60'));
+const engine = options.get('engine', 'pdfjs');
+const seconds = options.get('seconds', 60);
 // server.mjs reads a book at start; in live mode the pages show the compile response's build
 const h = await openHarness({
-    name: `live-${engine}`, port: Number(arg('port', '8820')), ext: arg('ext'), bookDir: themeBook(), latency: 0,
+    name: `live-${engine}`, port: options.get('port', 8820), ext: options.get('ext'), bookDir: themeBook(), latency: 0,
     args: ['--live', path.resolve(response), '--live-project', project], stderr: 'pipe',
 });
 h.server.stderr.on('data', d => process.stdout.write(String(d)));

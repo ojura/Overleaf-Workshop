@@ -12,7 +12,10 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { EXIT_CODES } from '../lib/cleanup.mjs';
-import { arg, defaultExt, here, work } from './common.mjs';
+import { scriptOptions } from '../lib/options.mjs';
+import { defaultExt, here, work } from './common.mjs';
+
+const options = scriptOptions({ ext: 'value', overleaf: 'value', pdfjs: 'value', engines: 'value', port: 'number', runs: 'value', out: 'value' });
 
 /**
  * The last resort for a drive that never ends: drive.mjs ends on its own, also when the viewer
@@ -20,15 +23,15 @@ import { arg, defaultExt, here, work } from './common.mjs';
  */
 const RUN_LIMIT_MS = 600000;
 
-const ext = arg('ext', defaultExt);
-const exts = { overleaf: arg('overleaf', ext), pdfjs: arg('pdfjs', ext) };
-const engines = (arg('engines', 'overleaf,pdfjs')).split(',');
-const port = Number(arg('port', '8785'));
-const runs = (arg('runs', 'frame:40,frame:150,plain:40')).split(',').map(r => {
+const ext = options.get('ext', defaultExt);
+const exts = { overleaf: options.get('overleaf', ext), pdfjs: options.get('pdfjs', ext) };
+const engines = (options.get('engines', 'overleaf,pdfjs')).split(',');
+const port = options.get('port', 8785);
+const runs = (options.get('runs', 'frame:40,frame:150,plain:40')).split(',').map(r => {
     const [mode, latency] = r.split(':');
     return { framed: mode === 'frame', latency: Number(latency) };
 });
-const outDir = path.resolve(arg('out', path.join(work, 'compare')));
+const outDir = path.resolve(options.get('out', path.join(work, 'compare')));
 fs.mkdirSync(outDir, { recursive: true });
 
 const all = {};

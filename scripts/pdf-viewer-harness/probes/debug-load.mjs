@@ -2,10 +2,13 @@
 // page's console messages and the server's errors.
 //   node probes/debug-load.mjs [--ext DIR] [--engine pdfjs|overleaf] [--book DIR] [--port 8794]
 // --book is a folder of make_book.py or theme_book.py; the default is the 120-page test book.
-import { arg, openHarness } from '../common.mjs';
+import { openHarness } from '../common.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
 
-const engine = arg('engine', 'pdfjs');
-const h = await openHarness({ name: `debug-${engine}`, port: Number(arg('port', '8794')), ext: arg('ext'), bookDir: arg('book'), latency: 5, stderr: 'pipe' });
+const options = scriptOptions({ book: 'value', engine: 'value', ext: 'value', port: 'number' });
+
+const engine = options.get('engine', 'pdfjs');
+const h = await openHarness({ name: `debug-${engine}`, port: options.get('port', 8794), ext: options.get('ext'), bookDir: options.get('book'), latency: 5, stderr: 'pipe' });
 let serverErrors = '';
 h.server.stderr.on('data', d => { serverErrors += d; });
 const logs = [];

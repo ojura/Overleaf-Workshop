@@ -4,9 +4,12 @@
 // stall. --steps chooses which of update, load and sync run. The reload loads build A after an
 // update, and build B without one, since the viewer keeps a build that is already in view.
 //   node probes/stall.mjs [--ext DIR] [--latency 150] [--steps update,load,sync] [--port 8767]
-import { arg, openHarness } from '../common.mjs';
+import { openHarness } from '../common.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
 
-const h = await openHarness({ name: 'stall', port: Number(arg('port', '8767')), ext: arg('ext'), latency: arg('latency', '150') });
+const options = scriptOptions({ ext: 'value', latency: 'number', port: 'number', steps: 'value' });
+
+const h = await openHarness({ name: 'stall', port: options.get('port', 8767), ext: options.get('ext'), latency: options.get('latency', 150) });
 const { page } = h;
 const problems = [];
 page.on('Runtime.consoleAPICalled', (p) => problems.push(`${p.type}: ${p.args.map(a => a.value ?? a.description ?? '').join(' ').slice(0, 200)}`));
@@ -16,7 +19,7 @@ try {
     const V = 'window.overleafViewer.wrapper.viewer';
     await page.waitFor(`window.overleafViewer?.wrapper?.viewer?.getPageView(0)?.renderingState === 3`, 60000);
     const states = (pages) => page.evaluate(`JSON.stringify([${pages}].map(n => [n, ${V}.getPageView(n - 1)?.renderingState, !!document.querySelector('.page[data-page-number="' + n + '"] .textLayer span')]))`);
-    const steps = arg('steps', 'update,load,sync');
+    const steps = options.get('steps', 'update,load,sync');
     if (steps.includes('update')) {
         await page.evaluate(`window.__old = ${V}.pdfDocument; harness.update('a'); true`);
         await page.waitFor(`${V}.pdfDocument !== window.__old && ${V}.pagesCount === 120`, 60000);

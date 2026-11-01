@@ -11,11 +11,16 @@
 // on page 1, where the extension then keeps it.
 //   node ide/drive-build.mjs [--theme-page N]
 // Open output.pdf in the instance first, for example with Overleaf Workshop's View PDF command.
-import { arg } from '../common.mjs';
-import { checker, instance, notWithinLimit, rafOnTimer, reopenTab, sleep, viewerOf, viewerPage, waitUntil, windowDraws, workbench } from './ide.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
+import {
+    checker, instance, INSTANCE_OPTION, notWithinLimit, rafOnTimer, reopenTab, sleep, viewerOf, viewerPage,
+    waitUntil, windowDraws, workbench,
+} from './ide.mjs';
 
-const themePage = arg('theme-page') && Number(arg('theme-page'));
-const inst = instance();
+const options = scriptOptions({ ...INSTANCE_OPTION, 'theme-page': 'number' });
+
+const themePage = options.get('theme-page');
+const inst = instance(options);
 const { check, summary } = checker();
 const wb = await workbench(inst);
 let view;

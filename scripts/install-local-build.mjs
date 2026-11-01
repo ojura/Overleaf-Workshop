@@ -33,6 +33,7 @@ import { fileURLToPath } from 'node:url';
 import {
     buildCheckout, EXTENSION_ID, IDES, installedExtension, installInto, plannedChanges, readStamp, removeExtensionCache,
 } from './lib/install-build.mjs';
+import { parseOptions, usageOf, UsageError } from './lib/options.mjs';
 
 const checkout = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -55,11 +56,7 @@ function describeChanges({ deleted, added, changed }) {
 }
 
 async function main(args) {
-    if (args.length > 1 || (args.length === 1 && args[0] !== '--check')) {
-        console.error('usage: scripts/install-local-build.sh [--check]');
-        return 64;
-    }
-    const check = args[0] === '--check';
+    const check = parseOptions({ check: 'flag' }, args).check === true;
     const version = JSON.parse(fs.readFileSync(path.join(checkout, 'package.json'), 'utf8')).version;
     const targets = [];
     for (const ide of IDES) {
@@ -105,5 +102,6 @@ try {
     process.exitCode = await main(process.argv.slice(2));
 } catch (error) {
     console.error(`install-local-build: ${error.message}`);
-    process.exitCode = 1;
+    if (error instanceof UsageError) { console.error(`\n${usageOf(fileURLToPath(import.meta.url))}`); }
+    process.exitCode = error instanceof UsageError ? 64 : 1;
 }

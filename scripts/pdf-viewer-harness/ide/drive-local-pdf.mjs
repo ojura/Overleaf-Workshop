@@ -11,14 +11,16 @@
 // "quick brown") and book-theme/build-a.pdf (1 page, with the text "IIII").
 import fs from 'node:fs';
 import path from 'node:path';
-import { arg } from '../common.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
 import {
-    associatePdfs, checker, click, instance, key, notWithinLimit, openWithQuickOpen, rafOnTimer, settings, sleep,
-    viewerOf, viewerPage, waitUntil, windowDraws, workbench,
+    associatePdfs, checker, click, instance, INSTANCE_OPTION, key, notWithinLimit, openWithQuickOpen, rafOnTimer,
+    settings, sleep, viewerOf, viewerPage, waitUntil, windowDraws, workbench,
 } from './ide.mjs';
 
-const pdf = arg('pdf');
-const expectedPages = Number(arg('pages'));
+const options = scriptOptions({ ...INSTANCE_OPTION, pdf: 'value', pages: 'number', find: 'value', 'theme-book': 'flag' });
+
+const pdf = options.get('pdf');
+const expectedPages = options.get('pages');
 if (!pdf || !expectedPages) {
     console.error('usage: node ide/drive-local-pdf.mjs --pdf <path> --pages N [--find TEXT] [--theme-book]');
     process.exit(2);
@@ -28,9 +30,9 @@ if (!fs.existsSync(path.resolve(pdf))) {
     console.error(`${path.resolve(pdf)} does not exist`);
     process.exit(2);
 }
-const isThemeBook = process.argv.includes('--theme-book');
-const findText = arg('find', isThemeBook ? 'IIII' : 'quick brown');
-const inst = instance();
+const isThemeBook = options.has('theme-book');
+const findText = options.get('find', isThemeBook ? 'IIII' : 'quick brown');
+const inst = instance(options);
 const restoreAssociation = await associatePdfs(settings(inst));
 const { check, summary } = checker();
 const wb = await workbench(inst);

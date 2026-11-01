@@ -6,12 +6,14 @@
 // text's color, and they are among the first only.
 //   node ide/probe-page-colors.mjs --page N
 // When the instance does not show a viewer that draws, it prints the error and exits with 1.
-import { arg } from '../common.mjs';
-import { instance, newestViewer, workbench } from './ide.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
+import { instance, INSTANCE_OPTION, newestViewer, workbench } from './ide.mjs';
 
-const page = Number(arg('page'));
+const options = scriptOptions({ ...INSTANCE_OPTION, page: 'number' });
+
+const page = options.get('page');
 if (!page) { console.error('usage: node ide/probe-page-colors.mjs --page N'); process.exit(2); }
-const wb = await workbench(instance());
+const wb = await workbench(instance(options));
 try {
     const { view, engine, V } = await newestViewer(wb);
     const button = engine === 'overleaf' ? `document.getElementById('themeToggle')` : `document.getElementById('themeButton')`;

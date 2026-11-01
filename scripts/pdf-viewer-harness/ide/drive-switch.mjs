@@ -4,10 +4,16 @@
 // same page, and writes the setting. At the end the setting is restored.
 //   node ide/drive-switch.mjs
 // Open output.pdf in the instance first, for example with Overleaf Workshop's View PDF command.
-import { checker, instance, newestViewer, rafOnTimer, settings, sleep, viewerOf, waitUntil, windowDraws, workbench } from './ide.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
+import {
+    checker, instance, INSTANCE_OPTION, newestViewer, rafOnTimer, settings, sleep, viewerOf, waitUntil, windowDraws,
+    workbench,
+} from './ide.mjs';
+
+const options = scriptOptions({ ...INSTANCE_OPTION });
 
 const SETTING = 'overleaf-workshop.pdfViewer.engine';
-const inst = instance();
+const inst = instance(options);
 const config = settings(inst);
 const original = config.get(SETTING);
 let restoreSetting;

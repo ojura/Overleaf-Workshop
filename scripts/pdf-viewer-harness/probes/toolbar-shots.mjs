@@ -7,13 +7,16 @@
 // --out defaults to shots/toolbar-<engine> in the work folder.
 import fs from 'node:fs';
 import path from 'node:path';
-import { arg, book, openHarness, work } from '../common.mjs';
+import { book, openHarness, work } from '../common.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
 
-const engine = arg('engine', 'pdfjs');
-const pages = Number(arg('pages', '456'));
-const outDir = path.resolve(arg('out', path.join(work, 'shots', `toolbar-${engine}`)));
+const options = scriptOptions({ engine: 'value', ext: 'value', out: 'value', pages: 'number', port: 'number' });
+
+const engine = options.get('engine', 'pdfjs');
+const pages = options.get('pages', 456);
+const outDir = path.resolve(options.get('out', path.join(work, 'shots', `toolbar-${engine}`)));
 fs.mkdirSync(outDir, { recursive: true });
-const h = await openHarness({ name: `toolbar-${engine}`, port: Number(arg('port', '8860')), ext: arg('ext'), bookDir: book(`book-${pages}`, pages, 1), latency: 5, width: 1400, height: 500 });
+const h = await openHarness({ name: `toolbar-${engine}`, port: options.get('port', 8860), ext: options.get('ext'), bookDir: book(`book-${pages}`, pages, 1), latency: 5, width: 1400, height: 500 });
 const { page } = h;
 /** the elements in `selector`'s element whose right edge is past the pane's */
 const past = (selector) => page.evaluate(`(() => { const w = document.documentElement.clientWidth; const root = document.querySelector(${JSON.stringify(selector)}); return [...root.querySelectorAll('*')].filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.right > w + 0.5 && getComputedStyle(e).visibility !== 'hidden'; }).map(e => e.id || e.className || e.tagName).slice(0, 6); })()`);

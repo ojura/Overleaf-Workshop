@@ -2,9 +2,12 @@
 // page and to the middle of the viewer?
 //   node probes/highlight.mjs [--ext DIR] [--port 8766]
 import { notWithinLimit } from '../../lib/devtools.mjs';
-import { arg, openHarness } from '../common.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
+import { openHarness } from '../common.mjs';
 
-const h = await openHarness({ name: 'highlight', port: Number(arg('port', '8766')), ext: arg('ext'), latency: 20 });
+const options = scriptOptions({ ext: 'value', port: 'number' });
+
+const h = await openHarness({ name: 'highlight', port: options.get('port', 8766), ext: options.get('ext'), latency: 20 });
 const { page } = h;
 try {
     await page.send('Page.navigate', { url: `${h.origin}/page?engine=overleaf&doc=probe` });

@@ -1,9 +1,12 @@
 // The pdfjs viewer: does a build that is in view stay when the host sends it again, does a new
 // build still load, and do the zoom buttons and Ctrl+= step by 1.25?
 //   node probes/pdfjs-same-build-zoom.mjs [--ext DIR] [--port 8798]
-import { arg, openHarness } from '../common.mjs';
+import { openHarness } from '../common.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
 
-const h = await openHarness({ name: 'same-build', port: Number(arg('port', '8798')), ext: arg('ext'), latency: 20 });
+const options = scriptOptions({ ext: 'value', port: 'number' });
+
+const h = await openHarness({ name: 'same-build', port: options.get('port', 8798), ext: options.get('ext'), latency: 20 });
 const { page, origin } = h;
 const problems = [];
 page.on('Runtime.consoleAPICalled', (p) => { if (p.type === 'error' || p.type === 'warning') { problems.push(p.args.map(a => a.value ?? a.description).join(' ').slice(0, 200)); } });

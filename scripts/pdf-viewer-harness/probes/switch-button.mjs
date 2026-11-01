@@ -1,10 +1,13 @@
 // Does a viewer show the button to the other viewer, and what does a click send the host?
 // Saves a screenshot as shots/switch-<engine>.png in the work folder.
 //   node probes/switch-button.mjs [--ext DIR] [--engine pdfjs|overleaf] [--port 8850]
-import { arg, openHarness, shotPath, themeBook } from '../common.mjs';
+import { openHarness, shotPath, themeBook } from '../common.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
 
-const engine = arg('engine', 'pdfjs');
-const h = await openHarness({ name: `switch-${engine}`, port: Number(arg('port', '8850')), ext: arg('ext'), bookDir: themeBook(), latency: 5 });
+const options = scriptOptions({ engine: 'value', ext: 'value', port: 'number' });
+
+const engine = options.get('engine', 'pdfjs');
+const h = await openHarness({ name: `switch-${engine}`, port: options.get('port', 8850), ext: options.get('ext'), bookDir: themeBook(), latency: 5 });
 const { page } = h;
 try {
     await page.send('Page.navigate', { url: `${h.origin}/frame?engine=${engine}&doc=switch-${engine}` });
