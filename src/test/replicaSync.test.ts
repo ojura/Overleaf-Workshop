@@ -169,6 +169,9 @@ class LockedStore extends FakeStore {
         super();
         this.waitStarted = new Promise<void>(resolve => { this.started = resolve; });
     }
+    /** the git operation under way in the folder, e.g. 'a merge' */
+    op?: string;
+    async operation() { return this.op; }
     async foreignIndexLock() { return this.lock; }
     indexLockReleased() {
         let resolve!: () => void;
@@ -177,7 +180,7 @@ class LockedStore extends FakeStore {
         this.started();
         return {released, dispose: () => {}};
     }
-    async workTree() { return this.tree; }
+    async workTree() { return this.op ? { operation: this.op } : this.tree; }
     /** git removes the lock: the sync's watch learns of it */
     release() {
         this.lock = undefined;
@@ -527,6 +530,56 @@ describe('ReplicaSync', () => {
             } finally {
                 ReplicaSync.staleLockMs = saved;
             }
+        });
+    });
+
+    describe('a step that started before a git operation in the folder', () => {
+        async function synced(n: number) {
+            const t = setup();
+            const store = new LockedStore();
+            store.lock = undefined;
+            const docs = Array.from({ length: n }, (_, i) => `/d${i}.tex`);
+            for (const p of docs) { t.remote.docs.set(p, `${p} v1\n`); }
+            const sync = new ReplicaSync(t.remote, t.local, store, t.ui, (p: string) => p.endsWith('.aux'));
+            await sync.syncAll();
+            t.remote.calls.length = 0;
+            return { ...t, store, sync, docs };
+        }
+
+        it('leaves the downloads it has not written yet to the full sync after the operation', async () => {
+            const t = await synced(3);
+            for (const p of t.docs) { t.remote.docs.set(p, `${p} v2, edited on Overleaf\n`); }
+            // a merge starts in the folder while the full sync reads the first document
+            const readDoc = t.remote.readDoc.bind(t.remote);
+            t.remote.readDoc = async (path: string) => { t.store.op = 'a merge'; return readDoc(path); };
+            const during = await t.sync.syncAll();
+            assert.deepStrictEqual(t.docs.map(p => t.local.text(p)), t.docs.map(p => `${p} v1\n`), 'nothing is written into the folder during the merge');
+            assert.deepStrictEqual([during.downloaded, during.failed], [[], []]);
+            assert.strictEqual(during.waitingFor, 'git is in the middle of a merge in the folder');
+            // the merge ends; the full sync after it takes the documents in
+            t.remote.readDoc = readDoc;
+            t.store.op = undefined;
+            await t.sync.syncAll();
+            assert.deepStrictEqual(t.docs.map(p => t.local.text(p)), t.docs.map(p => `${p} v2, edited on Overleaf\n`));
+        });
+
+        it('leaves the uploads it has not made yet to the full sync after the operation', async () => {
+            // one transfer at a time, so that the uploads go out one after the other
+            const concurrency = ReplicaSync.concurrency;
+            ReplicaSync.concurrency = 1;
+            const t = await synced(3).finally(() => { ReplicaSync.concurrency = concurrency; });
+            for (const p of t.docs) { t.local.set(p, `${p} v2, edited locally\n`); }
+            // a merge starts in the folder while the first document is uploaded
+            const writeDoc = t.remote.writeDoc.bind(t.remote);
+            t.remote.writeDoc = async (path: string, text: string) => { t.store.op = 'a merge'; return writeDoc(path, text); };
+            const during = await t.sync.flush(true);
+            assert.strictEqual(t.remote.calls.filter(call => call.startsWith('writeDoc')).length, 1, 'one upload had started before the merge');
+            assert.deepStrictEqual(during.failed, []);
+            assert.strictEqual(during.waitingFor, 'git is in the middle of a merge in the folder');
+            t.remote.writeDoc = writeDoc;
+            t.store.op = undefined;
+            await t.sync.syncAll();
+            assert.deepStrictEqual(t.docs.map(p => t.remote.docs.get(p)), t.docs.map(p => `${p} v2, edited locally\n`));
         });
     });
 

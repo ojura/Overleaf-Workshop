@@ -179,6 +179,8 @@ export interface ReplicaStore {
      * never makes the sync wait.
      */
     workTree?(): Promise<WorkTreeState | undefined>,
+    /** The git operation under way in the folder, e.g. 'a merge', from the files that git keeps for it; undefined when none is. */
+    operation?(): Promise<string | undefined>,
     /**
      * The path of git's index lock while a program other than the store holds it, as git does
      * while it writes the work tree and the index, e.g. during a checkout, which moves HEAD last;
@@ -297,6 +299,11 @@ export type FolderChange = 'gone' | 'replaced' | 'gitFolderGone' | 'settingsGone
  */
 export class FolderChangedError extends Error {
     constructor(readonly reason: FolderChange, message: string) { super(message); }
+}
+
+/** A reconcile found right before a write that the sync waits (`beforeWrite`): it leaves its path to the full sync after the wait. */
+class SyncWaitsError extends Error {
+    constructor(readonly reason: string) { super(`the sync waits: ${reason}`); }
 }
 
 class Semaphore {
@@ -784,6 +791,7 @@ export class ReplicaSync {
             this.local.stat(from), this.local.stat(to), this.remote.entry(from), this.remote.entry(to)]);
         if (localFrom===undefined || localFrom==='folder' || localTo!==undefined || remoteFrom!==undefined || remoteTo?.kind!==entry.kind) { return; }
         if (await this.isUnmerged(from) || await this.isUnmerged(to)) { return; }
+        await this.beforeWrite();
         await this.local.move(from, to);
         // The entry keeps the size and time the file had when it held the base. A hard link keeps
         // the file itself, with them, so they still tell whether it holds the base; a copy, where
@@ -1000,11 +1008,29 @@ export class ReplicaSync {
         return this.reported(path, mode, () => this.reconcile(path, mode));
     }
 
+    /**
+     * Right before a reconcile writes to either side, or trashes or moves a file. A step asks
+     * mayAct when it starts; a git operation, or another program's index lock, that comes during
+     * the step is found here, and the reconcile then leaves its path (SyncWaitsError) to the full
+     * sync after the wait. When neither is there, the check is the existence of their files.
+     */
+    private async beforeWrite(): Promise<void> {
+        const [operation, lock] = await Promise.all([this.store.operation?.(), this.store.foreignIndexLock?.()]);
+        if (operation===undefined && lock===undefined) { return; }
+        const reason = await this.mayAct();
+        if (reason!==undefined) { throw new SyncWaitsError(reason); }
+    }
+
     /** Run `work` on `path`; a failure goes into the summary and the log. */
     private async reported(path: string, mode: Mode, work: () => Promise<void>): Promise<void> {
         try {
             await work();
         } catch (error) {
+            if (error instanceof SyncWaitsError) {
+                // not a failure: the full sync after the wait takes the path in
+                mode.summary.waitingFor ??= error.reason;
+                return;
+            }
             mode.summary.failed.push({path, error: errorText(error)});
             this.ui.log(`${path}: sync failed: ${errorText(error)}`);
         }
@@ -1287,6 +1313,7 @@ export class ReplicaSync {
             } else if (mode.deletions==='collect') {
                 mode.collected!.local.push(path);
             } else if (localHash===base) {
+                await this.beforeWrite();
                 await this.local.remove(path);
                 delete this.state.entries[path];
                 this.noteChange(path, 'remote');
@@ -1295,6 +1322,7 @@ export class ReplicaSync {
                 await this.local.removeFolderIfEmpty(parentOf(path));
             } else {
                 // deleted on Overleaf, changed locally: follow Overleaf and keep the local version aside
+                await this.beforeWrite();
                 const copy = await this.store.keepCopy(path, localContent ?? await this.local.read(path) ?? new Uint8Array());
                 await this.local.remove(path);
                 delete this.state.entries[path];
@@ -1325,7 +1353,7 @@ export class ReplicaSync {
         } else if (!this.uploads) {
             summary.held.push(path);
         } else {
-            await this.transfers.run(() => this.remote.remove(path));
+            await this.transfers.run(async () => { await this.beforeWrite(); await this.remote.remove(path); });
             delete this.state.entries[path];
             this.noteChange(path, 'local');
             summary.deletedRemote.push(path);
@@ -1351,6 +1379,7 @@ export class ReplicaSync {
         if (summary===undefined) {
             return content; // only needed for comparing
         }
+        await this.beforeWrite();
         const stat = await this.local.write(path, content);
         await this.setEntry(path, {kind: remote.kind, base: hash, ...stat, checked: Date.now()}, 'remote', text, content);
         summary.downloaded.push(path);
@@ -1378,10 +1407,10 @@ export class ReplicaSync {
                 return;
             }
             const sent = text;
-            await this.transfers.run(() => this.remote.writeDoc(path, sent));
+            await this.transfers.run(async () => { await this.beforeWrite(); await this.remote.writeDoc(path, sent); });
             kind = 'doc';
         } else {
-            const created = await this.transfers.run(() => this.remote.upload(path, content));
+            const created = await this.transfers.run(async () => { await this.beforeWrite(); return this.remote.upload(path, content); });
             kind = created.kind;
             if (kind==='doc') { text = decoder.decode(content); }
         }
@@ -1399,6 +1428,7 @@ export class ReplicaSync {
             return;
         }
         const merged = await this.merge(baseText, localText, remoteText);
+        await this.beforeWrite();
         // Markers left from an earlier conflict merge cleanly with new changes, but must not be
         // uploaded either; nor a merge into a file that git's index still has unmerged
         if (merged.hasConflict || (entry.conflict && (hasConflictMarkers(merged.content) || await this.isUnmerged(path)))) {
@@ -1422,7 +1452,7 @@ export class ReplicaSync {
         }
         if (merged.content!==remoteText) {
             const sent = merged.content;
-            await this.transfers.run(() => this.remote.writeDoc(path, sent));
+            await this.transfers.run(async () => { await this.beforeWrite(); await this.remote.writeDoc(path, sent); });
         }
         const written = merged.content!==localText ? await this.local.write(path, encoder.encode(merged.content)) : stat;
         await this.setEntry(path, {kind: 'doc', base: textHash(merged.content), ...seen(written)}, 'merge', merged.content);
@@ -1433,6 +1463,7 @@ export class ReplicaSync {
     /** Put Overleaf's version in place and keep a copy of the local one. */
     private async keepAside(path: string, localContent: Uint8Array | undefined, remote: RemoteEntry,
                             remoteText: string | undefined, remoteContent: Uint8Array | undefined, summary: SyncSummary) {
+        await this.beforeWrite();
         const copy = await this.store.keepCopy(path, localContent ?? new Uint8Array());
         await this.download(path, remote, remoteText, remoteContent, summary);
         summary.downloaded.pop();
@@ -1554,6 +1585,8 @@ export class ReplicaSync {
         const still = entry!==undefined && !entry.conflict && this.state.entries[to]===undefined && remoteFrom?.kind===entry.kind
             && remoteTo===undefined && localFrom===undefined && localTo!==undefined && localTo!=='folder';
         if (!still || await this.isUnmerged(from) || await this.isUnmerged(to)) { return false; }
+        // before the try: a rename that the check stops waits for the full sync after the wait, and is not taken for one that Overleaf refused
+        await this.beforeWrite();
         try {
             await this.transfers.run(() => this.remote.rename!(from, to));
         } catch (error) {
