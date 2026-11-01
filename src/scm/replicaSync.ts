@@ -1074,9 +1074,9 @@ export class ReplicaSync {
      * The synced paths that a rename takes away, not a deletion: the old paths that git pairs with
      * a new local file, and the paths of renames made on Overleaf that `remoteRenamed` is
      * applying. They are neither counted nor deleted. The pairing is made from the listing that
-     * the deletion step takes when it decides, not taken from the batch: a pair whose rename
-     * Overleaf refused, and whose new file is uploaded since, is not a pair any more, and its old
-     * path is a deletion.
+     * the deletion step takes when it decides, not taken from the batch: when Overleaf refused a
+     * pair's rename and the new file was uploaded since, the two paths are not a pair any more,
+     * and the old path is a deletion.
      */
     private async renamedPaths(listing: Listing): Promise<Set<string>> {
         const paths = new Set((await this.pairRenamesIn(listing.local, listing.present, async () => listing.remote)).values());

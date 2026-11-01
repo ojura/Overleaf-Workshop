@@ -245,7 +245,7 @@ export class ReplicaControlServer {
     }
 }
 
-/** No window answers for the folder: the IDE is not running, or it does not have the folder open as a replica. */
+/** A window does not answer for the folder: the IDE is not running, or it does not have the folder open as a replica. */
 export class NoReplicaWindowError extends Error {}
 /**
  * Tools cannot reach the window that keeps the folder in sync: the window's pointer file gives the
@@ -261,7 +261,7 @@ export function findReplicaSocket(folder: string): string {
     let pointer: any;
     try {
         pointer = JSON.parse(fs.readFileSync(path.join(folder, POINTER_FILE), 'utf8'));
-    } catch { /* no pointer file */ }
+    } catch { /* the pointer file is missing, or it is not JSON */ }
     if (typeof pointer?.socket === 'string') { return pointer.socket; }
     if (typeof pointer?.error === 'string' && writerRuns(pointer)) {
         throw new ReplicaUnreachableError(`the IDE window that keeps ${folder} in sync cannot answer tools: ${pointer.error}`);

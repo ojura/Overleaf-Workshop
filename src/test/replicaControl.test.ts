@@ -191,7 +191,7 @@ describe('the control socket of a local replica', () => {
     it('takes over a socket left behind by a window that ended', async () => {
         const socket = replicaSocketPath(folder);
         fs.mkdirSync(path.dirname(socket), { recursive: true, mode: 0o700 });
-        fs.writeFileSync(socket, ''); // what a crash leaves: the path is taken, nothing answers
+        fs.writeFileSync(socket, ''); // what a crash leaves: the path is taken, and a server does not answer there
         assert.strictEqual(await serve(async () => ({ ok: true })).start(), socket);
         assert.deepStrictEqual(await requestReplica(folder, { op: 'status' }, 5000), { ok: true });
     });
@@ -236,7 +236,7 @@ describe('the control socket of a local replica', () => {
 
     it('finds the socket from the pointer file when the program computes another path', async () => {
         const socket = (await serve(async () => ({ ok: true })).start())!;
-        // e.g. a program whose environment has no XDG_RUNTIME_DIR
+        // e.g. a program with XDG_RUNTIME_DIR unset in its environment
         delete process.env.XDG_RUNTIME_DIR;
         assert.notStrictEqual(replicaSocketPath(folder), socket);
         assert.deepStrictEqual(await requestReplica(folder, { op: 'status' }, 5000), { ok: true });
@@ -247,6 +247,8 @@ describe('the control socket of a local replica', () => {
         // a window that cannot listen writes why, with its pid and when its process started
         longRuntime();
         assert.strictEqual(await serve(async () => ({ ok: true })).start(), undefined, 'the server does not listen');
+        // the tools' runtime folder is the short one, so that a tool that does not take the pointer's
+        // reason connects to the computed path and does not stop at that path's length
         process.env.XDG_RUNTIME_DIR = runtime;
         const file = path.join(folder, POINTER_FILE);
         const pointer = JSON.parse(fs.readFileSync(file, 'utf8'));
