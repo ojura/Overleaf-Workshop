@@ -311,8 +311,9 @@ function processRuns(pid: unknown): boolean {
 /**
  * When the process `pid` started, as the system records it, or undefined where the system does not
  * give it. On Linux it is field 22 of /proc/<pid>/stat, starttime, in clock ticks after boot
- * (proc(5)), which tells a process from a later one that has the same pid. The fields are counted
- * after the last ")", as the command's name before it, field 2, can contain spaces and ")".
+ * (proc_pid_stat(5); man-pages before 6.06 list the fields in proc(5)), which tells a process from a
+ * later one that has the same pid. The fields are counted after the last ")", as the command's
+ * name before it, field 2, can contain spaces and ")".
  */
 function processStartTime(pid: number): number | undefined {
     if (process.platform !== 'linux') { return undefined; }
