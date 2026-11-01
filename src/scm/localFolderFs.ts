@@ -1,4 +1,5 @@
 import { execFile } from 'child_process';
+import { randomBytes } from 'crypto';
 import * as fsp from 'fs/promises';
 import * as path from 'path';
 
@@ -23,6 +24,32 @@ export interface LocalStat { type: number, size: number, mtime: number, ctime: n
 
 type PathLike = string | { fsPath: string };
 const fsPath = (p: PathLike) => typeof p === 'string' ? p : p.fsPath;
+
+/**
+ * Whether a failed call says that the path does not exist: ENOENT, or ENOTDIR when a folder on
+ * the way is a file. Any other error (EACCES, EIO, ...) leaves open what is at the path.
+ */
+export function isMissing(error: unknown): boolean {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+/** Which folder or file is at a path: its device and inode, as strings, which keep every digit. */
+export async function identity(p: PathLike): Promise<{ dev: string, ino: string }> {
+    const stat = await fsp.stat(fsPath(p), { bigint: true });
+    return { dev: String(stat.dev), ino: String(stat.ino) };
+}
+
+/** Whether anything is at a path, a link included; rejects when that cannot be told. */
+export async function exists(p: PathLike): Promise<boolean> {
+    try {
+        await fsp.lstat(fsPath(p));
+        return true;
+    } catch (error) {
+        if (isMissing(error)) { return false; }
+        throw error;
+    }
+}
 
 function typeOf(stat: { isFile(): boolean, isDirectory(): boolean }) {
     return stat.isDirectory() ? fileType.directory : stat.isFile() ? fileType.file : fileType.unknown;
@@ -56,11 +83,53 @@ export async function readFile(p: PathLike): Promise<Uint8Array> {
     return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 }
 
-/** Write a file, creating its parent folders, as vscode.workspace.fs.writeFile does. */
-export async function writeFile(p: PathLike, content: Uint8Array): Promise<void> {
+/**
+ * Write a file, creating its parent folders.
+ *
+ * With `temporaryFolder`, a folder on the target's file system (the replica's own
+ * REPLICA_TEMPORARY_FOLDER), a regular file is replaced in one rename: the content goes into a
+ * new file there, named independently of the target, which then is renamed over the target. A
+ * reader, or a crash, sees the old content or the new one, never a part of it. The new file gets
+ * the target's mode, but it is a new inode owned by this user: extended attributes and ACLs of
+ * the old file stay behind. A file that a rename would change in other ways is written in place,
+ * as without `temporaryFolder`: a symbolic link, dangling or not (the file it names is written),
+ * a file with other names (hard links), one owned by another user, and a target on another file
+ * system than the temporary folder (EXDEV).
+ */
+export async function writeFile(p: PathLike, content: Uint8Array, temporaryFolder?: string): Promise<void> {
     const file = fsPath(p);
     await fsp.mkdir(path.dirname(file), { recursive: true });
-    await fsp.writeFile(file, content);
+    let mode: number | undefined;
+    let inPlace = temporaryFolder === undefined;
+    try {
+        const target = await fsp.lstat(file);
+        mode = target.mode & 0o7777;
+        if (target.isSymbolicLink() || target.nlink > 1 || (process.getuid !== undefined && target.uid !== process.getuid())) { inPlace = true; }
+    } catch (error) {
+        if (!isMissing(error)) { throw error; }
+    }
+    if (inPlace) {
+        await fsp.writeFile(file, content);
+        return;
+    }
+    await fsp.mkdir(temporaryFolder!, { recursive: true });
+    const temporary = path.join(temporaryFolder!, `${process.pid}-${randomBytes(8).toString('hex')}.tmp`);
+    try {
+        const handle = await fsp.open(temporary, 'wx');
+        try {
+            await handle.writeFile(content);
+            // the mode of `open` is reduced by the umask; chmod sets the target's exactly
+            if (mode !== undefined) { await handle.chmod(mode); }
+            await handle.sync();
+        } finally {
+            await handle.close();
+        }
+        await fsp.rename(temporary, file);
+    } catch (error) {
+        await fsp.rm(temporary, { force: true });
+        if ((error as NodeJS.ErrnoException)?.code !== 'EXDEV') { throw error; }
+        await fsp.writeFile(file, content);
+    }
 }
 
 export async function createDirectory(p: PathLike): Promise<void> {

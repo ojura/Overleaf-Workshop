@@ -18,6 +18,7 @@ const dec = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 
 /** Overleaf, in memory: docs hold text, files hold bytes and report their hash; it can rename. */
 class Remote implements ReplicaRemote {
+    connected() { return true; }
     docs = new Map<string, string>();
     files = new Map<string, Uint8Array>();
     calls: string[] = [];
@@ -66,6 +67,7 @@ class Remote implements ReplicaRemote {
 /** The replica folder on disk, the repository's work tree. */
 class Folder implements ReplicaLocal {
     constructor(readonly root: string, readonly ignored: (p: string) => boolean) {}
+    async verify() {}
     private abs(p: string) { return path.join(this.root, p); }
     async list() {
         const files = new Map<string, LocalStat>();

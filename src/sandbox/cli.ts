@@ -11,8 +11,8 @@ import { SandboxSafetyError } from './guard';
 import { LockTimeoutError } from './lock';
 import { describeFindings, describeRanges, exitStatusOf, pushCheck, RANGES_HELP } from './rangesCli';
 import { ControlAnswer, NoReplicaWindowError, ReplicaTimeoutError, requestReplica } from '../scm/replicaControl';
-import { describe, SyncSummary } from '../scm/replicaSync';
-import { DEFAULT_IGNORE_PATTERNS } from '../scm/ignorePatterns';
+import { deletionsNeedConfirmation, describe, ReplicaSync, SyncSummary } from '../scm/replicaSync';
+import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath } from '../scm/ignorePatterns';
 import { Repo } from '../gitbridge/plumbing';
 import { minimatch } from 'minimatch';
 import { fetchCommitFrom, LandError, landCommit, landedCleanly, LandReport } from './land';
@@ -143,15 +143,18 @@ replica-sync    Asks the IDE window that keeps the replica in sync with Overleaf
                 acknowledged every local change so far; e.g. after a program wrote files
                 into the folder. The window answers on a local socket, also while it is in
                 the background, and does not come to the front. It also scans when
-                overleaf-workshop.localReplica.syncOnFileChange is off.
+                overleaf-workshop.localReplica.syncOnFileChange is off. It deletes at most
+                ${ReplicaSync.deletionThreshold} files on one side, as the window does without asking; more wait for the
+                user's confirmation in the window.
 replica-status  Shows whether the window is connected to Overleaf, how it watches the
                 folder, what it synced in the last 10 minutes, and the replica's git state:
                 the checked-out commit and Overleaf's state (refs/remotes/overleaf/main).
 --timeout <s>   how long to wait for the window's answer; default 300
 Exit status of both: 0 in sync (replica-status: the window answered); 3 a file could not
-be synced or has conflict markers, listed; 4 no IDE window keeps the folder in sync (the
-IDE is not running, or it has not opened the folder as a replica); 5 the window did not
-answer in time; 1 the tool failed; 2 wrong arguments.
+be synced, has conflict markers, or waits for a deletion to be confirmed, listed; 4 an IDE
+window does not keep the folder in sync (the IDE is not running, or it has not opened the
+folder as a replica); 5 the window did not answer in time; 1 the tool failed; 2 wrong
+arguments.
 
 replica-land    Lands <commit> of the replica's git repository in the project, then compiles
                 the project. The commit must descend from the checked-out commit, which
@@ -160,8 +163,10 @@ replica-land    Lands <commit> of the replica's git repository in the project, t
                 files by the hash Overleaf reports). Then the window pushes the commit: it
                 fast-forwards the branch, uploads what the commit changed (a rename as a
                 rename on Overleaf, so documents keep their comments) and waits for
-                Overleaf's acknowledgements. The tool checks again that Overleaf holds the
-                commit, for up to three minutes, and compiles the project once (again while
+                Overleaf's acknowledgements. The files the commit deletes are deleted with
+                it; other deletions follow replica-sync's rule. The tool checks again that
+                Overleaf holds the commit, for up to three minutes, and compiles the
+                project once (again while
                 Overleaf answers that another compile of yours runs). The compile's logs are
                 kept in <git dir>/overleaf/compiles/<commit>/ and checked: an error line
                 ("! ") in output.log, no "Output written on output.pdf", latexmk's
@@ -394,6 +399,7 @@ async function replicaCommand(command: 'replica-sync' | 'replica-status', folder
     } else {
         const a = answer as any;
         const lines = [`${a.folder ?? folder}: ${a.connected ? 'connected to' : 'not connected to'} ${a.project?.server ?? 'Overleaf'} ("${a.project?.name ?? '?'}"), changes reported by ${a.watcher === 'node' ? "Node's watcher" : "the IDE's file events"}${a.modes ? `, fetch mode ${a.modes.fetch}, push mode ${a.modes.push}` : ''}${a.fullSyncRunning ? ', a full sync is running' : ''}`];
+        if (a.question) { lines.push(`a question in the IDE window waits for an answer: ${deletionsNeedConfirmation(a.question.where, a.question.paths.length)}: ${a.question.paths.join(', ')}`); }
         if (a.git) {
             const g = a.git as { head?: string, overleaf?: string, branch?: string, unmerged?: string[] };
             lines.push(`git: ${g.branch ?? 'detached HEAD'} at ${g.head?.slice(0, 7) ?? 'no commit'}, Overleaf's state (refs/remotes/overleaf/main) ${g.overleaf?.slice(0, 7) ?? 'not recorded yet'}${g.head && g.head === g.overleaf ? ', the same' : ''}${g.unmerged?.length ? `; conflicts to resolve in ${g.unmerged.join(', ')}` : ''}`);
@@ -410,8 +416,8 @@ async function replicaCommand(command: 'replica-sync' | 'replica-status', folder
     return answer.ok ? 0 : 3;
 }
 
-/** The paths the replica leaves out, by its default ignore patterns; '/dir/name' */
-const replicaIgnored = (p: string) => p === '/.overleaf' || p.startsWith('/.overleaf/') || DEFAULT_IGNORE_PATTERNS.some(g => minimatch(p, g, { dot: true }));
+/** The paths the replica leaves out: its own folders, and its default ignore patterns; '/dir/name' */
+const replicaIgnored = (p: string) => isReplicaOwnPath(p) || DEFAULT_IGNORE_PATTERNS.some(g => minimatch(p, g, { dot: true }));
 
 /** replica-connect: join a development history with the replica's repository (src/scm/replicaConnect.ts). */
 async function replicaConnectCommand(folder: string, values: Record<string, string>, notOwn: string[], json: boolean): Promise<number> {
