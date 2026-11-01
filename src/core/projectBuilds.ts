@@ -124,10 +124,11 @@ export function cachedBuild(response: CompileResponseSchema, answeredAt: number)
  *           standard-group user's compile (CLSICacheHandler.js:197-224); whether Overleaf then
  *           answers 404 or 200 without output.pdf does not show in its source, and both give none
  *   failed  the request failed, with the error
+ * `said` is what Overleaf answered, in words, for the log of the builds (BuildsHost.log).
  */
 export type LatestAnswer =
     | { kind: 'build', build: Build }
-    | { kind: 'none' }
+    | { kind: 'none', said?: string }
     | { kind: 'failed', detail: string };
 
 /**
@@ -152,6 +153,9 @@ export function isCompileStart(value: unknown): value is CompileStart {
 
 /** Why a successful compile made no build: its answer lists no output.pdf. */
 export const NO_OUTPUT_PDF = 'the compile made no output.pdf';
+
+/** Why a check waits: the window has not joined the project on Overleaf yet, or lost it (BuildsHost.joined). */
+export const NOT_JOINED = 'the window is not connected to the project on Overleaf yet';
 
 /**
  * How a compile in the window ended:
@@ -221,7 +225,7 @@ type CompileState =
     | { state: 'failed', status: BuildStatus };
 
 /**
- * Who asks ProjectBuilds for a compile, which decides when it asks (asks):
+ * Who asks ProjectBuilds for a compile, which decides when it asks (whyNotCompile):
  *   viewer   no build to show while a viewer of the build is visible (compileIfNeeded)
  *   opening  the project was opened in this window (opened)
  *   user     a viewer's Recompile (recompile)
@@ -241,6 +245,18 @@ export interface BuildsHost {
     latest(): Promise<LatestAnswer>;
     settings(): CompileSettings;
     compile(): Promise<CompileStart>;
+    /**
+     * Whether the window has joined the project now: only then are the settings it compiles with
+     * known (settings), such as the main document, which comes with the project's tree
+     */
+    joined(): boolean;
+    /** Log `line`: each check's answer and what the window did with it, so that it can be read later. */
+    log(line: string): void;
+}
+
+/** `settings` in words, for the log. */
+function settingsText(settings: CompileSettings): string {
+    return `${settings.rootResourcePath ?? 'the project\'s main document'}, draft ${settings.draft ? 'on' : 'off'}, ${settings.stopOnFirstError ? 'stopping' : 'not stopping'} at the first error`;
 }
 
 
@@ -289,7 +305,12 @@ function notify<T>(listeners: Set<(value: T) => void>, value: T) {
  * user, until a build comes. With a build to show, an answer without a newer build keeps it.
  *
  * Checks run one at a time (CoalescedRuns): an event during a check asks for one more check after
- * it, so the answer is never older than the event.
+ * it, so the answer is never older than the event. A check waits while the window has not joined
+ * the project (BuildsHost.joined), as when a viewer that the window restores at its load asks, or
+ * during a reconnect: an answer is taken against the window's settings, and the main document
+ * comes with the project's tree. At the opening the waiting checks are the opening's own check;
+ * after a reconnect, one check runs (rejoined). An answer that comes after the window lost the
+ * project decides nothing and compiles nothing; the check waits for the next join.
  */
 export class ProjectBuilds {
     private current?: Build;
@@ -299,6 +320,11 @@ export class ProjectBuilds {
     private gone = false;
     /** whether a check is waiting for Overleaf's answer */
     private checking = false;
+    /**
+     * the checks asked while the window had not joined the project (BuildsHost.joined): the first
+     * check that runs after the join settles them (waitForJoin)
+     */
+    private waitingForJoin?: { promise: Promise<void>, resolve: () => void };
     /** why the last check failed; cleared by the next check that gets an answer */
     private checkError?: string;
     private compile: CompileState = { state: 'idle' };
@@ -352,9 +378,39 @@ export class ProjectBuilds {
         this.replace(build);
     }
 
-    /** Ask Overleaf for the latest compile; settles when a check that started after this call has ended. */
+    /**
+     * Ask Overleaf for the latest compile; settles when a check that started after this call has
+     * ended. While the window has not joined the project, the check waits for the join, since the
+     * window's settings, against which an answer is taken, are not known before it (waitForJoin).
+     */
     check(): Promise<void> {
-        return this.checks.request();
+        return this.host.joined() ? this.checks.request() : this.waitForJoin();
+    }
+
+    /**
+     * The window joined the project again after a lost connection, whose reconnect took the
+     * project's tree away: the checks asked meanwhile run now, as one check. At the first join, the
+     * opening's check is that check (opened).
+     */
+    rejoined(): Promise<void> {
+        return this.waitingForJoin ? this.checks.request() : Promise.resolve();
+    }
+
+    /**
+     * A check for when the window has joined the project: as at a window's load, when a restored
+     * viewer asks before the join, or during a reconnect. It settles with the first check that runs
+     * after the join (runCheck), and the viewers say meanwhile that the window waits for its
+     * connection to the project.
+     */
+    private waitForJoin(): Promise<void> {
+        if (!this.waitingForJoin) {
+            let resolve!: () => void;
+            const promise = new Promise<void>(r => { resolve = r; });
+            this.waitingForJoin = { promise, resolve };
+            this.host.log('check: waits until the window has joined the project, whose settings it needs');
+            this.update();
+        }
+        return this.waitingForJoin.promise;
     }
 
     /**
@@ -365,6 +421,7 @@ export class ProjectBuilds {
      */
     opened(): Promise<void> {
         this.opening ??= (async () => {
+            this.host.log('opening: asks Overleaf for its latest compile');
             await this.check();
             await this.startCompile('opening');
         })();
@@ -438,6 +495,7 @@ export class ProjectBuilds {
         if (!ofThisProject) {
             return;
         }
+        this.host.log(`compile ended: ${outcome.result === 'failure' ? `failure: ${outcome.detail}` : outcome.result}`);
         const before = this.beforeStart;
         this.beforeStart = undefined;
         if (outcome.result === 'skipped') {
@@ -472,6 +530,29 @@ export class ProjectBuilds {
     }
 
     private async runCheck(): Promise<void> {
+        // this check is the one that the checks waiting for the join wait for
+        const waited = this.waitingForJoin;
+        this.waitingForJoin = undefined;
+        let lost = false;
+        try {
+            lost = (await this.checkOnce()) === 'lost';
+        } finally {
+            if (!lost) {
+                waited?.resolve();
+            }
+        }
+        if (lost) {
+            // the window lost the project before the answer: this check waits for the next join,
+            // and so do the checks that waited for it
+            const next = this.waitForJoin();
+            if (waited) {
+                void next.then(waited.resolve);
+            }
+        }
+    }
+
+    /** One check: 'lost' when the window lost the project before Overleaf answered, and the answer decided nothing. */
+    private async checkOnce(): Promise<'decided' | 'lost'> {
         this.checking = true;
         this.update();
         let answer: LatestAnswer;
@@ -481,36 +562,55 @@ export class ProjectBuilds {
             answer = { kind: 'failed', detail: errorMessage(error) };
         }
         this.checking = false;
+        if (!this.host.joined()) {
+            // the connection was lost while Overleaf answered: without the window's settings the
+            // answer decides nothing, and nothing compiles; a check after the join decides
+            this.host.log('check: the window lost the project before the answer came; the answer is left');
+            return 'lost';
+        }
         if (answer.kind === 'failed') {
+            this.host.log(`check: failed: ${answer.detail}`);
             this.checkError = answer.detail;
             this.update();
-            return;
+            return 'decided';
         }
         this.checkError = undefined;
-        if (answer.kind === 'build' && this.take(answer.build)) {
-            return;
+        if (answer.kind === 'none') {
+            this.host.log(`check: ${answer.said ?? 'Overleaf has no build to show'}`);
+        } else {
+            const build = answer.build;
+            const refused = this.refusal(build);
+            this.host.log(`check: Overleaf names build ${build.id} of editor ${build.editorId}, compiled with ${settingsText(build.settings)}; `
+                + (refused === undefined ? 'the window takes it' : `the window does not take it: ${refused}`));
+            if (refused === undefined) {
+                this.replace(build);
+                return 'decided';
+            }
         }
         // a compile that starts now is shown at once, without the state before it
         await this.compileIfNeeded();
         this.update();
+        return 'decided';
     }
 
     /**
-     * Take `build` from Overleaf's answer as the build in use, unless the window has had it, it
-     * typeset something else, or it began before the build in use.
+     * Why `build` from Overleaf's answer does not become the build in use: the window has had it,
+     * it typeset something else, or it began before the build in use; undefined when it does.
      */
-    private take(build: Build): boolean {
-        if (build.id === this.current?.id || this.superseded.has(build.id)) {
-            return false;
+    private refusal(build: Build): string | undefined {
+        if (build.id === this.current?.id) {
+            return 'it is the build in use';
+        }
+        if (this.superseded.has(build.id)) {
+            return 'the window replaced that build';
         }
         if (!sameSettings(build.settings, this.host.settings())) {
-            return false;
+            return `the window compiles with ${settingsText(this.host.settings())}`;
         }
         if (this.current && !this.beganLater(build, this.current)) {
-            return false;
+            return 'that build began before it';
         }
-        this.replace(build);
-        return true;
+        return undefined;
     }
 
     /**
@@ -550,31 +650,42 @@ export class ProjectBuilds {
     }
 
     /**
-     * Whether `asker` asks for a compile now: never while a compile of this project runs or was
-     * asked for; the user always else; the others only while there is no build to show and no
-     * failure that waits for the user: at the project's opening, or while a viewer of the build
-     * is visible and the window has not compiled for a viewer since a build was shown or the user
-     * compiled (compiledForViewer).
+     * Why `asker` does not ask for a compile now, in words for the log; undefined when it asks.
+     * It never asks while a compile of this project runs or was asked for; the user always asks
+     * else; the others ask only while there is no build to show and no failure that waits for the
+     * user: at the project's opening, or while a viewer of the build is visible and the window has
+     * not compiled for a viewer since a build was shown or the user compiled (compiledForViewer).
      */
-    private asks(asker: Asker): boolean {
+    private whyNotCompile(asker: Asker): string | undefined {
         if (this.compile.state === 'running') {
-            return false;
+            return 'a compile of the project runs, or was asked for';
         }
         if (asker === 'user') {
-            return true;
+            return undefined;
         }
-        if (this.hasBuildToShow() || this.compile.state !== 'idle') {
-            return false;
+        if (this.hasBuildToShow()) {
+            return `it shows build ${this.current!.id}`;
+        }
+        if (this.compile.state !== 'idle') {
+            return 'the last compile failed, and the next one is the user\'s';
         }
         if (asker === 'opening') {
-            return true;
+            return undefined;
         }
-        return !this.compiledForViewer && [...this.viewers].some(viewer => viewer.visible);
+        if (this.compiledForViewer) {
+            return 'it compiled on its own already, and the next compile is the user\'s';
+        }
+        return [...this.viewers].some(viewer => viewer.visible) ? undefined : 'no viewer of the build is visible';
     }
 
-    /** Ask the window's compile path for the compile that `asker` wants, if it asks now (asks). */
+    /** Ask the window's compile path for the compile that `asker` wants, if it asks now (whyNotCompile). */
     private async startCompile(asker: Asker): Promise<void> {
-        if (!this.asks(asker)) {
+        const whyNot = this.whyNotCompile(asker);
+        // a viewer's request comes with each check: logged only when there is no build to show
+        if (asker !== 'viewer' || !this.hasBuildToShow()) {
+            this.host.log(`${asker}: ${whyNot === undefined ? 'compiles' : `does not compile: ${whyNot}`}`);
+        }
+        if (whyNot !== undefined) {
             return;
         }
         if (asker === 'user') {
@@ -596,6 +707,7 @@ export class ProjectBuilds {
             return;
         }
         if (start.kind === 'unavailable') {
+            this.host.log(`${asker}: the compile cannot start: ${detail}`);
             this.compile = { state: 'failed', status: { state: 'compile-unavailable', detail } };
             this.update();
         } else if (start.kind === 'started') {
@@ -609,6 +721,7 @@ export class ProjectBuilds {
             // replaced this request meanwhile. A failure of this project that the compile's end
             // reports comes first: the compile fires compileEndedEvent in the same step as it
             // settles `ended`. Not awaited, so that checks go on meanwhile.
+            this.host.log(`${asker}: another compile of the window runs; asks again when it has ended`);
             void start.ended.then(() => {
                 if (this.compile === request) {
                     this.compile = { state: 'idle' };
@@ -620,7 +733,11 @@ export class ProjectBuilds {
 
     private derive(): BuildStatus {
         if (this.hasBuildToShow()) {
-            // the PDF shown stays valid: a failed check only says that it may not be the latest
+            // the PDF shown stays valid: a check that waits for the join, or a failed check, only
+            // says that it may not be the latest
+            if (this.waitingForJoin) {
+                return { state: 'unchecked', detail: NOT_JOINED };
+            }
             return this.checkError !== undefined ? { state: 'unchecked', detail: this.checkError } : { state: 'ready' };
         }
         if (this.compile.state === 'running') {
@@ -628,6 +745,9 @@ export class ProjectBuilds {
         }
         if (this.compile.state === 'failed') {
             return this.compile.status;
+        }
+        if (this.waitingForJoin) {
+            return { state: 'connecting' };
         }
         if (this.checking) {
             return { state: 'checking' };

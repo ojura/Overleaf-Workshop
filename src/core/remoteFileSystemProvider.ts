@@ -211,6 +211,18 @@ export function parseUri(uri: vscode.Uri) {
     return {userId, projectId, serverName, projectName, identifier, pathParts};
 }
 
+/**
+ * The window's log of the builds in use, "Overleaf Workshop: Builds": each check's answer and what
+ * the window did with it (ProjectBuilds). VS Code writes the lines of a log channel with their
+ * times into the session's logs folder too, so that the decisions of earlier sessions, such as an
+ * opening before a reload, can be read later.
+ */
+let buildsChannel: vscode.LogOutputChannel | undefined;
+function logBuilds(line: string) {
+    buildsChannel ??= vscode.window.createOutputChannel('Overleaf Workshop: Builds', {log: true});
+    buildsChannel.info(line);
+}
+
 export class VirtualFileSystem extends vscode.Disposable {
     private root?: ProjectEntity;
     private currentVersion?: number;
@@ -360,6 +372,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             latest: () => this.latestBuild(),
             settings: () => this.compileSettings(),
             compile: () => this.compileProject(),
+            // the project's tree, with its main document, is there once the project is joined
+            joined: () => this.root !== undefined,
+            log: (line) => logBuilds(`${this.projectName}: ${line}`),
         });
         this.buildListeners.push(
             this.builds.onDidChangeBuild((build) => {
@@ -549,6 +564,9 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (!this.compileStarted) {
             this.compileStarted = true;
             void this.builds.opened();
+        } else {
+            // a check asked while the connection was lost runs now (ProjectBuilds.rejoined)
+            void this.builds.rejoined();
         }
         // documents may have changed on the server while disconnected: have them read again
         if (adopted.length > 0) {
@@ -1988,10 +2006,14 @@ export class VirtualFileSystem extends vscode.Disposable {
         const res = await this.api.getLatestCompileFromCache(identity, this.projectId);
         if (res.type==='success' && res.compile) {
             const build = cachedBuild(res.compile, Date.now());
-            return build ? {kind: 'build', build} : {kind: 'none'};
+            return build ? {kind: 'build', build}
+                : {kind: 'none', said: `Overleaf answers 200 with a compile of status "${res.compile.status}" without a build to show: no output.pdf with an editor, or no options`};
         }
-        if (res.status===404 || res.status===410) {
-            return {kind: 'none'};
+        if (res.status===404) {
+            return {kind: 'none', said: 'Overleaf answers 404: its cache has no compile of the project by this user'};
+        }
+        if (res.status===410) {
+            return {kind: 'none', said: 'Overleaf answers 410: the project changed after its latest compile, or its compiler or TeX Live image is not the compile\'s'};
         }
         return {kind: 'failed', detail: res.message ?? 'Overleaf did not answer'};
     }

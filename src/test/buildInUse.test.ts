@@ -222,6 +222,10 @@ const world = {
     activeEditor: undefined as { document: { uri: Uri } } | undefined,
     /** the texts of the compile's status bar item, first to last */
     statusTexts: [] as string[],
+    /** the lines of the window's log of the builds (VirtualFileSystem's log channel) */
+    buildsLog: [] as string[],
+    /** the waiters for the compile status's next text */
+    statusWaiters: [] as Array<(text: string) => void>,
     /** the project's file system, for 'remoteFileSystem.prefetch' and the workspace's reads */
     vfs: undefined as any,
     overleaf: undefined as unknown as Overleaf,
@@ -271,12 +275,13 @@ const vscodeStandIn = strict('vscode', {
             let text = '';
             return {
                 get text() { return text; },
-                set text(value: string) { text = value; world.statusTexts.push(value); },
+                set text(value: string) { text = value; world.statusTexts.push(value); world.statusWaiters.splice(0).forEach(waiter => waiter(value)); },
                 tooltip: undefined, command: undefined, backgroundColor: undefined, show() {}, hide() {}, dispose() {},
             };
         },
         onDidChangeWindowState: () => disposable,
         registerCustomEditorProvider: () => disposable,
+        createOutputChannel: (_name: string, _options: { log: true }) => ({ info: (line: string) => world.buildsLog.push(line) }),
     }),
     commands: strict('vscode.commands', {
         registerCommand: (id: string, handler: (...args: any[]) => any) => { world.commands.set(id, handler); return disposable; },
@@ -406,6 +411,8 @@ describe('the build in use, from Overleaf to the window', function () {
         world.settings = {};
         world.activeEditor = undefined;
         world.statusTexts = [];
+        world.statusWaiters = [];
+        world.buildsLog = [];
         scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'build-in-use-'));
         vfs = new VirtualFileSystem({ globalState: { get: (_key: string, value: unknown) => value } }, projectUri, () => {});
         vfs.root = tree();
@@ -956,6 +963,32 @@ describe('the build in use, from Overleaf to the window', function () {
             await vfs.builds.opened();
             assert.strictEqual(vfs.builds.build.id, 'b-web');
             assert.deepStrictEqual(overleaf.to('/project/p1/compile'), []);
+            // what Overleaf answered and what the window did, in the window's log of the builds
+            assert.deepStrictEqual(world.buildsLog, [
+                'Book: opening: asks Overleaf for its latest compile',
+                `Book: check: Overleaf names build b-web of editor ${WEB_EDITOR}, compiled with main.tex, draft off, not stopping at the first error; the window takes it`,
+                'Book: opening: does not compile: it shows build b-web',
+            ]);
+        });
+
+        it('lets a restored viewer\'s check wait for the join, and compiles nothing when Overleaf\'s latest compile is current', async () => {
+            // the window has not joined the project yet, as at its load, when output.pdf's viewer is restored
+            vfs.root = undefined;
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            const { panel } = await open();
+            assert.deepStrictEqual(overleaf.to('/project/p1/output/cached/output.overleaf.json'), []);
+            assert.deepStrictEqual(panel.posted.filter(message => message.type === 'buildState').pop(), { type: 'buildState', state: 'connecting' });
+            await vfs.joined(tree());
+            await vfs.builds.opened();
+            assert.strictEqual((await panel.first('load')).output.file.build, 'b-web');
+            assert.deepStrictEqual(overleaf.to('/project/p1/compile'), []);
+            assert.strictEqual(overleaf.to('/project/p1/output/cached/output.overleaf.json').length, 1);
+            assert.deepStrictEqual(world.buildsLog, [
+                'Book: check: waits until the window has joined the project, whose settings it needs',
+                'Book: opening: asks Overleaf for its latest compile',
+                `Book: check: Overleaf names build b-web of editor ${WEB_EDITOR}, compiled with main.tex, draft off, not stopping at the first error; the window takes it`,
+                'Book: opening: does not compile: it shows build b-web',
+            ]);
         });
 
         it('compiles when the project changed after Overleaf\'s latest compile (410)', async () => {
@@ -967,6 +1000,13 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.deepStrictEqual((await ended).outcome, { result: 'success' });
             assert.strictEqual(vfs.builds.build.id, 'b-new');
             assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
+            assert.deepStrictEqual(world.buildsLog, [
+                'Book: opening: asks Overleaf for its latest compile',
+                'Book: check: Overleaf answers 410: the project changed after its latest compile, or its compiler or TeX Live image is not the compile\'s',
+                'Book: viewer: does not compile: no viewer of the build is visible',
+                'Book: opening: compiles',
+                'Book: compile ended: success',
+            ]);
         });
     });
 
@@ -993,6 +1033,46 @@ describe('the build in use, from Overleaf to the window', function () {
 
         it('typesets the project\'s main document from a document whose \\documentclass is commented out', async () => {
             assert.deepStrictEqual(await compileFrom('notes.tex', '% \\documentclass{article}\nSome notes.\n'), [['doc-main', 'main.tex']]);
+        });
+    });
+
+    describe('the compile status', () => {
+        /** The status's next text, or the error that kept it from showing. */
+        function nextStatus(): { outcome: Promise<string>, restore: () => void } {
+            const error = console.error;
+            const outcome = new Promise<string>(resolve => {
+                world.statusWaiters.push(text => resolve(`status: ${text}`));
+                console.error = (...args: unknown[]) => resolve(`error: ${args.map(String).join(' ')}`);
+            });
+            return { outcome, restore: () => { console.error = error; } };
+        }
+
+        it('waits for the project to be joined, as at a window\'s load, and then shows the compiler and the main document', async () => {
+            // the window has not joined the project yet: the join ends when the test says so
+            vfs.root = undefined;
+            let join!: () => void;
+            const joined = new Promise<void>(resolve => { join = resolve; });
+            vfs.init = async () => { await joined; vfs.root = tree(); return vfs.root; };
+            const { outcome, restore } = nextStatus();
+            try {
+                await manager.update('compiling', projectUri);
+                join();
+                assert.strictEqual(await outcome, 'status: pdfLaTeX $(sync~spin)');
+            } finally { restore(); }
+        });
+
+        it('waits for the project to be joined again after a lost connection', async () => {
+            // connectionLost clears the tree until the reconnect has joined the project again
+            vfs.root = undefined;
+            let reconnect!: () => void;
+            const reconnected = new Promise<void>(resolve => { reconnect = resolve; });
+            vfs.init = async () => { await reconnected; vfs.root = tree(); return vfs.root; };
+            const { outcome, restore } = nextStatus();
+            try {
+                await manager.update('success', projectUri);
+                reconnect();
+                assert.strictEqual(await outcome, 'status: pdfLaTeX');
+            } finally { restore(); }
         });
     });
 

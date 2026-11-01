@@ -217,11 +217,17 @@ export class CompileManager {
         return undefined;
     }
 
-    /** Show `status` for the project of `target`, else of the active editor or the workspace (check). */
+    /**
+     * Show `status` for the project of `target`, else of the active editor or the workspace (check).
+     * The status names the project's compiler and main document, which the window knows once it
+     * has joined the project: it shows when the join has come, as at a window's load or after a
+     * lost connection, whose reconnect takes the project's tree away until it has joined again.
+     */
     async update(status: 'idle'|'success'|'compiling'|'failed'|'alert', target?: vscode.Uri) {
         const uri = await CompileManager.check(target);
         if (uri) {
-            this.vfsm.prefetch(uri).then((vfs) => {
+            this.vfsm.prefetch(uri).then(async (vfs) => {
+                await vfs.init();
                 const rootDocName = vfs.getRootDocName().slice(1);
                 const compilerName = vfs.getCompiler()?.name || '';
                 this.status.tooltip = new vscode.MarkdownString();
