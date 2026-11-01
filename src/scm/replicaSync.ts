@@ -60,8 +60,12 @@ export interface LocalStat {
 
 /** The Overleaf side. Paths look like '/folder/name.ext'. */
 export interface ReplicaRemote {
-    /** Whether Overleaf answers now; while it does not, a file missing there is not taken as deleted. */
-    connected(): boolean,
+    /**
+     * Why Overleaf does not answer now, e.g. while the connection is made again: the error that its
+     * requests get meanwhile; undefined while it answers. While it does not answer, a file missing
+     * there is not taken as deleted.
+     */
+    disconnected(): Error | undefined,
     /** All files of the project; rejects when Overleaf does not answer. */
     list(): Promise<Map<string, RemoteEntry>>,
     /** The file at `path` in the project tree as it is now: undefined only when the tree does not have it. */
@@ -233,11 +237,6 @@ function errorText(error: any): string {
     return String(error?.message ?? error);
 }
 
-/** Overleaf does not answer now, e.g. while the connection is made again: the sync decides from Overleaf's side once it answers. */
-export class NotConnectedError extends Error {
-    constructor() { super('not connected to Overleaf'); }
-}
-
 /**
  * How the local folder differs from the one the sync started with (`ReplicaLocal.verify`): it is
  * gone from its path, another folder is there, or its git folder or its settings file is gone.
@@ -308,7 +307,10 @@ export class ReplicaSync {
     static concurrency = 4;
     /** files reconciled at a time during a full sync */
     static scanConcurrency = 8;
-    /** A full sync asks before deleting more files than this on either side. */
+    /**
+     * More files than this deleted on one side at once need the user's confirmation in the window,
+     * in every kind of sync (`applyDeletions`); a tool's request does not make them.
+     */
     static deletionThreshold = 5;
     /** Wait this long before acting on a remote deletion: replacing a file on Overleaf removes it and then adds it again. */
     static remoteDeleteDelayMs = 1000;
@@ -867,8 +869,10 @@ export class ReplicaSync {
         }
 
         const base = entry?.base;
-        // a file missing from the project tree is known to be gone from Overleaf only while Overleaf answers
-        if (remote===undefined && !this.remote.connected()) { throw new NotConnectedError(); }
+        // a file missing from the project tree is known to be gone from Overleaf only while Overleaf
+        // answers; until then the next sync decides
+        const disconnected = remote===undefined ? this.remote.disconnected() : undefined;
+        if (disconnected) { throw disconnected; }
         if (localHash===undefined && remoteHash===undefined) {
             if (entry) {
                 delete this.state.entries[path];

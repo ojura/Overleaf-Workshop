@@ -289,13 +289,16 @@ export class VirtualFileSystem extends vscode.Disposable {
         return this.initializing;
     }
 
+    /** The error of a request that needs the project while it is not connected, with the message the window shows. */
+    notConnectedError(): Error {
+        return new Error(vscode.l10n.t('Not connected to {serverName}; reconnecting in the background.', {serverName: this.serverName}));
+    }
+
     /** The project once the connection is back, or an error after `reconnectWaitMs`. */
     private waitForReconnect(reconnected: Promise<ProjectEntity>): Promise<ProjectEntity> {
         let timer: NodeJS.Timeout | undefined;
         const timeout = new Promise<ProjectEntity>((_, reject) => {
-            timer = setTimeout(() => reject(new Error(
-                vscode.l10n.t('Not connected to {serverName}; reconnecting in the background.', {serverName: this.serverName})
-            )), VirtualFileSystem.reconnectWaitMs);
+            timer = setTimeout(() => reject(this.notConnectedError()), VirtualFileSystem.reconnectWaitMs);
         });
         return Promise.race([reconnected, timeout]).finally(() => clearTimeout(timer));
     }

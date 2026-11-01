@@ -7,7 +7,7 @@ import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { FileRefEntity, FolderEntity, VirtualFileSystem, __OUTPUTS_ID, parseUri } from '../core/remoteFileSystemProvider';
 import {
-    Deletions, describe, FolderChange, FolderChangedError, LocalStat, NotConnectedError, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync,
+    Deletions, describe, FolderChange, FolderChangedError, LocalStat, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync,
     ReplicaUI, SyncSummary,
 } from './replicaSync';
 import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath, REPLICA_CONFLICTS_FOLDER, REPLICA_SETTINGS_FILE, REPLICA_TEMPORARY_FOLDER } from './ignorePatterns';
@@ -209,7 +209,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
      * known to be absent on Overleaf.
      */
     private async resolveRemote(path: string) {
-        if (!this.vfs.connected) { throw new NotConnectedError(); }
+        if (!this.vfs.connected) { throw this.vfs.notConnectedError(); }
         try {
             return await this.vfs._resolveUri(this.vfs.pathToUri(path));
         } catch (error) {
@@ -253,9 +253,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const vfs = this.vfs;
         const uri = (path: string) => vfs.pathToUri(path);
         // while the project is not connected, a lookup cannot be answered
-        const online = () => { if (!vfs.connected) { throw new NotConnectedError(); } };
+        const online = () => { if (!vfs.connected) { throw vfs.notConnectedError(); } };
         return {
-            connected: () => vfs.connected,
+            disconnected: () => vfs.connected ? undefined : vfs.notConnectedError(),
             list: async () => {
                 online();
                 const root = await vfs.init();

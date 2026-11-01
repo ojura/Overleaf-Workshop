@@ -18,7 +18,7 @@ const dec = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 
 /** Overleaf, in memory: docs hold text, files hold bytes and report their hash; it can rename. */
 class Remote implements ReplicaRemote {
-    connected() { return true; }
+    disconnected() { return undefined; }
     docs = new Map<string, string>();
     files = new Map<string, Uint8Array>();
     calls: string[] = [];

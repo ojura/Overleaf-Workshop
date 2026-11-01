@@ -9,7 +9,9 @@ const dec = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 
 /** Overleaf, in memory: docs hold text, files hold bytes and report their hash. */
 class FakeRemote implements ReplicaRemote {
-    connected() { return true; }
+    /** the error that Overleaf's requests get while it does not answer; undefined while it answers */
+    lost?: Error;
+    disconnected() { return this.lost; }
     docs = new Map<string, string>();
     files = new Map<string, Uint8Array>();
     folders = new Set<string>();
@@ -335,6 +337,19 @@ describe('ReplicaSync', () => {
         assert.strictEqual(t.ui.asked.length, 1);
         assert.strictEqual(summary.skippedDeletions.length, 7);
         assert.strictEqual(t.remote.files.size, 7);
+    });
+
+    it('does not take a file missing on Overleaf for deleted while Overleaf does not answer, and fails with Overleaf\'s reason', async () => {
+        const t = setup();
+        t.remote.docs.set('/a.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        // the project tree lacks the file, but Overleaf does not answer: the tree may be old
+        t.remote.docs.delete('/a.tex');
+        t.remote.lost = new Error('Not connected to Overleaf, as the test has it');
+        const summary = await sync.syncAll();
+        assert.deepStrictEqual(summary.failed, [{ path: '/a.tex', error: t.remote.lost.message }]);
+        assert.strictEqual(t.local.text('/a.tex'), text, 'the local file stays');
     });
 
     it('counts deletions that events report one at a time together, and asks once before making many', async () => {

@@ -144,8 +144,10 @@ replica-sync    Asks the IDE window that keeps the replica in sync with Overleaf
                 into the folder. The window answers on a local socket, also while it is in
                 the background, and does not come to the front. It also scans when
                 overleaf-workshop.localReplica.syncOnFileChange is off. It deletes at most
-                ${ReplicaSync.deletionThreshold} files on one side, as the window does without asking; more wait for the
-                user's confirmation in the window.
+                ${ReplicaSync.deletionThreshold} files on one side, as the window does without asking; more wait
+                for the user's confirmation in the window. While a question about
+                deletions is open there, the window answers at once with the question,
+                without looking for changed files: answer it, then run replica-sync again.
 replica-status  Shows whether the window is connected to Overleaf, how it watches the
                 folder, what it synced in the last 10 minutes, and the replica's git state:
                 the checked-out commit and Overleaf's state (refs/remotes/overleaf/main).
@@ -166,9 +168,9 @@ replica-land    Lands <commit> of the replica's git repository in the project, t
                 Overleaf's acknowledgements. The files the commit deletes are deleted with
                 it; other deletions follow replica-sync's rule. The tool checks again that
                 Overleaf holds the commit, for up to three minutes, and compiles the
-                project once (again while
-                Overleaf answers that another compile of yours runs). The compile's logs are
-                kept in <git dir>/overleaf/compiles/<commit>/ and checked: an error line
+                project once (again while Overleaf answers that another compile of yours
+                runs). It keeps the logs of the compile in a folder of its own,
+                <git dir>/overleaf/compiles/<commit>/, and checks them: an error line
                 ("! ") in output.log, no "Output written on output.pdf", latexmk's
                 "Collected error summary", an "Automatic index:" line in output.stderr, or
                 "The index was not built/sorted" fails the landing. The warnings are listed

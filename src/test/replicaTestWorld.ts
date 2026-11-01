@@ -153,6 +153,7 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
         },
         getUpdates: async () => ({ updates: w.updates, nextBeforeTimestamp: 0 }),
         documentUpdatesSettled: async () => {},
+        notConnectedError: () => new Error('Not connected to www.overleaf.com; reconnecting in the background.'),
     };
     /** a change on Overleaf, as the project reports it */
     const remoteChange = (p: string, text: string) => {
