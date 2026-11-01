@@ -241,4 +241,28 @@ describe('the control socket of a local replica', () => {
         assert.notStrictEqual(replicaSocketPath(folder), socket);
         assert.deepStrictEqual(await requestReplica(folder, { op: 'status' }, 5000), { ok: true });
     });
+
+    it('tells the window that wrote why it cannot listen from a later process with its pid, by the start time', async function () {
+        if (process.platform !== 'linux') { this.skip(); } // the start time is in /proc/<pid>/stat
+        // a window that cannot listen writes why, with its pid and when its process started
+        longRuntime();
+        assert.strictEqual(await serve(async () => ({ ok: true })).start(), undefined, 'the server does not listen');
+        process.env.XDG_RUNTIME_DIR = runtime;
+        const file = path.join(folder, POINTER_FILE);
+        const pointer = JSON.parse(fs.readFileSync(file, 'utf8'));
+        assert.strictEqual(pointer.pid, process.pid);
+        assert.ok(Number.isSafeInteger(pointer.processStart), `the start time beside the pid: ${pointer.processStart}`);
+        const unreachable = (error: Error) => error instanceof ReplicaUnreachableError && error.message.endsWith(`cannot answer tools: ${pointer.error}`);
+        await assert.rejects(requestReplica(folder, { op: 'status' }, 5000), unreachable, 'while the window runs');
+
+        // the window ended, and a process that started later has its pid
+        fs.writeFileSync(file, JSON.stringify({ ...pointer, processStart: pointer.processStart - 1 }));
+        await assert.rejects(requestReplica(folder, { op: 'status' }, 5000), NoReplicaWindowError, 'after another process took the pid');
+
+        // a pointer without the start time, as older windows wrote it: the pid decides
+        const older = { ...pointer };
+        delete older.processStart;
+        fs.writeFileSync(file, JSON.stringify(older));
+        await assert.rejects(requestReplica(folder, { op: 'status' }, 5000), unreachable, 'a pointer without the start time');
+    });
 });

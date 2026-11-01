@@ -218,7 +218,10 @@ export class ReplicaControlServer {
             fs.mkdirSync(path.dirname(file), { recursive: true });
             // a new file renamed over the old one, so that a tool reads all of it or the one before
             const tmp = `${file}.${process.pid}.tmp`;
-            fs.writeFileSync(tmp, JSON.stringify({ ...content, pid: process.pid, since: new Date().toISOString() }, null, 4) + '\n');
+            const processStart = processStartTime(process.pid);
+            fs.writeFileSync(tmp, JSON.stringify({
+                ...content, pid: process.pid, ...(processStart === undefined ? {} : { processStart }), since: new Date().toISOString(),
+            }, null, 4) + '\n');
             fs.renameSync(tmp, file);
             this.pointerWritten = true;
         } catch (error: any) {
@@ -260,10 +263,23 @@ export function findReplicaSocket(folder: string): string {
         pointer = JSON.parse(fs.readFileSync(path.join(folder, POINTER_FILE), 'utf8'));
     } catch { /* no pointer file */ }
     if (typeof pointer?.socket === 'string') { return pointer.socket; }
-    if (typeof pointer?.error === 'string' && processRuns(pointer.pid)) {
+    if (typeof pointer?.error === 'string' && writerRuns(pointer)) {
         throw new ReplicaUnreachableError(`the IDE window that keeps ${folder} in sync cannot answer tools: ${pointer.error}`);
     }
     return replicaSocketPath(folder);
+}
+
+/**
+ * Whether the window that wrote `pointer` runs: a process with its pid runs, and that process
+ * started when the pointer says the window did. The pid decides alone for a pointer without the
+ * start time, as older windows and systems without /proc write it, and when the system does not
+ * give the start time of the process with that pid.
+ */
+function writerRuns(pointer: { pid?: unknown, processStart?: unknown }): boolean {
+    if (!processRuns(pointer.pid)) { return false; }
+    if (typeof pointer.processStart !== 'number') { return true; }
+    const start = processStartTime(pointer.pid as number);
+    return start === undefined || start === pointer.processStart;
 }
 
 /** Whether the process `pid` runs, e.g. the window that wrote a pointer file. */
@@ -275,6 +291,23 @@ function processRuns(pid: unknown): boolean {
     } catch (error: any) {
         // EPERM: it runs, as another user's
         return error?.code === 'EPERM';
+    }
+}
+
+/**
+ * When the process `pid` started, as the system records it, or undefined where the system does not
+ * give it. On Linux it is field 22 of /proc/<pid>/stat, starttime, in clock ticks after boot
+ * (proc(5)), which tells a process from a later one that has the same pid. The fields are counted
+ * after the last ")", as the command's name before it, field 2, can contain spaces and ")".
+ */
+function processStartTime(pid: number): number | undefined {
+    if (process.platform !== 'linux') { return undefined; }
+    try {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+        const field = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[22 - 3];
+        return /^\d+$/.test(field ?? '') ? Number(field) : undefined;
+    } catch {
+        return undefined;
     }
 }
 
