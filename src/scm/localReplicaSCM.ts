@@ -10,7 +10,7 @@ import {
     deletionsNeedConfirmation, describe, LocalStat, NotConnectedError, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync,
     ReplicaUI, SyncSummary, syncProblems,
 } from './replicaSync';
-import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath, REPLICA_TEMPORARY_FOLDER } from './ignorePatterns';
+import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath, REPLICA_CONFLICTS_FOLDER, REPLICA_SETTINGS_FILE, REPLICA_TEMPORARY_FOLDER } from './ignorePatterns';
 import * as localFs from './localFolderFs';
 import { LocalFolderWatcher } from './localFolderWatcher';
 import { ControlAnswer, ControlRequest, ReplicaControlServer } from './replicaControl';
@@ -19,10 +19,6 @@ import { GitReplicaStore, OVERLEAF_REF, Person } from './replicaGit';
 import type { HistoryUpdate } from '../gitbridge/history';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
-/** The replica's settings in its folder; that it exists also marks the folder as the replica's. */
-const SETTINGS_FILE = '.overleaf/settings.json';
-/** Where the sync keeps the local versions it replaced. Paths in `.overleaf` are never synced. */
-const CONFLICTS_FOLDER = '.overleaf/conflicts';
 
 /**
  * How often a replica that syncs the changes of other programs also scans its folder, in case a
@@ -137,7 +133,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
         if (workspaceRoot===undefined || workspaceRoot?.scheme!=='file') { return undefined; }
 
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, SETTINGS_FILE);
+        const settingUri = vscode.Uri.joinPath(workspaceRoot, REPLICA_SETTINGS_FILE);
         try {
             await vscode.workspace.fs.stat(settingUri);
             return vscode.Uri.joinPath(workspaceRoot, path);
@@ -150,7 +146,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
         if (workspaceRoot===undefined || workspaceRoot?.scheme!=='file') { return undefined; }
 
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, SETTINGS_FILE);
+        const settingUri = vscode.Uri.joinPath(workspaceRoot, REPLICA_SETTINGS_FILE);
         try {
             await vscode.workspace.fs.stat(settingUri);
             return uri.path.slice(workspaceRoot.path.length);
@@ -163,7 +159,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     public static async writeSettings(settings: any): Promise<void> {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
         if (workspaceRoot===undefined || workspaceRoot.scheme!=='file') { return; }
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, SETTINGS_FILE);
+        const settingUri = vscode.Uri.joinPath(workspaceRoot, REPLICA_SETTINGS_FILE);
         await vscode.workspace.fs.writeFile(settingUri, Buffer.from(JSON.stringify(settings, null, 4)));
     }
 
@@ -171,7 +167,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
         if (vscode.workspace.workspaceFolders?.length!==1 || workspaceRoot?.scheme!=='file') { return undefined; }
 
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, SETTINGS_FILE);
+        const settingUri = vscode.Uri.joinPath(workspaceRoot, REPLICA_SETTINGS_FILE);
         try {
             await vscode.workspace.fs.stat(settingUri);
             const content = await vscode.workspace.fs.readFile(settingUri);
@@ -384,7 +380,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 const problem = now===undefined ? 'it is gone'
                     : now.dev!==start.identity.dev || now.ino!==start.identity.ino ? 'another folder is at its path'
                     : !await fs.exists(start.gitDir) ? `its git folder ${start.gitDir} is gone`
-                    : !await fs.exists(uri(SETTINGS_FILE)) ? `its ${SETTINGS_FILE} is gone`
+                    : !await fs.exists(uri(REPLICA_SETTINGS_FILE)) ? `its ${uri(REPLICA_SETTINGS_FILE).fsPath} is gone`
                     : undefined;
                 if (problem!==undefined) {
                     throw new Error(`"${folder}" is not the folder this replica started with: ${problem}. The replica does not sync until the window is reloaded`);
@@ -460,7 +456,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             // when git has no user.name and user.email: the Overleaf account, as the project lists it
             fallbackUser: () => person,
             log: message => log(`[${vfs.projectName}] ${message}`),
-            copiesFolder: CONFLICTS_FOLDER,
         });
         void vfs.init().then(project => {
             const me = [project.owner, ...(project.members ?? [])].find(member => member?._id===vfs._userId);
@@ -508,7 +503,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             notes.push(vscode.l10n.t('{count} files were changed on both sides in the same place and have conflicts to resolve: {files}. They are uploaded once the markers are gone and the file is staged (git add).', {count: summary.conflicts.length, files: list(summary.conflicts)}));
         }
         if (summary.keptAside.length) {
-            notes.push(vscode.l10n.t('{count} local files differed from Overleaf without saved sync state to tell which side changed; Overleaf\'s version is in place and the local one is kept in {folder}: {files}.', {count: summary.keptAside.length, folder: CONFLICTS_FOLDER, files: list(summary.keptAside.map(k => k.path))}));
+            notes.push(vscode.l10n.t('{count} local files differed from Overleaf without saved sync state to tell which side changed; Overleaf\'s version is in place and the local one is kept in {folder}: {files}.', {count: summary.keptAside.length, folder: vscode.Uri.joinPath(this.baseUri, REPLICA_CONFLICTS_FOLDER).fsPath, files: list(summary.keptAside.map(k => k.path))}));
         }
         if (summary.failed.length) {
             notes.push(vscode.l10n.t('{count} files could not be synced and keep their local content: {files} ({error}). They are synced again when the connection is back, or with "Sync Now".', {count: summary.failed.length, files: list(summary.failed.map(f => f.path)), error: summary.failed[0].error}));
@@ -890,7 +885,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private async initWatch() {
         // write the settings file if it does not exist
-        const settingUri = vscode.Uri.joinPath(this.baseUri, SETTINGS_FILE);
+        const settingUri = vscode.Uri.joinPath(this.baseUri, REPLICA_SETTINGS_FILE);
         if (!await localFs.exists(settingUri)) {
             await localFs.writeFile(settingUri, Buffer.from(
                 JSON.stringify({

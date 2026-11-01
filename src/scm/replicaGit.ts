@@ -6,7 +6,8 @@ import * as os from 'os';
 import * as path from 'path';
 import type { HistoryUpdate } from '../gitbridge/history';
 import { changedPaths, Entry, FlatTree, GitError } from '../gitbridge/plumbing';
-import { REPLICA_OWN_FOLDERS } from './ignorePatterns';
+import { REPLICA_CONFLICTS_FOLDER, REPLICA_FOLDER, REPLICA_OWN_FOLDERS } from './ignorePatterns';
+import { isMissing } from './localFolderFs';
 import type { Origin, ReplicaStore, SavedState } from './replicaSync';
 
 /*
@@ -53,6 +54,8 @@ export const OVERLEAF_REF = 'refs/remotes/overleaf/main';
 /** The Overleaf version of commits that became Overleaf's state by a push. */
 export const NOTES_REF = 'refs/notes/overleaf';
 const NULL_OID = '0'.repeat(40);
+/** Where the sync kept its state before it kept a git repository (`importLegacyState`). */
+const LEGACY_STATE_FOLDER = `${REPLICA_FOLDER}/sync`;
 
 export interface Person { name: string; email: string; }
 /** A person and a date in git's format, "<seconds> <+hhmm>". */
@@ -330,8 +333,6 @@ export interface ReplicaGitOptions {
     /** who commits when git has no user.name and user.email, e.g. the Overleaf account */
     fallbackUser?: () => Person | undefined;
     log: (message: string) => void;
-    /** where `keepCopy` puts a local version that the sync replaces, inside the folder */
-    copiesFolder?: string;
 }
 
 /** What `record` did, for the log and for tools. */
@@ -434,7 +435,7 @@ export class GitReplicaStore implements ReplicaStore {
         try {
             text = await fsp.readFile(file, 'utf8');
         } catch (error: any) {
-            if (error?.code !== 'ENOENT') { throw await this.stateError(file, `it cannot be read (${error?.message ?? error})`); }
+            if (!isMissing(error)) { throw await this.stateError(file, `it cannot be read (${error?.message ?? error})`); }
             // a recorded state is newer than the state kept before git, which its first record turned into commits
             const state = await this.recordedState(file) ?? await this.importLegacyState();
             if (state) { this.lastState = state; }
@@ -517,7 +518,7 @@ export class GitReplicaStore implements ReplicaStore {
     async pruneBases(): Promise<void> {}
 
     async keepCopy(filePath: string, content: Uint8Array): Promise<string> {
-        const copy = `${this.options.copiesFolder ?? '.overleaf/conflicts'}/${stamp()}${filePath}`;
+        const copy = `${REPLICA_CONFLICTS_FOLDER}/${stamp()}${filePath}`;
         const target = path.join(this.options.folder, copy);
         await fsp.mkdir(path.dirname(target), { recursive: true });
         await fsp.writeFile(target, content);
@@ -559,7 +560,7 @@ export class GitReplicaStore implements ReplicaStore {
      * `.overleaf/sync` is not read again.
      */
     private async importLegacyState(): Promise<SavedState | undefined> {
-        const dir = path.join(this.options.folder, '.overleaf', 'sync');
+        const dir = path.join(this.options.folder, LEGACY_STATE_FOLDER);
         let legacy: { project?: string, state?: SavedState };
         try {
             legacy = JSON.parse(await fsp.readFile(path.join(dir, 'state.json'), 'utf8'));
@@ -592,7 +593,7 @@ export class GitReplicaStore implements ReplicaStore {
         for (const f of files) {
             if (!held.has(f.path)) { delete state.entries[f.path]; dropped.push(f.path); }
         }
-        this.options.log(`The sync state in .overleaf/sync (${Object.keys(legacy.state.entries ?? {}).length} files) is now kept in git; .overleaf/sync is no longer read.`
+        this.options.log(`The sync state in ${dir} (${Object.keys(legacy.state.entries ?? {}).length} files) is now kept in git; that folder is no longer read.`
             + (dropped.length ? ` ${dropped.length} files have no saved base any more and sync as if seen for the first time: ${dropped.slice(0, 10).join(', ')}${dropped.length > 10 ? ', ...' : ''}` : ''));
         state.changes = Object.fromEntries(Object.keys(state.entries).map(p => [p, 'import' as Origin]));
         await this.save(state);
