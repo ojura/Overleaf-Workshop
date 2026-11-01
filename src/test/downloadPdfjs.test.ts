@@ -59,7 +59,13 @@ describe('the download of pdf.js (scripts/download-pdfjs.mjs)', function () {
         fs.writeFileSync(`${release}-dist.patch`, '');
         // a name under .invalid never resolves (RFC 6761): the download fails at once
         const plan = { ...script.planOf('9.8.7', release), url: 'http://pdfjs.invalid/pdfjs-9.8.7-dist.zip' };
-        assert.throws(() => script.download(plan), /the download of http:\/\/pdfjs\.invalid\/pdfjs-9\.8\.7-dist\.zip failed/);
+        // download-cli's output stays out of the suite's output, and the error carries what it said
+        assert.throws(() => script.download(plan, { output: 'pipe' }), (error: Error) => {
+            const [first, ...said] = error.message.split('\n');
+            assert.match(first, /^the download of http:\/\/pdfjs\.invalid\/pdfjs-9\.8\.7-dist\.zip failed/);
+            assert.ok(said.join('\n').includes('pdfjs.invalid'), error.message);
+            return true;
+        });
         assert.deepStrictEqual(fs.readdirSync(vendor).sort(), ['pdfjs-9.8.7', 'pdfjs-9.8.7-dist.patch']);
         assert.strictEqual(fs.readFileSync(path.join(release, 'earlier.txt'), 'utf8'), 'the earlier copy');
     });
