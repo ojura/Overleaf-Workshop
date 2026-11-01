@@ -115,7 +115,7 @@ describe('landing a commit through the replica\'s window (the land request)', fu
         // what the replica asks of Overleaf's side of the project
         const calls: string[] = [];
         const rel = (uri: Uri) => uri.path.slice(t.vfs.origin.path.length);
-        for (const op of ['rename', 'createFile', 'writeFile', 'remove'] as const) {
+        for (const op of ['rename', 'createFile', 'writeDoc', 'remove'] as const) {
             const real = t.vfs[op] as (...args: any[]) => Promise<any>;
             (t.vfs as any)[op] = (...args: any[]) => {
                 calls.push(`${op} ${rel(args[0])}${op === 'rename' ? ` ${rel(args[1])}` : ''}`);
@@ -133,7 +133,7 @@ describe('landing a commit through the replica\'s window (the land request)', fu
         const answer: any = await t.requestReplica(folder, { op: 'land', commit }, 10000);
         assert.strictEqual(answer.ok, true, `the landing: ${JSON.stringify(answer)}`);
         assert.deepStrictEqual(answer.summary.renamed, [{ from: '/chapters/one.tex', to: '/chapters/first.tex' }], 'the landing\'s renames');
-        assert.deepStrictEqual(calls, ['rename /chapters/one.tex /chapters/first.tex', 'writeFile /chapters/first.tex'], 'what the replica asked of Overleaf: the rename, then the edit');
+        assert.deepStrictEqual(calls, ['rename /chapters/one.tex /chapters/first.tex', 'writeDoc /chapters/first.tex'], 'what the replica asked of Overleaf: the rename, then the edit');
         assert.deepStrictEqual([t.w.remote.get('/chapters/first.tex'), t.w.remote.has('/chapters/one.tex')], [edited, false], 'the documents on Overleaf');
         assert.strictEqual(git(folder, 'rev-parse', OVERLEAF_REF), commit, 'Overleaf\'s state');
         assert.strictEqual(git(folder, 'status', '--porcelain'), '', 'git status');

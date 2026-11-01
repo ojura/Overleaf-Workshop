@@ -57,7 +57,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
     function loseConnection(t: ReturnType<typeof host>, options: { treeAnswers?: boolean } = {}) {
         const vfs = t.vfs as any;
         vfs.connected = false;
-        const keys = options.treeAnswers ? ['getUpdates'] : ['init', '_resolveUri', 'openFile', 'writeFile', 'createFile', 'remove', 'rename', 'mkdir', 'getUpdates'];
+        const keys = options.treeAnswers ? ['getUpdates'] : ['init', '_resolveUri', 'openFile', 'writeFile', 'writeDoc', 'createFile', 'remove', 'rename', 'mkdir', 'getUpdates'];
         for (const key of keys) {
             const original = vfs[key];
             vfs[key] = async (...args: any[]) => { if (!vfs.connected) { throw vfs.notConnectedError(); } return original(...args); };
@@ -460,10 +460,11 @@ describe('local replica: what it deletes and what it never syncs', function () {
                 return undefined;
             };
             const { scm } = await committedV2(t);
+            // the replica writes a document with the VFS's writeDoc
             const vfs = t.vfs as any;
-            const write = vfs.writeFile;
+            const write = vfs.writeDoc;
             const uploaded = new Promise<void>(resolve => {
-                vfs.writeFile = async (...args: any[]) => {
+                vfs.writeDoc = async (...args: any[]) => {
                     await write(...args);
                     if (t.w.remote.get('/main.tex') === 'v1\n') { resolve(); }
                 };

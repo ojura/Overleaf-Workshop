@@ -283,7 +283,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             isFolder: async (path) => (await this.resolveRemote(path))?.fileType==='folder',
             readDoc: async (path) => { online(); return decoder.decode(await vfs.openFile(uri(path))); },
             readFile: async (path) => { online(); return vfs.openFile(uri(path)); },
-            writeDoc: (path, text) => vfs.writeFile(uri(path), encoder.encode(text), false, true),
+            writeDoc: (path, text) => vfs.writeDoc(uri(path), encoder.encode(text)),
             upload: async (path, content) => {
                 await this.ensureRemoteFolders(path);
                 const entity = await vfs.createFile(uri(path), content, true);

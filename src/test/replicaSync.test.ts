@@ -76,7 +76,9 @@ class FakeRemote implements ReplicaRemote {
         this.files.delete(path);
     }
     async removeFolderIfEmpty() {}
-    async settled() {}
+    /** settled() rejects with this while set, as the VFS does with documents that Overleaf has not confirmed */
+    settleFailure?: Error;
+    async settled() { if (this.settleFailure) { throw this.settleFailure; } }
     count(prefix: string) { return this.calls.filter(call => call.startsWith(prefix)).length; }
 }
 
@@ -118,6 +120,8 @@ class FakeLocal implements ReplicaLocal {
 
 class FakeStore implements ReplicaStore {
     state?: SavedState;
+    /** set by a test that watches what the sync records */
+    record?: (state: SavedState) => Promise<{waiting?: boolean}>;
     bases = new Map<string, string>();
     copies = new Map<string, Uint8Array>();
     async load() { return this.state && JSON.parse(JSON.stringify(this.state)); }
@@ -624,3 +628,23 @@ describe('ReplicaSync', () => {
     });
 });
 
+describe('ReplicaSync and the updates that Overleaf has not confirmed', () => {
+    before(() => { ReplicaSync.remoteDeleteDelayMs = 0; ReplicaSync.saveDelayMs = 0; });
+
+    it('does not record the state while Overleaf has not confirmed the document updates', async () => {
+        const t = setup();
+        t.remote.docs.set('/main.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        const recorded: SavedState[] = [];
+        t.store.record = async (state: SavedState) => { recorded.push(state); return {}; };
+        t.remote.settleFailure = new Error('Overleaf has not confirmed these updates: /main.tex: not confirmed (the connection was lost (disconnected))');
+        t.local.set('/main.tex', text + 'line 6\n');
+        await assert.rejects(sync.flush(true, {record: true}), /has not confirmed these updates: \/main\.tex/);
+        assert.deepStrictEqual(recorded, []);
+        t.remote.settleFailure = undefined;
+        await sync.flush(true, {record: true});
+        assert.strictEqual(recorded.length, 1);
+        assert.strictEqual(t.remote.docs.get('/main.tex'), text + 'line 6\n');
+    });
+});
