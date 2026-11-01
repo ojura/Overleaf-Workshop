@@ -10,6 +10,8 @@
  * is off. The shared project's id is refused outright, whatever the record says.
  */
 
+import type { CompileRequest } from '../api/base';
+
 /** What .overleaf/sandbox.json holds. */
 export interface SandboxRecord {
     /** version of this file's format */
@@ -116,12 +118,6 @@ export interface ProjectWriter {
     updateSettings(projectId: string, settings: { compiler?: string, imageName?: string }): Promise<void>;
     clearOutput(projectId: string): Promise<void>;
     compile(projectId: string, request: CompileRequest): Promise<any>;
-}
-
-export interface CompileRequest {
-    rootResourcePath: string;
-    draft: boolean;
-    stopOnFirstError: boolean;
 }
 
 /**

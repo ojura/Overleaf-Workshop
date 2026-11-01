@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention -- mirrors the 'vscode' export names */
 import * as assert from 'assert';
-import Module = require('module');
+import { loadWithVscode } from './standIn';
 
 const identity = { cookies: 'overleaf_session2=s', csrfToken: 't' };
 
@@ -25,13 +25,7 @@ const vscodeMock = withStubs({
     l10n: { t: (message: string) => message },
     workspace: withStubs({ textDocuments: [], getConfiguration: () => ({ get: (_k: string, v: any) => v }) }),
 });
-const moduleAny = Module as any;
-const originalLoad = moduleAny._load;
-moduleAny._load = function (request: string, ...rest: any[]) {
-    return request === 'vscode' ? vscodeMock : originalLoad.call(this, request, ...rest);
-};
-const { VirtualFileSystem } = require('../core/remoteFileSystemProvider');
-moduleAny._load = originalLoad;
+const { VirtualFileSystem } = loadWithVscode(vscodeMock, () => require('../core/remoteFileSystemProvider'));
 
 describe('VirtualFileSystem.compile', () => {
     function vfsWith(calls: string[]) {
@@ -44,8 +38,8 @@ describe('VirtualFileSystem.compile', () => {
         vfs.notify = () => {};
         vfs.api = {
             deleteAuxFiles: async () => { calls.push('clear the output'); return { type: 'success' }; },
-            compile: async (_identity: any, _projectId: string, rootResourcePath: string) => {
-                calls.push(`compile ${rootResourcePath}`);
+            compile: async (_identity: any, _projectId: string, request: any) => {
+                calls.push(`compile ${request.rootResourcePath} (${request.rootDocId})`);
                 return { type: 'success', compile: { status: 'failure', outputFiles: [] } };
             },
         };
@@ -55,12 +49,12 @@ describe('VirtualFileSystem.compile', () => {
     it('keeps the compile output on Overleaf for the first compile of a session', async () => {
         const calls: string[] = [];
         await vfsWith(calls).compile(true);
-        assert.deepStrictEqual(calls, ['compile main.tex']);
+        assert.deepStrictEqual(calls, ['compile main.tex (doc1)']);
     });
 
     it('clears the compile output first when it compiles from scratch', async () => {
         const calls: string[] = [];
         await vfsWith(calls).compile(true, false, false, undefined, true);
-        assert.deepStrictEqual(calls, ['clear the output', 'compile main.tex']);
+        assert.deepStrictEqual(calls, ['clear the output', 'compile main.tex (doc1)']);
     });
 });

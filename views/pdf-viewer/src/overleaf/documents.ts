@@ -7,12 +7,12 @@ import { createWorkerPort } from '../common/worker';
 export interface DocumentHooks {
     /** a load is about to replace the shown document: save what depends on it */
     beforeLoad(): void;
-    /** `doc` is shown */
-    loaded(doc: any): void;
-    /** the load failed; `aborted` when a newer load stopped it */
-    failed(error: unknown, aborted: boolean): void;
-    /** a request of the document failed (the transport's handleFetchError) */
-    fetchFailed(error: unknown): void;
+    /** `doc`, of build `build` or read whole, is shown */
+    loaded(doc: any, build: string | undefined): void;
+    /** the load of build `build`, or of a PDF read whole, failed; `aborted` when a newer load stopped it */
+    failed(error: unknown, aborted: boolean, build: string | undefined): void;
+    /** a request of build `build`'s document failed (the transport's handleFetchError) */
+    fetchFailed(error: unknown, build: string): void;
 }
 
 interface Job {
@@ -59,7 +59,8 @@ const DESTROY_TIMEOUT_MS = 10_000;
 export class Documents {
     private queue: Promise<void> = Promise.resolve();
     private inFlight?: Job;
-    private shownUrl?: string;
+    /** the build shown, unless the shown document was read whole */
+    private shownBuild?: string;
     /** the worker and the range requests of each document's loading task */
     private readonly owned = new Map<any, Owned>();
 
@@ -70,9 +71,14 @@ export class Documents {
         return this.inFlight !== undefined;
     }
 
+    /** settles when the loads asked for so far have ended, shown, failed or overtaken */
+    get settled(): Promise<void> {
+        return this.queue;
+    }
+
     /** Load the build `output` in ranges, unless it is the build shown already. */
     load(output: PdfOutput, force = false) {
-        if (!force && !this.inFlight && output.url === this.shownUrl) { return; }
+        if (!force && !this.inFlight && output.file.build === this.shownBuild) { return; }
         this.enqueue(job => this.loadOutput(output, job));
     }
 
@@ -145,7 +151,7 @@ export class Documents {
             abortController: job.abort,
             handleFetchError: (error: unknown) => {
                 if (job.abort.signal.aborted) { return; }
-                this.hooks.fetchFailed(error);
+                this.hooks.fetchFailed(error, output.file.build);
                 // Before the document is shown, a request that failed for good ends its load:
                 // pdf.js waits for the missing range forever. Stop the job, so that its worker
                 // goes and the next load can start.
@@ -160,7 +166,7 @@ export class Documents {
             doc = await this.untilAborted(job, loading);
         } catch (error) {
             if (job.task) { this.destroy(job.task); }
-            this.hooks.failed(error, job.abort.signal.aborted);
+            this.hooks.failed(error, job.abort.signal.aborted, output.file.build);
             return;
         }
         if (!doc) {
@@ -169,9 +175,9 @@ export class Documents {
             return;
         }
         shown = true;
-        this.shownUrl = url;
+        this.shownBuild = output.file.build;
         this.destroyAllBut(doc);
-        this.hooks.loaded(doc);
+        this.hooks.loaded(doc, output.file.build);
     }
 
     /** End `job` now: stop its requests and destroy its document. */
@@ -193,7 +199,7 @@ export class Documents {
             doc = await this.untilAborted(job, task.promise);
         } catch (error) {
             this.destroy(task);
-            this.hooks.failed(error, job.abort.signal.aborted);
+            this.hooks.failed(error, job.abort.signal.aborted, undefined);
             return;
         }
         if (!doc) {
@@ -201,9 +207,9 @@ export class Documents {
             return;
         }
         this.setDocument(doc);
-        this.shownUrl = undefined;
+        this.shownBuild = undefined;
         this.destroyAllBut(doc);
-        this.hooks.loaded(doc);
+        this.hooks.loaded(doc, undefined);
     }
 
     /** PDFJSWrapper.loadDocument's swap (pdf-js-wrapper.ts:89-106), for a document it did not load. */

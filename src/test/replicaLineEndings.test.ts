@@ -7,6 +7,7 @@ const dec = (b: Uint8Array) => new TextDecoder().decode(b);
 
 /** Overleaf's side for one document: it stores the text with "\n", as the extension now sends it. */
 class Overleaf implements ReplicaRemote {
+    connected() { return true; }
     docs = new Map<string, string>();
     writes: string[] = [];
     async list() { return new Map<string, RemoteEntry>([...this.docs.keys()].map(path => [path, { kind: 'doc' }])); }
@@ -23,6 +24,7 @@ class Overleaf implements ReplicaRemote {
 
 /** The local folder, in memory, with a clock for modification times. */
 class Folder implements ReplicaLocal {
+    async verify() {}
     files = new Map<string, { content: Uint8Array, mtime: number }>();
     clock = 1_000_000;
     set(path: string, text: string) { this.clock += 10_000; this.files.set(path, { content: enc(text), mtime: this.clock }); }

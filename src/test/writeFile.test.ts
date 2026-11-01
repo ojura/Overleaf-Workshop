@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention -- mirrors the 'vscode' and class export names */
 import * as assert from 'assert';
-import Module = require('module');
+import { loadWithVscode } from './standIn';
 
 // The modules under test import 'vscode', which only exists inside the extension host.
 // Serve a minimal stand-in so the save path can be driven from plain Node.
@@ -24,14 +24,10 @@ const vscodeMock = withStubs({
     FileChangeType: { Changed: 1, Created: 2, Deleted: 3 },
     workspace: withStubs({ textDocuments: [] }),
 });
-const moduleAny = Module as any;
-const originalLoad = moduleAny._load;
-moduleAny._load = function (request: string, ...rest: any[]) {
-    return request === 'vscode' ? vscodeMock : originalLoad.call(this, request, ...rest);
-};
-const { VirtualFileSystem } = require('../core/remoteFileSystemProvider');
-const { SocketIOAPI } = require('../api/socketio');
-moduleAny._load = originalLoad;
+const { VirtualFileSystem, SocketIOAPI } = loadWithVscode(vscodeMock, () => ({
+    VirtualFileSystem: require('../core/remoteFileSystemProvider').VirtualFileSystem,
+    SocketIOAPI: require('../api/socketio').SocketIOAPI,
+}));
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const settle = async () => { for (let i = 0; i < 20; i++) { await tick(); } };
@@ -339,5 +335,74 @@ describe('SocketIOAPI.applyOtUpdate', () => {
         await assert.rejects(api.applyOtUpdate('doc1', { doc: 'doc1', v: 1, op: [{ p: 5, i: '\r' }] }), /"\\r"/);
         await assert.rejects(api.applyOtUpdate('doc1', { doc: 'doc1', v: 1, op: [{ p: 0, d: 'a\r\n' }] }), /"\\r"/);
         assert.strictEqual(emitted.length, 0);
+    });
+});
+
+describe('VirtualFileSystem: a rename or a move made on Overleaf', () => {
+    /** A project with a folder "chapters" holding the document "ch", and a folder "parts"; its events as paths. */
+    function project() {
+        const handlers: any = {};
+        const vfs = Object.create(VirtualFileSystem.prototype);
+        vfs.socket = { isUsingAlternativeConnectionScheme: false, updateEventHandlers(h: any) { Object.assign(handlers, h); } };
+        const batches: { type: number, path: string, renamedFrom?: string }[][] = [];
+        vfs.notify = (events: any[]) => batches.push(events.map(e => ({ type: e.type, path: e.uri.path, ...(e.renamedFrom ? { renamedFrom: e.renamedFrom.path } : {}) })));
+        vfs.pathToUri = (...parts: string[]) => ({ path: parts.join('/').replace(/\/+/g, '/') });
+        vfs.root = { rootFolder: [{ _id: 'root', name: 'rootFolder', docs: [], fileRefs: [], folders: [
+            { _id: 'chapters', name: 'chapters', docs: [{ _id: 'ch', name: 'ch' }], fileRefs: [], folders: [] },
+            { _id: 'parts', name: 'parts', docs: [], fileRefs: [], folders: [] },
+        ] }] };
+        vfs.connections = [];
+        vfs.remoteWatch();
+        return { handlers, batches };
+    }
+    const { Created, Deleted } = vscodeMock.FileChangeType;
+
+    it('reports a renamed file at its new path, with the path it had, also when a folder name holds the file name', () => {
+        const t = project();
+        t.handlers.onFileRenamed('ch', 'intro');
+        assert.deepStrictEqual(t.batches, [[{ type: Deleted, path: '/chapters/ch' }, { type: Created, path: '/chapters/intro', renamedFrom: '/chapters/ch' }]]);
+    });
+
+    it('reports a renamed folder at its new path, with the path it had', () => {
+        const t = project();
+        t.handlers.onFileRenamed('chapters', 'parts2');
+        assert.deepStrictEqual(t.batches, [[{ type: Deleted, path: '/chapters/' }, { type: Created, path: '/parts2/', renamedFrom: '/chapters/' }]]);
+    });
+
+    it('reports a moved file at its new path, with the path it had', () => {
+        const t = project();
+        t.handlers.onFileMoved('ch', 'parts');
+        assert.deepStrictEqual(t.batches, [[{ type: Deleted, path: '/chapters/ch' }, { type: Created, path: '/parts/ch', renamedFrom: '/chapters/ch' }]]);
+    });
+});
+
+describe('VirtualFileSystem: a folder moved or deleted on Overleaf', () => {
+    /** A project with the folders "chapters", holding the document "one.tex", and "parts"; the paths its tree holds. */
+    function project() {
+        const handlers: any = {};
+        const vfs = Object.create(VirtualFileSystem.prototype);
+        vfs.socket = { isUsingAlternativeConnectionScheme: false, updateEventHandlers(h: any) { Object.assign(handlers, h); } };
+        vfs.notify = () => {};
+        vfs.pathToUri = (...parts: string[]) => ({ path: parts.join('/').replace(/\/+/g, '/') });
+        vfs.root = { rootFolder: [{ _id: 'root', name: 'rootFolder', docs: [], fileRefs: [], folders: [
+            { _id: 'chapters', name: 'chapters', docs: [{ _id: 'one', name: 'one.tex' }], fileRefs: [], folders: [] },
+            { _id: 'parts', name: 'parts', docs: [], fileRefs: [], folders: [] },
+        ] }] };
+        vfs.connections = [];
+        vfs.remoteWatch();
+        const paths = () => vfs.walk(() => true).map((e: any) => e.path).sort();
+        return { handlers, paths };
+    }
+
+    it('holds a moved folder at its new path only', () => {
+        const t = project();
+        t.handlers.onFileMoved('chapters', 'parts');
+        assert.deepStrictEqual(t.paths(), ['/', '/parts', '/parts/chapters', '/parts/chapters/one.tex']);
+    });
+
+    it('holds a deleted folder nowhere', () => {
+        const t = project();
+        t.handlers.onFileRemoved('chapters');
+        assert.deepStrictEqual(t.paths(), ['/', '/parts']);
     });
 });

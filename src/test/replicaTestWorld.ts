@@ -3,8 +3,9 @@
 // memory, a stand-in for the 'vscode' module, and the replica's modules loaded against it.
 import * as assert from 'assert';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
-import Module = require('module');
+import { loadWithVscode } from './standIn';
 
 /** Stands in for anything else: callable, constructible, and every member is one again. */
 export function stub(): any {
@@ -110,8 +111,22 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
     // the project: documents only, enough for the replica's Overleaf side
     // the project's files, addressed as the extension addresses them
     const origin = new Uri('overleaf-workshop', '/project', 'www.overleaf.com', 'user=u&project=p');
-    const changes = new Emitter<{ type: number, uri: Uri }[]>();
+    const changes = new Emitter<{ type: number, uri: Uri, renamedFrom?: Uri }[]>();
     const rel = (uri: Uri) => uri.path.slice(origin.path.length);
+    /** whether the project has a folder at `p`: one created, or one that holds a document */
+    const isFolder = (p: string) => w.remoteFolders.has(p) || [...w.remote.keys()].some(q => q.startsWith(`${p}/`));
+    /** the folder at `p` as the project tree has it: the documents and the folders in it, by name */
+    const folderEntity = (p: string) => {
+        const prefix = `${p}/`;
+        const docs: { _id: string, name: string }[] = [];
+        const folders = new Set<string>();
+        for (const q of [...w.remote.keys(), ...w.remoteFolders]) {
+            if (!q.startsWith(prefix)) { continue; }
+            const rest = q.slice(prefix.length), slash = rest.indexOf('/');
+            if (slash >= 0) { folders.add(rest.slice(0, slash)); } else if (w.remote.has(q)) { docs.push({ _id: q, name: rest }); } else { folders.add(rest); }
+        }
+        return { docs, fileRefs: [], folders: [...folders].map(name => ({ _id: `${prefix}${name}`, name, docs: [], fileRefs: [], folders: [] })) };
+    };
     const vfs = {
         origin, serverName: 'www.overleaf.com', projectName: 'project', projectId: 'p', connected: true, _userId: 'u',
         onDidChangeFiles: changes.event,
@@ -120,13 +135,13 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
         setProjectSCMPersist: () => {},
         init: async () => ({ rootFolder: [{ _id: 'root', name: 'rootFolder', docs: [...w.remote.keys()].map(p => ({ _id: p, name: p.slice(1) })), fileRefs: [], folders: [] }] }),
         _resolveUri: async (uri: Uri) => w.remote.has(rel(uri)) ? { fileType: 'doc', fileEntity: {} }
-            : w.remoteFolders.has(rel(uri)) ? { fileType: 'folder', fileEntity: { docs: [], fileRefs: [], folders: [] } }
+            : isFolder(rel(uri)) ? { fileType: 'folder', fileEntity: folderEntity(rel(uri)) }
             : { fileType: undefined, fileEntity: undefined },
         // as Overleaf does: a folder that exists already is refused, and the request takes a moment
         mkdir: async (uri: Uri) => {
-            if (w.remoteFolders.has(rel(uri))) { throw new Error(`${uri.path}: 400: file already exists`); }
+            if (isFolder(rel(uri))) { throw new Error(`${uri.path}: 400: file already exists`); }
             await new Promise(resolve => setTimeout(resolve, 20));
-            if (w.remoteFolders.has(rel(uri))) { throw new Error(`${uri.path}: 400: file already exists`); }
+            if (isFolder(rel(uri))) { throw new Error(`${uri.path}: 400: file already exists`); }
             w.remoteFolders.add(rel(uri));
         },
         openFile: async (uri: Uri) => new TextEncoder().encode(w.remote.get(rel(uri)) ?? ''),
@@ -136,12 +151,18 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
             w.remoteWrites.push(rel(uri));
             return { _type: 'doc', _id: rel(uri), name: path.posix.basename(uri.path) };
         },
-        remove: async (uri: Uri) => { w.remote.delete(rel(uri)); },
+        // a document, or a folder with what it holds
+        remove: async (uri: Uri) => {
+            const p = rel(uri), inside = (q: string) => q === p || q.startsWith(`${p}/`);
+            [...w.remote.keys()].filter(inside).forEach(q => w.remote.delete(q));
+            [...w.remoteFolders].filter(inside).forEach(q => w.remoteFolders.delete(q));
+        },
         rename: async (from: Uri, to: Uri) => {
             if (!w.remote.has(rel(from)) || w.remote.has(rel(to))) { return; }
             w.remote.set(rel(to), w.remote.get(rel(from))!);
             w.remote.delete(rel(from));
-            changes.fire([{ type: FileChangeType.Deleted, uri: from }, { type: FileChangeType.Created, uri: to }]);
+            // as the project reports a rename: the Created event names where the file was
+            changes.fire([{ type: FileChangeType.Deleted, uri: from }, { type: FileChangeType.Created, uri: to, renamedFrom: from }]);
         },
         getUpdates: async () => ({ updates: w.updates, nextBeforeTimestamp: 0 }),
         documentUpdatesSettled: async () => {},
@@ -160,22 +181,93 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
 }
 
 export function load(mock: any) {
-    const moduleAny = Module as any;
-    const originalLoad = moduleAny._load;
-    moduleAny._load = function (request: string, ...rest: any[]) {
-        return request === 'vscode' ? mock : originalLoad.call(this, request, ...rest);
-    };
-    try {
-        for (const key of Object.keys(require.cache)) {
-            if (key.includes(`${path.sep}out${path.sep}`) && !key.includes(`${path.sep}test${path.sep}`)) { delete require.cache[key]; }
-        }
+    return loadWithVscode(mock, () => {
         require('../scm/localFolderWatcher').LocalFolderWatcher.quietMs = 50;
         return {
             LocalReplicaSCMProvider: require('../scm/localReplicaSCM').LocalReplicaSCMProvider,
             requestReplica: require('../scm/replicaControl').requestReplica,
+            // the project tree's class from this load, the module that the replica's modules import
+            VirtualFileSystem: require('../core/remoteFileSystemProvider').VirtualFileSystem,
         };
-    } finally {
-        moduleAny._load = originalLoad;
+    });
+}
+
+/**
+ * What a test set up, undone after it in reverse order on every path, failures included: the test
+ * adds each resource as it makes it, and afterEach calls `undo`.
+ */
+export class Cleanup {
+    private steps: (() => void | Promise<void>)[] = [];
+
+    add(step: () => void | Promise<void>) { this.steps.push(step); }
+
+    /** Undo the step added last, now, e.g. to stop a replica before the next one starts. */
+    async undoLast() { await this.steps.pop()?.(); }
+
+    async undo() {
+        const steps = this.steps.reverse();
+        this.steps = [];
+        const errors: unknown[] = [];
+        for (const step of steps) {
+            try { await step(); } catch (error) { errors.push(error); }
+        }
+        if (errors.length) { throw errors[0]; }
+    }
+
+    tempDir(prefix: string): string {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+        this.add(() => fs.rmSync(dir, { recursive: true, force: true }));
+        return dir;
+    }
+
+    setEnv(key: string, value: string) {
+        const saved = process.env[key];
+        process.env[key] = value;
+        this.add(() => { if (saved === undefined) { delete process.env[key]; } else { process.env[key] = saved; } });
+    }
+
+    /** A socket folder and a trash of the test's own, so that the developer's stay untouched. */
+    privateRuntime(): { runtime: string, data: string } {
+        const runtime = this.tempDir('ow-runtime-');
+        fs.chmodSync(runtime, 0o700);
+        this.setEnv('XDG_RUNTIME_DIR', runtime);
+        const data = this.tempDir('ow-data-');
+        this.setEnv('XDG_DATA_HOME', data);
+        return { runtime, data };
+    }
+
+    /**
+     * Start the replica `scm` (a LocalReplicaSCMProvider) and add its stop: its listeners are
+     * disposed, and the stop of its sync, which saves the state into the folder, is awaited
+     * before the folder goes.
+     */
+    async start(scm: any): Promise<{ dispose(): void }[]> {
+        const triggers: { dispose(): void }[] = await scm.triggers;
+        this.add(async () => {
+            triggers.forEach(trigger => trigger.dispose());
+            await scm.sync?.stop();
+        });
+        return triggers;
+    }
+
+    /**
+     * Resolves once `holds()` is true: at once, or at the change in the folder `dir` that makes
+     * it so. Its watcher closes then, or at the end of the test.
+     */
+    folderShows(dir: string, holds: () => boolean): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const watcher = fs.watch(dir);
+            this.add(() => watcher.close());
+            const check = () => { if (holds()) { watcher.close(); resolve(); } };
+            watcher.on('change', check);
+            watcher.on('error', error => { watcher.close(); reject(error); });
+            check();
+        });
+    }
+
+    /** Resolves once `file` exists, e.g. the pointer file that the replica's control server writes once it listens. */
+    fileAppears(file: string): Promise<void> {
+        return this.folderShows(path.dirname(file), () => fs.existsSync(file));
     }
 }
 
