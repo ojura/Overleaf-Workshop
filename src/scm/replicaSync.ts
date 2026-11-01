@@ -753,7 +753,9 @@ export class ReplicaSync {
         let done = 0;
         let next = 0;
         const worker = async () => {
-            while (next<todo.length && !this.stopped && !this.cancelled) {
+            // Once a reconcile finds the sync waiting, e.g. for a git operation that started meanwhile,
+            // the rest are not started: the full sync after the wait reads and syncs them (notChecked).
+            while (next<todo.length && !this.stopped && !this.cancelled && summary.waitingFor===undefined) {
                 const path = todo[next++];
                 await this.schedule(path, mode);
                 done += 1;

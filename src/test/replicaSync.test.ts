@@ -836,6 +836,25 @@ describe('ReplicaSync', () => {
             assert.deepStrictEqual(t.docs.map(p => t.local.text(p)), t.docs.map(p => `${p} v2, edited on Overleaf\n`));
         });
 
+        it('stops starting reconciles once the full sync finds git in the middle of an operation, and leaves them to the full sync after it', async () => {
+            const n = 4 * ReplicaSync.scanConcurrency;
+            const t = await synced(n);
+            for (const p of t.docs) { t.remote.docs.set(p, `${p} v2, edited on Overleaf\n`); }
+            // a merge starts in the folder while the full sync reads the first document
+            const readDoc = t.remote.readDoc.bind(t.remote);
+            let reads = 0;
+            t.remote.readDoc = async (path: string) => { reads += 1; t.store.op = 'a merge'; return readDoc(path); };
+            const during = await t.sync.syncAll();
+            assert.strictEqual(during.waitingFor, 'git is in the middle of a merge in the folder');
+            assert.ok(reads <= ReplicaSync.scanConcurrency, `${reads} of the ${n} documents read during the merge`);
+            assert.strictEqual(during.notChecked, n - ReplicaSync.scanConcurrency, 'the reconciles not started');
+            // the merge ends; the full sync after it takes the documents in
+            t.remote.readDoc = readDoc;
+            t.store.op = undefined;
+            await t.sync.syncAll();
+            assert.deepStrictEqual(t.docs.map(p => t.local.text(p)), t.docs.map(p => `${p} v2, edited on Overleaf\n`));
+        });
+
         it('leaves the uploads it has not made yet to the full sync after the operation', async () => {
             // one transfer at a time, so that the uploads go out one after the other
             const concurrency = ReplicaSync.concurrency;
