@@ -7,7 +7,7 @@ import { gitBlobHash } from '../scm/replicaSync';
 import { overleafText } from '../sandbox/plan';
 import { SandboxSafetyError } from '../sandbox/guard';
 import { LockTimeoutError } from '../sandbox/lock';
-import { createSandbox, lockFile, readRecord, readReplica, recentRuns, recordFile, runCompile, RunOptions } from '../sandbox/sandbox';
+import { createSandbox, formatSandboxStatus, lockFile, readRecord, readReplica, recentRuns, recordFile, runCompile, RunOptions, sandboxStatus } from '../sandbox/sandbox';
 
 const SHARED = '5a5a5a5a5a5a5a5a5a5a5a5a';
 const USER = '5b5b5b5b5b5b5b5b5b5b5b5b';
@@ -197,6 +197,23 @@ describe('a sandbox run', () => {
         write('.git/HEAD', 'ref');
     });
     afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+    it('writes the status: the copy and the shared project as joined, the safety checks, the lock and the latest runs', async () => {
+        const status = await sandboxStatus(server as any, readReplica(replica), USER);
+        if (!status.record) { assert.fail('the sandbox is recorded'); }
+        const runs = [{ event: 'start', at: '2026-11-01T05:00:00Z', pid: 7, purpose: 'a test', dir: '/v', main: 'main.tex' }];
+        const lines = formatSandboxStatus(status, runs, '/r/.overleaf/sandbox-runs.jsonl').split('\n');
+        assert.match(lines[0], /^sandbox: "Book \(sandbox\)", \S+\/project\/[0-9a-f]{24}, created \S+$/);
+        // the fake projects name no main document (rootDoc_id)
+        assert.deepStrictEqual(lines.slice(1), [
+            'copy: compiler pdflatex, image texlive-full:2025.1, main document undefined, compile timeout 240 s, compile group priority',
+            'shared project: compiler pdflatex, image texlive-full:2025.1, main document undefined',
+            'safety checks pass: owned by this account, no collaborators, no invites, link sharing off',
+            'lock: free',
+            'latest runs (from /r/.overleaf/sandbox-runs.jsonl):',
+            '  2026-11-01T05:00:00Z pid 7 started: a test (/v, main.tex)',
+        ]);
+    });
 
     it('is created by cloning, with the shared project\'s TeX Live image, and recorded', () => {
         const record = readRecord(replica)!;
