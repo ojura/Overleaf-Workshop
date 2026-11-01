@@ -163,8 +163,9 @@ replica-land    Lands <commit> of the replica's git repository in the project, t
                 must be Overleaf's state: the window syncs first, and the tool checks that
                 Overleaf holds that commit file for file (documents by their text, binary
                 files by the hash Overleaf reports). Then the window pushes the commit: it
-                fast-forwards the branch, uploads what the commit changed (a rename as a
-                rename on Overleaf, so documents keep their comments) and waits for
+                fast-forwards the branch, uploads what the commit changed (a rename or move
+                that git shows, edited or not, as a rename on Overleaf, so documents keep
+                their comments; docs/replica-workflows.md, "Renames and moves") and waits for
                 Overleaf's acknowledgements. The files the commit deletes are deleted with
                 it; other deletions follow replica-sync's rule. The tool checks again that
                 Overleaf holds the commit, for up to three minutes, and compiles the

@@ -13,7 +13,8 @@ export const DEFAULT_PDF_VIEWER_ENGINE: PdfViewerEngine = 'pdfjs';
 /** pdf.js 5.1.91's release in views/pdf-viewer/, the pdf.js version of Overleaf's viewer */
 export const PDFJS_RELEASE = 'vendor/pdfjs-5.1.91';
 
-const PLACEHOLDER = '<!--viewer-config-->';
+/** where a viewer page takes its configuration (completeViewerPage) */
+export const PLACEHOLDER = '<!--viewer-config-->';
 
 /** What a page reads from its #viewer-config element; `base` is the webview URL of views/pdf-viewer/. */
 export function viewerConfig(engine: PdfViewerEngine, base: string) {

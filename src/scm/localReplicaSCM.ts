@@ -399,6 +399,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 await fs.writeFile(uri(path), content, this.temporaryFolder);
                 return statOf(await fs.stat(uri(path)));
             },
+            move: (from, to) => fs.moveFile(uri(from), uri(to)),
             remove: async (path) => {
                 // to the system trash: on Linux through gio, without the window; elsewhere only the
                 // IDE can move a file there, and that waits for the window
@@ -572,6 +573,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const done: [string, string[]][] = [
             ['uploaded', summary.uploaded], ['downloaded', summary.downloaded], ['merged', summary.merged],
             ['renamed', summary.renamed.map(r => `${r.from} -> ${r.to}`)],
+            ['renamed locally', summary.renamedLocally.map(r => `${r.from} -> ${r.to}`)],
             ['deleted locally', summary.deletedLocal], ['deleted on Overleaf', summary.deletedRemote],
             ['failed', summary.failed.map(f => f.path)],
         ];
@@ -854,8 +856,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     /**
      * A native push of `commit`, for tools (replica-land): once Overleaf holds the checked-out
      * commit and the folder has no changes, fast-forward the branch to `commit`, upload what it
-     * changed (renames as renames) and wait for Overleaf's acknowledgements. Then Overleaf's
-     * ref is the commit, or a commit on top of it when someone edited meanwhile.
+     * changed (the sync renames on Overleaf what git shows as renames and moves) and wait for
+     * Overleaf's acknowledgements. Then Overleaf's ref is the commit, or a commit on top of it
+     * when someone edited meanwhile.
      */
     private async land(commit: string): Promise<ControlAnswer> {
         const sync = this.sync, store = this.store;
@@ -1018,10 +1021,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
         const listeners: vscode.Disposable[] = [
             // Overleaf's side: the project reports its changes here directly, not through the
-            // window as a file system watcher would
+            // window as a file system watcher would. A rename or a move is one change: its
+            // Created event names where the file or folder was, and the Deleted event of that
+            // path in the same batch belongs to it.
             this.vfs.onDidChangeFiles(events => {
+                const renamed = new Map<string, string>();
                 for (const event of events) {
-                    onRemote(this.remotePath(event.uri), event.type===vscode.FileChangeType.Deleted);
+                    const from = event.renamedFrom && this.remotePath(event.renamedFrom), to = this.remotePath(event.uri);
+                    if (from!==undefined && from!==to) { renamed.set(from, to); }
+                }
+                for (const [from, to] of renamed) {
+                    this.track('pull', to, sync.remoteRenamed(from, to));
+                }
+                const moved = new Set([...renamed].flat());
+                for (const event of events) {
+                    const path = this.remotePath(event.uri);
+                    if (!moved.has(path)) { onRemote(path, event.type===vscode.FileChangeType.Deleted); }
                 }
             }),
             // saves in the editor always sync; the saved sync state keeps a save and the

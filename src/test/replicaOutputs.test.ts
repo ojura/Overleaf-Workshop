@@ -3,7 +3,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import Module = require('module');
+import { loadWithVscode } from './standIn';
 import { CompileRecord, saveCompileOutputs } from '../compile/outputFiles';
 
 const response = (status: string, paths: string[]): any => ({
@@ -88,17 +88,10 @@ const vscodeMock = withStubs({
     window: withStubs({ showWarningMessage: async () => undefined, createStatusBarItem: () => withStubs({ show() {}, hide() {} }) }),
     workspace: withStubs({ saveAll: async () => true, getConfiguration: () => ({ get: (_key: string, value: any) => value }), textDocuments: [] }),
 });
-const moduleAny = Module as any;
-const originalLoad = moduleAny._load;
-moduleAny._load = function (request: string, ...rest: any[]) {
-    return request === 'vscode' ? vscodeMock : originalLoad.call(this, request, ...rest);
-};
-const { CompileManager } = require('../compile/compileManager');
-const { LocalReplicaSCMProvider } = require('../scm/localReplicaSCM');
-moduleAny._load = originalLoad;
-for (const key of Object.keys(require.cache)) {
-    if (/[\\/]out[\\/](?!test[\\/])/.test(key)) { delete require.cache[key]; }
-}
+const { CompileManager, LocalReplicaSCMProvider } = loadWithVscode(vscodeMock, () => ({
+    CompileManager: require('../compile/compileManager').CompileManager,
+    LocalReplicaSCMProvider: require('../scm/localReplicaSCM').LocalReplicaSCMProvider,
+}));
 
 describe('CompileManager and a local replica\'s logs', () => {
     const saved = { readSettings: LocalReplicaSCMProvider.readSettings, pathToUri: LocalReplicaSCMProvider.pathToUri, flushAll: LocalReplicaSCMProvider.flushAll };

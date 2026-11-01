@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention -- mirrors the 'vscode' export names */
 import * as assert from 'assert';
 import * as path from 'path';
-import Module = require('module');
+import { loadWithVscode } from './standIn';
 
 function stub(): any {
     const f: any = function () { return stub(); };
@@ -67,25 +67,20 @@ const vscodeMock = withStubs({
         }),
     }),
 });
-const moduleAny = Module as any;
-const originalLoad = moduleAny._load;
-moduleAny._load = function (request: string, ...rest: any[]) {
-    return request === 'vscode' ? vscodeMock : originalLoad.call(this, request, ...rest);
-};
-const { PdfViewEditorProvider } = require('../core/pdfViewEditorProvider');
-moduleAny._load = originalLoad;
-for (const key of Object.keys(require.cache)) {
-    if (/[\\/]out[\\/](?!test[\\/])/.test(key)) { delete require.cache[key]; }
-}
+const [{ PdfViewEditorProvider }] = loadWithVscode(vscodeMock, () => [require('../core/pdfViewEditorProvider')]);
 
-/** a webview panel that records its pages, and through which the test sends the page's messages */
+/**
+ * a webview panel that records its pages, through which the test sends the page's messages;
+ * nextPage() settles when the panel gets its next page, as when the provider reloads the viewer
+ */
 function panel() {
     const pages: string[] = [];
+    const pageWaiters: Array<() => void> = [];
     let onMessage: (message: any) => void = () => {};
     let onDispose: () => void = () => {};
     const webview = {
         options: {},
-        set html(value: string) { pages.push(value); },
+        set html(value: string) { pages.push(value); pageWaiters.splice(0).forEach(resolve => resolve()); },
         get html() { return pages.at(-1) ?? ''; },
         asWebviewUri: (uri: Uri) => uri,
         postMessage: async () => true,
@@ -93,12 +88,12 @@ function panel() {
     };
     return {
         pages,
+        nextPage: () => new Promise<void>(resolve => pageWaiters.push(resolve)),
         send: (message: any) => onMessage(message),
         dispose: () => onDispose(),
         webviewPanel: { webview, onDidDispose: (listener: () => void) => { onDispose = listener; }, onDidChangeViewState: () => ({ dispose() {} }) },
     };
 }
-const settled = () => new Promise(resolve => setTimeout(resolve, 10));
 const viewerOf = (page: string | undefined) => /the (\w+) viewer/.exec(page ?? '')?.[1];
 
 describe('the button that switches between the pdfjs and the overleaf viewer', () => {
@@ -118,20 +113,22 @@ describe('the button that switches between the pdfjs and the overleaf viewer', (
         await provider.resolveCustomEditor(doc, editor.webviewPanel);
         assert.strictEqual(viewerOf(editor.webviewPanel.webview.html), 'pdfjs');
 
+        let reloaded = editor.nextPage();
         editor.send({ type: 'switchViewer', engine: 'overleaf' });
-        await settled();
+        await reloaded;
         assert.deepStrictEqual(world.updates, [['engine', 'overleaf', 1]]);
         assert.strictEqual(doc.engine, 'overleaf');
         assert.strictEqual(viewerOf(editor.webviewPanel.webview.html), 'overleaf');
 
+        reloaded = editor.nextPage();
         editor.send({ type: 'switchViewer', engine: 'pdfjs' });
-        await settled();
+        await reloaded;
         assert.strictEqual(viewerOf(editor.webviewPanel.webview.html), 'pdfjs');
         assert.strictEqual(editor.pages.length, 3);
     });
 
-    it('deletes the builds that the PDF viewer of earlier versions downloaded', async () => {
-        await settled();
+    it('deletes the builds that the PDF viewer of earlier versions downloaded', () => {
+        // the provider's constructor asks for the delete
         assert.deepStrictEqual(world.deleted, ['/storage/legacy-viewer-builds (recursive)']);
     });
 
@@ -148,9 +145,9 @@ describe('the button that switches between the pdfjs and the overleaf viewer', (
         const doc = await provider.openCustomDocument(Uri.file('/home/u/paper.pdf'));
         const editor = panel();
         await provider.resolveCustomEditor(doc, editor.webviewPanel);
+        // switchViewer turns these away before its first await, so the handler is done when send returns
         editor.send({ type: 'switchViewer', engine: 'legacy' });
         editor.send({ type: 'switchViewer', engine: '../../evil' });
-        await settled();
         assert.deepStrictEqual(world.updates, []);
         assert.strictEqual(editor.pages.length, 1);
     });
@@ -164,8 +161,10 @@ describe('the button that switches between the pdfjs and the overleaf viewer', (
         await provider.resolveCustomEditor(secondDoc, second.webviewPanel);
         second.dispose();
 
+        const reloaded = first.nextPage();
         first.send({ type: 'switchViewer', engine: 'overleaf' });
-        await settled();
+        // applyEngine renders the open viewers one after another; the closed one is not among them
+        await reloaded;
         assert.strictEqual(viewerOf(first.webviewPanel.webview.html), 'overleaf');
         assert.strictEqual(second.pages.length, 1);
         assert.strictEqual(viewerOf(second.webviewPanel.webview.html), 'pdfjs');

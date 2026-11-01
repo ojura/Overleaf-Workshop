@@ -7,6 +7,9 @@
 // - Overleaf's download domain: it serves the builds that make_book.py wrote, with single and
 //   multipart Range requests as nginx answers them, and the pieces of Overleaf's PDF caching
 //   under /project/<p>/user/<u>/content/<contentId>/<hash>. Each answer waits --latency ms.
+//   It also plays Overleaf's cache of compile outputs, which serves a build under
+//   /build/<editor>-<build>/ for clsiserverid=harness-cache after the compile server has
+//   deleted it; POST /gone?build=a&from=server|everywhere deletes a build.
 // - The extension host: POST /bridge runs the extension's own PdfFetchBridge and PieceCache
 //   (src/core/pdfFetchBridge.ts, bundled by common.mjs) on a fetch message.
 // - The webview: GET /page?engine=overleaf|pdfjs serves <ext>/dist/<engine>.html with
@@ -33,6 +36,11 @@ const USER = 'fedcba9876543210fedcba98';
 const CONTENT_ID = '19a1b2c3d4e-c0ffee0123456789';
 const BOUNDARY = '00000000000000000001';
 const BUILD_IDS = { a: '19a1b2c3d4e-0000000000000001', b: '19a1b2c3d4e-0000000000000002' };
+// the editor whose compiles made the builds, and the shard of the cache of compile outputs
+const EDITOR = '0d9c1e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f';
+const CACHE_SHARD = 'harness-cache';
+/** builds deleted from the compile server ('server') or from the cache as well ('everywhere') */
+const gone = new Map();
 
 const builds = JSON.parse(fs.readFileSync(path.join(bookDir, 'builds.json'), 'utf8'));
 const files = Object.fromEntries(Object.entries(builds).map(([name, b]) => [name, fs.readFileSync(path.join(bookDir, b.file))]));
@@ -65,6 +73,8 @@ const hostState = new Map(); // doc -> saved state, as GlobalStateManager keeps 
 const emptyStats = () => ({
     outputRequests: 0, outputWholeRequests: 0, outputBytes: 0, outputRanges: 0,
     contentRequests: 0, contentBytes: 0,
+    // requests of output.pdf that the cache of compile outputs answered
+    cacheRequests: 0,
     bridgeRequests: 0, bridgeBytes: 0, bridgeErrors: 0,
     log: [],
 });
@@ -85,7 +95,9 @@ export function outputFor(name) {
             path: 'output.pdf', url: fileUrl, type: 'pdf', build: id,
             size: b.size, ranges: b.ranges, contentId: CONTENT_ID,
             createdAt: new Date(startedAt).toISOString(), startXRefTable: b.startXRefTable,
+            editorId: EDITOR,
         },
+        clsiCacheShard: CACHE_SHARD,
     };
 }
 
@@ -236,8 +248,16 @@ const server = http.createServer(async (req, res) => {
     try {
         let m;
         if ((m = new RegExp(`^/project/${PROJECT}/user/${USER}/build/([^/]+)/output/output\\.pdf$`).exec(p))) {
-            const name = buildByID[m[1]];
-            if (!name) { res.writeHead(404).end(); return; }
+            // the compile server's path /build/<build>/, or the cache's /build/<editor>-<build>/
+            const fromCache = url.searchParams.get('clsiserverid') === CACHE_SHARD && m[1].startsWith(`${EDITOR}-`);
+            const name = buildByID[fromCache ? m[1].slice(EDITOR.length + 1) : m[1]];
+            const deleted = gone.get(name);
+            if (!name || deleted === 'everywhere' || (deleted === 'server' && !fromCache)) {
+                note({ kind: 'output', build: name, missing: true, fromCache });
+                res.writeHead(404).end();
+                return;
+            }
+            if (fromCache) { stats.cacheRequests++; }
             await serveOutput(req, res, name);
         } else if ((m = new RegExp(`^/project/${PROJECT}/user/${USER}/content/${CONTENT_ID}/([0-9a-f]{64})$`).exec(p))) {
             await serveContent(req, res, m[1]);
@@ -255,6 +275,11 @@ const server = http.createServer(async (req, res) => {
                 + ` allow="cross-origin-isolated; autoplay; local-network-access; clipboard-read; clipboard-write;" src="${page}"></iframe></body></html>`);
         } else if (p === '/page') {
             servePage(res, url.searchParams.get('engine') ?? 'overleaf', url.searchParams.get('doc') ?? 'book');
+        } else if (p === '/gone' && req.method === 'POST') {
+            const name = url.searchParams.get('build') ?? 'a';
+            const from = url.searchParams.get('from') ?? 'server';
+            if (from === 'none') { gone.delete(name); } else { gone.set(name, from); }
+            res.writeHead(204).end();
         } else if (p === '/builds') {
             res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(liveOutput ? { a: liveOutput, b: liveOutput } : { a: outputFor('a'), b: outputFor('b') }));
         } else if (p === '/whole') {

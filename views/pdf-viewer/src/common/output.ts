@@ -11,6 +11,8 @@ export interface OutputFile {
     contentId?: string;
     createdAt?: string;
     startXRefTable?: number;
+    /** the editor whose compile made the build; with the build ID it names the build in Overleaf's cache of compile outputs */
+    editorId?: string;
 }
 
 /** A build's output.pdf, as the host's 'load' message carries it (src/core/remoteFileSystemProvider.ts). */
@@ -20,6 +22,8 @@ export interface PdfOutput {
     downloadDomain: string;
     projectId: string;
     file: OutputFile;
+    /** the shard of Overleaf's cache of compile outputs that keeps the build */
+    clsiCacheShard?: string;
 }
 
 /**
@@ -37,8 +41,10 @@ export function toPdfFile(output: PdfOutput): { url: string, pdfFile: PDFFile } 
         size: file.size ?? 0,
         ranges: (file.ranges ?? []).map(range => ({ ...range, objectId: range.objectId ?? '' })),
         contentId: file.contentId ?? '',
-        clsiCacheShard: '',
-        editorId: '',
+        // where the loader finds the build when the compile server has deleted it
+        // (pdf-caching-transport.ts, getOutputPDFURLFromCache)
+        clsiCacheShard: output.clsiCacheShard ?? '',
+        editorId: file.editorId ?? '',
     } as unknown as PDFFile;
     return { url: output.url, pdfFile };
 }

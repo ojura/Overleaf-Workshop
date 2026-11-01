@@ -6,7 +6,7 @@ import * as http from 'http';
 import { AddressInfo } from 'net';
 import * as os from 'os';
 import * as path from 'path';
-import Module = require('module');
+import { loadWithVscode } from './standIn';
 
 // GlobalStateManager imports 'vscode', which only exists inside the extension host, and so do
 // the modules it imports. Stand in for anything they touch while they load, as download.test does.
@@ -29,14 +29,10 @@ const vscodeMock = withStubs({
     workspace: withStubs({ getConfiguration: () => ({ get: (_key: string, value: any) => value }) }),
     l10n: { t: (message: string) => message },
 });
-const moduleAny = Module as any;
-const originalLoad = moduleAny._load;
-moduleAny._load = function (request: string, ...rest: any[]) {
-    return request === 'vscode' ? vscodeMock : originalLoad.call(this, request, ...rest);
-};
-const { GlobalStateManager } = require('../utils/globalStateManager');
-const { BaseAPI } = require('../api/base');
-moduleAny._load = originalLoad;
+const { GlobalStateManager, BaseAPI } = loadWithVscode(vscodeMock, () => ({
+    GlobalStateManager: require('../utils/globalStateManager').GlobalStateManager,
+    BaseAPI: require('../api/base').BaseAPI,
+}));
 
 import { checkGitToken, NO_PROJECT_ID } from '../api/gitBridge';
 import { cloneProject, credentialAnswer, credentialConfig, credentialHelperCommand, fetchProject, parseCredentialInput, stableNodePath } from '../sandbox/git';

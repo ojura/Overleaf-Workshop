@@ -1,5 +1,6 @@
 import { execFile } from 'child_process';
 import { randomBytes } from 'crypto';
+import { constants as fsConstants } from 'fs';
 import * as fsp from 'fs/promises';
 import * as path from 'path';
 
@@ -198,6 +199,24 @@ export async function remove(p: PathLike, options?: { recursive?: boolean }): Pr
 /** Rename, replacing what is at the target, as `{overwrite: true}` does. */
 export async function rename(from: PathLike, to: PathLike): Promise<void> {
     await fsp.rename(fsPath(from), fsPath(to));
+}
+
+/**
+ * Move a file to a path where nothing is, creating its parent folders; fails with EEXIST when
+ * something is there. A hard link to the new path, then the removal of the old one, keeps the
+ * file itself, with its size and modification time; a rename would replace what is at the new
+ * path. Where the file system has no hard links, a copy that refuses an existing target does it.
+ */
+export async function moveFile(from: PathLike, to: PathLike): Promise<void> {
+    const source = fsPath(from), target = fsPath(to);
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    try {
+        await fsp.link(source, target);
+    } catch (error: any) {
+        if (error?.code === 'EEXIST' || error?.code === 'ENOENT') { throw error; }
+        await fsp.copyFile(source, target, fsConstants.COPYFILE_EXCL);
+    }
+    await fsp.unlink(source);
 }
 
 /**
