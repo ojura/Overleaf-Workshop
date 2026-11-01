@@ -220,7 +220,7 @@ The compiled PDF `output.pdf` is also located in the output folder. You can doub
 
 #### Which build the PDF shows
 
-The PDF viewer shows the project's latest build, whoever compiled it: this window, Overleaf's web editor, another window, or a command-line tool. The window asks Overleaf for its latest compile when a viewer opens, when it becomes visible again, and when the window gets the focus back. A build from another client is taken when the window has not had it, and while the window shows its own compile, only when it began later; in either case only when it was compiled with the same main document, draft mode and handling of errors as the window compiles.
+The PDF viewer shows the project's latest build, whoever compiled it: this window, Overleaf's web editor, another window, or a command-line tool. The window asks Overleaf for its latest compile when a viewer opens, when it becomes visible again, and when the window gets the focus back. A build from another client is taken when the window has not had it and it began later than the build that the window shows, as the times in their build IDs say. It must also have been compiled with the same main document and draft mode as the window compiles, and while the window stops at the first error, only a build that stopped at its first error too is taken.
 
 Overleaf can answer with another client's build only when it keeps compiles in its cache of compile outputs, which it does for projects whose owner has the priority compile group. For other projects the viewer shows this window's own compiles.
 

@@ -138,13 +138,35 @@ describe('the build in use (ProjectBuilds)', () => {
         assert.deepStrictEqual(builds.status, { state: 'ready' });
     });
 
-    it('compares the times only with its own build: after another client\'s build, it takes any build that it has not had', async () => {
-        const { host, builds } = setup();
+    it('compares the times with another client\'s build too: it keeps that build when the cache names an earlier one afterwards', async () => {
+        const { host, builds, changes } = setup();
         // the cache's stores are not ordered: another client's earlier compile can be stored after a later one
+        host.answers.push({ kind: 'build', build: fromCache(at(20)) }, { kind: 'build', build: fromCache(at(10)) }, { kind: 'build', build: fromCache(at(30)) });
+        await builds.check();
+        await builds.check();
+        assert.strictEqual(builds.build?.id, at(20));
+        await builds.check();
+        assert.deepStrictEqual(changes, [at(20), at(30)]);
+    });
+
+    it('does not take an earlier build that the window never had after another client\'s later build (the review\'s scratch T1)', async () => {
+        // the window's x, then another client's later w, then the earlier y
+        const { host, builds, changes } = setup();
+        builds.useOwn(own(at(20)));
+        host.answers.push({ kind: 'build', build: fromCache(at(30)) }, { kind: 'build', build: fromCache(at(10)) });
+        await builds.check();
+        await builds.check();
+        assert.deepStrictEqual(changes, [at(20), at(30)]);
+    });
+
+    it('does not go back to an earlier build when the build in use is gone, and compiles instead', async () => {
+        const { host, builds } = setup();
         host.answers.push({ kind: 'build', build: fromCache(at(20)) }, { kind: 'build', build: fromCache(at(10)) });
         await builds.check();
-        await builds.check();
-        assert.strictEqual(builds.build?.id, at(10));
+        await builds.reportGone(at(20));
+        assert.strictEqual(builds.build?.id, at(20));
+        assert.strictEqual(host.compiles, 1);
+        assert.deepStrictEqual(builds.status, { state: 'compiling' });
     });
 
     it('with a build ID of another form, takes a build that it has not had, and says once that it cannot compare them', async () => {

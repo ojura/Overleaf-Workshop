@@ -262,20 +262,20 @@ function notify<T>(listeners: Set<(value: T) => void>, value: T) {
  * answer about the latest compile names a build that the window has not had (check). A build
  * that the window replaced is older than the build in use, so an answer naming it is ignored. An
  * answer is also ignored when its compile typeset something else than the window compiles
- * (sameSettings). While the build in use is another client's, any other build in an answer is
- * taken: Overleaf answers only for its latest compile, and only while the project has not changed
- * since.
+ * (sameSettings). Overleaf answers only for its latest compile, and only while the project has
+ * not changed since.
  *
- * While the build in use is this window's own compile X, a build Y in an answer is taken only if
- * Y's build ID says that Y began later than X (buildTimeOf). Overleaf stores a compile in its cache
- * after it has answered the compile request, without waiting for the store
- * (CLSICacheHandler.js:142-196), so a check after X and before that store answers with the cache's
- * earlier latest, Y. Y can lack an edit that X has: Overleaf answers with its latest compile while
- * the time of the cache's copy is at least the time of the project's last update
- * (ClsiCacheManager.mjs:33-52, 108), and the copy is written after the compile, so an edit made
- * while Y compiled counts as older than Y. Overleaf orders compiles by the times in their build
- * IDs, which it takes before it reads the project (CompileManager.mjs:66). When either ID has
- * another form, the build is taken as above, and the form is logged once.
+ * A build Y in an answer is taken only if Y's build ID says that Y began later than the build in
+ * use X (buildTimeOf), whether X is this window's own compile or another client's. Overleaf stores
+ * a compile in its cache after it has answered the compile request, without waiting for the store
+ * (CLSICacheHandler.js:142-196): a check after X and before that store answers with the cache's
+ * earlier latest, Y, and another client's earlier compile can be stored after a later one. Y can
+ * lack an edit that X has: Overleaf answers with its latest compile while the time of the cache's
+ * copy is at least the time of the project's last update (ClsiCacheManager.mjs:33-52, 108), and
+ * the copy is written after the compile, so an edit made while Y compiled counts as older than Y.
+ * Overleaf orders compiles by the times in their build IDs, which it takes before it reads the
+ * project (CompileManager.mjs:66). When either ID has another form, the times are not compared:
+ * the build is taken unless the window replaced it, and the form is logged once.
  *
  * When the project opens, the window shows Overleaf's latest compile if it is current and of the
  * window's settings, and compiles otherwise (opened).
@@ -306,7 +306,7 @@ export class ProjectBuilds {
     private readonly checks = new CoalescedRuns(() => this.runCheck());
     /** the handling of the project's opening (opened) */
     private opening?: Promise<void>;
-    /** whether a build ID of another form than Overleaf's was logged (laterThanOwn) */
+    /** whether a build ID of another form than Overleaf's was logged (beganLater) */
     private loggedIdForm = false;
     /**
      * whether the window compiled on its own for a viewer without a build to show, since a viewer
@@ -497,7 +497,7 @@ export class ProjectBuilds {
 
     /**
      * Take `build` from Overleaf's answer as the build in use, unless the window has had it, it
-     * typeset something else, or it began before the window's own build in use.
+     * typeset something else, or it began before the build in use.
      */
     private take(build: Build): boolean {
         if (build.id === this.current?.id || this.superseded.has(build.id)) {
@@ -506,7 +506,7 @@ export class ProjectBuilds {
         if (!sameSettings(build.settings, this.host.settings())) {
             return false;
         }
-        if (this.current && !fromCache(this.current) && !this.laterThanOwn(build, this.current)) {
+        if (this.current && !this.beganLater(build, this.current)) {
             return false;
         }
         this.replace(build);
@@ -514,21 +514,21 @@ export class ProjectBuilds {
     }
 
     /**
-     * Whether `build` from Overleaf's cache began after `own`, this window's build in use, as the
-     * times in their build IDs say. With an ID of another form the times cannot be compared, and
-     * the build counts as later.
+     * Whether `build` from Overleaf's cache began after `current`, the build in use, as the times
+     * in their build IDs say. With an ID of another form the times cannot be compared, and the
+     * build counts as later.
      */
-    private laterThanOwn(build: Build, own: Build): boolean {
+    private beganLater(build: Build, current: Build): boolean {
         const time = buildTimeOf(build.id);
-        const ownTime = buildTimeOf(own.id);
-        if (time === undefined || ownTime === undefined) {
+        const currentTime = buildTimeOf(current.id);
+        if (time === undefined || currentTime === undefined) {
             if (!this.loggedIdForm) {
                 this.loggedIdForm = true;
-                console.warn(`Overleaf Workshop: the build IDs ${own.id} and ${build.id} are not both of Overleaf's form <time in hex>-<random hex>, so the window takes the build from Overleaf's cache without comparing their times`);
+                console.warn(`Overleaf Workshop: the build IDs ${current.id} and ${build.id} are not both of Overleaf's form <time in hex>-<random hex>, so the window takes the build from Overleaf's cache without comparing their times`);
             }
             return true;
         }
-        return time > ownTime;
+        return time > currentTime;
     }
 
     private replace(build: Build) {
