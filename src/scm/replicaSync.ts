@@ -1739,11 +1739,13 @@ export class ReplicaSync {
         const still = entry!==undefined && !entry.conflict && this.state.entries[to]===undefined && remoteFrom?.kind===entry.kind
             && remoteTo===undefined && localFrom===undefined && localTo!==undefined && localTo!=='folder';
         if (!still || await this.isUnmerged(from) || await this.isUnmerged(to)) { return false; }
-        // before the try: a rename that the check stops waits for the full sync after the wait, and is not taken for one that Overleaf refused
-        await this.beforeWrite(mode);
         try {
-            await this.transfers.run(() => this.remote.rename!(from, to));
+            // checked inside the transfer, right before the request, also after a wait for a transfer slot
+            await this.transfers.run(async () => { await this.beforeWrite(mode); await this.remote.rename!(from, to); });
         } catch (error) {
+            // a rename that the check stops waits for the full sync after the wait, or runs again,
+            // and is not taken for one that Overleaf refused
+            if (error instanceof SyncWaitsError || error instanceof StaleReadError) { throw error; }
             this.ui.log(`${from}: renaming it to ${to} on Overleaf failed (${errorMessage(error)}); ${to} syncs as a new file`);
             return false;
         }
