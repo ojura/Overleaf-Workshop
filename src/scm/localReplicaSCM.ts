@@ -1004,13 +1004,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                          uploads: modes.push==='native',
                                          onRecorded: result => this.afterRecord(result),
                                      });
-        // a saved state that cannot be used stops the replica here, before anything syncs
+        // a saved state that cannot be used stops the replica here, before anything syncs; the
+        // collection's notice of the failed start says why (scmCollectionProvider.ts)
         try {
             await sync.open();
         } catch (error) {
-            const message = String((error as Error)?.message ?? error);
-            log(`[${this.vfs.projectName}] ${message}`);
-            void vscode.window.showErrorMessage(vscode.l10n.t('The local replica "{folder}" does not sync: {error}', {folder: this.baseUri.fsPath, error: message}));
+            log(`[${this.vfs.projectName}] ${String((error as Error)?.message ?? error)}`);
             throw error;
         }
         const record: {sync: ReplicaSync, stopped?: Promise<void>} = {sync};
