@@ -57,10 +57,30 @@ function prepareSocketFolder(socket: string): string | undefined {
 }
 
 /**
- * Whether a socket is at `socket`, which a server listens on. An operating system that shortens a
- * path longer than a socket's may be does so without an error, and the socket is then at the
- * shortened path: nothing is at the one asked for (measured with Node 22 on Linux, where
- * server.address() still answers the path asked for).
+ * The bytes of sun_path, the field of a Unix socket's address that holds the socket's path and its
+ * terminating NUL: 108 on Linux (unix(7): "On Linux, sun_path is 108 bytes in size"), 104 on
+ * macOS (xnu's bsd/sys/un.h: `char sun_path[104]`). unix(7) asks, for portability, that the path
+ * and its NUL fit: Linux also binds a path of 108 bytes without the NUL, which Node's clients
+ * reach but Python's refuse. On other systems, socketIsThere finds a path that Node shortened.
+ */
+const SUN_PATH_BYTES: Partial<Record<NodeJS.Platform, number>> = { linux: 108, darwin: 104 };
+
+/**
+ * Why `socket` cannot be a socket's path on this system, or undefined when it fits or when
+ * SUN_PATH_BYTES does not give this system's limit. Node would shorten such a path at listen and
+ * at connect alike.
+ */
+function socketPathTooLong(socket: string): string | undefined {
+    const field = ReplicaControlServer.sunPathBytes;
+    if (field === undefined || Buffer.byteLength(socket) < field) { return undefined; }
+    return `the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), is longer than the ${field - 1} bytes that a socket's path may have on this system: set XDG_RUNTIME_DIR to a folder with a shorter path`;
+}
+
+/**
+ * Whether a socket is at `socket`, which a server listens on. Node shortens a socket path that is
+ * too long, without an error: it makes the socket at the first bytes of the path that fit into
+ * sun_path, and stat of the path asked for fails with ENOENT (measured with Node 22 on Linux,
+ * where server.address() still answers the path asked for).
  */
 function socketIsThere(socket: string): boolean {
     try {
@@ -81,6 +101,15 @@ function answers(socket: string): Promise<boolean> {
 }
 
 export class ReplicaControlServer {
+    /**
+     * The bytes of sun_path on this system (SUN_PATH_BYTES). start() refuses a socket path that
+     * does not fit, with its NUL, before Node would make the socket at a shortened path, which can
+     * be in a folder that other users can enter; requestReplica does not connect to such a path,
+     * where another program can listen. Undefined on a system that SUN_PATH_BYTES does not list:
+     * there, the check after listen finds the shortening, and the close removes that socket.
+     */
+    static sunPathBytes: number | undefined = SUN_PATH_BYTES[process.platform];
+
     private server?: net.Server;
     private socket?: string;
     private disposed = false;
@@ -102,6 +131,8 @@ export class ReplicaControlServer {
     async start(): Promise<string | undefined> {
         const socket = replicaSocketPath(this.folder);
         try {
+            const tooLong = socketPathTooLong(socket);
+            if (tooLong) { return this.cannotListen(tooLong); }
             const problem = prepareSocketFolder(socket);
             if (problem) {
                 this.log(`Tools cannot ask for a sync: ${problem}.`);
@@ -122,10 +153,7 @@ export class ReplicaControlServer {
                 if (!error && process.platform !== 'win32' && !socketIsThere(socket)) {
                     // closing the server removes the socket at the shortened path
                     await new Promise<void>(resolve => server.close(() => resolve()));
-                    const reason = `the operating system shortened the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), as a socket's path must be shorter: set XDG_RUNTIME_DIR to a folder with a shorter path`;
-                    this.log(`Tools cannot ask for a sync: ${reason}.`);
-                    this.writePointer({ error: reason });
-                    return undefined;
+                    return this.cannotListen(`Node shortened the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), as a socket's path must be shorter: set XDG_RUNTIME_DIR to a folder with a shorter path`);
                 }
                 if (!error) {
                     server.unref(); // the window lives on its own; a tool's process need not wait for the socket
@@ -145,6 +173,13 @@ export class ReplicaControlServer {
         } catch (error: any) {
             this.log(`Tools cannot ask for a sync: ${error?.message ?? error}.`);
         }
+        return undefined;
+    }
+
+    /** Say in the log, and in the pointer file for the tools, why this window cannot listen. */
+    private cannotListen(reason: string): undefined {
+        this.log(`Tools cannot ask for a sync: ${reason}.`);
+        this.writePointer({ error: reason });
         return undefined;
     }
 
@@ -183,7 +218,10 @@ export class ReplicaControlServer {
             fs.mkdirSync(path.dirname(file), { recursive: true });
             // a new file renamed over the old one, so that a tool reads all of it or the one before
             const tmp = `${file}.${process.pid}.tmp`;
-            fs.writeFileSync(tmp, JSON.stringify({ ...content, pid: process.pid, since: new Date().toISOString() }, null, 4) + '\n');
+            const processStart = processStartTime(process.pid);
+            fs.writeFileSync(tmp, JSON.stringify({
+                ...content, pid: process.pid, ...(processStart === undefined ? {} : { processStart }), since: new Date().toISOString(),
+            }, null, 4) + '\n');
             fs.renameSync(tmp, file);
             this.pointerWritten = true;
         } catch (error: any) {
@@ -207,9 +245,13 @@ export class ReplicaControlServer {
     }
 }
 
-/** No window answers for the folder: the IDE is not running, or it does not have the folder open as a replica. */
+/** A window does not answer for the folder: the IDE is not running, or it does not have the folder open as a replica. */
 export class NoReplicaWindowError extends Error {}
-/** A window keeps the folder in sync but cannot answer tools, for the reason its pointer file gives. */
+/**
+ * Tools cannot reach the window that keeps the folder in sync: the window's pointer file gives the
+ * reason, or the socket's path is too long for this system, and a window does not listen at such a
+ * path. In the second case a window may or may not run.
+ */
 export class ReplicaUnreachableError extends Error {}
 /** The window did not answer in time. */
 export class ReplicaTimeoutError extends Error {}
@@ -219,12 +261,25 @@ export function findReplicaSocket(folder: string): string {
     let pointer: any;
     try {
         pointer = JSON.parse(fs.readFileSync(path.join(folder, POINTER_FILE), 'utf8'));
-    } catch { /* no pointer file */ }
+    } catch { /* the pointer file is missing, or it is not JSON */ }
     if (typeof pointer?.socket === 'string') { return pointer.socket; }
-    if (typeof pointer?.error === 'string' && processRuns(pointer.pid)) {
+    if (typeof pointer?.error === 'string' && writerRuns(pointer)) {
         throw new ReplicaUnreachableError(`the IDE window that keeps ${folder} in sync cannot answer tools: ${pointer.error}`);
     }
     return replicaSocketPath(folder);
+}
+
+/**
+ * Whether the window that wrote `pointer` runs: a process with its pid runs, and that process
+ * started when the pointer says the window did. The pid decides alone for a pointer without the
+ * start time, as older windows and systems without /proc write it, and when the system does not
+ * give the start time of the process with that pid.
+ */
+function writerRuns(pointer: { pid?: unknown, processStart?: unknown }): boolean {
+    if (!processRuns(pointer.pid)) { return false; }
+    if (typeof pointer.processStart !== 'number') { return true; }
+    const start = processStartTime(pointer.pid as number);
+    return start === undefined || start === pointer.processStart;
 }
 
 /** Whether the process `pid` runs, e.g. the window that wrote a pointer file. */
@@ -239,6 +294,23 @@ function processRuns(pid: unknown): boolean {
     }
 }
 
+/**
+ * When the process `pid` started, as the system records it, or undefined where the system does not
+ * give it. On Linux it is field 22 of /proc/<pid>/stat, starttime, in clock ticks after boot
+ * (proc(5)), which tells a process from a later one that has the same pid. The fields are counted
+ * after the last ")", as the command's name before it, field 2, can contain spaces and ")".
+ */
+function processStartTime(pid: number): number | undefined {
+    if (process.platform !== 'linux') { return undefined; }
+    try {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+        const field = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[22 - 3];
+        return /^\d+$/.test(field ?? '') ? Number(field) : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 /** Send one request to the window that keeps `folder` in sync and wait for its answer. */
 export function requestReplica(folder: string, request: ControlRequest, timeoutMs: number): Promise<ControlAnswer> {
     let socket: string;
@@ -247,6 +319,9 @@ export function requestReplica(folder: string, request: ControlRequest, timeoutM
     } catch (error) {
         return Promise.reject(error);
     }
+    // Node would connect to the shortened path, where another program can listen
+    const tooLong = socketPathTooLong(socket);
+    if (tooLong) { return Promise.reject(new ReplicaUnreachableError(`tools cannot reach an IDE window for ${folder}: ${tooLong}`)); }
     return new Promise((resolve, reject) => {
         let buffer = '';
         let settled = false;
@@ -266,10 +341,12 @@ export function requestReplica(folder: string, request: ControlRequest, timeoutM
                 });
             }
         });
-        client.once('error', (error: NodeJS.ErrnoException) => finish(() => reject(
-            error.code === 'ENOENT' || error.code === 'ECONNREFUSED'
-                ? new NoReplicaWindowError(`no IDE window keeps ${folder} in sync (nothing answers at ${socket})`)
-                : error)));
+        client.once('error', (error: NodeJS.ErrnoException) => finish(() => {
+            if (error.code !== 'ENOENT' && error.code !== 'ECONNREFUSED') { reject(error); return; }
+            // ECONNREFUSED: the path is there, e.g. left by a window that ended, and a server does not listen on it
+            const why = error.code === 'ENOENT' ? `${socket} does not exist` : `a server does not listen on ${socket}`;
+            reject(new NoReplicaWindowError(`an IDE window does not keep ${folder} in sync: ${why}`));
+        }));
         client.once('close', () => finish(() => reject(new Error(`the IDE window closed the connection without answering (${socket})`))));
     });
 }

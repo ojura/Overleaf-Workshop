@@ -207,7 +207,7 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
         synced = await ask({ op: 'sync' }, options.windowTimeoutMs);
     } catch (error) {
         if (!(bridge && error instanceof NoReplicaWindowError)) { throw error; }
-        log('no IDE window keeps the replica in sync; its repository says what Overleaf holds');
+        log(`${error.message}; the replica's repository says what Overleaf holds`);
         synced = { ok: true, connected: true, window: false, git: { head: repo.commit('HEAD'), overleaf: repo.commit(OVERLEAF_REF), unmerged: [] } };
     }
     if (!synced.ok) { throw new LandError(`the IDE window could not sync the replica: ${synced.error}`); }
@@ -241,7 +241,7 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
     let main = options.main;
     if (options.compile !== false) {
         main ??= mainDocument(before.joined);
-        if (!main) { throw new LandError('the project names no main document; give --main'); }
+        if (!main) { throw new LandError('the project does not name a main document; give --main'); }
         const parentDir = path.join(compiles, head);
         if (hook && commit !== head && !fs.existsSync(path.join(parentDir, 'output.log'))) {
             log(`compiling ${head.slice(0, 7)} first, for overleaf.landCheck to compare with`);
@@ -253,14 +253,14 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
     if (commit !== head) {
         let expect = commit;
         if (bridge) {
-            if (!options.bridgePush) { throw new LandError('no push through the bridge is available'); }
+            if (!options.bridgePush) { throw new LandError('a push through the bridge is not available'); }
             if (repo.text(['status', '--porcelain', '--untracked-files=no'])) { throw new LandError('the replica folder has changes that are not committed'); }
             repo.run(['merge', '--ff-only', '--quiet', commit]);
             log(`pushing ${commit.slice(0, 7)} through the git bridge`);
             const pushed = await options.bridgePush(repo);
             report.pushed = true;
             report.push = { ok: true, ...pushed };
-            log(`${pushed.pushed ? 'pushed' : 'nothing to push:'} ${pushed.head.slice(0, 7)} through the bridge`);
+            log(pushed.pushed ? `pushed ${pushed.head.slice(0, 7)} through the bridge` : `the bridge already had ${pushed.head.slice(0, 7)}`);
         } else {
             log(`pushing ${commit.slice(0, 7)} through the IDE window`);
             const answer = await ask({ op: 'land', commit }, options.windowTimeoutMs) as any;

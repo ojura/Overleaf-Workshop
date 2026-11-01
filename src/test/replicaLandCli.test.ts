@@ -8,6 +8,8 @@ import type { CompileRequest } from '../api/base';
 import { Repo } from '../gitbridge/plumbing';
 import { checkBuild } from '../sandbox/buildCheck';
 import { AskWindow, fetchCommitFrom, LandClient, LandError, landCommit, landedCleanly } from '../sandbox/land';
+import { replicaSocketPath, requestReplica } from '../scm/replicaControl';
+import { SHORT_TEMP } from './replicaTestWorld';
 
 const OVERLEAF_REF = 'refs/remotes/overleaf/main';
 
@@ -215,6 +217,31 @@ describe('replica-land', function () {
         assert.strictEqual(git(t.folder, 'rev-parse', 'HEAD'), commit);
         assert.strictEqual(report.verified, 2);
         assert.ok(!t.asked.includes(`land ${commit.slice(0, 7)}`), 'the window does not push');
+    });
+
+    it('pushes through the bridge when an IDE window does not keep the replica in sync, and logs why', async () => {
+        const t = setup();
+        const commit = t.commit({ 'main.tex': 'main v2\n' }, 'Without a window');
+        // a runtime folder of the test's own, where a window does not listen
+        const saved = process.env.XDG_RUNTIME_DIR;
+        const runtime = fs.mkdtempSync(path.join(SHORT_TEMP, 'owr-'));
+        process.env.XDG_RUNTIME_DIR = runtime;
+        try {
+            const bridgePush = async (repo: Repo) => {
+                const head = repo.mustCommit('HEAD');
+                t.overleaf.docs.set('main.tex', 'main v2\n');
+                return { pushed: true, head };
+            };
+            const logs: string[] = [];
+            const ask: AskWindow = (request, timeoutMs) => requestReplica(t.folder, request, timeoutMs);
+            const report = await landCommit(t.repo, t.overleaf, ask, { ...t.options, commit, push: 'bridge', bridgePush, compile: false, log: line => logs.push(line) });
+            assert.strictEqual(report.pushed, true);
+            assert.strictEqual(logs[0], `an IDE window does not keep ${t.folder} in sync: ${replicaSocketPath(t.folder)} does not exist; the replica's repository says what Overleaf holds`);
+            assert.ok(logs.includes(`pushed ${commit.slice(0, 7)} through the bridge`), logs.join('\n'));
+        } finally {
+            if (saved === undefined) { delete process.env.XDG_RUNTIME_DIR; } else { process.env.XDG_RUNTIME_DIR = saved; }
+            fs.rmSync(runtime, { recursive: true, force: true });
+        }
     });
 
     it('compares a check of the checked-out commit with its parent\'s compile', async () => {
