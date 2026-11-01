@@ -78,6 +78,10 @@ const noViewerComponents = {
 
 /** esbuild options shared by the viewers and by the tests that bundle their modules */
 export const bundleOptions = {
+    // the bundles name their modules by paths relative to this folder, the checkout, in comments
+    // and in the names of CommonJS modules; esbuild's default is the working directory, with which
+    // the same checkout built different files from different folders
+    absWorkingDir: path.resolve(viewerRoot, '..', '..'),
     bundle: true,
     format: 'esm',
     target: 'es2022',
