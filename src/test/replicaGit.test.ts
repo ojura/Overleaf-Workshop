@@ -852,6 +852,23 @@ describe('local replica: git as the merge backend', function () {
             await sync.stop();
         });
 
+        it('lists the folder once for a deletion step\'s count and its pairing', async () => {
+            const t = await synced({ '/a.tex': chapter, '/b.tex': edited });
+            try {
+                const list = t.local.list.bind(t.local);
+                let listings = 0;
+                t.local.list = async () => { listings += 1; return list(); };
+                fs.rmSync(path.join(t.folder, 'b.tex'));
+                await t.sync.localChanged('/b.tex');
+                assert.deepStrictEqual(t.remote.calls, ['remove /b.tex'], 'what the sync asked of Overleaf');
+                // the pairing of the reconcile that collects the deletion, the deletion step's one
+                // listing, and the pairing of the reconcile that makes the deletion
+                assert.strictEqual(listings, 3, 'the listings of the folder');
+            } finally {
+                await t.sync.stop();
+            }
+        });
+
         it('deletes the old path of a rename that Overleaf refuses in the same step, once the new file is uploaded', async () => {
             const t = await synced({ '/a.tex': chapter });
             move(t, 'a.tex', 'b.tex');

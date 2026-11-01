@@ -1,3 +1,5 @@
+import { Minimatch } from 'minimatch';
+
 /**
  * The local replica's own folder in its folder, as a path of the sync ('/dir/name'), like the
  * other paths in this module: the replica's settings, the local versions it replaced, its
@@ -56,3 +58,26 @@ export const DEFAULT_IGNORE_PATTERNS: readonly string[] = [
     '**/main.pdf',
     '**/output.pdf',
 ];
+
+/**
+ * The replica's ignore patterns, minimatch patterns matched against paths like '/dir/name' with
+ * dot files, compiled once for each value: asked again with the same patterns, by value, the
+ * matcher matches with the patterns compiled before, and compiles them again when they differ.
+ */
+export class IgnoreMatcher {
+    private compiled?: { key: string, matchers: readonly Minimatch[] };
+
+    /** The compiled `patterns`: the same objects while the value of `patterns` stays the same. */
+    matchers(patterns: readonly string[]): readonly Minimatch[] {
+        const key = JSON.stringify(patterns);
+        if (this.compiled?.key !== key) {
+            this.compiled = { key, matchers: patterns.map(pattern => new Minimatch(pattern, { dot: true })) };
+        }
+        return this.compiled.matchers;
+    }
+
+    /** Whether `path` matches one of `patterns`. */
+    matches(patterns: readonly string[], path: string): boolean {
+        return this.matchers(patterns).some(matcher => matcher.match(path));
+    }
+}
