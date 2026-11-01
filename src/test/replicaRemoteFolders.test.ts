@@ -23,15 +23,14 @@ function project() {
 }
 
 /**
- * The extension's own project tree (VirtualFileSystem), loaded with the replica, over `tree`: the
- * server's events come through `handlers`, and what the replica asks of Overleaf is recorded in
- * `asked` and not sent.
+ * The extension's own project tree (VirtualFileSystem, the class of the load that also loaded
+ * the replica), over `tree`: the server's events come through `handlers`, and what the replica
+ * asks of Overleaf is recorded in `asked` and not sent.
  */
-function projectTree(t: ReturnType<typeof world>, tree: any) {
+function projectTree(t: ReturnType<typeof world>, tree: any, VirtualFileSystem: any) {
     // the errors the project tree throws, with the codes of the IDE's FileSystemError
     const error = (code: string) => (uri?: Uri) => Object.assign(new Error(`${code}: ${uri?.path ?? ''}`), { code });
     t.mock.FileSystemError = { FileNotFound: error('FileNotFound'), FileIsADirectory: error('FileIsADirectory'), FileExists: error('FileExists'), Unavailable: error('Unavailable') };
-    const { VirtualFileSystem } = require('../core/remoteFileSystemProvider');
     const vfs = Object.create(VirtualFileSystem.prototype);
     const handlers: any = {};
     const changes = new Emitter<any[]>();
@@ -88,8 +87,8 @@ describe('a local replica over the project tree, when Overleaf moves or deletes 
         git(folder, 'init', '--quiet', '--initial-branch=main');
         git(folder, 'config', 'user.name', 'Local User');
         git(folder, 'config', 'user.email', 'local@example.com');
-        const { LocalReplicaSCMProvider } = load(t.mock);
-        const overleaf = projectTree(t, tree);
+        const { LocalReplicaSCMProvider, VirtualFileSystem } = load(t.mock);
+        const overleaf = projectTree(t, tree, VirtualFileSystem);
         const open = async () => {
             const scm = new LocalReplicaSCMProvider(overleaf.vfs, Uri.file(folder));
             triggers = await scm.triggers;

@@ -166,6 +166,8 @@ export function load(mock: any) {
         return {
             LocalReplicaSCMProvider: require('../scm/localReplicaSCM').LocalReplicaSCMProvider,
             requestReplica: require('../scm/replicaControl').requestReplica,
+            // the project tree's class from this load, the module that the replica's modules import
+            VirtualFileSystem: require('../core/remoteFileSystemProvider').VirtualFileSystem,
         };
     });
 }
