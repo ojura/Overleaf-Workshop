@@ -39,6 +39,12 @@ describe('the download of pdf.js (scripts/download-pdfjs.mjs)', function () {
         assert.ok(packageText.includes(`"pdfjs-dist": "${version}"`));
     });
 
+    it('the settings\' texts and the viewer harness\'s server do not name the pdf.js version', () => {
+        for (const file of ['package.nls.json', path.join('scripts', 'pdf-viewer-harness', 'server.mjs')]) {
+            assert.ok(!fs.readFileSync(path.join(repo, file), 'utf8').includes(version), `${file} names ${version}`);
+        }
+    });
+
     it('refuses a release without its patch, before it downloads anything', () => {
         const release = path.join(scratch, 'vendor', 'pdfjs-9.8.7');
         assert.throws(() => script.download(script.planOf('9.8.7', release)), /there is no patch for pdf\.js 9\.8\.7/);
