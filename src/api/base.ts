@@ -31,6 +31,18 @@ export function downloadDomainUrl(downloadDomain: string, url: string, clsiServe
     return `${downloadDomain.replace(/\/+$/, '')}/${url.replace(/^\/+/, '')}?${query}`;
 }
 
+/**
+ * Where output file `url` of build `build`, which editor `editorId` compiled, is in Overleaf's
+ * cache of compile outputs on the download domain, which serves it in ranges: the build's path
+ * with build/<editor>-<build>/ for build/<build>/, and the cache's shard `shard` for the compile
+ * server, as Overleaf's PDF loader asks for a build that the compile server has deleted
+ * (pdf-caching-transport.ts:154-163, getOutputPDFURLFromCache, which finds the build's part of the
+ * path by the form of build IDs).
+ */
+export function cachedDownloadDomainUrl(downloadDomain: string, url: string, build: string, editorId: string, shard: string, compileGroup: string | undefined): string {
+    return downloadDomainUrl(downloadDomain, url.replace(`build/${build}/`, `build/${editorId}-${build}/`), shard, compileGroup);
+}
+
 /** The compilers Overleaf offers. */
 export const COMPILERS: ReadonlyArray<{code:string, name:string}> = [
     {code: 'pdflatex', name: 'pdfLaTex'},
@@ -1005,6 +1017,13 @@ export class BaseAPI {
      * and the editor, for which the web server passes the request on to the compile server, and
      * on to Overleaf's cache when the compile server answers 404 (CompileController.mjs,
      * canTryClsiCacheFallback). Undefined when Overleaf's answer gives no downloadURL.
+     *
+     * These routes send a file whole, whatever the request's Range header says: the web server
+     * fetches the file without it and passes on the status, the length and the type
+     * (ClsiCacheController.mjs:113-152; CompileController.mjs, _proxyToClsi). Asked for bytes 0-99
+     * of the book's output.pdf at its cached route, Overleaf answered 200 with all 885,588,853 bytes
+     * (the IDE test of 2026-11-01). The window reads them whole on purpose; ranges of a build come
+     * from the download domain (downloadDomainUrl, cachedDownloadDomainUrl).
      */
     static webRouteOf(file:OutputFileEntity, response:CompileResponseSchema, editorId?:string): string | undefined {
         if (response.fromCache) {

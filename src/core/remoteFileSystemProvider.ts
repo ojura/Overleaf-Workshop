@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
 import * as DiffMatchPatch from 'diff-match-patch';
-import { BaseAPI, COMPILERS, CompileRequest, CompileResponseSchema, downloadDomainUrl, EDITOR_ID, MemberEntity, ProjectSettingsSchema } from '../api/base';
+import { BaseAPI, cachedDownloadDomainUrl, COMPILERS, CompileRequest, CompileResponseSchema, downloadDomainUrl, EDITOR_ID, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import type { CompileRecord } from '../compile/outputFiles';
 import { windowCompileSettings } from '../compile/compileSettings';
 import { cachedBuild, CompileSettings, CompileStart, fromCache, isCompileStart, LatestAnswer, ownBuild, ProjectBuilds } from './projectBuilds';
@@ -1603,9 +1603,12 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     /**
      * Save the build in use's output.pdf to `target`: from the download domain in ranges
-     * (downloadInRanges); when the compile server has deleted the build and the download domain
-     * answers 404, whole from the web server, which sends it from Overleaf's cache of compile
-     * outputs (BaseAPI.webRouteOf). Either way the PDF goes to a part file first, which takes
+     * (downloadInRanges). When the compile server has deleted the build and the download domain
+     * answers 404, from Overleaf's cache of compile outputs, in ranges on the download domain as
+     * the viewers' loader reads it (cachedDownloadDomainUrl), when the build names the cache's
+     * shard and its editor; else whole from the web server, which passes the request on to the
+     * cache (BaseAPI.webRouteOf), and ends a response after 10 minutes, too short for 885 MB on a
+     * link slower than about 1.5 MB/s. Each way the PDF goes to a part file first, which takes
      * `target`'s name when it is complete.
      */
     async savePdf(target: string, signal: AbortSignal, onProgress: (received: number) => void) {
@@ -1619,8 +1622,14 @@ export class VirtualFileSystem extends vscode.Disposable {
         try {
             await downloadInRanges(output.url, target, size, signal, { onProgress });
         } catch (error) {
+            if (signal.aborted || (error as DownloadError).status!==404) { throw error; }
+            if (output.clsiCacheShard && build.editorId) {
+                const cached = cachedDownloadDomainUrl(output.downloadDomain, file.url, build.id, build.editorId, output.clsiCacheShard, build.record.response.compileGroup);
+                await downloadInRanges(cached, target, size, signal, { onProgress });
+                return;
+            }
             const route = BaseAPI.webRouteOf(file, build.record.response, build.editorId);
-            if (signal.aborted || (error as DownloadError).status!==404 || route===undefined) { throw error; }
+            if (route===undefined) { throw error; }
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
             await downloadWhole(this.api.serverUrl + route, target, { headers: {'Cookie': identity.cookies}, size, signal, onProgress });
         }

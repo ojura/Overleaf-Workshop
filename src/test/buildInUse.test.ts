@@ -540,21 +540,46 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.deepStrictEqual(partFiles(), []);
         });
 
-        it('saves another client\'s build whole from Overleaf\'s cache when the compile server has deleted it', async () => {
+        /** the requests for `path` on the download domain, with their ranges and compile servers */
+        const rangesOf = (path: string) => overleaf.to(path).map(r => [r.range !== undefined, r.query.get('clsiserverid')]);
+
+        it('saves another client\'s build in ranges from Overleaf\'s cache on the download domain when the compile server has deleted it', async () => {
             overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
-            overleaf.files.set(`/download/project/p1/build/${WEB_EDITOR}-b-web/output/cached/output.pdf`, PDF);
+            // as Overleaf's loader asks the cache: build/<editor>-<build>/, with the cache's shard
+            const cached = `/cdn/project/p1/user/u1/build/${WEB_EDITOR}-b-web/output/output.pdf`;
+            overleaf.files.set(cached, PDF);
             const { doc, panel } = await open();
             await panel.first('load');
             await provider.download(doc);
             assert.deepStrictEqual(fs.readFileSync(target()), PDF);
-            const whole = overleaf.to('/download/project/p1/build/').filter(r => r.path.endsWith('/output.pdf'));
-            assert.deepStrictEqual(whole.map(r => [r.path, r.range, r.cookie]), [[`/download/project/p1/build/${WEB_EDITOR}-b-web/output/cached/output.pdf`, undefined, identity.cookies]]);
+            const asked = rangesOf(cached);
+            assert.ok(asked.length > 0 && asked.every(([range, server]) => range && server === 'cache-1'), JSON.stringify(asked));
+            // not the web server's route, which sends the whole file (the Problems view reads output.log there)
+            assert.deepStrictEqual(overleaf.to('/download/').filter(r => r.path.endsWith('/output.pdf')), []);
             assert.deepStrictEqual(partFiles(), []);
         });
 
-        it('saves this window\'s build through the web server, with the window\'s editor, when the compile server has deleted it', async () => {
+        it('saves this window\'s build in ranges from Overleaf\'s cache when the compile server has deleted it', async () => {
             overleaf.latest = { status: 404 };
             overleaf.compiles.push(ownAnswer(overleaf, 'b-own'));
+            const cached = `/cdn/project/p1/user/u1/build/${EDITOR_ID}-b-own/output/output.pdf`;
+            overleaf.files.set(cached, PDF);
+            const ended = compileEnd();
+            const { doc, panel } = await open();
+            await panel.first('load');
+            await ended;
+            await provider.download(doc);
+            assert.deepStrictEqual(fs.readFileSync(target()), PDF);
+            const asked = rangesOf(cached);
+            assert.ok(asked.length > 0 && asked.every(([range, server]) => range && server === 'cache-1'), JSON.stringify(asked));
+            assert.deepStrictEqual(overleaf.to('/project/p1/user/u1/build/b-own/output/output.pdf'), []);
+        });
+
+        it('saves a build whose compile named no shard of the cache whole through the web server, with the window\'s editor, when the compile server has deleted it', async () => {
+            overleaf.latest = { status: 404 };
+            const answer: any = ownAnswer(overleaf, 'b-own');
+            delete answer.clsiCacheShard;
+            overleaf.compiles.push(answer);
             overleaf.files.set('/project/p1/user/u1/build/b-own/output/output.pdf', PDF);
             const ended = compileEnd();
             const { doc, panel } = await open();
