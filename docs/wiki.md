@@ -220,13 +220,13 @@ The compiled PDF `output.pdf` is also located in the output folder. You can doub
 
 #### Which build the PDF shows
 
-The PDF viewer shows the project's latest build, whoever compiled it: this window, Overleaf's web editor, another window, or a command-line tool. The window asks Overleaf for its latest compile when a viewer opens, when it becomes visible again, and when the window gets the focus back. A build from another client is taken when the window has not had it, and while the window shows its own compile, only when it began later; in either case only when it was compiled with the same main document, draft mode and handling of errors as the window compiles.
+The PDF viewer shows the project's latest build, whoever compiled it: this window, Overleaf's web editor, another window, or a command-line tool. The window asks Overleaf for its latest compile when a viewer opens, when it becomes visible again, and when the window gets the focus back. A build from another client is taken when the window has not had it and it began later than the build that the window shows, as the times in their build IDs say. It must also have been compiled with the same main document and draft mode as the window compiles, and while the window stops at the first error, only a build that stopped at its first error too is taken.
 
 Overleaf can answer with another client's build only when it keeps compiles in its cache of compile outputs, which it does for projects whose owner has the priority compile group. For other projects the viewer shows this window's own compiles.
 
 Overleaf's compile servers delete a build after 90 minutes, or once two newer builds of the same user exist on that server; one user's compiles can run on several compile servers. When a viewer finds its build deleted everywhere, the window asks Overleaf for a newer one and, when there is none, compiles once on its own. If that build goes too before the viewer has shown it, the window waits for you: the line at the top of the viewer offers **Recompile**. The same line says when the window is checking or compiling, and why a compile failed.
 
-The viewer loads a build in ranges, as Overleaf's own viewer does, so a large PDF (the book that this fork was written for has 885 MB and 456 pages) shows its first pages without being downloaded whole. **Save PDF** saves it in ranges too, also when the compile server has deleted it and Overleaf's cache keeps it.
+The viewer loads a build in ranges, as Overleaf's own viewer does, so a large PDF (the book that this fork was written for has 885 MB and 456 pages) shows its first pages without being downloaded whole. **Save PDF** saves it in ranges too, also from Overleaf's cache when the compile server has deleted it. When the cache's address on the download domain does not have the build either, Save PDF reads it whole through Overleaf's web server, which finds it in the cache and ends a response after 10 minutes.
 
 #### SyncTeX and Reverse SyncTeX
 

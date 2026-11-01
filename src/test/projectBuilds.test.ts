@@ -138,13 +138,35 @@ describe('the build in use (ProjectBuilds)', () => {
         assert.deepStrictEqual(builds.status, { state: 'ready' });
     });
 
-    it('compares the times only with its own build: after another client\'s build, it takes any build that it has not had', async () => {
-        const { host, builds } = setup();
+    it('compares the times with another client\'s build too: it keeps that build when the cache names an earlier one afterwards', async () => {
+        const { host, builds, changes } = setup();
         // the cache's stores are not ordered: another client's earlier compile can be stored after a later one
+        host.answers.push({ kind: 'build', build: fromCache(at(20)) }, { kind: 'build', build: fromCache(at(10)) }, { kind: 'build', build: fromCache(at(30)) });
+        await builds.check();
+        await builds.check();
+        assert.strictEqual(builds.build?.id, at(20));
+        await builds.check();
+        assert.deepStrictEqual(changes, [at(20), at(30)]);
+    });
+
+    it('does not take an earlier build that the window never had after another client\'s later build (the review\'s scratch T1)', async () => {
+        // the window's x, then another client's later w, then the earlier y
+        const { host, builds, changes } = setup();
+        builds.useOwn(own(at(20)));
+        host.answers.push({ kind: 'build', build: fromCache(at(30)) }, { kind: 'build', build: fromCache(at(10)) });
+        await builds.check();
+        await builds.check();
+        assert.deepStrictEqual(changes, [at(20), at(30)]);
+    });
+
+    it('does not go back to an earlier build when the build in use is gone, and compiles instead', async () => {
+        const { host, builds } = setup();
         host.answers.push({ kind: 'build', build: fromCache(at(20)) }, { kind: 'build', build: fromCache(at(10)) });
         await builds.check();
-        await builds.check();
-        assert.strictEqual(builds.build?.id, at(10));
+        await builds.reportGone(at(20));
+        assert.strictEqual(builds.build?.id, at(20));
+        assert.strictEqual(host.compiles, 1);
+        assert.deepStrictEqual(builds.status, { state: 'compiling' });
     });
 
     it('with a build ID of another form, takes a build that it has not had, and says once that it cannot compare them', async () => {
@@ -270,6 +292,19 @@ describe('the build in use (ProjectBuilds)', () => {
             assert.strictEqual(host.compiles, 2);
         });
 
+        it('does not count a compile that the user started elsewhere when it compiled nothing (skipped)', async () => {
+            const { host, builds } = await goneOnce();
+            await builds.reportGone(at(10));
+            assert.deepStrictEqual(builds.status, { state: 'gone' });
+            // a compile on save finds nothing changed since the last compile
+            builds.compileStarted(true);
+            builds.compileEnded({ result: 'skipped' }, true);
+            assert.deepStrictEqual(builds.status, { state: 'gone' });
+            host.answers.push({ kind: 'none' });
+            await builds.check();
+            assert.strictEqual(host.compiles, 1);
+        });
+
         it('does not count the compile at the project\'s opening, while no viewer was visible', async () => {
             const { host, builds, viewer } = setup({ visible: false });
             host.answers.push({ kind: 'none' }, { kind: 'none' });
@@ -315,6 +350,23 @@ describe('the build in use (ProjectBuilds)', () => {
         // the user's Recompile makes a build: the window shows it
         builds.useOwn(own('z'));
         assert.deepStrictEqual(builds.status, { state: 'ready' });
+    });
+
+    it('keeps the failure of its compile when a compile that the user started elsewhere compiled nothing (skipped)', async () => {
+        const { host, builds } = setup();
+        host.answers.push({ kind: 'none' }, { kind: 'none' });
+        await builds.check();
+        const failed: BuildStatus = { state: 'compile-failed', detail: 'Overleaf\'s status is "failure"' };
+        builds.compileEnded({ result: 'failure', detail: 'Overleaf\'s status is "failure"' }, true);
+        // a compile on save finds nothing changed since the failed compile
+        builds.compileStarted(true);
+        assert.deepStrictEqual(builds.status, { state: 'compiling' });
+        builds.compileEnded({ result: 'skipped' }, true);
+        assert.deepStrictEqual(builds.status, failed);
+        // the viewer becomes visible again: the failure waits for the user, and nothing compiles on its own
+        await builds.check();
+        assert.strictEqual(host.compiles, 1);
+        assert.deepStrictEqual(builds.status, failed);
     });
 
     it('says that it compiles while a compile of the project runs that it did not ask for, until that compile ends', () => {

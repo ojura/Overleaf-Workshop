@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { setTimeout as sleep } from 'timers/promises';
 import { Agent, fetch } from 'undici';
 import type { BridgeRequest, BridgeResponse } from './viewerProtocol';
 
@@ -180,11 +181,32 @@ function partFile(file: string): string {
     return `${file}.${process.pid}-${++downloads}.part`;
 }
 
-/** A download that the server refused, with the HTTP status of its answer. */
+/**
+ * A download that the server refused, with the HTTP status of its answer, and the time in ms that
+ * the answer asked the client to wait before it asks again (Retry-After), when it named one.
+ */
 export class DownloadError extends Error {
-    constructor(message: string, readonly status: number) {
+    constructor(message: string, readonly status: number, readonly retryAfterMs?: number) {
         super(message);
     }
+}
+
+/**
+ * The time in ms that a Retry-After header asks a client to wait before it asks again: a number
+ * of seconds, or a date, which has passed for 0 (RFC 9110, section 10.2.3); undefined without the
+ * header or for a value of another form.
+ */
+export function retryAfterMs(value: string | null, now: number = Date.now()): number | undefined {
+    const text = value?.trim();
+    if (!text) {
+        return undefined;
+    }
+    if (/^\d+$/.test(text)) {
+        return Number(text) * 1000;
+    }
+    // an HTTP date names its weekday and month, as in "Sun, 01 Nov 2026 05:00:30 GMT"
+    const date = /[a-z]/i.test(text) ? Date.parse(text) : NaN;
+    return Number.isNaN(date) ? undefined : Math.max(0, date - now);
 }
 
 /**
@@ -194,9 +216,12 @@ export class DownloadError extends Error {
  * viewer and the PDF viewers here ask for ranges. Holds at most `parallel` ranges in memory. The
  * ranges go to a temporary file next to `file`, which then takes `file`'s name, so a failed
  * download leaves `file` as it was. `onProgress` gets the bytes written so far after each range.
+ * `wait` waits the time that an answer asks for before the range is asked again, until the
+ * download stops (timers/promises' setTimeout).
  */
 export async function downloadInRanges(url: string, file: string, size: number, signal?: AbortSignal,
-    { chunk = 8 * 1024 * 1024, parallel = 4, attempts = 3, onProgress = undefined as ((received: number) => void) | undefined } = {}) {
+    { chunk = 8 * 1024 * 1024, parallel = 4, attempts = 3, onProgress = undefined as ((received: number) => void) | undefined,
+        wait = (ms: number, stopped: AbortSignal): Promise<void> => sleep(ms, undefined, { signal: stopped }) } = {}) {
     const tmp = partFile(file);
     // stops every range when one fails for good or the caller aborts
     const stop = new AbortController();
@@ -210,7 +235,8 @@ export async function downloadInRanges(url: string, file: string, size: number, 
         const res = await fetch(url, { signal: stop.signal, dispatcher: PdfFetchBridge.dispatcher, headers: { range: `bytes=${start}-${end}` } });
         if (res.status !== 206) {
             await res.body?.cancel();
-            throw new DownloadError(`the download of ${path.basename(file)} failed: bytes ${start}-${end}: ${res.status} ${res.statusText}`, res.status);
+            throw new DownloadError(`the download of ${path.basename(file)} failed: bytes ${start}-${end}: ${res.status} ${res.statusText}`,
+                res.status, retryAfterMs(res.headers.get('retry-after')));
         }
         const body = new Uint8Array(await res.arrayBuffer());
         if (body.byteLength !== end - start + 1) {
@@ -225,10 +251,17 @@ export async function downloadInRanges(url: string, file: string, size: number, 
             try {
                 body = await fetchBytes(start, end);
             } catch (error) {
-                // A network error, a range that came cut off and a 5xx answer can pass; any other
-                // answer, such as 404 for a build that is gone, comes again the same way.
-                const passing = !(error instanceof DownloadError) || error.status >= 500;
+                // A network error, a range that came cut off, a 5xx answer and a 429 answer that
+                // names a time to ask again can pass; any other answer, such as 404 for a build
+                // that is gone, comes again the same way. An answer that names a time to ask
+                // again (Retry-After) is asked again after it.
+                const answer = error instanceof DownloadError ? error : undefined;
+                const passing = answer === undefined || answer.status >= 500 || (answer.status === 429 && answer.retryAfterMs !== undefined);
                 if (stop.signal.aborted || attempt >= attempts || !passing) { throw error; }
+                if (answer?.retryAfterMs !== undefined) {
+                    // a stop during the wait ends the range with the answer's error
+                    await wait(answer.retryAfterMs, stop.signal).catch(() => { throw error; });
+                }
                 continue;
             }
             // a failure to write the file is not the server's, and is not asked again

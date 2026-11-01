@@ -576,6 +576,38 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.deepStrictEqual(overleaf.to('/project/p1/user/u1/build/b-own/output/output.pdf'), []);
         });
 
+        // The cache keeps the build, but not under the shard that the build names: its address on
+        // the download domain answers 404, and the web server finds the build, since it asks the
+        // cache's instances to search for it (ClsiCacheHandler.getOutputFile).
+        it('saves another client\'s build whole through the web server when the cache\'s address on the download domain answers 404 too', async () => {
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            const web = `/download/project/p1/build/${WEB_EDITOR}-b-web/output/cached/output.pdf`;
+            overleaf.files.set(web, PDF);
+            const { doc, panel } = await open();
+            await panel.first('load');
+            await provider.download(doc);
+            assert.deepStrictEqual(fs.readFileSync(target()), PDF);
+            assert.ok(rangesOf(`/cdn/project/p1/user/u1/build/${WEB_EDITOR}-b-web/output/output.pdf`).length > 0, 'the cache\'s address on the download domain comes first');
+            assert.deepStrictEqual(overleaf.to(web).map(r => [r.range, r.cookie]), [[undefined, identity.cookies]]);
+            assert.deepStrictEqual(partFiles(), []);
+        });
+
+        it('saves this window\'s build whole through the web server, with the window\'s editor, when the cache\'s address on the download domain answers 404 too', async () => {
+            overleaf.latest = { status: 404 };
+            overleaf.compiles.push(ownAnswer(overleaf, 'b-own'));
+            const web = '/project/p1/user/u1/build/b-own/output/output.pdf';
+            overleaf.files.set(web, PDF);
+            const ended = compileEnd();
+            const { doc, panel } = await open();
+            await panel.first('load');
+            await ended;
+            await provider.download(doc);
+            assert.deepStrictEqual(fs.readFileSync(target()), PDF);
+            assert.ok(rangesOf(`/cdn/project/p1/user/u1/build/${EDITOR_ID}-b-own/output/output.pdf`).length > 0, 'the cache\'s address on the download domain comes first');
+            assert.deepStrictEqual(overleaf.to(web).map(r => [r.range, r.query.get('clsiserverid'), r.query.get('editorId'), r.cookie]), [[undefined, 'clsi-vm-2', EDITOR_ID, identity.cookies]]);
+            assert.deepStrictEqual(partFiles(), []);
+        });
+
         it('saves a build whose compile named no shard of the cache whole through the web server, with the window\'s editor, when the compile server has deleted it', async () => {
             overleaf.latest = { status: 404 };
             const answer: any = ownAnswer(overleaf, 'b-own');
@@ -763,6 +795,26 @@ describe('the build in use, from Overleaf to the window', function () {
             overleaf.release('/project/p1/compile');
             assert.deepStrictEqual((await ended).outcome, { result: 'success' });
             assert.deepStrictEqual(vfs.builds.status, { state: 'ready' });
+        });
+
+        it('keeps the failed compile\'s line, and compiles nothing on its own, after a compile that found nothing changed (skipped)', async () => {
+            overleaf.latest = { status: 404 };
+            overleaf.compiles.push({ status: 'failure', compileGroup: 'priority', clsiServerId: 'clsi-vm-2', outputFiles: [] });
+            let ended = compileEnd();
+            const { panel } = await open();
+            await ended;
+            const failed = vfs.builds.status;
+            assert.strictEqual(failed.state, 'compile-failed');
+            // a compile without force, as on save, finds nothing changed since the failed compile
+            ended = compileEnd();
+            assert.deepStrictEqual(await manager.compile(false, false, projectUri), { kind: 'started' });
+            assert.deepStrictEqual((await ended).outcome, { result: 'skipped' });
+            assert.deepStrictEqual(vfs.builds.status, failed);
+            assert.deepStrictEqual(panel.posted.filter(message => message.type === 'buildState').pop(), { type: 'buildState', ...failed });
+            // the viewer becomes visible again: the failure waits for the user's Recompile
+            await vfs.builds.check();
+            assert.deepStrictEqual(vfs.builds.status, failed);
+            assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
         });
 
         it('says that it compiles from the click on Recompile, and compiles once the compile that kept it waiting has ended', async () => {
@@ -980,6 +1032,33 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.strictEqual(stops().length, 1);
             overleaf.release('/project/p1/compile');
             await ended;
+        });
+
+        it('does not send a compile that the user stopped while its editors were being saved, and says so', async () => {
+            overleaf.compiles.push(ownAnswer(overleaf, 'b-new'));
+            let saved!: () => void;
+            world.saveAll = () => new Promise<boolean>(resolve => { saved = () => resolve(true); });
+            const ended = compileEnd();
+            const start = manager.compile(true, false, projectUri);
+            await manager.stopCompile();
+            saved();
+            assert.deepStrictEqual(await start, { kind: 'started' });
+            const { outcome } = await ended;
+            assert.strictEqual(outcome.result, 'failure');
+            assert.match((outcome as { detail: string }).detail, /stopped before its request reached Overleaf/);
+            // neither the compile nor a stop: the compile never reached Overleaf
+            assert.deepStrictEqual(overleaf.to('/project/p1/compile').map(r => r.path), []);
+        });
+
+        it('sends nothing for a compile stopped before its request, and the project still counts as changed', async () => {
+            const stop = new AbortController();
+            stop.abort();
+            assert.strictEqual(await vfs.compile(false, false, false, undefined, false, stop.signal), 'stopped');
+            assert.deepStrictEqual(overleaf.to('/project/p1/compile').map(r => r.path), []);
+            // the next compile without force is sent, as it would have been without the stopped one
+            overleaf.compiles.push(ownAnswer(overleaf, 'b-new'));
+            assert.strictEqual(await vfs.compile(false), true);
+            assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
         });
     });
 

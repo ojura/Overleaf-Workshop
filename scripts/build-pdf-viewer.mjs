@@ -3,7 +3,9 @@
 //   pdfjs     pdf.js's own viewer app, views/pdf-viewer/src/pdfjs/
 //   overleaf  Overleaf's PDFJSWrapper with the extension's toolbar, views/pdf-viewer/src/overleaf/
 // Overleaf's files stay unmodified in views/pdf-viewer/overleaf/; the extension's stand-ins for
-// the parts of Overleaf's web app that they import are in views/pdf-viewer/src/shims/.
+// the parts of Overleaf's web app that they import are in views/pdf-viewer/src/shims/. The build
+// changes one condition of Overleaf's loader as it bundles it (perLoadCacheFlag), and stops when
+// Overleaf's text is not the one it expects.
 // Each viewer's page script src/<engine>/main.ts goes to views/pdf-viewer/dist/<engine>.mjs
 // (and .css), its page src/<engine>/index.html to dist/<engine>.html, which
 // src/core/pdfViewerPages.ts completes at run time.
@@ -39,7 +41,30 @@ function overleafModule(args) {
  * - PDFJSWrapper's './pdf-caching-transport' becomes src/common/transport.ts, Overleaf's factory
  *   with the transport kept on after a failed request. That module's own import of Overleaf's
  *   factory still reaches Overleaf's file.
+ * - Overleaf's loader gets src/common/caching-flags.ts in place of Overleaf's flags module, and
+ *   asks it about the fallback to Overleaf's cache for each load (perLoadCacheFlag).
  */
+/**
+ * Overleaf's loader `source` (in `file`), with the fallback to Overleaf's cache decided for each
+ * load. The loader reads canUseClsiCache, one flag for every load, when a request fails
+ * (pdf-caching-transport.ts:150), also for a request of an older load that fails after a newer
+ * load has begun. Here it asks canUseClsiCacheFor with the load's own file
+ * (src/common/caching-flags.ts). Throws when Overleaf's text is not the expected one.
+ */
+function perLoadCacheFlag(source, file) {
+    const changes = [
+        ["  canUseClsiCache,\n} from './pdf-caching-flags'", "  canUseClsiCacheFor,\n} from './pdf-caching-flags'"],
+        ['        if (!canUseClsiCache) return false', '        if (!canUseClsiCacheFor(this.pdfFile)) return false'],
+    ];
+    for (const [from, to] of changes) {
+        if (source.split(from).length !== 2) {
+            throw new Error(`${file}: the build expects ${JSON.stringify(from)} once, to decide the fallback to Overleaf's cache for each load (perLoadCacheFlag)`);
+        }
+        source = source.replace(from, to);
+    }
+    return source;
+}
+
 export const standIns = {
     name: 'overleaf-stand-ins',
     setup(build) {
@@ -47,11 +72,17 @@ export const standIns = {
             const shim = shims[overleafModule(args)];
             return shim ? { path: path.join(src, 'shims', shim) } : undefined;
         });
-        // Overleaf's caching flags, with the cache's fallback set for each load (common/caching-flags.ts)
+        // Overleaf's caching flags, with the cache's fallback decided for each load (common/caching-flags.ts)
         build.onResolve({ filter: /pdf-caching-flags$/ }, (args) => {
             const fromTransport = path.basename(args.importer) === 'pdf-caching-transport.ts';
             return fromTransport && overleafModule(args) === 'features/pdf-preview/util/pdf-caching-flags'
                 ? { path: path.join(src, 'common', 'caching-flags.ts') }
+                : undefined;
+        });
+        build.onLoad({ filter: /pdf-caching-transport\.ts$/ }, (args) => {
+            const relative = path.relative(overleafJs, args.path).split(path.sep).join('/');
+            return relative === 'features/pdf-preview/util/pdf-caching-transport.ts'
+                ? { contents: perLoadCacheFlag(readFileSync(args.path, 'utf8'), args.path), loader: 'ts' }
                 : undefined;
         });
         build.onResolve({ filter: /pdf-caching-transport$/ }, (args) => {

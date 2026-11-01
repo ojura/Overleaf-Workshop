@@ -295,6 +295,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     private handlersRegistered: boolean = false;
     /** this window's last compile on Overleaf, whatever its status */
     lastCompile?: CompileRecord;
+    /** whether Overleaf has this window's compile request and has not answered it yet (compile) */
+    waitingForCompile = false;
     /** the build in use, which may be another client's (src/core/projectBuilds.ts) */
     readonly builds: ProjectBuilds;
     /** stops the listeners of `builds` and of the compiles' ends */
@@ -1891,11 +1893,24 @@ export class VirtualFileSystem extends vscode.Disposable {
      * first, as by "Recompile from scratch": this user's build is deleted, and the compile
      * sends every file and runs every pass. The main document is `rootDocId`, else the
      * project's. A compile that makes a build with output.pdf replaces the build in use.
+     *
+     * Answers true for a build, false for a compile without one, undefined when nothing changed
+     * since the last compile, and 'stopped' when `stop` was aborted before the request was sent:
+     * then the request is not sent, nor the clearing of the output when the stop came before it,
+     * and the project counts as changed as before. While Overleaf has the request and has not
+     * answered it, waitingForCompile is true.
      */
-    async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string, fromScratch:boolean=false) {
+    async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string, fromScratch:boolean=false, stop?: AbortSignal): Promise<boolean | 'stopped' | undefined> {
         if (force || fromScratch || (this.root && this.isDirty)) {
+            const wasDirty = this.isDirty;
             this.isDirty = false;
+            /** whether the user stopped the compile, which then sends nothing */
+            const stopped = () => {
+                if (stop?.aborted && wasDirty) { this.isDirty = true; }
+                return stop?.aborted === true;
+            };
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+            if (stopped()) { return 'stopped'; }
             if (fromScratch) {
                 const cleared = await this.api.deleteAuxFiles(identity, this.projectId);
                 if (cleared.type!=='success') {
@@ -1914,8 +1929,16 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             }
             const request: CompileRequest = {rootDocId: resolvedRootDocId, rootResourcePath, draft, stopOnFirstError};
+            // the last moment before the request: no wait between this check and the request
+            if (stopped()) { return 'stopped'; }
             const startedAt = Date.now();
-            const res = await this.api.compile(identity, this.projectId, request, {auto: true});
+            this.waitingForCompile = true;
+            let res: Awaited<ReturnType<BaseAPI['compile']>>;
+            try {
+                res = await this.api.compile(identity, this.projectId, request, {auto: true});
+            } finally {
+                this.waitingForCompile = false;
+            }
             this.lastCompile = {
                 response: res.type==='success' ? res.compile : undefined,
                 message: res.type==='success' ? undefined : res.message,
@@ -2005,12 +2028,14 @@ export class VirtualFileSystem extends vscode.Disposable {
     /**
      * Save the build in use's output.pdf to `target`: from the download domain in ranges
      * (downloadInRanges). When the compile server has deleted the build and the download domain
-     * answers 404, from Overleaf's cache of compile outputs, in ranges on the download domain as
-     * the viewers' loader reads it (cachedDownloadDomainUrl), when the build names the cache's
-     * shard and its editor; else whole from the web server, which passes the request on to the
-     * cache (BaseAPI.webRouteOf), and ends a response after 10 minutes, too short for 885 MB on a
-     * link slower than about 1.5 MB/s. Each way the PDF goes to a part file first, which takes
-     * `target`'s name when it is complete.
+     * answers 404, from Overleaf's cache of compile outputs:
+     * - in ranges on the download domain, as the viewers' loader reads it
+     *   (cachedDownloadDomainUrl), when the build names the cache's shard and its editor;
+     * - else, or when that address answers 404 too, whole from the web server (BaseAPI.webRouteOf),
+     *   which asks the cache's instances to search for the build whichever shard keeps it
+     *   (ClsiCacheHandler.getOutputFile) and ends a response after 10 minutes, too short for
+     *   885 MB on a link slower than about 1.5 MB/s.
+     * Each way the PDF goes to a part file first, which takes `target`'s name when it is complete.
      */
     async savePdf(target: string, signal: AbortSignal, onProgress: (received: number) => void) {
         const build = this.builds.build;
@@ -2020,20 +2045,26 @@ export class VirtualFileSystem extends vscode.Disposable {
             throw new Error(vscode.l10n.t('There is no build of the PDF to save.'));
         }
         const size = output.file.size;
-        try {
-            await downloadInRanges(output.url, target, size, signal, { onProgress });
-        } catch (error) {
-            if (signal.aborted || (error as DownloadError).status!==404) { throw error; }
-            if (output.clsiCacheShard && build.editorId) {
-                const cached = cachedDownloadDomainUrl(output.downloadDomain, file.url, build.id, build.editorId, output.clsiCacheShard, build.record.response.compileGroup);
-                await downloadInRanges(cached, target, size, signal, { onProgress });
-                return;
+        /** Read `url` in ranges: undefined when the PDF is saved, the error when the server answers 404, which leaves the next way. */
+        const inRanges = async (url: string): Promise<DownloadError | undefined> => {
+            try {
+                await downloadInRanges(url, target, size, signal, { onProgress });
+                return undefined;
+            } catch (error) {
+                if (signal.aborted || (error as DownloadError).status!==404) { throw error; }
+                return error as DownloadError;
             }
-            const route = BaseAPI.webRouteOf(file, build.record.response, build.editorId);
-            if (route===undefined) { throw error; }
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-            await downloadWhole(this.api.serverUrl + route, target, { headers: {'Cookie': identity.cookies}, size, signal, onProgress });
+        };
+        let gone = await inRanges(output.url);
+        if (!gone) { return; }
+        if (output.clsiCacheShard && build.editorId) {
+            gone = await inRanges(cachedDownloadDomainUrl(output.downloadDomain, file.url, build.id, build.editorId, output.clsiCacheShard, build.record.response.compileGroup));
+            if (!gone) { return; }
         }
+        const route = BaseAPI.webRouteOf(file, build.record.response, build.editorId);
+        if (route===undefined) { throw gone; }
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        await downloadWhole(this.api.serverUrl + route, target, { headers: {'Cookie': identity.cookies}, size, signal, onProgress });
     }
 
     /** Download output file `file` of compile `response`: this window's, with any status, or one from Overleaf's cache. */
