@@ -139,6 +139,29 @@ describe('landing a commit through the replica\'s window (the land request)', fu
         assert.strictEqual(git(folder, 'status', '--porcelain'), '', 'git status');
     });
 
+    it('pushes a commit that moves a document into another folder, and leaves the folder that still holds another', async () => {
+        const t = await start();
+        const head = git(folder, 'rev-parse', 'HEAD');
+        const second = commitInClone(folder, clone, head, { 'chapters/two.tex': 'two v1\n' }, 'A second chapter');
+        const added: any = await t.requestReplica(folder, { op: 'land', commit: second }, 10000);
+        assert.strictEqual(added.ok, true, `the landing of the second chapter: ${JSON.stringify(added)}`);
+        // what the replica asks of Overleaf's side of the project from now on
+        const calls: string[] = [];
+        const rel = (uri: Uri) => uri.path.slice(t.vfs.origin.path.length);
+        for (const op of ['rename', 'createFile', 'writeFile', 'remove', 'mkdir'] as const) {
+            const real = t.vfs[op] as (...args: any[]) => Promise<any>;
+            (t.vfs as any)[op] = (...args: any[]) => {
+                calls.push(`${op} ${rel(args[0])}${op === 'rename' ? ` ${rel(args[1])}` : ''}`);
+                return real(...args);
+            };
+        }
+        const commit = commitInClone(folder, clone, second, { 'chapters/one.tex': null, 'parts/one.tex': 'one v1\n' }, 'Move the first chapter into parts');
+        const answer: any = await t.requestReplica(folder, { op: 'land', commit }, 10000);
+        assert.strictEqual(answer.ok, true, `the landing of the move: ${JSON.stringify(answer)}`);
+        assert.deepStrictEqual(calls, ['mkdir /parts', 'rename /chapters/one.tex /parts/one.tex'], 'what the replica asked of Overleaf');
+        assert.deepStrictEqual([t.w.remote.get('/chapters/two.tex'), t.w.remote.get('/parts/one.tex')], ['two v1\n', 'one v1\n'], 'the documents on Overleaf');
+    });
+
     it('pushes a commit that adds several files in new folders', async () => {
         const t = await start();
         const head = git(folder, 'rev-parse', 'HEAD');
