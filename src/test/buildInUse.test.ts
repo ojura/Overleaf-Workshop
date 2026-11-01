@@ -317,6 +317,7 @@ const { VirtualFileSystem, PdfDocument, PdfViewEditorProvider, CompileManager, L
     ...require('../compile/compileManager'),
     ...require('../scm/localReplicaSCM'),
     ...require('../api/base'),
+    ...require('../api/downloadDomain'),
     ...require('../core/pdfViewerPages'),
     ...require('../core/viewerProtocol'),
 }), {

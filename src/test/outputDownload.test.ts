@@ -1,7 +1,8 @@
 import * as assert from 'assert';
 import * as http from 'http';
 import { AddressInfo } from 'net';
-import { BaseAPI, downloadDomainUrl } from '../api/base';
+import { BaseAPI } from '../api/base';
+import { downloadDomainUrl } from '../api/downloadDomain';
 
 /** A server that plays both the download domain (paths below /cdn) and the web frontend. */
 async function serve(answer: (req: http.IncomingMessage) => { status: number, body?: string }) {

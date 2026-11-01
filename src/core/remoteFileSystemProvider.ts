@@ -2,7 +2,8 @@
 import * as vscode from 'vscode';
 import { inspect } from 'util';
 import * as DiffMatchPatch from 'diff-match-patch';
-import { BaseAPI, cachedDownloadDomainUrl, COMPILERS, CompileRequest, CompileResponseSchema, downloadDomainUrl, EDITOR_ID, MemberEntity, ProjectSettingsSchema } from '../api/base';
+import { BaseAPI, COMPILERS, CompileRequest, CompileResponseSchema, EDITOR_ID, MemberEntity, ProjectSettingsSchema } from '../api/base';
+import { cachedDownloadDomainUrl, downloadDomainUrl } from '../api/downloadDomain';
 import type { CompileRecord } from '../compile/outputFiles';
 import { windowCompileSettings } from '../compile/compileSettings';
 import { cachedBuild, CompileSettings, CompileStart, fromCache, isCompileStart, LatestAnswer, ownBuild, ProjectBuilds } from './projectBuilds';
