@@ -224,6 +224,8 @@ const world = {
     statusTexts: [] as string[],
     /** the lines of the window's log of the builds (VirtualFileSystem's log channel) */
     buildsLog: [] as string[],
+    /** the waiters for the compile status's next text */
+    statusWaiters: [] as Array<(text: string) => void>,
     /** the project's file system, for 'remoteFileSystem.prefetch' and the workspace's reads */
     vfs: undefined as any,
     overleaf: undefined as unknown as Overleaf,
@@ -273,7 +275,7 @@ const vscodeStandIn = strict('vscode', {
             let text = '';
             return {
                 get text() { return text; },
-                set text(value: string) { text = value; world.statusTexts.push(value); },
+                set text(value: string) { text = value; world.statusTexts.push(value); world.statusWaiters.splice(0).forEach(waiter => waiter(value)); },
                 tooltip: undefined, command: undefined, backgroundColor: undefined, show() {}, hide() {}, dispose() {},
             };
         },
@@ -409,6 +411,7 @@ describe('the build in use, from Overleaf to the window', function () {
         world.settings = {};
         world.activeEditor = undefined;
         world.statusTexts = [];
+        world.statusWaiters = [];
         world.buildsLog = [];
         scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'build-in-use-'));
         vfs = new VirtualFileSystem({ globalState: { get: (_key: string, value: unknown) => value } }, projectUri, () => {});
@@ -1010,6 +1013,46 @@ describe('the build in use, from Overleaf to the window', function () {
 
         it('typesets the project\'s main document from a document whose \\documentclass is commented out', async () => {
             assert.deepStrictEqual(await compileFrom('notes.tex', '% \\documentclass{article}\nSome notes.\n'), [['doc-main', 'main.tex']]);
+        });
+    });
+
+    describe('the compile status', () => {
+        /** The status's next text, or the error that kept it from showing. */
+        function nextStatus(): { outcome: Promise<string>, restore: () => void } {
+            const error = console.error;
+            const outcome = new Promise<string>(resolve => {
+                world.statusWaiters.push(text => resolve(`status: ${text}`));
+                console.error = (...args: unknown[]) => resolve(`error: ${args.map(String).join(' ')}`);
+            });
+            return { outcome, restore: () => { console.error = error; } };
+        }
+
+        it('waits for the project to be joined, as at a window\'s load, and then shows the compiler and the main document', async () => {
+            // the window has not joined the project yet: the join ends when the test says so
+            vfs.root = undefined;
+            let join!: () => void;
+            const joined = new Promise<void>(resolve => { join = resolve; });
+            vfs.init = async () => { await joined; vfs.root = tree(); return vfs.root; };
+            const { outcome, restore } = nextStatus();
+            try {
+                await manager.update('compiling', projectUri);
+                join();
+                assert.strictEqual(await outcome, 'status: pdfLaTeX $(sync~spin)');
+            } finally { restore(); }
+        });
+
+        it('waits for the project to be joined again after a lost connection', async () => {
+            // connectionLost clears the tree until the reconnect has joined the project again
+            vfs.root = undefined;
+            let reconnect!: () => void;
+            const reconnected = new Promise<void>(resolve => { reconnect = resolve; });
+            vfs.init = async () => { await reconnected; vfs.root = tree(); return vfs.root; };
+            const { outcome, restore } = nextStatus();
+            try {
+                await manager.update('success', projectUri);
+                reconnect();
+                assert.strictEqual(await outcome, 'status: pdfLaTeX');
+            } finally { restore(); }
         });
     });
 

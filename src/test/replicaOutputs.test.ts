@@ -111,6 +111,8 @@ describe('CompileManager and a local replica\'s logs', () => {
         const called = new Promise<void>(resolve => { compileCalled = resolve; });
         const vfs: any = {
             projectId: 'p1',
+            // the project is joined (VirtualFileSystem.init answers with its tree)
+            init: async () => ({}),
             getRootDocName: () => '/main.tex',
             getCompiler: () => ({ name: 'pdfLaTeX' }),
             _resolveUri: async () => ({ fileType: 'folder', fileId: 'root' }),

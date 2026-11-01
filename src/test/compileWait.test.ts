@@ -62,6 +62,8 @@ describe('CompileManager with a local replica', () => {
         LocalReplicaSCMProvider.readSettings = async () => (replica ? { uri: 'overleaf-workshop://server/project?user=u&project=p', enableCompileNPreview: true } : undefined);
         LocalReplicaSCMProvider.flushAll = async () => { events.push('flush started'); await flush(); events.push('flush done'); };
         const vfs = {
+            // the project is joined (VirtualFileSystem.init answers with its tree)
+            init: async () => ({}),
             getRootDocName: () => '/main.tex',
             getCompiler: () => ({ name: 'pdfLaTeX' }),
             _resolveUri: async () => ({ fileType: 'folder', fileId: 'root' }),
