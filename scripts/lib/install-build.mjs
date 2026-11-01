@@ -15,6 +15,11 @@
 // with mode 644.
 // vsce also rewrites the relative links in README.md and CHANGELOG.md; the install copies those two
 // files as they are.
+//
+// Of what the extension folder held, the install keeps only the installer's metadata, which the
+// IDE wrote when it installed the extension from its gallery: __metadata in package.json, and the
+// file .vsixmanifest. Antigravity's code does not read .vsixmanifest; it stays because it is the
+// installer's, as __metadata is, and keeping it costs nothing.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -148,12 +153,13 @@ export async function buildCheckout(checkout) {
         const { pdfjsRelease } = await import(pathToFileURL(viewerBuild).href);
         const chatView = path.join(checkout, 'views', 'chat-view');
         const needed = [
-            { folder: pdfjsRelease, how: 'npm run download-pdfjs' },
-            ...DOWNLOADS.map(({ folder, how }) => ({ folder: path.join(checkout, folder), how })),
-            { folder: path.join(chatView, 'node_modules'), how: 'npm ci in views/chat-view' },
+            { folder: pdfjsRelease, how: `npm run download-pdfjs, in ${checkout}` },
+            ...DOWNLOADS.map(({ folder, how }) => ({ folder: path.join(checkout, folder), how: `${how}, in ${checkout}` })),
+            { folder: path.join(chatView, 'node_modules'), how: `npm ci, in ${chatView}` },
         ];
-        for (const { folder, how } of needed) {
-            if (!fs.statSync(folder, { throwIfNoEntry: false })?.isDirectory()) { throw new Error(`${folder} is missing: run ${how} in ${checkout}`); }
+        const missing = needed.filter(({ folder }) => !fs.statSync(folder, { throwIfNoEntry: false })?.isDirectory());
+        if (missing.length) {
+            throw new Error(`the checkout lacks ${missing.length === 1 ? 'a folder' : 'folders'} that the build needs:\n${missing.map(({ folder, how }) => `  ${folder}: run ${how}`).join('\n')}`);
         }
         const chatViewBuild = JSON.parse(fs.readFileSync(path.join(chatView, 'package.json'), 'utf8')).scripts?.build;
         if (chatViewBuild !== CHAT_VIEW_BUILD) {
@@ -261,7 +267,7 @@ async function stagePackage(build, ext, installed) {
     }
 }
 
-/** rsync's options that make an extension folder an exact copy of a staged package, keeping the installer's .vsixmanifest. */
+/** rsync's options that make an extension folder an exact copy of a staged package, keeping the installer's .vsixmanifest (see the top). */
 const EXACT_COPY = ['-a', '--checksum', '--delete', '--filter', 'protect /.vsixmanifest'];
 
 /**
