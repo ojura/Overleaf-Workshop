@@ -572,8 +572,6 @@ describe('local replica: what it deletes and what it never syncs', function () {
             const stateFile = path.join(t.folder, '.git', 'overleaf', 'state.json');
             fs.mkdirSync(path.dirname(stateFile), { recursive: true });
             fs.writeFileSync(stateFile, '{not json');
-            const errors: string[] = [];
-            t.mock.window.showErrorMessage = async (message: string) => { errors.push(message); return undefined; };
             const { LocalReplicaSCMProvider } = load(t.mock);
             const scm = new LocalReplicaSCMProvider(t.vfs, Uri.file(t.folder));
             const started = await cleanup.start(scm).then(() => 'started', (error: Error) => error);
@@ -582,7 +580,8 @@ describe('local replica: what it deletes and what it never syncs', function () {
             assert.strictEqual(read(stateFile), '{not json');
             assert.strictEqual(t.w.remote.get('/main.tex'), 'v1\n');
             assert.ok(started instanceof Error, 'the replica does not start');
-            assert.ok(errors.some(message => message.includes('state.json')), JSON.stringify(errors));
+            // the collection's notice of the failed start shows the error
+            assert.ok(started.message.includes(stateFile), started.message);
         });
     });
 });

@@ -152,7 +152,8 @@ export class SCMCollectionProvider extends vscode.Disposable {
         } catch (error) {
             // permanently remove failed scm
             // this.vfs.setProjectSCMPersist(scm.scmKey, undefined);
-            vscode.window.showErrorMessage( vscode.l10n.t('"{scm}" creation failed.', {scm:scmProto.label}) );
+            // the one notice of the failure, with its reason; the source control's log has the details
+            vscode.window.showErrorMessage(vscode.l10n.t('"{scm}" creation failed: {error}', {scm: scmProto.label, error: String((error as Error)?.message ?? error)}));
             return undefined;
         }
     }
@@ -191,11 +192,10 @@ export class SCMCollectionProvider extends vscode.Disposable {
         .then((uri) => scmProto.validateBaseUri(uri as string || '', this.vfs.projectName))
         .then(async (baseUri) => {
             if (baseUri) {
+                // createSCM tells a failure, with its reason
                 const scm = await this.createSCM(scmProto, baseUri, true);
                 if (scm) {
                     vscode.window.showInformationMessage( vscode.l10n.t('"{scm}" created: {uri}.', {scm:scmProto.label, uri: decodeURI(scm.baseUri.toString()) }) );
-                } else {
-                    vscode.window.showErrorMessage( vscode.l10n.t('"{scm}" creation failed.', {scm:scmProto.label}) );
                 }
             }
         });
