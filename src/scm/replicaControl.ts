@@ -57,10 +57,19 @@ function prepareSocketFolder(socket: string): string | undefined {
 }
 
 /**
- * Whether a socket is at `socket`, which a server listens on. An operating system that shortens a
- * path longer than a socket's may be does so without an error, and the socket is then at the
- * shortened path: nothing is at the one asked for (measured with Node 22 on Linux, where
- * server.address() still answers the path asked for).
+ * The bytes of sun_path, the field of a Unix socket's address that holds the socket's path and its
+ * terminating NUL: 108 on Linux (unix(7): "On Linux, sun_path is 108 bytes in size"), 104 on
+ * macOS (xnu's bsd/sys/un.h: `char sun_path[104]`). unix(7) asks, for portability, that the path
+ * and its NUL fit: Linux also binds a path of 108 bytes without the NUL, which Node's clients
+ * reach but Python's refuse. On other systems, socketIsThere finds a path that Node shortened.
+ */
+const SUN_PATH_BYTES: Partial<Record<NodeJS.Platform, number>> = { linux: 108, darwin: 104 };
+
+/**
+ * Whether a socket is at `socket`, which a server listens on. Node shortens a socket path that is
+ * too long, without an error: it makes the socket at the first bytes of the path that fit into
+ * sun_path, and stat of the path asked for fails with ENOENT (measured with Node 22 on Linux,
+ * where server.address() still answers the path asked for).
  */
 function socketIsThere(socket: string): boolean {
     try {
@@ -81,6 +90,14 @@ function answers(socket: string): Promise<boolean> {
 }
 
 export class ReplicaControlServer {
+    /**
+     * The bytes of sun_path on this system (SUN_PATH_BYTES). start() refuses a socket path that
+     * does not fit, with its NUL, before Node would make the socket at a shortened path, which can
+     * be in a folder that other users can enter. Undefined on a system that SUN_PATH_BYTES does not
+     * list: there, the check after listen finds the shortening, and the close removes that socket.
+     */
+    static sunPathBytes: number | undefined = SUN_PATH_BYTES[process.platform];
+
     private server?: net.Server;
     private socket?: string;
     private disposed = false;
@@ -102,6 +119,10 @@ export class ReplicaControlServer {
     async start(): Promise<string | undefined> {
         const socket = replicaSocketPath(this.folder);
         try {
+            const field = ReplicaControlServer.sunPathBytes;
+            if (field !== undefined && Buffer.byteLength(socket) >= field) {
+                return this.cannotListen(`the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), is longer than the ${field - 1} bytes that a socket's path may have on this system: set XDG_RUNTIME_DIR to a folder with a shorter path`);
+            }
             const problem = prepareSocketFolder(socket);
             if (problem) {
                 this.log(`Tools cannot ask for a sync: ${problem}.`);
@@ -122,10 +143,7 @@ export class ReplicaControlServer {
                 if (!error && process.platform !== 'win32' && !socketIsThere(socket)) {
                     // closing the server removes the socket at the shortened path
                     await new Promise<void>(resolve => server.close(() => resolve()));
-                    const reason = `the operating system shortened the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), as a socket's path must be shorter: set XDG_RUNTIME_DIR to a folder with a shorter path`;
-                    this.log(`Tools cannot ask for a sync: ${reason}.`);
-                    this.writePointer({ error: reason });
-                    return undefined;
+                    return this.cannotListen(`Node shortened the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), as a socket's path must be shorter: set XDG_RUNTIME_DIR to a folder with a shorter path`);
                 }
                 if (!error) {
                     server.unref(); // the window lives on its own; a tool's process need not wait for the socket
@@ -145,6 +163,13 @@ export class ReplicaControlServer {
         } catch (error: any) {
             this.log(`Tools cannot ask for a sync: ${error?.message ?? error}.`);
         }
+        return undefined;
+    }
+
+    /** Say in the log, and in the pointer file for the tools, why this window cannot listen. */
+    private cannotListen(reason: string): undefined {
+        this.log(`Tools cannot ask for a sync: ${reason}.`);
+        this.writePointer({ error: reason });
         return undefined;
     }
 
