@@ -1,7 +1,8 @@
 // Tests the PDF viewer of the hidden IDE (ide.mjs) on a local PDF, which the viewer reads whole.
 // It opens the PDF with Quick Open, as a user would, and checks that the page in view and the
-// last page are drawn, that pdf.js 5.1.91 runs in its own worker, that Ctrl+= zooms the PDF by 1.25
-// and leaves the window's zoom alone (its devicePixelRatio), that Ctrl+P in the viewer opens Quick Open, and, in the
+// last page are drawn, that pdf.js runs in its own worker in the version that package.json pins
+// (PDFJS_VERSION in viewers.mjs), that Ctrl+= zooms the PDF by 1.25 and leaves the window's zoom
+// alone (its devicePixelRatio), that Ctrl+P in the viewer opens Quick Open, and, in the
 // pdfjs viewer, that Ctrl+F finds text without asking first. With --theme-book the PDF is the page
 // of theme_book.py, and the colors of the dark theme are checked too.
 //   node ide/drive-local-pdf.mjs --pdf <path> [--pages N] [--find TEXT] [--theme-book]
@@ -16,7 +17,8 @@ import { scriptOptions } from '../../lib/options.mjs';
 import { bookFacts } from '../common.mjs';
 import {
     areaColorsFunction, associatePdfs, checker, clickAt, instance, INSTANCE_OPTION, openWithQuickOpen, pressKey, rafOnTimer, settings,
-    showPageFunction, sleep, switchThemeFunction, themeColors, THEMES_SETTING, viewerOf, viewerPage, windowDraws, workbench,
+    PDFJS_VERSION, showPageFunction, sleep, switchThemeFunction, themeColors, THEMES_SETTING, viewerOf, viewerPage, windowDraws,
+    workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, pdf: 'value', pages: 'number', find: 'value', 'theme-book': 'flag' });
@@ -70,7 +72,7 @@ try {
     const V = viewerOf(engine);
     const E = view.E;
     const info = await E(`(() => { const v = ${V}; const lib = globalThis.pdfjsLib; return { pages: v.pagesCount, version: lib.version, workerPort: lib.GlobalWorkerOptions.workerPort instanceof Worker, fakeWorker: typeof globalThis.pdfjsWorker !== 'undefined' }; })()`);
-    check('pdf.js 5.1.91 in its own worker', info.version === '5.1.91' && info.workerPort && !info.fakeWorker, JSON.stringify(info));
+    check(`pdf.js ${PDFJS_VERSION} in its own worker`, info.version === PDFJS_VERSION && info.workerPort && !info.fakeWorker, JSON.stringify(info));
     check(`${expectedPages} pages`, info.pages === expectedPages, `${info.pages}`);
 
     if (expectedPages > 1) {

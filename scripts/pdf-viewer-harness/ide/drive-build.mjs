@@ -1,7 +1,8 @@
 // Tests the PDF viewer of the hidden IDE (ide.mjs) on the project's build, output.pdf, which the
 // viewer loads in ranges through the extension host. It closes and reopens the output.pdf tab, so
 // that the viewer the setting picks opens it, attaches to the viewer page as soon as the webview
-// exists, and checks that the page in view is drawn, that pdf.js 5.1.91 runs in its own worker,
+// exists, and checks that the page in view is drawn, that pdf.js runs in its own worker in the
+// version that package.json pins (PDFJS_VERSION in viewers.mjs),
 // that the build is loaded in ranges, and that jumps to page 200 and to the last page draw them.
 // With --theme-page N it also draws page N in the default and the dark theme and checks that
 // colored pixels of images keep their colors and the white background takes the theme's color;
@@ -13,8 +14,8 @@
 // Open output.pdf in the instance first, for example with Overleaf Workshop's View PDF command.
 import { scriptOptions } from '../../lib/options.mjs';
 import {
-    checker, instance, INSTANCE_OPTION, pagePixelsFunction, rafOnTimer, reopenTab, settings, showPageFunction, sleep, switchThemeFunction,
-    themeColors, THEMES_SETTING, viewerOf, viewerPage, windowDraws, workbench,
+    checker, instance, INSTANCE_OPTION, pagePixelsFunction, PDFJS_VERSION, rafOnTimer, reopenTab, settings, showPageFunction, sleep,
+    switchThemeFunction, themeColors, THEMES_SETTING, viewerOf, viewerPage, windowDraws, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, 'theme-page': 'number' });
@@ -43,7 +44,7 @@ try {
         return { pages: v.pagesCount, page: v.currentPageNumber, whole, version: lib.version, workerPort: lib.GlobalWorkerOptions.workerPort instanceof Worker, fakeWorker: typeof globalThis.pdfjsWorker !== 'undefined' };
     })()`);
     console.log('viewer:', JSON.stringify(info));
-    check('pdf.js 5.1.91 in its own worker', info.version === '5.1.91' && info.workerPort && !info.fakeWorker);
+    check(`pdf.js ${PDFJS_VERSION} in its own worker`, info.version === PDFJS_VERSION && info.workerPort && !info.fakeWorker);
     check('the build is loaded in ranges', info.whole === 'only parts are loaded');
 
     /** show page n and wait until it is drawn: the time that took, or the error */

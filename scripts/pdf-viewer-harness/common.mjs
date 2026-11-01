@@ -16,7 +16,7 @@ import { launchChrome } from './cdp.mjs';
 export const here = path.dirname(fileURLToPath(import.meta.url));
 /** the checkout */
 export const repo = path.resolve(here, '../..');
-/** the checkout's PDF viewers: views/pdf-viewer/ with dist/ (npm run build-pdf-viewer) and vendor/pdfjs-5.1.91/ (npm run download-pdfjs) */
+/** the checkout's PDF viewers: views/pdf-viewer/ with dist/ (npm run build-pdf-viewer) and pdf.js's release (npm run download-pdfjs, in pdfjsReleaseFolder of scripts/viewer-protocol.mjs) */
 export const defaultExt = path.join(repo, 'views/pdf-viewer');
 export const work = path.resolve(process.env.PDF_VIEWER_HARNESS_WORK ?? path.join(os.tmpdir(), 'pdf-viewer-harness'));
 fs.mkdirSync(work, { recursive: true });

@@ -7,7 +7,10 @@
 // as an image's.
 import fs from 'node:fs';
 import path from 'node:path';
-import { protocol, repo } from '../viewer-protocol.mjs';
+import { pdfjsVersion, protocol, repo } from '../viewer-protocol.mjs';
+
+/** The version of pdf.js that package.json pins and the viewers run (scripts/viewer-protocol.mjs). */
+export const PDFJS_VERSION = pdfjsVersion;
 
 /** The viewers, by their names in the setting overleaf-workshop.pdfViewer.engine (src/core/viewerProtocol.ts). */
 export const ENGINES = [...protocol.PDF_VIEWER_ENGINES];

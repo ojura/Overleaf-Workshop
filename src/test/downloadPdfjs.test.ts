@@ -39,10 +39,14 @@ describe('the download of pdf.js (scripts/download-pdfjs.mjs)', function () {
         assert.ok(packageText.includes(`"pdfjs-dist": "${version}"`));
     });
 
-    it('the settings\' texts and the viewer harness\'s server do not name the pdf.js version', () => {
-        for (const file of ['package.nls.json', path.join('scripts', 'pdf-viewer-harness', 'server.mjs')]) {
-            assert.ok(!fs.readFileSync(path.join(repo, file), 'utf8').includes(version), `${file} names ${version}`);
-        }
+    it('the settings\' texts and the viewer harness\'s files do not name the pdf.js version', () => {
+        const harness = path.join('scripts', 'pdf-viewer-harness');
+        const inHarness = (fs.readdirSync(path.join(repo, harness), { recursive: true }) as string[])
+            .map(name => path.join(harness, name))
+            .filter(file => fs.statSync(path.join(repo, file)).isFile());
+        assert.ok(inHarness.includes(path.join(harness, 'ide', 'drive-build.mjs')), inHarness.join(', '));
+        const naming = ['package.nls.json', ...inHarness].filter(file => fs.readFileSync(path.join(repo, file), 'utf8').includes(version));
+        assert.deepStrictEqual(naming, []);
     });
 
     it('refuses a release without its patch, before it downloads anything', () => {

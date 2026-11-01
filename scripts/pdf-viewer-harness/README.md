@@ -72,7 +72,8 @@ page's pixels with those that count as an image's.
 - `python3`, which writes the test books.
 - The checkout's dev dependencies (`npm install`), for esbuild.
 - The viewer pages: `npm run build-pdf-viewer` writes `views/pdf-viewer/dist/`, and
-  `npm run download-pdfjs` writes `views/pdf-viewer/vendor/pdfjs-5.1.91/` with the patch applied.
+  `npm run download-pdfjs` writes pdf.js's release, the version that package.json pins as
+  `pdfjs-dist`, to `views/pdf-viewer/vendor/pdfjs-<version>/` with the patch applied.
 
 ## Running
 
