@@ -185,3 +185,49 @@ describe('the local replica\'s writes into its folder', () => {
         assert.deepStrictEqual(synced(replica), ['main.tex'], 'the temporary file is removed');
     });
 });
+
+// The local replica moves a file that Overleaf renamed with localFolderFs.moveFile: never over a
+// file at the new path, and with the file's own size and time where the file system allows.
+describe('the local replica\'s moves in its folder', () => {
+    let dir: string;
+    beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-local-move-')); });
+    afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+    /** A file written an hour ago, and the path it moves to, in a folder that does not exist yet. */
+    function file() {
+        const from = path.join(dir, 'a.tex'), to = path.join(dir, 'parts', 'b.tex');
+        fs.writeFileSync(from, 'text\n');
+        const hourAgo = new Date(Date.now() - 3_600_000);
+        fs.utimesSync(from, hourAgo, hourAgo);
+        return { from, to, before: fs.statSync(from) };
+    }
+
+    it('keep the file itself, with its time, and refuse a path that holds a file', async () => {
+        const { from, to, before } = file();
+        await localFs.moveFile(from, to);
+        const after = fs.statSync(to);
+        assert.deepStrictEqual([fs.existsSync(from), after.ino, after.mtimeMs], [false, before.ino, before.mtimeMs], 'the old path, and the moved file');
+        fs.writeFileSync(from, 'another\n');
+        await assert.rejects(localFs.moveFile(from, to), (error: any) => error?.code === 'EEXIST', 'a move onto the file');
+        assert.deepStrictEqual([fs.readFileSync(to, 'utf8'), fs.readFileSync(from, 'utf8')], ['text\n', 'another\n'], 'both files after the refused move');
+    });
+
+    it('copy where the file system has no hard links: the copy has a new time, and a path that holds a file is refused', async () => {
+        // a file system without hard links, as a FAT one, answers EPERM to a link
+        const promises = require('fs/promises');
+        const link = promises.link;
+        promises.link = async () => { throw Object.assign(new Error('EPERM: operation not permitted, link'), { code: 'EPERM' }); };
+        try {
+            const { from, to, before } = file();
+            await localFs.moveFile(from, to);
+            const after = fs.statSync(to);
+            assert.deepStrictEqual([fs.existsSync(from), fs.readFileSync(to, 'utf8')], [false, 'text\n'], 'the old path, and the copy');
+            assert.ok(after.ino !== before.ino && after.mtimeMs > before.mtimeMs, 'the copy is a new file, with a new time');
+            fs.writeFileSync(from, 'another\n');
+            await assert.rejects(localFs.moveFile(from, to), (error: any) => error?.code === 'EEXIST', 'a move onto the file');
+            assert.deepStrictEqual([fs.readFileSync(to, 'utf8'), fs.readFileSync(from, 'utf8')], ['text\n', 'another\n'], 'both files after the refused move');
+        } finally {
+            promises.link = link;
+        }
+    });
+});

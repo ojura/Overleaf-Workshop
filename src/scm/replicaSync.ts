@@ -373,6 +373,8 @@ export class ReplicaSync {
 
     private state: SavedState = {version: 1, entries: {}, untracked: []};
     private loaded?: Promise<void>;
+    /** whether `loaded` has settled with the saved state in place */
+    private stateLoaded = false;
     /** paths that existed only locally when a sync without saved state started */
     private firstRunLocalOnly = new Set<string>();
     private slots = new Map<string, Slot>();
@@ -520,6 +522,7 @@ export class ReplicaSync {
             if (Object.values(this.state.changes ?? {}).includes('import')) {
                 await this.recordNow();
             }
+            this.stateLoaded = true;
         })();
         return this.loaded;
     }
@@ -657,18 +660,22 @@ export class ReplicaSync {
         this.remoteMoves.set(from, to);
         const mode: Mode = {...collecting(emptySummary(), {live: true}), remoteMove: true};
         try {
-            await this.load();
-            // while the sync waits, the full sync after the wait finds both paths as they are then
-            if (await this.mayAct()!==undefined) { return; }
+            // Once the saved state is loaded, the moves are queued before the first wait, so that
+            // the work scheduled after the event in the queues of these paths comes after them.
+            if (!this.stateLoaded) { await this.load(); }
             const prefix = `${from}/`;
             const moves: [string, string][] = this.state.entries[from]!==undefined ? [[from, to]]
                 : Object.keys(this.state.entries).filter(p => p.startsWith(prefix)).map(p => [p, `${to}${p.slice(from.length)}`]);
-            // each file moves, and then both of its paths sync as they are, in the queues of both
-            await Promise.all(moves.map(([a, b]) => this.inQueues([a, b], async () => {
+            // each file moves, after the check that the sync may act on the folder (`mayAct`), and
+            // then both of its paths sync as they are, in the queues of both
+            const moving = moves.map(([a, b]) => this.inQueues([a, b], async () => {
+                if (await this.mayAct()!==undefined) { return; }
                 await this.reported(a, mode, () => this.moveLocally(a, b, mode.summary));
                 await this.reconcileReported(a, mode);
                 if (this.tracked(b)) { await this.reconcileReported(b, mode); }
-            })));
+            }));
+            const failed = (await Promise.allSettled(moving)).find((result): result is PromiseRejectedResult => result.status==='rejected');
+            if (failed) { throw failed.reason; }
             // Overleaf's other files in a moved folder
             const moved = new Set(moves.map(([, b]) => b));
             await this.scheduleAll((await this.expand(to, true)).filter(p => !moved.has(p) && this.tracked(p)), mode);
@@ -700,7 +707,9 @@ export class ReplicaSync {
         if (localFrom===undefined || localFrom==='folder' || localTo!==undefined || remoteFrom!==undefined || remoteTo?.kind!==entry.kind) { return; }
         if (await this.isUnmerged(from) || await this.isUnmerged(to)) { return; }
         await this.local.move(from, to);
-        // the file is the same: its size and time still tell whether it holds the base
+        // The entry keeps the size and time the file had when it held the base. A hard link keeps
+        // the file itself, with them, so they still tell whether it holds the base; a copy, where
+        // the file system has no hard links, has a new time, and the next reconcile compares its content.
         delete this.state.entries[from];
         this.state.entries[to] = entry;
         this.noteChange(from, 'remote');
@@ -971,7 +980,7 @@ export class ReplicaSync {
         if (this.stopped || open.size===0) { return; }
         try {
             const deletable = await this.deletable();
-            const renamed = await this.renamedPaths(mode);
+            const renamed = await this.renamedPaths();
             for (const where of ['local', 'remote'] as const) {
                 if (requested[where].length===0 || this.stopped) { continue; }
                 const side = where==='local' ? 'in the local folder' : 'on Overleaf';
@@ -1032,11 +1041,13 @@ export class ReplicaSync {
 
     /**
      * The synced paths that a rename takes away, not a deletion: the old paths that git pairs with
-     * a new local file (`localRenames`), and the paths of renames made on Overleaf that
-     * `remoteRenamed` is applying. They are neither counted nor deleted.
+     * a new local file, and the paths of renames made on Overleaf that `remoteRenamed` is
+     * applying. They are neither counted nor deleted. The pairing is made when the deletion step
+     * decides (`currentRenames`), not taken from the batch: a pair whose rename Overleaf refused,
+     * and whose new file is uploaded since, is not a pair any more, and its old path is a deletion.
      */
-    private async renamedPaths(mode: Mode): Promise<Set<string>> {
-        const paths = new Set((await this.localRenames(mode)).values());
+    private async renamedPaths(): Promise<Set<string>> {
+        const paths = new Set((await this.currentRenames()).values());
         for (const path of Object.keys(this.state.entries)) {
             if (this.movingOnOverleaf(path)) { paths.add(path); }
         }
@@ -1377,29 +1388,31 @@ export class ReplicaSync {
         }
     }
 
+    /** git's pairing of the local renames and moves (`currentRenames`), which the reconciles of one mode ask for once. */
+    private localRenames(mode: Mode): Promise<Map<string, string>> {
+        mode.renames ??= this.currentRenames();
+        return mode.renames;
+    }
+
     /**
      * git's pairing of the synced files gone from the folder with the new files in it, by new
-     * path (the store's `renames`; docs/replica-workflows.md, "Renames and moves"). The reconciles
-     * of one mode ask for it once. A pairing reads the folder, the saved state and Overleaf after
-     * the requests it answers: a request joins the next pairing while that one has not started,
-     * and otherwise starts one after the running one. The requests that come while a pairing runs
-     * share the next one, so a burst of events, such as for the files of a moved folder, lists the
-     * folder and runs git about twice, not once per file.
+     * path (the store's `renames`; docs/replica-workflows.md, "Renames and moves"), as the folder,
+     * the saved state and Overleaf are after this request: a request joins the next pairing
+     * while that one has not started, and otherwise starts one after the running one. The
+     * requests that come while a pairing runs share the next one, so a burst of events, such as
+     * for the files of a moved folder, lists the folder and runs git about twice, not once per file.
      */
-    private localRenames(mode: Mode): Promise<Map<string, string>> {
-        if (mode.renames===undefined) {
-            let run = this.renamesWaiting;
-            if (run===undefined) {
-                run = this.renamesTail.then(() => {
-                    this.renamesWaiting = undefined;
-                    return this.pairRenames();
-                });
-                this.renamesWaiting = run;
-                this.renamesTail = run.catch(() => {});
-            }
-            mode.renames = run;
+    private currentRenames(): Promise<Map<string, string>> {
+        let run = this.renamesWaiting;
+        if (run===undefined) {
+            run = this.renamesTail.then(() => {
+                this.renamesWaiting = undefined;
+                return this.pairRenames();
+            });
+            this.renamesWaiting = run;
+            this.renamesTail = run.catch(() => {});
         }
-        return mode.renames;
+        return run;
     }
 
     /**
