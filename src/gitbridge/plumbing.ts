@@ -223,3 +223,36 @@ export function changedPaths(a: FlatTree, b: FlatTree): string[] {
     const paths = new Set([...a.keys(), ...b.keys()]);
     return [...paths].filter(p => a.get(p)?.oid !== b.get(p)?.oid).sort();
 }
+
+/**
+ * The git command that compares two trees (or commits), followed by the two: each path that
+ * changed, with a removed path and an added path paired as one file renamed or moved when git's
+ * rename detection pairs them (-M, at git's default similarity of 50%), as git log, git show
+ * and git log --follow show the history. This is the one rule for which paths are a rename:
+ * the local replica's sync renames on Overleaf what it pairs (src/scm/replicaGit.ts,
+ * GitReplicaStore.renames), and push-check lists a push's renames with it (src/sandbox/gitPush.ts).
+ * Only removed and added paths are paired: a path that both trees hold is a change of that path.
+ */
+export const TREE_DIFF_ARGS = ['diff-tree', '-r', '-z', '--name-status', '-M'];
+
+/** One path in git's answer to TREE_DIFF_ARGS; for a rename or move, `oldPath` is where the file was. */
+export interface TreeChange { status: 'A' | 'M' | 'D' | 'T' | 'R'; path: string; oldPath?: string; }
+
+/** git's answer to TREE_DIFF_ARGS, read: "<status>\0<path>\0", and "R<score>\0<old path>\0<new path>\0" for a rename. */
+export function parseTreeDiff(out: string): TreeChange[] {
+    const fields = out.split('\0');
+    const changes: TreeChange[] = [];
+    for (let i = 0; i < fields.length && fields[i] !== '';) {
+        const status = fields[i++];
+        const kind = status[0];
+        if (kind === 'R') {
+            const oldPath = fields[i++], path = fields[i++];
+            changes.push({ status: 'R', path, oldPath });
+        } else if (kind === 'A' || kind === 'M' || kind === 'D' || kind === 'T') {
+            changes.push({ status: kind, path: fields[i++] });
+        } else {
+            throw new Error(`git ${TREE_DIFF_ARGS[0]} reported an unexpected status ${status} for ${fields[i]}`);
+        }
+    }
+    return changes;
+}

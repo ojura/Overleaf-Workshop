@@ -19,8 +19,9 @@ import type { ProjectRanges } from './ranges';
  * 2. Overleaf must hold the parent file for file (a check of its own, as the editor reads the
  *    project: documents by their text, binary files by the hash Overleaf reports);
  * 3. the window pushes the commit (the land request of src/scm/replicaControl.ts): it
- *    fast-forwards the branch, uploads what the commit changed, renames as renames, and waits
- *    for Overleaf's acknowledgements;
+ *    fast-forwards the branch, uploads what the commit changed, with the renames and moves
+ *    that git shows as renames on Overleaf (the sync's rule: docs/replica-workflows.md,
+ *    "Renames and moves"), and waits for Overleaf's acknowledgements;
  * 4. Overleaf must hold the commit, checked as in 2, for up to three minutes;
  * 5. one compile of the project, repeated while Overleaf answers that another compile of the
  *    user runs; its logs are kept in <git dir>/overleaf/compiles/<commit>, and checked for
