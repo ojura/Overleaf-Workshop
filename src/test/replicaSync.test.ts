@@ -155,11 +155,17 @@ class FakeUI implements ReplicaUI {
     waits: (string | undefined)[] = [];
     onWaiting?: () => void;
     waiting(reason: string | undefined) { this.waits.push(reason); this.onWaiting?.(); }
+    /** the notices about a lock that stays; `onLockStays` is told of each */
+    lockNotices: string[] = [];
+    onLockStays?: () => void;
+    lockStays(reason: string) { this.lockNotices.push(reason); this.onLockStays?.(); }
 }
 
 /** A store with git's index lock held by another program while `lock` is set, and git's state of the work tree. */
 class LockedStore extends FakeStore {
     lock?: string = '/replica/.git/index.lock';
+    /** when git last wrote the lock, ms since the epoch */
+    lockTime = Date.now();
     tree?: WorkTreeState;
     private watches: (() => void)[] = [];
     /** resolves when the sync starts to wait for the lock */
@@ -173,6 +179,7 @@ class LockedStore extends FakeStore {
     op?: string;
     async operation() { return this.op; }
     async foreignIndexLock() { return this.lock; }
+    async indexLockTime() { return this.lock===undefined ? undefined : this.lockTime; }
     indexLockReleased() {
         let resolve!: () => void;
         const released = new Promise<void>(r => { resolve = r; });
@@ -512,16 +519,17 @@ describe('ReplicaSync', () => {
             assert.deepStrictEqual(t.remote.calls, []);
         });
 
-        it('tells the user about a lock that stays, naming the file, and goes on once it is gone', async () => {
+        it('reports a lock that stays to the user, naming the file, in the status bar and in a notice, and goes on once it is gone', async () => {
             const saved = ReplicaSync.staleLockMs;
             ReplicaSync.staleLockMs = 0;
             try {
                 const t = await locked();
-                const told = new Promise<void>(resolve => { t.ui.onWaiting = resolve; });
+                const noticed = new Promise<void>(resolve => { t.ui.onLockStays = resolve; });
                 t.local.set('/a.tex', 'an edit\n');
                 const step = t.sync.localChanged('/a.tex');
-                await told;
+                await noticed;
                 assert.ok(String(t.ui.waits[0]).includes('/replica/.git/index.lock'), String(t.ui.waits[0]));
+                assert.deepStrictEqual(t.ui.lockNotices, [t.ui.waits[0]], 'one notice, with the status bar\'s text');
                 assert.ok(String(t.sync.waitingFor).includes('/replica/.git/index.lock'), 'the status says why the sync waits');
                 t.store.release();
                 await step;
@@ -530,6 +538,24 @@ describe('ReplicaSync', () => {
             } finally {
                 ReplicaSync.staleLockMs = saved;
             }
+        });
+
+        it('takes a lock that git wrote staleLockMs ago or earlier for one that stays at once, in the window and in a tool\'s answer', async () => {
+            const t = await locked();
+            // a git that ended a minute ago without removing its lock
+            t.store.lockTime = Date.now() - 60_000;
+            const noticed = new Promise<void>(resolve => { t.ui.onLockStays = resolve; });
+            t.local.set('/a.tex', 'an edit\n');
+            const step = t.sync.localChanged('/a.tex');
+            await noticed;
+            const [notice] = t.ui.lockNotices;
+            assert.ok(notice.includes('/replica/.git/index.lock'), notice);
+            const summary = await t.sync.flush(true, { by: 'tool' });
+            assert.strictEqual(summary.waitingFor, notice, 'a tool is told what the window says');
+            assert.deepStrictEqual(t.remote.calls, [], 'nothing goes to Overleaf while the lock is there');
+            t.store.release();
+            await step;
+            assert.strictEqual(t.remote.docs.get('/a.tex'), 'an edit\n');
         });
     });
 
