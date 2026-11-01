@@ -814,6 +814,20 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
         });
 
+        it('says what came when the compile command\'s answer is a value that JSON cannot write', async () => {
+            const answer: any = { kind: 'busy', size: BigInt(1) };
+            answer.self = answer;
+            world.commands.set('overleaf-workshop.compileManager.compile', async () => answer);
+            overleaf.latest = { status: 404 };
+            const unavailable = new Promise<any>(resolve => {
+                const stop = vfs.builds.onDidChangeStatus((status: any) => {
+                    if (status.state === 'compile-unavailable') { stop(); resolve(status); }
+                });
+            });
+            await open();
+            assert.match((await unavailable).detail, /^the compile command answered .*kind: 'busy'.*, not how the compile started$/);
+        });
+
         it('says why it does not compile when the compile command\'s answer has lost the end of the running compile', async () => {
             // 'busy' as a copy of the answer would bring it, without its promise
             world.commands.set('overleaf-workshop.compileManager.compile', async () => ({ kind: 'busy', ended: {} }));
@@ -824,7 +838,7 @@ describe('the build in use, from Overleaf to the window', function () {
                 });
             });
             const { panel } = await open();
-            const detail = 'the compile command answered {"kind":"busy","ended":{}}, not how the compile started';
+            const detail = 'the compile command answered { kind: \'busy\', ended: {} }, not how the compile started';
             assert.deepStrictEqual(await unavailable, { state: 'compile-unavailable', detail });
             assert.deepStrictEqual(panel.posted.filter(message => message.type === 'buildState').pop(), { type: 'buildState', state: 'compile-unavailable', detail });
         });

@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
+import { inspect } from 'util';
 import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, cachedDownloadDomainUrl, COMPILERS, CompileRequest, CompileResponseSchema, downloadDomainUrl, EDITOR_ID, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import type { CompileRecord } from '../compile/outputFiles';
@@ -1479,7 +1480,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     async compileProject(): Promise<CompileStart> {
         const start = await vscode.commands.executeCommand<unknown>(`${ROOT_NAME}.compileManager.compile`, this.pathToUri());
         if (!isCompileStart(start)) {
-            throw new Error(`the compile command answered ${JSON.stringify(start)}, not how the compile started`);
+            // inspect describes any value, a circular one or a BigInt too
+            throw new Error(`the compile command answered ${inspect(start, { depth: 2, breakLength: Infinity })}, not how the compile started`);
         }
         return start;
     }
