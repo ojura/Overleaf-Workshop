@@ -4,8 +4,9 @@ import * as os from 'os';
 import * as path from 'path';
 import {
     ControlRequest, NoReplicaWindowError, POINTER_FILE, ReplicaControlServer, replicaSocketPath, ReplicaTimeoutError,
-    requestReplica,
+    ReplicaUnreachableError, requestReplica,
 } from '../scm/replicaControl';
+import { Cleanup, SHORT_TEMP } from './replicaTestWorld';
 
 describe('the control socket of a local replica', () => {
     let runtime: string;
@@ -16,7 +17,7 @@ describe('the control socket of a local replica', () => {
 
     beforeEach(() => {
         savedRuntime = process.env.XDG_RUNTIME_DIR;
-        runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-runtime-'));
+        runtime = fs.mkdtempSync(path.join(SHORT_TEMP, 'owr-'));
         fs.chmodSync(runtime, 0o700);
         process.env.XDG_RUNTIME_DIR = runtime;
         folder = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-replica-'));
@@ -49,6 +50,39 @@ describe('the control socket of a local replica', () => {
         assert.deepStrictEqual(await requestReplica(folder, { op: 'status' }, 5000), { ok: true, connected: true });
         assert.deepStrictEqual(await requestReplica(folder, { op: 'sync' }, 5000), { ok: true, summary: { uploaded: ['/main.tex'] } });
         assert.deepStrictEqual(asked, ['status', 'sync']);
+    });
+
+    it('says plainly when the operating system shortens the socket\'s path, and tools say so too', async function () {
+        if (process.platform === 'win32') { this.skip(); }
+        // a runtime folder whose path makes the socket's path longer than a socket's may be
+        const long = path.join(runtime, 'a-runtime-folder-with-a-long-name-'.repeat(3));
+        fs.mkdirSync(long, { mode: 0o700 });
+        process.env.XDG_RUNTIME_DIR = long;
+        const socket = replicaSocketPath(folder);
+        assert.strictEqual(await serve(async () => ({ ok: true })).start(), undefined, 'the server does not listen');
+        const reason = `the operating system shortened the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), as a socket's path must be shorter: set XDG_RUNTIME_DIR to a folder with a shorter path`;
+        assert.deepStrictEqual(logs, [`Tools cannot ask for a sync: ${reason}.`], 'the log');
+        await assert.rejects(requestReplica(folder, { op: 'status' }, 5000),
+            (error: Error) => error instanceof ReplicaUnreachableError && error.message === `the IDE window that keeps ${folder} in sync cannot answer tools: ${reason}`,
+            'a tool\'s answer');
+        assert.deepStrictEqual(fs.readdirSync(path.join(long, 'overleaf-workshop')), [], 'the socket folder after the server closed');
+    });
+
+    it('lets a test that waits for the server fail at once with the reason it cannot listen', async function () {
+        if (process.platform === 'win32') { this.skip(); }
+        const long = path.join(runtime, 'a-runtime-folder-with-a-long-name-'.repeat(3));
+        fs.mkdirSync(long, { mode: 0o700 });
+        process.env.XDG_RUNTIME_DIR = long;
+        // the replica's own folder, which a replica folder has before its control server starts
+        fs.mkdirSync(path.join(folder, '.overleaf'));
+        const cleanup = new Cleanup();
+        try {
+            const listens = cleanup.controlListens(folder);
+            await serve(async () => ({ ok: true })).start();
+            await assert.rejects(listens, /^Error: the replica's control server cannot listen: the operating system shortened the path of the control socket/);
+        } finally {
+            await cleanup.undo();
+        }
     });
 
     it('keeps the socket and its folder to this user', async () => {

@@ -223,8 +223,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
         return vscode.window.showQuickPick(quickPickItems, {
             ignoreFocusOut: true,
             title: vscode.l10n.t('Project Source Control Management'),
-        }).then(async (select) => {
-            if (select===undefined) { return; }
+        }).then(select => select===undefined ? undefined : this.runAction(scmItem.scm, select.label, async () => {
             switch (select.label) {
                 case 'Enable':
                 case 'Disable':
@@ -253,19 +252,29 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     vscode.window.showWarningMessage(`"${(scmItem.scm.constructor as any).label}" ${persist.enabled?'enabled':'disabled'}: ${baseUri}.`);
                     break;
                 case 'Remove':
-                    vscode.window.showWarningMessage(`${vscode.l10n.t('Remove')} ${baseUri}?`, 'Yes', 'No')
-                    .then((select) => {
-                        if (select==='Yes') {
-                            this.removeSCM(scmItem);
-                        }
-                    });
+                    if (await vscode.window.showWarningMessage(`${vscode.l10n.t('Remove')} ${baseUri}?`, 'Yes', 'No')==='Yes') {
+                        this.removeSCM(scmItem);
+                    }
                     break;
                 default:
-                    const settingItem = settingItems.find(item => item.label===select.label);
-                    settingItem?.callback();
+                    await settingItems.find(item => item.label===select.label)?.callback();
                     break;
             }
-        });
+        }));
+    }
+
+    /**
+     * Run `action`, chosen for `scm` in a quick pick. Nobody waits for the promise of a quick
+     * pick's handler, so a failure is shown here, in a notice with its reason, as a failed start
+     * is (`start`); without it, the user's choice would end without a word.
+     */
+    private async runAction(scm: BaseSCM, action: string, run: () => Promise<unknown>): Promise<void> {
+        try {
+            await run();
+        } catch (error) {
+            const label = (scm.constructor as {label?: string}).label;
+            vscode.window.showErrorMessage(vscode.l10n.t('"{scm}": {action} failed: {error}', {scm: label, action, error: String((error as Error)?.message ?? error)}));
+        }
     }
 
     showSCMConfiguration() {

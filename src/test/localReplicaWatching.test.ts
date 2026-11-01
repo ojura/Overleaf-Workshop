@@ -2,7 +2,6 @@
 import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
-import { POINTER_FILE } from '../scm/replicaControl';
 import { Cleanup, Uri, load, until, wait, world } from './replicaTestWorld';
 
 describe('a local replica that watches its folder itself', () => {
@@ -19,7 +18,7 @@ describe('a local replica that watches its folder itself', () => {
         const scm = new LocalReplicaSCMProvider(t.vfs, Uri.file(folder));
         await cleanup.start(scm);
         await scm.syncNow(); // the first sync downloads main.tex, and its state is recorded
-        await cleanup.fileAppears(path.join(folder, POINTER_FILE)); // the control socket listens
+        await cleanup.controlListens(folder);
         t.w.remoteWrites.length = 0;
         return { ...t, scm, requestReplica };
     }

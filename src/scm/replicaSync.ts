@@ -306,6 +306,13 @@ class SyncWaitsError extends Error {
     constructor(readonly reason: string) { super(`the sync waits: ${reason}`); }
 }
 
+/**
+ * A reconcile found right before a write that git held its index lock, or was in the middle of
+ * an operation, and the sync may act again once that is over (`beforeWrite`). git may have
+ * written the file since the reconcile read it, so the reconcile reads both sides again (`reported`).
+ */
+class StaleReadError extends Error {}
+
 class Semaphore {
     private waiting: (() => void)[] = [];
     constructor(private available: number) {}
@@ -350,6 +357,13 @@ interface Mode {
 /** A mode that collects deletions. */
 function collecting(summary: SyncSummary, options: Partial<Pick<Mode, 'live' | 'tool' | 'approved'>> = {}): Mode {
     return {deletions: 'collect', collected: {local: [], remote: []}, summary, ...options};
+}
+
+/** The folder's files and Overleaf's, listed once, and the synced paths that are in the folder (`presentLocally`). */
+interface Listing {
+    local: Map<string, LocalStat>,
+    remote: Map<string, RemoteEntry>,
+    present: Set<string>,
 }
 
 interface Slot {
@@ -1012,33 +1026,49 @@ export class ReplicaSync {
     /**
      * Right before a reconcile writes to either side, or trashes or moves a file. A step asks
      * mayAct when it starts; a git operation, or another program's index lock, that comes during
-     * the step is found here, and the reconcile then leaves its path (SyncWaitsError) to the full
-     * sync after the wait. When neither is there, the check is the existence of their files.
+     * the step is found here. While the sync waits, the reconcile leaves its path (SyncWaitsError)
+     * to the full sync after the wait. When the lock is gone, or the operation is over, by the
+     * time mayAct answers, git may have written the file since the reconcile read it, and the
+     * reconcile reads both sides again (StaleReadError). When neither is there, the check is the
+     * existence of their files.
      */
     private async beforeWrite(): Promise<void> {
         const [operation, lock] = await Promise.all([this.store.operation?.(), this.store.foreignIndexLock?.()]);
         if (operation===undefined && lock===undefined) { return; }
         const reason = await this.mayAct();
         if (reason!==undefined) { throw new SyncWaitsError(reason); }
+        throw new StaleReadError(`${lock!==undefined ? `git held its index lock ${lock}` : `git was in the middle of ${operation}`} when the sync was about to write; it reads both sides again`);
     }
 
     /**
      * Run `work` on `path`; a failure goes into the summary and the log. Answers why the work
-     * stopped to wait for the sync (`SyncWaitsError`), undefined when it ran or failed.
+     * stopped to wait for the sync (`SyncWaitsError`), undefined when it ran or failed. Work that
+     * found git's lock or operation right before a write, over by then (`StaleReadError`), runs
+     * again from its reads. Each attempt after the first comes after a lock or an operation of
+     * git's that has ended, so the work runs again only as often as git's commands came during it.
      */
     private async reported(path: string, mode: Mode, work: () => Promise<void>): Promise<string | undefined> {
-        try {
-            await work();
-        } catch (error) {
-            if (error instanceof SyncWaitsError) {
-                // not a failure: the full sync after the wait takes the path in
-                mode.summary.waitingFor ??= error.reason;
-                return error.reason;
+        for (;;) {
+            try {
+                await work();
+                return undefined;
+            } catch (error) {
+                if (error instanceof StaleReadError) {
+                    // Every write of the work comes after a check, so what it decided before is not
+                    // carried out; only the copy that keepAside keeps before its download's check stays.
+                    this.ui.log(`${path}: ${error.message}`);
+                    continue;
+                }
+                if (error instanceof SyncWaitsError) {
+                    // not a failure: the full sync after the wait takes the path in
+                    mode.summary.waitingFor ??= error.reason;
+                    return error.reason;
+                }
+                mode.summary.failed.push({path, error: errorText(error)});
+                this.ui.log(`${path}: sync failed: ${errorText(error)}`);
+                return undefined;
             }
-            mode.summary.failed.push({path, error: errorText(error)});
-            this.ui.log(`${path}: sync failed: ${errorText(error)}`);
         }
-        return undefined;
     }
 
     /**
@@ -1089,8 +1119,10 @@ export class ReplicaSync {
         const open = new Set([...requested.local, ...requested.remote]);
         if (this.stopped || open.size===0) { return; }
         try {
-            const deletable = await this.deletable();
-            const renamed = await this.renamedPaths();
+            // one listing, for the count and for the pairing
+            const listing = await this.listing();
+            const deletable = this.deletable(listing);
+            const renamed = await this.renamedPaths(listing);
             for (const where of ['local', 'remote'] as const) {
                 if (requested[where].length===0 || this.stopped) { continue; }
                 const side = where==='local' ? 'in the local folder' : 'on Overleaf';
@@ -1152,35 +1184,45 @@ export class ReplicaSync {
     /**
      * The synced paths that a rename takes away, not a deletion: the old paths that git pairs with
      * a new local file, and the paths of renames made on Overleaf that `remoteRenamed` is
-     * applying. They are neither counted nor deleted. The pairing is made when the deletion step
-     * decides (`currentRenames`), not taken from the batch: a pair whose rename Overleaf refused,
-     * and whose new file is uploaded since, is not a pair any more, and its old path is a deletion.
+     * applying. They are neither counted nor deleted. The pairing is made from the listing that
+     * the deletion step takes when it decides, not taken from the batch: a pair whose rename
+     * Overleaf refused, and whose new file is uploaded since, is not a pair any more, and its old
+     * path is a deletion.
      */
-    private async renamedPaths(): Promise<Set<string>> {
-        const paths = new Set((await this.currentRenames()).values());
+    private async renamedPaths(listing: Listing): Promise<Set<string>> {
+        const paths = new Set((await this.pairRenamesIn(listing.local, listing.present, async () => listing.remote)).values());
         for (const path of Object.keys(this.state.entries)) {
             if (this.movingOnOverleaf(path)) { paths.add(path); }
         }
         return paths;
     }
 
+    /** The folder's files and Overleaf's now, listed once: what a deletion step counts and pairs. */
+    private async listing(): Promise<Listing> {
+        const [local, remote] = await Promise.all([this.local.list(), this.remote.list()]);
+        return {local, remote, present: await this.presentLocally(local)};
+    }
+
     /**
-     * The synced files that a deletion on each side would remove now: there, and missing on the
-     * other side. A synced file that the local listing lacks is looked up with stat, as the
-     * reconcile looks it up: the listing does not walk symbolically linked folders, while stat
+     * The synced paths that are in the folder: in its listing `localFiles`, or found with stat, as
+     * the reconcile finds them: the listing does not walk symbolically linked folders, while stat
      * follows links, so a file in a linked folder is there for both.
      */
-    private async deletable(): Promise<{local: string[], remote: string[]}> {
-        const [localFiles, remoteFiles] = await Promise.all([this.local.list(), this.remote.list()]);
-        const paths = Object.keys(this.state.entries).filter(path => this.tracked(path));
-        const foundByStat = new Set<string>();
-        await Promise.all(paths.filter(path => !localFiles.has(path)).map(async path => {
+    private async presentLocally(localFiles: Map<string, LocalStat>): Promise<Set<string>> {
+        const present = new Set<string>();
+        await Promise.all(Object.keys(this.state.entries).filter(path => this.tracked(path)).map(async path => {
+            if (localFiles.has(path)) { present.add(path); return; }
             const stat = await this.local.stat(path);
-            if (stat!==undefined && stat!=='folder') { foundByStat.add(path); }
+            if (stat!==undefined && stat!=='folder') { present.add(path); }
         }));
+        return present;
+    }
+
+    /** The synced files that a deletion on each side would remove: there, and missing on the other side. */
+    private deletable(listing: Listing): {local: string[], remote: string[]} {
         const deletable = {local: [] as string[], remote: [] as string[]};
-        for (const path of paths) {
-            const local = localFiles.has(path) || foundByStat.has(path), remote = remoteFiles.has(path);
+        for (const path of Object.keys(this.state.entries).filter(path => this.tracked(path))) {
+            const local = listing.present.has(path), remote = listing.remote.has(path);
             if (local && !remote) { deletable.local.push(path); }
             if (remote && !local) { deletable.remote.push(path); }
         }
@@ -1538,18 +1580,30 @@ export class ReplicaSync {
      * uploads shows. Only the sync with uploads and a remote side that can rename applies renames.
      */
     private async pairRenames(): Promise<Map<string, string>> {
-        const none = new Map<string, string>();
-        if (!this.uploads || !this.remote.rename || !this.store.renames || Object.keys(this.state.entries).length===0) { return none; }
-        // Overleaf's tree is read only when the folder has both kinds of change
+        if (!this.pairsRenames()) { return new Map(); }
         const localFiles = await this.local.list();
-        const gone = Object.entries(this.state.entries).filter(([path, entry]) => !entry.conflict && this.tracked(path) && !localFiles.has(path));
+        return this.pairRenamesIn(localFiles, await this.presentLocally(localFiles), () => this.remote.list());
+    }
+
+    /** Whether this sync applies renames on Overleaf: with uploads, a remote side that renames, a store that pairs, and files synced. */
+    private pairsRenames(): boolean {
+        return this.uploads && this.remote.rename!==undefined && this.store.renames!==undefined && Object.keys(this.state.entries).length>0;
+    }
+
+    /** git's pairing of the local changes in the listing `localFiles` (see `pairRenames`); `present` is `presentLocally(localFiles)`. */
+    private async pairRenamesIn(localFiles: Map<string, LocalStat>, present: Set<string>,
+                                remoteFiles: () => Promise<Map<string, RemoteEntry>>): Promise<Map<string, string>> {
+        const none = new Map<string, string>();
+        if (!this.pairsRenames()) { return none; }
+        const gone = Object.entries(this.state.entries).filter(([path, entry]) => !entry.conflict && this.tracked(path) && !present.has(path));
         const fresh = [...localFiles.keys()].filter(path => this.state.entries[path]===undefined && this.tracked(path)
             && !this.state.untracked.includes(path) && !this.firstRunLocalOnly.has(path));
+        // Overleaf's tree is read only when the folder has both kinds of change
         if (gone.length===0 || fresh.length===0) { return none; }
-        const remoteFiles = await this.remote.list();
-        const removed = new Map(gone.filter(([path, entry]) => remoteFiles.get(path)?.kind===entry.kind).map(([path, entry]) => [path, entry.base]));
-        const added = fresh.filter(path => !remoteFiles.has(path));
-        return removed.size>0 && added.length>0 ? await this.store.renames(removed, added) : none;
+        const remote = await remoteFiles();
+        const removed = new Map(gone.filter(([path, entry]) => remote.get(path)?.kind===entry.kind).map(([path, entry]) => [path, entry.base]));
+        const added = fresh.filter(path => !remote.has(path));
+        return removed.size>0 && added.length>0 ? await this.store.renames?.(removed, added) ?? none : none;
     }
 
     /**
