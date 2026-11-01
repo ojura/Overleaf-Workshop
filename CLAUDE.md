@@ -13,6 +13,13 @@ window) are in CLAUDE.local.md, which git leaves out.
   time.
 - The command-line tools run from the main checkout's out/. After a landing, build out/ again
   while no tool runs.
+- Set up a new checkout with `npm ci --ignore-scripts`, then `npm run postinstall` and
+  `npm ci --ignore-scripts --prefix views/chat-view`. `--ignore-scripts` keeps the dependencies'
+  install scripts from running, and it skips the project's own postinstall as well, which applies
+  the socket.io-client patch and downloads pdf.js's release and the LaTeX language files into
+  data/vendor. The chat view has packages of its own, which the release workflow installs in a
+  second step (.github/workflows/vsce-package.yml). `npm run compile` then builds the extension,
+  the PDF viewers and the chat view.
 - Build, test and lint:
   - `node node_modules/typescript/bin/tsc -p ./`
   - `node node_modules/.bin/mocha "out/test/**/*.test.js"`. The test files load the extension's
