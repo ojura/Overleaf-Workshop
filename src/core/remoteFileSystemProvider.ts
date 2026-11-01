@@ -372,6 +372,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             latest: () => this.latestBuild(),
             settings: () => this.compileSettings(),
             compile: () => this.compileProject(),
+            // the project's tree, with its main document, is there once the project is joined
+            joined: () => this.root !== undefined,
             log: (line) => logBuilds(`${this.projectName}: ${line}`),
         });
         this.buildListeners.push(
@@ -562,6 +564,9 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (!this.compileStarted) {
             this.compileStarted = true;
             void this.builds.opened();
+        } else {
+            // a check asked while the connection was lost runs now (ProjectBuilds.rejoined)
+            void this.builds.rejoined();
         }
         // documents may have changed on the server while disconnected: have them read again
         if (adopted.length > 0) {

@@ -971,6 +971,26 @@ describe('the build in use, from Overleaf to the window', function () {
             ]);
         });
 
+        it('lets a restored viewer\'s check wait for the join, and compiles nothing when Overleaf\'s latest compile is current', async () => {
+            // the window has not joined the project yet, as at its load, when output.pdf's viewer is restored
+            vfs.root = undefined;
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            const { panel } = await open();
+            assert.deepStrictEqual(overleaf.to('/project/p1/output/cached/output.overleaf.json'), []);
+            assert.deepStrictEqual(panel.posted.filter(message => message.type === 'buildState').pop(), { type: 'buildState', state: 'connecting' });
+            await vfs.joined(tree());
+            await vfs.builds.opened();
+            assert.strictEqual((await panel.first('load')).output.file.build, 'b-web');
+            assert.deepStrictEqual(overleaf.to('/project/p1/compile'), []);
+            assert.strictEqual(overleaf.to('/project/p1/output/cached/output.overleaf.json').length, 1);
+            assert.deepStrictEqual(world.buildsLog, [
+                'Book: check: waits until the window has joined the project, whose settings it needs',
+                'Book: opening: asks Overleaf for its latest compile',
+                `Book: check: Overleaf names build b-web of editor ${WEB_EDITOR}, compiled with main.tex, draft off, not stopping at the first error; the window takes it`,
+                'Book: opening: does not compile: it shows build b-web',
+            ]);
+        });
+
         it('compiles when the project changed after Overleaf\'s latest compile (410)', async () => {
             overleaf.latest = { status: 410 };
             overleaf.compiles.push(ownAnswer(overleaf, 'b-new'));

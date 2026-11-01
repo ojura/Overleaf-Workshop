@@ -1,7 +1,7 @@
 import * as assert from 'assert';
 import type { CompileResponseSchema } from '../api/base';
 import {
-    Build, BuildsHost, cachedBuild, CoalescedRuns, CompileSettings, CompileStart, LatestAnswer, ownBuild,
+    Build, BuildsHost, cachedBuild, CoalescedRuns, CompileSettings, CompileStart, LatestAnswer, NOT_JOINED, ownBuild,
     ProjectBuilds, sameSettings,
 } from '../core/projectBuilds';
 import type { BuildStatus } from '../core/viewerProtocol';
@@ -62,6 +62,8 @@ class Host implements BuildsHost {
     window: CompileSettings = MAIN;
     /** the lines of the log of the builds (BuildsHost.log) */
     lines: string[] = [];
+    /** whether the window has joined the project (BuildsHost.joined) */
+    joinedNow = true;
     /** the waiters for the next compile request */
     private readonly compileWaiters: Array<() => void> = [];
 
@@ -73,8 +75,10 @@ class Host implements BuildsHost {
         if (!answer) { throw new Error(`check ${this.checks} has no answer`); }
         return Promise.resolve(answer);
     }
-    settings() { return this.window; }
+    // before the join the window does not know its main document, as VirtualFileSystem.compileSettings
+    settings() { return this.joinedNow ? this.window : { ...this.window, rootResourcePath: null }; }
     log(line: string) { this.lines.push(line); }
+    joined() { return this.joinedNow; }
     async compile(): Promise<CompileStart> {
         this.compiles += 1;
         this.compileWaiters.splice(0).forEach(resolve => resolve());
@@ -626,6 +630,85 @@ describe('the build in use (ProjectBuilds)', () => {
             await builds.opened();
             assert.strictEqual(host.checks, 1);
             assert.strictEqual(host.compiles, 1);
+        });
+    });
+
+    describe('before the window has joined the project, whose settings it compiles with', () => {
+        it('lets a restored viewer\'s check wait for the join; the opening decides, takes the current build and compiles nothing', async () => {
+            const { host, builds } = setup();
+            host.joinedNow = false;
+            host.answers.push({ kind: 'build', build: fromCache('y') });
+            // the viewer of output.pdf, restored at the window's load, checks at once
+            const viewerCheck = builds.check();
+            assert.strictEqual(host.checks, 0);
+            assert.deepStrictEqual(builds.status, { state: 'connecting' });
+            host.joinedNow = true;
+            await builds.opened();
+            await viewerCheck;
+            assert.strictEqual(host.checks, 1);
+            assert.strictEqual(builds.build?.id, 'y');
+            assert.strictEqual(host.compiles, 0);
+        });
+
+        it('lets a check during a reconnect wait for the join, and then takes the current build without a compile', async () => {
+            const { host, builds } = setup();
+            builds.useOwn(own(at(0)));
+            builds.buildShown(at(0));
+            // the connection is lost: the reconnect takes the project's tree away
+            host.joinedNow = false;
+            host.answers.push({ kind: 'build', build: fromCache(at(10)) });
+            const gone = builds.reportGone(at(0));
+            assert.strictEqual(host.checks, 0);
+            host.joinedNow = true;
+            await builds.rejoined();
+            await gone;
+            assert.strictEqual(host.checks, 1);
+            assert.strictEqual(builds.build?.id, at(10));
+            assert.strictEqual(host.compiles, 0);
+        });
+
+        it('says over the PDF shown that a check waits for the join', () => {
+            const { host, builds } = setup();
+            builds.useOwn(own(at(0)));
+            host.joinedNow = false;
+            void builds.check();
+            assert.deepStrictEqual(builds.status, { state: 'unchecked', detail: NOT_JOINED });
+        });
+
+        it('compiles once, after the join, when Overleaf\'s latest compile is not current', async () => {
+            const { host, builds } = setup();
+            host.joinedNow = false;
+            host.answers.push({ kind: 'none', said: 'Overleaf answers 410: the project changed after its latest compile' });
+            const viewerCheck = builds.check();
+            host.joinedNow = true;
+            await builds.opened();
+            await viewerCheck;
+            assert.strictEqual(host.checks, 1);
+            assert.strictEqual(host.compiles, 1);
+        });
+
+        it('decides nothing on an answer that came after the window lost the project, and checks again after the join', async () => {
+            const { host, builds } = setup();
+            builds.useOwn(own(at(0)));
+            builds.buildShown(at(0));
+            const held = deferred<LatestAnswer>();
+            host.held.push(held);
+            const gone = builds.reportGone(at(0));
+            // the connection is lost while Overleaf answers: the window either says that it waits
+            // for the connection, or compiles on settings that it does not know
+            const waits = new Promise<string>(resolve => {
+                const stop = builds.onDidChangeStatus(status => { if (status.state === 'connecting') { stop(); resolve('waits'); } });
+            });
+            host.joinedNow = false;
+            held.resolve({ kind: 'build', build: fromCache(at(10)) });
+            assert.strictEqual(await Promise.race([waits, host.nextCompile().then(() => 'compiles')]), 'waits');
+            host.answers.push({ kind: 'build', build: fromCache(at(10)) });
+            host.joinedNow = true;
+            await builds.rejoined();
+            await gone;
+            assert.strictEqual(host.checks, 2);
+            assert.strictEqual(builds.build?.id, at(10));
+            assert.strictEqual(host.compiles, 0);
         });
     });
 

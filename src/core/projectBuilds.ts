@@ -154,6 +154,9 @@ export function isCompileStart(value: unknown): value is CompileStart {
 /** Why a successful compile made no build: its answer lists no output.pdf. */
 export const NO_OUTPUT_PDF = 'the compile made no output.pdf';
 
+/** Why a check waits: the window has not joined the project on Overleaf yet, or lost it (BuildsHost.joined). */
+export const NOT_JOINED = 'the window is not connected to the project on Overleaf yet';
+
 /**
  * How a compile in the window ended:
  *   success  Overleaf's status was 'success'
@@ -242,6 +245,11 @@ export interface BuildsHost {
     latest(): Promise<LatestAnswer>;
     settings(): CompileSettings;
     compile(): Promise<CompileStart>;
+    /**
+     * Whether the window has joined the project now: only then are the settings it compiles with
+     * known (settings), such as the main document, which comes with the project's tree
+     */
+    joined(): boolean;
     /** Log `line`: each check's answer and what the window did with it, so that it can be read later. */
     log(line: string): void;
 }
@@ -297,7 +305,12 @@ function notify<T>(listeners: Set<(value: T) => void>, value: T) {
  * user, until a build comes. With a build to show, an answer without a newer build keeps it.
  *
  * Checks run one at a time (CoalescedRuns): an event during a check asks for one more check after
- * it, so the answer is never older than the event.
+ * it, so the answer is never older than the event. A check waits while the window has not joined
+ * the project (BuildsHost.joined), as when a viewer that the window restores at its load asks, or
+ * during a reconnect: an answer is taken against the window's settings, and the main document
+ * comes with the project's tree. At the opening the waiting checks are the opening's own check;
+ * after a reconnect, one check runs (rejoined). An answer that comes after the window lost the
+ * project decides nothing and compiles nothing; the check waits for the next join.
  */
 export class ProjectBuilds {
     private current?: Build;
@@ -307,6 +320,11 @@ export class ProjectBuilds {
     private gone = false;
     /** whether a check is waiting for Overleaf's answer */
     private checking = false;
+    /**
+     * the checks asked while the window had not joined the project (BuildsHost.joined): the first
+     * check that runs after the join settles them (waitForJoin)
+     */
+    private waitingForJoin?: { promise: Promise<void>, resolve: () => void };
     /** why the last check failed; cleared by the next check that gets an answer */
     private checkError?: string;
     private compile: CompileState = { state: 'idle' };
@@ -360,9 +378,39 @@ export class ProjectBuilds {
         this.replace(build);
     }
 
-    /** Ask Overleaf for the latest compile; settles when a check that started after this call has ended. */
+    /**
+     * Ask Overleaf for the latest compile; settles when a check that started after this call has
+     * ended. While the window has not joined the project, the check waits for the join, since the
+     * window's settings, against which an answer is taken, are not known before it (waitForJoin).
+     */
     check(): Promise<void> {
-        return this.checks.request();
+        return this.host.joined() ? this.checks.request() : this.waitForJoin();
+    }
+
+    /**
+     * The window joined the project again after a lost connection, whose reconnect took the
+     * project's tree away: the checks asked meanwhile run now, as one check. At the first join, the
+     * opening's check is that check (opened).
+     */
+    rejoined(): Promise<void> {
+        return this.waitingForJoin ? this.checks.request() : Promise.resolve();
+    }
+
+    /**
+     * A check for when the window has joined the project: as at a window's load, when a restored
+     * viewer asks before the join, or during a reconnect. It settles with the first check that runs
+     * after the join (runCheck), and the viewers say meanwhile that the window waits for its
+     * connection to the project.
+     */
+    private waitForJoin(): Promise<void> {
+        if (!this.waitingForJoin) {
+            let resolve!: () => void;
+            const promise = new Promise<void>(r => { resolve = r; });
+            this.waitingForJoin = { promise, resolve };
+            this.host.log('check: waits until the window has joined the project, whose settings it needs');
+            this.update();
+        }
+        return this.waitingForJoin.promise;
     }
 
     /**
@@ -482,6 +530,29 @@ export class ProjectBuilds {
     }
 
     private async runCheck(): Promise<void> {
+        // this check is the one that the checks waiting for the join wait for
+        const waited = this.waitingForJoin;
+        this.waitingForJoin = undefined;
+        let lost = false;
+        try {
+            lost = (await this.checkOnce()) === 'lost';
+        } finally {
+            if (!lost) {
+                waited?.resolve();
+            }
+        }
+        if (lost) {
+            // the window lost the project before the answer: this check waits for the next join,
+            // and so do the checks that waited for it
+            const next = this.waitForJoin();
+            if (waited) {
+                void next.then(waited.resolve);
+            }
+        }
+    }
+
+    /** One check: 'lost' when the window lost the project before Overleaf answered, and the answer decided nothing. */
+    private async checkOnce(): Promise<'decided' | 'lost'> {
         this.checking = true;
         this.update();
         let answer: LatestAnswer;
@@ -491,11 +562,17 @@ export class ProjectBuilds {
             answer = { kind: 'failed', detail: errorMessage(error) };
         }
         this.checking = false;
+        if (!this.host.joined()) {
+            // the connection was lost while Overleaf answered: without the window's settings the
+            // answer decides nothing, and nothing compiles; a check after the join decides
+            this.host.log('check: the window lost the project before the answer came; the answer is left');
+            return 'lost';
+        }
         if (answer.kind === 'failed') {
             this.host.log(`check: failed: ${answer.detail}`);
             this.checkError = answer.detail;
             this.update();
-            return;
+            return 'decided';
         }
         this.checkError = undefined;
         if (answer.kind === 'none') {
@@ -507,12 +584,13 @@ export class ProjectBuilds {
                 + (refused === undefined ? 'the window takes it' : `the window does not take it: ${refused}`));
             if (refused === undefined) {
                 this.replace(build);
-                return;
+                return 'decided';
             }
         }
         // a compile that starts now is shown at once, without the state before it
         await this.compileIfNeeded();
         this.update();
+        return 'decided';
     }
 
     /**
@@ -655,7 +733,11 @@ export class ProjectBuilds {
 
     private derive(): BuildStatus {
         if (this.hasBuildToShow()) {
-            // the PDF shown stays valid: a failed check only says that it may not be the latest
+            // the PDF shown stays valid: a check that waits for the join, or a failed check, only
+            // says that it may not be the latest
+            if (this.waitingForJoin) {
+                return { state: 'unchecked', detail: NOT_JOINED };
+            }
             return this.checkError !== undefined ? { state: 'unchecked', detail: this.checkError } : { state: 'ready' };
         }
         if (this.compile.state === 'running') {
@@ -663,6 +745,9 @@ export class ProjectBuilds {
         }
         if (this.compile.state === 'failed') {
             return this.compile.status;
+        }
+        if (this.waitingForJoin) {
+            return { state: 'connecting' };
         }
         if (this.checking) {
             return { state: 'checking' };
