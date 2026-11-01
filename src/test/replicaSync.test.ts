@@ -567,6 +567,49 @@ describe('ReplicaSync', () => {
             }
         });
 
+        it('answers a tool\'s request that records with the lock\'s text when the lock comes in the middle of its step and stays', async () => {
+            const saved = ReplicaSync.toolLockWaitMs;
+            ReplicaSync.toolLockWaitMs = 0;
+            try {
+                const t = await locked();
+                // a store that records, as the git store's commit of Overleaf's state
+                let records = 0;
+                t.store.record = async () => { records += 1; return {}; };
+                t.local.set('/a.tex', 'an edit\n');
+                lockDuringRead(t);
+                const summary = await t.sync.flush(true, { record: true, by: 'tool' });
+                assert.ok(String(summary.waitingFor).includes('/replica/.git/index.lock'), summary.waitingFor);
+                assert.strictEqual(t.remote.docs.get('/a.tex'), text, 'Overleaf keeps its text');
+                assert.strictEqual(records, 0, 'the record waits too');
+                t.store.release();
+            } finally {
+                ReplicaSync.toolLockWaitMs = saved;
+            }
+        });
+
+        it('lets the checks of one tool\'s request wait for the lock up to toolLockWaitMs together: the record waits only for what the write\'s check left', async () => {
+            const saved = ReplicaSync.toolLockWaitMs;
+            ReplicaSync.toolLockWaitMs = 50;
+            try {
+                const t = await locked();
+                t.store.record = async () => ({});
+                t.local.set('/a.tex', 'an edit\n');
+                lockDuringRead(t);
+                // how long each check of the request waits for the lock (the sync's own wait)
+                const sync = t.sync as any;
+                const goesWithin = sync.indexLockGoesWithin.bind(sync);
+                const waits: number[] = [];
+                sync.indexLockGoesWithin = (file: string, ms: number) => { waits.push(ms); return goesWithin(file, ms); };
+                const summary = await t.sync.flush(true, { record: true, by: 'tool' });
+                assert.ok(String(summary.waitingFor).includes('/replica/.git/index.lock'), summary.waitingFor);
+                assert.strictEqual(waits.length, 2, 'the write\'s check and the record\'s');
+                assert.ok(waits[1] < waits[0], `the record waits for what is left: ${JSON.stringify(waits)}`);
+                t.store.release();
+            } finally {
+                ReplicaSync.toolLockWaitMs = saved;
+            }
+        });
+
         it('does not ask the window about the commit that a checkout leaves when a tool\'s request meets the checkout\'s lock in the middle of its step', async () => {
             const t = await locked();
             let asked = 0;

@@ -221,6 +221,15 @@ export interface ReplicaUI {
     lockStays?(reason: string, gone: Promise<void>): void,
 }
 
+/**
+ * A tool's request, a sync or a landing, across all of its checks (`ReplicaSync.mayAct`): it waits
+ * for another program's git index lock for up to `ReplicaSync.toolLockWaitMs` in total.
+ */
+export interface ToolRequest {
+    /** when the request's wait for the lock ends: set when its first wait starts */
+    lockDeadline?: number,
+}
+
 export interface SyncSummary {
     downloaded: string[],
     uploaded: string[],
@@ -350,6 +359,8 @@ interface Mode {
     live?: boolean,
     /** a tool's request: deletions that need the user's confirmation are not made */
     tool?: boolean,
+    /** the tool's request that the mode's steps belong to, with its one limit for the wait for git's index lock */
+    request?: ToolRequest,
     /** deletions that the request itself confirms, e.g. those of a commit that is landed */
     approved?: ReadonlySet<string>,
     /** git's pairing of the local renames and moves (`localRenames`), asked for once by the reconciles of this mode */
@@ -361,7 +372,7 @@ interface Mode {
 }
 
 /** A mode that collects deletions. */
-function collecting(summary: SyncSummary, options: Partial<Pick<Mode, 'live' | 'tool' | 'approved'>> = {}): Mode {
+function collecting(summary: SyncSummary, options: Partial<Pick<Mode, 'live' | 'tool' | 'request' | 'approved'>> = {}): Mode {
     return {deletions: 'collect', collected: {local: [], remote: []}, summary, ...options};
 }
 
@@ -411,7 +422,10 @@ export class ReplicaSync {
      * How long a tool's request waits for another program's git index lock to go before it
      * answers that the sync waits. The IDE's own git takes the lock for a few milliseconds when it
      * refreshes the index, e.g. after the sync wrote files, so a tool's request right after a sync
-     * can meet it. A lock that stays never goes, and this limit is the last resort for it.
+     * can meet it. A lock that stays never goes, and this limit is the last resort for it. The
+     * limit is for the whole request: its checks (the start of its step, each write's, the
+     * deletion step's and the record's) wait together until `ToolRequest.lockDeadline`, which
+     * its first wait sets.
      */
     static toolLockWaitMs = 2_000;
 
@@ -539,7 +553,7 @@ export class ReplicaSync {
      * about each such commit; a tool (`by`) is not asked. When the sync may act again after
      * waiting, a full sync catches up with what changed meanwhile.
      */
-    private async mayAct(by?: 'tool' | 'user'): Promise<string | undefined> {
+    private async mayAct(by?: 'tool' | 'user', request?: ToolRequest): Promise<string | undefined> {
         await this.local.verify();
         // While another program holds git's index lock, git writes the work tree and the index, as
         // in a checkout, which moves HEAD last. A window step waits until the lock is gone and asks
@@ -550,7 +564,8 @@ export class ReplicaSync {
             if (by==='tool') {
                 const {reason, stays} = await this.lockReason(lock);
                 if (stays) { return reason; }
-                if (!await this.indexLockGoesWithin(lock, ReplicaSync.toolLockWaitMs)) { return (await this.lockReason(lock)).reason; }
+                const deadline = request ? request.lockDeadline ??= Date.now() + ReplicaSync.toolLockWaitMs : Date.now() + ReplicaSync.toolLockWaitMs;
+                if (!await this.indexLockGoesWithin(lock, Math.max(0, deadline - Date.now()))) { return (await this.lockReason(lock)).reason; }
             } else {
                 await this.indexLockReleased(lock);
             }
@@ -944,12 +959,15 @@ export class ReplicaSync {
      * saw open in the window (`questionOpened`): the answer names it, also when the user has
      * answered it since; without it, the answer names the question open at its end.
      */
-    async flush(scan: boolean, {skipRecentMs = 0, now = Date.now(), record = false, by, approved, question: seen}: {
+    async flush(scan: boolean, {skipRecentMs = 0, now = Date.now(), record = false, by, approved, question: seen, request: given}: {
         skipRecentMs?: number, now?: number, record?: boolean, by?: 'tool' | 'user', approved?: ReadonlySet<string>, question?: Deletions,
+        /** a tool's request that the flush is a part of, e.g. a landing's (`ToolRequest`); a tool's flush makes its own otherwise */
+        request?: ToolRequest,
     } = {}): Promise<SyncSummary> {
         await this.load();
+        const request = by==='tool' ? given ?? {} : undefined;
         const summary = emptySummary();
-        summary.waitingFor = await this.mayAct(by);
+        summary.waitingFor = await this.mayAct(by, request);
         if (summary.waitingFor!==undefined) { return summary; }
         if (by==='user') {
             this.declined.local.clear();
@@ -979,7 +997,7 @@ export class ReplicaSync {
             // A tool's request does not join a reconcile that another step scheduled and has not
             // started: that step would decide the deletion, without the request's approvals and
             // without the request learning about it. The request reconciles after it instead.
-            const mode = collecting(summary, {live: by!=='tool', tool: by==='tool', approved});
+            const mode = collecting(summary, {live: by!=='tool', tool: by==='tool', request, approved});
             await this.scheduleAll([...changed, ...deleted], mode);
             await this.applyDeletions(mode);
             this.ui.liveResult(mode.summary);
@@ -994,7 +1012,7 @@ export class ReplicaSync {
         await Promise.all([...this.slots.values()].map(slot => slot.tail));
         await this.remote.settled();
         if (record) {
-            await this.recordNow();
+            await this.recordNow({by, request});
         } else {
             this.scheduleSave();
         }
@@ -1103,7 +1121,7 @@ export class ReplicaSync {
     private async beforeWrite(mode: Mode): Promise<void> {
         const [operation, lock] = await Promise.all([this.store.operation?.(), this.store.foreignIndexLock?.()]);
         if (operation===undefined && lock===undefined) { return; }
-        const reason = await this.mayAct(mode.tool ? 'tool' : undefined);
+        const reason = await this.mayAct(mode.tool ? 'tool' : undefined, mode.request);
         if (reason!==undefined) { throw new SyncWaitsError(reason); }
         throw new StaleReadError(`${lock!==undefined ? `git held its index lock ${lock}` : `git was in the middle of ${operation}`} when the sync was about to write; it reads both sides again`);
     }
@@ -1239,7 +1257,7 @@ export class ReplicaSync {
                 }
                 requested[where].filter(path => declined.has(path)).forEach(path => open.delete(path));
                 if (apply.length===0) { continue; }
-                const waiting = await this.mayAct(mode.tool ? 'tool' : undefined);
+                const waiting = await this.mayAct(mode.tool ? 'tool' : undefined, mode.request);
                 if (waiting!==undefined) {
                     // the full sync after the wait makes these deletions, or finds them gone
                     summary.waitingFor = waiting;
@@ -1826,7 +1844,11 @@ export class ReplicaSync {
      * Have the store record the synced state now (the git store's commit of Overleaf's state),
      * after the reconciles under way. Does nothing while held, unless `force`.
      */
-    async recordNow({force = false, stopping = false} = {}): Promise<{waiting?: boolean} | undefined> {
+    async recordNow({force = false, stopping = false, by, request}: {
+        force?: boolean, stopping?: boolean,
+        /** a tool's request (`by`, `request`) waits for git's index lock by its rule (`mayAct`) */
+        by?: 'tool' | 'user', request?: ToolRequest,
+    } = {}): Promise<{waiting?: boolean} | undefined> {
         if (!this.store.record || (this.holds>0 && !force)) { return undefined; }
         if (!stopping) {
             while (this.active>0) {
@@ -1836,7 +1858,7 @@ export class ReplicaSync {
         const run = this.recording.then(async (): Promise<{waiting?: boolean}> => {
             await this.saving;
             // while the sync waits, the record waits too: the changes stay noted for the record after the wait
-            if (await this.mayAct()!==undefined) { return {waiting: true}; }
+            if (await this.mayAct(by, request)!==undefined) { return {waiting: true}; }
             const state: SavedState = JSON.parse(JSON.stringify(this.state));
             await this.store.save(state);
             const result = await this.store.record!(state);

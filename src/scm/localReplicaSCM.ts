@@ -7,7 +7,7 @@ import { BaseSCM, CommitItem, SettingItem } from ".";
 import { FileRefEntity, FolderEntity, VirtualFileSystem, __OUTPUTS_ID, parseUri } from '../core/remoteFileSystemProvider';
 import {
     Deletions, describe, FolderChange, FolderChangedError, LocalStat, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync,
-    ReplicaUI, SyncSummary,
+    ReplicaUI, SyncSummary, ToolRequest,
 } from './replicaSync';
 import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath, REPLICA_CONFLICTS_FOLDER, REPLICA_SETTINGS_FILE, REPLICA_TEMPORARY_FOLDER } from './ignorePatterns';
 import * as localFs from './localFolderFs';
@@ -923,9 +923,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const deleted = (await git.run(['diff', '--name-only', '--no-renames', '--diff-filter=D', '-z', head, target]))
                 .stdout.toString('utf8').split('\0').filter(Boolean).map(p => `/${p}`);
             await git.ownIndexWrite(() => git.run(['merge', '--ff-only', '--quiet', target]));
-            const summary = await sync.flush(true, {by: 'tool', approved: new Set(deleted)});
+            // the landing's flush and record are one tool's request, with one limit for the wait for git's index lock
+            const request: ToolRequest = {};
+            const summary = await sync.flush(true, {by: 'tool', approved: new Set(deleted), request});
             const failed = this.syncProblems(summary);
-            const recorded = await sync.recordNow({force: true});
+            const recorded = await sync.recordNow({force: true, by: 'tool', request});
             const after = await git.commit(OVERLEAF_REF);
             const held = after!==undefined && (after===target || await git.isAncestor(target, after));
             const ok = failed.length===0 && held && !recorded?.waiting;
