@@ -899,7 +899,7 @@ export class ReplicaSync {
         this.scheduleSave();
         mode.summary.renamedLocally.push({from, to});
         this.ui.log(`${from}: renamed to ${to} locally, as on Overleaf`);
-        if (parentOf(from)!==parentOf(to)) { await this.local.removeFolderIfEmpty(parentOf(from)); }
+        if (parentOf(from)!==parentOf(to)) { await this.removeFolderIfEmpty('local', parentOf(from)); }
     }
 
     private async changed(path: string, remote: boolean): Promise<void> {
@@ -1119,11 +1119,37 @@ export class ReplicaSync {
      * there, the check is the existence of their files.
      */
     private async beforeWrite(mode: Mode): Promise<void> {
-        const [operation, lock] = await Promise.all([this.store.operation?.(), this.store.foreignIndexLock?.()]);
-        if (operation===undefined && lock===undefined) { return; }
+        const atWork = await this.gitAtWork();
+        if (atWork===undefined) { return; }
         const reason = await this.mayAct(mode.tool ? 'tool' : undefined, mode.request);
         if (reason!==undefined) { throw new SyncWaitsError(reason); }
-        throw new StaleReadError(`${lock!==undefined ? `git held its index lock ${lock}` : `git was in the middle of ${operation}`} when the sync was about to write; it reads both sides again`);
+        throw new StaleReadError(`${atWork.lock!==undefined ? `git held its index lock ${atWork.lock}` : `git was in the middle of ${atWork.operation}`} when the sync was about to write; it reads both sides again`);
+    }
+
+    /** The git operation under way and another program's index lock, by the files that git keeps for them; undefined when neither is there. */
+    private async gitAtWork(): Promise<{operation?: string, lock?: string} | undefined> {
+        const [operation, lock] = await Promise.all([this.store.operation?.(), this.store.foreignIndexLock?.()]);
+        return operation===undefined && lock===undefined ? undefined : {operation, lock};
+    }
+
+    /**
+     * Remove `folder` when it is empty, in the local folder or on Overleaf (`where`), after its
+     * last file was deleted or moved away. While git holds its index lock or is in the middle of
+     * an operation (`gitAtWork`), the empty folder stays: git may be writing into it, as a
+     * checkout does, and the sync does not act on the folder meanwhile.
+     */
+    private async removeFolderIfEmpty(where: 'local' | 'remote', folder: string): Promise<void> {
+        const atWork = await this.gitAtWork();
+        if (atWork!==undefined) {
+            this.ui.log(`${folder}: the empty folder stays ${where==='local' ? 'in the local folder' : 'on Overleaf'}, since ${atWork.lock!==undefined ? `git holds its index lock ${atWork.lock}` : `git is in the middle of ${atWork.operation}`}`);
+            return;
+        }
+        if (where==='local') {
+            await this.local.removeFolderIfEmpty(folder);
+            return;
+        }
+        await this.remote.removeFolderIfEmpty(folder)
+            .catch(error => this.ui.log(`${folder}: removing the empty folder on Overleaf failed: ${errorMessage(error)}`));
     }
 
     /**
@@ -1449,7 +1475,7 @@ export class ReplicaSync {
                 this.noteChange(path, 'remote');
                 summary.deletedLocal.push(path);
                 this.ui.log(`${path}: deleted locally, as on Overleaf`);
-                await this.local.removeFolderIfEmpty(parentOf(path));
+                await this.removeFolderIfEmpty('local', parentOf(path));
             } else {
                 // deleted on Overleaf, changed locally: follow Overleaf and keep the local version aside
                 await this.beforeWrite(mode);
@@ -1459,7 +1485,7 @@ export class ReplicaSync {
                 this.noteChange(path, 'remote');
                 summary.keptAside.push({path, copy});
                 this.ui.log(`${path}: deleted on Overleaf but changed locally; the local version is kept at ${copy}`);
-                await this.local.removeFolderIfEmpty(parentOf(path));
+                await this.removeFolderIfEmpty('local', parentOf(path));
             }
             return;
         }
@@ -1488,7 +1514,7 @@ export class ReplicaSync {
             this.noteChange(path, 'local');
             summary.deletedRemote.push(path);
             this.ui.log(`${path}: deleted on Overleaf, as locally`);
-            await this.removeEmptyRemoteFolder(parentOf(path));
+            await this.removeFolderIfEmpty('remote', parentOf(path));
         }
     }
 
@@ -1756,14 +1782,8 @@ export class ReplicaSync {
         this.scheduleSave();
         mode.summary.renamed.push({from, to});
         this.ui.log(`${from}: renamed to ${to} on Overleaf, as in the folder`);
-        if (parentOf(from)!==parentOf(to)) { await this.removeEmptyRemoteFolder(parentOf(from)); }
+        if (parentOf(from)!==parentOf(to)) { await this.removeFolderIfEmpty('remote', parentOf(from)); }
         return true;
-    }
-
-    /** Remove `folder` on Overleaf when it is empty, as after its last file was deleted or moved away locally. */
-    private async removeEmptyRemoteFolder(folder: string) {
-        await this.remote.removeFolderIfEmpty(folder)
-            .catch(error => this.ui.log(`${folder}: removing the empty folder on Overleaf failed: ${errorMessage(error)}`));
     }
 
     /**

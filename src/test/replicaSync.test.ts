@@ -682,6 +682,52 @@ describe('ReplicaSync', () => {
             assert.ok(t.ui.logs.some(line => line.includes('reads both sides again')), 'it ran again');
         });
 
+        /** A synced project with /fig/a.png and /main.tex, its sync, and a store without git's lock. */
+        async function withFigure() {
+            const t = setup();
+            const store = new LockedStore();
+            store.lock = undefined;
+            t.remote.files.set('/fig/a.png', png);
+            t.remote.docs.set('/main.tex', text);
+            const sync = new ReplicaSync(t.remote, t.local, store, t.ui, (p: string) => p.endsWith('.aux'));
+            await sync.syncAll();
+            return { ...t, store, sync };
+        }
+
+        it('leaves the empty local folder of a file deleted on Overleaf in place when git takes its lock right after the file\'s removal', async () => {
+            const t = await withFigure();
+            const emptied: string[] = [];
+            t.local.removeFolderIfEmpty = async (...folders: string[]) => { emptied.push(...folders); };
+            const remove = t.local.remove.bind(t.local);
+            t.local.remove = async (path: string) => { await remove(path); t.store.lock = '/replica/.git/index.lock'; };
+            t.remote.files.delete('/fig/a.png');
+            await t.sync.remoteChanged('/fig/a.png', true);
+            assert.strictEqual(t.local.files.has('/fig/a.png'), false, 'the file is deleted locally, as on Overleaf');
+            assert.deepStrictEqual(emptied, [], 'the empty folder stays while git holds its lock');
+            assert.ok(t.ui.logs.some(line => line.startsWith('/fig: the empty folder stays in the local folder')), t.ui.logs.join('\n'));
+            t.store.release();
+        });
+
+        it('leaves the empty folder of a file deleted locally in place on Overleaf when git takes its lock right after the removal there', async () => {
+            const saved = ReplicaSync.localDeleteDelayMs;
+            ReplicaSync.localDeleteDelayMs = 0;
+            try {
+                const t = await withFigure();
+                const emptied: string[] = [];
+                t.remote.removeFolderIfEmpty = async (...folders: string[]) => { emptied.push(...folders); };
+                const remove = t.remote.remove.bind(t.remote);
+                t.remote.remove = async (path: string) => { await remove(path); t.store.lock = '/replica/.git/index.lock'; };
+                t.local.files.delete('/fig/a.png');
+                await t.sync.localChanged('/fig/a.png');
+                assert.strictEqual(t.remote.files.has('/fig/a.png'), false, 'the file is deleted on Overleaf, as locally');
+                assert.deepStrictEqual(emptied, [], 'the empty folder stays on Overleaf while git holds its lock');
+                assert.ok(t.ui.logs.some(line => line.startsWith('/fig: the empty folder stays on Overleaf')), t.ui.logs.join('\n'));
+                t.store.release();
+            } finally {
+                ReplicaSync.localDeleteDelayMs = saved;
+            }
+        });
+
         it('keeps what git writes into a file during the upload of its merge, at the merged text\'s local write', async () => {
             const t = await locked();
             t.store.lock = undefined;
