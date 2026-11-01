@@ -68,6 +68,37 @@ export const pastRightEdge = (selector) => `(() => {
  */
 export const SYNCTEX_HIGHLIGHT = `[...document.querySelectorAll('.pdfViewer > div, .pdfViewer .page > div')].find(d => d.style.backgroundColor === 'rgb(255, 255, 0)')`;
 
+/**
+ * Whether the SyncTeX highlight lies in the visible area of the container of the viewer `engine`:
+ * an expression. The viewers scroll it there at once, 100 ms after they draw it (showHighlights in
+ * views/pdf-viewer/src/common/synctex.ts).
+ */
+export const highlightInView = (engine) => `(() => { const h = (${SYNCTEX_HIGHLIGHT})?.getBoundingClientRect(); const c = ${viewerIfAny(engine)}?.container.getBoundingClientRect(); return !!h && !!c && h.top >= c.top && h.bottom <= c.bottom; })()`;
+
+/**
+ * An expression for a promise that settles two animation frames later. A scroll's event comes in
+ * the next frame, and pdf.js updates the viewer's current page in a frame after that event, so
+ * after two frames the viewer has taken in a scroll that happened before.
+ */
+export const TWO_FRAMES = 'new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))';
+
+/**
+ * An expression that makes the page wait for its next 'resize' event and two animation frames after
+ * it, when the page has laid out again at its new size: it sets window.__resized, a promise of the
+ * page's new width, or of undefined when the page has not been resized within `limitMs`. Evaluate
+ * it before the change of size, and window.__resized after it.
+ */
+export const armResizeWait = (limitMs = 5000) => `(() => {
+    window.__resized = new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(undefined), ${limitMs});
+        addEventListener('resize', () => requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(timer); resolve(innerWidth); })), { once: true });
+    });
+    return true;
+})()`;
+
+/** Whether the pop-up of `selector` (PDFJS_POPUPS) is shown: pdf.js hides it with the class hidden. An expression. */
+export const popupShown = (selector) => `(() => { const e = document.querySelector(${JSON.stringify(selector)}); return !!e && !e.classList.contains('hidden'); })()`;
+
 /** The last resort for a page that a viewer does not draw: the viewers draw a page within a few seconds. */
 const DRAW_LIMIT_MS = 30000;
 

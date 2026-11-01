@@ -1,6 +1,7 @@
 // Does a viewer show the button to the other viewer, and what does a click send the host?
 // Saves a screenshot as shots/switch-<engine>.png in the work folder.
 //   node probes/switch-button.mjs [--ext DIR] [--engine pdfjs|overleaf] [--port N]
+import { notWithinLimit } from '../../lib/devtools.mjs';
 import { checker, openHarness, shotPath, themeBook } from '../common.mjs';
 import { buttonOf, pageDrawn } from '../viewers.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
@@ -20,7 +21,8 @@ try {
     check('the viewer shows the button to the other viewer', shown?.visible, JSON.stringify(shown));
     await page.screenshot(shotPath(`switch-${engine}.png`));
     await page.evaluate(`${button}.click(); true`);
-    await new Promise(r => setTimeout(r, 500));
+    // the stub logs the message when the page sends it; 5 s is the last resort for a click that sends none
+    await page.waitFor(`harness.events.some(e => e.type === 'switchViewer')`, 5000).catch(notWithinLimit);
     const sent = await page.evaluate(`harness.events.filter(e => e.type === 'switchViewer' || e.type === 'saveState').slice(-3)`);
     const other = engine === 'overleaf' ? 'pdfjs' : 'overleaf';
     check(`a click sends the host switchViewer to the ${other} viewer`, sent.some(e => e.type === 'switchViewer' && e.engine === other), JSON.stringify(sent));

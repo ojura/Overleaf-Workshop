@@ -7,6 +7,8 @@ import { openHarness } from '../common.mjs';
 import { viewerIfAny } from '../viewers.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 
+/** When the probe looks at the viewer, after the navigation: the time it observes, not a wait for a state. */
+const LOOK_AFTER_MS = 8000;
 const options = scriptOptions({ book: 'value', engine: 'value', ext: 'value', port: 'number' });
 
 const engine = options.get('engine', 'pdfjs');
@@ -18,7 +20,8 @@ h.page.on('Runtime.consoleAPICalled', (p) => logs.push(`${p.type}: ${p.args.map(
 h.page.on('Runtime.exceptionThrown', (p) => logs.push(`exception: ${p.exceptionDetails.exception?.description?.slice(0, 400) ?? p.exceptionDetails.text}`));
 try {
     await h.page.send('Page.navigate', { url: `${h.origin}/page?engine=${engine}&doc=debug` });
-    await new Promise(r => setTimeout(r, 8000));
+    // what the probe shows is the state 8 s after the navigation, also when the viewer never draws
+    await new Promise(r => setTimeout(r, LOOK_AFTER_MS));
     const V = viewerIfAny(engine);
     console.log('state:', await h.page.evaluate(`JSON.stringify({ pages: ${V}?.pagesCount, r0: ${V}?.getPageView?.(0)?.renderingState, events: window.harness?.events?.slice(-15) })`));
 } finally {

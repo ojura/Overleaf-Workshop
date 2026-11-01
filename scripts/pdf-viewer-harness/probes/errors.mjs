@@ -22,8 +22,10 @@ try {
     // 1. rapid reloads: b, a, b, a, b within a few ms; the last one must win and leave one document
     await page.evaluate(`window.__start = ${V}.pdfDocument; for (const b of ['b','a','b','a','b']) harness.load(b); true`);
     await page.waitFor(`${V}.pdfDocument !== window.__start && ${OVERLEAF_DOCUMENTS}.inFlight === undefined`, 30000);
-    await new Promise(r => setTimeout(r, 1500));
-    const rapid = await page.evaluate(`({ shown: ${OVERLEAF_DOCUMENTS}.shownUrl.includes('0000000000000002') ? 'b' : 'a', documents: ${OVERLEAF_DOCUMENTS}.owned.size, rendered: ${pageInViewDrawn('overleaf')} })`);
+    const rapidState = `({ shown: ${OVERLEAF_DOCUMENTS}.shownUrl.includes('0000000000000002') ? 'b' : 'a', documents: ${OVERLEAF_DOCUMENTS}.owned.size, rendered: ${pageInViewDrawn('overleaf')} })`;
+    // the state that the check asks for, or the state after 5 s
+    await page.waitFor(`(() => { const r = ${rapidState}; return r.shown === 'b' && r.documents === 1 && r.rendered; })()`, 5000).catch(notWithinLimit);
+    const rapid = await page.evaluate(rapidState);
     check('rapid reloads: the last build is shown, drawn, with one document', rapid.shown === 'b' && rapid.documents === 1 && rapid.rendered, JSON.stringify(rapid));
     // 2. a build that is gone from the server (404)
     await page.evaluate(`(() => { const o = structuredClone(harness.builds.b); o.url = o.url.replace('0000000000000002', '00000000000000ff'); o.file.url = o.file.url.replace('0000000000000002', '00000000000000ff'); o.file.build = o.file.build.replace('0000000000000002', '00000000000000ff'); window.postMessage({ type: 'load', output: o }, '*'); return true; })()`);

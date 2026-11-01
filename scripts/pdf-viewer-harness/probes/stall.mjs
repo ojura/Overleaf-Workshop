@@ -9,6 +9,9 @@ import { book, bookFacts, openHarness } from '../common.mjs';
 import { OVERLEAF_DOCUMENTS, pageDrawn, viewerOf } from '../viewers.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 
+/** The time between two samples of the pages, and their number. */
+const SAMPLE_MS = 2000;
+const SAMPLES = 8;
 const options = scriptOptions({ ext: 'value', latency: 'number', port: 'number', steps: 'value' });
 
 const bookDir = book();
@@ -37,10 +40,11 @@ try {
     if (steps.includes('sync')) {
         await page.evaluate(`harness.syncCode([{ page: 30, h: 72, v: 110, width: 320, height: 14 }]); true`);
     }
-    for (let i = 0; i < 8; i++) {
-        await new Promise(r => setTimeout(r, 2000));
+    // the samples are what the probe shows, every SAMPLE_MS for SAMPLES samples
+    for (let i = 0; i < SAMPLES; i++) {
+        await new Promise(r => setTimeout(r, SAMPLE_MS));
         const fetches = await page.evaluate(`harness.messages('fetch').length`);
-        console.log(`t+${(i + 1) * 2}s current ${await page.evaluate(`${V}.currentPageNumber`)} states ${await states('28,29,30,31,32')} fetches ${fetches}`);
+        console.log(`t+${(i + 1) * SAMPLE_MS / 1000}s current ${await page.evaluate(`${V}.currentPageNumber`)} states ${await states('28,29,30,31,32')} fetches ${fetches}`);
     }
 } finally {
     console.log('page messages:', JSON.stringify(problems.slice(-15), null, 1));

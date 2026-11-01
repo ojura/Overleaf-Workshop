@@ -5,7 +5,7 @@
 import { notWithinLimit } from '../../lib/devtools.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 import { openHarness } from '../common.mjs';
-import { pageDrawn, SYNCTEX_HIGHLIGHT, viewerOf } from '../viewers.mjs';
+import { highlightInView, pageDrawn, SYNCTEX_HIGHLIGHT, TWO_FRAMES, viewerOf } from '../viewers.mjs';
 
 const options = scriptOptions({ ext: 'value', port: 'number' });
 
@@ -17,9 +17,11 @@ try {
     await page.waitFor(pageDrawn('overleaf', 1), 60000);
     for (const [pageNo, v] of [[30, 110], [30, 600], [75, 400]]) {
         await page.evaluate(`harness.syncCode([{ page: ${pageNo}, h: 72, v: ${v}, width: 320, height: 14 }]); true`);
-        // the highlight is a yellow box in the page's div; the view scrolls to it smoothly
-        await page.waitFor(`(${SYNCTEX_HIGHLIGHT}) !== undefined`, 10000).catch(notWithinLimit);
-        await new Promise(r => setTimeout(r, 1500));
+        // the highlight is a yellow box in the page's div; the viewer scrolls it into view, and the
+        // probe measures where it lands once it lies in the visible area and the viewer has taken
+        // in the scroll, or after 10 s
+        await page.waitFor(highlightInView('overleaf'), 10000).catch(notWithinLimit);
+        await page.evaluate(TWO_FRAMES);
         const m = await page.evaluate(`(() => {
             const c = ${V}.container.getBoundingClientRect();
             const hl = ${SYNCTEX_HIGHLIGHT};

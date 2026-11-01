@@ -4,7 +4,7 @@
 import { notWithinLimit } from '../../lib/devtools.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 import { checker, openHarness } from '../common.mjs';
-import { SYNCTEX_HIGHLIGHT, viewerOf } from '../viewers.mjs';
+import { highlightInView, SYNCTEX_HIGHLIGHT, TWO_FRAMES, viewerOf } from '../viewers.mjs';
 
 const options = scriptOptions({ ext: 'value', port: 'number' });
 
@@ -19,13 +19,16 @@ try {
     await page.waitFor(`!!window.harness && !!window.overleafViewer`, 20000);
     await page.evaluate(`harness.syncCode([{ page: 40, h: 72, v: 300, width: 320, height: 14 }]); true`);
     const first = await page.waitFor(yellow, 20000).then(() => true, (error) => notWithinLimit(error) ?? false);
-    await new Promise(r => setTimeout(r, 1500));
+    // the page that the check reports, once the viewer has scrolled the highlight into view and taken in the scroll
+    await page.waitFor(highlightInView('overleaf'), 5000).catch(notWithinLimit);
+    await page.evaluate(TWO_FRAMES);
     check('a search that arrives before the first document is drawn', first, `current page ${await page.evaluate(`${V}.currentPageNumber`)}`);
     // 2. during a reload
     await page.evaluate(`window.__old = ${V}.pdfDocument; harness.load('b'); harness.syncCode([{ page: 70, h: 72, v: 300, width: 320, height: 14 }]); true`);
     await page.waitFor(`${V}.pdfDocument !== window.__old`, 30000);
     const second = await page.waitFor(yellow, 20000).then(() => true, (error) => notWithinLimit(error) ?? false);
-    await new Promise(r => setTimeout(r, 1500));
+    await page.waitFor(highlightInView('overleaf'), 5000).catch(notWithinLimit);
+    await page.evaluate(TWO_FRAMES);
     check('a search that arrives during a reload is drawn after the swap', second, `current page ${await page.evaluate(`${V}.currentPageNumber`)}`);
 } catch (error) {
     check('run', false, String(error?.message ?? error));

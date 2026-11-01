@@ -15,7 +15,7 @@ import { clickAt, notWithinLimit, pressKey } from '../lib/devtools.mjs';
 import { scriptOptions } from '../lib/options.mjs';
 import { launchChrome } from './cdp.mjs';
 import { book, bookFacts, checker, defaultExt, startServer, work } from './common.mjs';
-import { OVERLEAF_DOCUMENTS, pageDrawn, SYNCTEX_HIGHLIGHT, viewerIfAny, viewerOf } from './viewers.mjs';
+import { highlightInView, OVERLEAF_DOCUMENTS, pageDrawn, SYNCTEX_HIGHLIGHT, TWO_FRAMES, viewerIfAny, viewerOf } from './viewers.mjs';
 
 const options = scriptOptions({ ext: 'value', engine: 'value', frame: 'flag', latency: 'number', shots: 'value', port: 'number', json: 'value' });
 
@@ -174,9 +174,10 @@ try {
     await page.evaluate(`harness.syncCode([{ page: 30, h: 72, v: 110, width: 320, height: 14 }]); true`);
     const highlight = await page.waitFor(`(${SYNCTEX_HIGHLIGHT}) !== undefined`, 10000).catch(notWithinLimit);
     check('forward SyncTeX: the highlight is drawn', !!highlight);
-    // the viewer scrolls the highlight into view 100 ms after it drew it (showHighlights in
-    // views/pdf-viewer/src/common/synctex.ts): once the highlight lies in the viewer's visible area
-    const inView = await page.waitFor(`(() => { const h = (${SYNCTEX_HIGHLIGHT})?.getBoundingClientRect(); const c = ${VIEWER}.container.getBoundingClientRect(); return !!h && h.top >= c.top && h.bottom <= c.bottom; })()`, STATE_LIMIT_MS).catch(notWithinLimit);
+    // the viewer scrolls the highlight into view 100 ms after it drew it: once it lies in the
+    // viewer's visible area, and the viewer has taken in the scroll
+    const inView = await page.waitFor(highlightInView(engine), STATE_LIMIT_MS).catch(notWithinLimit);
+    await page.evaluate(TWO_FRAMES);
     const at = await page.evaluate(`${VIEWER}.currentPageNumber`);
     check('forward SyncTeX: the highlight is scrolled into view', !!inView && Math.abs(at - 30) <= 1, `${inView ? 'in the visible area' : 'not in the visible area'}, current page ${at}`);
     await page.screenshot(path.join(shots, '5-synctex-highlight.png'));

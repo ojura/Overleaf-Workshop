@@ -8,7 +8,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { book, openHarness, work } from '../common.mjs';
-import { pageDrawn, pastRightEdge, PDFJS_POPUPS, TOOLBAR } from '../viewers.mjs';
+import { notWithinLimit } from '../../lib/devtools.mjs';
+import { armResizeWait, pageDrawn, pastRightEdge, popupShown, PDFJS_POPUPS, TOOLBAR } from '../viewers.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 
 const options = scriptOptions({ engine: 'value', ext: 'value', out: 'value', pages: 'number', port: 'number' });
@@ -17,7 +18,8 @@ const engine = options.get('engine', 'pdfjs');
 const pages = options.get('pages', 456);
 const outDir = path.resolve(options.get('out', path.join(work, 'shots', `toolbar-${engine}`)));
 fs.mkdirSync(outDir, { recursive: true });
-const h = await openHarness({ name: `toolbar-${engine}`, port: options.get('port'), ext: options.get('ext'), bookDir: book(`book-${pages}`, pages, 1), latency: 5, width: 1400, height: 500 });
+const startWidth = 1400;
+const h = await openHarness({ name: `toolbar-${engine}`, port: options.get('port'), ext: options.get('ext'), bookDir: book(`book-${pages}`, pages, 1), latency: 5, width: startWidth, height: 500 });
 const { page } = h;
 /** the elements in `selector`'s element whose right edge is past the pane's */
 const past = (selector) => page.evaluate(pastRightEdge(selector));
@@ -26,16 +28,20 @@ try {
     await page.send('Page.navigate', { url: `${h.origin}/frame?engine=${engine}&doc=shots-${engine}` });
     await page.useFrame();
     await page.waitFor(pageDrawn(engine, 1), 60000);
+    let shownWidth = startWidth;
     for (const width of [1400, 1085, 900, 760, 740, 680, 560, 470, 350, 330, 300, 260, 220]) {
+        // the viewer lays its toolbar out again after the page's resize event
+        await page.evaluate(armResizeWait());
         await page.send('Emulation.setDeviceMetricsOverride', { width, height: 500, deviceScaleFactor: 1, mobile: false });
-        await new Promise(r => setTimeout(r, 400));
+        if (width !== shownWidth && !(await page.evaluate('window.__resized'))) { console.log(`${width} px: the page did not report a resize within 5 s`); }
+        shownWidth = width;
         const results = { toolbar: await past(TOOLBAR[engine]) };
         await page.screenshot(path.join(outDir, `${engine}-${width}.png`));
         if (engine === 'pdfjs') {
             // the find bar and the tools menu, each opened by its button and closed again
             for (const [name, button, popup] of PDFJS_POPUPS) {
                 await page.evaluate(`document.getElementById('${button}').click(); true`);
-                await new Promise(r => setTimeout(r, 300));
+                await page.waitFor(popupShown(popup), 5000).catch(notWithinLimit);
                 results[name] = await past(popup);
                 await page.screenshot(path.join(outDir, `${engine}-${width}-${name.replace(' ', '-')}.png`));
                 await page.evaluate(`document.getElementById('${button}').click(); true`);
