@@ -7,12 +7,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { onCleanup, sleep } from '../../lib/cleanup.mjs';
-import { answerWithin, evaluate, waitForTarget, waitUntil, notWithinLimit } from '../../lib/devtools.mjs';
+import { answerWithin, clickAt, evaluate, notWithinLimit, pressKey, waitForTarget, waitUntil } from '../../lib/devtools.mjs';
 import { checkInstanceFolder, connectWindow, drawsExpression, instanceHome, readRunningInstance, workbenchTarget } from '../../lib/test-instance.mjs';
 import { checker } from '../common.mjs';
 import { ENGINE_OF_PAGE, pageInViewDrawn, viewerOf } from '../viewers.mjs';
 
-export { evaluate, waitUntil, notWithinLimit, onCleanup, sleep };
+export { clickAt, evaluate, notWithinLimit, onCleanup, pressKey, sleep, waitUntil };
 /** What the drivers use of the viewer pages (../viewers.mjs). */
 export * from '../viewers.mjs';
 
@@ -58,20 +58,6 @@ export function settings(inst) {
     return { file, get: (key) => read()[key], set, guard, change };
 }
 
-/** Press and release a key; modifiers add up from 1 Alt, 2 Ctrl, 4 Meta and 8 Shift. */
-export async function key(session, keyChar, code, vk, modifiers = 0) {
-    for (const type of ['rawKeyDown', 'keyUp']) {
-        await session.send('Input.dispatchKeyEvent', { type, modifiers, key: keyChar, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
-    }
-}
-
-/** A left click at (x, y) in the session's page. */
-export async function click(session, x, y) {
-    for (const type of ['mousePressed', 'mouseReleased']) {
-        await session.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
-    }
-}
-
 /** The last resort for a workbench that never lays out its status bar, for example a window stuck on its start. */
 const WORKBENCH_LAYOUT_LIMIT_MS = 60000;
 
@@ -103,16 +89,16 @@ export async function workbench(inst) {
 
 /** Run a command of the Command Palette by its title; returns whether the palette found it. */
 export async function runCommand(wb, title) {
-    await key(wb.session, 'P', 'KeyP', 80, 2 | 8);
+    await pressKey(wb.session, 'Ctrl+Shift+P');
     await sleep(400);
     await wb.session.send('Input.insertText', { text: title });
     await sleep(500);
     const selected = await wb.E(`document.querySelector('.quick-input-widget .quick-input-list .monaco-list-row.focused')?.textContent ?? ''`);
     if (!selected.toLowerCase().includes(title.toLowerCase())) {
-        await key(wb.session, 'Escape', 'Escape', 27);
+        await pressKey(wb.session, 'Escape');
         return false;
     }
-    await key(wb.session, 'Enter', 'Enter', 13);
+    await pressKey(wb.session, 'Enter');
     await sleep(500);
     return true;
 }
@@ -120,7 +106,7 @@ export async function runCommand(wb, title) {
 /** Give the workbench the keyboard focus with a click on its title bar (or its status bar). */
 export async function focusWorkbench(wb) {
     const bar = await wb.E(`(() => { const s = document.querySelector('.part.titlebar') || document.querySelector('.statusbar'); const r = s.getBoundingClientRect(); return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
-    await click(wb.session, bar.x, bar.y);
+    await clickAt(wb.session, bar.x, bar.y);
     await sleep(200);
 }
 
@@ -178,7 +164,7 @@ export async function openWithQuickOpen(wb, file) {
     await closeTab(wb, path.basename(file));
     const before = new Set((await viewerFrames(wb)).map(t => t.targetId));
     await focusWorkbench(wb);
-    await key(wb.session, 'p', 'KeyP', 80, 2);
+    await pressKey(wb.session, 'Ctrl+P');
     if (!(await untilInPage(wb, `document.activeElement?.closest('.quick-input-widget') ? true : undefined`))) {
         throw new Error(`Quick Open did not take the keyboard focus within ${WORKBENCH_CHANGE_LIMIT_MS / 1000} s of Ctrl+P`);
     }
@@ -188,10 +174,10 @@ export async function openWithQuickOpen(wb, file) {
     const isFile = `(() => { const row = ${focusedRow}; const want = ${want}; return row && row.querySelector('.label-name')?.textContent === want.name && row.querySelector('.label-description')?.textContent === want.folder ? true : undefined; })()`;
     if (!(await untilInPage(wb, isFile))) {
         const row = await wb.E(`${focusedRow}?.getAttribute('aria-label') ?? '(Quick Open does not focus a row)'`);
-        await key(wb.session, 'Escape', 'Escape', 27);
+        await pressKey(wb.session, 'Escape');
         throw new Error(`Quick Open did not focus ${file} within ${WORKBENCH_CHANGE_LIMIT_MS / 1000} s; its focused row is ${row}`);
     }
-    await key(wb.session, 'Enter', 'Enter', 13);
+    await pressKey(wb.session, 'Enter');
     return waitForTarget(wb.browser, (t) => isViewerFrame(t) && !before.has(t.targetId), { what: `a viewer of ${file}`, limitMs: VIEWER_OPEN_LIMIT_MS });
 }
 
@@ -311,7 +297,7 @@ export async function reopenTab(wb, label, timeoutMs = 10000) {
     const before = new Set((await viewerFrames(wb)).map(t => t.targetId));
     if (!(await closeTab(wb, label))) { return undefined; }
     await focusWorkbench(wb);
-    await key(wb.session, 'T', 'KeyT', 84, 2 | 8);
+    await pressKey(wb.session, 'Ctrl+Shift+T');
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
         const frame = (await viewerFrames(wb)).find(t => !before.has(t.targetId));

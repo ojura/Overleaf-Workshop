@@ -343,3 +343,44 @@ export function notWithinLimit(error) {
     if (error instanceof WaitLimitError) { return undefined; }
     throw error;
 }
+
+/** The modifier bits of Input.dispatchKeyEvent. */
+const MODIFIERS = { Alt: 1, Ctrl: 2, Meta: 4, Shift: 8 };
+/** The keys that pressKey takes besides letters and digits: [key, code, Windows virtual key code]. */
+const NAMED_KEYS = { Escape: ['Escape', 'Escape', 27], Enter: ['Enter', 'Enter', 13], '=': ['=', 'Equal', 187], '-': ['-', 'Minus', 189] };
+
+/**
+ * Press and release the key `combo` in the page of `session` (a session or a page with send()), as
+ * a keyboard sends it: "Ctrl+Shift+P", "Ctrl+=", "Escape". The modifiers come first, then a letter,
+ * a digit or a key of NAMED_KEYS; a letter is its capital when Shift is among the modifiers.
+ */
+export async function pressKey(session, combo) {
+    const parts = combo.split('+');
+    const name = parts.pop();
+    let modifiers = 0;
+    for (const part of parts) {
+        if (!(part in MODIFIERS)) { throw new Error(`pressKey: ${part} in ${combo} is not one of the modifiers ${Object.keys(MODIFIERS).join(', ')}`); }
+        modifiers |= MODIFIERS[part];
+    }
+    let key, code, keyCode;
+    if (/^[a-z]$/i.test(name)) {
+        const capital = name.toUpperCase();
+        [key, code, keyCode] = [modifiers & MODIFIERS.Shift ? capital : capital.toLowerCase(), `Key${capital}`, capital.charCodeAt(0)];
+    } else if (/^[0-9]$/.test(name)) {
+        [key, code, keyCode] = [name, `Digit${name}`, name.charCodeAt(0)];
+    } else if (name in NAMED_KEYS) {
+        [key, code, keyCode] = NAMED_KEYS[name];
+    } else {
+        throw new Error(`pressKey: ${name} in ${combo} is not a letter, a digit or one of ${Object.keys(NAMED_KEYS).join(' ')}`);
+    }
+    for (const type of ['rawKeyDown', 'keyUp']) {
+        await session.send('Input.dispatchKeyEvent', { type, modifiers, key, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode });
+    }
+}
+
+/** A left click at (x, y), in CSS pixels of the page of `session` (a session or a page with send()). */
+export async function clickAt(session, x, y) {
+    for (const type of ['mousePressed', 'mouseReleased']) {
+        await session.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
+    }
+}

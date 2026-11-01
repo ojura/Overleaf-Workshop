@@ -15,7 +15,7 @@ import path from 'node:path';
 import { scriptOptions } from '../../lib/options.mjs';
 import { bookFacts } from '../common.mjs';
 import {
-    areaColorsFunction, associatePdfs, checker, click, instance, INSTANCE_OPTION, key, openWithQuickOpen, rafOnTimer, settings,
+    areaColorsFunction, associatePdfs, checker, clickAt, instance, INSTANCE_OPTION, openWithQuickOpen, pressKey, rafOnTimer, settings,
     showPageFunction, sleep, switchThemeFunction, viewerOf, viewerPage, windowDraws, workbench,
 } from './ide.mjs';
 
@@ -92,7 +92,7 @@ try {
     // Ctrl+= zooms the PDF, and VS Code's window keeps its zoom
     const area = await E(`(() => { const r = ${V}.container.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
     const outer = await wb.E(`(() => { const f = [...document.querySelectorAll('iframe')].map(f => f.getBoundingClientRect()).filter(r => r.width > 200).sort((a, b) => b.width * b.height - a.width * a.height)[0]; return { x: f.left, y: f.top }; })()`);
-    const intoViewer = () => click(wb.session, outer.x + area.x, outer.y + area.y);
+    const intoViewer = () => clickAt(wb.session, outer.x + area.x, outer.y + area.y);
     await intoViewer();
     await sleep(300);
     const scale0 = await E(`${V}.currentScale`);
@@ -102,19 +102,19 @@ try {
     const zoom0 = await windowZoom();
     // the viewer's next scale, from pdf.js's event bus; 5 s is the last resort for a key that the viewer does not get
     await E(`(() => { window.__scaleChange = new Promise((resolve) => { ${V}.eventBus.on('scalechanging', (event) => resolve(event.scale), { once: true }); setTimeout(() => resolve(undefined), 5000); }); return true; })()`);
-    await key(wb.session, '=', 'Equal', 187, 2);
+    await pressKey(wb.session, 'Ctrl+=');
     const scale1 = (await E('window.__scaleChange')) ?? scale0;
     check('Ctrl+= in the viewer zooms the PDF by 1.25', Math.abs(scale1 / scale0 - 1.25) < 0.02, `${scale0.toFixed(3)} -> ${scale1.toFixed(3)}`);
     const zoom1 = await windowZoom();
     check('the window keeps its zoom', zoom1 === zoom0, `the workbench's devicePixelRatio ${zoom0} -> ${zoom1}`);
     await E(`(() => { window.__scaleChange = new Promise((resolve) => { ${V}.eventBus.on('scalechanging', (event) => resolve(event.scale), { once: true }); setTimeout(() => resolve(undefined), 5000); }); return true; })()`);
-    await key(wb.session, '-', 'Minus', 189, 2);
+    await pressKey(wb.session, 'Ctrl+-');
     await E('window.__scaleChange');
 
     // Ctrl+P in the viewer opens Quick Open
     await intoViewer();
     await sleep(300);
-    await key(wb.session, 'p', 'KeyP', 80, 2);
+    await pressKey(wb.session, 'Ctrl+P');
     // the first Quick Open of a window takes longer
     let quick = false;
     for (let i = 0; i < 30 && !quick; i++) {
@@ -122,14 +122,14 @@ try {
         quick = await wb.E(`(() => { const w = document.querySelector('.quick-input-widget'); return !!w && getComputedStyle(w).display !== 'none'; })()`);
     }
     check('Ctrl+P in the viewer opens Quick Open', quick);
-    await key(wb.session, 'Escape', 'Escape', 27);
+    await pressKey(wb.session, 'Escape');
     await sleep(300);
 
     // find, in a PDF read whole (the pdfjs viewer only)
     if (engine === 'pdfjs') {
         await intoViewer();
         await sleep(200);
-        await key(wb.session, 'f', 'KeyF', 70, 2);
+        await pressKey(wb.session, 'Ctrl+F');
         await sleep(500);
         const findOpen = await E(`(() => { const b = document.getElementById('findbar'); return !!b && !b.classList.contains('hidden'); })()`);
         check('Ctrl+F in the viewer opens pdf.js\'s find bar', findOpen);
@@ -140,7 +140,7 @@ try {
             await sleep(1500);
             const count = await E(`(() => { const c = PDFViewerApplication.findController; return { matches: c?._matchesCountTotal ?? null, consent: !!document.getElementById('findConsent') }; })()`);
             check(`find finds "${findText}" without asking first (the PDF is read whole)`, (count.matches ?? 0) > 0 && !count.consent, JSON.stringify(count));
-            await key(wb.session, 'Escape', 'Escape', 27);
+            await pressKey(wb.session, 'Escape');
         }
     }
 } catch (error) {

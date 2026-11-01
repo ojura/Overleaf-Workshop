@@ -1,7 +1,7 @@
 // The pdfjs viewer: does a build that is in view stay when the host sends it again, does a new
 // build still load, and do the zoom buttons and Ctrl+= step by 1.25?
 //   node probes/pdfjs-same-build-zoom.mjs [--ext DIR] [--port 8798]
-import { notWithinLimit } from '../../lib/devtools.mjs';
+import { clickAt, notWithinLimit, pressKey } from '../../lib/devtools.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 import { checker, openHarness } from '../common.mjs';
 import { pageDrawn, viewerOf } from '../viewers.mjs';
@@ -58,12 +58,8 @@ try {
     const afterIn = await page.evaluate(`${V}.currentScale`);
     check('the zoom-in button steps by 1.25', Math.abs(afterIn - 1.25) < 1e-9, `${afterIn}`);
     const box = await page.evaluate(`(() => { const r = ${V}.container.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
-    for (const type of ['mousePressed', 'mouseReleased']) {
-        await page.send('Input.dispatchMouseEvent', { type, x: box.x, y: box.y, button: 'left', clickCount: 1 });
-    }
-    for (const type of ['rawKeyDown', 'keyUp']) {
-        await page.send('Input.dispatchKeyEvent', { type, modifiers: 2, key: '=', code: 'Equal', windowsVirtualKeyCode: 187, nativeVirtualKeyCode: 187 });
-    }
+    await clickAt(page, box.x, box.y);
+    await pressKey(page, 'Ctrl+=');
     await sleep(300);
     const afterKey = await page.evaluate(`${V}.currentScale`);
     check('Ctrl+= steps by 1.25', Math.abs(afterKey - 1.56) < 1e-9, `${afterKey}`);

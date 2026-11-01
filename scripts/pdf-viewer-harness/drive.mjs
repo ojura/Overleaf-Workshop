@@ -10,7 +10,7 @@
 // The checks find the viewer's objects in the page through viewers.mjs.
 import fs from 'node:fs';
 import path from 'node:path';
-import { notWithinLimit } from '../lib/devtools.mjs';
+import { clickAt, notWithinLimit, pressKey } from '../lib/devtools.mjs';
 import { scriptOptions } from '../lib/options.mjs';
 import { launchChrome } from './cdp.mjs';
 import { book, bookFacts, checker, defaultExt, startServer, work } from './common.mjs';
@@ -193,44 +193,36 @@ try {
     await page.screenshot(path.join(shots, '8-zoom.png'));
 
     // 9. keys that belong to VS Code: do they reach VS Code's listener, and does Ctrl+S download the PDF?
-    const key = async (keyChar, code, vk, modifiers) => {
-        for (const type of ['rawKeyDown', 'keyUp']) {
-            await page.send('Input.dispatchKeyEvent', { type, modifiers, key: keyChar, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
-        }
-    };
     // a click in the viewer gives it the focus; the iframe of --frame fills the page, so the
     // viewer's coordinates are the page's
     const box = await page.evaluate(`(() => { const r = ${VIEWER}.container.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
-    for (const type of ['mousePressed', 'mouseReleased']) {
-        await page.send('Input.dispatchMouseEvent', { type, x: box.x, y: box.y, button: 'left', clickCount: 1 });
-    }
+    await clickAt(page, box.x, box.y);
     await resetStats();
     const seen = async (k, shift) => (await page.evaluate(`JSON.stringify(harness.messages('did-keydown').filter(e => e.key.toLowerCase() === '${k}' && e.ctrl && e.shift === ${shift}).length)`)) !== '0';
-    await key('p', 'KeyP', 80, 2);
+    await pressKey(page, 'Ctrl+P');
     await new Promise(r => setTimeout(r, 300));
     const ctrlP = await seen('p', false);
     check('Ctrl+P (Quick Open) reaches VS Code', ctrlP);
-    await key('P', 'KeyP', 80, 2 | 8);
+    await pressKey(page, 'Ctrl+Shift+P');
     await new Promise(r => setTimeout(r, 300));
     const ctrlShiftP = await seen('p', true);
     check('Ctrl+Shift+P (Command Palette) reaches VS Code', ctrlShiftP);
     const zoomBeforeKey = await page.evaluate(`${VIEWER}.currentScale`);
-    await key('=', 'Equal', 187, 2);
+    await pressKey(page, 'Ctrl+=');
     await new Promise(r => setTimeout(r, 400));
     const zoomed = (await page.evaluate(`${VIEWER}.currentScale`)) > zoomBeforeKey * 1.05;
     const ctrlEqToVSCode = await seen('=', false);
     check('Ctrl+= zooms the PDF (trusted key event)', zoomed);
     check('Ctrl+= stays with the viewer (VS Code would zoom its window too)', !ctrlEqToVSCode);
-    await key('0', 'Digit0', 48, 2);
+    await pressKey(page, 'Ctrl+0');
     await new Promise(r => setTimeout(r, 300));
-    await key('s', 'KeyS', 83, 2);
+    await pressKey(page, 'Ctrl+S');
     await new Promise(r => setTimeout(r, 3000));
     s = await stats();
     check('Ctrl+S reaches VS Code', await seen('s', false));
     check('Ctrl+S does not download the PDF through the bridge', s.bridgeBytes < 8 * 1048576 && s.outputWholeRequests === 0, traffic(s));
     metrics.keys = { ctrlP, ctrlShiftP, ctrlEqToVSCode, ctrlSBridgeMB: +(s.bridgeBytes / 1048576).toFixed(2) };
-    await page.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
-    await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+    await pressKey(page, 'Escape');
 
     // 10. pdf.js's viewer only: what a search downloads
     if (engine === 'pdfjs') {
