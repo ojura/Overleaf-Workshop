@@ -2,14 +2,15 @@
 // viewer loads in ranges through the extension host. It closes and reopens the output.pdf tab, so
 // that the viewer the setting picks opens it, attaches to the viewer page as soon as the webview
 // exists, and checks that the page in view is drawn, that pdf.js runs in its own worker in the
-// version that package.json pins (PDFJS_VERSION in viewers.mjs),
-// that the build is loaded in ranges, and that jumps to page 200 and to the last page draw them.
-// With --theme-page N it also draws page N in the default and the dark theme and checks that
-// colored pixels of images keep their colors and the white background takes the theme's color;
-// pick a page with images for N (find-image-page.mjs lists some). A colored pixel counts as an
-// image's when it lies outside the text layer's spans and its eight neighbors are colored too:
-// the colored edges of anti-aliased text change with the text's color. At the end the viewer is back
-// on page 1, where the extension then keeps it.
+// version that package.json pins (PDFJS_VERSION in viewers.mjs), that the build is loaded in
+// ranges, and that jumps to page 200 and to the last page draw them. With --theme-page N it also
+// draws page N in the default and the dark theme and checks that colored pixels of images keep
+// their colors and that the white background, outside the boxes of the page's images, takes the
+// theme's color; pick a page with images for N (find-image-page.mjs lists some). A colored pixel
+// counts as an image's when it lies outside the text layer's spans and its eight neighbors are
+// colored too: the colored edges of anti-aliased text change with the text's color. The boxes of
+// the images come from pdf.js's operator list (imageBoxesFunction in viewers.mjs); an image keeps
+// its own white. At the end the viewer is back on page 1, where the extension then keeps it.
 //   node ide/drive-build.mjs [--theme-page N]
 // Open output.pdf in the instance first, for example with Overleaf Workshop's View PDF command.
 import { scriptOptions } from '../../lib/options.mjs';
@@ -58,14 +59,15 @@ try {
         const toTheme = (theme) => E(`(${switchThemeFunction(shown.engine)})(${themePage}, ${JSON.stringify(theme)})`);
         const shownPage = await goTo(themePage);
         if (shownPage.error) { throw new Error(shownPage.error); }
-        // pixels on a grid of about 80 x 120, each with whether it counts as an image's (pagePixelsFunction)
+        // pixels on a grid of about 80 x 120, each with whether it counts as an image's and whether
+        // it lies in an image's box (pagePixelsFunction)
         const sample = `(async () => {
-            const { width, height, data, inImage } = await (${pagePixelsFunction(shown.engine)})(${themePage});
+            const { width, height, data, inImage, inImageBox } = await (${pagePixelsFunction(shown.engine)})(${themePage});
             const pts = [];
             for (let y = 2; y < height - 1; y += Math.max(1, Math.floor(height / 120))) {
                 for (let x = 2; x < width - 1; x += Math.max(1, Math.floor(width / 80))) {
                     const i = (y * width + x) * 4;
-                    pts.push([data[i], data[i + 1], data[i + 2], inImage(x, y)]);
+                    pts.push([data[i], data[i + 1], data[i + 2], inImage(x, y), inImageBox(x, y)]);
                 }
             }
             return pts;
@@ -76,15 +78,22 @@ try {
         const dark = await E(sample);
         // the dark theme's background as the instance gives it to the viewer: its setting, else the setting's default
         const darkBackground = themeColors('dark', settings(inst).get(THEMES_SETTING)).bgColor.match(/[0-9a-f]{2}/g).map(h => parseInt(h, 16));
-        let kept = 0, changed = 0, white = 0, background = 0;
-        plain.forEach(([r, gr, b, inImage], i) => {
+        // the page's white background: white points outside the images' boxes, since an image keeps its own white
+        let kept = 0, changed = 0, white = 0, background = 0, whiteInImages = 0;
+        plain.forEach(([r, gr, b, inImage, inImageBox], i) => {
             const q = dark[i];
             if (!q) { return; }
             if (inImage) { if (Math.abs(r - q[0]) <= 2 && Math.abs(gr - q[1]) <= 2 && Math.abs(b - q[2]) <= 2) { kept++; } else { changed++; } }
-            if (r >= 250 && gr >= 250 && b >= 250) { white++; if (darkBackground.every((value, k) => q[k] === value)) { background++; } }
+            if (r >= 250 && gr >= 250 && b >= 250) {
+                if (inImageBox) { whiteInImages++; return; }
+                white++;
+                if (darkBackground.every((value, k) => q[k] === value)) { background++; }
+            }
         });
+        console.log(`white points on page ${themePage}: ${white} of the page's background, ${whiteInImages} in the boxes of its images`);
         check(`dark theme on page ${themePage}: the images' colored pixels keep their colors`, kept > 0 && changed <= kept * 0.02, `${kept} kept, ${changed} changed`);
-        check(`dark theme on page ${themePage}: the white background takes the theme's color`, white > 0 && background >= white * 0.9, `${background} of ${white}`);
+        // a few in a thousand of the background's white points lie at the anti-aliased edges of text or of an image
+        check(`dark theme on page ${themePage}: the white background takes the theme's color`, white > 0 && background >= white * 0.98, `${background} of ${white}`);
         await toTheme('default');
     }
     // the extension keeps the view's position; leave it at the start of the document

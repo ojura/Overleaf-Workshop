@@ -291,12 +291,56 @@ export const areaColorsFunction = (engine) => `((pageNumber, boxes, inset = 2) =
 })`;
 
 /**
+ * The source of an async function for a page of the viewer `engine`, (pageNumber) => boxes: the
+ * box [x0, y0, x1, y1] in the drawn canvas's pixels of each image that page `pageNumber` paints,
+ * from pdf.js's operator list of the page. The transform at an image's painting maps the unit
+ * square onto the image; the list's transforms, saves and restores, and the matrices of form
+ * XObjects make that transform, and pdf.js's repeated and grouped images give each image its own
+ * transform after it. Image masks, which pdf.js paints in the fill color, are not images here.
+ */
+export const imageBoxesFunction = (engine) => `(async (pageNumber) => {
+    const view = ${viewerOf(engine)}.getPageView(pageNumber - 1);
+    const canvas = view.canvas || view.div.querySelector('canvas');
+    const { OPS } = globalThis.pdfjsLib;
+    const { fnArray, argsArray } = await view.pdfPage.getOperatorList();
+    // m after n: the transform that applies n, then m (PDF's concatenation of a cm onto the CTM)
+    const after = (m, n) => [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
+    const sx = canvas.width / view.viewport.width, sy = canvas.height / view.viewport.height;
+    const boxes = [];
+    const add = (m) => {
+        const corners = [[0, 0], [1, 0], [0, 1], [1, 1]].map(([x, y]) => view.viewport.convertToViewportPoint(m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]));
+        const xs = corners.map(c => c[0] * sx), ys = corners.map(c => c[1] * sy);
+        boxes.push([Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)]);
+    };
+    let ctm = [1, 0, 0, 1, 0, 0];
+    const saved = [];
+    fnArray.forEach((fn, i) => {
+        const args = argsArray[i];
+        if (fn === OPS.save) { saved.push(ctm); }
+        else if (fn === OPS.restore) { ctm = saved.pop() ?? ctm; }
+        else if (fn === OPS.transform) { ctm = after(ctm, args); }
+        else if (fn === OPS.paintFormXObjectBegin) { saved.push(ctm); if (args[0]) { ctm = after(ctm, args[0]); } }
+        else if (fn === OPS.paintFormXObjectEnd) { ctm = saved.pop() ?? ctm; }
+        else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject) { add(ctm); }
+        else if (fn === OPS.paintImageXObjectRepeat) {
+            const [, scaleX, scaleY, positions] = args;
+            for (let k = 0; k < positions.length; k += 2) { add(after(ctm, [scaleX, 0, 0, scaleY, positions[k], positions[k + 1]])); }
+        } else if (fn === OPS.paintInlineImageXObjectGroup) {
+            for (const entry of args[1]) { add(after(ctm, entry.transform)); }
+        }
+    });
+    return boxes;
+})`;
+
+/**
  * The source of an async function for a page of the viewer `engine`, (pageNumber) => pixels: the
  * drawn canvas of page `pageNumber` as { width, height, data } (getImageData), with colored(x, y),
- * whether a pixel is colored (its channels differ by more than 40), and inImage(x, y), whether a
+ * whether a pixel is colored (its channels differ by more than 40), inImage(x, y), whether a
  * pixel counts as an image's: it is colored, lies outside the text layer's spans (2 px wider on
- * each side), and its eight neighbors are colored too. The colored edges of anti-aliased text change
- * with the text's color, and this leaves them out. It waits up to `limitMs` for the page's text
+ * each side), and its eight neighbors are colored too, and inImageBox(x, y), whether a pixel lies
+ * in the box of an image that the page paints (imageBoxesFunction), which holds the image's white
+ * too. The colored edges of anti-aliased text change with the text's color, and inImage leaves
+ * them out. It waits up to `limitMs` for the page's text
  * layer: pdf.js adds the element .endOfContent to it once it has rendered it, also when the page
  * has no text, and then reports 'textlayerrendered'.
  */
@@ -328,5 +372,7 @@ export const pagePixelsFunction = (engine, limitMs = DRAW_LIMIT_MS) => `(async (
         for (let dy = -1; dy <= 1; dy++) { for (let dx = -1; dx <= 1; dx++) { if (!colored(x + dx, y + dy)) { return false; } } }
         return true;
     };
-    return { width, height, data, colored, inImage };
+    const imageBoxes = await (${imageBoxesFunction(engine)})(pageNumber);
+    const inImageBox = (x, y) => imageBoxes.some(([x0, y0, x1, y1]) => x >= x0 && x <= x1 && y >= y0 && y <= y1);
+    return { width, height, data, colored, inImage, inImageBox, imageBoxes };
 })`;
