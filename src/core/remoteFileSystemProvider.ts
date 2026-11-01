@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, COMPILERS, CompileResponseSchema, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import type { CompileRecord } from '../compile/outputFiles';
-import { SocketIOAPI, UpdateSchema } from '../api/socketio';
+import { EmitRefusedError, isMissingOpsRefusal, SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { applyOps, opsFor, overleafLineEndings, TrackChangesState, updateMeta } from '../utils/docUpdate';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
@@ -34,6 +34,10 @@ export interface DocumentEntity extends FileEntity {
     version?: number,
     mtime?: number,
     lastVersion?: number,
+    /**
+     * The text that the next write of the doc is based on: the writer's text is merged with
+     * what changed on Overleaf since. Undefined while `undetermined` is set.
+     */
     localCache?: string,
     remoteCache?: string,
     /**
@@ -41,16 +45,24 @@ export interface DocumentEntity extends FileEntity {
      * Overleaf takes an update of a doc only over a connection that joined the doc.
      */
     joinedOn?: number,
-    /** the last of this doc's writes, which run one at a time (see VirtualFileSystem.serialize) */
+    /** the last of this doc's writes and reads from Overleaf, which run one at a time (see VirtualFileSystem.serialize) */
     writes?: Promise<void>,
     /** Set while one of our updates waits for Overleaf's answer (see VirtualFileSystem.attempt). */
     sync?: Attempt,
     /**
      * A write that Overleaf may or may not have applied: its answer was lost, or Overleaf reported
-     * an error for the doc while it waited. It is sent again before the next write of the doc and
-     * by documentUpdatesSettled (see confirmWrite).
+     * an error for the doc while it waited. It is settled from what Overleaf reports before the
+     * doc is read from Overleaf or written again, and by documentUpdatesSettled (see
+     * settleUnconfirmed).
      */
     unconfirmed?: PendingWrite,
+    /**
+     * A write with an outcome that cannot be determined (see settleUnconfirmed). It is not sent
+     * again, the user is told, and the base of the next write is not known until a reader takes
+     * Overleaf's text (see takeRead) or the user chooses to make the editor's text Overleaf's
+     * (`overwrite`).
+     */
+    undetermined?: {write: PendingWrite, reason: string, overwrite?: boolean, shown?: boolean},
 }
 
 interface PendingWrite {
@@ -61,20 +73,26 @@ interface PendingWrite {
     content: string,
     /** `localCache` before the write */
     base: string,
+    /** when the write was made, for messages */
+    madeAt: number,
+    /** how many times the update was sent */
+    attempts: number,
     /** `seq` of the connection current at the first attempt (see VirtualFileSystem.connections) */
     firstConnection?: number,
     /** why the last attempt ended without Overleaf confirming the update */
     failure?: string,
-    /** Overleaf reported an error for the doc (otUpdateError) while an attempt of this write waited */
-    rejected?: boolean,
+    /** Overleaf reported an error for the doc (otUpdateError) while a resend of this write waited */
+    resendRejected?: boolean,
 }
 
 /**
- * How an attempt to send a write ended: Overleaf applied the update at `version`; Overleaf
- * reported an error for the doc; or no answer can come any more.
+ * How an attempt to send a write ended: Overleaf applied the update at `version`; refused it
+ * before queuing it (the emit's callback carried an error); reported an error for the doc while
+ * it waited (otUpdateError); or the answer cannot arrive any more.
  */
 type Answer =
     | {kind: 'applied', version: number}
+    | {kind: 'refused', error: string}
     | {kind: 'rejected', error: string}
     | {kind: 'lost', error: string};
 
@@ -88,10 +106,13 @@ interface Attempt {
     buffered: UpdateSchema[],
 }
 
-/** Overleaf has not confirmed the last write of each of `documents` (see documentUpdatesSettled). */
+/**
+ * Overleaf has not confirmed the last write of each of `documents`: the write waits to be
+ * settled, or its outcome cannot be determined (see documentUpdatesSettled).
+ */
 export class UnconfirmedWritesError extends Error {
     constructor(readonly documents: {path: string, reason: string}[]) {
-        super(`Overleaf has not confirmed the last update of ${documents.map(d => `${d.path} (${d.reason})`).join(', ')}`);
+        super(`Overleaf has not confirmed these updates: ${documents.map(d => `${d.path}: ${d.reason}`).join('; ')}`);
         this.name = 'UnconfirmedWritesError';
     }
 }
@@ -202,13 +223,16 @@ export class VirtualFileSystem extends vscode.Disposable {
     /**
      * A last resort: how long an update waits for Overleaf's answer. The wait ends with the
      * answer, which is the op-less otUpdateApplied that Overleaf sends the author once the update
-     * is applied, or otUpdateError for the doc; or when the connection is lost. This limit is for
-     * an update that Overleaf drops without telling anyone: document-updater applies a project's
-     * queued updates in batches, stops a batch at the first update that fails, and real-time
-     * tells of the failure only the connections that joined that update's doc
-     * (RealTimeRedisManager.getPendingProjectUpdates, UpdateManager.fetchAndApplyProjectUpdates,
+     * is applied, a refusal in the emit's callback, or otUpdateError for the doc; or when the
+     * connection is lost. This limit is for an update that Overleaf does not answer at all:
+     * document-updater applies a project's queued updates in batches and stops a batch at the
+     * first update that fails, real-time tells of the failure only the connections that joined
+     * that update's doc, and the updates queued after the batch wait for the project's next
+     * update (RealTimeRedisManager.getPendingProjectUpdates, UpdateManager.fetchAndApplyProjectUpdates,
      * DocumentUpdaterController._processErrorFromDocumentUpdater). The value is the one after
-     * which Overleaf's editor reports an update as failed (FATAL_OP_TIMEOUT in share-js-doc.ts).
+     * which Overleaf's editor reports an update as failed when it does not keep an offline copy
+     * of the document (FATAL_OP_TIMEOUT in share-js-doc.ts); with the offline copy it does not
+     * limit the wait.
      */
     static updateAnswerLimitMs = 45 * 1000;
     /** whether this session has told the user that "\r\n" line endings go up as "\n" */
@@ -243,11 +267,14 @@ export class VirtualFileSystem extends vscode.Disposable {
     private joinedOnce = false;
     /** Set while a lost connection is made again: settles with the project once it is joined. */
     private reconnecting?: {promise: Promise<ProjectEntity>, resolve: (project: ProjectEntity) => void};
-    /** Whether the project is joined on a working connection now, e.g. for a tool asking for the state. */
+    /**
+     * Whether the project is joined on a connection that Overleaf accepted, so that an update or
+     * a read of a doc can go out now (see readyToSend); also for a tool asking for the state.
+     */
     get connected(): boolean {
-        return this.joinedOnce && !this.disposed && this.reconnected===undefined && this.reconnecting===undefined;
+        return !this.disposed && this.root!==undefined && this.reconnected===undefined;
     }
-    /** the tree before the connection was lost, whose documents keep their editing state */
+    /** the tree before the connection was lost; its documents keep their editing state */
     private previousRoot?: ProjectEntity;
     /** why the connection was lost again while a reconnect was still setting up the new one */
     private lostWhileJoining?: string;
@@ -292,6 +319,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.scmCollectionItem?.triggers.forEach((trigger) => trigger.dispose());
             this.scmCollectionItem = undefined;
             this.changes.dispose();
+            // the updates waiting for an answer end, with their timers
+            this.answersLost('the project was closed');
             this.disposed = true;
             // disconnect socketio
             // this.socket.disconnect();
@@ -968,16 +997,19 @@ export class VirtualFileSystem extends vscode.Disposable {
 
         if (fileType==='doc') {
             const doc = fileEntity as DocumentEntity;
-            if (doc.remoteCache!==undefined) {
+            if (doc.remoteCache!==undefined && doc.unconfirmed===undefined) {
                 const content = doc.remoteCache;
-                // the editor is about to show this content, so it is the base of its next write
-                const _doc = vscode.workspace.textDocuments.find((d) => d.uri.toString()===uri.toString());
-                if (!_doc || !_doc.isDirty) { doc.localCache = content; }
+                this.takeRead(doc, uri, content);
                 EventBus.fire('fileWillOpenEvent', {uri});
                 return new TextEncoder().encode(content);
             } else {
-                const content = await this.readDoc(doc);
-                doc.localCache  = content;
+                // A write that Overleaf has not confirmed is settled first, so that the reader
+                // gets Overleaf's text with that write's outcome known (see settleUnconfirmed).
+                const content = await this.serialize(doc, async () => {
+                    if (doc.unconfirmed) { await this.settleUnconfirmed(uri, doc); }
+                    return doc.remoteCache ?? (await this.readDoc(doc)).content;
+                });
+                this.takeRead(doc, uri, content);
                 EventBus.fire('fileWillOpenEvent', {uri});
                 return new TextEncoder().encode(content);
             }
@@ -1203,8 +1235,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     /**
      * Replace the text of the document at `uri`, and resolve once Overleaf has applied the
      * update. Rejects with FileNotFound when `uri` is not a document, e.g. once it is deleted or
-     * replaced by a binary file, and with an error when Overleaf has not confirmed the update
-     * (see settle).
+     * replaced by a binary file. Rejects with an error when Overleaf refused the update or has
+     * not confirmed it (see settle), and while the doc has a write with an outcome that cannot
+     * be determined and the user has not chosen to make this text Overleaf's (see undetermined).
      */
     async writeDoc(uri: vscode.Uri, content: Uint8Array): Promise<void> {
         const {fileType, fileEntity} = await this._resolveUri(uri);
@@ -1219,15 +1252,25 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (text!==decoded) { this.lineEndingsNormalized(doc); }
         await this.serialize(doc, async () => {
             if (doc.unconfirmed) {
-                // An earlier write may or may not have been applied: settle it first, so that
-                // its edit is neither lost nor applied twice.
-                await this.confirmWrite(uri, doc, doc.unconfirmed);
+                // Overleaf may or may not have applied an earlier write: settle it first, so
+                // that its edit is neither lost nor applied twice.
+                await this.settleUnconfirmed(uri, doc);
             }
             await this.readyToSend(doc);
+            const undetermined = doc.undetermined;
+            if (undetermined) {
+                if (!undetermined.overwrite) {
+                    this.tellUndetermined(uri, doc);
+                    throw new Error(`${uri.path}: Overleaf Workshop cannot tell whether Overleaf applied the update of ${VirtualFileSystem.timeOf(undetermined.write)} (${undetermined.reason}), so it does not merge this text with Overleaf's. Compare it with Overleaf's text; to make it Overleaf's text, choose Save My Version in the notice about ${doc.name} and save again.`);
+                }
+                // the user chose to make this text Overleaf's text: base it on Overleaf's text as it is now
+                doc.localCache = doc.remoteCache;
+            }
             const write = this.writeFor(doc, text);
             if (write===undefined) {
-                // nothing to send: Overleaf holds this content already
+                // Overleaf holds this content already: the update would be empty
                 doc.localCache = text;
+                doc.undetermined = undefined;
                 this.notifyChanged(uri);
                 return;
             }
@@ -1238,7 +1281,7 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     /**
      * The write that turns Overleaf's copy of `doc` into `text`, with the ops of others since the
-     * editor's base merged in; undefined when it would send nothing.
+     * doc's base merged in; undefined when the merged text equals Overleaf's copy.
      */
     private writeFor(doc: DocumentEntity, text: string): PendingWrite | undefined {
         const dmp = new DiffMatchPatch();
@@ -1268,63 +1311,72 @@ export class VirtualFileSystem extends vscode.Disposable {
                 return meta ? {meta} : {};
             })(),
         };
-        return {update, mergeRes, content: text, base: doc.localCache!};
+        return {update, mergeRes, content: text, base: doc.localCache!, madeAt: Date.now(), attempts: 0};
     }
 
     /**
-     * Run `task` after the writes of `doc` that came before it, whatever their outcome, so that
-     * a doc has one write going at a time. The caller gets the outcome of `task`.
+     * Run `task` after the writes and reads from Overleaf of `doc` that came before it, whatever
+     * their outcome, so that one of them runs at a time. The caller gets the outcome of `task`.
      */
-    private serialize(doc: DocumentEntity, task: () => Promise<void>): Promise<void> {
+    private serialize<T>(doc: DocumentEntity, task: () => Promise<T>): Promise<T> {
         const run = (doc.writes ?? Promise.resolve()).then(task);
         doc.writes = run.then(() => undefined, () => undefined);
         return run;
     }
 
-    /** Whether an update can go out now: the project is joined on a connection that Overleaf accepted. */
-    private get canSend(): boolean {
-        return !this.disposed && this.root!==undefined && this.reconnected===undefined;
-    }
-
     /**
-     * Wait until an update of `doc` can go out: see canSend, and the doc must be joined on the
-     * current connection with a known version, as Overleaf takes an update only over a
-     * connection that joined its doc (real-time's AuthorizationManager). An update emitted
-     * while socket.io reconnects would go out over the next connection, which dupIfSource
-     * could not name should it drop before accepting us. Fails as the other file operations
-     * do when the connection does not come back (see waitForReconnect).
+     * Wait until a request about a doc can go out (see connected). An update emitted while
+     * socket.io reconnects would go out over the next connection, which dupIfSource could not
+     * name should it drop before accepting us. Fails as the other file operations do when the
+     * connection does not come back (see waitForReconnect).
      */
-    private async readyToSend(doc: DocumentEntity) {
-        for (;;) {
+    private async waitConnected() {
+        while (!this.connected) {
             if (this.disposed) {
                 throw vscode.FileSystemError.Unavailable(`${this.projectName}: the project is closed`);
             }
-            if (!this.canSend) {
-                await (this.reconnected ? this.waitForReconnect(this.reconnected.promise) : this.init());
-            } else if (doc.joinedOn!==this.connectionSeq || doc.version===undefined || doc.remoteCache===undefined) {
-                // never read, read on an earlier connection, or dropped after a missed op
-                await this.resyncDoc(doc);
-            } else {
-                return;
-            }
+            await (this.reconnected ? this.waitForReconnect(this.reconnected.promise) : this.init());
         }
     }
 
     /**
+     * Wait until an update of `doc` can go out: see waitConnected, and the doc must be joined on
+     * the current connection with a known version, as Overleaf takes an update only over a
+     * connection that joined its doc (real-time's AuthorizationManager).
+     */
+    private async readyToSend(doc: DocumentEntity) {
+        for (;;) {
+            await this.waitConnected();
+            if (doc.joinedOn===this.connectionSeq && doc.version!==undefined && doc.remoteCache!==undefined) {
+                return;
+            }
+            // never read, read on an earlier connection, or dropped after a missed op
+            await this.resyncDoc(doc);
+        }
+    }
+
+    /**
+     * The publicIds of the connections that `write` may have gone out over: the one current at its
+     * first attempt or, as socket.io sends an emit made while reconnecting over the next
+     * connection, any connection accepted since.
+     */
+    private sourcesOf(write: PendingWrite): string[] {
+        return this.connections.filter(c => c.seq>=write.firstConnection!).map(c => c.publicId);
+    }
+
+    /**
      * Send `write` once and wait for the answer: Overleaf's answer to the update (see
-     * onFileChanged and onUpdateError), a failed emit, or the loss of the connection (see
+     * onFileChanged and onUpdateError), the emit's callback, or the loss of the connection (see
      * answersLost). `updateAnswerLimitMs` is a last resort.
      */
     private attempt(doc: DocumentEntity, write: PendingWrite): Attempt {
         write.firstConnection ??= this.connectionSeq;
-        // A copy sent before may have reached Overleaf over the connection current at the first
-        // attempt or, as socket.io sends an emit made while reconnecting over the next
-        // connection, over any connection accepted since. dupIfSource names them: Overleaf
-        // answers such a copy as applied instead of applying the update twice.
-        const update = write.failure===undefined ? write.update : {
-            ...write.update,
-            dupIfSource: this.connections.filter(c => c.seq>=write.firstConnection!).map(c => c.publicId),
-        };
+        write.attempts += 1;
+        // dupIfSource names the connections that a copy sent before may have reached Overleaf
+        // over: Overleaf answers such a copy as applied instead of applying the update twice,
+        // when the update is at most maxUpdateAge versions behind the doc and Overleaf still keeps
+        // the ops since its version (see settleUnconfirmed).
+        const update = write.attempts===1 ? write.update : {...write.update, dupIfSource: this.sourcesOf(write)};
         let resolve!: (answer: Answer) => void;
         const answered = new Promise<Answer>((r) => { resolve = r; });
         const limit = setTimeout(() => resolve({
@@ -1339,21 +1391,29 @@ export class VirtualFileSystem extends vscode.Disposable {
         };
         doc.sync = attempt;
         this.socket.applyOtUpdate(doc._id, update).then(() => {
-            // The callback only means that Overleaf queued the update. The alternative
-            // connection scheme sends no other answer: there, the callback is all there is.
+            // The callback only means that Overleaf queued the update. The alternative connection
+            // scheme does not send another answer: there, the callback is all there is.
             if (this.socket.isUsingAlternativeConnectionScheme) {
                 attempt.answer({kind: 'applied', version: write.update.v});
             }
-        }, (error: any) => attempt.answer({kind: 'lost', error: error?.message ?? String(error)}));
+        }, (error: any) => attempt.answer(error instanceof EmitRefusedError
+            ? {kind: 'refused', error: error.message}
+            : {kind: 'lost', error: error?.message ?? String(error)}));
         return attempt;
     }
 
     /**
-     * Settle `doc` with the answer to `attempt`. Applied: the written content is the editor's
-     * base, and Overleaf's copy is known again. Otherwise the update is not known to be
-     * applied: the doc keeps the base from before the write, so that a later write still
-     * carries the edit, and the editor is not reloaded over it. The write is kept to be sent
-     * again (see confirmWrite), and this throws.
+     * Settle `doc` with the answer to `attempt`, and throw unless Overleaf applied the update.
+     * - Applied: the written content is the doc's base, and Overleaf's copy is known again.
+     * - Refused at its first attempt: real-time refuses an update before it queues it
+     *   (WebsocketController.applyOtUpdate), so it is not applied and will not be; a redis
+     *   failure in queueChange's second push is the one exception, after which the update is
+     *   queued (DocumentUpdaterManager.queueChange). The doc's base reverts to the one from
+     *   before the write, so the next write of the doc carries the edit.
+     * - Otherwise Overleaf may or may not apply it: the base reverts to the one from before the
+     *   write, the editor is not reloaded over the edit, and the write is kept until it is
+     *   settled from what Overleaf reports (see settleUnconfirmed), which happens before the doc
+     *   is read from Overleaf or written again.
      */
     private async settle(uri: vscode.Uri, doc: DocumentEntity, attempt: Attempt): Promise<void> {
         const answer = await attempt.answered;
@@ -1361,6 +1421,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         try {
             if (answer.kind==='applied') {
                 doc.unconfirmed = undefined;
+                doc.undetermined = undefined;
                 doc.localCache = write.content;
                 if (answer.version===write.update.v && doc.version===write.update.v && doc.remoteCache!==undefined) {
                     // applied as sent, to the copy it was made for: that copy is now `mergeRes`
@@ -1381,60 +1442,166 @@ export class VirtualFileSystem extends vscode.Disposable {
                 return;
             }
             doc.localCache = write.base;
+            if (answer.kind==='refused' && write.attempts===1) {
+                doc.unconfirmed = undefined;
+                throw new Error(`${uri.path}: Overleaf refused the update (${answer.error}); the next write of the file sends the edit again`);
+            }
             doc.remoteCache = undefined;
             doc.version = undefined;
-            if (answer.kind==='rejected' && write.rejected) {
-                // Overleaf reported an error for the doc while this update waited, the second
-                // time: take it that Overleaf cannot apply it, e.g. a delete that does not match
-                // its text. The next write carries the edit, made against Overleaf's text then.
-                doc.unconfirmed = undefined;
-                throw new Error(`${uri.path}: Overleaf could not apply the update (${answer.error}); the next write of the file sends the edit again`);
-            }
-            write.rejected ||= answer.kind==='rejected';
+            if (answer.kind==='rejected' && write.attempts>1) { write.resendRejected = true; }
             write.failure = answer.error;
             doc.unconfirmed = write;
-            throw new Error(`${uri.path}: Overleaf has not confirmed the update (${answer.error}); it is sent again before the next write of the file, and Overleaf applies it only once`);
+            throw new Error(`${uri.path}: Overleaf has not confirmed the update (${answer.error}). Before the file is read from Overleaf or written again, Overleaf Workshop asks Overleaf whether it applied the update, and sends it again when Overleaf did not and can still take it.`);
         } finally {
             this.endSync(doc, attempt);
         }
     }
 
+    /** Ops further behind a doc than this Overleaf refuses as too old (MAX_AGE_OF_OP in document-updater's ShareJsUpdateManager). */
+    private static readonly maxUpdateAge = 80;
+
     /**
-     * Send `write`, which Overleaf has not confirmed, again, after joining the doc on the current
-     * connection. Overleaf applies it, or answers it as applied if a copy sent before was
-     * (dupIfSource, see attempt). Throws while it is still not confirmed.
+     * Settle the doc's unconfirmed write from what Overleaf reports, and throw while it stays
+     * unconfirmed. Overleaf reads the doc from the write's version (joinDoc with fromVersion,
+     * which also joins the doc on this connection) and returns the ops applied since, each with
+     * the connection that sent it:
+     * - One came from a connection the write went out over: the write is applied.
+     * - Overleaf no longer keeps those ops (it keeps a doc's last 100 ops for an hour, and drops
+     *   them when the project is flushed): whether it applied the write cannot be determined.
+     * - They all came from other connections: the write is not applied so far, and a copy may
+     *   still be queued, e.g. behind a batch that failed. When the doc has moved more than
+     *   maxUpdateAge versions since, Overleaf refuses any copy of it as too old, so it will not
+     *   be applied: the doc's next write carries the edit. When a resend of it was rejected
+     *   already, its outcome cannot be determined. Else it is sent again unchanged: Overleaf
+     *   applies it, or answers it as applied when a copy that went out earlier is applied first
+     *   (dupIfSource).
+     * A write with an outcome that cannot be determined is not sent again: the user is told,
+     * and the edit stays in the writer's text (see DocumentEntity.undetermined).
+     *
+     * An editor that drops the unsaved text (Revert, or closing without saving) does not withdraw
+     * the write: Overleaf may have applied it already, or apply a copy it has queued, and only
+     * settling it tells which. The editor's next read settles it first, so the editor then shows
+     * Overleaf's text with the write's outcome.
      */
-    private async confirmWrite(uri: vscode.Uri, doc: DocumentEntity, write: PendingWrite) {
-        await this.readyToSend(doc);
+    private async settleUnconfirmed(uri: vscode.Uri, doc: DocumentEntity): Promise<void> {
+        const write = doc.unconfirmed!;
+        await this.waitConnected();
+        let ops: Array<{meta?: {source?: string}}>;
+        try {
+            ops = await this.resyncDoc(doc, write.update.v);
+        } catch (error: any) {
+            if (isMissingOpsRefusal(error)) {
+                this.cannotDetermine(uri, doc, write, `Overleaf no longer keeps the document's updates since then (${error.message})`);
+                return;
+            }
+            throw new Error(`${uri.path}: Overleaf has not confirmed the update of ${VirtualFileSystem.timeOf(write)} (${write.failure}), and asking Overleaf about it failed (${error?.message ?? error})`);
+        }
+        const sources = this.sourcesOf(write);
+        if (ops.some(op => op?.meta?.source!==undefined && sources.includes(op.meta.source))) {
+            // applied; the copy just read holds it
+            doc.unconfirmed = undefined;
+            doc.undetermined = undefined;
+            doc.localCache = write.content;
+            return;
+        }
+        if (doc.version! - write.update.v > VirtualFileSystem.maxUpdateAge) {
+            console.log(`Overleaf Workshop: ${uri.path}: Overleaf did not apply the update of ${VirtualFileSystem.timeOf(write)}, and now refuses it as too old; the next write of the file sends the edit again`);
+            doc.unconfirmed = undefined;
+            doc.localCache = write.base;
+            return;
+        }
+        if (write.resendRejected) {
+            this.cannotDetermine(uri, doc, write, `Overleaf reported an error for the document when the update was sent again (${write.failure})`);
+            return;
+        }
+        if (!this.connected) {
+            throw new Error(`${uri.path}: Overleaf has not confirmed the update of ${VirtualFileSystem.timeOf(write)} (${write.failure}), and the connection was lost before it could be sent again`);
+        }
         await this.settle(uri, doc, this.attempt(doc, write));
+    }
+
+    /** `write`'s outcome cannot be determined: it is not sent again, the doc's base is not known, and the user is told. */
+    private cannotDetermine(uri: vscode.Uri, doc: DocumentEntity, write: PendingWrite, reason: string) {
+        console.warn(`Overleaf Workshop: ${uri.path}: cannot tell whether Overleaf applied the update of ${VirtualFileSystem.timeOf(write)}: ${reason}`);
+        doc.unconfirmed = undefined;
+        doc.undetermined = {write, reason};
+        doc.localCache = undefined;
+        this.tellUndetermined(uri, doc);
+    }
+
+    /**
+     * Tell the user that Overleaf Workshop cannot tell whether Overleaf applied the doc's write.
+     * With an editor open on the doc, the notice offers to compare its text with Overleaf's, and
+     * to make the editor's text Overleaf's text with the next save.
+     */
+    private tellUndetermined(uri: vscode.Uri, doc: DocumentEntity) {
+        const state = doc.undetermined;
+        if (state===undefined || state.shown) { return; }
+        state.shown = true;
+        const what = `${doc.name}: Overleaf Workshop cannot tell whether Overleaf applied the update of ${VirtualFileSystem.timeOf(state.write)}: ${state.reason}.`;
+        const open = vscode.workspace.textDocuments.some((d) => d.uri.toString()===uri.toString());
+        const compare = 'Compare With Overleaf', mine = 'Save My Version';
+        const shown = open
+            ? vscode.window.showWarningMessage(`${what} The editor keeps your text. Compare it with Overleaf's text; to make your text Overleaf's text, choose Save My Version and save the file.`, compare, mine)
+            : vscode.window.showWarningMessage(`${what} The next read of the file takes Overleaf's text as it is then; check the file.`);
+        Promise.resolve(shown).then((choice) => {
+            state.shown = false;
+            if (choice===mine && doc.undetermined===state) {
+                state.overwrite = true;
+            } else if (choice===compare) {
+                vscode.commands.executeCommand('workbench.files.action.compareWithSaved', uri);
+            }
+        }, () => { state.shown = false; });
+    }
+
+    /** When `write` was made, for messages. */
+    private static timeOf(write: PendingWrite): string {
+        return new Date(write.madeAt).toLocaleTimeString();
+    }
+
+    /**
+     * A read of the doc for `uri` returned `content`. A reader that shows the text without
+     * unsaved changes, or that is not an editor (the local replica), bases its next write on it:
+     * it becomes the doc's base, and a doc without a known base has one again. An editor with
+     * unsaved changes keeps its base: its text derives from that base, not from this read.
+     */
+    private takeRead(doc: DocumentEntity, uri: vscode.Uri, content: string) {
+        const editor = vscode.workspace.textDocuments.find((d) => d.uri.toString()===uri.toString());
+        if (!editor?.isDirty) {
+            doc.localCache = content;
+            doc.undetermined = undefined;
+        } else if (doc.localCache===undefined && doc.undetermined===undefined) {
+            doc.localCache = content; // the doc's first read
+        }
     }
 
     /**
      * Resolves once Overleaf has confirmed every document write made so far. Waits for the
-     * writes going on and, while an update can go out (see canSend), sends each write that
-     * Overleaf has not confirmed once more (see confirmWrite). Rejects with
+     * writes going on and, while the project is joined on a working connection (see connected),
+     * settles each write that Overleaf has not confirmed (see settleUnconfirmed). Rejects with
      * UnconfirmedWritesError naming the documents with a write that Overleaf has still not
-     * confirmed or could not apply; during a reconnect, the documents are those of the tree
-     * from before the connection was lost.
+     * confirmed, or with an outcome that cannot be determined; during a reconnect, the documents
+     * are those of the tree from before the connection was lost.
      */
     async documentUpdatesSettled(): Promise<void> {
         const docs = this.walk(entity => entity._type==='doc', this.root ?? this.previousRoot);
-        const notApplied = new Map<DocumentEntity, string>();
+        const checkFailed = new Map<DocumentEntity, string>();
         await Promise.all(docs.map(({entity, path}) => {
             const doc = entity as DocumentEntity;
             return this.serialize(doc, async () => {
-                if (doc.unconfirmed===undefined || !this.canSend) { return; }
+                if (doc.unconfirmed===undefined || !this.connected) { return; }
                 try {
-                    await this.confirmWrite(this.pathToUri(path), doc, doc.unconfirmed);
+                    await this.settleUnconfirmed(this.pathToUri(path), doc);
                 } catch (error: any) {
-                    // still unconfirmed: named below with the reason; else Overleaf could not apply it
-                    if (doc.unconfirmed===undefined) { notApplied.set(doc, error?.message ?? String(error)); }
+                    // the write stays unconfirmed, and is named below with why
+                    checkFailed.set(doc, error?.message ?? String(error));
                 }
             });
         }));
         const named = docs.flatMap(({entity, path}) => {
             const doc = entity as DocumentEntity;
-            const reason = doc.unconfirmed?.failure ?? notApplied.get(doc);
+            const reason = doc.unconfirmed ? `not confirmed (${checkFailed.get(doc) ?? doc.unconfirmed.failure})`
+                : doc.undetermined ? `cannot be determined (${doc.undetermined.reason})` : undefined;
             return reason===undefined ? [] : [{path, reason}];
         });
         if (named.length>0) {
@@ -1442,7 +1609,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    /** The connection is gone: the updates sent over it get no answer any more (see attempt). */
+    /** The connection is gone: the updates sent over it cannot be answered any more (see attempt). */
     private answersLost(reason: string) {
         for (const {entity} of this.walk(e => e._type==='doc', this.root ?? this.previousRoot)) {
             (entity as DocumentEntity).sync?.answer({kind: 'lost', error: `the connection was lost (${reason})`});
@@ -1461,7 +1628,8 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     /**
      * Tell the IDE that the doc at `uri` changed, so that an editor showing it reads it again.
-     * The notice goes out 10 ms later, after the write has returned to the IDE.
+     * The notice goes out 10 ms after the write returns to the IDE; whether the IDE needs that
+     * delay to read the document again is unchecked.
      */
     private notifyChanged(uri: vscode.Uri) {
         setTimeout(() => {
@@ -1471,23 +1639,27 @@ export class VirtualFileSystem extends vscode.Disposable {
         }, 10);
     }
 
-    /** Fetch the server's copy of `doc`. `localCache` is kept: it is what the editor is based on. */
-    private async resyncDoc(doc: DocumentEntity) {
-        const content = await this.readDoc(doc);
+    /**
+     * Fetch the server's copy of `doc`, and with `fromVersion` the ops applied since then (see
+     * settleUnconfirmed). `localCache` is kept: the next write is based on it.
+     */
+    private async resyncDoc(doc: DocumentEntity, fromVersion?: number) {
+        const {content, ops} = await this.readDoc(doc, fromVersion);
         doc.lastVersion = doc.version;
-        if (doc.localCache===undefined) { doc.localCache = content; }
+        if (doc.localCache===undefined && doc.undetermined===undefined) { doc.localCache = content; }
         doc.mtime = undefined;
+        return ops;
     }
 
-    /** Join `doc` on the current connection, which reads Overleaf's copy of it; returns its text. */
-    private async readDoc(doc: DocumentEntity): Promise<string> {
+    /** Join `doc` on the current connection, which reads Overleaf's copy of it, and with `fromVersion` the ops since. */
+    private async readDoc(doc: DocumentEntity, fromVersion?: number): Promise<{content: string, ops: Array<{meta?: {source?: string}}>}> {
         const connection = this.connectionSeq;
-        const res = await this.socket.joinDoc(doc._id);
+        const res = await this.socket.joinDoc(doc._id, fromVersion);
         const content = res.docLines.join('\n');
         doc.joinedOn = connection;
         doc.version = res.version;
         doc.remoteCache = content;
-        return content;
+        return {content, ops: res.updates ?? []};
     }
 
     async mkdir(uri: vscode.Uri) {

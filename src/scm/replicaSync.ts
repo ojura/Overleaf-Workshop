@@ -57,7 +57,7 @@ export interface ReplicaRemote {
     isFolder(path: string): Promise<boolean>,
     readDoc(path: string): Promise<string>,
     readFile(path: string): Promise<Uint8Array>,
-    /** Replace the text of the document at `path`; resolves once Overleaf has applied it, and rejects when `path` is not a document. */
+    /** Replace the text of the document at `path`; resolves once Overleaf has applied it, and rejects when `path` is not a document or when Overleaf refused the update or has not confirmed it. */
     writeDoc(path: string, text: string): Promise<void>,
     /** Create `path` or replace the binary file there; returns what Overleaf made of it. */
     upload(path: string, content: Uint8Array): Promise<RemoteEntry>,

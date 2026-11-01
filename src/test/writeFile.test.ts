@@ -39,36 +39,54 @@ moduleAny._load = function (request: string, ...rest: any[]) {
     return request === 'vscode' ? vscodeMock : originalLoad.call(this, request, ...rest);
 };
 const { VirtualFileSystem } = require('../core/remoteFileSystemProvider');
-const { SocketIOAPI } = require('../api/socketio');
+const { SocketIOAPI, EmitRefusedError, EmitTimeoutError, isMissingOpsRefusal } = require('../api/socketio');
 moduleAny._load = originalLoad;
 
 type Op = {p: number, i?: string, d?: string};
+
+/** What the tests choose in the warnings the file system shows, and what it showed. */
+const notices = { shown: [] as string[], choice: undefined as string | undefined };
+vscodeMock.window = withStubs({
+    showWarningMessage: (message: string) => { notices.shown.push(message); return Promise.resolve(notices.choice); },
+});
+
+/** Overleaf's refusal of a request, as SocketIOAPI's emit reports it (a stand-in before EmitRefusedError existed). */
+const Refusal: any = EmitRefusedError ?? class extends Error {
+    constructor(event: string, readonly answer: any) { super(`'${event}' rejected: ${answer?.message}`); }
+};
 
 /**
  * A fake of Overleaf's real-time and document-updater services for one doc, as they behave in
  * overleaf/overleaf at e039ad2:
  * - joinDoc gives the connection access to the doc; an update over a connection without that
- *   access is refused (real-time's AuthorizationManager).
+ *   access is refused through the emit's callback (real-time's AuthorizationManager).
  * - The emit's callback means that the update is queued. Once it is applied, the connection that
  *   sent it gets an op-less otUpdateApplied {doc, v}, and the other connections the update with
  *   its ops (DocumentUpdaterController).
- * - An update that fails gives otUpdateError for the doc to the connections that joined it, and
- *   real-time disconnects them.
- * - An update at an older version is transformed against the ops since (inserts only here), and
- *   one with dupIfSource naming the source of one of those ops is answered as applied at that
- *   op's version, without being applied again (ShareJS's model.applyOp).
+ * - An update that fails gives otUpdateError for the doc to the connections that joined it,
+ *   whichever client sent the failing update, and real-time disconnects them.
+ * - Before it transforms an update, document-updater refuses one more than 80 versions behind
+ *   ('Op too old') or one from a version when it no longer keeps the ops since (it keeps the
+ *   last 100, and drops them in a flush). Then an update at an older version is transformed against the ops since
+ *   (inserts only here), and one with dupIfSource naming the source of one of those ops is
+ *   answered as applied at that op's version, without being applied again (ShareJS's model).
+ * - joinDoc with fromVersion answers the ops since that version with their sources, after
+ *   applying a batch of the project's queued updates (UpdateManager.lockUpdatesAndDo), and
+ *   refuses when it no longer keeps them.
  * Events reach the file system after the call that caused them returns, as over the network.
  */
 function setup(initialContent: string) {
     const server = {
-        content: initialContent, v: 10, history: [] as {op: Op[], source: string}[],
+        content: initialContent, v: 10, history: [] as {op: Op[], source: string, v: number}[],
+        /** the first version that Overleaf still keeps the ops from */
+        keptFrom: 10,
         /** the publicId of our connection; undefined while we are disconnected */
         connection: 'conn1' as string | undefined,
         /** the connections that joined the doc */
         joined: new Set<string>(),
         /** whether what Overleaf sends reaches us */
         listening: true,
-        joins: 0, emitted: [] as any[],
+        joins: 0, emitted: [] as any[], historyReads: 0,
         /** when set, runs as the next update arrives */
         beforeNextApply: undefined as undefined | (() => void),
         /** when set, the next update is applied but its callback is lost; this runs instead */
@@ -80,6 +98,12 @@ function setup(initialContent: string) {
         /** this many of the next updates fail after they are queued */
         failNext: 0,
         failure: 'Delete component does not match',
+        /** the emit's callback refuses the next update, or every update, with this message */
+        refuseNext: undefined as string | undefined,
+        refuseAll: undefined as string | undefined,
+        /** queued updates wait, as behind more queued updates than one batch */
+        holdQueue: false,
+        queue: [] as {update: any, source: string}[],
         /** answers to us are held back while set, until releaseHeld */
         holdAnswers: false,
         held: [] as any[],
@@ -87,6 +111,12 @@ function setup(initialContent: string) {
         queuedWaiters: [] as Array<() => void>,
         nextQueued: () => new Promise<void>(resolve => { server.queuedWaiters.push(resolve); }),
         releaseHeld: () => { server.held.splice(0).forEach(message => send(() => handlers.onFileChanged(message))); },
+        /** document-updater flushes the project and drops the doc's ops */
+        flush: () => { server.keptFrom = server.v; },
+        /** another client's update of the doc fails */
+        otherFails: () => fail(server.failure),
+        /** the queued updates are processed */
+        release: () => { server.holdQueue = false; drain(Infinity); },
     };
     const handlers: any = {};
     /** run `event` after the current call returns; resolves once it ran */
@@ -97,8 +127,9 @@ function setup(initialContent: string) {
                 ? server.content.slice(0, c.p) + c.i + server.content.slice(c.p)
                 : server.content.slice(0, c.p) + server.content.slice(c.p + c.d!.length);
         }
-        server.history.push({op, source});
+        server.history.push({op, source, v: server.v});
         server.v += 1;
+        server.keptFrom = Math.max(server.keptFrom, server.v - 100);
     };
     /** the op-less otUpdateApplied for the connection that sent the update */
     const answer = (source: string, message: any) => {
@@ -116,21 +147,27 @@ function setup(initialContent: string) {
         server.connection = undefined;
         return send(() => handlers.onDisconnected());
     };
-    const process = (update: any, source: string) => {
-        if (server.neverApply) { return; }
+    /** an update of the doc fails: otUpdateError for the doc, then the disconnect, for us if we joined it */
+    const fail = (error: string) => {
+        if (server.connection === undefined || !server.joined.has(server.connection)) { return; }
+        server.connection = undefined;
+        send(() => { handlers.onUpdateError?.('doc1', error); handlers.onDisconnected(); });
+    };
+    /** document-updater applies one update; false when it fails */
+    const process = (update: any, source: string): boolean => {
+        if (server.neverApply) { return true; }
         if (server.failNext > 0) {
             server.failNext -= 1;
-            server.connection = undefined;
-            // otUpdateError, and then the disconnect, which real-time sends right after it
-            send(() => { handlers.onUpdateError?.('doc1', server.failure); handlers.onDisconnected(); });
-            return;
+            fail(server.failure);
+            return false;
         }
+        if (update.v + 80 < server.v) { fail('Op too old'); return false; }
+        if (update.v < server.v && update.v < server.keptFrom) { fail('doc ops range is not loaded in redis'); return false; }
         let op: Op[] = update.op;
-        for (let v = update.v; v < server.v; v++) {
-            const old = server.history[v - 10];
+        for (const old of server.history.filter(h => h.v >= update.v)) {
             if (update.dupIfSource?.includes(old.source)) {
-                answer(source, {doc: 'doc1', v});
-                return;
+                answer(source, {doc: 'doc1', v: old.v});
+                return true;
             }
             // transform against an earlier insert (the only kind these tests transform against)
             op = op.map(c => ({...c, p: old.op[0].p <= c.p ? c.p + old.op[0].i!.length : c.p}));
@@ -140,19 +177,36 @@ function setup(initialContent: string) {
         if (server.dropAfterApply) {
             server.dropAfterApply = false;
             disconnect();
-            return;
+            return true;
         }
         answer(source, {doc: 'doc1', v: at});
         broadcast(source, {doc: 'doc1', v: at, op});
+        return true;
+    };
+    /** document-updater takes up to `count` queued updates, and stops at the first that fails */
+    const drain = (count: number) => {
+        for (let i = 0; i < count && server.queue.length > 0; i++) {
+            const {update, source} = server.queue.shift()!;
+            if (!process(update, source)) { break; }
+        }
     };
     const socket = {
         isUsingAlternativeConnectionScheme: false,
         updateEventHandlers(h: any) { Object.assign(handlers, h); },
-        async joinDoc() {
+        async joinDoc(_docId: string, fromVersion?: number) {
             server.joins += 1;
             if (server.connection === undefined) { throw new Error(`'joinDoc' timed out`); }
+            if (!server.holdQueue) { drain(8); }
+            let updates: any[] = [];
+            if (fromVersion !== undefined) {
+                server.historyReads += 1;
+                if (fromVersion < server.v && fromVersion < server.keptFrom) {
+                    throw new Refusal('joinDoc', {message: 'doc updater could not load requested ops'});
+                }
+                updates = server.history.filter(h => h.v >= fromVersion).map(h => ({op: h.op, v: h.v, meta: {source: h.source}}));
+            }
             server.joined.add(server.connection);
-            return { docLines: server.content.split('\n'), version: server.v };
+            return { docLines: server.content.split('\n'), version: server.v, updates };
         },
         async applyOtUpdate(docId: string, update: any) {
             server.emitted.push(update);
@@ -160,10 +214,17 @@ function setup(initialContent: string) {
             server.beforeNextApply = undefined;
             before?.();
             if (server.connection === undefined) { throw new Error(`'applyOtUpdate' timed out`); }
-            if (!server.joined.has(server.connection)) { throw new Error(`'applyOtUpdate' rejected: not authorized`); }
+            const refusal = server.refuseAll ?? server.refuseNext;
+            server.refuseNext = undefined;
+            if (refusal !== undefined) { throw new Refusal('applyOtUpdate', {message: refusal}); }
+            if (!server.joined.has(server.connection)) { throw new Refusal('applyOtUpdate', {message: 'not authorized'}); }
             const lost = server.loseNextCallback;
             server.loseNextCallback = undefined;
-            process(update, server.connection);
+            if (server.holdQueue) {
+                server.queue.push({update, source: server.connection});
+            } else {
+                process(update, server.connection);
+            }
             if (lost) {
                 lost();
                 throw new Error(`'applyOtUpdate' timed out`);
@@ -190,6 +251,8 @@ function setup(initialContent: string) {
     const uri: any = { path: '/test/main.tex', toString: () => 'overleaf-workshop://test/main.tex' };
     const editor = { isDirty: false, uri };
     vscodeMock.workspace.textDocuments = [editor];
+    notices.shown = [];
+    notices.choice = undefined;
     const vfs = Object.create(VirtualFileSystem.prototype);
     vfs.socket = socket;
     vfs.notify = () => {};
@@ -201,10 +264,18 @@ function setup(initialContent: string) {
     vfs.remoteWatch();
     handlers.onConnectionAccepted(server.connection);
 
-    return {
+    const t = {
         server, doc, editor, vfs, handlers, uri,
         open: async () => new TextDecoder().decode(await vfs.openFile(uri)),
-        save: (text: string) => vfs.writeFile(uri, new TextEncoder().encode(text), false, true),
+        /**
+         * The save's promise, which the test awaits. A test that fails while a save waits leaves
+         * it to the teardown, which ends the save (see harnesses).
+         */
+        save: (text: string) => {
+            const saving = vfs.writeFile(uri, new TextEncoder().encode(text), false, true);
+            saving.catch(() => undefined);
+            return saving;
+        },
         collaborator, collaboratorDeletes,
         /** the connection drops */
         disconnect: () => {
@@ -216,8 +287,21 @@ function setup(initialContent: string) {
             server.connection = publicId;
             handlers.onConnectionAccepted(publicId);
         },
+        /** a reconnect has started: the tree is the one from before the loss (see connectionLost) */
+        reconnecting: () => {
+            vfs.previousRoot = vfs.root;
+            vfs.root = undefined;
+        },
     };
+    harnesses.push(t);
+    return t;
 }
+
+/** the file systems of the running test; the teardown ends their updates that still wait */
+const harnesses: Array<{ vfs: any }> = [];
+afterEach(() => {
+    for (const t of harnesses.splice(0)) { t.vfs.answersLost?.('the test ended'); }
+});
 
 /** settled() rejected, naming main.tex for a reason that matches `reason` */
 const namesMainTex = (reason: RegExp) => (error: any) => {
@@ -265,8 +349,22 @@ describe('VirtualFileSystem.writeFile', () => {
         await t.open();
         await t.collaborator(2, '[b1]');
         t.editor.isDirty = true;                  // typed before VS Code got to reload
+        await t.open();                           // a read by the dirty editor keeps its base
         await t.save('B:\nA: a1');
         assert.strictEqual(t.server.content, 'B:[b1]\nA: a1');
+    });
+
+    it('keeps a dirty editor\'s base when the doc is read from Overleaf again', async () => {
+        const t = setup('B:\nA:');
+        await t.open();
+        t.server.listening = false;
+        t.collaborator(2, '[b1]');                // never reaches us
+        t.server.listening = true;
+        await t.collaborator(0, '# ');            // reaches us, one version ahead: the copy is dropped
+        t.editor.isDirty = true;
+        assert.strictEqual(await t.open(), '# B:[b1]\nA:');
+        await t.save('B:\nA: a1');                // the editor never loaded '# ' or [b1]
+        assert.strictEqual(t.server.content, '# B:[b1]\nA: a1');
     });
 
     it('does not apply an update twice when only its callback was lost', async () => {
@@ -274,9 +372,11 @@ describe('VirtualFileSystem.writeFile', () => {
         await t.open();
         t.server.loseNextCallback = () => t.collaborator(0, '# ');
         await assert.rejects(t.save('hello a'), /has not confirmed/);
-        await t.vfs.documentUpdatesSettled();     // sent again: Overleaf recognises it
+        await t.vfs.documentUpdatesSettled();     // Overleaf's history shows it applied
         assert.strictEqual(t.server.content, '# hello a');
-        assert.deepStrictEqual(t.server.emitted[1].dupIfSource, ['conn1']);
+        assert.strictEqual(t.server.emitted.length, 1);
+        await t.save('hello a b');
+        assert.strictEqual(t.server.content, '# hello a b');
     });
 
     it('recognises its update when it went out over a later connection', async () => {
@@ -289,7 +389,8 @@ describe('VirtualFileSystem.writeFile', () => {
         await assert.rejects(t.save('hello a'), /has not confirmed/);
         await t.vfs.documentUpdatesSettled();
         assert.strictEqual(t.server.content, 'hello a');
-        assert.deepStrictEqual(t.server.emitted[1].dupIfSource, ['conn1', 'conn2']);
+        assert.strictEqual(t.server.emitted.length, 1);
+        assert.deepStrictEqual(t.server.history.map(h => h.source), ['conn2']);
     });
 
     it('fetches the doc again instead of skipping a write after a missed op', async () => {
@@ -316,7 +417,7 @@ describe('VirtualFileSystem: updates that Overleaf does not confirm', () => {
     it('does not report an update as saved while Overleaf has not applied it, and settled() names its document', async () => {
         const t = setup('hello');
         await t.open();
-        t.server.neverApply = true;               // takes every update and applies none
+        t.server.neverApply = true;               // takes every update and does not apply it
         const saving = t.save('hello a');
         await t.server.nextQueued();              // the callback is on the way: Overleaf queued it
         const settling = t.vfs.documentUpdatesSettled();
@@ -325,6 +426,15 @@ describe('VirtualFileSystem: updates that Overleaf does not confirm', () => {
         await assert.rejects(settling, namesMainTex(/the connection was lost/));
         assert.strictEqual(t.server.content, 'hello');
         assert.strictEqual(t.server.emitted.length, 1);
+    });
+
+    it('names a document with an unconfirmed write while a reconnect runs, from the tree from before the loss', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.server.dropAfterApply = true;
+        await assert.rejects(t.save('hello a'), /has not confirmed/);
+        t.reconnecting();
+        await assert.rejects(t.vfs.documentUpdatesSettled(), namesMainTex(/the connection was lost/));
     });
 
     it('fails a write on otUpdateError for its document, and sends it again once reconnected', async () => {
@@ -337,28 +447,13 @@ describe('VirtualFileSystem: updates that Overleaf does not confirm', () => {
         await assert.rejects(t.vfs.documentUpdatesSettled(), namesMainTex(/Delete component does not match/));
         assert.strictEqual(t.server.emitted.length, 1);
         t.reconnect('conn2');
-        await t.vfs.documentUpdatesSettled();     // joins the doc on conn2 and sends it again
+        await t.vfs.documentUpdatesSettled();     // not in Overleaf's history: sent again over conn2
         assert.strictEqual(t.server.content, 'hello a');
         assert.deepStrictEqual(t.server.emitted.map(u => u.dupIfSource), [undefined, ['conn1', 'conn2']]);
         assert.strictEqual(t.doc.unconfirmed, undefined);
     });
 
-    it('drops an update that Overleaf reports an error for twice, and the next save sends the edit again', async () => {
-        const t = setup('hello');
-        await t.open();
-        t.server.failNext = 2;
-        await assert.rejects(t.save('hello a'), /Delete component does not match/);
-        t.reconnect('conn2');
-        await assert.rejects(t.vfs.documentUpdatesSettled(), namesMainTex(/could not apply the update/));
-        assert.strictEqual(t.doc.unconfirmed, undefined);
-        assert.strictEqual(t.server.content, 'hello');
-        t.reconnect('conn3');                     // Overleaf disconnected us again
-        await t.save('hello a');                  // made against Overleaf's text as it is now
-        assert.strictEqual(t.server.content, 'hello a');
-        assert.strictEqual(t.server.emitted[2].dupIfSource, undefined);
-    });
-
-    it('confirms over the new connection a write that a reconnect left unconfirmed, and Overleaf applies it once', async () => {
+    it('confirms from Overleaf\'s history a write that a reconnect left unconfirmed, without sending it again', async () => {
         const t = setup('hello');
         await t.open();
         t.server.dropAfterApply = true;           // applied, but the answer is lost with the connection
@@ -366,26 +461,23 @@ describe('VirtualFileSystem: updates that Overleaf does not confirm', () => {
         assert.strictEqual(t.server.content, 'hello a');
         await assert.rejects(t.vfs.documentUpdatesSettled(), namesMainTex(/the connection was lost/));
         t.reconnect('conn2');
-        await t.vfs.documentUpdatesSettled();     // Overleaf recognises the copy it applied
+        await t.vfs.documentUpdatesSettled();
         assert.strictEqual(t.server.content, 'hello a');
-        assert.deepStrictEqual(t.server.emitted[1].dupIfSource, ['conn1', 'conn2']);
-        assert.strictEqual(t.server.history.length, 1);
+        assert.strictEqual(t.server.emitted.length, 1);
         await t.save('hello a b');                // based on the confirmed write
         assert.strictEqual(t.server.content, 'hello a b');
     });
 
-    it('takes a late answer to an earlier update for no answer to a later one', async () => {
+    it('does not take a late answer to an earlier update as the answer to a later one', async () => {
         const t = setup('hello');
         await t.open();
         t.server.holdAnswers = true;              // the answer to the first update comes late
         t.server.loseNextCallback = () => {};
         await assert.rejects(t.save('hello a'), /has not confirmed/);
         t.server.holdAnswers = false;
-        // the second save sends the first update again, then its own; as its own goes out,
-        // the late answer {v: 10} arrives, and Overleaf cannot apply the new update
-        t.server.beforeNextApply = () => {
-            t.server.beforeNextApply = () => { t.server.releaseHeld(); t.server.failNext = 1; };
-        };
+        // The second save finds the first update in Overleaf's history, then sends its own.
+        // As its own goes out, the late answer {v: 10} arrives, and Overleaf cannot apply it.
+        t.server.beforeNextApply = () => { t.server.releaseHeld(); t.server.failNext = 1; };
         await assert.rejects(t.save('hello a b'), /Delete component does not match/);
         assert.strictEqual(t.server.content, 'hello a');
         assert.strictEqual(t.doc.unconfirmed?.content, 'hello a b');
@@ -409,6 +501,153 @@ describe('VirtualFileSystem: updates that Overleaf does not confirm', () => {
     });
 });
 
+describe('VirtualFileSystem: deciding from Overleaf\'s history whether it applied an update', () => {
+    it('finds an applied update in the history when a resend would be refused as too old (A)', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.server.dropAfterApply = true;
+        await assert.rejects(t.save('hello a'), /has not confirmed/);
+        t.reconnect('conn2');
+        for (let i = 0; i < 81; i++) { await t.collaborator(0, 'x'); }
+        await t.vfs.documentUpdatesSettled();     // conn1's op at version 10 is in the history
+        assert.strictEqual(t.server.emitted.length, 1);
+        t.editor.isDirty = true;
+        await t.save('hello a b');
+        assert.strictEqual(t.server.content, `${'x'.repeat(81)}hello a b`);
+    });
+
+    it('does not send again an update that Overleaf would now refuse as too old, and sends the edit with the next write', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.server.neverApply = true;
+        const saving = t.save('hello a');
+        await t.server.nextQueued();
+        t.disconnect();
+        await assert.rejects(saving, /has not confirmed/);
+        t.server.neverApply = false;
+        t.reconnect('conn2');
+        for (let i = 0; i < 81; i++) { await t.collaborator(0, 'x'); }
+        await t.vfs.documentUpdatesSettled();     // not in the history, and too old for Overleaf
+        assert.strictEqual(t.server.emitted.length, 1);
+        assert.strictEqual(t.doc.unconfirmed, undefined);
+        t.editor.isDirty = true;
+        await t.save('hello a b');
+        assert.strictEqual(t.server.content, `${'x'.repeat(81)}hello a b`);
+    });
+
+    it('tells the user when Overleaf no longer has the history, does not send the update again, and lets the user decide', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.server.dropAfterApply = true;
+        await assert.rejects(t.save('hello a'), /has not confirmed/);
+        t.server.flush();                         // the last client left: the doc's ops are gone
+        t.reconnect('conn2');
+        await assert.rejects(t.vfs.documentUpdatesSettled(), namesMainTex(/cannot be determined \(Overleaf no longer keeps/));
+        assert.strictEqual(t.server.emitted.length, 1);
+        assert.match(notices.shown[0], /main\.tex: Overleaf Workshop cannot tell whether Overleaf applied the update/);
+        // the editor still has the edit; a save does not merge it with Overleaf's text
+        t.editor.isDirty = true;
+        notices.choice = 'Save My Version';
+        await assert.rejects(t.save('hello a b'), /cannot tell whether Overleaf applied the update/);
+        assert.strictEqual(t.server.content, 'hello a');
+        await t.save('hello a b');                // after Save My Version: the editor's text is Overleaf's text
+        assert.strictEqual(t.server.content, 'hello a b');
+        assert.strictEqual(t.doc.undetermined, undefined);
+        await t.vfs.documentUpdatesSettled();
+    });
+
+    it('lets a reader that takes Overleaf\'s text write again when the history is gone', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.server.dropAfterApply = true;
+        await assert.rejects(t.save('hello a'), /has not confirmed/);
+        t.server.flush();
+        t.reconnect('conn2');
+        assert.strictEqual(await t.open(), 'hello a');   // as the local replica reads before it merges
+        await t.vfs.writeDoc(t.uri, new TextEncoder().encode('hello a b'));
+        assert.strictEqual(t.server.content, 'hello a b');
+        assert.strictEqual(t.server.emitted.length, 2);
+    });
+
+    it('does not drop a write when the errors come from other clients\' failing updates (C)', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.server.holdQueue = true;                // ours waits behind more queued updates than one batch
+        const saving = t.save('hello a');
+        await t.server.nextQueued();
+        t.server.otherFails();
+        await assert.rejects(saving, /Delete component does not match/);
+        t.reconnect('conn2');
+        const resent = t.server.nextQueued();
+        const settling = t.vfs.documentUpdatesSettled();
+        await resent;                             // not in the history yet: sent again, and that one waits too
+        t.server.otherFails();
+        await assert.rejects(settling, namesMainTex(/Delete component does not match/));
+        t.reconnect('conn3');
+        t.server.release();                       // ours is applied, its copy answered as a duplicate
+        assert.strictEqual(t.server.content, 'hello a');
+        await t.vfs.documentUpdatesSettled();     // found in the history
+        t.editor.isDirty = true;
+        await t.save('hello a b');
+        assert.strictEqual(t.server.content, 'hello a b');
+    });
+
+    it('settles a write before a read of the doc, so that a reader gets the write\'s outcome (E)', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.server.neverApply = true;               // queued, and not applied
+        const saving = t.save('hello a');
+        await t.server.nextQueued();
+        t.disconnect();
+        await assert.rejects(saving, /has not confirmed/);
+        t.server.neverApply = false;
+        await t.collaborator(0, '# ');
+        t.reconnect('conn2');
+        // the local replica reads the doc, merges its file into Overleaf's text, and writes
+        assert.strictEqual(await t.open(), '# hello a');
+        await t.vfs.writeDoc(t.uri, new TextEncoder().encode('# hello a b'));
+        assert.strictEqual(t.server.content, '# hello a b');
+    });
+
+    it('settles a write that the editor dropped (Revert) before the editor reads the doc again', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.server.neverApply = true;
+        const saving = t.save('hello a');
+        await t.server.nextQueued();
+        t.disconnect();
+        await assert.rejects(saving, /has not confirmed/);
+        t.server.neverApply = false;
+        t.reconnect('conn2');
+        t.editor.isDirty = false;                 // reverted: VS Code reads the file again
+        assert.strictEqual(await t.open(), 'hello a');
+        assert.strictEqual(t.doc.unconfirmed, undefined);
+    });
+});
+
+describe('VirtualFileSystem: refusals through the emit\'s callback', () => {
+    it('fails a write that Overleaf refuses, and does not send it again', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.server.refuseNext = 'not authorized';
+        await assert.rejects(t.save('hello a'), /Overleaf refused the update \('applyOtUpdate' rejected: not authorized\)/);
+        assert.strictEqual(t.doc.unconfirmed, undefined);
+        await t.vfs.documentUpdatesSettled();
+        assert.strictEqual(t.server.emitted.length, 1);
+        await t.save('hello a b');                // the next write carries the edit
+        assert.strictEqual(t.server.content, 'hello a b');
+    });
+
+    it('sends each write once while Overleaf keeps refusing them', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.server.refuseAll = 'not authorized';
+        await assert.rejects(t.save('hello a'), /refused/);
+        await assert.rejects(t.save('hello a b'), /refused/);
+        assert.deepStrictEqual(t.server.emitted.map(u => [u.v, u.dupIfSource]), [[10, undefined], [10, undefined]]);
+    });
+});
+
 describe('VirtualFileSystem: the ops of others, as Overleaf sends them', () => {
     it('applies inserts and deletes as text: Overleaf packs only joinDoc\'s lines', async () => {
         for (const text of ['\u00dc\u00a0', '\u00ec\u00a9\u00b0', '\u00c3\u00a9', '\u010d', '\u0107\u017e']) {
@@ -425,7 +664,7 @@ describe('VirtualFileSystem: the ops of others, as Overleaf sends them', () => {
 });
 
 describe('VirtualFileSystem.writeDoc', () => {
-    it('rejects with FileNotFound when the path holds no document, and sends nothing', async () => {
+    it('rejects with FileNotFound when the path does not hold a document, and leaves Overleaf\'s text as it was', async () => {
         const t = setup('hello');
         await t.open();
         const content = new TextEncoder().encode('hello a');
@@ -537,6 +776,39 @@ describe('SocketIOAPI.applyOtUpdate', () => {
         await assert.rejects(api.applyOtUpdate('doc1', { doc: 'doc1', v: 1, op: [{ p: 5, i: '\r' }] }), /"\\r"/);
         await assert.rejects(api.applyOtUpdate('doc1', { doc: 'doc1', v: 1, op: [{ p: 0, d: 'a\r\n' }] }), /"\\r"/);
         assert.strictEqual(emitted.length, 0);
+    });
+});
+
+describe('SocketIOAPI: how an emit ends', () => {
+    it('tells a refusal in the callback from an emit that was not answered', async () => {
+        const saved = SocketIOAPI.emitTimeoutMs;
+        try {
+            SocketIOAPI.emitTimeoutMs = 5;        // the emit's own limit, which this test is about
+            const answers: Record<string, any> = {
+                applyOtUpdate: { message: 'not authorized' },
+                joinDoc: { message: 'doc updater could not load requested ops' },
+            };
+            const raw = {
+                on() {},
+                emit(event: string, ...args: any[]) {
+                    const callback = args.pop();
+                    if (answers[event]) { setImmediate(() => callback(answers[event])); }
+                },
+            };
+            const api = Object.create(SocketIOAPI.prototype);
+            Object.assign(api, { scheme: 'v1', _handlers: [], _eventBusCleanups: [], api: { _initSocketV0: () => raw } });
+            api.init();
+            const refused = await api.emit('applyOtUpdate', 'doc1', {}).catch((error: any) => error);
+            assert.ok(refused instanceof EmitRefusedError, String(refused));
+            assert.deepStrictEqual(refused.answer, { message: 'not authorized' });
+            const missing = await api.emit('joinDoc', 'doc1', 10, {}).catch((error: any) => error);
+            assert.ok(isMissingOpsRefusal(missing));
+            assert.ok(!isMissingOpsRefusal(refused));
+            const unanswered = await api.emit('clientTracking.getConnectedUsers').catch((error: any) => error);
+            assert.ok(unanswered instanceof EmitTimeoutError, String(unanswered));
+        } finally {
+            SocketIOAPI.emitTimeoutMs = saved;
+        }
     });
 });
 
