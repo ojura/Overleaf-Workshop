@@ -76,6 +76,16 @@ export function checkInstanceFolder(home) {
     }
 }
 
+/**
+ * The record of the instance in `home`, which must run (instanceProcesses); the drivers and
+ * hidden-ide.sh's commands call it before they change anything.
+ */
+export function readRunningInstance(home) {
+    const record = readInstance(home);
+    if (instanceProcesses(record).length === 0) { throw new Error(`the instance in ${home} does not run`); }
+    return record;
+}
+
 /** The record of the instance in `home`, with `home` added; fails when start has not written one. */
 export function readInstance(home) {
     const file = path.join(home, 'instance.json');
@@ -177,7 +187,10 @@ async function checkMainProcess(main, pid) {
     }
 }
 
-/** Connect to a recorded endpoint of the instance, with the cause when the IDE does not answer there. */
+/**
+ * Connect to a recorded endpoint of the instance. When that fails, the error says whether the
+ * recorded IDE process still runs, and what the connection reported.
+ */
 async function connectRecorded(instance, url, name) {
     if (!url) {
         throw new Error(`${path.join(instance.home, 'instance.json')} does not record the ${name} endpoint: the instance did not finish starting`);
@@ -185,7 +198,10 @@ async function connectRecorded(instance, url, name) {
     try {
         return await connect(url);
     } catch (error) {
-        throw new Error(`the instance's IDE does not answer at its ${name} endpoint ${url}: the IDE has stopped, or another process holds that port now`);
+        const ide = isRecordedProcess(instance.pid, instance.pidStart, instance.boot)
+            ? `the instance's IDE (process ${instance.pid}) runs, and does not answer at its recorded ${name} endpoint`
+            : `the instance's IDE (process ${instance.pid}) has ended`;
+        throw new Error(`${ide}: ${error.message}`);
     }
 }
 
@@ -279,20 +295,31 @@ const SERVER_ANSWER_LIMIT_MS = 5000;
  * The inspector's endpoint of process `pid`: of the ports it listens on at 127.0.0.1, other than
  * its DevTools port, the one that names a target of type node in its /json/list.
  */
-async function findInspector(pid, devtoolsPort) {
+export async function findInspector(pid, devtoolsPort) {
     const found = [];
+    /** what each port answered, for the error when the inspector is not found exactly once */
+    const outcomes = [];
     for (const port of listeningPorts(pid).filter(p => p !== devtoolsPort)) {
-        let list;
+        let answer;
         try {
-            const answer = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(SERVER_ANSWER_LIMIT_MS) });
-            list = answer.ok ? await answer.json() : [];
-        } catch {
-            continue; // a server of the IDE's own that does not speak this protocol
+            answer = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(SERVER_ANSWER_LIMIT_MS) });
+        } catch (error) {
+            outcomes.push(`port ${port}: ${error.name === 'TimeoutError' ? `did not answer within ${SERVER_ANSWER_LIMIT_MS / 1000} s` : error.message}`);
+            continue;
         }
-        found.push(...(Array.isArray(list) ? list : []).filter(t => t.type === 'node' && t.webSocketDebuggerUrl).map(t => t.webSocketDebuggerUrl));
+        const text = await answer.text();
+        let inspectors = [];
+        try {
+            const list = JSON.parse(text);
+            inspectors = Array.isArray(list) ? list.filter(t => t.type === 'node' && t.webSocketDebuggerUrl).map(t => t.webSocketDebuggerUrl) : [];
+        } catch {
+            // the answer is not JSON: a server of the IDE's own that speaks another protocol
+        }
+        outcomes.push(`port ${port}: HTTP ${answer.status}, ${inspectors.length} Node inspector${inspectors.length === 1 ? '' : 's'}`);
+        found.push(...inspectors);
     }
     if (found.length !== 1) {
-        throw new Error(`the IDE (process ${pid}) has ${found.length} Node inspectors on 127.0.0.1, not one: ${found.join(', ') || 'none'}`);
+        throw new Error(`the IDE (process ${pid}) shows ${found.length} Node inspectors on 127.0.0.1, not one (${outcomes.join('; ') || 'it listens on its DevTools port alone'})`);
     }
     return found[0];
 }

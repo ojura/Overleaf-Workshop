@@ -12,6 +12,12 @@ import path from 'node:path';
 /** The file in which a browser names its DevTools port and its browser target. */
 const ACTIVE_PORT_FILE = 'DevToolsActivePort';
 
+/**
+ * The last resort for an endpoint that accepts the TCP connection and never completes the
+ * WebSocket handshake, for example a process that took a recorded port after the browser ended.
+ */
+const HANDSHAKE_LIMIT_MS = 10000;
+
 /** The connections that are open, so that a signal can end every command that a script awaits (scripts/lib/cleanup.mjs). */
 const openConnections = new Set();
 /** why connect() refuses new connections: set when the script ends them all */
@@ -92,8 +98,14 @@ export async function connect(url) {
     if (refusal !== undefined) { throw new Error(`no connection to ${url}: ${refusal}`); }
     const ws = new WebSocket(url);
     await new Promise((resolve, reject) => {
-        const opened = () => { ws.removeEventListener('error', failed); resolve(); };
-        const failed = () => { ws.removeEventListener('open', opened); reject(new Error(`could not connect to ${url}`)); };
+        const timer = setTimeout(() => {
+            ws.removeEventListener('open', opened);
+            ws.removeEventListener('error', failed);
+            ws.close();
+            reject(new Error(`${url} did not complete the WebSocket handshake within ${HANDSHAKE_LIMIT_MS / 1000} s`));
+        }, HANDSHAKE_LIMIT_MS);
+        const opened = () => { clearTimeout(timer); ws.removeEventListener('error', failed); resolve(); };
+        const failed = () => { clearTimeout(timer); ws.removeEventListener('open', opened); reject(new Error(`could not connect to ${url}`)); };
         ws.addEventListener('open', opened, { once: true });
         ws.addEventListener('error', failed, { once: true });
     });
@@ -261,6 +273,27 @@ export async function evaluate(target, expression, contextId) {
 
 /** A wait that reached its limit before its condition held. */
 export class WaitLimitError extends Error {}
+
+/**
+ * `work`, or a WaitLimitError when it has not settled within `limitMs`, which is the last resort
+ * for a party that may never answer; `what` names the work in the error. At the limit the
+ * connection closes, which also ends the commands that `work` still awaits.
+ */
+export async function answerWithin(connection, what, limitMs, work) {
+    let timer;
+    const limit = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            const error = new WaitLimitError(`${what}: no answer within ${limitMs / 1000} s`);
+            connection.close(error.message);
+            reject(error);
+        }, limitMs);
+    });
+    try {
+        return await Promise.race([work(), limit]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
 
 /**
  * Wait until `probe()` resolves to a truthy value, and return { value, ms }. probe runs again

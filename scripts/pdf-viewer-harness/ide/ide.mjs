@@ -8,19 +8,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { onCleanup, sleep } from '../../lib/cleanup.mjs';
 import { evaluate, waitUntil, notWithinLimit } from '../../lib/devtools.mjs';
-import { checkInstanceFolder, connectWindow, instanceHome, readInstance, workbenchTarget } from '../../lib/test-instance.mjs';
+import { checkInstanceFolder, connectWindow, instanceHome, readRunningInstance, workbenchTarget } from '../../lib/test-instance.mjs';
 import { arg } from '../common.mjs';
 
 export { evaluate, waitUntil, notWithinLimit, onCleanup, sleep };
 
 /**
  * The instance: its record in instance.json (pid, devtools, display, profile, replica, ...) and its
- * folder, home, which is checked first (checkInstanceFolder), as hidden-ide.sh checks it.
+ * folder, home. The folder is checked first (checkInstanceFolder), and the instance must run
+ * (readRunningInstance), before a driver changes a setting.
  */
 export function instance() {
     const home = instanceHome(arg('instance'));
     checkInstanceFolder(home);
-    return readInstance(home);
+    return readRunningInstance(home);
 }
 
 /**

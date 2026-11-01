@@ -91,18 +91,18 @@
 // the chosen project in it, readable only by this user, and deleted again by "stop". Nothing in
 // this program prints it.
 //
-// Exit status: 0 done; 1 failed; 2 the page did not answer within PAGE_ANSWER_LIMIT_MS; 64 wrong
-// usage.
+// Exit status: 0 done; 1 failed; 2 the page or the main process did not answer within
+// ANSWER_LIMIT_MS; 64 wrong usage.
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { evaluate, removeActivePort } from './lib/devtools.mjs';
+import { answerWithin, evaluate, removeActivePort, WaitLimitError } from './lib/devtools.mjs';
 import { buildCheckout, installedExtension, installInto, removeExtensionCache } from './lib/install-build.mjs';
 import {
     bootId, checkInstanceFolder, connectMainProcess, connectWindow, inMainProcess, instanceHome, instanceProcesses, isRecordedProcess,
-    processStat, readInstance, waitForInstance, workbenchTarget, writeInstance,
+    processStat, readInstance, readRunningInstance, waitForInstance, workbenchTarget, writeInstance,
 } from './lib/test-instance.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -112,10 +112,10 @@ const START_LIMIT_MS = 60000;
 /** The last resort for an X server that does not report its display and does not exit. */
 const DISPLAY_LIMIT_MS = 30000;
 /**
- * The last resort for a page that does not answer: a page that DevTools froze does not run scripts, so
- * an evaluation there waits until this limit, and exit status 2 reports it.
+ * The last resort for a page, or the IDE's main process, that does not answer: for example a page
+ * that DevTools froze outside freeze, which does not run scripts. Exit status 2 reports it.
  */
-const PAGE_ANSWER_LIMIT_MS = 15000;
+const ANSWER_LIMIT_MS = 15000;
 /** The last resort for an IDE, or an X server, that does not end after SIGTERM. */
 const STOP_LIMIT_S = 30;
 /** The first display that start tries when it is not given one. */
@@ -238,9 +238,8 @@ function recordIfAny(home) {
 /** The record of the instance in HIDDEN_IDE_HOME, which must run. */
 function runningInstance() {
     const home = instanceFolder();
-    const record = recordIfAny(home);
-    if (!record || instanceProcesses(record).length === 0) { throw new Error(`the instance in ${home} does not run`); }
-    return record;
+    if (!recordIfAny(home)) { throw new Error(`${home} does not hold an instance (instance.json)`); }
+    return readRunningInstance(home);
 }
 
 /** Stop processes and wait for their exits (scripts/lib/stop-processes.py); whether all have ended. */
@@ -575,34 +574,27 @@ function stop() {
     console.log('stopped; deleted the instance\'s saved state (state.vscdb, which holds the login copy in --project mode) and its runtime folder');
 }
 
-/**
- * Run `work` with a session on the instance's workbench page, within PAGE_ANSWER_LIMIT_MS; `what`
- * names the work in the error. Closing the connection afterwards also ends a command that the page
- * has not answered.
- */
-async function withPage(instance, what, work) {
-    const browser = await connectWindow(instance);
-    let timer;
+/** `work` on `connection` within ANSWER_LIMIT_MS, with exit status 2 at the limit; the connection is closed afterwards. */
+async function withinLimit(connection, what, work) {
     try {
-        const page = await browser.attach((await workbenchTarget(browser)).targetId);
-        const limit = new Promise((_, reject) => {
-            timer = setTimeout(() => reject(failure(`${what}: the page did not answer within ${PAGE_ANSWER_LIMIT_MS / 1000} s`, 2)), PAGE_ANSWER_LIMIT_MS);
-        });
-        return await Promise.race([work(page), limit]);
+        return await answerWithin(connection, what, ANSWER_LIMIT_MS, work);
+    } catch (error) {
+        throw error instanceof WaitLimitError ? failure(error.message, 2) : error;
     } finally {
-        clearTimeout(timer);
-        browser.close();
+        connection.close();
     }
 }
 
-/** What `statements` return in the IDE's main process, with w set to its window. */
+/** Run `work` with a session on the instance's workbench page, within ANSWER_LIMIT_MS; `what` names the work. */
+async function withPage(instance, what, work) {
+    const browser = await connectWindow(instance);
+    return withinLimit(browser, what, async () => work(await browser.attach((await workbenchTarget(browser)).targetId)));
+}
+
+/** What `statements` return in the IDE's main process, with w set to its window, within ANSWER_LIMIT_MS. */
 async function inMain(instance, statements) {
     const main = await connectMainProcess(instance);
-    try {
-        return await inMainProcess(main, statements);
-    } finally {
-        main.close();
-    }
+    return withinLimit(main, 'the main process', () => inMainProcess(main, statements));
 }
 
 const WINDOW_STATE = 'return { visible: w.isVisible(), minimized: w.isMinimized(), focused: w.isFocused(), bounds: w.getBounds() };';
