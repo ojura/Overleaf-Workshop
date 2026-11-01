@@ -307,8 +307,52 @@ describe('local replica: what it deletes and what it never syncs', function () {
             const { t, deleted, requestReplica } = await questionOpen();
             const answer: any = await requestReplica(t.folder, { op: 'sync' }, 10000);
             assert.strictEqual(answer.ok, false, JSON.stringify(answer));
+            assert.deepStrictEqual([...(answer.summary.question?.paths ?? [])].sort(), deleted);
+            assert.deepStrictEqual(answer.summary.deletionsToConfirm, [], 'the question names the deletions on its side');
             for (const p of deleted) { assert.ok(answer.error.includes(p), answer.error); }
             const status: any = await requestReplica(t.folder, { op: 'status' }, 10000);
+            assert.deepStrictEqual([...(status.question?.paths ?? [])].sort(), deleted);
+            assert.strictEqual(typeof status.question.message, 'string', 'the window words the question for replica-status');
+        });
+
+        it('is named to a tool also when the user answers it while the tool\'s request runs', async () => {
+            const { t, deleted, scm, requestReplica, answer } = await questionOpen();
+            // the user answers just after the tool's request saw the question
+            const flush = scm.sync.flush.bind(scm.sync);
+            scm.sync.flush = (...args: any[]) => { answer(true); return flush(...args); };
+            const reply: any = await requestReplica(t.folder, { op: 'sync' }, 10000);
+            assert.strictEqual(reply.ok, false, JSON.stringify(reply));
+            assert.deepStrictEqual([...(reply.summary.question?.paths ?? [])].sort(), deleted);
+        });
+
+        it('that the first sync after a start asks is named to a tool at once, while that sync waits for the answer', async () => {
+            const t = host();
+            const chapters = Array.from({ length: 8 }, (_, i) => `/chapter${i}.tex`);
+            project(t, { ...Object.fromEntries(chapters.map(p => [p, `${p}\n`])), '/main.tex': 'main\n' });
+            const modules = load(t.mock);
+            await start(t, modules);
+            await undo.pop()!(); // the IDE closes
+            const deleted = chapters.slice(0, 6);
+            deleted.forEach(p => t.w.remote.delete(p)); // a collaborator deletes six meanwhile
+            let shown!: () => void;
+            const questionShown = new Promise<void>(resolve => { shown = resolve; });
+            t.mock.window.showWarningMessage = (_message: string, options?: any) => {
+                if (options?.modal) { shown(); return new Promise(() => { /* the user is away */ }); }
+                return Promise.resolve(undefined);
+            };
+            // the IDE starts again: its first sync asks about the six, and the question waits
+            const scm = new modules.LocalReplicaSCMProvider(t.vfs, Uri.file(t.folder));
+            const triggers: { dispose(): void }[] = await scm.triggers;
+            undo.push(async () => { triggers.forEach(trigger => trigger.dispose()); await scm.sync?.stop(); });
+            await questionShown;
+            await fileAppears(path.join(t.folder, POINTER_FILE));
+            const reply: any = await modules.requestReplica(t.folder, { op: 'sync' }, 10000);
+            assert.strictEqual(reply.ok, false, JSON.stringify(reply));
+            assert.deepStrictEqual([...(reply.summary.question?.paths ?? [])].sort(), deleted);
+            const landing: any = await modules.requestReplica(t.folder, { op: 'land', commit: 'HEAD' }, 10000);
+            assert.strictEqual(landing.ok, false, JSON.stringify(landing));
+            const status: any = await modules.requestReplica(t.folder, { op: 'status' }, 10000);
+            assert.strictEqual(status.fullSyncRunning, true);
             assert.deepStrictEqual([...(status.question?.paths ?? [])].sort(), deleted);
         });
 

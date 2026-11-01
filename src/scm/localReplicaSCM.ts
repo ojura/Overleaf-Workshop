@@ -7,8 +7,8 @@ import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { FileRefEntity, FolderEntity, VirtualFileSystem, __OUTPUTS_ID, parseUri } from '../core/remoteFileSystemProvider';
 import {
-    deletionsNeedConfirmation, describe, FolderChange, FolderChangedError, LocalStat, NotConnectedError, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync,
-    ReplicaUI, SyncSummary, syncProblems,
+    Deletions, describe, FolderChange, FolderChangedError, LocalStat, NotConnectedError, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync,
+    ReplicaUI, SyncSummary,
 } from './replicaSync';
 import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath, REPLICA_CONFLICTS_FOLDER, REPLICA_SETTINGS_FILE, REPLICA_TEMPORARY_FOLDER } from './ignorePatterns';
 import * as localFs from './localFolderFs';
@@ -521,10 +521,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             notes.push(vscode.l10n.t('{count} local files are not on Overleaf and were not uploaded: {files}.', {count: summary.untracked.length, files: list(summary.untracked)}));
         }
         if (summary.skippedDeletions.length) {
-            notes.push(vscode.l10n.t('{count} deletions were not confirmed and wait for the next sync.', {count: summary.skippedDeletions.length}));
+            notes.push(`${this.deletionsDeclined(summary.skippedDeletions.length)}.`);
         }
-        for (const {where, paths} of summary.deletionsToConfirm) {
-            notes.push(`${deletionsNeedConfirmation(where, paths.length)}: ${list(paths)}.`);
+        for (const deletions of summary.deletionsToConfirm) {
+            notes.push(`${this.deletionsWaiting(deletions, false)}: ${list(deletions.paths)}.`);
         }
         if (summary.notChecked) {
             notes.push(vscode.l10n.t('The sync was cancelled before {count} files were checked.', {count: summary.notChecked}));
@@ -681,25 +681,61 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             throw new Error(vscode.l10n.t('This local replica has not started.'));
         }
         await this.ready;
-        if (by==='tool' && await this.questionComesFirst()) {
-            // the answer names the question at once (flush adds it for a tool) instead of waiting for the user
-            return await this.sync.flush(false, {by});
+        const question = by==='tool' ? await this.questionComesFirst() : undefined;
+        if (question) {
+            // the answer names the question at once instead of waiting for the user, also when the
+            // user answers it meanwhile
+            return await this.sync.flush(false, {by, question});
         }
         await this.fullSync;
         return await this.sync.flush(true, {record: true, by});
     }
 
     /**
-     * For a tool: whether a question about deletions is open in the window, or opens before the
-     * full sync under way is done, e.g. the full sync's own question. A tool waits for neither.
+     * For a tool: the deletions that a question open in the window asks about, or one that opens
+     * before the full sync under way is done, e.g. the full sync's own question; undefined when
+     * the full sync is done first. A tool waits for neither.
      */
-    private async questionComesFirst(): Promise<boolean> {
-        const question = this.sync!.questionOpened();
+    private async questionComesFirst(): Promise<Deletions | undefined> {
+        const sync = this.sync!;
+        // a question open now comes first, whether or not the full sync is done
+        const open = sync.openQuestion;
+        if (open) { return open; }
+        const question = sync.questionOpened();
         try {
-            return await Promise.race([question.opened.then(() => true), (this.fullSync ?? Promise.resolve()).then(() => false)]);
+            // when both have settled, Promise.race takes the first of the list: the question
+            return await Promise.race([question.opened, (this.fullSync ?? Promise.resolve()).then(() => undefined)]);
         } finally {
             question.dispose();
         }
+    }
+
+    /**
+     * What a tool's answer, the status and the window say about deletions that wait for the
+     * user: a question open in the window (`asked`), or a confirmation that the window has to ask for.
+     */
+    private deletionsWaiting({where, paths}: Deletions, asked: boolean): string {
+        const side = where==='local' ? vscode.l10n.t('in the local folder') : vscode.l10n.t('on Overleaf');
+        return asked
+            ? vscode.l10n.t('A question in the IDE window asks whether to delete {count} files {side}; answer it there', {count: paths.length, side})
+            : vscode.l10n.t('{count} files would be deleted {side}, more than {threshold} at once, and wait for a confirmation in the IDE window ("Sync Local Replica Now")',
+                {count: paths.length, side, threshold: ReplicaSync.deletionThreshold});
+    }
+
+    /** What a tool's answer and the window say about deletions that the user declined in the window. */
+    private deletionsDeclined(count: number): string {
+        return vscode.l10n.t('{count} deletions were not confirmed in the IDE window; the next full sync or "Sync Local Replica Now" asks again', {count});
+    }
+
+    /** What keeps a sync from being complete, one line each, for a tool's answer. */
+    private syncProblems(summary: SyncSummary): string[] {
+        return [
+            ...summary.failed.map(f => `${f.path}: ${f.error}`),
+            ...summary.conflicts.map(path => vscode.l10n.t('{path}: conflict markers to resolve', {path})),
+            ...(summary.question ? [`${this.deletionsWaiting(summary.question, true)}: ${summary.question.paths.join(', ')}`] : []),
+            ...summary.deletionsToConfirm.map(deletions => `${this.deletionsWaiting(deletions, false)}: ${deletions.paths.join(', ')}`),
+            ...(summary.skippedDeletions.length ? [this.deletionsDeclined(summary.skippedDeletions.length)] : []),
+        ];
     }
 
     /** The command "Sync Local Replica Now", for every open replica. */
@@ -792,6 +828,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     /** Answer a tool's request on the control socket (src/scm/replicaControl.ts). */
     private async answerTool(request: ControlRequest): Promise<ControlAnswer> {
+        const question = this.sync?.openQuestion;
         const state = {
             folder: this.baseUri.fsPath,
             project: {id: this.vfs.projectId, name: this.vfs.projectName, server: this.vfs.serverName},
@@ -799,7 +836,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             watcher: this.watchedBy,
             modes: this.modes,
             fullSyncRunning: this.fullSyncRunning,
-            question: this.sync?.openQuestion,
+            question: question && {...question, message: this.deletionsWaiting(question, true)},
         };
         if (request.op==='status') {
             return {ok: true, ...state, git: await this.gitState(), recent: [...this.recent]};
@@ -808,7 +845,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return {...await this.land(request.commit), ...state, recent: [...this.recent]};
         }
         const summary = await this.syncNow('tool');
-        const problems = syncProblems(summary);
+        const problems = this.syncProblems(summary);
         const git = await this.gitState();
         return problems.length===0
             ? {ok: true, ...state, summary, git, recent: [...this.recent]}
@@ -827,14 +864,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return {ok: false, error: vscode.l10n.t('This local replica has not started.')};
         }
         await this.ready;
-        if (await this.questionComesFirst()) {
-            const waiting = await sync.flush(false, {by: 'tool'});
-            return {ok: false, error: `the replica is not in sync: ${syncProblems(waiting).join('; ')}`, summary: waiting};
+        const question = await this.questionComesFirst();
+        if (question) {
+            const waiting = await sync.flush(false, {by: 'tool', question});
+            return {ok: false, error: `the replica is not in sync: ${this.syncProblems(waiting).join('; ')}`, summary: waiting};
         }
         await this.fullSync;
         const git = store.git;
         const before = await sync.flush(true, {record: true, by: 'tool'});
-        const problems = syncProblems(before);
+        const problems = this.syncProblems(before);
         if (problems.length) { return {ok: false, error: `the replica is not in sync: ${problems.join('; ')}`, summary: before}; }
         const [head, overleaf, target] = await Promise.all([git.commit('HEAD'), git.commit(OVERLEAF_REF), git.commit(commit)]);
         if (target===undefined) { return {ok: false, error: `${commit} names no commit in the replica's repository`}; }
@@ -857,7 +895,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 .stdout.toString('utf8').split('\0').filter(Boolean).map(p => `/${p}`);
             await git.run(['merge', '--ff-only', '--quiet', target]);
             const summary = await sync.flush(true, {by: 'tool', approved: new Set(deleted)});
-            const failed = syncProblems(summary);
+            const failed = this.syncProblems(summary);
             const recorded = await sync.recordNow({force: true});
             const after = await git.commit(OVERLEAF_REF);
             const held = after!==undefined && (after===target || await git.isAncestor(target, after));

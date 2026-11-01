@@ -181,11 +181,19 @@ export interface SyncSummary {
     /** deletions that the user did not confirm in the window */
     skippedDeletions: string[],
     /** deletions that a tool's request did not make: more than `deletionThreshold` on one side need the user's confirmation */
-    deletionsToConfirm: {where: 'local' | 'remote', paths: string[]}[],
+    deletionsToConfirm: Deletions[],
+    /** for a tool's request: the deletions that a question open in the window asks about, which the request did not wait for */
+    question?: Deletions,
     failed: {path: string, error: string}[],
     unchanged: number,
     /** files a cancelled `syncAll` did not get to */
     notChecked: number,
+}
+
+/** Deletions on one side of the sync: of local files (`local`), or of files on Overleaf (`remote`). */
+export interface Deletions {
+    where: 'local' | 'remote',
+    paths: string[],
 }
 
 function emptySummary(): SyncSummary {
@@ -243,22 +251,6 @@ export type FolderChange = 'gone' | 'replaced' | 'gitFolderGone' | 'settingsGone
  */
 export class FolderChangedError extends Error {
     constructor(readonly reason: FolderChange, message: string) { super(message); }
-}
-
-/** Why a tool's sync did not make the deletions: more than `deletionThreshold` on one side need the user's confirmation. */
-export function deletionsNeedConfirmation(where: 'local' | 'remote', count: number): string {
-    return `${count} files would be deleted ${where==='local' ? 'in the local folder' : 'on Overleaf'}, more than ${ReplicaSync.deletionThreshold} at once,`
-        + ' and wait for a confirmation in the IDE window ("Sync Local Replica Now")';
-}
-
-/** What keeps a sync from being complete, one line each, e.g. for a tool's answer. */
-export function syncProblems(summary: SyncSummary): string[] {
-    return [
-        ...summary.failed.map(f => `${f.path}: ${f.error}`),
-        ...summary.conflicts.map(path => `${path}: conflict markers to resolve`),
-        ...summary.deletionsToConfirm.map(({where, paths}) => `${deletionsNeedConfirmation(where, paths.length)}: ${paths.join(', ')}`),
-        ...(summary.skippedDeletions.length ? [`${summary.skippedDeletions.length} deletions were not confirmed in the IDE window`] : []),
-    ];
 }
 
 class Semaphore {
@@ -354,9 +346,9 @@ export class ReplicaSync {
     /** one deletion step at a time, so that the deletions of one moment get one question */
     private deleting: Promise<unknown> = Promise.resolve();
     /** the deletions that a question open in the window asks about (decideDeletions); undefined while the window does not ask */
-    private question?: {where: 'local' | 'remote', paths: string[]};
-    /** who waits for a question to open (`questionOpened`) */
-    private readonly questionListeners = new Set<() => void>();
+    private question?: Deletions;
+    /** who waits for a question to open (`questionOpened`), told the question when it opens */
+    private readonly questionListeners = new Set<(question: Deletions) => void>();
     private readonly merge: MergeText;
     /** whether local changes are uploaded; without, they wait for a push through the git bridge */
     private readonly uploads: boolean;
@@ -381,20 +373,22 @@ export class ReplicaSync {
     }
 
     /** The deletions that a question open in the window asks about now; undefined while the window does not ask. */
-    get openQuestion(): {where: 'local' | 'remote', paths: string[]} | undefined {
+    get openQuestion(): Deletions | undefined {
         return this.question && {where: this.question.where, paths: [...this.question.paths]};
     }
 
     /**
-     * Resolves once a question about deletions is open in the window, at once while one is: a
-     * tool that must not wait behind the question waits for this or for what it needs, whichever
-     * comes first. `dispose` ends the wait.
+     * Resolves with the deletions that a question open in the window asks about, as they were
+     * when it opened: at once while one is open, else when the next one opens. A tool that must
+     * not wait behind the question waits for this or for what it needs, whichever comes first.
+     * `dispose` ends the wait.
      */
-    questionOpened(): {opened: Promise<void>, dispose(): void} {
-        let listener!: () => void;
-        const opened = new Promise<void>(resolve => { listener = resolve; });
-        if (this.question) {
-            listener();
+    questionOpened(): {opened: Promise<Deletions>, dispose(): void} {
+        let listener!: (question: Deletions) => void;
+        const opened = new Promise<Deletions>(resolve => { listener = resolve; });
+        const open = this.openQuestion;
+        if (open) {
+            listener(open);
             return {opened, dispose: () => {}};
         }
         this.questionListeners.add(listener);
@@ -587,10 +581,12 @@ export class ReplicaSync {
      * may still be half written: a periodic scan gets them the next time. `by` says who asks:
      * a tool, which does not make the deletions that need a confirmation, or the user in the
      * window, who is asked again about deletions declined before. `approved` lists deletions
-     * that the request itself confirms.
+     * that the request itself confirms. `question` is the question about deletions that a tool
+     * saw open in the window (`questionOpened`): the answer names it, also when the user has
+     * answered it since; without it, the answer names the question open at its end.
      */
-    async flush(scan: boolean, {skipRecentMs = 0, now = Date.now(), record = false, by, approved}: {
-        skipRecentMs?: number, now?: number, record?: boolean, by?: 'tool' | 'user', approved?: ReadonlySet<string>,
+    async flush(scan: boolean, {skipRecentMs = 0, now = Date.now(), record = false, by, approved, question: seen}: {
+        skipRecentMs?: number, now?: number, record?: boolean, by?: 'tool' | 'user', approved?: ReadonlySet<string>, question?: Deletions,
     } = {}): Promise<SyncSummary> {
         await this.load();
         await this.local.verify();
@@ -619,10 +615,12 @@ export class ReplicaSync {
             await this.applyDeletions(mode);
             this.ui.liveResult(mode.summary);
         }
-        // a tool learns about a question open in the window, whatever its own step collected
-        const question = by==='tool' ? this.openQuestion : undefined;
-        if (question && !summary.deletionsToConfirm.some(({where}) => where===question.where)) {
-            summary.deletionsToConfirm.push(question);
+        // a tool learns about a question open in the window, whatever its own step collected; the
+        // question names the deletions on its side that the step could not make
+        const question = by==='tool' ? seen ?? this.openQuestion : undefined;
+        if (question) {
+            summary.question = question;
+            summary.deletionsToConfirm = summary.deletionsToConfirm.filter(({where}) => where!==question.where);
         }
         await Promise.all([...this.slots.values()].map(slot => slot.tail));
         await this.remote.settled();
@@ -762,12 +760,12 @@ export class ReplicaSync {
                 if (counted.length>ReplicaSync.deletionThreshold) {
                     if (mode.tool) {
                         summary.deletionsToConfirm.push({where, paths: counted});
-                        this.ui.log(`${deletionsNeedConfirmation(where, counted.length)}: ${counted.join(', ')}`);
+                        this.ui.log(`Not deleting ${counted.length} files ${side} for a tool's request: more than ${ReplicaSync.deletionThreshold} at once need the user's confirmation in the window: ${counted.join(', ')}`);
                         requested[where].forEach(path => open.delete(path));
                         continue;
                     }
                     this.question = {where, paths: counted};
-                    this.questionListeners.forEach(listener => listener());
+                    this.questionListeners.forEach(listener => listener(this.openQuestion!));
                     let confirmed: boolean;
                     try {
                         confirmed = await this.ui.confirmDeletions(where, counted);
@@ -1292,6 +1290,7 @@ export function describe(summary: SyncSummary): string {
         [summary.untracked.length, 'local-only files left alone'],
         [summary.skippedDeletions.length, 'deletions not confirmed'],
         [summary.deletionsToConfirm.reduce((count, {paths}) => count + paths.length, 0), 'deletions that need a confirmation in the IDE window'],
+        [summary.question?.paths.length ?? 0, 'deletions that a question in the IDE window asks about'],
         [summary.failed.length, 'failed'],
         [summary.notChecked, 'not checked'],
     ].filter(([count]) => count!==0).map(([count, what]) => `${count} ${what}`);
