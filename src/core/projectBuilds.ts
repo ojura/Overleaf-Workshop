@@ -310,10 +310,16 @@ export class ProjectBuilds {
     private loggedIdForm = false;
     /**
      * whether the window compiled on its own for a viewer without a build to show, since a viewer
-     * last showed a build or the user last compiled: then the next such compile is the user's, so
-     * that builds reported gone one after another do not each start a compile
+     * last showed a build or the user last compiled (a compile that compiled nothing because
+     * nothing had changed does not count): then the next such compile is the user's, so that
+     * builds reported gone one after another do not each start a compile
      */
     private compiledForViewer = false;
+    /**
+     * what a compile of this project that started elsewhere replaced (compileStarted): the
+     * compile state and compiledForViewer, which come back when that compile compiled nothing
+     */
+    private beforeStart?: { compile: CompileState, compiledForViewer: boolean };
     private shown: BuildStatus = { state: 'none' };
     private readonly buildListeners = new Set<(build: Build) => void>();
     private readonly statusListeners = new Set<(status: BuildStatus) => void>();
@@ -413,7 +419,9 @@ export class ProjectBuilds {
      */
     compileStarted(ofThisProject: boolean) {
         if (ofThisProject && this.compile.state !== 'running') {
-            // a compile that the user started, from an editor or with a save
+            // a compile that the user started, from an editor or with a save; whether it compiles
+            // anything shows only at its end, which puts this state back when it did not
+            this.beforeStart = { compile: this.compile, compiledForViewer: this.compiledForViewer };
             this.compiledForViewer = false;
             this.compile = { state: 'running', started: true };
             this.update();
@@ -430,11 +438,18 @@ export class ProjectBuilds {
         if (!ofThisProject) {
             return;
         }
+        const before = this.beforeStart;
+        this.beforeStart = undefined;
         if (outcome.result === 'skipped') {
-            // nothing had changed since the last compile, so it made no build; a compile that ran
-            // ends here, and a request waiting for it asks again when it has ended
+            // nothing had changed since the last compile, so it compiled nothing and made no build:
+            // a compile that started elsewhere leaves the state that it found, a failure and
+            // compiledForViewer included; a compile that this project asked for ends here, and a
+            // request waiting for it asks again when it has ended
             if (this.compile.state === 'running' && this.compile.started) {
-                this.compile = { state: 'idle' };
+                this.compile = before?.compile ?? { state: 'idle' };
+                if (before) {
+                    this.compiledForViewer = before.compiledForViewer;
+                }
                 this.update();
             }
             return;

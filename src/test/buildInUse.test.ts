@@ -797,6 +797,26 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.deepStrictEqual(vfs.builds.status, { state: 'ready' });
         });
 
+        it('keeps the failed compile\'s line, and compiles nothing on its own, after a compile that found nothing changed (skipped)', async () => {
+            overleaf.latest = { status: 404 };
+            overleaf.compiles.push({ status: 'failure', compileGroup: 'priority', clsiServerId: 'clsi-vm-2', outputFiles: [] });
+            let ended = compileEnd();
+            const { panel } = await open();
+            await ended;
+            const failed = vfs.builds.status;
+            assert.strictEqual(failed.state, 'compile-failed');
+            // a compile without force, as on save, finds nothing changed since the failed compile
+            ended = compileEnd();
+            assert.deepStrictEqual(await manager.compile(false, false, projectUri), { kind: 'started' });
+            assert.deepStrictEqual((await ended).outcome, { result: 'skipped' });
+            assert.deepStrictEqual(vfs.builds.status, failed);
+            assert.deepStrictEqual(panel.posted.filter(message => message.type === 'buildState').pop(), { type: 'buildState', ...failed });
+            // the viewer becomes visible again: the failure waits for the user's Recompile
+            await vfs.builds.check();
+            assert.deepStrictEqual(vfs.builds.status, failed);
+            assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
+        });
+
         it('says that it compiles from the click on Recompile, and compiles once the compile that kept it waiting has ended', async () => {
             overleaf.latest = { status: 404 };
             overleaf.compiles.push({ status: 'failure', compileGroup: 'priority', clsiServerId: 'clsi-vm-2', outputFiles: [] }, ownAnswer(overleaf, 'b-new'));
