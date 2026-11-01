@@ -1,4 +1,6 @@
-// Runs both viewers through drive.mjs and prints a side-by-side table.
+// Runs both viewers through drive.mjs and prints a side-by-side table: drive.mjs's measurements, and
+// each check that a run reported, by its name, with n/a for a run that did not report it (a check
+// of one viewer only).
 //   node compare.mjs [--ext <views/pdf-viewer dir>] [--overleaf DIR] [--pdfjs DIR] [--port 8785]
 //                    [--engines overleaf,pdfjs] [--runs frame:40,frame:150,plain:40] [--out DIR]
 // --ext defaults to the checkout's views/pdf-viewer; --overleaf and --pdfjs take one viewer from
@@ -68,7 +70,10 @@ for (const engine of engines) {
 const cell = (r, f) => {
     try { const v = f(r); return v === undefined ? 'n/a' : String(v); } catch { return 'n/a'; }
 };
-const check = (r, name) => {
+const names = Object.keys(all);
+/** the checks that the runs reported, by name, in the order in which they first appear */
+const checkNames = [...new Set(names.flatMap(n => (all[n].results ?? []).map(c => c.name)))];
+const checkCell = (r, name) => {
     const c = r.results?.find(x => x.name === name);
     return c ? (c.ok ? 'yes' : 'NO') : 'n/a';
 };
@@ -79,18 +84,11 @@ const rows = [
     ['reload: swap (ms)', r => r.metrics.reloadSwapMs],
     ['reload: page 60 drawn (ms)', r => r.metrics.reloadRenderedMs],
     ['reload: MB through the bridge / from the server', r => `${r.metrics.reloadBridgeMB} / ${r.metrics.reloadServerMB}`],
-    ['reload: old pages stay during the load', r => check(r, 'reload: the old pages stay while the new build loads')],
-    ['reload: same page and offset on screen', r => check(r, 'reload: same page, same offset on screen')],
-    ['find: asks before downloading', r => check(r, 'find: the viewer asks before a search downloads the PDF')],
-    ['Ctrl+P reaches VS Code', r => check(r, 'Ctrl+P (Quick Open) reaches VS Code')],
-    ['Ctrl+Shift+P reaches VS Code', r => check(r, 'Ctrl+Shift+P (Command Palette) reaches VS Code')],
-    ['Ctrl+= zooms only the PDF', r => check(r, 'Ctrl+= stays with the viewer (VS Code would zoom its window too)')],
-    ['Ctrl+S does not download the PDF', r => check(r, 'Ctrl+S does not download the PDF through the bridge')],
     ['find: MB downloaded in 10 s', r => r.metrics.find10sBridgeMB],
+    ...checkNames.map(name => [name, r => checkCell(r, name)]),
     ['checks passed', r => `${r.results.filter(x => x.ok).length}/${r.results.length}`],
     ['console errors and warnings', r => r.problems.length],
 ];
-const names = Object.keys(all);
 let table = `| | ${names.join(' | ')} |\n|---|${names.map(() => '---').join('|')}|\n`;
 for (const [label, f] of rows) {
     table += `| ${label} | ${names.map(n => all[n].error ? 'error' : cell(all[n], f)).join(' | ')} |\n`;
