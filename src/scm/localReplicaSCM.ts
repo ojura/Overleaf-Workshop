@@ -2,14 +2,13 @@ import * as vscode from 'vscode';
 import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { FileRefEntity, FolderEntity, VirtualFileSystem, __OUTPUTS_ID, parseUri } from '../core/remoteFileSystemProvider';
 import {
     Deletions, describe, FolderChange, FolderChangedError, LocalStat, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync,
     ReplicaUI, SyncSummary,
 } from './replicaSync';
-import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath, REPLICA_CONFLICTS_FOLDER, REPLICA_SETTINGS_FILE, REPLICA_TEMPORARY_FOLDER } from './ignorePatterns';
+import { DEFAULT_IGNORE_PATTERNS, IgnoreMatcher, isReplicaOwnPath, REPLICA_CONFLICTS_FOLDER, REPLICA_SETTINGS_FILE, REPLICA_TEMPORARY_FOLDER } from './ignorePatterns';
 import * as localFs from './localFolderFs';
 import { LocalFolderWatcher } from './localFolderWatcher';
 import { ControlAnswer, ControlRequest, ReplicaControlServer } from './replicaControl';
@@ -178,14 +177,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
+    /** the ignore patterns, compiled once for each value of the setting */
+    private readonly ignoreMatcher = new IgnoreMatcher();
+
     private matchIgnorePatterns(path: string): boolean {
-        const ignorePatterns = this.getSetting<string[]>(IGNORE_SETTING_KEY) || this.ignorePatterns;
-        for (const pattern of ignorePatterns) {
-            if (minimatch(path, pattern, {dot:true})) {
-                return true;
-            }
-        }
-        return false;
+        return this.ignoreMatcher.matches(this.getSetting<string[]>(IGNORE_SETTING_KEY) || this.ignorePatterns, path);
     }
 
     /** The path of `uri` inside the local folder, like '/dir/name.ext'; undefined when outside. */

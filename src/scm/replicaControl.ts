@@ -56,6 +56,21 @@ function prepareSocketFolder(socket: string): string | undefined {
     return undefined;
 }
 
+/**
+ * Whether a socket is at `socket`, which a server listens on. An operating system that shortens a
+ * path longer than a socket's may be does so without an error, and the socket is then at the
+ * shortened path: nothing is at the one asked for (measured with Node 22 on Linux, where
+ * server.address() still answers the path asked for).
+ */
+function socketIsThere(socket: string): boolean {
+    try {
+        return fs.statSync(socket).isSocket();
+    } catch (error: any) {
+        if (error?.code === 'ENOENT') { return false; }
+        throw error;
+    }
+}
+
 /** Whether a server answers on `socket`. */
 function answers(socket: string): Promise<boolean> {
     return new Promise(resolve => {
@@ -69,6 +84,8 @@ export class ReplicaControlServer {
     private server?: net.Server;
     private socket?: string;
     private disposed = false;
+    /** whether this server wrote the pointer file, with its socket or with why it cannot listen */
+    private pointerWritten = false;
 
     /**
      * @param folder the replica's folder
@@ -102,12 +119,20 @@ export class ReplicaControlServer {
                     if (process.platform !== 'win32') { fs.rmSync(socket, { force: true }); }
                     return undefined;
                 }
+                if (!error && process.platform !== 'win32' && !socketIsThere(socket)) {
+                    // closing the server removes the socket at the shortened path
+                    await new Promise<void>(resolve => server.close(() => resolve()));
+                    const reason = `the operating system shortened the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), as a socket's path must be shorter: set XDG_RUNTIME_DIR to a folder with a shorter path`;
+                    this.log(`Tools cannot ask for a sync: ${reason}.`);
+                    this.writePointer({ error: reason });
+                    return undefined;
+                }
                 if (!error) {
                     server.unref(); // the window lives on its own; a tool's process need not wait for the socket
                     this.server = server;
                     this.socket = socket;
                     if (process.platform !== 'win32') { fs.chmodSync(socket, 0o600); }
-                    this.writePointer(socket);
+                    this.writePointer({ socket });
                     return socket;
                 }
                 if (error.code !== 'EADDRINUSE' || attempt > 0) { throw error; }
@@ -151,11 +176,16 @@ export class ReplicaControlServer {
         if (!connection.destroyed) { connection.write(JSON.stringify(answer) + '\n'); }
     }
 
-    private writePointer(socket: string) {
+    /** Name the socket in the folder, or why this window cannot listen, for the tools that look there. */
+    private writePointer(content: { socket: string } | { error: string }) {
         try {
             const file = path.join(this.folder, POINTER_FILE);
             fs.mkdirSync(path.dirname(file), { recursive: true });
-            fs.writeFileSync(file, JSON.stringify({ socket, pid: process.pid, since: new Date().toISOString() }, null, 4) + '\n');
+            // a new file renamed over the old one, so that a tool reads all of it or the one before
+            const tmp = `${file}.${process.pid}.tmp`;
+            fs.writeFileSync(tmp, JSON.stringify({ ...content, pid: process.pid, since: new Date().toISOString() }, null, 4) + '\n');
+            fs.renameSync(tmp, file);
+            this.pointerWritten = true;
         } catch (error: any) {
             this.log(`Could not write ${path.join(this.folder, POINTER_FILE)}: ${error?.message ?? error}`);
         }
@@ -167,33 +197,56 @@ export class ReplicaControlServer {
         this.server?.close();
         this.server = undefined;
         this.socket = undefined;
-        if (socket === undefined) { return; }
-        if (process.platform !== 'win32') { fs.rmSync(socket, { force: true }); }
+        if (socket !== undefined && process.platform !== 'win32') { fs.rmSync(socket, { force: true }); }
+        if (!this.pointerWritten) { return; }
         try {
             const file = path.join(this.folder, POINTER_FILE);
             const pointer = JSON.parse(fs.readFileSync(file, 'utf8'));
-            if (pointer.socket === socket && pointer.pid === process.pid) { fs.rmSync(file, { force: true }); }
+            if (pointer.pid === process.pid && (pointer.socket === socket || typeof pointer.error === 'string')) { fs.rmSync(file, { force: true }); }
         } catch { /* gone, or another window's */ }
     }
 }
 
 /** No window answers for the folder: the IDE is not running, or it does not have the folder open as a replica. */
 export class NoReplicaWindowError extends Error {}
+/** A window keeps the folder in sync but cannot answer tools, for the reason its pointer file gives. */
+export class ReplicaUnreachableError extends Error {}
 /** The window did not answer in time. */
 export class ReplicaTimeoutError extends Error {}
 
 /** The socket a program should use for `folder`: the one the window named, else the computed one. */
 export function findReplicaSocket(folder: string): string {
+    let pointer: any;
     try {
-        const pointer = JSON.parse(fs.readFileSync(path.join(folder, POINTER_FILE), 'utf8'));
-        if (typeof pointer.socket === 'string') { return pointer.socket; }
+        pointer = JSON.parse(fs.readFileSync(path.join(folder, POINTER_FILE), 'utf8'));
     } catch { /* no pointer file */ }
+    if (typeof pointer?.socket === 'string') { return pointer.socket; }
+    if (typeof pointer?.error === 'string' && processRuns(pointer.pid)) {
+        throw new ReplicaUnreachableError(`the IDE window that keeps ${folder} in sync cannot answer tools: ${pointer.error}`);
+    }
     return replicaSocketPath(folder);
+}
+
+/** Whether the process `pid` runs, e.g. the window that wrote a pointer file. */
+function processRuns(pid: unknown): boolean {
+    if (typeof pid !== 'number') { return false; }
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error: any) {
+        // EPERM: it runs, as another user's
+        return error?.code === 'EPERM';
+    }
 }
 
 /** Send one request to the window that keeps `folder` in sync and wait for its answer. */
 export function requestReplica(folder: string, request: ControlRequest, timeoutMs: number): Promise<ControlAnswer> {
-    const socket = findReplicaSocket(folder);
+    let socket: string;
+    try {
+        socket = findReplicaSocket(folder);
+    } catch (error) {
+        return Promise.reject(error);
+    }
     return new Promise((resolve, reject) => {
         let buffer = '';
         let settled = false;

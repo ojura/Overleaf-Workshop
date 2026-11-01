@@ -5,7 +5,15 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { POINTER_FILE } from '../scm/replicaControl';
 import { loadWithVscode } from './standIn';
+
+/**
+ * A place with a short path for the tests' socket folders: a socket's path must be short, and the
+ * system shortens a longer one (src/scm/replicaControl.ts), while os.tmpdir() can be long (TMPDIR).
+ * Windows' sockets are named pipes, which this does not concern.
+ */
+export const SHORT_TEMP = process.platform === 'win32' ? os.tmpdir() : '/tmp';
 
 /** Stands in for anything else: callable, constructible, and every member is one again. */
 export function stub(): any {
@@ -227,8 +235,8 @@ export class Cleanup {
         if (errors.length) { throw errors[0]; }
     }
 
-    tempDir(prefix: string): string {
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    tempDir(prefix: string, base = os.tmpdir()): string {
+        const dir = fs.mkdtempSync(path.join(base, prefix));
         this.add(() => fs.rmSync(dir, { recursive: true, force: true }));
         return dir;
     }
@@ -241,7 +249,7 @@ export class Cleanup {
 
     /** A socket folder and a trash of the test's own, so that the developer's stay untouched. */
     privateRuntime(): { runtime: string, data: string } {
-        const runtime = this.tempDir('ow-runtime-');
+        const runtime = this.tempDir('owr-', SHORT_TEMP);
         fs.chmodSync(runtime, 0o700);
         this.setEnv('XDG_RUNTIME_DIR', runtime);
         const data = this.tempDir('ow-data-');
@@ -281,6 +289,17 @@ export class Cleanup {
     /** Resolves once `file` exists, e.g. the pointer file that the replica's control server writes once it listens. */
     fileAppears(file: string): Promise<void> {
         return this.folderShows(path.dirname(file), () => fs.existsSync(file));
+    }
+
+    /**
+     * Resolves once the control server of the replica in `folder` listens, by its pointer file;
+     * fails with the server's own reason when the pointer file says that it cannot listen.
+     */
+    async controlListens(folder: string): Promise<void> {
+        const file = path.join(folder, POINTER_FILE);
+        await this.fileAppears(file);
+        const pointer = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (typeof pointer.error === 'string') { throw new Error(`the replica's control server cannot listen: ${pointer.error}`); }
     }
 }
 
