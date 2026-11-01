@@ -1,5 +1,6 @@
 import * as assert from 'assert';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import {
@@ -81,6 +82,35 @@ describe('the control socket of a local replica', () => {
             'a tool\'s answer');
         assert.strictEqual(fs.readFileSync(shortened, 'utf8'), 'a file of another program', 'the file at the shortened path');
         assert.deepStrictEqual(fs.readdirSync(long), [], 'the long runtime folder, without a socket folder');
+    });
+
+    it('does not connect a tool to a socket path that is too long for the system, where another program can listen at the shortened path', async function () {
+        const sunPath = ({ linux: 108, darwin: 104 } as Partial<Record<NodeJS.Platform, number>>)[process.platform];
+        if (sunPath === undefined) { this.skip(); }
+        longRuntime();
+        const socket = replicaSocketPath(folder);
+        // another program listens where Node would connect a tool: at the first bytes of the path that fit into sun_path
+        const requests: string[] = [];
+        const connections: net.Socket[] = [];
+        const other = net.createServer(connection => {
+            connections.push(connection);
+            connection.setEncoding('utf8');
+            connection.on('data', request => {
+                requests.push(String(request).trim());
+                connection.end(JSON.stringify({ ok: true, from: 'another program' }) + '\n');
+            });
+        });
+        await new Promise<void>(resolve => other.listen(Buffer.from(socket).subarray(0, sunPath).toString(), resolve));
+        try {
+            const reason = `the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), is longer than the ${sunPath - 1} bytes that a socket's path may have on this system: set XDG_RUNTIME_DIR to a folder with a shorter path`;
+            await assert.rejects(requestReplica(folder, { op: 'sync' }, 5000),
+                (error: Error) => error instanceof ReplicaUnreachableError && error.message === `tools cannot reach an IDE window for ${folder}: ${reason}`,
+                'a tool\'s answer');
+            assert.deepStrictEqual({ connections: connections.length, requests }, { connections: 0, requests: [] }, 'what the other program got');
+        } finally {
+            connections.forEach(connection => connection.destroy());
+            await new Promise<void>(resolve => other.close(() => resolve()));
+        }
     });
 
     it('listens on a socket path as long as the system allows, and not on one a byte longer', async function () {

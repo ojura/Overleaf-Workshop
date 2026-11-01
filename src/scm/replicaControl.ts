@@ -66,6 +66,17 @@ function prepareSocketFolder(socket: string): string | undefined {
 const SUN_PATH_BYTES: Partial<Record<NodeJS.Platform, number>> = { linux: 108, darwin: 104 };
 
 /**
+ * Why `socket` cannot be a socket's path on this system, or undefined when it fits or when
+ * SUN_PATH_BYTES does not give this system's limit. Node would shorten such a path at listen and
+ * at connect alike.
+ */
+function socketPathTooLong(socket: string): string | undefined {
+    const field = ReplicaControlServer.sunPathBytes;
+    if (field === undefined || Buffer.byteLength(socket) < field) { return undefined; }
+    return `the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), is longer than the ${field - 1} bytes that a socket's path may have on this system: set XDG_RUNTIME_DIR to a folder with a shorter path`;
+}
+
+/**
  * Whether a socket is at `socket`, which a server listens on. Node shortens a socket path that is
  * too long, without an error: it makes the socket at the first bytes of the path that fit into
  * sun_path, and stat of the path asked for fails with ENOENT (measured with Node 22 on Linux,
@@ -93,8 +104,9 @@ export class ReplicaControlServer {
     /**
      * The bytes of sun_path on this system (SUN_PATH_BYTES). start() refuses a socket path that
      * does not fit, with its NUL, before Node would make the socket at a shortened path, which can
-     * be in a folder that other users can enter. Undefined on a system that SUN_PATH_BYTES does not
-     * list: there, the check after listen finds the shortening, and the close removes that socket.
+     * be in a folder that other users can enter; requestReplica does not connect to such a path,
+     * where another program can listen. Undefined on a system that SUN_PATH_BYTES does not list:
+     * there, the check after listen finds the shortening, and the close removes that socket.
      */
     static sunPathBytes: number | undefined = SUN_PATH_BYTES[process.platform];
 
@@ -119,10 +131,8 @@ export class ReplicaControlServer {
     async start(): Promise<string | undefined> {
         const socket = replicaSocketPath(this.folder);
         try {
-            const field = ReplicaControlServer.sunPathBytes;
-            if (field !== undefined && Buffer.byteLength(socket) >= field) {
-                return this.cannotListen(`the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), is longer than the ${field - 1} bytes that a socket's path may have on this system: set XDG_RUNTIME_DIR to a folder with a shorter path`);
-            }
+            const tooLong = socketPathTooLong(socket);
+            if (tooLong) { return this.cannotListen(tooLong); }
             const problem = prepareSocketFolder(socket);
             if (problem) {
                 this.log(`Tools cannot ask for a sync: ${problem}.`);
@@ -234,7 +244,11 @@ export class ReplicaControlServer {
 
 /** No window answers for the folder: the IDE is not running, or it does not have the folder open as a replica. */
 export class NoReplicaWindowError extends Error {}
-/** A window keeps the folder in sync but cannot answer tools, for the reason its pointer file gives. */
+/**
+ * Tools cannot reach the window that keeps the folder in sync: the window's pointer file gives the
+ * reason, or the socket's path is too long for this system, and a window does not listen at such a
+ * path. In the second case a window may or may not run.
+ */
 export class ReplicaUnreachableError extends Error {}
 /** The window did not answer in time. */
 export class ReplicaTimeoutError extends Error {}
@@ -272,6 +286,9 @@ export function requestReplica(folder: string, request: ControlRequest, timeoutM
     } catch (error) {
         return Promise.reject(error);
     }
+    // Node would connect to the shortened path, where another program can listen
+    const tooLong = socketPathTooLong(socket);
+    if (tooLong) { return Promise.reject(new ReplicaUnreachableError(`tools cannot reach an IDE window for ${folder}: ${tooLong}`)); }
     return new Promise((resolve, reject) => {
         let buffer = '';
         let settled = false;
