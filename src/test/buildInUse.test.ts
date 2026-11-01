@@ -88,6 +88,18 @@ class Overleaf {
     private answer(req: http.IncomingMessage, body: string, res: http.ServerResponse) {
         const url = new URL(req.url!, 'http://x');
         this.requests.push({ method: req.method!, path: url.pathname, query: url.searchParams, cookie: req.headers.cookie, range: req.headers.range, body: body ? JSON.parse(body) : undefined });
+        const waiting = this.holding.get(url.pathname);
+        if (waiting) {
+            res.on('close', () => { if (!res.writableFinished) { this.events.emit('closed', url.pathname); } });
+            waiting.push(() => this.route(req, res, url));
+            this.events.emit('held', url.pathname);
+            return;
+        }
+        this.route(req, res, url);
+    }
+
+    /** Answer a request as the server does at its path. */
+    private route(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
         const json = (status: number, value: unknown) => {
             res.writeHead(status, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(value));
@@ -112,13 +124,6 @@ class Overleaf {
         }
         if (url.pathname === '/project/p1/sync/pdf') {
             json(200, { code: [{ file: 'main.tex', line: 7, column: 0 }] });
-            return;
-        }
-        const waiting = this.holding.get(url.pathname);
-        if (waiting) {
-            res.on('close', () => { if (!res.writableFinished) { this.events.emit('closed', url.pathname); } });
-            waiting.push(() => this.send(req, res, url));
-            this.events.emit('held', url.pathname);
             return;
         }
         this.send(req, res, url);
@@ -631,6 +636,26 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.deepStrictEqual((await ended).outcome, { result: 'success' });
             assert.deepStrictEqual(overleaf.to('/project/p1/compile').map(r => [r.body.rootDoc_id, r.body.rootResourcePath]), [['doc-main', 'main.tex'], ['doc-main', 'main.tex']]);
             assert.strictEqual((await panel.first('load')).output.file.build, 'b-new');
+            assert.deepStrictEqual(vfs.builds.status, { state: 'ready' });
+        });
+
+        it('says that it compiles while a compile that it did not ask for runs, also after a failed compile', async () => {
+            overleaf.latest = { status: 404 };
+            overleaf.compiles.push({ status: 'failure', compileGroup: 'priority', clsiServerId: 'clsi-vm-2', outputFiles: [] }, ownAnswer(overleaf, 'b-new'));
+            let ended = compileEnd();
+            const { panel } = await open();
+            await ended;
+            assert.strictEqual(vfs.builds.status.state, 'compile-failed');
+            // the compile command, as an editor's menu, a key or a save runs it
+            overleaf.hold('/project/p1/compile');
+            const held = once(overleaf.events, 'held');
+            ended = compileEnd();
+            assert.deepStrictEqual(await manager.compile(true, false, projectUri), { kind: 'started' });
+            await held;
+            assert.deepStrictEqual(vfs.builds.status, { state: 'compiling' });
+            assert.deepStrictEqual(panel.posted.filter(message => message.type === 'buildState').pop(), { type: 'buildState', state: 'compiling' });
+            overleaf.release('/project/p1/compile');
+            assert.deepStrictEqual((await ended).outcome, { result: 'success' });
             assert.deepStrictEqual(vfs.builds.status, { state: 'ready' });
         });
 

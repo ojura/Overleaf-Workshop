@@ -261,6 +261,30 @@ describe('the build in use (ProjectBuilds)', () => {
         assert.deepStrictEqual(builds.status, { state: 'ready' });
     });
 
+    it('says that it compiles while a compile of the project runs that it did not ask for, until that compile ends', () => {
+        const { host, builds, statuses } = setup({ visible: false });
+        // another project's compile
+        builds.compileStarted(false);
+        assert.deepStrictEqual(builds.status, { state: 'none' });
+        // this project's, from an editor
+        builds.compileStarted(true);
+        assert.deepStrictEqual(builds.status, { state: 'compiling' });
+        builds.compileEnded({ result: 'failure', detail: 'Overleaf\'s status is "failure"' }, true);
+        assert.deepStrictEqual(builds.status, { state: 'compile-failed', detail: 'Overleaf\'s status is "failure"' });
+        assert.deepStrictEqual(statuses.map(s => s.state), ['compiling', 'compile-failed']);
+        assert.strictEqual(host.compiles, 0);
+    });
+
+    it('ends the compiling state when a compile that it started turns out to have nothing to compile', async () => {
+        const { host, builds } = setup();
+        host.answers.push({ kind: 'none' });
+        await builds.check();
+        assert.deepStrictEqual(builds.status, { state: 'compiling' });
+        builds.compileEnded({ result: 'skipped' }, true);
+        assert.deepStrictEqual(builds.status, { state: 'none' });
+        assert.strictEqual(host.compiles, 1);
+    });
+
     it('says why when the compile cannot start', async () => {
         const { host, builds } = setup();
         host.answers.push({ kind: 'none' });

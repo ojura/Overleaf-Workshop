@@ -282,6 +282,10 @@ export class VirtualFileSystem extends vscode.Disposable {
             }),
             this.builds.onDidChangeStatus((status) => EventBus.fire('buildStatusEvent', {uri: this.pathToUri(), status})),
         );
+        const compileStarted = EventBus.on('compileStartedEvent', ({uri}) => {
+            this.builds.compileStarted(parseUri(uri).projectId===this.projectId);
+        });
+        this.buildListeners.push(() => compileStarted.dispose());
         const compileEnded = EventBus.on('compileEndedEvent', ({uri, outcome}) => {
             this.builds.compileEnded(outcome, parseUri(uri).projectId===this.projectId);
         });

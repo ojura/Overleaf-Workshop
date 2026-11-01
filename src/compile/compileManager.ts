@@ -274,6 +274,8 @@ export class CompileManager {
     /** The compile of the project at `uri` that `compile` started, up to its diagnostics; it calls `end` when it ends. */
     private async run(uri: vscode.Uri, force: boolean, fromScratch: boolean, end: () => void) {
         let outcome: CompileOutcome = { result: 'failure', detail: 'the compile did not start' };
+        // before compile() answers 'started': the viewers say 'compiling' for this compile too
+        EventBus.fire('compileStartedEvent', { uri });
         try {
             const vfs = await this.vfsm.prefetch(uri);
             await this.waitForLocalReplica(vfs);

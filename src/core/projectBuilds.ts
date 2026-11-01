@@ -192,9 +192,10 @@ type CompileState =
     /** no compile was asked for since the build in use came */
     | { state: 'idle' }
     /**
-     * a compile was asked for and has not ended: `started` once the compile path has started it;
-     * before, the request is on its way, or it found another compile running, maybe of another
-     * project, and waits for that compile's end (CompileStart 'busy')
+     * a compile of this project runs, or was asked for and has not ended: `started` once a
+     * compile of this project has started, asked for here or elsewhere (compileStarted); before,
+     * the request is on its way, or it found another compile running, maybe of another project,
+     * and waits for that compile's end (CompileStart 'busy')
      */
     | { state: 'running', started: boolean }
     /** the compile ended without a build, or did not start; the user's Recompile is next */
@@ -352,13 +353,35 @@ export class ProjectBuilds {
     }
 
     /**
+     * A compile in this window started: of this project when `ofThisProject`, else of another
+     * project. A compile of this project runs, whoever asked for it (a viewer, an editor, a save),
+     * so the viewers say 'compiling' while there is no build to show, until its end
+     * (compileEnded). A compile that this project asked for is running already.
+     */
+    compileStarted(ofThisProject: boolean) {
+        if (ofThisProject && this.compile.state !== 'running') {
+            this.compile = { state: 'running', started: true };
+            this.update();
+        }
+    }
+
+    /**
      * A compile in this window ended: of this project when `ofThisProject`, else of another
      * project, which the window compiles one at a time.
      */
     compileEnded(outcome: CompileOutcome, ofThisProject: boolean) {
-        // it made no build of this project; a compile of this project that waited for it asks
-        // again when it has ended (compileIfNeeded)
-        if (!ofThisProject || outcome.result === 'skipped') {
+        // another project's compile made no build of this project; a request of this project that
+        // waited for it asks again when it has ended (startCompile)
+        if (!ofThisProject) {
+            return;
+        }
+        if (outcome.result === 'skipped') {
+            // nothing had changed since the last compile, so it made no build; a compile that ran
+            // ends here, and a request waiting for it asks again when it has ended
+            if (this.compile.state === 'running' && this.compile.started) {
+                this.compile = { state: 'idle' };
+                this.update();
+            }
             return;
         }
         if (this.hasBuildToShow()) {
