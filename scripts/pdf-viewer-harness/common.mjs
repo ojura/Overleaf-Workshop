@@ -71,8 +71,13 @@ function writtenBook(name, writer, args = []) {
     return dir;
 }
 
-/** The test book of make_book.py, 120 pages with an image of 1 MB on each, in the folder book/ of the work folder. */
-export const book = () => writtenBook('book', 'make_book.py', ['120', '1024']);
+/**
+ * A test book of make_book.py in the folder `name` of the work folder: `pages` pages with an image
+ * of `imageKb` KB on each; by default the 120-page book in book/. The name stands for the book, so a
+ * caller that asks for other pages or images gives it another name, as probes/toolbar-shots.mjs
+ * does.
+ */
+export const book = (name = 'book', pages = 120, imageKb = 1024) => writtenBook(name, 'make_book.py', [String(pages), String(imageKb)]);
 
 /** The one-page book of theme_book.py, for the color themes, in the folder book-theme/ of the work folder. */
 export const themeBook = () => writtenBook('book-theme', 'theme_book.py');
