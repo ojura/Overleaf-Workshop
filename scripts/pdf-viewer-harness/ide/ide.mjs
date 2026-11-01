@@ -63,8 +63,8 @@ const WORKBENCH_LAYOUT_LIMIT_MS = 60000;
 
 /**
  * The instance's workbench window: `browser`, the checked connection to the instance's IDE,
- * `session` on the workbench page with the Runtime domain enabled, and E(expression), which
- * evaluates in that page. It returns once the workbench has laid out its status bar: the page
+ * `session` on the workbench page with the Runtime domain enabled, `folder`, the folder that the
+ * window opened, and E(expression), which evaluates in that page. It returns once the workbench has laid out its status bar: the page
  * reports that from its own DOM changes (a MutationObserver), since the window's page exists some
  * time before the workbench's parts do. close() closes the connection, and with it every session
  * of the script.
@@ -80,7 +80,7 @@ export async function workbench(inst) {
             const observer = new MutationObserver(() => { if (laidOut()) { observer.disconnect(); resolve(true); } });
             observer.observe(document, { childList: true, subtree: true });
         })`));
-        return { browser, session, E: (expression) => evaluate(session, expression), close: () => browser.close() };
+        return { browser, session, folder: inst.folder, E: (expression) => evaluate(session, expression), close: () => browser.close() };
     } catch (error) {
         browser.close();
         throw error;
@@ -179,9 +179,12 @@ export async function openWithQuickOpen(wb, file) {
         throw new Error(`Quick Open did not take the keyboard focus within ${WORKBENCH_CHANGE_LIMIT_MS / 1000} s of Ctrl+P`);
     }
     await wb.session.send('Input.insertText', { text: file });
-    const want = JSON.stringify({ name: path.basename(file), folder: path.dirname(file) });
+    // Quick Open describes a file by its folder: relative to the workspace's folder for a file in
+    // it, with no description at the workspace's top, and absolute for a file outside it
+    const inWorkspace = wb.folder && (path.dirname(file) === wb.folder || file.startsWith(`${wb.folder}${path.sep}`));
+    const want = JSON.stringify({ name: path.basename(file), folder: inWorkspace ? path.relative(wb.folder, path.dirname(file)) : path.dirname(file) });
     const focusedRow = `document.querySelector('.quick-input-widget .monaco-list-row.focused')`;
-    const isFile = `(() => { const row = ${focusedRow}; const want = ${want}; return row && row.querySelector('.label-name')?.textContent === want.name && row.querySelector('.label-description')?.textContent === want.folder ? true : undefined; })()`;
+    const isFile = `(() => { const row = ${focusedRow}; const want = ${want}; return row && row.querySelector('.label-name')?.textContent === want.name && (row.querySelector('.label-description')?.textContent ?? '') === want.folder ? true : undefined; })()`;
     if (!(await untilInPage(wb, isFile))) {
         const row = await wb.E(`${focusedRow}?.getAttribute('aria-label') ?? '(Quick Open does not focus a row)'`);
         await pressKey(wb.session, 'Escape');
