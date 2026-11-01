@@ -13,8 +13,8 @@
 // Open output.pdf in the instance first, for example with Overleaf Workshop's View PDF command.
 import { scriptOptions } from '../../lib/options.mjs';
 import {
-    checker, instance, INSTANCE_OPTION, pagePixelsFunction, rafOnTimer, reopenTab, showPageFunction, sleep, switchThemeFunction,
-    viewerOf, viewerPage, windowDraws, workbench,
+    checker, instance, INSTANCE_OPTION, pagePixelsFunction, rafOnTimer, reopenTab, settings, showPageFunction, sleep, switchThemeFunction,
+    themeColors, THEMES_SETTING, viewerOf, viewerPage, windowDraws, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, 'theme-page': 'number' });
@@ -73,12 +73,14 @@ try {
         const plain = await E(sample);
         await toTheme('dark');
         const dark = await E(sample);
+        // the dark theme's background as the instance gives it to the viewer: its setting, else the setting's default
+        const darkBackground = themeColors('dark', settings(inst).get(THEMES_SETTING)).bgColor.match(/[0-9a-f]{2}/g).map(h => parseInt(h, 16));
         let kept = 0, changed = 0, white = 0, background = 0;
         plain.forEach(([r, gr, b, inImage], i) => {
             const q = dark[i];
             if (!q) { return; }
             if (inImage) { if (Math.abs(r - q[0]) <= 2 && Math.abs(gr - q[1]) <= 2 && Math.abs(b - q[2]) <= 2) { kept++; } else { changed++; } }
-            if (r >= 250 && gr >= 250 && b >= 250) { white++; if (q[0] === 0x4b && q[1] === 0x4b && q[2] === 0x4b) { background++; } }
+            if (r >= 250 && gr >= 250 && b >= 250) { white++; if (darkBackground.every((value, k) => q[k] === value)) { background++; } }
         });
         check(`dark theme on page ${themePage}: the images' colored pixels keep their colors`, kept > 0 && changed <= kept * 0.02, `${kept} kept, ${changed} changed`);
         check(`dark theme on page ${themePage}: the white background takes the theme's color`, white > 0 && background >= white * 0.9, `${background} of ${white}`);

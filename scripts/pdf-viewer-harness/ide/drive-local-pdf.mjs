@@ -16,7 +16,7 @@ import { scriptOptions } from '../../lib/options.mjs';
 import { bookFacts } from '../common.mjs';
 import {
     areaColorsFunction, associatePdfs, checker, clickAt, instance, INSTANCE_OPTION, openWithQuickOpen, pressKey, rafOnTimer, settings,
-    showPageFunction, sleep, switchThemeFunction, viewerOf, viewerPage, windowDraws, workbench,
+    showPageFunction, sleep, switchThemeFunction, themeColors, THEMES_SETTING, viewerOf, viewerPage, windowDraws, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, pdf: 'value', pages: 'number', find: 'value', 'theme-book': 'flag' });
@@ -45,7 +45,8 @@ if (isThemeBook && !facts?.elements) {
 }
 const findText = options.get('find') ?? facts?.text;
 const inst = instance(options);
-const restoreAssociation = await associatePdfs(settings(inst));
+const config = settings(inst);
+const restoreAssociation = await associatePdfs(config);
 const { check, summary } = checker();
 const wb = await workbench(inst);
 let view;
@@ -85,7 +86,9 @@ try {
         const toTheme = (theme) => E(`(${switchThemeFunction(engine)})(1, ${JSON.stringify(theme)})`);
         await toTheme('dark');
         const dark = await E(sample);
-        check('dark theme: background, line and image as expected', dark.background === '#4b4b4b' && dark.blackLine === '#fbf0d9' && dark.imageBlue === '#0000ff' && dark.imageGreen === '#00ff00', JSON.stringify(dark));
+        // the dark theme's colors as the instance gives them to the viewer: its setting, else the setting's default
+        const colors = themeColors('dark', config.get(THEMES_SETTING));
+        check('dark theme: background, line and image as expected', dark.background === colors.bgColor && dark.blackLine === colors.fontColor && dark.imageBlue === '#0000ff' && dark.imageGreen === '#00ff00', JSON.stringify(dark));
         await toTheme('default');
     }
 

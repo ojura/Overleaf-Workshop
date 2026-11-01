@@ -5,7 +5,9 @@
 // object (pdf.js's PDFViewer), when a page counts as drawn, the ids of the buttons and toolbars, the
 // SyncTeX highlight, how a theme switch waits for the new drawing, and which pixels of a page count
 // as an image's.
-import { protocol } from '../viewer-protocol.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
+import { protocol, repo } from '../viewer-protocol.mjs';
 
 /** The viewers, by their names in the setting overleaf-workshop.pdfViewer.engine (src/core/viewerProtocol.ts). */
 export const ENGINES = [...protocol.PDF_VIEWER_ENGINES];
@@ -13,6 +15,31 @@ export const ENGINES = [...protocol.PDF_VIEWER_ENGINES];
 export const DEFAULT_ENGINE = protocol.DEFAULT_PDF_VIEWER_ENGINE;
 /** The setting that picks the viewer. */
 export const ENGINE_SETTING = 'overleaf-workshop.pdfViewer.engine';
+/** The setting with the viewers' color themes. */
+export const THEMES_SETTING = 'overleaf-workshop.pdfViewer.themes';
+
+/** The default of the extension's setting `key`, from where the extension defines it: package.json's contributes.configuration. */
+export function settingDefault(key) {
+    const { configuration } = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8')).contributes;
+    const property = [configuration].flat().map(c => c.properties?.[key]).find(Boolean);
+    if (!property || !Object.hasOwn(property, 'default')) { throw new Error(`package.json does not define a default for the setting ${key}`); }
+    return property.default;
+}
+
+/** The colors that a theme may name instead of #rrggbb (views/pdf-viewer/src/common/theme.ts). */
+const NAMED_COLORS = { black: '#000000', white: '#ffffff' };
+
+/**
+ * The colors of the color theme `name` that the viewers get, as { fontColor, bgColor } in the form
+ * '#rrggbb' in lower case: from `themes`, the setting's value where the caller has one, as in an
+ * instance's settings, and else from the setting's default (settingDefault).
+ */
+export function themeColors(name, themes = settingDefault(THEMES_SETTING)) {
+    const theme = (themes ?? settingDefault(THEMES_SETTING))[name];
+    if (!theme) { throw new Error(`the setting ${THEMES_SETTING} does not have the theme ${name}`); }
+    const color = (value) => NAMED_COLORS[value.toLowerCase()] ?? value.toLowerCase();
+    return { fontColor: color(theme.fontColor), bgColor: color(theme.bgColor) };
+}
 /** The viewer that the extension shows for the setting's value `value` (as the provider picks it). */
 export const engineOfSetting = (value) => (protocol.isPdfViewerEngine(value) ? value : DEFAULT_ENGINE);
 
