@@ -46,4 +46,7 @@ window) are in CLAUDE.local.md, which git leaves out.
 - Experiments never write into a shared project or into a live local replica. Use a private copy
   of the project (`node out/sandbox/cli.js init`) and a test instance of the IDE
   (scripts/hidden-ide.sh).
+- A test instance in project mode holds a lock on its project, and a second start for the same
+  project refuses, naming the instance that holds the lock. That instance can be another agent's:
+  stop it only if you started it.
 - Never turn on shell tracing (`set -x`) where a session cookie or a token is expanded.

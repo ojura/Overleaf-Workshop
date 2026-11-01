@@ -43,7 +43,10 @@
 // Options for start (give --project or --folder; without either, start opens the project of the
 // previous start):
 //   --project ID        the Overleaf project of the replica; the instance opens its replica
-//                       folder. It must be listed in the user's test projects (below)
+//                       folder. It must be listed in the user's test projects (below), and
+//                       another instance must not hold the project's lock: the instance's
+//                       processes hold an flock on $XDG_RUNTIME_DIR/hidden-ide-locks/ID.lock while
+//                       they run, and a second start for the project refuses, naming the first
 //   --folder DIR        open DIR; start does not copy the login and does not make a replica, e.g.
 //                       for tests that only open local files. A local replica, a folder that holds
 //                       .overleaf/settings.json or lies inside one, is refused: only --project opens
@@ -143,6 +146,11 @@ const ANSWER_LIMIT_MS = 15000;
 const FROZEN_LIMIT_MS = 2000;
 /** The last resort for an IDE, or an X server, that does not end after SIGTERM. */
 const STOP_LIMIT_S = 30;
+/** flock's exit status when another process holds a project's lock (--conflict-exit-code). */
+const LOCK_CONFLICT = 75;
+/** The name of the session bus's configuration file in an instance's folder, which dbus-run-session's command line names. */
+const BUS_CONFIG = 'session-bus.conf';
+
 /** The first display that start tries when it is not given one. */
 const FIRST_DISPLAY = 99;
 /** How many displays from FIRST_DISPLAY up start tries. */
@@ -297,6 +305,100 @@ function removeRuntimeFolder(run) {
     fs.rmSync(run, { recursive: true, force: true });
 }
 
+/**
+ * The lock file of the test project `project`: <project>.lock in hidden-ide-locks/ of the caller's
+ * XDG_RUNTIME_DIR, the user's own runtime folder, which every agent's start of this user reaches,
+ * unlike an instance's private runtime folder. A start in project mode holds an flock on it
+ * through the instance's processes, so that two test instances do not sync one Overleaf project at
+ * the same time: a second instance would change the first one's results (a compile, the build
+ * cache, the file list). The kernel releases the lock when the last of those processes ends, also
+ * after a crash. Only the flock counts, not the file, which stays: had a stop deleted it, a later
+ * start would create and lock a new file while processes of the stopped instance still held the
+ * lock on the old one.
+ */
+function projectLockFile(project) {
+    const runtime = process.env.XDG_RUNTIME_DIR;
+    if (!runtime) { throw new Error('XDG_RUNTIME_DIR is not set; start in project mode keeps the lock of its project in that folder'); }
+    const dir = path.join(runtime, 'hidden-ide-locks');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const stat = fs.lstatSync(dir);
+    if (stat.isSymbolicLink() || !stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0) {
+        throw new Error(`refusing the lock folder ${dir}: it must be a folder of this user's that others cannot enter (mode 700)`);
+    }
+    return path.join(dir, `${project}.lock`);
+}
+
+/**
+ * The processes that hold an flock on `file`, as the kernel's lock table /proc/locks lists them. A
+ * line there names the process that took a lock, and the lock's file by its device's major and
+ * minor numbers, in hexadecimal, and its inode. A line with "->" before FLOCK is a process that
+ * waits for the lock, which does not count.
+ */
+function flockHolders(file) {
+    const stat = fs.statSync(file, { bigint: true, throwIfNoEntry: false });
+    if (!stat) { return []; }
+    // the device number's major and minor numbers, as glibc's major() and minor() take them apart
+    const major = ((stat.dev >> 8n) & 0xfffn) | ((stat.dev >> 32n) & ~0xfffn);
+    const minor = (stat.dev & 0xffn) | ((stat.dev >> 12n) & ~0xffn);
+    return fs.readFileSync('/proc/locks', 'utf8').split('\n').map(line => line.trim().split(/\s+/))
+        .filter((fields) => {
+            if (fields[1] !== 'FLOCK') { return false; }
+            const [maj, min, ino] = fields[5].split(':');
+            return BigInt(`0x${maj}`) === major && BigInt(`0x${min}`) === minor && BigInt(ino) === stat.ino;
+        })
+        .map(fields => Number(fields[4]));
+}
+
+/**
+ * The holder of a project's lock, from the process `pid` that took it, for a message. An instance's
+ * lock is taken by flock, which then becomes dbus-run-session, the first process of the instance's
+ * process group (startIde); its command line names the instance's folder, in which the
+ * configuration file BUS_CONFIG lies. That process can end while processes that it started still
+ * hold the lock.
+ */
+function lockHolder(pid) {
+    let args = [];
+    try {
+        // a process that has ended but that its parent has not waited for yet has an empty command line
+        args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
+    } catch (error) {
+        if (error.code !== 'ENOENT' && error.code !== 'ESRCH') { throw error; }
+    }
+    if (!args[0]) { return `the processes that inherited the lock from process ${pid}, which has ended`; }
+    const busConfig = args.find(arg => arg.startsWith('--config-file=') && path.basename(arg) === BUS_CONFIG);
+    if (busConfig) {
+        const home = path.dirname(busConfig.slice('--config-file='.length));
+        let display;
+        try {
+            const record = readInstance(home);
+            if (record.group === pid) { display = record.display; }
+        } catch {
+            // a record that cannot be read leaves the display out of the message
+        }
+        return `the test instance in ${home} (process group ${pid}${display ? `, display ${display}` : ''})`;
+    }
+    const group = processStat(pid)?.group;
+    return `process ${pid} (${args[0]}${group === undefined ? '' : `, process group ${group}`})`;
+}
+
+/**
+ * The error for project `project`, whose lock file `file` the processes `holders` (flockHolders)
+ * hold. The instance that holds it can be another agent's, which only that agent stops.
+ */
+function lockHeldError(file, project, holders) {
+    return new Error(`refusing project ${project}: its lock ${file} is held by ${holders.map(lockHolder).join(' and ')}, and a second instance on one Overleaf project would change the first one's results. Start again once that instance has stopped; stop it yourself only if you started it`);
+}
+
+/**
+ * Fail when a process holds the lock file `file` of project `project`, before start makes
+ * anything. This reads the lock table and does not take the lock, so that two starts that check at
+ * the same moment do not refuse each other; the flock that startIde runs decides between them.
+ */
+function checkProjectLock(file, project) {
+    const holders = flockHolders(file);
+    if (holders.length > 0) { throw lockHeldError(file, project, holders); }
+}
+
 /** Delete the instance's saved state, which holds the login copy in --project mode. */
 function deleteSavedState(home) {
     for (const suffix of ['', '-journal', '.backup']) {
@@ -394,8 +496,8 @@ const xmlText = (text) => text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').
  * (port 0): the window's browser names its endpoint in DevToolsActivePort in the profile, and the
  * file that an earlier start left there must not be taken for the new one.
  */
-function startIde(home, runtime, ide, display, folder) {
-    const busConfig = path.join(home, 'session-bus.conf');
+function startIde(home, runtime, ide, display, folder, lockFile) {
+    const busConfig = path.join(home, BUS_CONFIG);
     // only this user may connect, and the configuration leaves out the service folders, so the bus does not start services on demand
     writePrivately(busConfig, `<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
@@ -412,7 +514,11 @@ function startIde(home, runtime, ide, display, folder) {
     removeActivePort(path.join(home, 'profile'));
     const userHome = path.join(home, 'home');
     const log = fs.openSync(path.join(home, 'ide.log'), 'w');
-    const child = spawn('dbus-run-session', [`--config-file=${busConfig}`, '--', ide,
+    // in project mode flock takes the project's lock and then becomes dbus-run-session (--no-fork),
+    // so the instance's processes hold the lock through the file descriptor that they inherit
+    const lock = lockFile ? ['flock', '--nonblock', '--no-fork', '--conflict-exit-code', String(LOCK_CONFLICT), lockFile] : [];
+    const [program, ...prefix] = [...lock, 'dbus-run-session'];
+    const child = spawn(program, [...prefix, `--config-file=${busConfig}`, '--', ide,
         '--ozone-platform=x11', '--disable-gpu', '--password-store=basic', '--remote-debugging-port=0', '--inspect=0',
         `--user-data-dir=${path.join(home, 'profile')}`, `--extensions-dir=${path.join(home, 'extensions')}`,
         '--disable-workspace-trust', '--skip-welcome', '--skip-release-notes', '--new-window', folder], {
@@ -553,6 +659,8 @@ async function start(...argv) {
         checkTestProject(project);
         folder = path.join(home, 'replica');
     }
+    const lockFile = project ? projectLockFile(project) : undefined;
+    if (lockFile) { checkProjectLock(lockFile, project); }
     const ide = options.ide ?? process.env.HIDDEN_IDE_BINARY;
     if (!ide) { throw new UsageError('name the Antigravity binary with --ide PATH or HIDDEN_IDE_BINARY'); }
     fs.accessSync(ide, fs.constants.X_OK);
@@ -606,12 +714,12 @@ async function start(...argv) {
         children.push(xvfb);
         record = { ...record, xvfb: xvfb.pid, xvfbStart: processStat(xvfb.pid)?.start, display };
         writeInstance(home, record);
-        const session = startIde(home, run, ide, display, folder);
+        const session = startIde(home, run, ide, display, folder, lockFile);
         children.push(session);
         // a program that cannot be started does not get a pid, so the record names the group only once it runs
         await new Promise((resolve, reject) => {
             session.once('spawn', resolve);
-            session.once('error', (error) => reject(new Error(`dbus-run-session, which starts the IDE, could not run: ${error.message}`)));
+            session.once('error', (error) => reject(new Error(`${lockFile ? 'flock, which takes the project\'s lock and starts the IDE,' : 'dbus-run-session, which starts the IDE,'} could not run: ${error.message}`)));
         });
         // recorded at once, so that stop finds the instance also when the wait below fails
         record = { ...record, group: session.pid, groupStart: processStat(session.pid)?.start };
@@ -622,7 +730,13 @@ async function start(...argv) {
         });
         const found = await Promise.race([
             waitForInstance(home, session.pid, START_LIMIT_MS, ended),
-            ended.then((how) => { throw new Error(`the IDE exited (${how}; see ${home}/ide.log)`); }),
+            ended.then((how) => {
+                // flock exits with LOCK_CONFLICT when another start took the project's lock after
+                // this one's check; the IDE can exit with that status too, so the lock table decides
+                const others = lockFile && how === `exit code ${LOCK_CONFLICT}` ? flockHolders(lockFile).filter(pid => pid !== session.pid) : [];
+                if (others.length > 0) { throw lockHeldError(lockFile, project, others); }
+                throw new Error(`the IDE exited (${how}; see ${home}/ide.log)`);
+            }),
         ]);
         writeInstance(home, { ...record, ...found, pidStart: processStat(found.pid)?.start });
         // the instance runs on its own: this process does not wait for it
