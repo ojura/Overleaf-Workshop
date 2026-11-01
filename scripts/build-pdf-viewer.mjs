@@ -47,6 +47,13 @@ export const standIns = {
             const shim = shims[overleafModule(args)];
             return shim ? { path: path.join(src, 'shims', shim) } : undefined;
         });
+        // Overleaf's caching flags, with the cache's fallback set for each load (common/caching-flags.ts)
+        build.onResolve({ filter: /pdf-caching-flags$/ }, (args) => {
+            const fromTransport = path.basename(args.importer) === 'pdf-caching-transport.ts';
+            return fromTransport && overleafModule(args) === 'features/pdf-preview/util/pdf-caching-flags'
+                ? { path: path.join(src, 'common', 'caching-flags.ts') }
+                : undefined;
+        });
         build.onResolve({ filter: /pdf-caching-transport$/ }, (args) => {
             const fromWrapper = path.basename(args.importer) === 'pdf-js-wrapper.ts';
             return fromWrapper && overleafModule(args) === 'features/pdf-preview/util/pdf-caching-transport'
