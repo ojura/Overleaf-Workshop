@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { CompileResponseSchema } from '../api/base';
 import type { OutputFileEntity } from '../core/remoteFileSystemProvider';
+import { REPLICA_FOLDER } from '../scm/ignorePatterns';
 import { errorMessage } from '../utils/errorMessage';
 
 /**
@@ -21,8 +22,11 @@ export interface CompileRecord {
     answeredAt?: number;
 }
 
-/** Where a local replica keeps the logs of its last compile, relative to the replica's folder. */
-export const REPLICA_OUTPUT_FOLDER = '.overleaf/output';
+/**
+ * Where a local replica keeps the logs of its last compile: a folder in the replica's own folder,
+ * which the sync leaves out, as a path of the sync ('/dir/name').
+ */
+export const REPLICA_OUTPUT_FOLDER = `${REPLICA_FOLDER}/output`;
 
 /** The output files that a local replica keeps of each compile: the logs. */
 export const REPLICA_OUTPUT_FILES: readonly string[] = ['output.log', 'output.blg', 'output.ilg', 'output.stdout', 'output.stderr'];

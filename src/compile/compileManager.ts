@@ -385,7 +385,7 @@ export class CompileManager {
     }
 
     /**
-     * Keep the logs of a local replica's compile in the replica's .overleaf/output folder, so
+     * Keep the logs of a local replica's compile in the replica's REPLICA_OUTPUT_FOLDER, so
      * that editors and tools can read Overleaf's log locally. The replica never syncs that
      * folder. Saves run one after another, so the folder ends up with the last one's logs:
      * `compile` is this window's last compile, whatever its status, or another client's compile

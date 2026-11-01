@@ -12,10 +12,10 @@ import { LockTimeoutError } from './lock';
 import { describeFindings, describeRanges, exitStatusOf, pushCheck, RANGES_HELP } from './rangesCli';
 import { ControlAnswer, NoReplicaWindowError, ReplicaTimeoutError, requestReplica } from '../scm/replicaControl';
 import { describe, ReplicaSync, SyncSummary } from '../scm/replicaSync';
-import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath } from '../scm/ignorePatterns';
+import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath, REPLICA_SETTINGS_FILE } from '../scm/ignorePatterns';
 import { Repo } from '../gitbridge/plumbing';
 import { minimatch } from 'minimatch';
-import { fetchCommitFrom, LandError, landCommit, landedCleanly, LandReport } from './land';
+import { fetchCommitFrom, LAND_COMPILES_FOLDER, LandError, landCommit, landedCleanly, LANDINGS_LOG, LandReport } from './land';
 import { anchorBridge } from '../gitbridge/anchor';
 import { bridgeBranch, pushToBridge } from '../gitbridge/flow';
 import { OverleafHistory, Pacer } from '../gitbridge/history';
@@ -23,9 +23,12 @@ import { addBridgeRemote, rangesCheck } from '../gitbridge/overleaf';
 import { connectReplica, CONNECT_REF } from '../scm/replicaConnect';
 import { BaseAPI } from '../api/base';
 import {
-    createSandbox, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions, sandboxStatus, sandboxUrl,
-    settingsOf,
+    createSandbox, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions, SANDBOX_RECORD_FILE,
+    SANDBOX_RUN_LOG_FILE, sandboxStatus, sandboxUrl, settingsOf,
 } from './sandbox';
+
+/** A path of the sync ('/dir/name'), as the help names it: relative to the replica's folder. */
+const inReplica = (file: string) => file.slice(1);
 
 const HELP = `Compile a local directory on Overleaf, in a private copy of a shared project;
 describe a project; reach it through Overleaf's git bridge, and check what a push
@@ -49,8 +52,8 @@ usage:
   node out/sandbox/cli.js replica-connect --replica <folder> --history <repo> [--ref <branch>] [--start-version <n>] [--not-own <glob>] [--pace <ms>] [--json]
   node out/sandbox/cli.js replica-bridge  --replica <folder> [--label <comment>] [--remote <name>] [--bridge <url>] [--json]
 
---replica <folder>  the shared project's local replica. Its .overleaf/settings.json names
-                    the project; .overleaf/sandbox.json records the private copy.
+--replica <folder>  the shared project's local replica. Its ${inReplica(REPLICA_SETTINGS_FILE)} names
+                    the project; ${inReplica(SANDBOX_RECORD_FILE)} records the private copy.
 
 init     Clones the shared project once into a new project of this account, named
          "<project> (sandbox)" unless --name says otherwise, sets the copy's compiler
@@ -124,7 +127,7 @@ compile and plan options:
   --purpose <text>        what this run is for, shown to runs that wait for it
   --json                  print run.json instead of the summary
 
-Each run adds its start and its end to .overleaf/sandbox-runs.jsonl in the replica:
+Each run adds its start and its end to ${inReplica(SANDBOX_RUN_LOG_FILE)} in the replica:
 what it was for, the directory, the main document, its status and where its results
 are. status shows the latest entries.
 
@@ -171,7 +174,7 @@ replica-land    Lands <commit> of the replica's git repository in the project, t
                 Overleaf holds the commit, for up to three minutes, and compiles the
                 project once (again while Overleaf answers that another compile of yours
                 runs). It keeps the logs of the compile in a folder of its own,
-                <git dir>/overleaf/compiles/<commit>/, and checks them: an error line
+                <git dir>/${LAND_COMPILES_FOLDER}/<commit>/, and checks them: an error line
                 ("! ") in output.log, no "Output written on output.pdf", latexmk's
                 "Collected error summary", an "Automatic index:" line in output.stderr, or
                 "The index was not built/sorted" fails the landing. The warnings are listed
@@ -180,7 +183,7 @@ replica-land    Lands <commit> of the replica's git repository in the project, t
                 OVERLEAF_PARENT_COMPILE (the parent's, compiled first when missing),
                 OVERLEAF_COMMIT and OVERLEAF_PARENT, e.g. a check of where the pages of the
                 contents fall. Without <commit>, the checked-out commit is checked and
-                compiled. <git dir>/overleaf/landings.log lists the landings.
+                compiled. <git dir>/${LANDINGS_LOG} lists the landings.
 --from <repo>   take <commit> from that repository, e.g. a clone of the replica's
                 repository where the work happens: <commit> is resolved there (HEAD by
                 default) and fetched into the replica's repository first
@@ -229,7 +232,7 @@ replica-bridge  Brings the git bridge's newest commit into the replica's reposit
                 Labels tab, so that the bridge's commit holds exactly that version. Exit
                 status 3 when nothing was joined.
 
-Safety: the tool writes only to the project recorded in .overleaf/sandbox.json, which
+Safety: the tool writes only to the project recorded in ${inReplica(SANDBOX_RECORD_FILE)}, which
 init created, and refuses the shared project's id and every other one. Before each
 write it joins the copy again and stops unless this account owns it, it has no
 collaborators and no pending invites, link sharing is off, and its name is the

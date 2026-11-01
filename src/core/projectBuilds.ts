@@ -5,8 +5,8 @@ import { errorMessage } from '../utils/errorMessage';
 
 /**
  * The build of a project that this window shows: in the PDF viewers, for SyncTeX, in the output
- * folder, in the Problems view and in the replica's .overleaf/output. Overleaf is compiled from
- * several places, such as the web editor, other windows and the command-line tools, and each
+ * folder, in the Problems view and in the replica's REPLICA_OUTPUT_FOLDER. Overleaf is compiled
+ * from several places, such as the web editor, other windows and the command-line tools, and each
  * compile makes a new build that this window does not hear of. Overleaf keeps each user's latest
  * compile of a project in its cache of compile outputs and answers for it
  * (BaseAPI.getLatestCompileFromCache), so the window asks when the latest build may have changed.
@@ -56,7 +56,7 @@ export interface Build {
     editorId: string;
     /** what the compile typeset */
     settings: CompileSettings;
-    /** the compile: Overleaf's answer, and how the replica's .overleaf/output records it (outputFiles.ts) */
+    /** the compile: Overleaf's answer, and how the replica's REPLICA_OUTPUT_FOLDER records it (outputFiles.ts) */
     record: CompileRecord & { response: CompileResponseSchema };
 }
 
