@@ -360,6 +360,27 @@ describe('ReplicaSync', () => {
         }
     });
 
+    it('without uploads, holds local deletions for a push without asking, also when a tool asks', async () => {
+        const saved = ReplicaSync.localDeleteDelayMs;
+        ReplicaSync.localDeleteDelayMs = 0;
+        try {
+            const t = setup();
+            for (let i = 0; i < 8; i++) { t.remote.files.set(`/f${i}.png`, new Uint8Array([i])); }
+            const sync = new ReplicaSync(t.remote, t.local, t.store, t.ui, (p: string) => p.endsWith('.aux'), { uploads: false });
+            await sync.syncAll();
+            // six files deleted at once, as by a git checkout, and reported one by one
+            for (let i = 0; i < 6; i++) { t.local.files.delete(`/f${i}.png`); }
+            await sync.localChanged('/f0.png');
+            const summary = await sync.flush(true, { by: 'tool' });
+            assert.deepStrictEqual(t.ui.asked, [], 'the user is not asked');
+            assert.deepStrictEqual(summary.deletionsToConfirm, [], 'the tool is not refused');
+            assert.deepStrictEqual([...summary.held].sort(), ['/f0.png', '/f1.png', '/f2.png', '/f3.png', '/f4.png', '/f5.png']);
+            assert.strictEqual(t.remote.files.size, 8, 'every file stays on Overleaf until a push');
+        } finally {
+            ReplicaSync.localDeleteDelayMs = saved;
+        }
+    });
+
     it('finishes the steps without deletions while a question about others waits for an answer', async () => {
         const t = setup();
         for (let i = 0; i < 6; i++) { t.remote.files.set(`/fig/f${i}.png`, new Uint8Array([i])); }

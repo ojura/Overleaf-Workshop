@@ -37,9 +37,9 @@ import { gitMergeText } from './replicaGit';
  * at its path, is not read or written, and its files do not reach Overleaf. The sync goes on once
  * the folder it started with is back.
  *
- * Without uploads (the push mode "bridge"), local changes stay local until a push through
- * the git bridge brings them to Overleaf; changes made on Overleaf still come in, merged
- * into the local files.
+ * Without uploads (the push mode "bridge"), local changes and deletions stay local until a push
+ * through the git bridge brings them to Overleaf, and a local deletion does not count toward
+ * `deletionThreshold` or ask; changes made on Overleaf still come in, merged into the local files.
  *
  * This module does not import 'vscode', so that it can be tested in plain Node.
  */
@@ -968,7 +968,8 @@ export class ReplicaSync {
         // only the Overleaf file exists
         if (base===undefined || remoteHash!==base) {
             await this.download(path, remote!, remoteText, remoteContent, summary);
-        } else if (mode.deletions==='collect') {
+        } else if (mode.deletions==='collect' && this.uploads) {
+            // without uploads the deletion waits for a push and is not made here (below), so it does not count or ask
             mode.collected!.remote.push(path);
         } else if (await this.isUnmerged(path)) {
             this.blocked(path);
