@@ -17,8 +17,23 @@ const severityMap: Record<string, vscode.DiagnosticSeverity> = {
     information: vscode.DiagnosticSeverity.Information,
 };
 
-// Match the document class in the tex file
-const documentClassRegex = new RegExp(/\\documentclass(?:\[[^\[\]\{\}]*\])?\{([^\[\]\{\}]+)\}/);
+/**
+ * A line that begins with \documentclass, after spaces or tabs, as Overleaf tells a main document
+ * (DocumentHelper.mjs:39-55, contentHasDocumentclass), so a commented-out one does not count; with
+ * its options and its class, which may follow on the next lines.
+ */
+const DOCUMENT_CLASS = /^[ \t]*\\documentclass(?![A-Za-z])(?:\s*\[[^\]]*\])?(?:\s*\{\s*([^}]*?)\s*\})?/m;
+
+/**
+ * Whether the document with text `content` is a main document, which a compile from its editor
+ * typesets on its own: it has a \documentclass line (DOCUMENT_CLASS) whose class is not subfiles.
+ * A subfiles chapter names the project's main document as its class's option, and the project
+ * compiles it as part of that document.
+ */
+export function isMainDocument(content: string): boolean {
+    const match = DOCUMENT_CLASS.exec(content);
+    return match !== null && match[1] !== 'subfiles';
+}
 
 /** Why compile `record` made no build, as the viewers' banner says it. */
 function failureOf(record: CompileRecord | undefined): string {
@@ -281,13 +296,13 @@ export class CompileManager {
         try {
             const vfs = await this.vfsm.prefetch(uri);
             await this.waitForLocalReplica(vfs);
-            // Compile the open document as the main document when it has a
-            // \documentclass. For a local replica `uri` is the project folder.
+            // Compile the open document as the main document when it is one (isMainDocument),
+            // else the project's main document. For a local replica `uri` is the project folder.
             const {fileType, fileId} = await vfs._resolveUri(uri);
             let rootDocId: string | undefined = undefined;
             if (fileType==='doc') {
                 const content = new TextDecoder().decode( await vfs.openFile(uri) );
-                rootDocId = RegExp(documentClassRegex).exec(content) ? fileId : undefined;
+                rootDocId = isMainDocument(content) ? fileId : undefined;
             }
             const res = await vfs.compile(force, windowCompileSettings.draft, windowCompileSettings.stopOnFirstError, rootDocId, fromScratch);
             if (res===undefined) {

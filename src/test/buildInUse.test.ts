@@ -877,6 +877,32 @@ describe('the build in use, from Overleaf to the window', function () {
         });
     });
 
+    describe('which document a compile from an editor typesets', () => {
+        /** Compile from the editor of document `name` with text `text`; the main documents that Overleaf was asked for. */
+        async function compileFrom(name: string, text: string) {
+            vfs.root.rootFolder[0].docs.push({ _id: `doc-${name}`, name });
+            const openFile = vfs.openFile.bind(vfs);
+            vfs.openFile = async (uri: Uri) => uri.path.endsWith(`/${name}`) ? new TextEncoder().encode(text) : openFile(uri);
+            overleaf.compiles.push(ownAnswer(overleaf, 'b-new'));
+            const ended = compileEnd();
+            assert.deepStrictEqual(await manager.compile(true, false, inProject(name)), { kind: 'started' });
+            await ended;
+            return overleaf.to('/project/p1/compile').map(r => [r.body.rootDoc_id, r.body.rootResourcePath]);
+        }
+
+        it('typesets a main document on its own', async () => {
+            assert.deepStrictEqual(await compileFrom('letter.tex', '\\documentclass{letter}\n\\begin{document}\nx\n\\end{document}\n'), [['doc-letter.tex', 'letter.tex']]);
+        });
+
+        it('typesets the project\'s main document from a subfiles chapter', async () => {
+            assert.deepStrictEqual(await compileFrom('chapter1.tex', '\\documentclass[../main.tex]{subfiles}\n\\begin{document}\nx\n\\end{document}\n'), [['doc-main', 'main.tex']]);
+        });
+
+        it('typesets the project\'s main document from a document whose \\documentclass is commented out', async () => {
+            assert.deepStrictEqual(await compileFrom('notes.tex', '% \\documentclass{article}\nSome notes.\n'), [['doc-main', 'main.tex']]);
+        });
+    });
+
     describe('Stop compilation', () => {
         /**
          * Start a compile of the project whose answer Overleaf holds; settles when Overleaf has the
