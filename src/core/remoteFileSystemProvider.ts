@@ -1330,7 +1330,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             if (undetermined) {
                 if (!undetermined.replace) {
                     this.tellUndetermined(uri, doc);
-                    throw new Error(`${uri.path}: Overleaf Workshop cannot tell whether Overleaf applied the update of ${VirtualFileSystem.timeOf(undetermined.write)} (${undetermined.reason}), so it does not merge this text with Overleaf's. Compare it with Overleaf's text. ${VirtualFileSystem.replaceChoice} in the notice about ${doc.name} makes the editor's text Overleaf's text at the next save, which deletes what others changed in the file since this editor loaded it.`);
+                    throw vscode.FileSystemError.Unavailable(`${uri.path}: Overleaf Workshop cannot tell whether Overleaf applied the update of ${VirtualFileSystem.timeOf(undetermined.write)} (${undetermined.reason}), so it does not merge this text with Overleaf's. Compare it with Overleaf's text. ${VirtualFileSystem.replaceChoice} in the notice about ${doc.name} makes the editor's text Overleaf's text at the next save, which deletes what others changed in the file since this editor loaded it.`);
                 }
                 // the user chose to replace Overleaf's text with this one: base it on Overleaf's text as it is now
                 doc.localCache = doc.remoteCache;
@@ -1513,7 +1513,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             doc.localCache = write.base;
             if (answer.kind==='refused' && write.attempts===1) {
                 doc.unconfirmed = undefined;
-                throw new Error(`${uri.path}: Overleaf refused the update (${answer.error}); the next write of the file sends the edit again`);
+                throw vscode.FileSystemError.Unavailable(`${uri.path}: Overleaf refused the update (${answer.error}); the next write of the file sends the edit again`);
             }
             doc.remoteCache = undefined;
             doc.version = undefined;
@@ -1524,7 +1524,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
             write.failure = answer.error;
             doc.unconfirmed = write;
-            throw new Error(`${uri.path}: Overleaf has not confirmed the update (${answer.error}). Before the file is read from Overleaf or written again, Overleaf Workshop asks Overleaf whether it applied the update, and sends it again when Overleaf did not and can still take it.`);
+            throw vscode.FileSystemError.Unavailable(`${uri.path}: Overleaf has not confirmed the update (${answer.error}). Before the file is read from Overleaf or written again, Overleaf Workshop asks Overleaf whether it applied the update, and sends it again when Overleaf did not and can still take it.`);
         } finally {
             this.endSync(doc, attempt);
         }
@@ -1574,7 +1574,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 return 'undetermined';
             }
             write.checkFailure = error?.message ?? String(error);
-            throw new Error(`${uri.path}: Overleaf has not confirmed the update of ${VirtualFileSystem.timeOf(write)} (${write.failure}), and asking Overleaf about it failed (${write.checkFailure})`);
+            throw vscode.FileSystemError.Unavailable(`${uri.path}: Overleaf has not confirmed the update of ${VirtualFileSystem.timeOf(write)} (${write.failure}), and asking Overleaf about it failed (${write.checkFailure})`);
         }
         write.checkFailure = undefined;
         const sources = this.sourcesOf(write);
@@ -1597,7 +1597,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
         if (!this.connected) {
             write.checkFailure = 'the connection was lost before it could be sent again';
-            throw new Error(`${uri.path}: Overleaf has not confirmed the update of ${VirtualFileSystem.timeOf(write)} (${write.failure}), and ${write.checkFailure}`);
+            throw vscode.FileSystemError.Unavailable(`${uri.path}: Overleaf has not confirmed the update of ${VirtualFileSystem.timeOf(write)} (${write.failure}), and ${write.checkFailure}`);
         }
         await this.settle(uri, doc, this.attempt(doc, write));
         return 'resent';
