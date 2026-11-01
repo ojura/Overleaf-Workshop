@@ -581,6 +581,38 @@ describe('ReplicaSync', () => {
             await t.sync.syncAll();
             assert.deepStrictEqual(t.docs.map(p => t.remote.docs.get(p)), t.docs.map(p => `${p} v2, edited locally\n`));
         });
+
+        it('reads both sides again when the operation that the check before a write found is over by the time the sync may act, and keeps what the operation wrote', async () => {
+            const t = await synced(0);
+            t.remote.docs.set('/a.tex', text);
+            await t.sync.syncAll();
+            t.remote.docs.set('/a.tex', text.replace('line 5', 'line 5, edited on Overleaf'));
+            // While the sync reads Overleaf's text, a merge writes a local change into a.tex. It ends
+            // right after the check before the download finds it, before mayAct looks at the folder.
+            const readDoc = t.remote.readDoc.bind(t.remote);
+            t.remote.readDoc = async (path: string) => {
+                t.remote.readDoc = readDoc;
+                t.store.op = 'a merge';
+                t.local.set('/a.tex', text.replace('line 1', 'line 1, written by the merge'));
+                return readDoc(path);
+            };
+            const operation = t.store.operation.bind(t.store);
+            let found = 0;
+            t.store.operation = async () => {
+                const op = await operation();
+                if (op !== undefined) {
+                    found += 1;
+                    t.store.op = undefined;
+                }
+                return op;
+            };
+            const summary = await t.sync.syncAll();
+            assert.strictEqual(found, 1, 'the check before the download found the merge');
+            const both = text.replace('line 1', 'line 1, written by the merge').replace('line 5', 'line 5, edited on Overleaf');
+            assert.strictEqual(t.local.text('/a.tex'), both, 'the local file: the merge\'s change, merged with Overleaf\'s');
+            assert.strictEqual(t.remote.docs.get('/a.tex'), both);
+            assert.deepStrictEqual([summary.merged, summary.downloaded, summary.failed], [['/a.tex'], [], []]);
+        });
     });
 
     it('finishes the steps without deletions while a question about others waits for an answer', async () => {
