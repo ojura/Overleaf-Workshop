@@ -157,10 +157,11 @@ class FakeUI implements ReplicaUI {
     /** while set, the window's question about a checked-out commit */
     confirmCheckout?: (head: string, overleaf: string) => Promise<boolean>;
     waiting(reason: string | undefined) { this.waits.push(reason); this.onWaiting?.(); }
-    /** the notices about a lock that stays; `onLockStays` is told of each */
+    /** the notices about a lock that stays, and when each may end; `onLockStays` is told of each */
     lockNotices: string[] = [];
+    lockGone: Promise<void>[] = [];
     onLockStays?: () => void;
-    lockStays(reason: string) { this.lockNotices.push(reason); this.onLockStays?.(); }
+    lockStays(reason: string, gone: Promise<void>) { this.lockNotices.push(reason); this.lockGone.push(gone); this.onLockStays?.(); }
 }
 
 /** A store with git's index lock held by another program while `lock` is set, and git's state of the work tree. */
@@ -318,6 +319,17 @@ describe('ReplicaSync', () => {
         assert.strictEqual(t.remote.docs.get('/main.tex'), resolved);
         await sync.stop();
         assert.strictEqual(t.store.state!.entries['/main.tex'].conflict, undefined);
+    });
+
+    it('reports a failure with its cause, as the failures of fetch carry one', async () => {
+        const t = setup();
+        t.remote.docs.set('/a.tex', text);
+        const sync = t.start();
+        await sync.syncAll();
+        t.local.set('/a.tex', text + 'line 6\n');
+        t.remote.writeDoc = async () => { throw Object.assign(new Error('fetch failed'), { cause: new Error('connect ECONNREFUSED 127.0.0.1:443') }); };
+        const summary = await sync.flush(true);
+        assert.deepStrictEqual(summary.failed, [{ path: '/a.tex', error: 'fetch failed: connect ECONNREFUSED 127.0.0.1:443' }]);
     });
 
     it('keeps the local version of a binary file changed on both sides', async () => {
@@ -674,7 +686,10 @@ describe('ReplicaSync', () => {
                 assert.ok(String(t.ui.waits[0]).includes('/replica/.git/index.lock'), String(t.ui.waits[0]));
                 assert.deepStrictEqual(t.ui.lockNotices, [t.ui.waits[0]], 'one notice, with the status bar\'s text');
                 assert.ok(String(t.sync.waitingFor).includes('/replica/.git/index.lock'), 'the status says why the sync waits');
+                const [gone] = t.ui.lockGone;
+                assert.ok(gone instanceof Promise, 'the notice is told when the wait ends');
                 t.store.release();
+                await gone; // the notice may end with the lock
                 await step;
                 assert.deepStrictEqual(t.ui.waits.slice(1), [undefined], 'the wait ends');
                 assert.strictEqual(t.remote.docs.get('/a.tex'), 'an edit\n');

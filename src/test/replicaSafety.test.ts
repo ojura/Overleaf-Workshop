@@ -532,6 +532,43 @@ describe('local replica: what it deletes and what it never syncs', function () {
             assert.ok(String(answer.summary?.waitingFor).includes(lock), JSON.stringify(answer));
         });
 
+        it('shows a notice about a git index lock that stays, naming the file, which ends when the lock goes', async () => {
+            const t = host();
+            project(t, { '/main.tex': 'v1\n' });
+            // the notices that the window shows with a progress, until their task ends
+            const notices: string[] = [];
+            // the task's end, in an object: a promise resolved with a promise would wait for it
+            let noticed!: (shown: { ends: PromiseLike<unknown> }) => void;
+            const notice = new Promise<{ ends: PromiseLike<unknown> }>(resolve => { noticed = resolve; });
+            const withProgress = t.mock.window.withProgress;
+            t.mock.window.withProgress = (options: { title?: string }, task: (...args: any[]) => PromiseLike<unknown>) => {
+                const ends = withProgress(options, task);
+                if (String(options.title).includes('index lock')) {
+                    notices.push(String(options.title));
+                    noticed({ ends });
+                }
+                return ends;
+            };
+            const { scm } = await start(t);
+            // a git that ended a minute ago without removing its lock
+            const lock = path.join(t.folder, '.git', 'index.lock');
+            fs.writeFileSync(lock, '');
+            cleanup.add(() => fs.rmSync(lock, { force: true }));
+            const minuteAgo = new Date(Date.now() - 60_000);
+            fs.utimesSync(lock, minuteAgo, minuteAgo);
+            // an edit, which Sync Now, a step of the window, takes to Overleaf once the lock is gone
+            fs.writeFileSync(path.join(t.folder, 'main.tex'), 'v2, edited locally\n');
+            const syncing = scm.syncNow();
+            const { ends } = await notice;
+            assert.strictEqual(notices.length, 1, JSON.stringify(notices));
+            assert.ok(notices[0].includes(lock), notices[0]);
+            assert.strictEqual(t.w.remote.get('/main.tex'), 'v1\n', 'nothing goes to Overleaf while the lock is there');
+            fs.rmSync(lock);
+            await ends;
+            await syncing;
+            assert.strictEqual(t.w.remote.get('/main.tex'), 'v2, edited locally\n');
+        });
+
         it('does not take a change made on Overleaf into a rebase that stopped to edit a commit', async () => {
             const t = host();
             const { scm } = await committedV2(t, { '/other.tex': 'o1\n' });
