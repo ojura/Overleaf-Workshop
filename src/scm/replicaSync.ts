@@ -214,9 +214,11 @@ export interface ReplicaUI {
     waiting?(reason: string | undefined): void,
     /**
      * Another program's git index lock has been there for `ReplicaSync.staleLockMs` or longer, and
-     * the sync waits for its removal; `reason` names the file. Called once for each lock that stays.
+     * the sync waits for its removal; `reason` names the file. Called once for each lock that
+     * stays; `gone` resolves when the wait ends, as the lock goes or the sync stops, so that the
+     * window can end its notice then.
      */
-    lockStays?(reason: string): void,
+    lockStays?(reason: string, gone: Promise<void>): void,
 }
 
 export interface SyncSummary {
@@ -644,7 +646,7 @@ export class ReplicaSync {
             wait.stale = reason;
             this.ui.log(`The sync waits: ${reason}.`);
             this.ui.waiting?.(reason);
-            this.ui.lockStays?.(reason);
+            this.ui.lockStays?.(reason, wait.released.then(() => {}, () => {}));
         }).catch(error => this.ui.log(`Looking at git's index lock ${file} failed: ${errorMessage(error)}`));
         void look();
         wait.released = Promise.race([watch.released, this.stopping]).finally(() => {

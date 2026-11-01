@@ -501,8 +501,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 this.waitingMessage?.dispose();
                 this.waitingMessage = reason===undefined ? undefined : vscode.window.setStatusBarMessage(`$(debug-pause) ${this.waitingText(reason)}`);
             },
-            lockStays: (reason) => {
-                vscode.window.showWarningMessage(this.waitingText(reason));
+            lockStays: (reason, gone) => {
+                // a notification that ends with the wait, so that the window does not show the lock after it is gone
+                void vscode.window.withProgress({location: vscode.ProgressLocation.Notification, title: this.waitingText(reason)}, () => gone);
             },
             conflictBlocked: (path) => {
                 const open = vscode.l10n.t('Open');

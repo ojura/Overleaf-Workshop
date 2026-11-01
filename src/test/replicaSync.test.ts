@@ -157,10 +157,11 @@ class FakeUI implements ReplicaUI {
     /** while set, the window's question about a checked-out commit */
     confirmCheckout?: (head: string, overleaf: string) => Promise<boolean>;
     waiting(reason: string | undefined) { this.waits.push(reason); this.onWaiting?.(); }
-    /** the notices about a lock that stays; `onLockStays` is told of each */
+    /** the notices about a lock that stays, and when each may end; `onLockStays` is told of each */
     lockNotices: string[] = [];
+    lockGone: Promise<void>[] = [];
     onLockStays?: () => void;
-    lockStays(reason: string) { this.lockNotices.push(reason); this.onLockStays?.(); }
+    lockStays(reason: string, gone: Promise<void>) { this.lockNotices.push(reason); this.lockGone.push(gone); this.onLockStays?.(); }
 }
 
 /** A store with git's index lock held by another program while `lock` is set, and git's state of the work tree. */
@@ -674,7 +675,10 @@ describe('ReplicaSync', () => {
                 assert.ok(String(t.ui.waits[0]).includes('/replica/.git/index.lock'), String(t.ui.waits[0]));
                 assert.deepStrictEqual(t.ui.lockNotices, [t.ui.waits[0]], 'one notice, with the status bar\'s text');
                 assert.ok(String(t.sync.waitingFor).includes('/replica/.git/index.lock'), 'the status says why the sync waits');
+                const [gone] = t.ui.lockGone;
+                assert.ok(gone instanceof Promise, 'the notice is told when the wait ends');
                 t.store.release();
+                await gone; // the notice may end with the lock
                 await step;
                 assert.deepStrictEqual(t.ui.waits.slice(1), [undefined], 'the wait ends');
                 assert.strictEqual(t.remote.docs.get('/a.tex'), 'an edit\n');
