@@ -15,6 +15,8 @@ describe('the collection of a project\'s source controls', () => {
         static label = 'Local Replica';
         readonly scmKey = 'replica';
         readonly baseUri = TestUri.parse('/replica');
+        /** the real replica's icon, vscode.ThemeIcon('folder-library') */
+        readonly iconPath = { id: 'folder-library' };
         readonly settingItems = [];
         readonly status = { status: 'idle', message: '' };
         /** each access starts it, as the replica's own getter does */
@@ -24,8 +26,9 @@ describe('the collection of a project\'s source controls', () => {
     /**
      * The collection, for a project whose settings name the failing replica, enabled or not.
      * `answers` are the user's choices in the quick picks, in order; the notices are collected.
+     * With `saveFails`, saving the project's settings throws it.
      */
-    function collectionWith(enabled: boolean, answers: ((items: any[]) => any)[] = []) {
+    function collectionWith(enabled: boolean, answers: ((items: any[]) => any)[] = [], saveFails?: Error) {
         const notices: string[] = [];
         let noticed!: () => void;
         const noticeShown = new Promise<void>(resolve => { noticed = resolve; });
@@ -62,6 +65,7 @@ describe('the collection of a project\'s source controls', () => {
             serverName: 'www.overleaf.com', projectId: 'p', origin: new TestUri('overleaf-workshop', '/project'),
             getProjectSCMPersist: () => ({ ...persist }),
             setProjectSCMPersist: (_key: string, value: typeof persist) => {
+                if (saveFails) { throw saveFails; }
                 Object.assign(persist, value);
                 saved.push({ ...value });
                 if (!value.enabled) { disabled(); }
@@ -94,6 +98,22 @@ describe('the collection of a project\'s source controls', () => {
             assert.ok(notices[0].includes(failure.message), notices[0]);
             await savedDisabled;
             assert.deepStrictEqual(saved.map(value => value.enabled), [true, false], 'enabled for the start, then disabled again');
+        } finally {
+            collection.dispose();
+        }
+    });
+
+    it('says why the user\'s choice in the quick pick of a source control failed, in a notice', async () => {
+        const unsaved = new Error('the project\'s settings cannot be saved');
+        const { collection, notices, noticeShown, saved } = collectionWith(false, [
+            items => items.find(item => item.item !== undefined), // the replica
+            items => items.find(item => item.label === 'Enable'),
+        ], unsaved);
+        try {
+            collection.showSCMConfiguration();
+            await noticeShown;
+            assert.deepStrictEqual(notices, [`"Local Replica": Enable failed: ${unsaved.message}`]);
+            assert.deepStrictEqual(saved, [], 'nothing was saved');
         } finally {
             collection.dispose();
         }
