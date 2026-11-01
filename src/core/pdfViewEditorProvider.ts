@@ -332,8 +332,9 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     const config = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer');
                     const colorThemes = config.get('themes', undefined);
                     const defaults = {
-                        scrollMode: config.get('defaultScrollMode', 'vertical'),
-                        spreadMode: config.get('defaultSpreadMode', 'none'),
+                        // VS Code answers the defaults that package.json declares for them
+                        scrollMode: config.get<string>('defaultScrollMode'),
+                        spreadMode: config.get<string>('defaultSpreadMode'),
                     };
                     post({type:'initState', content:state, colorThemes, defaults});
                     updateWebview();
