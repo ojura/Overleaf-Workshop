@@ -412,8 +412,19 @@ export class ReplicaSync {
     /** a pairing of local renames that has not started yet, which a request joins, and the end of the last one (`localRenames`) */
     private renamesWaiting?: Promise<Map<string, string>>;
     private renamesTail: Promise<unknown> = Promise.resolve();
-    /** renames made on Overleaf that `remoteRenamed` is applying, old path (a file's or a folder's) to new path */
+    /**
+     * renames made on Overleaf that `remoteRenamed` is applying, or that wait for the sync to act
+     * again (`renamedWhileWaiting`), old path (a file's or a folder's) to new path
+     */
     private remoteMoves = new Map<string, string>();
+    /**
+     * Renames made on Overleaf while the sync waited (`mayAct`), old path and new path, in their
+     * order. The next full sync applies them before it compares the folder with Overleaf; their
+     * paths stay in `remoteMoves` until then, so that no reconcile takes them for a deletion and
+     * a new file. They are kept in memory only: after a restart, the two paths of each sync as a
+     * deletion and a new file.
+     */
+    private renamedWhileWaiting: [string, string][] = [];
     private readonly onRecorded?: (result: {waiting?: boolean}) => void;
 
     constructor(
@@ -558,6 +569,8 @@ export class ReplicaSync {
         await this.load();
         const waiting = await this.mayAct();
         if (waiting!==undefined) { return {...emptySummary(), waitingFor: waiting}; }
+        // the renames made on Overleaf while the sync waited, before the comparison
+        for (const [from, to] of this.renamedWhileWaiting.splice(0)) { await this.remoteRenamed(from, to); }
         // the user asks again about the deletions declined before
         this.declined.local.clear();
         this.declined.remote.clear();
@@ -651,7 +664,8 @@ export class ReplicaSync {
      * project reports it. The local file moves with its saved entry and keeps its local changes,
      * which then sync as for any file, and the record shows the rename as git shows renames. Where
      * a file cannot move (it was never synced, its local file is gone, or `to` is taken in the
-     * folder), its two paths sync as a deletion and a new file.
+     * folder), its two paths sync as a deletion and a new file. While the sync waits (`mayAct`),
+     * the rename waits too, and the next full sync applies it first.
      */
     async remoteRenamed(from: string, to: string): Promise<void> {
         if (this.stopped || from===to) { return; }
@@ -659,6 +673,8 @@ export class ReplicaSync {
         // of `from` would take the local file for one deleted on Overleaf, one of `to` would download it.
         this.remoteMoves.set(from, to);
         const mode: Mode = {...collecting(emptySummary(), {live: true}), remoteMove: true};
+        // set when a move finds the sync waiting: the rename waits for the next full sync (`renamedWhileWaiting`)
+        let waits = false;
         try {
             // Once the saved state is loaded, the moves are queued before the first wait, so that
             // the work scheduled after the event in the queues of these paths comes after them.
@@ -669,13 +685,18 @@ export class ReplicaSync {
             // each file moves, after the check that the sync may act on the folder (`mayAct`), and
             // then both of its paths sync as they are, in the queues of both
             const moving = moves.map(([a, b]) => this.inQueues([a, b], async () => {
-                if (await this.mayAct()!==undefined) { return; }
+                if (await this.mayAct()!==undefined) { waits = true; return; }
                 await this.reported(a, mode, () => this.moveLocally(a, b, mode.summary));
                 await this.reconcileReported(a, mode);
                 if (this.tracked(b)) { await this.reconcileReported(b, mode); }
             }));
             const failed = (await Promise.allSettled(moving)).find((result): result is PromiseRejectedResult => result.status==='rejected');
             if (failed) { throw failed.reason; }
+            if (waits) {
+                this.renamedWhileWaiting.push([from, to]);
+                this.ui.log(`${from}: its rename to ${to} on Overleaf waits for the sync, until it acts again`);
+                return;
+            }
             // Overleaf's other files in a moved folder
             const moved = new Set(moves.map(([, b]) => b));
             await this.scheduleAll((await this.expand(to, true)).filter(p => !moved.has(p) && this.tracked(p)), mode);
@@ -684,7 +705,7 @@ export class ReplicaSync {
             mode.summary.failed.push({path: from, error: errorText(error)});
             this.ui.log(`${from}: applying its rename to ${to} on Overleaf failed: ${errorText(error)}`);
         } finally {
-            if (this.remoteMoves.get(from)===to) { this.remoteMoves.delete(from); }
+            if (!waits && this.remoteMoves.get(from)===to) { this.remoteMoves.delete(from); }
         }
         // a file that did not move is a deletion like any other, decided with them
         await this.applyDeletions(mode);

@@ -86,7 +86,9 @@ revert, a bisect, git am), and while the checked-out commit does not contain
 `refs/remotes/overleaf/main`, as after a checkout or a reset to an older commit, the sync waits:
 it does not upload, download, move, delete or record, and a tool's sync answers that it waits.
 For an older commit in push mode native, the window asks whether to upload its files to
-Overleaf. When the sync may act again, a full sync catches up with what changed meanwhile.
+Overleaf. When the sync may act again, a full sync catches up with what changed meanwhile; it
+first applies the renames and moves made on Overleaf while the sync waited, so that the local
+files move with their local changes.
 
 ## Renames and moves
 
