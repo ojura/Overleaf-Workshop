@@ -866,6 +866,7 @@ export class ReplicaSync {
         if (this.stopped || open.size===0) { return; }
         try {
             const deletable = await this.deletable();
+            const renamed = await this.renamedPaths(mode);
             for (const where of ['local', 'remote'] as const) {
                 if (requested[where].length===0 || this.stopped) { continue; }
                 const side = where==='local' ? 'in the local folder' : 'on Overleaf';
@@ -876,8 +877,10 @@ export class ReplicaSync {
                     if (mode.tool) { summary.skippedDeletions.push(...before); }
                     this.ui.log(`Not deleting ${before.length} files ${side}, which the user declined to delete: ${before.join(', ')}`);
                 }
-                let apply = requested[where].filter(path => !declined.has(path));
-                const counted = deletable[where].filter(path => !declined.has(path) && !mode.approved?.has(path));
+                // a rename takes these paths away: not deleted, and decided
+                requested[where].filter(path => renamed.has(path)).forEach(path => open.delete(path));
+                let apply = requested[where].filter(path => !declined.has(path) && !renamed.has(path));
+                const counted = deletable[where].filter(path => !declined.has(path) && !mode.approved?.has(path) && !renamed.has(path));
                 if (counted.length>ReplicaSync.deletionThreshold) {
                     if (mode.tool) {
                         summary.deletionsToConfirm.push({where, paths: counted});
@@ -915,6 +918,19 @@ export class ReplicaSync {
             for (const path of open) { summary.failed.push({path, error: errorText(error)}); }
             this.ui.log(`Deleting ${open.size} files failed: ${errorText(error)}`);
         }
+    }
+
+    /**
+     * The synced paths that a rename takes away, not a deletion: the old paths that git pairs with
+     * a new local file (`localRenames`), and the paths of renames made on Overleaf that
+     * `remoteRenamed` is applying. They are neither counted nor deleted.
+     */
+    private async renamedPaths(mode: Mode): Promise<Set<string>> {
+        const paths = new Set((await this.localRenames(mode)).values());
+        for (const path of Object.keys(this.state.entries)) {
+            if (this.movingOnOverleaf(path)) { paths.add(path); }
+        }
+        return paths;
     }
 
     /** The synced files that a deletion on each side would remove now: there, and missing on the other side. */

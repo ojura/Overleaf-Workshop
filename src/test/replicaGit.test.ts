@@ -166,7 +166,14 @@ class Folder implements ReplicaLocal {
         const s = await fsp.stat(this.abs(p));
         return { size: s.size, mtime: s.mtimeMs };
     }
-    async move(from: string, to: string) { await moveFile(this.abs(from), this.abs(to)); }
+    /** while set, a move waits for it; `onMove` hears of each move */
+    moveGate?: Promise<void>;
+    onMove?: () => void;
+    async move(from: string, to: string) {
+        this.onMove?.();
+        await this.moveGate;
+        await moveFile(this.abs(from), this.abs(to));
+    }
     async remove(p: string) { await fsp.rm(this.abs(p), { force: true }); }
     async removeFolderIfEmpty(p: string) { try { await fsp.rmdir(this.abs(p)); } catch { /* not empty */ } }
 }
@@ -176,7 +183,10 @@ class UI implements ReplicaUI {
     blocked: string[] = [];
     log(message: string) { this.logs.push(message); }
     progress() {}
-    async confirmDeletions() { return true; }
+    /** the questions about deletions, each with its paths; `onQuestion` hears of each */
+    questions: string[][] = [];
+    onQuestion?: () => void;
+    async confirmDeletions(_where: 'local' | 'remote', paths: string[]) { this.questions.push(paths); this.onQuestion?.(); return true; }
     conflictBlocked(p: string) { this.blocked.push(p); }
     liveResult(_summary: SyncSummary) {}
 }
@@ -808,6 +818,53 @@ describe('local replica: git as the merge backend', function () {
             assert.match(t.g('diff', '--name-status', '-M', first, 'HEAD'), /^R100\tchapter.tex\tintro.tex$/m, 'git\'s view of the recorded state');
             assert.strictEqual(t.g('status', '--porcelain'), 'M intro.tex', 'git status: the local change, still to push');
             await sync.stop();
+        });
+
+        it('renames the six files that one checkout renames, beside a deletion, without a question about deletions', async () => {
+            const chapters = Array.from({ length: 7 }, (_, k) => lines(i => `Chapter ${k}, line ${i}, with a few words in it.`));
+            const t = await synced(Object.fromEntries(chapters.map((text, k) => [`/chapter${k}.tex`, text])));
+            const ids = chapters.map((_, k) => t.remote.idOf(`/chapter${k}.tex`));
+            // one commit, checked out: chapters 0 to 5 become parts, chapter 6 is deleted
+            const files: Record<string, string | null> = { 'chapter6.tex': null };
+            for (let k = 0; k < 6; k++) { files[`chapter${k}.tex`] = null; files[`part${k}.tex`] = chapters[k]; }
+            t.g('merge', '--ff-only', '--quiet', commitOnTop(t.folder, t.first, files, 'Six chapters become parts, one goes'));
+            // the events as a checkout gives them: the deleted paths first
+            for (let k = 6; k >= 0; k--) { await t.sync.localChanged(`/chapter${k}.tex`); }
+            for (let k = 0; k < 6; k++) { await t.sync.localChanged(`/part${k}.tex`); }
+            assert.deepStrictEqual(t.ui.questions, [], 'the questions about deletions');
+            assert.deepStrictEqual([...t.remote.calls].sort(), ['remove /chapter6.tex', ...Array.from({ length: 6 }, (_, k) => `rename /chapter${k}.tex /part${k}.tex`)].sort(), 'what the sync asked of Overleaf');
+            assert.deepStrictEqual(Array.from({ length: 6 }, (_, k) => t.remote.ids.get(`/part${k}.tex`)), ids.slice(0, 6), 'each document keeps its id');
+            await t.sync.stop();
+        });
+
+        it('leaves the files of a folder that Overleaf moves out of the count of deletions while their move is applied', async () => {
+            const chapters = Array.from({ length: 6 }, (_, k) => lines(i => `Chapter ${k}, line ${i}, with a few words in it.`));
+            const t = await synced({ ...Object.fromEntries(chapters.map((text, k) => [`/chapters/c${k}.tex`, text])), '/other.tex': chapter });
+            // Overleaf moves the folder and deletes another file
+            for (let k = 0; k < 6; k++) { await t.remote.rename(`/chapters/c${k}.tex`, `/parts/c${k}.tex`); }
+            t.remote.docs.delete('/other.tex');
+            // the local moves wait while the deletion is decided
+            let open!: () => void;
+            t.local.moveGate = new Promise<void>(resolve => { open = resolve; });
+            const moving = new Promise<void>(resolve => { t.local.onMove = () => resolve(); });
+            const renamed = t.sync.remoteRenamed('/chapters', '/parts');
+            await moving;
+            // the deletion is decided, or a question about deletions is asked, whichever comes first
+            const question = new Promise<void>(resolve => { t.ui.onQuestion = () => resolve(); });
+            const deleted = t.sync.remoteChanged('/other.tex', true);
+            try {
+                await Promise.race([deleted, question]);
+                assert.deepStrictEqual(t.ui.questions, [], 'the questions about deletions');
+                assert.ok(!fs.existsSync(path.join(t.folder, 'other.tex')), 'the file deleted on Overleaf is deleted locally');
+            } finally {
+                t.local.moveGate = undefined;
+                open();
+                await Promise.allSettled([renamed, deleted]);
+            }
+            await Promise.all([renamed, deleted]);
+            assert.deepStrictEqual(chapters.map((text, k) => t.read(`/parts/c${k}.tex`) === text), chapters.map(() => true), 'the moved files');
+            assert.ok(!fs.existsSync(path.join(t.folder, 'chapters')), 'the folder they left is gone');
+            await t.sync.stop();
         });
 
         it('finishes when Overleaf reports the rename that the folder made, while the folder\'s rename waits for its pairing', async () => {
