@@ -113,6 +113,12 @@ class Overleaf {
             }
             return;
         }
+        if (url.pathname === '/project/p1/compile/stop') {
+            // as Overleaf's web server answers it (CompileController.stopCompile)
+            res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('OK');
+            return;
+        }
         if (url.pathname === '/project/p1/compile') {
             const next = this.compiles.shift();
             json(next === undefined ? 500 : 200, next ?? { message: 'the test gave no compile answer' });
@@ -212,6 +218,10 @@ const world = {
     saveAll: async () => true as boolean,
     /** the settings that the test sets, by name, e.g. 'engine' */
     settings: {} as Record<string, unknown>,
+    /** the editor that is active, with its document */
+    activeEditor: undefined as { document: { uri: Uri } } | undefined,
+    /** the texts of the compile's status bar item, first to last */
+    statusTexts: [] as string[],
     /** the project's file system, for 'remoteFileSystem.prefetch' and the workspace's reads */
     vfs: undefined as any,
     overleaf: undefined as unknown as Overleaf,
@@ -249,7 +259,7 @@ const vscodeStandIn = strict('vscode', {
         },
     }),
     window: strict('vscode.window', {
-        activeTextEditor: undefined,
+        get activeTextEditor() { return world.activeEditor; },
         visibleTextEditors: [],
         showInformationMessage: show('information'),
         showWarningMessage: show('warning'),
@@ -257,7 +267,14 @@ const vscodeStandIn = strict('vscode', {
         showSaveDialog: async () => world.saveTarget,
         withProgress: async (_options: unknown, task: (progress: unknown, token: unknown) => Promise<unknown>) =>
             task({ report() {} }, { onCancellationRequested: () => disposable }),
-        createStatusBarItem: () => ({ text: '', tooltip: undefined, command: undefined, backgroundColor: undefined, show() {}, hide() {}, dispose() {} }),
+        createStatusBarItem: () => {
+            let text = '';
+            return {
+                get text() { return text; },
+                set text(value: string) { text = value; world.statusTexts.push(value); },
+                tooltip: undefined, command: undefined, backgroundColor: undefined, show() {}, hide() {}, dispose() {},
+            };
+        },
         onDidChangeWindowState: () => disposable,
         registerCustomEditorProvider: () => disposable,
     }),
@@ -384,6 +401,8 @@ describe('the build in use, from Overleaf to the window', function () {
         world.saveTarget = undefined;
         world.saveAll = async () => true;
         world.settings = {};
+        world.activeEditor = undefined;
+        world.statusTexts = [];
         scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'build-in-use-'));
         vfs = new VirtualFileSystem({ globalState: { get: (_key: string, value: unknown) => value } }, projectUri, () => {});
         vfs.root = tree();
@@ -795,6 +814,45 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.deepStrictEqual((await ended).outcome, { result: 'success' });
             assert.strictEqual(vfs.builds.build.id, 'b-new');
             assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
+        });
+    });
+
+    describe('Stop compilation', () => {
+        /**
+         * Start a compile of the project whose answer Overleaf holds; settles when Overleaf has the
+         * request, with `ended`, the compile's end (in an object: an async function that returns a
+         * promise settles only when that promise does)
+         */
+        async function heldCompile() {
+            overleaf.hold('/project/p1/compile');
+            overleaf.compiles.push(ownAnswer(overleaf, 'b-new'));
+            const held = once(overleaf.events, 'held');
+            const ended = compileEnd();
+            assert.deepStrictEqual(await manager.compile(true, false, projectUri), { kind: 'started' });
+            await held;
+            return { ended };
+        }
+        const stops = () => overleaf.requests.filter(r => r.path === '/project/p1/compile/stop');
+
+        it('asks Overleaf to stop the running compile, and leaves the status to the compile\'s end', async () => {
+            world.activeEditor = { document: { uri: inProject('main.tex') } };
+            const { ended } = await heldCompile();
+            const before = world.statusTexts.length;
+            await manager.stopCompile();
+            assert.deepStrictEqual(stops().map(r => r.method), ['POST']);
+            // as in the IDE test, the stop reached a compile server that does not run the compile, which goes on
+            overleaf.release('/project/p1/compile');
+            assert.deepStrictEqual((await ended).outcome, { result: 'success' });
+            const after = world.statusTexts.slice(before);
+            assert.ok(!after.some(text => text.includes('$(x)')), `the status said that the compile failed: ${JSON.stringify(after)}`);
+        });
+
+        it('stops the running compile of its project also when no editor of the project is active', async () => {
+            const { ended } = await heldCompile();
+            await manager.stopCompile();
+            assert.strictEqual(stops().length, 1);
+            overleaf.release('/project/p1/compile');
+            await ended;
         });
     });
 

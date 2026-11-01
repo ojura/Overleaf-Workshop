@@ -125,10 +125,11 @@ export class CompileManager {
     static uploadWaitMs = 60 * 1000;
     readonly status: vscode.StatusBarItem;
     /**
-     * the compile that runs, from the request (compile) to its end (run); the promise settles when
-     * the compile has ended, however it ended
+     * the compile that runs, from the request (compile) to its end (run): `ended` settles when the
+     * compile has ended, however it ended, and `project` is the project that it compiles, once the
+     * request has found it
      */
-    private running?: Promise<void>;
+    private running?: { ended: Promise<void>, project?: vscode.Uri };
     private diagnosticProvider: CompileDiagnosticProvider;
     /** the saves of local replica logs, one after another */
     private outputSaves: Promise<void> = Promise.resolve();
@@ -249,10 +250,10 @@ export class CompileManager {
      * fires no compileEndedEvent, and its end settles the promise of 'busy' all the same.
      */
     async compile(force:boolean=false, fromScratch:boolean=false, target?: vscode.Uri): Promise<CompileStart> {
-        if (this.running) { return { kind: 'busy', ended: this.running }; }
+        if (this.running) { return { kind: 'busy', ended: this.running.ended }; }
         // taken before the first wait, so that a request meanwhile finds the window busy
         let settle!: () => void;
-        const running = new Promise<void>(resolve => { settle = resolve; });
+        const running: { ended: Promise<void>, project?: vscode.Uri } = { ended: new Promise<void>(resolve => { settle = resolve; }) };
         this.running = running;
         const end = () => {
             if (this.running === running) { this.running = undefined; }
@@ -263,6 +264,7 @@ export class CompileManager {
             await vscode.workspace.saveAll(); // save all dirty files
             const uri = await this.update('compiling', target);
             if (!uri) { return { kind: 'unavailable' }; }
+            running.project = uri;
             started = true;
             void this.run(uri, force, fromScratch, end);
             return { kind: 'started' };
@@ -407,13 +409,19 @@ export class CompileManager {
         }
     }
 
+    /**
+     * Stop compilation: ask Overleaf to stop the running compile, of whichever project it is. The
+     * compile's end then says how it ended (run): Overleaf answers a stopped compile 'terminated',
+     * and a compile that the stop did not reach ends as it would have. Overleaf sends a stop to
+     * the compile server that it keeps for the project and the user (ClsiManager.mjs:396-421),
+     * which need not be the one that runs the compile; that one answers at once, and the compile
+     * goes on (the compile server's CompileManager.js:410-423).
+     */
     async stopCompile() {
-        const uri = await CompileManager.check();
-        if (uri && this.inCompiling) {
-            const vfs = await this.vfsm.prefetch(uri);
-            await vfs.stopCompile();
-            await this.update('failed');
-        }
+        const project = this.running?.project;
+        if (!project) { return; }
+        const vfs = await this.vfsm.prefetch(project);
+        await vfs.stopCompile();
     }
 
     /**
