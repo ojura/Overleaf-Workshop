@@ -899,13 +899,23 @@ describe('local replica: git as the merge backend', function () {
             };
             const folder = t.sync.localChanged('/x.tex');
             await pairing;
-            // Overleaf reports the same rename: its move needs the queues of both paths
+            // Overleaf reports the same rename. Its move needs the queues of both paths, and
+            // remoteRenamed queues it before it first waits, the saved state being loaded.
             await t.remote.rename('/y.tex', '/x.tex');
             const overleaf = t.sync.remoteRenamed('/y.tex', '/x.tex');
-            // remoteRenamed queues its move after promise steps only, without I/O: one turn of the event loop has it queued
-            await new Promise(resolve => setImmediate(resolve));
             open();
-            await Promise.all([folder, overleaf]);
+            // Work that waits for itself in a circle never finishes, and only a limit tells "never"
+            // from "not yet": the test's last resort, far above the few hundred milliseconds the work takes.
+            const limitMs = 10_000;
+            let timer: NodeJS.Timeout | undefined;
+            const circle = new Promise<never>((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`the folder's rename and Overleaf's move did not finish within ${limitMs} ms: they wait for each other`)), limitMs);
+            });
+            try {
+                await Promise.race([Promise.all([folder, overleaf]), circle]);
+            } finally {
+                clearTimeout(timer);
+            }
             assert.deepStrictEqual([fs.existsSync(path.join(t.folder, 'y.tex')), t.read('/x.tex')], [false, chapter], 'the local files');
             assert.deepStrictEqual(t.remote.calls, ['rename /y.tex /x.tex'], 'what was asked of Overleaf: its own rename only');
             assert.strictEqual(t.remote.ids.get('/x.tex'), id, 'the document keeps its id');

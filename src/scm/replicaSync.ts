@@ -338,6 +338,8 @@ export class ReplicaSync {
 
     private state: SavedState = {version: 1, entries: {}, untracked: []};
     private loaded?: Promise<void>;
+    /** whether `loaded` has settled with the saved state in place */
+    private stateLoaded = false;
     /** paths that existed only locally when a sync without saved state started */
     private firstRunLocalOnly = new Set<string>();
     private slots = new Map<string, Slot>();
@@ -427,6 +429,7 @@ export class ReplicaSync {
             if (Object.values(this.state.changes ?? {}).includes('import')) {
                 await this.recordNow();
             }
+            this.stateLoaded = true;
         })();
         return this.loaded;
     }
@@ -563,17 +566,22 @@ export class ReplicaSync {
         this.remoteMoves.set(from, to);
         const mode: Mode = {...collecting(emptySummary(), {live: true}), remoteMove: true};
         try {
-            await this.load();
-            await this.local.verify();
+            // Once the saved state is loaded, the moves are queued before the first wait, so that
+            // the work scheduled after the event in the queues of these paths comes after them.
+            if (!this.stateLoaded) { await this.load(); }
             const prefix = `${from}/`;
             const moves: [string, string][] = this.state.entries[from]!==undefined ? [[from, to]]
                 : Object.keys(this.state.entries).filter(p => p.startsWith(prefix)).map(p => [p, `${to}${p.slice(from.length)}`]);
-            // each file moves, and then both of its paths sync as they are, in the queues of both
-            await Promise.all(moves.map(([a, b]) => this.inQueues([a, b], async () => {
+            // each file moves, after a check that the folder is the one the sync started with,
+            // and then both of its paths sync as they are, in the queues of both
+            const moving = moves.map(([a, b]) => this.inQueues([a, b], async () => {
+                await this.local.verify();
                 await this.reported(a, mode, () => this.moveLocally(a, b, mode.summary));
                 await this.reconcileReported(a, mode);
                 if (this.tracked(b)) { await this.reconcileReported(b, mode); }
-            })));
+            }));
+            const failed = (await Promise.allSettled(moving)).find((result): result is PromiseRejectedResult => result.status==='rejected');
+            if (failed) { throw failed.reason; }
             // Overleaf's other files in a moved folder
             const moved = new Set(moves.map(([, b]) => b));
             await this.scheduleAll((await this.expand(to, true)).filter(p => !moved.has(p) && this.tracked(p)), mode);
