@@ -15,7 +15,7 @@ import { generatePdfCachingTransportFactory } from '../common/transport';
 import PDFJSWrapper from '@/features/pdf-preview/util/pdf-js-wrapper';
 import { bridgeOutputsOf } from '../common/bridge';
 import { config } from '../common/config';
-import { clearError, errorKind, showError } from '../common/banner';
+import { documentShown, showBuildState, showLoadError, showState } from '../common/banner';
 import { onMessage, post, ready, savedState, saveState } from '../common/host';
 import type { InitState, Position } from '../common/host';
 import { toPdfFile } from '../common/output';
@@ -215,7 +215,7 @@ function untilStopped<T>(job: Job, promise: Promise<T>): Promise<T | undefined> 
  * is, as in the Overleaf viewer.
  */
 function show(source: { output?: PdfOutput, data?: ArrayBuffer }) {
-    if (source.output && !inFlight && app()?.pdfDocument && rangeLoaded?.url === source.output.url) { return; }
+    if (source.output && !inFlight && app()?.pdfDocument && rangeLoaded?.file.build === source.output.file.build) { return; }
     if (inFlight) { stop(inFlight); }
     const job: Job = { abort: new AbortController() };
     inFlight = job;
@@ -247,7 +247,7 @@ async function load(source: { output?: PdfOutput, data?: ArrayBuffer }, job: Job
             url, pdfFile: file.pdfFile, abortController: job.abort,
             handleFetchError: (error) => {
                 if (job.abort.signal.aborted) { return; }
-                showError(errorKind(error), error?.message);
+                showLoadError(error, source.output?.file.build);
                 // before the document is shown, pdf.js would wait for the missing data for good
                 if (!isShown) { stop(job); }
             },
@@ -273,14 +273,14 @@ async function load(source: { output?: PdfOutput, data?: ArrayBuffer }, job: Job
         doc = await untilStopped(job, task.promise);
     } catch (error: any) {
         destroy(task, worker);
-        if (!job.abort.signal.aborted) { showError(errorKind(error), error?.message); }
+        if (!job.abort.signal.aborted) { showLoadError(error, source.output?.file.build); }
         return;
     }
     if (!doc) { return; }
     isShown = true;
     // from here on a newer load waits for this one and then replaces it, rather than stopping it
     if (inFlight === job) { inFlight = undefined; }
-    clearError();
+    documentShown(source.output?.file.build);
     findAllowed = false;
     rangeLoaded = source.output;
 
@@ -429,6 +429,7 @@ function addToolbarButtons(a: any) {
 async function start() {
     onMessage('load', (message: { output: PdfOutput }) => show({ output: message.output }));
     onMessage('update', (message: { content: ArrayBuffer }) => show({ data: message.content }));
+    onMessage('buildState', (message) => showBuildState(message));
     onMessage('syncCode', (message: { content: SyncBox[] }) => {
         // compiling and then jumping to the PDF is the usual order: the search comes while the
         // new build loads, and its pages are not there yet
@@ -454,7 +455,7 @@ async function start() {
     a.eventBus.on('scrollmodechanged', ({ mode }: { mode: number }) => saveState({ scrollMode: mode }));
     a.eventBus.on('spreadmodechanged', ({ mode }: { mode: number }) => saveState({ spreadMode: mode }));
     a.eventBus.on('sidebarviewchanged', ({ view }: { view: number }) => saveState({ sidebarView: view }));
-    a.eventBus.on('documenterror', ({ message }: { message: string }) => showError('failed', message));
+    a.eventBus.on('documenterror', ({ message }: { message: string }) => showState('failed', message));
     askBeforeFind(a);
 
     initState = await ready();
@@ -464,5 +465,5 @@ async function start() {
 
 start().catch((error) => {
     console.error('pdf viewer:', error);
-    showError('failed', error?.message ?? String(error));
+    showState('failed', error?.message ?? String(error));
 });

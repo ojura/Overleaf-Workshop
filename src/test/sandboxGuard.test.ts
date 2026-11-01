@@ -1,6 +1,7 @@
 import * as assert from 'assert';
+import type { CompileRequest } from '../api/base';
 import {
-    CompileRequest, EntityType, GuardedSandbox, JoinedView, ProjectWriter, recordProblems, SandboxRecord,
+    EntityType, GuardedSandbox, JoinedView, ProjectWriter, recordProblems, SandboxRecord,
     SandboxSafetyError, viewProblems,
 } from '../sandbox/guard';
 

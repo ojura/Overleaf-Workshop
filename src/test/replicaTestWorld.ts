@@ -4,7 +4,7 @@
 import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
-import Module = require('module');
+import { loadWithVscode } from './standIn';
 
 /** Stands in for anything else: callable, constructible, and every member is one again. */
 export function stub(): any {
@@ -161,23 +161,13 @@ export function world(folder: string, syncOnFileChange: boolean, options: { wind
 }
 
 export function load(mock: any) {
-    const moduleAny = Module as any;
-    const originalLoad = moduleAny._load;
-    moduleAny._load = function (request: string, ...rest: any[]) {
-        return request === 'vscode' ? mock : originalLoad.call(this, request, ...rest);
-    };
-    try {
-        for (const key of Object.keys(require.cache)) {
-            if (key.includes(`${path.sep}out${path.sep}`) && !key.includes(`${path.sep}test${path.sep}`)) { delete require.cache[key]; }
-        }
+    return loadWithVscode(mock, () => {
         require('../scm/localFolderWatcher').LocalFolderWatcher.quietMs = 50;
         return {
             LocalReplicaSCMProvider: require('../scm/localReplicaSCM').LocalReplicaSCMProvider,
             requestReplica: require('../scm/replicaControl').requestReplica,
         };
-    } finally {
-        moduleAny._load = originalLoad;
-    }
+    });
 }
 
 export const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));

@@ -14,7 +14,16 @@
     let currentBuild = new URLSearchParams(location.search).get('build') || 'a';
     const t0 = performance.now();
     const events = [];
-    const log = (type, data = {}) => { events.push({ t: Math.round(performance.now() - t0), type, ...data }); };
+    /** the probes waiting for an event of a type (harness.first) */
+    const waiting = [];
+    const log = (type, data = {}) => {
+        const event = { t: Math.round(performance.now() - t0), type, ...data };
+        events.push(event);
+        for (const waiter of waiting.filter(w => w.type === type)) {
+            waiting.splice(waiting.indexOf(waiter), 1);
+            waiter.resolve(event);
+        }
+    };
     const deliver = (message) => window.postMessage(message, '*');
     const themes = {
         default: { fontColor: '#000000', bgColor: '#FFFFFF' },
@@ -62,6 +71,9 @@
                 deliver({ type: 'fetchResponse', ...meta, body });
                 break;
             }
+            case 'buildGone':
+                log('buildGone', { build: message.build });
+                break;
             case 'fetchAbort':
                 fetch('/bridge-abort', { method: 'POST', body: JSON.stringify({ id: message.id }) });
                 log('fetchAbort', { id: message.id });
@@ -89,5 +101,12 @@
         },
         syncCode(boxes) { log('syncCode'); deliver({ type: 'syncCode', content: boxes }); },
         messages(type) { return events.filter(e => e.type === type); },
+        /** the first event of `type`: logged already, or the next one */
+        first(type) {
+            const seen = events.find(e => e.type === type);
+            return seen ? Promise.resolve(seen) : new Promise(resolve => waiting.push({ type, resolve }));
+        },
+        /** the host's 'buildState' (src/core/projectBuilds.ts) */
+        buildState(state, detail) { log('buildState', { state }); deliver({ type: 'buildState', state, detail }); },
     };
 })();

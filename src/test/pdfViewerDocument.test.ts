@@ -1,20 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention -- mirrors the 'vscode' export names */
 import * as assert from 'assert';
 import * as path from 'path';
-import Module = require('module');
-
-function stub(): any {
-    const f: any = function () { return stub(); };
-    return new Proxy(f, {
-        get(target, key) {
-            if (key === 'then') { return undefined; }
-            if (!(key in target)) { target[key] = stub(); }
-            return target[key];
-        },
-        construct() { return stub(); },
-    });
-}
-const withStubs = (target: any): any => new Proxy(target, { get: (t, key) => (key in t ? t[key] : stub()) });
+import { loadWithVscode, strict } from './standIn';
 
 class Uri {
     constructor(readonly scheme: string, readonly authority: string, readonly path: string, readonly query = '') {}
@@ -29,53 +16,123 @@ class Uri {
     }
 }
 
-const world = { reads: [] as string[], output: undefined as any };
-const vscodeMock = withStubs({
+/**
+ * The project as the PDF document sees it (VirtualFileSystem): its build in use, which changes when
+ * a test says so, and the address of that build's output.pdf.
+ */
+const project = {
+    build: undefined as { id: string } | undefined,
+    output: undefined as any,
+    listeners: new Set<(build: unknown) => void>(),
+    /** the build in use changes to `id`, with output.pdf at `output` */
+    use(id: string, output: unknown) {
+        this.build = { id };
+        this.output = output;
+        this.listeners.forEach(listener => listener(this.build));
+    },
+};
+const vfs = {
+    builds: {
+        get build() { return project.build; },
+        onDidChangeBuild: (listener: (build: unknown) => void) => {
+            project.listeners.add(listener);
+            return () => { project.listeners.delete(listener); };
+        },
+    },
+    pdfOutput: () => project.output,
+};
+
+const world = { reads: [] as string[], unreadable: new Set<string>() };
+const vscodeStandIn = strict('vscode', {
     Uri,
-    Disposable: class { dispose() {} },
     EventEmitter: class {
         private listeners: ((value: any) => void)[] = [];
         event = (listener: (value: any) => void) => { this.listeners.push(listener); return { dispose() {} }; };
         fire(value: any) { this.listeners.forEach(listener => listener(value)); }
-        dispose() {}
+        dispose() { this.listeners = []; }
     },
-    TreeItem: class {},
-    l10n: { t: (message: string) => message },
-    commands: withStubs({
-        executeCommand: async (command: string) => command === 'remoteFileSystem.prefetch' ? { pdfOutput: () => world.output } : undefined,
+    l10n: strict('vscode.l10n', { t: (message: string) => message }),
+    window: strict('vscode.window', {}),
+    commands: strict('vscode.commands', {
+        executeCommand: async (command: string) => {
+            if (command !== 'remoteFileSystem.prefetch') { throw new Error(`the test has no command ${command}`); }
+            return vfs;
+        },
     }),
-    workspace: withStubs({
-        getConfiguration: () => ({ get: (_key: string, value: any) => value }),
-        fs: withStubs({
-            readFile: async (uri: Uri) => { world.reads.push(uri.path); return new TextEncoder().encode('%PDF-1.7 whole'); },
+    // classes that the extension's modules extend when they load
+    TreeItem: class {},
+    QuickPickItem: class {},
+    Disposable: class { dispose() {} },
+    workspace: strict('vscode.workspace', {
+        getConfiguration: () => ({ get: (_key: string, value: unknown) => value }),
+        fs: strict('vscode.workspace.fs', {
+            readFile: async (uri: Uri) => {
+                world.reads.push(uri.path);
+                if (world.unreadable.has(uri.path)) { throw new Error(`${uri.path}: unavailable`); }
+                return new TextEncoder().encode('%PDF-1.7 whole');
+            },
         }),
     }),
 });
-const moduleAny = Module as any;
-const originalLoad = moduleAny._load;
-moduleAny._load = function (request: string, ...rest: any[]) {
-    return request === 'vscode' ? vscodeMock : originalLoad.call(this, request, ...rest);
-};
-const { PdfDocument } = require('../core/pdfViewEditorProvider');
-moduleAny._load = originalLoad;
-for (const key of Object.keys(require.cache)) {
-    if (/[\\/]out[\\/](?!test[\\/])/.test(key)) { delete require.cache[key]; }
-}
+const { PdfDocument } = loadWithVscode(vscodeStandIn, () => require('../core/pdfViewEditorProvider'));
 
 const projectFile = (file: string) => Uri.parse(`overleaf-workshop://www.overleaf.com/Book/${file}?user%3Du1%26project%3Dp1`);
-const output = { url: 'https://dl/zone/d/project/p1/user/u1/build/b1/output/output.pdf?enable_pdf_caching=true', downloadDomain: 'https://dl/zone/d', projectId: 'p1', file: { path: 'output.pdf', size: 885_484_347 } };
+const outputOf = (build: string) => ({
+    url: `https://dl/zone/d/project/p1/user/u1/build/${build}/output/output.pdf?enable_pdf_caching=true`,
+    downloadDomain: 'https://dl/zone/d', projectId: 'p1', file: { path: 'output.pdf', build, size: 885_484_347 },
+});
 
 describe('what the PDF viewer loads', () => {
-    beforeEach(() => { world.reads = []; world.output = output; });
+    beforeEach(() => {
+        world.reads = [];
+        world.unreadable.clear();
+        project.build = undefined;
+        project.output = undefined;
+        project.listeners.clear();
+    });
 
-    it('passes the build\'s address to a viewer that loads in ranges, and reads nothing', async () => {
+    it('passes the build\'s address to the viewers, which load it in ranges, and reads nothing', async () => {
+        project.use('b1', outputOf('b1'));
         const doc = new PdfDocument(projectFile('.output/output.pdf'), 'overleaf');
         await doc.refresh();
-        assert.strictEqual(doc.output, output);
+        assert.deepStrictEqual(doc.output, outputOf('b1'));
         assert.deepStrictEqual(world.reads, []);
     });
 
-    it('reads any other PDF of the project whole, also in a viewer that loads in ranges', async () => {
+    it('follows the build in use, and tells the viewers only about a new build', async () => {
+        project.use('b1', outputOf('b1'));
+        const doc = new PdfDocument(projectFile('.output/output.pdf'), 'pdfjs');
+        const changes: string[] = [];
+        doc.onDidChange((change: any) => changes.push(change.output?.file.build));
+        await doc.refresh();
+        // another client's compile became the build in use (ProjectBuilds)
+        project.use('b2', outputOf('b2'));
+        assert.strictEqual(doc.output.file.build, 'b2');
+        // the same build again
+        project.use('b2', outputOf('b2'));
+        assert.deepStrictEqual(changes, ['b1', 'b2']);
+    });
+
+    it('shows nothing and reads nothing while the project has no build', async () => {
+        const doc = new PdfDocument(projectFile('.output/output.pdf'), 'overleaf');
+        const changes: unknown[] = [];
+        doc.onDidChange((change: unknown) => changes.push(change));
+        await doc.refresh();
+        assert.strictEqual(doc.output, undefined);
+        assert.deepStrictEqual(changes, []);
+        assert.deepStrictEqual(world.reads, []);
+    });
+
+    it('reads a build whole that the download domain does not serve, as without one on a server of one\'s own', async () => {
+        project.use('b1', undefined);
+        const doc = new PdfDocument(projectFile('.output/output.pdf'), 'overleaf');
+        await doc.refresh();
+        assert.strictEqual(doc.output, undefined);
+        assert.deepStrictEqual(world.reads, ['/Book/.output/output.pdf']);
+        assert.strictEqual(new TextDecoder().decode(doc.cache), '%PDF-1.7 whole');
+    });
+
+    it('reads any other PDF of the project whole', async () => {
         const doc = new PdfDocument(projectFile('slike/figure.pdf'), 'pdfjs');
         await doc.refresh();
         assert.strictEqual(doc.output, undefined);
@@ -83,12 +140,11 @@ describe('what the PDF viewer loads', () => {
         assert.strictEqual(new TextDecoder().decode(doc.cache), '%PDF-1.7 whole');
     });
 
-    it('reads the build whole when this session has not compiled it', async () => {
-        world.output = undefined;
-        const doc = new PdfDocument(projectFile('.output/output.pdf'), 'overleaf');
-        await doc.refresh();
-        assert.strictEqual(doc.output, undefined);
-        assert.deepStrictEqual(world.reads, ['/Book/.output/output.pdf']);
+    it('fails to open a PDF that cannot be read, instead of showing an empty one', async () => {
+        world.unreadable.add('/Book/slike/figure.pdf');
+        const doc = new PdfDocument(projectFile('slike/figure.pdf'), 'pdfjs');
+        await assert.rejects(doc.refresh(), /unavailable/);
+        assert.strictEqual(doc.cache.byteLength, 0);
     });
 
     it('opens a PDF in the pdfjs viewer when no viewer is named', () => {
@@ -100,17 +156,29 @@ describe('what the PDF viewer loads', () => {
         await doc.refresh();
         assert.deepStrictEqual(world.reads, ['/home/u/paper/output.pdf']);
     });
+
+    it('stops following the build in use when it is closed', async () => {
+        project.use('b1', outputOf('b1'));
+        const doc = new PdfDocument(projectFile('.output/output.pdf'), 'overleaf');
+        await doc.refresh();
+        doc.dispose();
+        assert.strictEqual(project.listeners.size, 0);
+    });
 });
 
 describe('switching the viewer of an open PDF', () => {
-    beforeEach(() => { world.reads = []; world.output = output; });
+    beforeEach(() => {
+        world.reads = [];
+        project.listeners.clear();
+        project.use('b1', outputOf('b1'));
+    });
 
     it('keeps a build loaded in ranges between the two viewers that load in ranges', async () => {
         const doc = new PdfDocument(projectFile('.output/output.pdf'), 'pdfjs');
         await doc.refresh();
         assert.strictEqual(await doc.setEngine('overleaf'), true);
         assert.strictEqual(doc.engine, 'overleaf');
-        assert.strictEqual(doc.output, output);
+        assert.deepStrictEqual(doc.output, outputOf('b1'));
         assert.deepStrictEqual(world.reads, []);
         assert.strictEqual(await doc.setEngine('overleaf'), false);
     });

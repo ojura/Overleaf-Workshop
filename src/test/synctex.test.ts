@@ -3,7 +3,7 @@ import * as assert from 'assert';
 import * as http from 'http';
 import * as path from 'path';
 import { AddressInfo } from 'net';
-import Module = require('module');
+import { loadWithVscode } from './standIn';
 
 function stub(): any {
     const f: any = function () { return stub(); };
@@ -64,17 +64,7 @@ const vscodeMock = withStubs({
         }),
     }),
 });
-const moduleAny = Module as any;
-const originalLoad = moduleAny._load;
-moduleAny._load = function (request: string, ...rest: any[]) {
-    return request === 'vscode' ? vscodeMock : originalLoad.call(this, request, ...rest);
-};
-const { CompileManager } = require('../compile/compileManager');
-const { BaseAPI } = require('../api/base');
-moduleAny._load = originalLoad;
-for (const key of Object.keys(require.cache)) {
-    if (/[\\/]out[\\/](?!test[\\/])/.test(key)) { delete require.cache[key]; }
-}
+const [{ CompileManager }, { BaseAPI }] = loadWithVscode(vscodeMock, () => [require('../compile/compileManager'), require('../api/base')]);
 
 const projectUri = Uri.parse('overleaf-workshop://www.overleaf.com/Book?user%3Du1%26project%3Dp1');
 
@@ -85,22 +75,26 @@ describe('SyncTeX', () => {
         world.infos = [];
     });
 
-    it('sends the line as SyncTeX counts it, the path encoded, and the compile server that made the build', async () => {
+    it('sends the line as SyncTeX counts it, the path encoded, and the compile server and editor of the build', async () => {
         const urls: string[] = [];
         const server = http.createServer((req, res) => { urls.push(req.url!); res.end(JSON.stringify({ pdf: [], code: [{ file: 'main.tex', line: 3, column: 0 }] })); });
         await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
         try {
             const api = new BaseAPI(`http://127.0.0.1:${(server.address() as AddressInfo).port}/`);
             const identity = { cookies: 'c', csrfToken: 't' };
-            await api.proxySyncCode(identity, 'p1', 'chapters/a b&c.tex', 12, 4, 'build1', 'clsi-7');
-            await api.proxySyncPdf(identity, 'p1', 3, 10.5, 200.25, 'build1', 'clsi-7');
+            const editor = '0d9c1e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f';
+            await api.proxySyncCode(identity, 'p1', 'chapters/a b&c.tex', 12, 4, 'build1', editor, 'clsi-7');
+            await api.proxySyncPdf(identity, 'p1', 3, 10.5, 200.25, 'build1', editor, 'clsi-7');
             const code = new URL(urls[0], 'http://x');
             assert.strictEqual(code.pathname, '/project/p1/sync/code');
             assert.strictEqual(code.searchParams.get('file'), 'chapters/a b&c.tex');
             assert.strictEqual(code.searchParams.get('line'), '12');
             assert.strictEqual(code.searchParams.get('clsiserverid'), 'clsi-7');
+            // the build's editor: Overleaf looks a build up in its cache of compile outputs by editor and build
+            assert.deepStrictEqual([code.searchParams.get('editorId'), code.searchParams.get('buildId')], [editor, 'build1']);
             const pdf = new URL(urls[1], 'http://x');
             assert.deepStrictEqual([pdf.searchParams.get('page'), pdf.searchParams.get('h'), pdf.searchParams.get('v'), pdf.searchParams.get('clsiserverid')], ['3', '10.50', '200.25', 'clsi-7']);
+            assert.deepStrictEqual([pdf.searchParams.get('editorId'), pdf.searchParams.get('buildId')], [editor, 'build1']);
         } finally { server.close(); }
     });
 
