@@ -2,11 +2,10 @@
 import * as assert from 'assert';
 import { execFileSync, spawnSync } from 'child_process';
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { POINTER_FILE } from '../scm/replicaControl';
 import { OVERLEAF_REF } from '../scm/replicaGit';
-import { Uri, load, world } from './replicaTestWorld';
+import { Cleanup, Uri, load, world } from './replicaTestWorld';
 
 const git = (dir: string, ...args: string[]) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' }).trim();
 const read = (file: string) => fs.readFileSync(file, 'utf8');
@@ -17,49 +16,15 @@ const recorded = (folder: string) => git(folder, 'ls-tree', '-r', '--name-only',
 describe('local replica: what it deletes and what it never syncs', function () {
     this.timeout(20000);
     /** what each test set up, undone in reverse order on every path */
-    let undo: (() => void | Promise<void>)[] = [];
-    afterEach(async () => {
-        const errors: unknown[] = [];
-        for (const step of undo.reverse()) {
-            try { await step(); } catch (error) { errors.push(error); }
-        }
-        undo = [];
-        if (errors.length) { throw errors[0]; }
-    });
-
-    function tempDir(prefix: string): string {
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-        undo.push(() => fs.rmSync(dir, { recursive: true, force: true }));
-        return dir;
-    }
-    function setEnv(key: string, value: string) {
-        const saved = process.env[key];
-        process.env[key] = value;
-        undo.push(() => { if (saved === undefined) { delete process.env[key]; } else { process.env[key] = saved; } });
-    }
-    /**
-     * Resolves once `holds()` is true: at once, or at the change in the folder `dir` that makes
-     * it so. Its watcher closes then, or at the end of the test.
-     */
-    function folderShows(dir: string, holds: () => boolean): Promise<void> {
-        return new Promise((resolve, reject) => {
-            const watcher = fs.watch(dir);
-            undo.push(() => watcher.close());
-            const check = () => { if (holds()) { watcher.close(); resolve(); } };
-            watcher.on('change', check);
-            watcher.on('error', error => { watcher.close(); reject(error); });
-            check();
-        });
-    }
-    /** Resolves once `file` exists: the replica's control server writes it after it listens. */
-    const fileAppears = (file: string) => folderShows(path.dirname(file), () => fs.existsSync(file));
+    const cleanup = new Cleanup();
+    afterEach(() => cleanup.undo());
     /**
      * A commit of the folder as an agent makes it with `git add -A` and `git commit` on top of
      * HEAD, in an index of its own, so that the replica's index and HEAD stay as they are.
      */
     function commitAll(folder: string, message: string): string {
         const env = {
-            ...process.env, GIT_INDEX_FILE: path.join(tempDir('ow-safety-index-'), 'index'),
+            ...process.env, GIT_INDEX_FILE: path.join(cleanup.tempDir('ow-safety-index-'), 'index'),
             GIT_AUTHOR_NAME: 'An Agent', GIT_AUTHOR_EMAIL: 'agent@example.com', GIT_COMMITTER_NAME: 'An Agent', GIT_COMMITTER_EMAIL: 'agent@example.com',
         };
         const run = (...args: string[]) => execFileSync('git', ['-C', folder, ...args], { encoding: 'utf8', env }).trim();
@@ -70,11 +35,8 @@ describe('local replica: what it deletes and what it never syncs', function () {
 
     /** One extension host with its own socket folder and trash, and the replica's folder. */
     function host(folder?: string) {
-        const runtime = tempDir('ow-safety-run-');
-        fs.chmodSync(runtime, 0o700);
-        setEnv('XDG_RUNTIME_DIR', runtime);
-        setEnv('XDG_DATA_HOME', tempDir('ow-safety-data-'));
-        const dir = folder ?? tempDir('ow-safety-');
+        cleanup.privateRuntime();
+        const dir = folder ?? cleanup.tempDir('ow-safety-');
         const t = world(dir, false);
         return { ...t, folder: dir };
     }
@@ -82,11 +44,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
     /** Start a replica of `t`'s project and wait for its first sync and record. */
     async function start(t: ReturnType<typeof host>, modules = load(t.mock)) {
         const scm = new modules.LocalReplicaSCMProvider(t.vfs, Uri.file(t.folder));
-        const triggers: { dispose(): void }[] = await scm.triggers;
-        undo.push(async () => {
-            triggers.forEach(trigger => trigger.dispose());
-            await scm.sync?.stop(); // the stop saves the state into the folder: wait for it before the folder goes
-        });
+        await cleanup.start(scm);
         await scm.syncNow();
         return { ...modules, scm };
     }
@@ -171,7 +129,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             const { scm } = await start(t);
             const moved = `${t.folder}-moved`;
             fs.renameSync(t.folder, moved);
-            undo.push(() => fs.rmSync(moved, { recursive: true, force: true }));
+            cleanup.add(() => fs.rmSync(moved, { recursive: true, force: true }));
             const error = await scm.syncNow().then(() => undefined, (e: any) => e);
             assert.strictEqual(error?.reason, 'gone', String(error));
             assert.strictEqual(t.w.remote.size, 3, 'every file is still on Overleaf');
@@ -195,7 +153,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             // the folder moved away, and another one with a repository, the settings and an older a.tex took its path
             const moved = `${t.folder}-moved`;
             fs.renameSync(t.folder, moved);
-            undo.push(() => fs.rmSync(moved, { recursive: true, force: true }));
+            cleanup.add(() => fs.rmSync(moved, { recursive: true, force: true }));
             fs.mkdirSync(path.join(t.folder, '.overleaf'), { recursive: true });
             fs.copyFileSync(path.join(moved, '.overleaf', 'settings.json'), path.join(t.folder, '.overleaf', 'settings.json'));
             git(t.folder, 'init', '--quiet');
@@ -213,7 +171,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             const { scm } = await start(t);
             const figs = path.join(t.folder, 'figs');
             fs.chmodSync(figs, 0o000);
-            undo.push(() => fs.chmodSync(figs, 0o755));
+            cleanup.add(() => fs.chmodSync(figs, 0o755));
             const error = await scm.syncNow().then(() => undefined, (e: Error) => e);
             assert.strictEqual(t.w.remote.has('/figs/a.tex') && t.w.remote.has('/figs/b.tex'), true, 'the files are still on Overleaf');
             assert.strictEqual((error as NodeJS.ErrnoException | undefined)?.code, 'EACCES', String(error));
@@ -225,11 +183,11 @@ describe('local replica: what it deletes and what it never syncs', function () {
             const figs = Array.from({ length: 6 }, (_, i) => `/figs/f${i}.tex`);
             project(t, { ...Object.fromEntries(figs.map(p => [p, `${p}\n`])), '/main.tex': 'main\n', '/extra.tex': 'extra\n' });
             // the figures are in another folder that the replica links to
-            const outside = tempDir('ow-safety-linked-');
+            const outside = cleanup.tempDir('ow-safety-linked-');
             fs.symlinkSync(outside, path.join(t.folder, 'figs'));
             const { requestReplica } = await start(t);
             assert.strictEqual(fs.readdirSync(outside).length, 6, 'the first sync writes the figures through the link');
-            await fileAppears(path.join(t.folder, POINTER_FILE));
+            await cleanup.fileAppears(path.join(t.folder, POINTER_FILE));
             fs.rmSync(path.join(t.folder, 'extra.tex'));
             const answer: any = await requestReplica(t.folder, { op: 'sync' }, 10000);
             assert.strictEqual(answer.ok, true, JSON.stringify(answer));
@@ -240,7 +198,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             const t = host();
             project(t, eight);
             const { requestReplica } = await start(t);
-            await fileAppears(path.join(t.folder, POINTER_FILE));
+            await cleanup.fileAppears(path.join(t.folder, POINTER_FILE));
             // as git checkout, git stash -u or git clean leave the folder
             for (let i = 0; i < 6; i++) { fs.rmSync(path.join(t.folder, `chapter${i}.tex`)); }
             const answer: any = await requestReplica(t.folder, { op: 'sync' }, 10000);
@@ -295,7 +253,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
                 return Promise.resolve(undefined);
             };
             const started = await start(t);
-            await fileAppears(path.join(t.folder, POINTER_FILE));
+            await cleanup.fileAppears(path.join(t.folder, POINTER_FILE));
             const deleted = chapters.slice(0, 6);
             deleted.forEach(p => t.remoteDelete(p));
             await questionShown;
@@ -330,7 +288,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             project(t, { ...Object.fromEntries(chapters.map(p => [p, `${p}\n`])), '/main.tex': 'main\n' });
             const modules = load(t.mock);
             await start(t, modules);
-            await undo.pop()!(); // the IDE closes
+            await cleanup.undoLast(); // the IDE closes
             const deleted = chapters.slice(0, 6);
             deleted.forEach(p => t.w.remote.delete(p)); // a collaborator deletes six meanwhile
             let shown!: () => void;
@@ -341,10 +299,9 @@ describe('local replica: what it deletes and what it never syncs', function () {
             };
             // the IDE starts again: its first sync asks about the six, and the question waits
             const scm = new modules.LocalReplicaSCMProvider(t.vfs, Uri.file(t.folder));
-            const triggers: { dispose(): void }[] = await scm.triggers;
-            undo.push(async () => { triggers.forEach(trigger => trigger.dispose()); await scm.sync?.stop(); });
+            await cleanup.start(scm);
             await questionShown;
-            await fileAppears(path.join(t.folder, POINTER_FILE));
+            await cleanup.fileAppears(path.join(t.folder, POINTER_FILE));
             const reply: any = await modules.requestReplica(t.folder, { op: 'sync' }, 10000);
             assert.strictEqual(reply.ok, false, JSON.stringify(reply));
             assert.deepStrictEqual([...(reply.summary.question?.paths ?? [])].sort(), deleted);
@@ -363,7 +320,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             assert.strictEqual(git(t.folder, 'diff', '--name-status', 'HEAD', commit), '', 'the commit adds nothing');
             answer(true);
             const files = deleted.map(p => path.join(t.folder, p.slice(1)));
-            await folderShows(t.folder, () => files.every(file => !fs.existsSync(file)));
+            await cleanup.folderShows(t.folder, () => files.every(file => !fs.existsSync(file)));
             await requestReplica(t.folder, { op: 'sync' }, 10000);
             await requestReplica(t.folder, { op: 'land', commit }, 10000);
             assert.deepStrictEqual([...t.w.remote.keys()].sort(), ['/chapter6.tex', '/chapter7.tex', '/main.tex'], 'the collaborator\'s deletion stands on Overleaf');
@@ -392,7 +349,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             const modules = load(t.mock);
             await start(t, modules);
             // the next start of the replica, as after a reload or a reconnect
-            await undo.pop()!();
+            await cleanup.undoLast();
             await start(t, modules);
             assert.deepStrictEqual([...t.w.remote.keys()].filter(p => p.startsWith('/.git')), []);
         });
@@ -426,10 +383,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             t.mock.window.createOutputChannel = () => ({ appendLine: (line: string) => lines.push(line), show() {}, dispose() {} });
             const { LocalReplicaSCMProvider } = load(t.mock);
             const scm = new LocalReplicaSCMProvider(t.vfs, Uri.file(t.folder));
-            const error = await scm.triggers.then((triggers: { dispose(): void }[]) => {
-                undo.push(async () => { triggers.forEach(trigger => trigger.dispose()); await scm.sync?.stop(); });
-                return undefined;
-            }, (e: NodeJS.ErrnoException) => e);
+            const error = await cleanup.start(scm).then(() => undefined, (e: NodeJS.ErrnoException) => e);
             return { error, lines };
         }
 
@@ -440,7 +394,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             const temporary = path.join(t.folder, '.overleaf', 'tmp');
             fs.mkdirSync(temporary, { recursive: true });
             fs.chmodSync(temporary, 0o000);
-            undo.push(() => fs.chmodSync(temporary, 0o755));
+            cleanup.add(() => fs.chmodSync(temporary, 0o755));
             const { error, lines } = await failedStart(t);
             assert.strictEqual(error?.code, 'EACCES', String(error));
             assert.ok(lines.some(line => line.includes(temporary) && line.includes(String(error))), JSON.stringify(lines));
@@ -453,7 +407,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             const own = path.join(t.folder, '.overleaf');
             fs.mkdirSync(own);
             fs.chmodSync(own, 0o555);
-            undo.push(() => fs.chmodSync(own, 0o755));
+            cleanup.add(() => fs.chmodSync(own, 0o755));
             const { error, lines } = await failedStart(t);
             assert.strictEqual(error?.code, 'EACCES', String(error));
             assert.ok(lines.some(line => line.includes(path.join(own, 'settings.json')) && line.includes(String(error))), JSON.stringify(lines));
@@ -504,10 +458,7 @@ describe('local replica: what it deletes and what it never syncs', function () {
             t.mock.window.showErrorMessage = async (message: string) => { errors.push(message); return undefined; };
             const { LocalReplicaSCMProvider } = load(t.mock);
             const scm = new LocalReplicaSCMProvider(t.vfs, Uri.file(t.folder));
-            const started = await scm.triggers.then((triggers: { dispose(): void }[]) => {
-                undo.push(async () => { triggers.forEach(trigger => trigger.dispose()); await scm.sync?.stop(); });
-                return 'started';
-            }, (error: Error) => error);
+            const started = await cleanup.start(scm).then(() => 'started', (error: Error) => error);
             if (started === 'started') { await scm.syncNow().catch(() => { /* the test asserts what the sync did */ }); }
             assert.strictEqual(read(path.join(t.folder, 'main.tex')), 'v2, edited while the IDE was closed\n');
             assert.strictEqual(read(stateFile), '{not json');
