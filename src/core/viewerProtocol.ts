@@ -107,11 +107,14 @@ export interface PdfOutput {
  *                        window compiles as for none
  *   checking             no build to show while the window asks Overleaf for the latest compile
  *   compiling            no build to show while a compile runs that makes one
- *   check-failed         asking Overleaf for the latest compile failed; `detail` says why
+ *   unchecked            the build in use is shown, but asking Overleaf whether a newer compile
+ *                        exists failed; `detail` says why
+ *   check-failed         no build to show, and asking Overleaf for the latest compile failed;
+ *                        `detail` says why
  *   compile-failed       the compile ended without a build; `detail` says why
  *   compile-unavailable  the compile did not start; `detail` says why
  */
-export type BuildState = 'ready' | 'none' | 'gone' | 'checking' | 'compiling' | 'check-failed' | 'compile-failed' | 'compile-unavailable';
+export type BuildState = 'ready' | 'unchecked' | 'none' | 'gone' | 'checking' | 'compiling' | 'check-failed' | 'compile-failed' | 'compile-unavailable';
 
 export interface BuildStatus {
     state: BuildState;

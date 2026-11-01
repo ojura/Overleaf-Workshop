@@ -457,7 +457,8 @@ describe('the build in use (ProjectBuilds)', () => {
         host.answers.push({ kind: 'failed', detail: 'fetch failed: Headers Timeout Error' });
         await builds.check();
         assert.strictEqual(builds.build?.id, 'x');
-        assert.deepStrictEqual(builds.status, { state: 'check-failed', detail: 'fetch failed: Headers Timeout Error' });
+        // quietly: the PDF shown stays, and only may not be the latest
+        assert.deepStrictEqual(builds.status, { state: 'unchecked', detail: 'fetch failed: Headers Timeout Error' });
         host.answers.push({ kind: 'none' });
         await builds.check();
         assert.deepStrictEqual(builds.status, { state: 'ready' });

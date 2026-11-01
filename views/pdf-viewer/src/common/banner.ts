@@ -15,13 +15,15 @@ export type BannerState = Exclude<BuildState, 'ready'> | 'failed';
 /**
  * Each state's text, from the state's detail. The states in which the project has no PDF to show
  * offer Recompile: while a viewer is visible, the window rests in them only when it does not
- * compile on its own (ProjectBuilds); 'checking' and 'compiling' say what is under way.
+ * compile on its own (ProjectBuilds); 'checking' and 'compiling' say what is under way, and
+ * 'unchecked' says quietly, over a PDF that is shown, that it may not be the latest.
  */
 const STATES: Record<BannerState, { text: (detail?: string) => string, recompile: boolean }> = {
     'none': { text: () => 'There is no build of this PDF yet.', recompile: true },
     'gone': { text: () => 'This build of the PDF is no longer on Overleaf\'s servers.', recompile: true },
     'checking': { text: () => 'Asking Overleaf for the latest compile of the project…', recompile: false },
     'compiling': { text: () => 'Compiling the project on Overleaf…', recompile: false },
+    'unchecked': { text: (detail) => `This PDF may not be the latest: Overleaf could not be asked for the latest compile: ${detail}`, recompile: false },
     'check-failed': { text: (detail) => `Overleaf could not be asked for the latest compile: ${detail}`, recompile: true },
     'compile-failed': { text: (detail) => `The compile ended without a PDF: ${detail}`, recompile: true },
     'compile-unavailable': { text: (detail) => `The project could not be compiled: ${detail}`, recompile: true },

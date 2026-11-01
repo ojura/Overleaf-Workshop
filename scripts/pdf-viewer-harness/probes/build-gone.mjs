@@ -92,6 +92,9 @@ try {
     await page.evaluate(`harness.buildState('compiling'); true`);
     await line('compiling');
     check('the host compiling shows its line, without Recompile', !(await hasRecompile()));
+    await page.evaluate(`harness.buildState('unchecked', 'fetch failed'); true`);
+    await line('unchecked');
+    check('a failed check over a PDF shows quietly, without Recompile', !(await hasRecompile()) && await page.evaluate(`${banner}.classList.contains('under-way')`));
     await page.evaluate(`harness.buildState('compile-failed', 'Overleaf\\'s status is "failure"'); true`);
     await line('compile-failed');
     const text = await page.evaluate(`${banner}.textContent`);

@@ -631,6 +631,18 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.strictEqual(panel.posted.filter(message => message.type === 'load').pop().output.file.build, 'b-new');
         });
 
+        it('says quietly over the PDF that it could not ask Overleaf for a newer compile, and keeps the PDF', async () => {
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            const { panel } = await open();
+            await panel.first('load');
+            overleaf.latest = { status: 503 };
+            await vfs.builds.check();
+            assert.strictEqual(vfs.builds.status.state, 'unchecked');
+            assert.strictEqual(panel.posted.filter(message => message.type === 'buildState').pop().state, 'unchecked');
+            assert.strictEqual(vfs.builds.build.id, 'b-web');
+            assert.deepStrictEqual(overleaf.to('/project/p1/compile'), []);
+        });
+
         it('asks Overleaf for the latest compile when the viewer becomes visible, and not when only its focus changes', async () => {
             overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
             const { panel } = await open();

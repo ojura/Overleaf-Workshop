@@ -587,7 +587,8 @@ export class ProjectBuilds {
 
     private derive(): BuildStatus {
         if (this.hasBuildToShow()) {
-            return this.checkError !== undefined ? { state: 'check-failed', detail: this.checkError } : { state: 'ready' };
+            // the PDF shown stays valid: a failed check only says that it may not be the latest
+            return this.checkError !== undefined ? { state: 'unchecked', detail: this.checkError } : { state: 'ready' };
         }
         if (this.compile.state === 'running') {
             return { state: 'compiling' };
