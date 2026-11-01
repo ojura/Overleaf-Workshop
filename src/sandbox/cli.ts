@@ -21,6 +21,7 @@ import { bridgeBranch, pushToBridge } from '../gitbridge/flow';
 import { OverleafHistory, Pacer } from '../gitbridge/history';
 import { addBridgeRemote, rangesCheck } from '../gitbridge/overleaf';
 import { connectReplica, CONNECT_REF } from '../scm/replicaConnect';
+import { OVERLEAF_REF } from '../scm/replicaGit';
 import { BaseAPI } from '../api/base';
 import {
     createSandbox, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions, SANDBOX_RECORD_FILE,
@@ -153,7 +154,7 @@ replica-sync    Asks the IDE window that keeps the replica in sync with Overleaf
                 without looking for changed files: answer it, then run replica-sync again.
 replica-status  Shows whether the window is connected to Overleaf, how it watches the
                 folder, what it synced in the last 10 minutes, and the replica's git state:
-                the checked-out commit and Overleaf's state (refs/remotes/overleaf/main).
+                the checked-out commit and Overleaf's state (${OVERLEAF_REF}).
 --timeout <s>   how long to wait for the window's answer; default 300
 Exit status of both: 0 in sync (replica-status: the window answered); 3 a file could not
 be synced, has conflict markers, or waits for a deletion to be confirmed, listed; 4 an IDE
@@ -207,8 +208,8 @@ replica-connect Connects a development history with the replica's repository, fo
                 master) of --history, which it only reads, writes its commits again on top of
                 the project's state where the history started (from the project's history,
                 or --start-version), each with a Rewritten-from trailer, and merges them with
-                Overleaf's state as the replica recorded it (refs/remotes/overleaf/main). The
-                result is in refs/connect/merge, on top of the replica's checked-out commit;
+                Overleaf's state as the replica recorded it (${OVERLEAF_REF}). The
+                result is in ${CONNECT_REF}, on top of the replica's checked-out commit;
                 replica-land lands it, which uploads the files the history adds to the
                 project. It lists those files, and the project files the history changes. The
                 replica must be in sync: its checked-out commit is Overleaf's state. Running
@@ -409,7 +410,7 @@ async function replicaCommand(command: 'replica-sync' | 'replica-status', folder
         if (a.question) { lines.push(`${a.question.message}: ${a.question.paths.join(', ')}`); }
         if (a.git) {
             const g = a.git as { head?: string, overleaf?: string, branch?: string, unmerged?: string[] };
-            lines.push(`git: ${g.branch ?? 'detached HEAD'} at ${g.head?.slice(0, 7) ?? 'no commit'}, Overleaf's state (refs/remotes/overleaf/main) ${g.overleaf?.slice(0, 7) ?? 'not recorded yet'}${g.head && g.head === g.overleaf ? ', the same' : ''}${g.unmerged?.length ? `; conflicts to resolve in ${g.unmerged.join(', ')}` : ''}`);
+            lines.push(`git: ${g.branch ?? 'detached HEAD'} at ${g.head?.slice(0, 7) ?? 'no commit'}, Overleaf's state (${OVERLEAF_REF}) ${g.overleaf?.slice(0, 7) ?? 'not recorded yet'}${g.head && g.head === g.overleaf ? ', the same' : ''}${g.unmerged?.length ? `; conflicts to resolve in ${g.unmerged.join(', ')}` : ''}`);
         }
         if (a.summary) { lines.push(`this sync: ${describe(a.summary as SyncSummary)}`); }
         if (!answer.ok) { lines.push(`not in sync: ${answer.error}`); }
