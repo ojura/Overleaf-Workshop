@@ -1195,3 +1195,15 @@ describe('VirtualFileSystem: a folder moved or deleted on Overleaf', () => {
         assert.deepStrictEqual(t.paths(), ['/', '/parts']);
     });
 });
+
+describe('VirtualFileSystem.openFile', () => {
+    it('reads a joined doc from its copy, which the ops of others keep up to date, without a request to Overleaf', async () => {
+        const t = setup('hello');
+        assert.strictEqual(await t.open(), 'hello');
+        assert.strictEqual(t.server.joins, 1, 'the first read joins the doc');
+        await t.collaborator(5, ' world');
+        assert.strictEqual(await t.open(), 'hello world', 'the copy has the other client\'s op');
+        assert.strictEqual(await t.open(), 'hello world');
+        assert.deepStrictEqual([t.server.joins, t.server.historyReads], [1, 0], 'the later reads take the joined doc\'s copy');
+    });
+});

@@ -469,6 +469,13 @@ export class ReplicaSync {
      */
     private remoteMoves = new Map<string, string>();
     /**
+     * Binary files that a download read from Overleaf before the check right before its write
+     * stopped it (StaleReadError), with the hash that the project's tree gave them. The reconcile
+     * that runs again takes the content from here while the tree gives the same hash: each read
+     * of a binary file is a request to Overleaf (vfs.openFile), unlike a document's (`reported`).
+     */
+    private readBeforeRerun = new Map<string, {hash: string, content: Uint8Array}>();
+    /**
      * Renames made on Overleaf while the sync waited (`mayAct`), old path and new path, in their
      * order. The next full sync applies them before it compares the folder with Overleaf; their
      * paths stay in `remoteMoves` until then, so that no reconcile takes them for a deletion and
@@ -1104,30 +1111,38 @@ export class ReplicaSync {
      * stopped to wait for the sync (`SyncWaitsError`), undefined when it ran or failed. Work that
      * found git's lock or operation right before a write, over by then (`StaleReadError`), runs
      * again from its reads. Each attempt after the first comes after a lock or an operation of
-     * git's that has ended, so the work runs again only as often as git's commands came during it.
+     * git's that has ended, so the work runs again only as often as git's commands came during
+     * it, and its reads of Overleaf's side are local: a document's text comes from the copy of
+     * the joined document, which Overleaf's updates keep up to date (vfs.openFile, measured in
+     * writeFile.test.ts), and a binary file that the attempt before downloaded comes from
+     * `readBeforeRerun`.
      */
     private async reported(path: string, mode: Mode, work: () => Promise<void>): Promise<string | undefined> {
-        for (;;) {
-            try {
-                await work();
-                return undefined;
-            } catch (error) {
-                if (error instanceof StaleReadError) {
-                    // Every write of the work comes after a check, so what it decided before is not
-                    // carried out; only the copy that keepAside keeps before its download's check
-                    // stays, and keepAside logs where it is.
-                    this.ui.log(`${path}: ${error.message}`);
-                    continue;
+        try {
+            for (;;) {
+                try {
+                    await work();
+                    return undefined;
+                } catch (error) {
+                    if (error instanceof StaleReadError) {
+                        // Every write of the work comes after a check, so what it decided before is not
+                        // carried out; only the copy that keepAside keeps before its download's check
+                        // stays, and keepAside logs where it is.
+                        this.ui.log(`${path}: ${error.message}`);
+                        continue;
+                    }
+                    if (error instanceof SyncWaitsError) {
+                        // not a failure: the full sync after the wait takes the path in
+                        mode.summary.waitingFor ??= error.reason;
+                        return error.reason;
+                    }
+                    mode.summary.failed.push({path, error: errorText(error)});
+                    this.ui.log(`${path}: sync failed: ${errorText(error)}`);
+                    return undefined;
                 }
-                if (error instanceof SyncWaitsError) {
-                    // not a failure: the full sync after the wait takes the path in
-                    mode.summary.waitingFor ??= error.reason;
-                    return error.reason;
-                }
-                mode.summary.failed.push({path, error: errorText(error)});
-                this.ui.log(`${path}: sync failed: ${errorText(error)}`);
-                return undefined;
             }
+        } finally {
+            this.readBeforeRerun.delete(path);
         }
     }
 
@@ -1465,7 +1480,8 @@ export class ReplicaSync {
             content = encoder.encode(text);
             hash = textHash(text);
         } else {
-            content ??= await this.transfers.run(() => this.remote.readFile(path));
+            const kept = this.readBeforeRerun.get(path);
+            content ??= kept!==undefined && kept.hash===remote.hash ? kept.content : await this.transfers.run(() => this.remote.readFile(path));
             hash = gitBlobHash(content);
             if (remote.hash && hash!==remote.hash) {
                 throw new Error(`the downloaded content does not match the hash Overleaf reports (${hash} instead of ${remote.hash})`);
@@ -1474,7 +1490,12 @@ export class ReplicaSync {
         if (mode===undefined) {
             return content; // only needed for comparing
         }
-        await this.beforeWrite(mode);
+        try {
+            await this.beforeWrite(mode);
+        } catch (error) {
+            if (error instanceof StaleReadError && remote.kind==='file' && remote.hash!==undefined) { this.readBeforeRerun.set(path, {hash: remote.hash, content}); }
+            throw error;
+        }
         const stat = await this.local.write(path, content);
         await this.setEntry(path, {kind: remote.kind, base: hash, ...stat, checked: Date.now()}, 'remote', text, content);
         mode.summary.downloaded.push(path);

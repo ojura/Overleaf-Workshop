@@ -602,6 +602,31 @@ describe('ReplicaSync', () => {
             assert.strictEqual(t.local.text('/a.tex'), text, 'Overleaf\'s version is in place');
         });
 
+        it('reads a binary file from Overleaf once when git\'s lock at its download makes the reconcile run again', async () => {
+            const t = setup();
+            const store = new LockedStore();
+            store.lock = undefined;
+            t.remote.files.set('/a.png', png);
+            const sync = new ReplicaSync(t.remote, t.local, store, t.ui, (p: string) => p.endsWith('.aux'));
+            await sync.syncAll();
+            t.remote.calls.length = 0;
+            // Overleaf replaces the file; while the sync reads it, git takes its lock
+            t.remote.files.set('/a.png', png2);
+            const readFile = t.remote.readFile.bind(t.remote);
+            t.remote.readFile = async (path: string) => {
+                t.remote.readFile = readFile;
+                store.lock = '/replica/.git/index.lock';
+                return readFile(path);
+            };
+            const run = sync.syncAll();
+            await Promise.race([run, store.waitStarted]);
+            store.release();
+            await run;
+            assert.deepStrictEqual(t.local.files.get('/a.png')!.content, png2);
+            assert.strictEqual(t.remote.count('readFile'), 1, 'the reconcile that ran again took the file that it had read');
+            assert.ok(t.ui.logs.some(line => line.includes('reads both sides again')), 'it ran again');
+        });
+
         it('keeps what git writes into a file during the upload of its merge, at the merged text\'s local write', async () => {
             const t = await locked();
             t.store.lock = undefined;
