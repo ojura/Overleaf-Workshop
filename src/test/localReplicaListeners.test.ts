@@ -1,35 +1,20 @@
 /* eslint-disable @typescript-eslint/naming-convention -- the replica's class name, as the module exports it */
 import * as assert from 'assert';
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
-import { Uri, load, until, wait, world } from './replicaTestWorld';
+import { Cleanup, Uri, load, until, wait, world } from './replicaTestWorld';
 
 // The replica reads and writes its folder with Node's own functions, so these tests use a real
 // folder; the replicas start a control socket (src/scm/replicaControl.ts), kept out of the
 // user's runtime folder.
-let folder: string;
-let runtime: string;
-let savedRuntime: string | undefined;
-let triggers: { dispose(): void }[] = [];
-beforeEach(() => {
-    folder = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-replica-listeners-'));
-    runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-runtime-'));
-    fs.chmodSync(runtime, 0o700);
-    savedRuntime = process.env.XDG_RUNTIME_DIR;
-    process.env.XDG_RUNTIME_DIR = runtime;
-});
-afterEach(async () => {
-    triggers.forEach(trigger => trigger.dispose());
-    triggers = [];
-    await wait(50);
-    if (savedRuntime === undefined) { delete process.env.XDG_RUNTIME_DIR; } else { process.env.XDG_RUNTIME_DIR = savedRuntime; }
-    fs.rmSync(folder, { recursive: true, force: true });
-    fs.rmSync(runtime, { recursive: true, force: true });
-});
 
 describe('LocalReplicaSCMProvider when the first sync fails', () => {
+    const cleanup = new Cleanup();
+    afterEach(() => cleanup.undo());
+
     it('keeps its listeners, reports the failure and uploads later changes', async () => {
+        cleanup.privateRuntime();
+        const folder = cleanup.tempDir('ow-replica-listeners-');
         const t = world(folder, true);
         const warnings: string[] = [];
         t.mock.window.showWarningMessage = async (message: string) => { warnings.push(message); return undefined; };
@@ -38,7 +23,7 @@ describe('LocalReplicaSCMProvider when the first sync fails', () => {
         const { LocalReplicaSCMProvider } = load(t.mock);
         const scm = new LocalReplicaSCMProvider(t.vfs, Uri.file(folder));
 
-        triggers = await scm.triggers;
+        const triggers = await cleanup.start(scm);
         await until(() => warnings.length > 0);
         assert.ok(triggers.length > 2, 'the listeners are registered');
         assert.strictEqual(warnings.length, 1, 'the failure is reported once');
@@ -52,7 +37,12 @@ describe('LocalReplicaSCMProvider when the first sync fails', () => {
 });
 
 describe('LocalReplicaSCMProvider when a live sync fails', () => {
+    const cleanup = new Cleanup();
+    afterEach(() => cleanup.undo());
+
     it('says why, offers Sync Now, and keeps one such notice open at a time', async () => {
+        cleanup.privateRuntime();
+        const folder = cleanup.tempDir('ow-replica-listeners-');
         const t = world(folder, true);
         const warnings: string[] = [];
         const offered: string[][] = [];
@@ -66,7 +56,7 @@ describe('LocalReplicaSCMProvider when a live sync fails', () => {
         (t.vfs as any).createFile = async () => { throw new Error('Not connected to www.overleaf.com; reconnecting in the background.'); };
         const { LocalReplicaSCMProvider } = load(t.mock);
         const scm = new LocalReplicaSCMProvider(t.vfs, Uri.file(folder));
-        triggers = await scm.triggers;
+        await cleanup.start(scm);
         await wait(300);
         assert.deepStrictEqual(warnings, []);
 

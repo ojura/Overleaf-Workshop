@@ -1,40 +1,25 @@
 /* eslint-disable @typescript-eslint/naming-convention -- the replica's class name, as the module exports it */
 import * as assert from 'assert';
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
-import { Uri, load, until, wait, world } from './replicaTestWorld';
+import { POINTER_FILE } from '../scm/replicaControl';
+import { Cleanup, Uri, load, until, wait, world } from './replicaTestWorld';
 
 describe('a local replica that watches its folder itself', () => {
+    const cleanup = new Cleanup();
+    afterEach(() => cleanup.undo());
     let folder: string;
-    let runtime: string;
-    let savedRuntime: string | undefined;
-    let triggers: { dispose(): void }[] = [];
-
-    beforeEach(() => {
-        folder = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-replica-watch-'));
-        runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-runtime-'));
-        fs.chmodSync(runtime, 0o700);
-        savedRuntime = process.env.XDG_RUNTIME_DIR;
-        process.env.XDG_RUNTIME_DIR = runtime;
-    });
-    afterEach(async () => {
-        triggers.forEach(trigger => trigger.dispose());
-        triggers = [];
-        await wait(50);
-        if (savedRuntime === undefined) { delete process.env.XDG_RUNTIME_DIR; } else { process.env.XDG_RUNTIME_DIR = savedRuntime; }
-        fs.rmSync(folder, { recursive: true, force: true });
-        fs.rmSync(runtime, { recursive: true, force: true });
-    });
 
     async function start(syncOnFileChange: boolean) {
+        cleanup.privateRuntime();
+        folder = cleanup.tempDir('ow-replica-watch-');
         const t = world(folder, syncOnFileChange);
         t.w.remote.set('/main.tex', 'v1\n');
         const { LocalReplicaSCMProvider, requestReplica } = load(t.mock);
         const scm = new LocalReplicaSCMProvider(t.vfs, Uri.file(folder));
-        triggers = await scm.triggers;
-        await until(() => fs.existsSync(path.join(folder, 'main.tex'))); // the first sync downloads it
-        await wait(200);
+        await cleanup.start(scm);
+        await scm.syncNow(); // the first sync downloads main.tex, and its state is recorded
+        await cleanup.fileAppears(path.join(folder, POINTER_FILE)); // the control socket listens
         t.w.remoteWrites.length = 0;
         return { ...t, scm, requestReplica };
     }
