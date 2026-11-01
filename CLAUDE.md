@@ -46,7 +46,10 @@ window) are in CLAUDE.local.md, which git leaves out.
   (scripts/hidden-ide.sh).
 - Never print a secret's value: a session cookie, a CSRF token, or an API, git or messaging token.
   That rules out shell tracing (`set -x`, `bash -x`) in a command that expands one, dumps of an
-  environment with its values (`env`, `printenv`, `/proc/<pid>/environ`), and echoes through
-  `${VAR-...}` or `${VAR:-...}`, which print the value whenever the variable is set. Record
-  variable names, or a secret's length. What a command prints stays in the agent's transcript,
-  and the only remedy is to invalidate the secret.
+  environment with its values (`env`, `printenv`, `/proc/<pid>/environ`), echoes through
+  `${VAR-...}` or `${VAR:-...}`, which print the value whenever the variable is set, and the
+  command line of a process that takes a token as an option (`ps -o args`, `pgrep -a`,
+  `/proc/<pid>/cmdline`): Antigravity's agent hub, `agy --hub`, has its CSRF token there, and a
+  line cut short can still end inside the token. Record variable names, a secret's length, or a
+  process's pid and name. What a command prints stays in the agent's transcript, and the only
+  remedy is to invalidate the secret.
