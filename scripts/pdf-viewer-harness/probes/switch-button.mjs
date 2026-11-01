@@ -22,8 +22,8 @@ try {
     await page.evaluate(`${button}.click(); true`);
     await new Promise(r => setTimeout(r, 500));
     const sent = await page.evaluate(`harness.events.filter(e => e.type === 'switchViewer' || e.type === 'saveState').slice(-3)`);
-    // the stub records a message's type and content, not the engine that switchViewer names
-    check('a click sends the host a switchViewer message', sent.some(e => e.type === 'switchViewer'), JSON.stringify(sent));
+    const other = engine === 'overleaf' ? 'pdfjs' : 'overleaf';
+    check(`a click sends the host switchViewer to the ${other} viewer`, sent.some(e => e.type === 'switchViewer' && e.engine === other), JSON.stringify(sent));
 } catch (error) {
     check('run', false, String(error?.message ?? error));
 } finally {

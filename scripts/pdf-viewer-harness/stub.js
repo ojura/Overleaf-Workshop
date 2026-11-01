@@ -66,6 +66,10 @@
                 fetch('/bridge-abort', { method: 'POST', body: JSON.stringify({ id: message.id }) });
                 log('fetchAbort', { id: message.id });
                 break;
+            case 'switchViewer':
+                // the viewer that the page asks the host to show the PDF in
+                log('switchViewer', { engine: message.engine });
+                break;
             default:
                 log(message?.type ?? 'unknown', { content: message?.content });
         }
