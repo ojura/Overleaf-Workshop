@@ -22,11 +22,12 @@ export interface CompileSettings {
 /**
  * Whether a build compiled with `build` shows what this window compiles with `window`. These are
  * the checks Overleaf's editor makes before it shows a compile from its cache instead of compiling
- * (local-compile-context.tsx:402-425): the same main document; the same draft mode; and stopping on
- * the first error only if the window stops too, since a compile that passed while stopping on the
- * first error also passes without it, but not the other way round. Overleaf's editor also compares
- * png2pdf, which Overleaf's server decides for each user, so the window has no value of its own
- * to compare it with.
+ * (local-compile-context.tsx:402-425): the same main document; the same draft mode; and a build
+ * compiled without stopping on the first error only while the window does not stop either. A build
+ * that stopped on the first error is taken either way: a compile that passed while stopping on the
+ * first error also passes without it, but not the other way round (local-compile-context.tsx:
+ * 417-420). Overleaf's editor also compares png2pdf, which Overleaf's server decides for each user,
+ * so the window has no value of its own to compare it with.
  */
 export function sameSettings(build: CompileSettings, window: CompileSettings): boolean {
     return build.rootResourcePath === window.rootResourcePath
@@ -103,10 +104,12 @@ export function cachedBuild(response: CompileResponseSchema, answeredAt: number)
 /**
  * Overleaf's answer about the latest compile of the project by this user:
  *   build   a successful compile with output.pdf
- *   none    Overleaf answered, without a build to show: 404 when its cache has no compile, 410
- *           when the project changed after the latest one (ClsiCacheManager.mjs:52,108), or a
- *           compile stored without output.pdf, as Overleaf stores a standard-group user's
- *           compile (CLSICacheHandler.js:199-223)
+ *   none    Overleaf answered, without a build to show: 404 when its cache has no compile; 410
+ *           when the project changed after the latest one (ClsiCacheManager.mjs:52, 108), or
+ *           when the project's compiler or TeX Live image is not the cached compile's (141-143);
+ *           or an answer that lists no output.pdf. The cache does not keep the PDF of a
+ *           standard-group user's compile (CLSICacheHandler.js:197-224); whether Overleaf then
+ *           answers 404 or 200 without output.pdf does not show in its source, and both give none
  *   failed  the request failed, with the error
  */
 export type LatestAnswer =

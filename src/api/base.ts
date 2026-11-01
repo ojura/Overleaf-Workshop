@@ -898,7 +898,8 @@ export class BaseAPI {
      * use the cache (ol-canUseClsiCache), and shows that PDF instead of compiling when the
      * compile's settings match its own (local-compile-context.tsx:219-223, 383-425). Overleaf
      * answers 404 when the cache has no compile, and 410 when the project changed after the
-     * latest one (ClsiCacheController.getLatestBuildFromCache); the error's `status` says which.
+     * latest one, or when the project's compiler or TeX Live image is not the cached compile's
+     * (ClsiCacheManager.mjs:52, 108, 141-143); the error's `status` says which.
      */
     async getLatestCompileFromCache(identity:Identity, projectId:string) {
         this.setIdentity(identity);
