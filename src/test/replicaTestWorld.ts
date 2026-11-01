@@ -3,6 +3,7 @@
 // memory, a stand-in for the 'vscode' module, and the replica's modules loaded against it.
 import * as assert from 'assert';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { loadWithVscode } from './standIn';
 
@@ -170,6 +171,85 @@ export function load(mock: any) {
             VirtualFileSystem: require('../core/remoteFileSystemProvider').VirtualFileSystem,
         };
     });
+}
+
+/**
+ * What a test set up, undone after it in reverse order on every path, failures included: the test
+ * adds each resource as it makes it, and afterEach calls `undo`.
+ */
+export class Cleanup {
+    private steps: (() => void | Promise<void>)[] = [];
+
+    add(step: () => void | Promise<void>) { this.steps.push(step); }
+
+    /** Undo the step added last, now, e.g. to stop a replica before the next one starts. */
+    async undoLast() { await this.steps.pop()?.(); }
+
+    async undo() {
+        const steps = this.steps.reverse();
+        this.steps = [];
+        const errors: unknown[] = [];
+        for (const step of steps) {
+            try { await step(); } catch (error) { errors.push(error); }
+        }
+        if (errors.length) { throw errors[0]; }
+    }
+
+    tempDir(prefix: string): string {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+        this.add(() => fs.rmSync(dir, { recursive: true, force: true }));
+        return dir;
+    }
+
+    setEnv(key: string, value: string) {
+        const saved = process.env[key];
+        process.env[key] = value;
+        this.add(() => { if (saved === undefined) { delete process.env[key]; } else { process.env[key] = saved; } });
+    }
+
+    /** A socket folder and a trash of the test's own, so that the developer's stay untouched. */
+    privateRuntime(): { runtime: string, data: string } {
+        const runtime = this.tempDir('ow-runtime-');
+        fs.chmodSync(runtime, 0o700);
+        this.setEnv('XDG_RUNTIME_DIR', runtime);
+        const data = this.tempDir('ow-data-');
+        this.setEnv('XDG_DATA_HOME', data);
+        return { runtime, data };
+    }
+
+    /**
+     * Start the replica `scm` (a LocalReplicaSCMProvider) and add its stop: its listeners are
+     * disposed, and the stop of its sync, which saves the state into the folder, is awaited
+     * before the folder goes.
+     */
+    async start(scm: any): Promise<{ dispose(): void }[]> {
+        const triggers: { dispose(): void }[] = await scm.triggers;
+        this.add(async () => {
+            triggers.forEach(trigger => trigger.dispose());
+            await scm.sync?.stop();
+        });
+        return triggers;
+    }
+
+    /**
+     * Resolves once `holds()` is true: at once, or at the change in the folder `dir` that makes
+     * it so. Its watcher closes then, or at the end of the test.
+     */
+    folderShows(dir: string, holds: () => boolean): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const watcher = fs.watch(dir);
+            this.add(() => watcher.close());
+            const check = () => { if (holds()) { watcher.close(); resolve(); } };
+            watcher.on('change', check);
+            watcher.on('error', error => { watcher.close(); reject(error); });
+            check();
+        });
+    }
+
+    /** Resolves once `file` exists, e.g. the pointer file that the replica's control server writes once it listens. */
+    fileAppears(file: string): Promise<void> {
+        return this.folderShows(path.dirname(file), () => fs.existsSync(file));
+    }
 }
 
 export const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
