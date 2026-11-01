@@ -597,6 +597,10 @@ export class ReplicaSync {
      * stays from, undefined when the store does not tell its time or it is gone.
      */
     private async lockReason(file: string): Promise<{reason: string, stays: boolean, staysFrom?: number}> {
+        // The lock's age is this machine's clock against the file's modification time, which the
+        // file system's clock sets. On a network file system, the server's clock can differ from
+        // this machine's: a fresh lock can then look old, and be taken for one that stays at once,
+        // or an old lock young.
         const written = await this.store.indexLockTime?.(file);
         const staysFrom = written===undefined ? undefined : written + ReplicaSync.staleLockMs;
         if (staysFrom!==undefined && staysFrom<=Date.now()) {
