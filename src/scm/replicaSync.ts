@@ -189,6 +189,8 @@ export interface ReplicaStore {
     foreignIndexLock?(): Promise<string | undefined>,
     /** Resolves once the lock `file` is gone, at the event of its folder that removes it; `dispose` stops the watch before that. */
     indexLockReleased?(file: string): {released: Promise<void>, dispose(): void},
+    /** When the lock `file` was last written, its modification time in ms since the epoch; undefined once it is gone. */
+    indexLockTime?(file: string): Promise<number | undefined>,
 }
 
 export interface ReplicaUI {
@@ -209,6 +211,11 @@ export interface ReplicaUI {
     confirmCheckout?(head: string, overleaf: string): Promise<boolean>,
     /** The sync waits, and why (`reason`), or acts again after waiting (undefined). */
     waiting?(reason: string | undefined): void,
+    /**
+     * Another program's git index lock has been there for `ReplicaSync.staleLockMs` or longer, and
+     * the sync waits for its removal; `reason` names the file. Called once for each lock that stays.
+     */
+    lockStays?(reason: string): void,
 }
 
 export interface SyncSummary {
@@ -394,9 +401,11 @@ export class ReplicaSync {
     /** Record the state (the store's commits) once the sync has been idle this long. */
     static recordQuietMs = 10_000;
     /**
-     * Tell the user about git's index lock once a window step has waited for it this long: a git
-     * that ended without removing it, e.g. at a crash, never answers, so the time limit is the
-     * only sign of it. The step keeps waiting for the lock's removal.
+     * Another program's git index lock that has been there this long, counted from the time its
+     * file was last written (`ReplicaStore.indexLockTime`), is taken for one that stays: the
+     * window tells the user, and a tool's answer says so. A git that ended without removing its
+     * lock, e.g. at a crash, never answers, so the time limit is the only sign of it. The steps
+     * keep waiting for the lock's removal.
      */
     static staleLockMs = 10_000;
 
@@ -432,7 +441,7 @@ export class ReplicaSync {
     private readonly questionListeners = new Set<(question: Deletions) => void>();
     /** why the sync waits instead of acting on the folder (`mayAct`); undefined while it acts */
     private waitReason?: string;
-    /** the index lock of another program that the window's steps wait for (`indexLockReleased`), and what is told about it once it is stale */
+    /** the index lock of another program that the window's steps wait for (`indexLockReleased`), and why the sync waits once the lock stays (`lockReason`) */
     private lockWait?: {file: string, released: Promise<void>, stale?: string};
     /** resolves when the sync stops, so that a step waiting for git's index lock ends then */
     private readonly stopping: Promise<void>;
@@ -524,7 +533,7 @@ export class ReplicaSync {
         // again, without the full sync that ends a wait: the step itself goes on. A tool's request
         // answers at once that the sync waits.
         for (let lock = await this.store.foreignIndexLock?.(); lock!==undefined; lock = await this.store.foreignIndexLock?.()) {
-            if (by==='tool') { return `git holds its index lock ${lock}: it is writing the folder, e.g. for a checkout`; }
+            if (by==='tool') { return (await this.lockReason(lock)).reason; }
             await this.indexLockReleased(lock);
             if (this.stopped) { return 'the sync stopped'; }
         }
@@ -564,21 +573,49 @@ export class ReplicaSync {
     }
 
     /**
+     * Why the sync waits for another program's index lock `file`: a git command under way, or a
+     * lock that stays, one that has been there for `staleLockMs` or longer; and when the lock
+     * stays from, undefined when the store does not tell its time or it is gone.
+     */
+    private async lockReason(file: string): Promise<{reason: string, stays: boolean, staysFrom?: number}> {
+        const written = await this.store.indexLockTime?.(file);
+        const staysFrom = written===undefined ? undefined : written + ReplicaSync.staleLockMs;
+        if (staysFrom!==undefined && staysFrom<=Date.now()) {
+            return {reason: `git's index lock ${file} has been there for ${ReplicaSync.staleLockMs/1000} s or longer: a git command still runs in the folder, or one that ended without removing it left it, and git does not work there until it is removed`, stays: true, staysFrom};
+        }
+        return {reason: `git holds its index lock ${file}: it is writing the folder, e.g. for a checkout`, stays: false, staysFrom};
+    }
+
+    /**
      * Resolves once another program's index lock `file` is gone (the store's event), or the sync
-     * stops; the window's steps that wait for it share one wait. When the lock stays for
-     * `staleLockMs`, the user is told, with the file, as git itself tells; the steps keep waiting.
+     * stops; the window's steps that wait for it share one wait. When the lock stays
+     * (`lockReason`), the user is told, with the file, as git's own message about the lock names
+     * it; the steps keep waiting.
      */
     private indexLockReleased(file: string): Promise<void> {
         if (this.lockWait?.file===file) { return this.lockWait.released; }
         const watch = this.store.indexLockReleased!(file);
         const wait: {file: string, released: Promise<void>, stale?: string} = {file, released: Promise.resolve()};
-        const stale = setTimeout(() => {
-            wait.stale = `git's index lock ${file} has been there for ${ReplicaSync.staleLockMs/1000} s: a git command still runs in the folder, or one that ended without removing it left it, and git does not work there until it is removed`;
-            this.ui.log(`The sync waits: ${wait.stale}.`);
-            this.ui.waiting?.(wait.stale);
-        }, ReplicaSync.staleLockMs);
+        let over = false;
+        let timer: NodeJS.Timeout | undefined;
+        // Looked at again when the lock would stay by then: git may have replaced the lock with a
+        // newer one meanwhile, at the same path.
+        const look = async () => {
+            const {reason, stays, staysFrom} = await this.lockReason(file);
+            if (over || staysFrom===undefined) { return; }
+            if (!stays) {
+                timer = setTimeout(() => { look().catch(error => this.ui.log(`Looking at git's index lock ${file} failed: ${errorText(error)}`)); }, staysFrom - Date.now());
+                return;
+            }
+            wait.stale = reason;
+            this.ui.log(`The sync waits: ${reason}.`);
+            this.ui.waiting?.(reason);
+            this.ui.lockStays?.(reason);
+        };
+        look().catch(error => this.ui.log(`Looking at git's index lock ${file} failed: ${errorText(error)}`));
         wait.released = Promise.race([watch.released, this.stopping]).finally(() => {
-            clearTimeout(stale);
+            over = true;
+            clearTimeout(timer);
             watch.dispose();
             if (this.lockWait===wait) { this.lockWait = undefined; }
             if (wait.stale!==undefined) {

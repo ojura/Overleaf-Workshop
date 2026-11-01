@@ -503,6 +503,16 @@ export class GitReplicaStore implements ReplicaStore {
         return !this.git.writesIndex && await exists(file) ? file : undefined;
     }
 
+    /** When the lock `file` was last written: its modification time, in ms since the epoch; undefined once it is gone. */
+    async indexLockTime(file: string): Promise<number | undefined> {
+        try {
+            return (await fsp.stat(file)).mtimeMs;
+        } catch (error) {
+            if (isMissing(error)) { return undefined; }
+            throw error;
+        }
+    }
+
     /** Resolves once the lock `file` is gone: at once when it is, else at the event of its folder that removes it. */
     indexLockReleased(file: string): { released: Promise<void>, dispose(): void } {
         let watcher: fs.FSWatcher | undefined;
