@@ -70,13 +70,20 @@ export const SUN_PATH_BYTES: Readonly<Partial<Record<NodeJS.Platform, number>>> 
 /**
  * Why `socket` cannot be a socket's path on this system, or undefined when it fits or when
  * SUN_PATH_BYTES does not give this system's limit. Node would shorten such a path at listen and
- * at connect alike.
+ * at connect alike. The callers add what to shorten: the runtime folder of the program that
+ * computed the path.
  */
 function socketPathTooLong(socket: string): string | undefined {
     const field = ReplicaControlServer.sunPathBytes;
     if (field === undefined || Buffer.byteLength(socket) < field) { return undefined; }
-    return `the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), is longer than the ${field - 1} bytes that a socket's path may have on this system: set XDG_RUNTIME_DIR to a folder with a shorter path`;
+    return `the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), is longer than the ${field - 1} bytes that a socket's path may have on this system`;
 }
+
+/**
+ * What to do about a socket path that a window computed: its runtime folder comes from the IDE's
+ * environment, also when a tool shows the window's reason in another shell.
+ */
+const SHORTER_WINDOW_RUNTIME = 'start the IDE with XDG_RUNTIME_DIR set to a folder with a shorter path';
 
 /**
  * Whether a socket is at `socket`, which a server listens on. Node shortens a socket path that is
@@ -134,7 +141,7 @@ export class ReplicaControlServer {
         const socket = replicaSocketPath(this.folder);
         try {
             const tooLong = socketPathTooLong(socket);
-            if (tooLong) { return this.cannotListen(tooLong); }
+            if (tooLong) { return this.cannotListen(`${tooLong}: ${SHORTER_WINDOW_RUNTIME}`); }
             const problem = prepareSocketFolder(socket);
             if (problem) {
                 this.log(`Tools cannot ask for a sync: ${problem}.`);
@@ -155,7 +162,7 @@ export class ReplicaControlServer {
                 if (!error && process.platform !== 'win32' && !socketIsThere(socket)) {
                     // closing the server removes the socket at the shortened path
                     await new Promise<void>(resolve => server.close(() => resolve()));
-                    return this.cannotListen(`Node shortened the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), as a socket's path must be shorter: set XDG_RUNTIME_DIR to a folder with a shorter path`);
+                    return this.cannotListen(`Node shortened the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), as a socket's path must be shorter: ${SHORTER_WINDOW_RUNTIME}`);
                 }
                 if (!error) {
                     server.unref(); // the window lives on its own; a tool's process need not wait for the socket
@@ -260,15 +267,20 @@ export class ReplicaTimeoutError extends Error {}
 
 /** The socket a program should use for `folder`: the one the window named, else the computed one. */
 export function findReplicaSocket(folder: string): string {
+    return locateReplicaSocket(folder).socket;
+}
+
+/** findReplicaSocket's socket, and whether the window named it in the pointer file. */
+function locateReplicaSocket(folder: string): { socket: string, named: boolean } {
     let pointer: any;
     try {
         pointer = JSON.parse(fs.readFileSync(path.join(folder, POINTER_FILE), 'utf8'));
     } catch { /* the pointer file is missing, or it is not JSON */ }
-    if (typeof pointer?.socket === 'string') { return pointer.socket; }
+    if (typeof pointer?.socket === 'string') { return { socket: pointer.socket, named: true }; }
     if (typeof pointer?.error === 'string' && writerRuns(pointer)) {
         throw new ReplicaUnreachableError(`the IDE window that keeps ${folder} in sync cannot answer tools: ${pointer.error}`);
     }
-    return replicaSocketPath(folder);
+    return { socket: replicaSocketPath(folder), named: false };
 }
 
 /**
@@ -315,15 +327,23 @@ function processStartTime(pid: number): number | undefined {
 
 /** Send one request to the window that keeps `folder` in sync and wait for its answer. */
 export function requestReplica(folder: string, request: ControlRequest, timeoutMs: number): Promise<ControlAnswer> {
-    let socket: string;
+    let located: { socket: string, named: boolean };
     try {
-        socket = findReplicaSocket(folder);
+        located = locateReplicaSocket(folder);
     } catch (error) {
         return Promise.reject(error);
     }
+    const socket = located.socket;
     // Node would connect to the shortened path, where another program can listen
     const tooLong = socketPathTooLong(socket);
-    if (tooLong) { return Promise.reject(new ReplicaUnreachableError(`tools cannot reach an IDE window for ${folder}: ${tooLong}`)); }
+    if (tooLong) {
+        // A window that named such a path computed it, e.g. a window of an earlier version, which
+        // listened at the shortened path: the window's runtime folder is the one to shorten.
+        const advice = located.named
+            ? `; the IDE window named it in ${path.join(folder, POINTER_FILE)}, so ${SHORTER_WINDOW_RUNTIME}`
+            : ': set XDG_RUNTIME_DIR to a folder with a shorter path';
+        return Promise.reject(new ReplicaUnreachableError(`tools cannot reach an IDE window for ${folder}: ${tooLong}${advice}`));
+    }
     return new Promise((resolve, reject) => {
         let buffer = '';
         let settled = false;

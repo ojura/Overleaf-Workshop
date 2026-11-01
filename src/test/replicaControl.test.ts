@@ -81,7 +81,7 @@ describe('the control socket of a local replica', () => {
         const shortened = Buffer.from(socket).subarray(0, sunPath).toString();
         fs.writeFileSync(shortened, 'a file of another program');
         assert.strictEqual(await serve(async () => ({ ok: true })).start(), undefined, 'the server does not listen');
-        const reason = `the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), is longer than the ${sunPath - 1} bytes that a socket's path may have on this system: set XDG_RUNTIME_DIR to a folder with a shorter path`;
+        const reason = `the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), is longer than the ${sunPath - 1} bytes that a socket's path may have on this system: start the IDE with XDG_RUNTIME_DIR set to a folder with a shorter path`;
         assert.deepStrictEqual(logs, [`Tools cannot ask for a sync: ${reason}.`], 'the log');
         await assert.rejects(requestReplica(folder, { op: 'status' }, 5000),
             (error: Error) => error instanceof ReplicaUnreachableError && error.message === `the IDE window that keeps ${folder} in sync cannot answer tools: ${reason}`,
@@ -119,6 +119,22 @@ describe('the control socket of a local replica', () => {
         }
     });
 
+    it('tells the user to shorten the window\'s runtime folder when the path that is too long comes from the window\'s pointer', async function () {
+        const sunPath = SUN_PATH_BYTES[process.platform];
+        if (sunPath === undefined) { this.skip(); }
+        // a window of an earlier version listened at the shortened path, and named the long one in its pointer
+        longRuntime();
+        const named = replicaSocketPath(folder);
+        fs.mkdirSync(path.join(folder, '.overleaf'));
+        fs.writeFileSync(path.join(folder, POINTER_FILE), JSON.stringify({ socket: named, pid: process.pid, since: new Date().toISOString() }));
+        // the tool's own runtime folder is short
+        process.env.XDG_RUNTIME_DIR = runtime;
+        const reason = `the path of the control socket, ${named} (${Buffer.byteLength(named)} bytes), is longer than the ${sunPath - 1} bytes that a socket's path may have on this system; the IDE window named it in ${path.join(folder, POINTER_FILE)}, so start the IDE with XDG_RUNTIME_DIR set to a folder with a shorter path`;
+        await assert.rejects(requestReplica(folder, { op: 'status' }, 5000),
+            (error: Error) => error instanceof ReplicaUnreachableError && error.message === `tools cannot reach an IDE window for ${folder}: ${reason}`,
+            'a tool\'s answer');
+    });
+
     it('listens on a socket path as long as the system allows, and not on one a byte longer', async function () {
         const sunPath = SUN_PATH_BYTES[process.platform];
         if (sunPath === undefined) { this.skip(); }
@@ -152,7 +168,7 @@ describe('the control socket of a local replica', () => {
             const long = longRuntime();
             const socket = replicaSocketPath(folder);
             assert.strictEqual(await serve(async () => ({ ok: true })).start(), undefined, 'the server does not listen');
-            const reason = `Node shortened the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), as a socket's path must be shorter: set XDG_RUNTIME_DIR to a folder with a shorter path`;
+            const reason = `Node shortened the path of the control socket, ${socket} (${Buffer.byteLength(socket)} bytes), as a socket's path must be shorter: start the IDE with XDG_RUNTIME_DIR set to a folder with a shorter path`;
             assert.deepStrictEqual(logs, [`Tools cannot ask for a sync: ${reason}.`], 'the log');
             await assert.rejects(requestReplica(folder, { op: 'status' }, 5000),
                 (error: Error) => error instanceof ReplicaUnreachableError && error.message === `the IDE window that keeps ${folder} in sync cannot answer tools: ${reason}`,
