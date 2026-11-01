@@ -78,9 +78,10 @@ for state in $states; do
             check_state shown ;;
         frozen)
             "$ide" freeze > /dev/null || { echo "FAIL: could not freeze the page; the remaining states do not run"; exit 1; }
-            # freeze records the frozen state, and probe reports it without asking the frozen page
-            [ "$("$ide" field frozen)" = true ] || { echo "FAIL: the record does not say frozen after freeze"; exit 1; }
-            echo "frozen: $("$ide" probe)"
+            # probe asks the page: a frozen page does not run tasks
+            probe=$("$ide" probe) || { echo "FAIL: probe failed after freeze"; exit 1; }
+            echo "frozen: $probe"
+            node -e 'process.exit(JSON.parse(process.argv[1]).frozen === true ? 0 : 1)' "$probe" || { echo "FAIL: the page still runs tasks after freeze"; exit 1; }
             check_state frozen
             "$ide" thaw > /dev/null || { echo "FAIL: could not thaw the page (see above); the remaining states do not run"; exit 1; }
             echo "thawed: $("$ide" probe)" ;;

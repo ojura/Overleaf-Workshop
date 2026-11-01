@@ -13,12 +13,16 @@
 //                                             minimize does not take effect there, and hide is
 //                                             what puts the window in the background
 //   scripts/hidden-ide.sh probe               the window's page: visible? focused? drawing? A
-//                                             page that freeze froze is not asked, since it does
-//                                             not run scripts: the probe says {"frozen": true}
-//   scripts/hidden-ide.sh freeze | thaw       freeze the page, or make it active again, and record
-//                                             it in the record's field frozen; thaw also hides and
-//                                             shows a shown window, so that the page is visible
-//                                             and draws again
+//                                             page that does not run a task within 2 s, as a page
+//                                             that freeze froze, makes the probe say
+//                                             {"frozen": true}. When the page and the record's field
+//                                             frozen disagree, as after a reload of a frozen page,
+//                                             the probe adds the record's value as "recorded"
+//   scripts/hidden-ide.sh freeze | thaw       freeze the page, or make it active again, check that
+//                                             it stopped or started running tasks, and record that
+//                                             in the record's field frozen; thaw also hides and
+//                                             shows a shown window, so that the page is visible and
+//                                             draws again
 //   scripts/hidden-ide.sh screenshot FILE.png [WIDTH HEIGHT]
 //                                             the window's page as an image, laid out at
 //                                             WIDTH x HEIGHT if given (on the virtual display,
@@ -130,6 +134,13 @@ const DISPLAY_LIMIT_MS = 30000;
  * that DevTools froze outside freeze, which does not run scripts. Exit status 2 reports it.
  */
 const ANSWER_LIMIT_MS = 15000;
+/**
+ * How long freeze, thaw and probe wait for the workbench page to run a task before they take it as
+ * frozen (pageRunsTasks). A page that DevTools froze does not run the tasks of its queues, and one
+ * that runs them, shown or hidden, runs one within milliseconds; a page that has not run the task
+ * within this time is what "frozen" means here.
+ */
+const FROZEN_LIMIT_MS = 2000;
 /** The last resort for an IDE, or an X server, that does not end after SIGTERM. */
 const STOP_LIMIT_S = 30;
 /** The first display that start tries when it is not given one. */
@@ -660,7 +671,35 @@ const WINDOW_STATE = 'return { visible: w.isVisible(), minimized: w.isMinimized(
 /** Set the page's lifecycle state ('frozen' or 'active') and record it in the field frozen. */
 async function setLifecycle(instance, state) {
     await withPage(instance, 'Page.setWebLifecycleState', (page) => page.send('Page.setWebLifecycleState', { state }));
+    const runs = await pageRunsTasks(instance);
+    if (runs !== (state === 'active')) {
+        throw new Error(`after Page.setWebLifecycleState ${state}, the page ${runs ? 'still runs tasks' : `has not run a task within ${FROZEN_LIMIT_MS / 1000} s`}`);
+    }
     writeInstance(instance.home, { ...readInstance(instance.home), frozen: state === 'frozen' });
+}
+
+/**
+ * Whether the instance's workbench page runs a task within FROZEN_LIMIT_MS: a message that it posts
+ * to itself through a MessageChannel arrives. A page that DevTools froze still runs DevTools' own
+ * evaluations, so an evaluation that needs nothing else answers there too, but it does not run the
+ * tasks of its queues, timers and messages among them. Measured on the instance: the message
+ * arrived within 1 to 15 ms in a shown page, a hidden one and one made active again, and within 3 s
+ * on the frozen page it did not, while an evaluation without it answered there after 1.6 s.
+ * Messages are not throttled in hidden pages, as timers are.
+ */
+async function pageRunsTasks(instance) {
+    const browser = await connectWindow(instance);
+    try {
+        const page = await browser.attach((await workbenchTarget(browser)).targetId);
+        await answerWithin(browser, 'the workbench page', FROZEN_LIMIT_MS, () => evaluate(page,
+            'new Promise((resolve) => { const channel = new MessageChannel(); channel.port1.onmessage = () => resolve(true); channel.port2.postMessage(0); })'));
+        return true;
+    } catch (error) {
+        if (error instanceof WaitLimitError) { return false; }
+        throw error;
+    } finally {
+        browser.close();
+    }
 }
 
 const commands = {
@@ -698,14 +737,17 @@ const commands = {
     },
     async probe() {
         const instance = runningInstance();
-        if (instance.frozen) {
-            console.log(JSON.stringify({ frozen: true }));
+        // the record's frozen field, when the page does not agree with it
+        const recorded = (frozen) => (frozen === Boolean(instance.frozen) ? {} : { recorded: { frozen: Boolean(instance.frozen) } });
+        if (!(await pageRunsTasks(instance))) {
+            console.log(JSON.stringify({ frozen: true, ...recorded(true) }));
             return;
         }
-        console.log(JSON.stringify(await withPage(instance, 'probe', (page) => evaluate(page, `(async () => {
+        const state = await withPage(instance, 'probe', (page) => evaluate(page, `(async () => {
             const draws = await ${drawsExpression};
             return { frozen: false, visibility: document.visibilityState, focus: document.hasFocus(), draws };
-        })()`))));
+        })()`));
+        console.log(JSON.stringify({ ...state, ...recorded(false) }));
     },
     async freeze() {
         await setLifecycle(runningInstance(), 'frozen');
