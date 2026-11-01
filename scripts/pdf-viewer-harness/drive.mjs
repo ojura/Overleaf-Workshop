@@ -168,7 +168,7 @@ try {
     }
     // back to a build in ranges
     await page.evaluate(`harness.load('a'); true`);
-    await page.waitFor(`${VIEWER}.pdfDocument && ${VIEWER}.pagesCount === ${facts.pages}${engine === 'overleaf' ? ` && ${OVERLEAF_DOCUMENTS}.inFlight === undefined` : ''}`, 60000);
+    await page.waitFor(`${VIEWER}.pdfDocument && ${VIEWER}.pagesCount === ${facts.pages}${engine === 'overleaf' ? ` && !${OVERLEAF_DOCUMENTS}.loading` : ''}`, 60000);
 
     // 5. SyncTeX from the source: a highlight on page 30
     await page.evaluate(`harness.syncCode([{ page: 30, h: 72, v: 110, width: 320, height: 14 }]); true`);

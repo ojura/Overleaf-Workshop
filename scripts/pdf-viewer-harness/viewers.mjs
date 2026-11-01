@@ -85,7 +85,21 @@ export const ANY_VIEWER = `(${ENGINES.map(viewerIfAny).join(' ?? ')})`;
 /** Which viewer a page runs: an expression that gives its name in ENGINES, or undefined while the page has not made its viewer. */
 export const ENGINE_OF_PAGE = `(${ENGINES.map(engine => `window.${pageOf(engine).global} ? ${JSON.stringify(engine)} : `).join('')}undefined)`;
 
-/** The Overleaf viewer's documents (views/pdf-viewer/src/overleaf/documents.ts): owned, inFlight, shownUrl. */
+/**
+ * The line above the PDF about its build (views/pdf-viewer/src/common/banner.ts): an expression for
+ * its element, null while the page shows none. Its data-state names the build's state, and its
+ * buttons what the line offers, as Recompile.
+ */
+export const BANNER = `document.getElementById('viewer-banner')`;
+
+/** The build that the page shows, which banner.ts writes into the page's data-shown-build: an expression. */
+export const SHOWN_BUILD = 'document.documentElement.dataset.shownBuild';
+
+/**
+ * The Overleaf viewer's documents (views/pdf-viewer/src/overleaf/documents.ts): `loading`, whether
+ * a load is under way, and `owned`, a private field with the worker of each document, which the
+ * checks of destroyed documents count.
+ */
 export const OVERLEAF_DOCUMENTS = 'window.overleafViewer.documents';
 
 /**

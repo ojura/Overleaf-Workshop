@@ -34,7 +34,7 @@ try {
     if (steps.includes('load')) {
         const build = steps.includes('update') ? 'a' : 'b';
         await page.evaluate(`window.__old = ${V}.pdfDocument; harness.load('${build}'); true`);
-        await page.waitFor(`${V}.pdfDocument !== window.__old && ${OVERLEAF_DOCUMENTS}.inFlight === undefined`, 60000);
+        await page.waitFor(`${V}.pdfDocument !== window.__old && !${OVERLEAF_DOCUMENTS}.loading`, 60000);
         console.log(`after load ${build}, current`, await page.evaluate(`${V}.currentPageNumber`), await states('1,2'));
     }
     if (steps.includes('sync')) {
