@@ -13,6 +13,7 @@ import { acquireLock, HeldLock, LockOwner } from './lock';
 import { LocalFile, overleafText, Plan, planSync, RemoteTree } from './plan';
 import { mapLimit } from './mapLimit';
 import type { CompileResult, JoinedProject, OverleafClient } from './client';
+import { errorMessage } from '../utils/errorMessage';
 
 export type Logger = (message: string) => void;
 
@@ -33,7 +34,7 @@ export function readReplica(folder: string): Replica {
     try {
         settings = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch (error: any) {
-        throw new Error(`${folder} is not a local replica: cannot read ${file}: ${error?.message ?? error}`);
+        throw new Error(`${folder} is not a local replica: cannot read ${file}: ${errorMessage(error)}`);
     }
     // e.g. overleaf-workshop://www.overleaf.com/Name?user%3D<id>%26project%3D<id>
     const uri = new URL(settings.uri);
@@ -85,7 +86,7 @@ export function readRecord(folder: string): SandboxRecord | undefined {
         return JSON.parse(fs.readFileSync(recordFile(folder), 'utf8'));
     } catch (error: any) {
         if (error?.code === 'ENOENT') { return undefined; }
-        throw new Error(`cannot read ${recordFile(folder)}: ${error?.message ?? error}`);
+        throw new Error(`cannot read ${recordFile(folder)}: ${errorMessage(error)}`);
     }
 }
 
@@ -574,7 +575,7 @@ export async function runCompile(client: OverleafClient, replica: Replica, userI
                 await fsp.writeFile(target, content);
                 saved.push({ path: file.path, bytes: content.byteLength });
             } catch (error: any) {
-                failed.push({ path: file.path, error: String(error?.message ?? error) });
+                failed.push({ path: file.path, error: errorMessage(error) });
             }
         }));
         saved.sort((a, b) => a.path.localeCompare(b.path));
@@ -591,8 +592,8 @@ export async function runCompile(client: OverleafClient, replica: Replica, userI
         summary.checks = guarded.checks;
         return { summary, out, status: response.status };
     } catch (error: any) {
-        summary.error = String(error?.message ?? error);
-        throw Object.assign(error instanceof Error ? error : new Error(String(error)), { summary, out: outReady ? out : undefined });
+        summary.error = errorMessage(error);
+        throw Object.assign(error instanceof Error ? error : new Error(errorMessage(error)), { summary, out: outReady ? out : undefined });
     } finally {
         timings.total = Date.now() - started;
         summary.finishedAt = new Date().toISOString();

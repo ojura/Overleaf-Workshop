@@ -1,4 +1,5 @@
 import type { BuildState, BuildStatus } from './protocol';
+import { errorMessage } from './errorMessage';
 import { post } from './host';
 
 /**
@@ -122,7 +123,7 @@ export function documentShown(build: string | undefined) {
 export function showLoadError(error: any, build: string | undefined) {
     const missing = error?.missing === true || error?.name === 'MissingPDFException';
     if (!missing || build === undefined) {
-        showState('failed', error === undefined ? undefined : String(error?.message ?? error));
+        showState('failed', error === undefined ? undefined : errorMessage(error));
         return;
     }
     showState('gone');

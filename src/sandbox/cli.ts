@@ -23,6 +23,7 @@ import { addBridgeRemote, rangesCheck } from '../gitbridge/overleaf';
 import { connectReplica, CONNECT_REF } from '../scm/replicaConnect';
 import { OVERLEAF_REF } from '../scm/replicaGit';
 import { BaseAPI } from '../api/base';
+import { errorMessage } from '../utils/errorMessage';
 import {
     createSandbox, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions, SANDBOX_RECORD_FILE,
     SANDBOX_RUN_LOG_FILE, sandboxStatus, sandboxUrl, settingsOf,
@@ -734,7 +735,7 @@ if (require.main === module) {
                 process.exit(2);
             }
             const kind = error instanceof SandboxSafetyError ? 'refused' : error instanceof LockTimeoutError ? 'lock' : 'error';
-            process.stderr.write(`${kind}: ${error?.message ?? error}\n`);
+            process.stderr.write(`${kind}: ${errorMessage(error)}\n`);
             process.exit(1);
         });
 }

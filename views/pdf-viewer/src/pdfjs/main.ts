@@ -16,6 +16,7 @@ import PDFJSWrapper from '@/features/pdf-preview/util/pdf-js-wrapper';
 import { bridgeOutputsOf } from '../common/bridge';
 import { config } from '../common/config';
 import { documentShown, showBuildState, showLoadError, showState } from '../common/banner';
+import { errorMessage } from '../common/errorMessage';
 import { onMessage, post, ready, savedState, saveState } from '../common/host';
 import type { InitState } from '../common/host';
 import { toPdfFile } from '../common/output';
@@ -464,5 +465,5 @@ async function start() {
 
 start().catch((error) => {
     console.error('pdf viewer:', error);
-    showState('failed', error?.message ?? String(error));
+    showState('failed', errorMessage(error));
 });

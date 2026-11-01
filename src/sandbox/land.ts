@@ -10,6 +10,7 @@ import { OVERLEAF_REF, REPLICA_FOLDER_IN_GIT_DIR } from '../scm/replicaGit';
 import { BuildCheck, checkBuild } from './buildCheck';
 import type { CompileResult, JoinedProject } from './client';
 import type { ProjectRanges } from './ranges';
+import { errorMessage } from '../utils/errorMessage';
 
 /*
  * Landing a commit of a local replica's repository in its Overleaf project (replica-land):
@@ -186,7 +187,7 @@ export async function compileProject(client: LandClient, projectId: string, join
         try {
             fs.writeFileSync(path.join(dir, file.path), await client.outputFile(file, response));
         } catch (error: any) {
-            log(`could not save ${file.path}: ${error?.message ?? error}`);
+            log(`could not save ${file.path}: ${errorMessage(error)}`);
         }
     }
     fs.writeFileSync(path.join(dir, 'compile-response.json'), JSON.stringify(response, null, 2) + '\n');
