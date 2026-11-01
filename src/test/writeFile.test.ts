@@ -275,7 +275,8 @@ function setup(initialContent: string) {
 
     const doc: any = { _id: 'doc1', name: 'main.tex' };
     const uri: any = { path: '/test/main.tex', toString: () => 'overleaf-workshop://test/main.tex' };
-    const editor = { isDirty: false, uri };
+    /** the editor open on the doc; `text` is what it shows, for the tests that take VS Code's part (see reloadOnNotice) */
+    const editor = { isDirty: false, uri, text: '' };
     vscodeMock.workspace.textDocuments = [editor];
     notices.shown = [];
     notices.choices = [];
@@ -320,6 +321,45 @@ function setup(initialContent: string) {
             vfs.previousRoot = vfs.root;
             vfs.root = undefined;
         },
+        /**
+         * Take VS Code's part from here on: a change notice for the doc (notify) makes VS Code
+         * read the doc again for an editor without unsaved changes, and the editor shows what it
+         * read (`editor.text`). `asked` counts the notices that the file system asked for with
+         * notifyChanged, which sends each 10 ms later. `reloaded` resolves once each of them has
+         * arrived and the reads they caused have ended, including the notices that those reads
+         * asked for, and at once when none was asked for.
+         */
+        reloadOnNotice: () => {
+            let asked = 0;
+            let arrived = 0;
+            let reloads: Promise<void>[] = [];
+            const waiting: Array<() => void> = [];
+            const notifyChanged = vfs.notifyChanged;
+            vfs.notifyChanged = function (this: any, changed: any) {
+                asked += 1;
+                return notifyChanged.call(this, changed);
+            };
+            vfs.notify = (events: any[]) => {
+                for (const event of events) {
+                    if (event.type !== vscodeMock.FileChangeType.Changed || event.uri.toString() !== uri.toString()) { continue; }
+                    arrived += 1;
+                    if (!editor.isDirty) { reloads.push(t.open().then((text) => { editor.text = text; })); }
+                }
+                waiting.splice(0).forEach(resolve => resolve());
+            };
+            return {
+                asked: () => asked,
+                reloaded: async () => {
+                    for (;;) {
+                        while (arrived < asked) { await new Promise<void>(resolve => waiting.push(resolve)); }
+                        const pending = reloads;
+                        reloads = [];
+                        if (pending.length === 0) { return; }
+                        await Promise.all(pending);
+                    }
+                },
+            };
+        },
     };
     harnesses.push(t);
     return t;
@@ -330,6 +370,23 @@ const harnesses: Array<{ vfs: any }> = [];
 afterEach(() => {
     for (const t of harnesses.splice(0)) { t.vfs.answersLost?.('the test ended'); }
 });
+
+/**
+ * The local replica writes `text`, and Overleaf's answer does not come within the last-resort
+ * limit (updateAnswerLimitMs, 1 ms here): the write fails without a reconnect, as at the 45 s
+ * limit in the IDE. A lost callback is not that case in the IDE: the emit times out, the
+ * connection is renewed (SocketIOAPI's onConnectionProblem), and joined() tells the IDE about
+ * every doc.
+ */
+async function replicaWriteUnanswered(t: { vfs: any, uri: any }, text: string) {
+    const limit = VirtualFileSystem.updateAnswerLimitMs;
+    VirtualFileSystem.updateAnswerLimitMs = 1;
+    try {
+        await assert.rejects(t.vfs.writeDoc(t.uri, new TextEncoder().encode(text)), /Overleaf did not answer within/);
+    } finally {
+        VirtualFileSystem.updateAnswerLimitMs = limit;
+    }
+}
 
 /** settled() rejected, naming main.tex for a reason that matches `reason` */
 const namesMainTex = (reason: RegExp) => (error: any) => {
@@ -787,9 +844,8 @@ describe('VirtualFileSystem: a history read that Overleaf refuses, and the reaso
     it('keeps an outcome it cannot determine while an editor is open on the doc, so that the editor\'s save does not delete others\' edits (S1)', async () => {
         const t = setup('hello');
         await t.open();                           // the editor shows 'hello'
-        t.server.neverApply = true;               // the replica's write is queued and not applied, and its callback is lost
-        t.server.loseNextCallback = () => {};
-        await assert.rejects(t.vfs.writeDoc(t.uri, new TextEncoder().encode('hello a')), /has not confirmed/);
+        t.server.neverApply = true;               // the replica's write is queued and not applied
+        await replicaWriteUnanswered(t, 'hello a');
         t.server.neverApply = false;
         await t.collaborator(0, '# ');            // the copy was dropped: the open editor is not told
         t.server.refuseHistory = 'Something went wrong in real-time service';
@@ -811,6 +867,85 @@ describe('VirtualFileSystem: a history read that Overleaf refuses, and the reaso
             assert.ok(!error.message.includes('/test/main.tex'), error.message);
             return true;
         });
+    });
+});
+
+// After a write fails without a reconnect (see replicaWriteUnanswered), the file system drops its
+// copy of the doc and does not apply the ops of others to it, so an editor without unsaved
+// changes is not told about them. Once the write is settled, the doc's base is the write's
+// content, or the text that a reader read (see takeRead), also when another reader read it: the
+// local replica, an intellisense provider, the compile manager. The editor has to reload
+// Overleaf's text then, or its next save deletes what it does not show. Each test also checks
+// that the editor's reload reads the doc without asking for another notice.
+describe('VirtualFileSystem: an editor without unsaved changes, once a write that Overleaf has not confirmed is settled (S2)', () => {
+    it('tells the editor to reload when another reader\'s read finds the local replica\'s write applied', async () => {
+        const t = setup('hello');
+        const ide = t.reloadOnNotice();
+        t.editor.text = await t.open();           // the editor shows 'hello'
+        t.server.holdAnswers = true;              // the replica's write is applied, and the answer does not come
+        await replicaWriteUnanswered(t, 'hello a');
+        t.server.holdAnswers = false;
+        await t.collaborator(0, '# ');            // the copy was dropped: the editor is not told
+        assert.strictEqual(await t.open(), '# hello a');   // another reader, e.g. the replica's next scan
+        await ide.reloaded();
+        const asked = ide.asked();
+        t.editor.isDirty = true;                  // the user types in the editor, and saves
+        await t.save(`${t.editor.text} z`);
+        assert.strictEqual(t.server.content, '# hello a z');
+        assert.strictEqual(asked, 1);
+    });
+
+    it('tells the editor to reload when settled() finds the local replica\'s write applied', async () => {
+        const t = setup('hello');
+        const ide = t.reloadOnNotice();
+        t.editor.text = await t.open();
+        t.server.holdAnswers = true;
+        await replicaWriteUnanswered(t, 'hello a');
+        t.server.holdAnswers = false;
+        await t.collaborator(0, '# ');
+        await t.vfs.documentUpdatesSettled();     // the replica's write is the doc's base now
+        await ide.reloaded();
+        const asked = ide.asked();
+        t.editor.isDirty = true;
+        await t.save(`${t.editor.text} z`);
+        assert.strictEqual(t.server.content, '# hello a z');
+        assert.strictEqual(asked, 1);
+    });
+
+    it('tells the editor to reload when another reader\'s read finds that Overleaf did not apply the local replica\'s write and now refuses it as too old', async () => {
+        const t = setup('hello');
+        const ide = t.reloadOnNotice();
+        t.editor.text = await t.open();
+        t.server.neverApply = true;               // the replica's write is queued and not applied
+        await replicaWriteUnanswered(t, 'hello a');
+        t.server.neverApply = false;
+        for (let i = 0; i < 81; i++) { await t.collaborator(0, 'x'); }
+        assert.strictEqual(await t.open(), `${'x'.repeat(81)}hello`);
+        await ide.reloaded();
+        const asked = ide.asked();
+        t.editor.isDirty = true;
+        await t.save(`${t.editor.text} z`);
+        assert.strictEqual(t.server.content, `${'x'.repeat(81)}hello z`);
+        assert.strictEqual(asked, 1);
+    });
+
+    it('tells the editor to reload when another reader\'s read ends an outcome it cannot determine, and only for that read', async () => {
+        const t = setup('hello');
+        const ide = t.reloadOnNotice();
+        t.editor.text = await t.open();
+        t.server.neverApply = true;
+        await replicaWriteUnanswered(t, 'hello a');
+        t.server.neverApply = false;
+        await t.collaborator(0, '# ');
+        t.server.refuseHistory = 'Something went wrong in real-time service';
+        assert.strictEqual(await t.open(), '# hello');     // Overleaf's text is the base again (see takeRead)
+        assert.strictEqual(t.doc.undetermined, undefined);
+        await ide.reloaded();                     // the editor's read does not end a state, and asks for nothing
+        const asked = ide.asked();
+        t.editor.isDirty = true;
+        await t.save(`${t.editor.text} z`);
+        assert.strictEqual(t.server.content, '# hello z');
+        assert.strictEqual(asked, 1);
     });
 });
 

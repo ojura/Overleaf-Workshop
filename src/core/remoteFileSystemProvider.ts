@@ -1562,6 +1562,14 @@ export class VirtualFileSystem extends vscode.Disposable {
      * settling it tells which. The editor's next read settles it first, so the editor then shows
      * Overleaf's text with the write's outcome, and the user is told when the dropped edit is in
      * it (see openFile).
+     *
+     * Once the write is settled as applied or failed, the IDE is told that the doc changed, so
+     * that an editor without unsaved changes reloads Overleaf's text, which is then its base (see
+     * takeRead). Without the reload, such an editor would show text that lacks edits in Overleaf's
+     * text: the ops of others that came while the copy of the doc was dropped (see settle and
+     * applyRemoteUpdate) and, when the write is the local replica's, the write's edit. For a
+     * resend that Overleaf applies, settle tells the IDE; for an outcome that cannot be
+     * determined, the read that ends it does (see takeRead).
      */
     private async settleUnconfirmed(uri: vscode.Uri, doc: DocumentEntity): Promise<'applied' | 'resent' | 'failed' | 'undetermined'> {
         const write = doc.unconfirmed!;
@@ -1586,12 +1594,14 @@ export class VirtualFileSystem extends vscode.Disposable {
             doc.unconfirmed = undefined;
             doc.undetermined = undefined;
             doc.localCache = write.content;
+            this.notifyChanged(uri);
             return 'applied';
         }
         if (doc.version! - write.update.v > VirtualFileSystem.maxUpdateAge) {
             console.log(`Overleaf Workshop: ${uri.path}: Overleaf did not apply the update of ${VirtualFileSystem.timeOf(write)}, and now refuses it as too old; the next write of the file sends the edit again`);
             doc.unconfirmed = undefined;
             doc.localCache = write.base;
+            this.notifyChanged(uri);
             return 'failed';
         }
         if (write.resendFailed) {
@@ -1655,9 +1665,28 @@ export class VirtualFileSystem extends vscode.Disposable {
      * unsaved changes, or that is not an editor (the local replica), bases its next write on it:
      * it becomes the doc's base, and a doc without a known base has one again. An editor with
      * unsaved changes keeps its base: its text derives from that base, not from this read.
+     *
+     * The doc has one base for all its readers, and the file system cannot tell which reader
+     * read: the local replica, the intellisense providers and the compile manager read docs too.
+     * So a read by another reader also becomes the base of an editor without unsaved changes,
+     * which did not get `content`. That editor reloads Overleaf's text when the IDE is told that
+     * the doc changed: for each op of others while the file system has a copy of the doc
+     * (applyRemoteUpdate), for each write that Overleaf applied (settle), for each write that
+     * Overleaf's history shows as applied, or as not applied and too old (settleUnconfirmed), and
+     * here when the read ends an outcome that cannot be determined. Until the editor has
+     * reloaded, it shows the text from before: the notice goes out at once or, from
+     * notifyChanged, 10 ms later, and VS Code then reads the doc again. If the user types in that
+     * time, VS Code does not reload the editor, and its next save, based on `content`, deletes
+     * the edits in `content` that the editor does not show.
      */
     private takeRead(doc: DocumentEntity, uri: vscode.Uri, content: string) {
-        if (this.editorOf(uri)?.isDirty!==true) {
+        const editor = this.editorOf(uri);
+        if (editor?.isDirty!==true) {
+            if (editor!==undefined && doc.undetermined!==undefined) {
+                // the editor can show text without edits that `content` has, as with a write
+                // settled from the history (see settleUnconfirmed)
+                this.notifyChanged(uri);
+            }
             doc.localCache = content;
             doc.undetermined = undefined;
         } else if (doc.localCache===undefined && doc.undetermined===undefined) {
@@ -1691,8 +1720,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                     if (doc.undetermined && this.editorOf(uri)===undefined) {
                         // Without an editor open on the doc, read it as a reader that is not an
                         // editor: its base is Overleaf's text again (see takeRead). An open editor
-                        // keeps the state until its own read or save ends it: this read would not
-                        // reach it, and its next save would be based on text that it does not show.
+                        // keeps the state until its own read or save ends it, so that this read
+                        // does not become the base of an editor that still shows the text from
+                        // before (see takeRead for the time until such an editor reloads).
                         this.takeRead(doc, uri, (await this.readDoc(doc)).content);
                     }
                 } catch {
