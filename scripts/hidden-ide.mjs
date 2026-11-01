@@ -41,7 +41,9 @@
 //   --project ID        the Overleaf project of the replica; the instance opens its replica
 //                       folder. It must be listed in the user's test projects (below)
 //   --folder DIR        open DIR; start does not copy the login and does not make a replica, e.g.
-//                       for tests that only open local files
+//                       for tests that only open local files. A local replica, a folder that holds
+//                       .overleaf/settings.json or lies inside one, is refused: only --project opens
+//                       a replica, of a project that the user listed
 //   --project-name N    the project's name, if the extension's saved login does not list it
 //   --build DIR         build that checkout of this extension (its TypeScript and its PDF viewers,
 //                       on the checkout's pdf.js release) and install the build into the instance;
@@ -220,6 +222,17 @@ function listedTestProjects() {
 function checkTestProject(project) {
     if (!listedTestProjects().includes(project)) {
         throw new Error(`refusing project ${project}: it is not listed in ${testProjects}, the user's list of Overleaf projects made for tests`);
+    }
+}
+
+/**
+ * The local replica that `folder` is or lies in: the first folder from `folder` up that holds
+ * .overleaf/settings.json; undefined when there is none.
+ */
+function replicaAround(folder) {
+    for (let dir = folder; ; dir = path.dirname(dir)) {
+        if (fs.existsSync(path.join(dir, '.overleaf', 'settings.json'))) { return dir; }
+        if (dir === path.dirname(dir)) { return undefined; }
     }
 }
 
@@ -481,6 +494,10 @@ async function start(...argv) {
         if (project) { throw new UsageError('give --project or --folder, not both'); }
         if (!fs.statSync(folder, { throwIfNoEntry: false })?.isDirectory()) { throw new Error(`${folder} is not a folder`); }
         folder = fs.realpathSync(folder);
+        const replica = replicaAround(folder);
+        if (replica) {
+            throw new Error(`refusing to open ${folder}: ${replica === folder ? 'it is' : `it lies in ${replica}, which is`} a local replica (it holds .overleaf/settings.json); only --project opens a replica, of a project that the user listed`);
+        }
     } else {
         project ??= previous?.project ?? undefined;
         if (!project) { throw new UsageError('--project ID or --folder DIR is required'); }
