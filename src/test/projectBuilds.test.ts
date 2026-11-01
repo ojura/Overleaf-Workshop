@@ -472,6 +472,13 @@ describe('the build in use (ProjectBuilds)', () => {
         assert.deepStrictEqual(builds.status, { state: 'check-failed', detail: '503: unavailable' });
     });
 
+    it('says why a check failed with the failure\'s cause, as fetch reports one', async () => {
+        const { host, builds } = setup();
+        host.latest = () => Promise.reject(Object.assign(new Error('fetch failed'), { cause: new Error('connect ECONNREFUSED 127.0.0.1:443') }));
+        await builds.check();
+        assert.deepStrictEqual(builds.status, { state: 'check-failed', detail: 'fetch failed: connect ECONNREFUSED 127.0.0.1:443' });
+    });
+
     it('takes a check that throws for a failed one', async () => {
         const { host, builds } = setup();
         host.latest = () => Promise.reject(new Error('not logged in'));

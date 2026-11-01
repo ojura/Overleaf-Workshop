@@ -5,12 +5,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { Agent, Dispatcher, fetch, FormData } from 'undici';
 import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
 import type { SyncBox } from '../core/viewerProtocol';
-
-function errorMessage(error: any): string {
-    const cause = error?.cause?.message;
-    const message = error?.message ?? String(error);
-    return cause ? `${message}: ${cause}` : message;
-}
+import { errorMessage } from '../utils/errorMessage';
 
 /** Extract set-cookie headers from an undici/Response object. */
 function getSetCookie(res: any): string[] {

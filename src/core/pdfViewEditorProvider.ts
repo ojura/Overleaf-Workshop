@@ -10,6 +10,7 @@ import type { VirtualFileSystem } from './remoteFileSystemProvider';
 import { outputsOf, PdfFetchBridge, PieceCache } from './pdfFetchBridge';
 import { completeViewerPage, isBuildPath } from './pdfViewerPages';
 import { DEFAULT_PDF_VIEWER_ENGINE, HostMessage, isPdfViewerEngine, pdfjsReleaseOf, PdfOutput, PdfViewerEngine, ViewerMessage } from './viewerProtocol';
+import { errorMessage } from '../utils/errorMessage';
 
 export class PdfDocument implements vscode.CustomDocument {
     /** the PDF read whole: a PDF that is not the project's build, or a build that the download domain does not serve */
@@ -75,7 +76,7 @@ export class PdfDocument implements vscode.CustomDocument {
                 this.vfs = await vscode.commands.executeCommand<VirtualFileSystem>('remoteFileSystem.prefetch', this.uri);
                 this.stopFollowing = this.vfs.builds.onDidChangeBuild(() => {
                     this.showBuild().catch((error) => {
-                        vscode.window.showErrorMessage(vscode.l10n.t('The PDF could not be read: {0}', String(error?.message ?? error)));
+                        vscode.window.showErrorMessage(vscode.l10n.t('The PDF could not be read: {0}', errorMessage(error)));
                     });
                 });
             }
@@ -187,7 +188,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         try {
             await vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer').update('engine', engine, vscode.ConfigurationTarget.Global);
         } catch (error: any) {
-            vscode.window.showErrorMessage(vscode.l10n.t('Could not switch the PDF viewer: {0}', String(error?.message ?? error)));
+            vscode.window.showErrorMessage(vscode.l10n.t('Could not switch the PDF viewer: {0}', errorMessage(error)));
         }
     }
 
@@ -295,7 +296,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     };
                     asked.fetches.handle(e).then(
                         (res) => answer({type:'fetchResponse', page: asked.page, ...res}),
-                        (error) => answer({type:'fetchError', page: asked.page, id:e.id, message:String(error?.message ?? error)}),
+                        (error) => answer({type:'fetchError', page: asked.page, id:e.id, message:errorMessage(error)}),
                     );
                     break;
                 }
@@ -419,7 +420,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                 await vscode.workspace.fs.writeFile(target, content);
             }
         } catch (error: any) {
-            vscode.window.showErrorMessage(vscode.l10n.t('Could not save {0}: {1}', name, error?.message ?? String(error)));
+            vscode.window.showErrorMessage(vscode.l10n.t('Could not save {0}: {1}', name, errorMessage(error)));
         }
     }
 

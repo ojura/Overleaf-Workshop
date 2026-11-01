@@ -7,7 +7,8 @@ import { EventBus } from '../utils/eventBus';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 import { CompileRecord, REPLICA_OUTPUT_FOLDER, saveCompileOutputs } from './outputFiles';
 import { windowCompileSettings } from './compileSettings';
-import type { CompileOutcome, CompileStart } from '../core/projectBuilds';
+import { NO_OUTPUT_PDF, type CompileOutcome, type CompileStart } from '../core/projectBuilds';
+import { errorMessage } from '../utils/errorMessage';
 import type { HostMessage } from '../core/viewerProtocol';
 
 // map string level to severity
@@ -41,7 +42,7 @@ function failureOf(record: CompileRecord | undefined): string {
     if (status === undefined) {
         return `the compile request failed: ${record?.message}`;
     }
-    return status === 'success' ? 'the compile made no output.pdf' : `Overleaf's status is "${status}"`;
+    return status === 'success' ? NO_OUTPUT_PDF : `Overleaf's status is "${status}"`;
 }
 
 class CompileDiagnosticProvider {
@@ -323,7 +324,7 @@ export class CompileManager {
             const hasError = await this.problemsOf(uri);
             await this.update(hasError ? 'failed' : 'success', uri);
         } catch (error) {
-            outcome = { result: 'failure', detail: String((error as Error)?.message ?? error) };
+            outcome = { result: 'failure', detail: errorMessage(error) };
             console.error(`${ELEGANT_NAME}: the compile failed:`, error);
             await this.update('failed', uri).catch((statusError) => console.error(`${ELEGANT_NAME}: showing the compile's status failed:`, statusError));
         } finally {
@@ -341,7 +342,7 @@ export class CompileManager {
         try {
             return await vscode.commands.executeCommand<boolean>(`${ROOT_NAME}.compileManager.compileErrorCheck`, uri);
         } catch (error) {
-            vscode.window.showWarningMessage( vscode.l10n.t('The compile log could not be read, so the Problems view does not show its errors: {error}', {error: String((error as Error)?.message ?? error)}) );
+            vscode.window.showWarningMessage( vscode.l10n.t('The compile log could not be read, so the Problems view does not show its errors: {error}', {error: errorMessage(error)}) );
             return false;
         }
     }
@@ -377,7 +378,7 @@ export class CompileManager {
                 vscode.window.showWarningMessage( vscode.l10n.t('Local changes are still being synced with Overleaf, so the PDF may not include all of them yet.') );
             }
         } catch (error) {
-            vscode.window.showWarningMessage( vscode.l10n.t('Some local changes could not be uploaded to Overleaf, so the PDF may not include them: {error}', {error: String((error as Error)?.message ?? error)}) );
+            vscode.window.showWarningMessage( vscode.l10n.t('Some local changes could not be uploaded to Overleaf, so the PDF may not include them: {error}', {error: errorMessage(error)}) );
         } finally {
             clearTimeout(timer);
         }
@@ -474,7 +475,7 @@ export class CompileManager {
         try {
             await this.openPdf(uri);
         } catch (error) {
-            vscode.window.showWarningMessage( vscode.l10n.t('The PDF could not be opened for the jump: {error}', {error: String((error as Error)?.message ?? error)}) );
+            vscode.window.showWarningMessage( vscode.l10n.t('The PDF could not be opened for the jump: {error}', {error: errorMessage(error)}) );
             return undefined;
         }
         const opened = this.viewers.get(key);

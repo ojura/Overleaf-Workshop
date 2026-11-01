@@ -1505,9 +1505,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             const resolvedRootDocId = rootDocId ?? this.root?.rootDoc_id ?? undefined;
             let rootResourcePath: string | null = null;
             if (resolvedRootDocId) {
-                const rootEntry = this._resolveById(resolvedRootDocId);
-                if (rootEntry?.path) {
-                    rootResourcePath = rootEntry.path.replace(/^\//, '');
+                const path = this.rootResourcePathOf(resolvedRootDocId);
+                if (path) {
+                    rootResourcePath = path;
                 } else {
                     console.warn(`Unable to resolve root document id '${resolvedRootDocId}' to a path; compiling without explicit rootResourcePath.`);
                 }
@@ -1535,12 +1535,22 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     /**
+     * The path of document `docId` relative to the project's folder, as a compile names its main
+     * document (rootResourcePath, e.g. 'main.tex'); undefined for a document that the project
+     * does not have. A compile's settings and the compile request take it from here, so that
+     * sameSettings compares like with like.
+     */
+    private rootResourcePathOf(docId: string): string | undefined {
+        return this._resolveById(docId)?.path.replace(/^\//, '');
+    }
+
+    /**
      * What this window compiles, which a build from Overleaf's cache must match (sameSettings):
      * the main document of its last compile, else the project's, and the window's compile settings.
      */
     private compileSettings(): CompileSettings {
         const rootDocId = this.root?.rootDoc_id;
-        const projectRoot = rootDocId ? this._resolveById(rootDocId)?.path.replace(/^\//, '') : undefined;
+        const projectRoot = rootDocId ? this.rootResourcePathOf(rootDocId) : undefined;
         return {
             rootResourcePath: this.lastCompile?.rootResourcePath ?? projectRoot ?? null,
             draft: windowCompileSettings.draft,

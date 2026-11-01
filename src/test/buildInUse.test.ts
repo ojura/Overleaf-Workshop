@@ -469,7 +469,8 @@ describe('the build in use, from Overleaf to the window', function () {
         it('says that there is no build yet, and asks Overleaf nothing, before any build', async () => {
             assert.strictEqual(await vfs.syncCode('main.tex', 7, 0), undefined);
             assert.deepStrictEqual(overleaf.to('/project/p1/sync/'), []);
-            assert.strictEqual(world.shown.length, 1);
+            assert.deepStrictEqual(world.shown.map(shown => shown.kind), ['information']);
+            assert.match(world.shown[0].message, /no build/);
         });
     });
     describe('2. the output folder and the Problems view', () => {

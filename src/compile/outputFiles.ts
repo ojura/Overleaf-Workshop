@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { CompileResponseSchema } from '../api/base';
 import type { OutputFileEntity } from '../core/remoteFileSystemProvider';
+import { errorMessage } from '../utils/errorMessage';
 
 /**
  * One compile on Overleaf, whatever its status: this window's, or another client's from Overleaf's
@@ -44,7 +45,7 @@ export async function saveCompileOutputs(
         try {
             return { file, content: await download(file) };
         } catch (error: any) {
-            return { file, error: String(error?.message ?? error) };
+            return { file, error: errorMessage(error) };
         }
     }));
 

@@ -1,6 +1,7 @@
 import type { CompileResponseSchema } from '../api/base';
 import type { CompileRecord } from '../compile/outputFiles';
 import type { BuildStatus } from './viewerProtocol';
+import { errorMessage } from '../utils/errorMessage';
 
 /**
  * The build of a project that this window shows: in the PDF viewers, for SyncTeX, in the output
@@ -137,6 +138,9 @@ export function isCompileStart(value: unknown): value is CompileStart {
         || (start?.kind === 'busy' && typeof start.ended?.then === 'function');
 }
 
+/** Why a successful compile made no build: its answer lists no output.pdf. */
+export const NO_OUTPUT_PDF = 'the compile made no output.pdf';
+
 /**
  * How a compile in the window ended:
  *   success  Overleaf's status was 'success'
@@ -227,7 +231,6 @@ export interface BuildsHost {
     compile(): Promise<CompileStart>;
 }
 
-const messageOf = (error: unknown) => String((error as Error)?.message ?? error);
 
 /** Call each of `listeners` with `value`; one that throws does not keep the others from it. */
 function notify<T>(listeners: Set<(value: T) => void>, value: T) {
@@ -432,7 +435,7 @@ export class ProjectBuilds {
             }
             return;
         }
-        const detail = outcome.result === 'failure' ? outcome.detail : 'the compile made no output.pdf';
+        const detail = outcome.result === 'failure' ? outcome.detail : NO_OUTPUT_PDF;
         this.compile = { state: 'failed', status: { state: 'compile-failed', detail } };
         this.update();
     }
@@ -448,7 +451,7 @@ export class ProjectBuilds {
         try {
             answer = await this.host.latest();
         } catch (error) {
-            answer = { kind: 'failed', detail: messageOf(error) };
+            answer = { kind: 'failed', detail: errorMessage(error) };
         }
         this.checking = false;
         if (answer.kind === 'failed') {
@@ -559,7 +562,7 @@ export class ProjectBuilds {
             start = await this.host.compile();
         } catch (error) {
             start = { kind: 'unavailable' };
-            detail = messageOf(error);
+            detail = errorMessage(error);
         }
         // the compile may have ended meanwhile (compileEnded), or a build may have come
         if (this.compile !== request) {
