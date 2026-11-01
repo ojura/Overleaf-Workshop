@@ -242,7 +242,20 @@ export async function createSandbox(client: OverleafClient, replica: Replica, us
     return { record, checks: guarded.checks };
 }
 
-export async function sandboxStatus(client: OverleafClient, replica: Replica, userId: string) {
+/**
+ * What the status command found about a replica's recorded sandbox: the problems of the safety
+ * checks, the copy and the shared project as the tool joined them, or the error of the join, and
+ * the lock's owner while a run holds it.
+ */
+export interface SandboxStatus {
+    record: SandboxRecord;
+    problems: string[];
+    copy: JoinedProject | Error;
+    shared: JoinedProject | Error;
+    lock?: LockOwner;
+}
+
+export async function sandboxStatus(client: OverleafClient, replica: Replica, userId: string): Promise<SandboxStatus | { record: undefined }> {
     const record = readRecord(replica.folder);
     if (!record) { return { record }; }
     const problems = recordProblems(record, replica.projectId, userId);
@@ -254,6 +267,38 @@ export async function sandboxStatus(client: OverleafClient, replica: Replica, us
     let lock: LockOwner | undefined;
     try { lock = JSON.parse(fs.readFileSync(lockFile(replica.folder), 'utf8')); } catch { lock = undefined; }
     return { record, problems, copy, shared, lock };
+}
+
+/**
+ * The status command's text for `status`: the record, the copy and the shared project, or why
+ * the tool could not join them, the safety checks, the lock, and `runs`, the latest entries of the
+ * run log `runLog` (recentRuns).
+ */
+export function formatSandboxStatus(status: SandboxStatus, runs: any[], runLog: string): string {
+    const lines = [`sandbox: "${status.record.projectName}", ${sandboxUrl(status.record)}, created ${status.record.createdAt}`];
+    if (status.copy instanceof Error) {
+        lines.push(`could not join the copy: ${errorMessage(status.copy)}`);
+    } else {
+        const s = settingsOf(status.copy);
+        lines.push(`copy: compiler ${s.compiler}, image ${s.imageName}, main document ${s.rootDoc}, compile timeout ${status.copy.project.features?.compileTimeout} s, compile group ${status.copy.project.features?.compileGroup}`);
+    }
+    if (status.shared instanceof Error) {
+        lines.push(`could not join the shared project: ${errorMessage(status.shared)}`);
+    } else {
+        const s = settingsOf(status.shared);
+        lines.push(`shared project: compiler ${s.compiler}, image ${s.imageName}, main document ${s.rootDoc}`);
+    }
+    lines.push(status.problems.length ? `NOT SAFE TO WRITE: ${status.problems.join('; ')}` : 'safety checks pass: owned by this account, no collaborators, no invites, link sharing off');
+    lines.push(status.lock ? `lock held by pid ${status.lock.pid} on ${status.lock.host} since ${status.lock.acquiredAt}: ${status.lock.purpose}` : 'lock: free');
+    if (runs.length) {
+        lines.push(`latest runs (from ${runLog}):`);
+        for (const run of runs) {
+            lines.push(run.event === 'start' ? `  ${run.at} pid ${run.pid} started: ${run.purpose} (${run.dir}, ${run.main})`
+                : run.event === 'end' ? `  ${run.at} pid ${run.pid} ended: ${run.status ?? run.error}${run.compileE2EMs ? `, compileE2E ${run.compileE2EMs} ms` : ''}${run.out ? `, results in ${run.out}` : ''}`
+                : `  ${run.at} ${run.event} ${run.projectId ?? ''}`);
+        }
+    }
+    return lines.join('\n');
 }
 
 

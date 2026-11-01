@@ -5,19 +5,8 @@ import { EventBus } from '../utils/eventBus';
 import { SocketIOAlt } from './socketioAlt';
 import { decodePackedUtf8 } from './packedUtf8';
 import type { TrackChangesState } from '../utils/docUpdate';
+import { errorMessage } from '../utils/errorMessage';
 
-
-/** Render a socket.io error payload as something readable instead of `[object Object]`. */
-function stringifyError(err: any): string {
-    if (err === null || err === undefined) { return 'unknown error'; }
-    if (typeof err === 'string') { return err; }
-    if (err.message) { return err.message; }
-    try {
-        return JSON.stringify(err);
-    } catch {
-        return String(err);
-    }
-}
 
 /**
  * The server answered an emit with an error: it refused the request. Real-time refuses an
@@ -26,7 +15,7 @@ function stringifyError(err: any): string {
  */
 export class EmitRefusedError extends Error {
     constructor(readonly event: string, readonly answer: unknown) {
-        super(`'${event}' rejected: ${stringifyError(answer)}`);
+        super(`'${event}' rejected: ${errorMessage(answer)}`);
         this.name = 'EmitRefusedError';
     }
 }
@@ -278,7 +267,7 @@ export class SocketIOAPI {
         this.socket.on('error', (err:any) => {
             // Log error instead of throwing to avoid crashing the extension
             console.error('SocketIOAPI: socket error', err?.message || err);
-            this.onConnectionProblem?.(`socket error: ${stringifyError(err)}`);
+            this.onConnectionProblem?.(`socket error: ${errorMessage(err)}`);
         });
 
         if (this.scheme==='v2') {
@@ -375,7 +364,7 @@ export class SocketIOAPI {
                     // to queue to its sender, which real-time then disconnects; `message` names
                     // the doc (DocumentUpdaterController, WebsocketController.applyOtUpdate).
                     this.socket.on('otUpdateError', (error:any, message?:{doc_id?: string}) => {
-                        handler(message?.doc_id, stringifyError(error));
+                        handler(message?.doc_id, errorMessage(error));
                     });
                     break;
                 case handlers.onDisconnected:
@@ -489,9 +478,9 @@ export class SocketIOAPI {
             case 'v2': {
                 // fail at once when this connection cannot be made, instead of at the timeout
                 const failed = new Promise<ProjectEntity>((_, reject) => {
-                    this.socket.on('connectionRejected', (err:any) => reject(new Error(`the connection was rejected: ${stringifyError(err)}`)));
+                    this.socket.on('connectionRejected', (err:any) => reject(new Error(`the connection was rejected: ${errorMessage(err)}`)));
                     this.socket.on('connect_failed', () => reject(new Error('the connection could not be made')));
-                    this.socket.on('error', (err:any) => reject(new Error(`socket error: ${stringifyError(err)}`)));
+                    this.socket.on('error', (err:any) => reject(new Error(`socket error: ${errorMessage(err)}`)));
                 });
                 return Promise.race([this.record!, timeoutPromise, failed]);
             }

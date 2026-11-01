@@ -25,8 +25,8 @@ import { OVERLEAF_REF } from '../scm/replicaGit';
 import { BaseAPI } from '../api/base';
 import { errorMessage } from '../utils/errorMessage';
 import {
-    createSandbox, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions, SANDBOX_RECORD_FILE,
-    SANDBOX_RUN_LOG_FILE, sandboxStatus, sandboxUrl, settingsOf,
+    createSandbox, formatSandboxStatus, readRecord, readReplica, recentRuns, recordFile, runCompile, runLogFile, RunOptions,
+    SANDBOX_RECORD_FILE, SANDBOX_RUN_LOG_FILE, sandboxStatus, sandboxUrl, settingsOf,
 } from './sandbox';
 
 /** A path of the sync ('/dir/name'), as the help names it: relative to the replica's folder. */
@@ -646,32 +646,8 @@ async function main(argv: string[]): Promise<number> {
             process.stdout.write(`no sandbox is recorded in ${recordFile(replica.folder)}; create one with: init --replica "${replica.folder}"\n`);
             return 1;
         }
-        const lines = [`sandbox: "${status.record.projectName}", ${sandboxUrl(status.record)}, created ${status.record.createdAt}`];
-        if (status.copy instanceof Error) {
-            lines.push(`could not join the copy: ${status.copy.message}`);
-        } else if (status.copy) {
-            const s = settingsOf(status.copy);
-            lines.push(`copy: compiler ${s.compiler}, image ${s.imageName}, main document ${s.rootDoc}, compile timeout ${status.copy.project.features?.compileTimeout} s, compile group ${status.copy.project.features?.compileGroup}`);
-        }
-        if (status.shared instanceof Error) {
-            lines.push(`could not join the shared project: ${status.shared.message}`);
-        } else if (status.shared) {
-            const s = settingsOf(status.shared);
-            lines.push(`shared project: compiler ${s.compiler}, image ${s.imageName}, main document ${s.rootDoc}`);
-        }
-        lines.push(status.problems!.length ? `NOT SAFE TO WRITE: ${status.problems!.join('; ')}` : 'safety checks pass: owned by this account, no collaborators, no invites, link sharing off');
-        lines.push(status.lock ? `lock held by pid ${status.lock.pid} on ${status.lock.host} since ${status.lock.acquiredAt}: ${status.lock.purpose}` : 'lock: free');
-        const runs = recentRuns(replica.folder, 10);
-        if (runs.length) {
-            lines.push(`latest runs (from ${runLogFile(replica.folder)}):`);
-            for (const run of runs) {
-                lines.push(run.event === 'start' ? `  ${run.at} pid ${run.pid} started: ${run.purpose} (${run.dir}, ${run.main})`
-                    : run.event === 'end' ? `  ${run.at} pid ${run.pid} ended: ${run.status ?? run.error}${run.compileE2EMs ? `, compileE2E ${run.compileE2EMs} ms` : ''}${run.out ? `, results in ${run.out}` : ''}`
-                    : `  ${run.at} ${run.event} ${run.projectId ?? ''}`);
-            }
-        }
-        process.stdout.write(lines.join('\n') + '\n');
-        return status.problems!.length || status.copy instanceof Error ? 1 : 0;
+        process.stdout.write(formatSandboxStatus(status, recentRuns(replica.folder, 10), runLogFile(replica.folder)) + '\n');
+        return status.problems.length || status.copy instanceof Error ? 1 : 0;
     }
 
     if (!values.dir) { throw new UsageError('--dir is required'); }

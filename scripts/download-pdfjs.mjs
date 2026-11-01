@@ -23,16 +23,25 @@ export function planOf(version = pdfjsVersion, release = pdfjsRelease) {
     };
 }
 
-/** Run `command` with `args`, its output on this process's; throws unless it ends with status 0. */
-function run(what, command, args, options = {}) {
-    const result = spawnSync(command, args, { stdio: 'inherit', ...options });
+/**
+ * Run `command` with `args`; throws unless it ends with status 0. With `output` 'inherit' the
+ * command's output goes to this process's; with 'pipe' it is kept, and a failure's error ends with
+ * what the command wrote to its error output, so that a caller such as a test shows only what
+ * failed.
+ */
+function run(what, command, args, { output = 'inherit', ...options } = {}) {
+    const result = spawnSync(command, args, { stdio: output === 'pipe' ? ['ignore', 'ignore', 'pipe'] : 'inherit', encoding: 'utf8', ...options });
     if (result.error || result.status !== 0) {
-        throw new Error(`${what} failed: ${result.error?.message ?? (result.signal ? `ended by ${result.signal}` : `exit status ${result.status}`)}`);
+        const said = output === 'pipe' ? result.stderr?.trim() : undefined;
+        throw new Error(`${what} failed: ${result.error?.message ?? (result.signal ? `ended by ${result.signal}` : `exit status ${result.status}`)}${said ? `\n${said}` : ''}`);
     }
 }
 
-/** Download, unpack and patch the release of `plan` into its folder. */
-export function download(plan = planOf()) {
+/**
+ * Download, unpack and patch the release of `plan` into its folder. `output` is where the output
+ * of the download and of patch goes (run): this process's, or kept for the error of a failure.
+ */
+export function download(plan = planOf(), { output = 'inherit' } = {}) {
     const name = (file) => path.relative(repo, file);
     if (!existsSync(plan.patch)) {
         throw new Error(`there is no patch for pdf.js ${plan.version}: ${name(plan.patch)} is missing; the viewers need the extension's changes to pdf.js, so make one for this release first`);
@@ -41,9 +50,9 @@ export function download(plan = planOf()) {
     const downloadCli = createRequire(import.meta.url).resolve('download-cli/cli.js');
     const unpacked = mkdtempSync(`${plan.release}.download-`);
     try {
-        run(`the download of ${plan.url}`, process.execPath, [downloadCli, '--extract', '--out', unpacked, plan.url]);
+        run(`the download of ${plan.url}`, process.execPath, [downloadCli, '--extract', '--out', unpacked, plan.url], { output });
         // --forward: a patch that looks applied already fails rather than being reversed
-        run(`applying ${name(plan.patch)}`, 'patch', ['-p1', '--forward', '--batch', '-i', plan.patch], { cwd: unpacked });
+        run(`applying ${name(plan.patch)}`, 'patch', ['-p1', '--forward', '--batch', '-i', plan.patch], { output, cwd: unpacked });
         // the earlier copy aside, the new one in, the earlier one away
         const earlier = `${unpacked}.earlier`;
         const replaced = existsSync(plan.release);
