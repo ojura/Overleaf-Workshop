@@ -659,6 +659,34 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.deepStrictEqual(vfs.builds.status, { state: 'ready' });
         });
 
+        it('says that it compiles from the click on Recompile, and compiles once the compile that kept it waiting has ended', async () => {
+            overleaf.latest = { status: 404 };
+            overleaf.compiles.push({ status: 'failure', compileGroup: 'priority', clsiServerId: 'clsi-vm-2', outputFiles: [] }, ownAnswer(overleaf, 'b-new'));
+            let ended = compileEnd();
+            const { panel } = await open();
+            await ended;
+            assert.strictEqual(vfs.builds.status.state, 'compile-failed');
+            // a compile of a file outside any Overleaf project keeps the window busy while the editors are saved
+            let saved!: () => void;
+            world.saveAll = () => new Promise<boolean>(resolve => { saved = () => resolve(true); });
+            const other = manager.compile(true, false, Uri.file('/elsewhere/notes.tex'));
+            world.saveAll = async () => true;
+            const compiling = new Promise<void>(resolve => {
+                const stop = vfs.builds.onDidChangeStatus((status: any) => { if (status.state === 'compiling') { stop(); resolve(); } });
+            });
+            panel.send({ type: 'recompile' });
+            await compiling;
+            // a second click while the request waits changes nothing
+            panel.send({ type: 'recompile' });
+            ended = compileEnd();
+            saved();
+            await other;
+            assert.deepStrictEqual((await ended).outcome, { result: 'success' });
+            assert.strictEqual(overleaf.to('/project/p1/compile').length, 2);
+            assert.strictEqual((await panel.first('load')).output.file.build, 'b-new');
+            assert.deepStrictEqual(vfs.builds.status, { state: 'ready' });
+        });
+
         it('compiles once the compile that kept it from starting has ended, also one that found no project to compile', async () => {
             // the user compiles a file outside any Overleaf project, which waits while the editors are saved
             let saved!: () => void;

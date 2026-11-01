@@ -285,6 +285,19 @@ describe('the build in use (ProjectBuilds)', () => {
         assert.strictEqual(host.compiles, 1);
     });
 
+    it('compiles at the user\'s Recompile after a failure, once however often it is clicked, and says so from the click', async () => {
+        const { host, builds } = setup({ visible: false });
+        builds.compileStarted(true);
+        builds.compileEnded({ result: 'failure', detail: 'Overleaf\'s status is "failure"' }, true);
+        assert.strictEqual(builds.status.state, 'compile-failed');
+        const first = builds.recompile();
+        assert.deepStrictEqual(builds.status, { state: 'compiling' });
+        await builds.recompile();
+        await first;
+        assert.strictEqual(host.compiles, 1);
+        assert.deepStrictEqual(builds.status, { state: 'compiling' });
+    });
+
     it('says why when the compile cannot start', async () => {
         const { host, builds } = setup();
         host.answers.push({ kind: 'none' });
@@ -345,6 +358,29 @@ describe('the build in use (ProjectBuilds)', () => {
             await running.promise;
             assert.strictEqual(host.compiles, 1);
             assert.deepStrictEqual(builds.status, { state: 'compile-failed', detail: 'Overleaf\'s status is "failure"' });
+        });
+
+        it('asks again for the opening\'s compile when that compile has ended, also without a visible viewer', async () => {
+            const { host, builds } = setup({ visible: false });
+            const running = deferred<void>();
+            host.answers.push({ kind: 'none' });
+            host.starts.push({ kind: 'busy', ended: running.promise });
+            await builds.opened();
+            assert.strictEqual(host.compiles, 1);
+            running.resolve();
+            await running.promise;
+            assert.strictEqual(host.compiles, 2);
+        });
+
+        it('asks again for the user\'s Recompile when that compile has ended', async () => {
+            const { host, builds } = setup({ visible: false });
+            const running = deferred<void>();
+            host.starts.push({ kind: 'busy', ended: running.promise });
+            await builds.recompile();
+            assert.deepStrictEqual(builds.status, { state: 'compiling' });
+            running.resolve();
+            await running.promise;
+            assert.strictEqual(host.compiles, 2);
         });
 
         it('checks meanwhile, and does not compile again when a build came', async () => {

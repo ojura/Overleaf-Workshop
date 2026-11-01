@@ -300,10 +300,9 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     break;
                 case 'recompile':
                     // the project of this build, whichever editor is active; only a build's viewer
-                    // offers Recompile, in its line about the build (ProjectBuilds.status)
-                    doc.vfs?.compileProject().catch((error) => {
-                        vscode.window.showErrorMessage(vscode.l10n.t('The project could not be compiled: {0}', String(error?.message ?? error)));
-                    });
+                    // offers Recompile, in its line about the build (ProjectBuilds.status), which
+                    // also says how the compile goes
+                    void builds?.recompile();
                     break;
                 case 'buildGone':
                     // the viewer found the build's files gone from Overleaf's servers

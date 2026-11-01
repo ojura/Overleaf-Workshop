@@ -1462,9 +1462,9 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     /**
      * Compile this project through the window's compile path (CompileManager.compile), whichever
-     * editor is active: the compile that ProjectBuilds starts for a missing build, and the PDF
-     * viewers' Recompile. The path gets the project's folder, so Overleaf compiles the project's
-     * main document.
+     * editor is active: the compiles that ProjectBuilds asks for, for a missing build, at the
+     * project's opening, and for a viewer's Recompile. The path gets the project's folder, so
+     * Overleaf compiles the project's main document.
      *
      * The answer comes through vscode.commands.executeCommand, and a 'busy' answer carries a
      * promise. executeCommand "resolves to the returned value of the given command" (vscode.d.ts,

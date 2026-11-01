@@ -201,6 +201,14 @@ type CompileState =
     /** the compile ended without a build, or did not start; the user's Recompile is next */
     | { state: 'failed', status: BuildStatus };
 
+/**
+ * Who asks ProjectBuilds for a compile, which decides when it asks (asks):
+ *   viewer   no build to show while a viewer of the build is visible (compileIfNeeded)
+ *   opening  the project was opened in this window (opened)
+ *   user     a viewer's Recompile (recompile)
+ */
+type Asker = 'viewer' | 'opening' | 'user';
+
 /** Something a viewer can say about itself: whether it is visible now. */
 export interface BuildViewer {
     readonly visible: boolean;
@@ -328,9 +336,17 @@ export class ProjectBuilds {
     opened(): Promise<void> {
         this.opening ??= (async () => {
             await this.check();
-            await this.startCompile();
+            await this.startCompile('opening');
         })();
         return this.opening;
+    }
+
+    /**
+     * The user asked for a compile with a viewer's Recompile. The viewers say 'compiling' from the
+     * click; while a compile of this project runs, or was asked for, its end decides.
+     */
+    recompile(): Promise<void> {
+        return this.startCompile('user');
     }
 
     /**
@@ -476,14 +492,31 @@ export class ProjectBuilds {
 
     /** Start the one compile that makes a build to show, while a viewer of the build is visible. */
     private async compileIfNeeded(): Promise<void> {
-        if ([...this.viewers].some(viewer => viewer.visible)) {
-            await this.startCompile();
-        }
+        await this.startCompile('viewer');
     }
 
-    /** Start the one compile that makes a build to show, unless there is one to show or a compile was asked for. */
-    private async startCompile(): Promise<void> {
+    /**
+     * Whether `asker` asks for a compile now: never while a compile of this project runs or was
+     * asked for; the user always else; the others only while there is no build to show and no
+     * failure that waits for the user, at the project's opening, or while a viewer of the build
+     * is visible.
+     */
+    private asks(asker: Asker): boolean {
+        if (this.compile.state === 'running') {
+            return false;
+        }
+        if (asker === 'user') {
+            return true;
+        }
         if (this.hasBuildToShow() || this.compile.state !== 'idle') {
+            return false;
+        }
+        return asker === 'opening' || [...this.viewers].some(viewer => viewer.visible);
+    }
+
+    /** Ask the window's compile path for the compile that `asker` wants, if it asks now (asks). */
+    private async startCompile(asker: Asker): Promise<void> {
+        if (!this.asks(asker)) {
             return;
         }
         const request: CompileState = { state: 'running', started: false };
@@ -508,14 +541,14 @@ export class ProjectBuilds {
             this.compile = { state: 'running', started: true };
         } else {
             // the window compiles one project at a time: once the running compile has ended,
-            // however it ended, ask again, unless a build or a failure to show replaced this
-            // request meanwhile. A failure of this project that the compile's end reports comes
-            // first: the compile fires compileEndedEvent in the same step as it settles `ended`.
-            // Not awaited, so that checks go on meanwhile.
+            // however it ended, the same asker asks again, unless a build or a failure to show
+            // replaced this request meanwhile. A failure of this project that the compile's end
+            // reports comes first: the compile fires compileEndedEvent in the same step as it
+            // settles `ended`. Not awaited, so that checks go on meanwhile.
             void start.ended.then(() => {
                 if (this.compile === request) {
                     this.compile = { state: 'idle' };
-                    void this.compileIfNeeded();
+                    void this.startCompile(asker);
                 }
             });
         }
