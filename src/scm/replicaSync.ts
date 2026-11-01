@@ -179,6 +179,14 @@ export interface ReplicaStore {
      * never makes the sync wait.
      */
     workTree?(): Promise<WorkTreeState | undefined>,
+    /**
+     * The path of git's index lock while a program other than the store holds it, as git does
+     * while it writes the work tree and the index, e.g. during a checkout, which moves HEAD last;
+     * undefined while nobody holds it, or the store's own index write does.
+     */
+    foreignIndexLock?(): Promise<string | undefined>,
+    /** Resolves once the lock `file` is gone, at the event of its folder that removes it; `dispose` stops the watch before that. */
+    indexLockReleased?(file: string): {released: Promise<void>, dispose(): void},
 }
 
 export interface ReplicaUI {
@@ -371,6 +379,12 @@ export class ReplicaSync {
     static saveDelayMs = 1000;
     /** Record the state (the store's commits) once the sync has been idle this long. */
     static recordQuietMs = 10_000;
+    /**
+     * Tell the user about git's index lock once a window step has waited for it this long: a git
+     * that ended without removing it, e.g. at a crash, never answers, so the time limit is the
+     * only sign of it. The step keeps waiting for the lock's removal.
+     */
+    static staleLockMs = 10_000;
 
     private state: SavedState = {version: 1, entries: {}, untracked: []};
     private loaded?: Promise<void>;
@@ -404,6 +418,11 @@ export class ReplicaSync {
     private readonly questionListeners = new Set<(question: Deletions) => void>();
     /** why the sync waits instead of acting on the folder (`mayAct`); undefined while it acts */
     private waitReason?: string;
+    /** the index lock of another program that the window's steps wait for (`indexLockReleased`), and what is told about it once it is stale */
+    private lockWait?: {file: string, released: Promise<void>, stale?: string};
+    /** resolves when the sync stops, so that a step waiting for git's index lock ends then */
+    private readonly stopping: Promise<void>;
+    private markStopped!: () => void;
     /** the checked-out commit that the user agreed to put on Overleaf, and the last one asked about */
     private agreedHead?: string;
     private askedHead?: string;
@@ -436,6 +455,7 @@ export class ReplicaSync {
         private readonly isIgnored: (path: string) => boolean,
         options: {merge?: MergeText, uploads?: boolean, onRecorded?: (result: {waiting?: boolean}) => void} = {},
     ) {
+        this.stopping = new Promise<void>(resolve => { this.markStopped = resolve; });
         this.merge = options.merge ?? gitMergeText;
         this.uploads = options.uploads ?? true;
         this.onRecorded = options.onRecorded;
@@ -471,7 +491,7 @@ export class ReplicaSync {
 
     /** Why the sync waits instead of acting on the folder, e.g. for a tool's status; undefined while it acts. */
     get waitingFor(): string | undefined {
-        return this.waitReason;
+        return this.waitReason ?? this.lockWait?.stale;
     }
 
     /**
@@ -485,6 +505,15 @@ export class ReplicaSync {
      */
     private async mayAct(by?: 'tool' | 'user'): Promise<string | undefined> {
         await this.local.verify();
+        // While another program holds git's index lock, git writes the work tree and the index, as
+        // in a checkout, which moves HEAD last. A window step waits until the lock is gone and asks
+        // again, without the full sync that ends a wait: the step itself goes on. A tool's request
+        // answers at once that the sync waits.
+        for (let lock = await this.store.foreignIndexLock?.(); lock!==undefined; lock = await this.store.foreignIndexLock?.()) {
+            if (by==='tool') { return `git holds its index lock ${lock}: it is writing the folder, e.g. for a checkout`; }
+            await this.indexLockReleased(lock);
+            if (this.stopped) { return 'the sync stopped'; }
+        }
         const tree = await this.store.workTree?.();
         let reason: string | undefined;
         if (tree!==undefined && 'operation' in tree) {
@@ -518,6 +547,33 @@ export class ReplicaSync {
             }
         }
         return reason;
+    }
+
+    /**
+     * Resolves once another program's index lock `file` is gone (the store's event), or the sync
+     * stops; the window's steps that wait for it share one wait. When the lock stays for
+     * `staleLockMs`, the user is told, with the file, as git itself tells; the steps keep waiting.
+     */
+    private indexLockReleased(file: string): Promise<void> {
+        if (this.lockWait?.file===file) { return this.lockWait.released; }
+        const watch = this.store.indexLockReleased!(file);
+        const wait: {file: string, released: Promise<void>, stale?: string} = {file, released: Promise.resolve()};
+        const stale = setTimeout(() => {
+            wait.stale = `git's index lock ${file} has been there for ${ReplicaSync.staleLockMs/1000} s: a git command still runs in the folder, or one that ended without removing it left it, and git does not work there until it is removed`;
+            this.ui.log(`The sync waits: ${wait.stale}.`);
+            this.ui.waiting?.(wait.stale);
+        }, ReplicaSync.staleLockMs);
+        wait.released = Promise.race([watch.released, this.stopping]).finally(() => {
+            clearTimeout(stale);
+            watch.dispose();
+            if (this.lockWait===wait) { this.lockWait = undefined; }
+            if (wait.stale!==undefined) {
+                this.ui.log(`git's index lock ${file} is gone.`);
+                this.ui.waiting?.(this.waitReason);
+            }
+        });
+        this.lockWait = wait;
+        return wait.released;
     }
 
     private load(): Promise<void> {
@@ -865,6 +921,7 @@ export class ReplicaSync {
     /** Stop syncing: drop the queued work, wait for the running work and save the state. */
     async stop(): Promise<void> {
         this.stopped = true;
+        this.markStopped();
         await Promise.all([...this.slots.values()].map(slot => slot.tail));
         if (this.saveTimer) {
             clearTimeout(this.saveTimer);

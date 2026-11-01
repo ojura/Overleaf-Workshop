@@ -918,7 +918,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             // the files the commit deletes are deleted because the commit is landed: that is their confirmation
             const deleted = (await git.run(['diff', '--name-only', '--no-renames', '--diff-filter=D', '-z', head, target]))
                 .stdout.toString('utf8').split('\0').filter(Boolean).map(p => `/${p}`);
-            await git.run(['merge', '--ff-only', '--quiet', target]);
+            await git.ownIndexWrite(() => git.run(['merge', '--ff-only', '--quiet', target]));
             const summary = await sync.flush(true, {by: 'tool', approved: new Set(deleted)});
             const failed = this.syncProblems(summary);
             const recorded = await sync.recordNow({force: true});

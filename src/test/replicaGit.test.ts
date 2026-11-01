@@ -330,6 +330,24 @@ describe('local replica: git as the merge backend', function () {
         assert.deepStrictEqual(fs.readdirSync(path.join(t.folder, '.git', 'overleaf', 'tmp')), [], 'the temporary files are gone');
     });
 
+    it('tells git\'s index lock of another program, but not the lock of its own index write, and when the lock goes', async () => {
+        const t = await world();
+        const lock = path.join(t.folder, '.git', 'index.lock');
+        assert.strictEqual(await t.store.foreignIndexLock(), undefined, 'before the lock');
+        // another program's git takes the lock
+        fs.writeFileSync(lock, '');
+        assert.strictEqual(await t.store.foreignIndexLock(), lock);
+        assert.strictEqual(await t.store.git.ownIndexWrite(() => t.store.foreignIndexLock()), undefined, 'during the replica\'s own index write the lock is its own');
+        const { released, dispose } = t.store.indexLockReleased(lock);
+        try {
+            fs.rmSync(lock);
+            await released;
+        } finally {
+            dispose();
+        }
+        assert.strictEqual(await t.store.foreignIndexLock(), undefined, 'after the lock');
+    });
+
     it('turns the replica\'s ignore patterns into gitignore lines', () => {
         assert.strictEqual(gitignoreLine('**/*.aux'), '*.aux');
         assert.strictEqual(gitignoreLine('**/.*'), '.*');

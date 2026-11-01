@@ -1,7 +1,7 @@
 import * as assert from 'assert';
 import {
     gitBlobHash, LocalStat, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaStore, ReplicaSync,
-    ReplicaUI, SavedState, SyncSummary,
+    ReplicaUI, SavedState, SyncSummary, WorkTreeState,
 } from '../scm/replicaSync';
 
 const enc = (text: string) => new TextEncoder().encode(text);
@@ -151,6 +151,38 @@ class FakeUI implements ReplicaUI {
     async confirmDeletions(_where: 'local' | 'remote', paths: string[]) { this.asked.push(paths); this.onAsk?.(); return this.answer ?? this.confirm; }
     conflictBlocked(path: string) { this.blocked.push(path); }
     liveResult(summary: SyncSummary) { this.live.push(summary); }
+    /** what the sync said about waiting, in order; `onWaiting` is told each time */
+    waits: (string | undefined)[] = [];
+    onWaiting?: () => void;
+    waiting(reason: string | undefined) { this.waits.push(reason); this.onWaiting?.(); }
+}
+
+/** A store with git's index lock held by another program while `lock` is set, and git's state of the work tree. */
+class LockedStore extends FakeStore {
+    lock?: string = '/replica/.git/index.lock';
+    tree?: WorkTreeState;
+    private watches: (() => void)[] = [];
+    /** resolves when the sync starts to wait for the lock */
+    waitStarted: Promise<void>;
+    private started!: () => void;
+    constructor() {
+        super();
+        this.waitStarted = new Promise<void>(resolve => { this.started = resolve; });
+    }
+    async foreignIndexLock() { return this.lock; }
+    indexLockReleased() {
+        let resolve!: () => void;
+        const released = new Promise<void>(r => { resolve = r; });
+        this.watches.push(resolve);
+        this.started();
+        return {released, dispose: () => {}};
+    }
+    async workTree() { return this.tree; }
+    /** git removes the lock: the sync's watch learns of it */
+    release() {
+        this.lock = undefined;
+        this.watches.splice(0).forEach(resolve => resolve());
+    }
 }
 
 function setup() {
@@ -424,6 +456,78 @@ describe('ReplicaSync', () => {
         const summary = await landing;
         assert.deepStrictEqual([...summary.deletedRemote].sort(), paths);
         assert.deepStrictEqual([...t.remote.files.keys()], [], 'the deletions that the request approves are made');
+    });
+
+    describe('while another program holds git\'s index lock, as a checkout under way does', () => {
+        async function locked() {
+            const t = setup();
+            const store = new LockedStore();
+            t.remote.docs.set('/a.tex', text);
+            const sync = new ReplicaSync(t.remote, t.local, store, t.ui, (p: string) => p.endsWith('.aux'));
+            store.lock = undefined;
+            await sync.syncAll();
+            store.lock = '/replica/.git/index.lock';
+            t.remote.calls.length = 0;
+            return { ...t, store, sync };
+        }
+
+        it('waits in a window step, and acts on the folder as the end of the lock leaves it', async () => {
+            const t = await locked();
+            // the checkout writes a.tex of an older commit, and the event of the file comes
+            t.local.set('/a.tex', 'an older text\n');
+            const step = t.sync.localChanged('/a.tex');
+            await Promise.race([step, t.store.waitStarted]);
+            assert.deepStrictEqual(t.remote.calls, [], 'nothing goes to Overleaf while the lock is held');
+            // git moves HEAD to the older commit last, then removes the lock
+            t.store.tree = { head: 'older', overleaf: 'recorded' };
+            t.store.release();
+            await step;
+            assert.deepStrictEqual(t.remote.calls, [], 'the sync waits for the checked-out commit');
+            assert.strictEqual(t.remote.docs.get('/a.tex'), text, 'Overleaf keeps the newer text');
+        });
+
+        it('goes on after a short lock, without the full sync that ends a wait', async () => {
+            const t = await locked();
+            const syncAll = t.sync.syncAll.bind(t.sync);
+            let fullSyncs = 0;
+            t.sync.syncAll = () => { fullSyncs += 1; return syncAll(); };
+            t.local.set('/a.tex', 'an edit\n');
+            const step = t.sync.localChanged('/a.tex');
+            await t.store.waitStarted;
+            t.store.release(); // e.g. git status of another program
+            await step;
+            assert.strictEqual(t.remote.docs.get('/a.tex'), 'an edit\n', 'the edit is uploaded once the lock is gone');
+            assert.strictEqual(fullSyncs, 0);
+            assert.deepStrictEqual(t.ui.waits, [], 'nothing is said about a wait');
+        });
+
+        it('answers a tool at once that the sync waits, naming the lock, and uploads nothing', async () => {
+            const t = await locked();
+            t.local.set('/a.tex', 'an older text\n');
+            const summary = await t.sync.flush(true, { by: 'tool' });
+            assert.ok(String(summary.waitingFor).includes('/replica/.git/index.lock'), summary.waitingFor);
+            assert.deepStrictEqual(t.remote.calls, []);
+        });
+
+        it('tells the user about a lock that stays, naming the file, and goes on once it is gone', async () => {
+            const saved = ReplicaSync.staleLockMs;
+            ReplicaSync.staleLockMs = 0;
+            try {
+                const t = await locked();
+                const told = new Promise<void>(resolve => { t.ui.onWaiting = resolve; });
+                t.local.set('/a.tex', 'an edit\n');
+                const step = t.sync.localChanged('/a.tex');
+                await told;
+                assert.ok(String(t.ui.waits[0]).includes('/replica/.git/index.lock'), String(t.ui.waits[0]));
+                assert.ok(String(t.sync.waitingFor).includes('/replica/.git/index.lock'), 'the status says why the sync waits');
+                t.store.release();
+                await step;
+                assert.deepStrictEqual(t.ui.waits.slice(1), [undefined], 'the wait ends');
+                assert.strictEqual(t.remote.docs.get('/a.tex'), 'an edit\n');
+            } finally {
+                ReplicaSync.staleLockMs = saved;
+            }
+        });
     });
 
     it('finishes the steps without deletions while a question about others waits for an answer', async () => {
