@@ -3,10 +3,9 @@
 // variable CHROME names. Chrome picks its DevTools port itself, and the harness connects through
 // the endpoint that Chrome wrote into the profile (scripts/lib/devtools.mjs), so it drives only the
 // Chrome it started.
-import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { onCleanup } from '../lib/cleanup.mjs';
+import { onCleanup, spawnTied } from '../lib/cleanup.mjs';
 import { connect, evaluate, waitFor, waitForActivePort, waitForTarget, WaitLimitError } from '../lib/devtools.mjs';
 
 /** The last resort for a Chrome that runs but never opens DevTools and its first page; it opens them within a second or two. */
@@ -29,7 +28,8 @@ function forwardLines(stream, prefix) {
 /**
  * Start headless Chrome on a new profile in the folder `dir` and connect to its page. close()
  * stops Chrome and deletes the profile; when the script ends before that, its clean-up kills
- * Chrome and deletes the profile (scripts/lib/cleanup.mjs). Chrome's own messages go to this
+ * Chrome and deletes the profile (scripts/lib/cleanup.mjs), and when a SIGKILL ends the script,
+ * the kernel kills Chrome (spawnTied); the profile then stays. Chrome's own messages go to this
  * process's stderr, each line after "chrome: ".
  *
  * Chrome runs outside the caller's desktop session, as the test instance of the IDE does
@@ -40,7 +40,7 @@ function forwardLines(stream, prefix) {
 export async function launchChrome({ dir, width = 1200, height = 900 }) {
     const profile = fs.mkdtempSync(path.join(dir, 'chrome-profile-'));
     const home = path.join(profile, 'home');
-    const chrome = spawn(process.env.CHROME || 'google-chrome', [
+    const chrome = spawnTied(process.env.CHROME || 'google-chrome', [
         '--headless=new', `--user-data-dir=${profile}`, '--remote-debugging-port=0', '--password-store=basic',
         '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-background-networking',
         `--window-size=${width},${height}`, 'about:blank',

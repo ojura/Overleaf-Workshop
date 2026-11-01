@@ -2,13 +2,13 @@
 // write what they generate (test books, browser profiles, piece caches, screenshots, results).
 // Set PDF_VIEWER_HARNESS_WORK to choose the work folder; it defaults to pdf-viewer-harness in the
 // system's temporary folder, outside the checkout.
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { onCleanup } from '../lib/cleanup.mjs';
+import { onCleanup, spawnTied } from '../lib/cleanup.mjs';
 import { launchChrome } from './cdp.mjs';
 
 /** the harness's folder, scripts/pdf-viewer-harness/ */
@@ -22,7 +22,9 @@ fs.mkdirSync(work, { recursive: true });
 
 // Ctrl+C, and the SIGTERM of a time limit, end a script as scripts/lib/cleanup.mjs describes: the
 // command that it awaits fails, its finally blocks run, and the server and Chrome that it started
-// are stopped also when it ends without them.
+// are stopped also when it ends without them. When a SIGKILL ends the script, which no clean-up
+// outlives, the kernel kills the server and Chrome (spawnTied), and their folders stay in the work
+// folder.
 
 /** The value of the option `--name`, or `fallback`. */
 export const arg = (name, fallback) => {
@@ -93,13 +95,14 @@ export function bridgeModule() {
 /**
  * Start server.mjs on `port` with an empty piece cache of its own (piece-cache-<name>-<port> in the
  * work folder) and wait until it listens. stop() stops the server and deletes the piece cache; when the
- * script ends first, its clean-up kills the server and deletes the piece cache. `args` are
+ * script ends first, its clean-up kills the server and deletes the piece cache, and when a SIGKILL
+ * ends the script, the kernel kills the server (spawnTied); the piece cache then stays. `args` are
  * more options for server.mjs; `stderr: 'pipe'` lets the caller read the server's errors.
  */
 export async function startServer({ name, port, ext = defaultExt, bookDir = book(), latency = 20, args = [], stderr = 'inherit' }) {
     const cache = path.join(work, `piece-cache-${name}-${port}`);
     fs.rmSync(cache, { recursive: true, force: true });
-    const server = spawn(process.execPath, [path.join(here, 'server.mjs'), '--ext', ext, '--book', bookDir,
+    const server = spawnTied(process.execPath, [path.join(here, 'server.mjs'), '--ext', ext, '--book', bookDir,
         '--latency', String(latency), '--cache', cache, '--port', String(port), ...args], { stdio: ['ignore', 'pipe', stderr] });
     const cleanup = onCleanup(() => {
         server.kill('SIGKILL');

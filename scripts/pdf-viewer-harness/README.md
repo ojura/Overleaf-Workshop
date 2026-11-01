@@ -83,7 +83,9 @@ and `--port N` for the server. Scripts on different ports can run at the same ti
 each script is in its first comment.
 
 Each script starts its own server and Chrome, with a new Chrome profile and an empty piece cache,
-and stops both when it ends, also after Ctrl+C or a timeout. Chrome picks a free DevTools port
+and stops both when it ends, also after Ctrl+C or a timeout. When a SIGKILL ends the script, the
+kernel kills the server and Chrome, which run under `setpriv --pdeathsig KILL`; their profile and
+piece cache then stay in the work folder. Chrome picks a free DevTools port
 itself and writes it into its profile, and the script connects through what Chrome wrote there
 (`scripts/lib/devtools.mjs`), so it drives only the Chrome it started. Chrome's own messages go to
 the script's stderr, after `chrome: `. Generated files go to the work
