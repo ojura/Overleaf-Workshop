@@ -2,18 +2,11 @@
 // rejection with the test that was running when it came and the test that had ended before it,
 // since a rejection can come from work that an earlier test left behind, and at the end the number
 // of them. Mocha 12 handles only its own errors among unhandled rejections and passes the others on
-// to the process's other listeners; without one, they disappear without a trace.
+// to the process's other listeners; without one, they disappear without a trace. A run with an
+// unhandled rejection fails (exit status 1 when the tests passed), so that a new one cannot hide
+// among passing tests.
 'use strict';
 const util = require('node:util');
-
-/**
- * Whether an unhandled rejection fails the run. Not yet: src/test/compileWait.test.ts leaves
- * rejections with the reason undefined behind in each run (7 at 94fefaf; node:test's runner, when
- * it shared mocha's process, printed each of them twice, as 14 lines), and ow-sandbox, which owns
- * the compile code, is fixing that test. Once it is fixed, this becomes true, so that a new
- * unhandled rejection cannot hide.
- */
-const FAIL_THE_RUN = false;
 
 /** the test that runs now, and the one that ended last */
 let running;
@@ -43,7 +36,20 @@ process.on('unhandledRejection', (reason, promise) => {
 process.on('exit', () => {
     if (count === 0) { return; }
     process.stderr.write(`\n${count} unhandled rejection${count === 1 ? '' : 's'} in this run (listed above); each is a defect in the code or the test that caused it\n`);
-    if (FAIL_THE_RUN) { process.exitCode = 1; }
+});
+
+/** Exit status 1 for a run with an unhandled rejection, unless the run fails already. */
+const failTheRun = () => { if (count > 0) { process.exitCode ||= 1; } };
+// Mocha sets the run's exit status itself (lib/cli/run-helpers.cjs): with --exit before it calls
+// process.exit, and without --exit in an 'exit' listener that it adds when the run has ended, which
+// would overwrite a status set by an earlier listener. So failTheRun is the last 'exit' listener:
+// Node emits 'beforeExit' each time the event loop has run empty, which happens after mocha's run
+// has ended, and failTheRun moves to the end of the list there. With --exit, Node does not emit
+// 'beforeExit', and failTheRun, added here, runs after mocha has set the status.
+process.on('exit', failTheRun);
+process.on('beforeExit', () => {
+    process.removeListener('exit', failTheRun);
+    process.on('exit', failTheRun);
 });
 
 exports.mochaHooks = {
