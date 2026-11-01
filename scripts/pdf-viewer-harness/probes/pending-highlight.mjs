@@ -4,6 +4,7 @@
 import { notWithinLimit } from '../../lib/devtools.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 import { checker, openHarness } from '../common.mjs';
+import { SYNCTEX_HIGHLIGHT, viewerOf } from '../viewers.mjs';
 
 const options = scriptOptions({ ext: 'value', port: 'number' });
 
@@ -11,8 +12,8 @@ const h = await openHarness({ name: 'pending-highlight', port: options.get('port
 const { page } = h;
 const { check, summary } = checker();
 try {
-    const V = 'window.overleafViewer.wrapper.viewer';
-    const yellow = `[...document.querySelectorAll('.page > div, .pdfViewer > div')].some(d => d.style.backgroundColor === 'rgb(255, 255, 0)')`;
+    const V = viewerOf('overleaf');
+    const yellow = `(${SYNCTEX_HIGHLIGHT}) !== undefined`;
     // 1. before the first document: send the search as soon as the stub exists
     await page.send('Page.navigate', { url: `${h.origin}/page?engine=overleaf&doc=pending-probe` });
     await page.waitFor(`!!window.harness && !!window.overleafViewer`, 20000);

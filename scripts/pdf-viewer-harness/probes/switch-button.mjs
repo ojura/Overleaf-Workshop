@@ -2,6 +2,7 @@
 // Saves a screenshot as shots/switch-<engine>.png in the work folder.
 //   node probes/switch-button.mjs [--ext DIR] [--engine pdfjs|overleaf] [--port 8850]
 import { checker, openHarness, shotPath, themeBook } from '../common.mjs';
+import { buttonOf, pageDrawn } from '../viewers.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 
 const options = scriptOptions({ engine: 'value', ext: 'value', port: 'number' });
@@ -13,9 +14,8 @@ const { check, summary } = checker();
 try {
     await page.send('Page.navigate', { url: `${h.origin}/frame?engine=${engine}&doc=switch-${engine}` });
     await page.useFrame();
-    const V = engine === 'overleaf' ? 'window.overleafViewer.wrapper.viewer' : 'window.PDFViewerApplication.pdfViewer';
-    await page.waitFor(`${V.replaceAll('.', '?.')}?.getPageView(0)?.renderingState === 3`, 60000);
-    const button = engine === 'overleaf' ? `document.getElementById('switchViewer')` : `document.getElementById('switchViewerButton')`;
+    await page.waitFor(pageDrawn(engine, 1), 60000);
+    const button = buttonOf(engine, 'switchViewer');
     const shown = await page.evaluate(`(() => { const b = ${button}; if (!b) return null; const r = b.getBoundingClientRect(); return { text: b.textContent.trim(), title: b.title, visible: r.width > 0 && r.height > 0 }; })()`);
     check('the viewer shows the button to the other viewer', shown?.visible, JSON.stringify(shown));
     await page.screenshot(shotPath(`switch-${engine}.png`));

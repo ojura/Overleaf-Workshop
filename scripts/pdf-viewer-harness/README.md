@@ -59,6 +59,12 @@ request and as a plain page at 40 ms, and writes a table of the results.
 | `toolbar-shots.mjs` | the toolbar at pane widths from 1400 to 220 px, with the pdfjs viewer's find bar and tools menu, and what reaches past the edge |
 | `live.mjs` | a real build from a saved compile response (see below) |
 
+What the scripts know about the two viewer pages is in `viewers.mjs`, for the headless scripts and
+the IDE scripts alike: where a page keeps its viewer object, when a page counts as drawn, the ids
+of the buttons and toolbars, the SyncTeX highlight, and the functions that run in a page to show a
+page, to switch the color theme and wait until pdf.js reports the page drawn again, and to read a
+page's pixels with those that count as an image's.
+
 ## Requirements
 
 - Node 22.4 or later, for the global `fetch` and `WebSocket`.

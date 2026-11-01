@@ -5,6 +5,7 @@
 import { notWithinLimit } from '../../lib/devtools.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 import { checker, openHarness, shotPath } from '../common.mjs';
+import { OVERLEAF_DOCUMENTS, pageDrawn, pageInViewDrawn, RENDERING_FINISHED, viewerOf } from '../viewers.mjs';
 
 const options = scriptOptions({ ext: 'value', port: 'number' });
 
@@ -16,20 +17,20 @@ page.on('Runtime.consoleAPICalled', (p) => { if (p.type === 'error' || p.type ==
 page.on('Runtime.exceptionThrown', (p) => problems.push(`exception: ${p.exceptionDetails.exception?.description?.slice(0, 200)}`));
 try {
     await page.send('Page.navigate', { url: `${h.origin}/page?engine=overleaf&doc=errors-probe` });
-    const V = 'window.overleafViewer.wrapper.viewer';
-    await page.waitFor(`window.overleafViewer?.wrapper?.viewer?.getPageView(0)?.renderingState === 3`, 60000);
+    const V = viewerOf('overleaf');
+    await page.waitFor(pageDrawn('overleaf', 1), 60000);
     // 1. rapid reloads: b, a, b, a, b within a few ms; the last one must win and leave one document
     await page.evaluate(`window.__start = ${V}.pdfDocument; for (const b of ['b','a','b','a','b']) harness.load(b); true`);
-    await page.waitFor(`${V}.pdfDocument !== window.__start && window.overleafViewer.documents.inFlight === undefined`, 30000);
+    await page.waitFor(`${V}.pdfDocument !== window.__start && ${OVERLEAF_DOCUMENTS}.inFlight === undefined`, 30000);
     await new Promise(r => setTimeout(r, 1500));
-    const rapid = await page.evaluate(`({ shown: window.overleafViewer.documents.shownUrl.includes('0000000000000002') ? 'b' : 'a', documents: window.overleafViewer.documents.owned.size, rendered: ${V}.getPageView(${V}.currentPageNumber - 1).renderingState === 3 })`);
+    const rapid = await page.evaluate(`({ shown: ${OVERLEAF_DOCUMENTS}.shownUrl.includes('0000000000000002') ? 'b' : 'a', documents: ${OVERLEAF_DOCUMENTS}.owned.size, rendered: ${pageInViewDrawn('overleaf')} })`);
     check('rapid reloads: the last build is shown, drawn, with one document', rapid.shown === 'b' && rapid.documents === 1 && rapid.rendered, JSON.stringify(rapid));
     // 2. a build that is gone from the server (404)
     await page.evaluate(`(() => { const o = structuredClone(harness.builds.b); o.url = o.url.replace('0000000000000002', '00000000000000ff'); o.file.url = o.file.url.replace('0000000000000002', '00000000000000ff'); o.file.build = o.file.build.replace('0000000000000002', '00000000000000ff'); window.postMessage({ type: 'load', output: o }, '*'); return true; })()`);
     const banner = await page.waitFor(`(() => { const all = [...document.body.querySelectorAll('*')].filter(e => /no longer|Recompile|could not|failed/i.test(e.textContent) && e.children.length < 4 && e.offsetParent); return all.map(e => e.textContent.trim()).join(' | ').slice(0, 300); })()`, 20000).catch((error) => notWithinLimit(error) ?? { value: 'the page did not show a banner within 20 s' });
     check('a build that is gone from the server: the page shows a banner', banner.value && !banner.value.startsWith('the page did not show'), banner.value);
-    const stillShown = await page.evaluate(`({ pages: ${V}.pagesCount, rendered: ${V}.getPageView(${V}.currentPageNumber - 1)?.renderingState, documents: window.overleafViewer.documents.owned.size })`);
-    check('after the failed load, the viewer still shows the last build, with one document', stillShown.pages > 0 && stillShown.rendered === 3 && stillShown.documents === 1, JSON.stringify(stillShown));
+    const stillShown = await page.evaluate(`({ pages: ${V}.pagesCount, rendered: ${V}.getPageView(${V}.currentPageNumber - 1)?.renderingState, documents: ${OVERLEAF_DOCUMENTS}.owned.size })`);
+    check('after the failed load, the viewer still shows the last build, with one document', stillShown.pages > 0 && stillShown.rendered === RENDERING_FINISHED && stillShown.documents === 1, JSON.stringify(stillShown));
     await page.screenshot(shotPath('errors-missing-build.png'));
     // 3. the Recompile button posts 'recompile'
     const recompile = await page.evaluate(`(() => { const b = [...document.querySelectorAll('button')].find(b => /recompile/i.test(b.textContent)); if (!b) return 'the page does not show a Recompile button'; b.click(); return harness.messages('recompile').length; })()`);

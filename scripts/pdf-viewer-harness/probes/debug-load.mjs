@@ -4,6 +4,7 @@
 // --book is a folder of make_book.py or theme_book.py; the default is the 120-page test book.
 // It prints what it sees, for a person to read; its exit status says only whether it ran to its end.
 import { openHarness } from '../common.mjs';
+import { viewerIfAny } from '../viewers.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 
 const options = scriptOptions({ book: 'value', engine: 'value', ext: 'value', port: 'number' });
@@ -18,7 +19,7 @@ h.page.on('Runtime.exceptionThrown', (p) => logs.push(`exception: ${p.exceptionD
 try {
     await h.page.send('Page.navigate', { url: `${h.origin}/page?engine=${engine}&doc=debug` });
     await new Promise(r => setTimeout(r, 8000));
-    const V = engine === 'overleaf' ? 'window.overleafViewer?.wrapper?.viewer' : 'window.PDFViewerApplication?.pdfViewer';
+    const V = viewerIfAny(engine);
     console.log('state:', await h.page.evaluate(`JSON.stringify({ pages: ${V}?.pagesCount, r0: ${V}?.getPageView?.(0)?.renderingState, events: window.harness?.events?.slice(-15) })`));
 } finally {
     console.log('console:', logs.slice(0, 30).join('\n'));

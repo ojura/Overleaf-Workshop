@@ -16,7 +16,8 @@ import path from 'node:path';
 import { work } from '../common.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 import {
-    associatePdfs, instance, INSTANCE_OPTION, openWithQuickOpen, runCommand, settings, sleep, viewerPage, workbench,
+    associatePdfs, buttonOf, instance, INSTANCE_OPTION, openWithQuickOpen, pastRightEdge, PDFJS_POPUPS, runCommand, settings,
+    sleep, TOOLBAR, viewerPage, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, pdf: 'value', widths: 'value', out: 'value' });
@@ -44,17 +45,17 @@ try {
     const frame = await openWithQuickOpen(wb, path.resolve(pdf));
     view = await viewerPage(wb, frame);
     /** the elements in `selector`'s element whose right edge is past the pane's */
-    const past = (selector) => view.E(`(() => { const w = document.documentElement.clientWidth; const root = document.querySelector(${JSON.stringify(selector)}); return root ? [...root.querySelectorAll('*')].filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.right > w + 0.5 && getComputedStyle(e).visibility !== 'hidden'; }).map(e => e.id || e.className || e.tagName).slice(0, 5) : []; })()`);
+    const past = (selector) => view.E(pastRightEdge(selector));
     const shots = async (engine) => {
         for (const width of widths) {
             await wb.session.send('Emulation.setDeviceMetricsOverride', { width, height: 880, deviceScaleFactor: 1, mobile: false });
             await sleep(1200);
             const rect = await wb.E(`(() => { const f = [...document.querySelectorAll('iframe')].map(f => f.getBoundingClientRect()).filter(r => r.width > 100 && r.height > 100).sort((a, b) => b.width * b.height - a.width * a.height)[0]; return f && { x: f.left, y: f.top, w: f.width, h: f.height }; })()`);
-            const results = { toolbar: await past(engine === 'overleaf' ? '#toolbar' : '#toolbarContainer') };
+            const results = { toolbar: await past(TOOLBAR[engine]) };
             const s = await wb.session.send('Page.captureScreenshot', { format: 'png', clip: { x: rect.x, y: rect.y, width: rect.w, height: 40, scale: 1 } });
             fs.writeFileSync(path.join(outDir, `${engine}-${width}.png`), Buffer.from(s.data, 'base64'));
             if (engine === 'pdfjs') {
-                for (const [name, button, popup] of [['find bar', 'viewFindButton', '#findbar'], ['tools menu', 'secondaryToolbarToggleButton', '#secondaryToolbar']]) {
+                for (const [name, button, popup] of PDFJS_POPUPS) {
                     await view.E(`document.getElementById('${button}').click(); true`);
                     await sleep(400);
                     results[name] = await past(popup);
@@ -71,12 +72,11 @@ try {
     if (!first) { throw new Error('the viewer did not draw the page in view'); }
     console.log(`the ${first.engine} viewer shows the PDF`);
     await shots(first.engine);
-    const buttons = { pdfjs: 'switchViewerButton', overleaf: 'switchViewer' };
     const second = first.engine === 'pdfjs' ? 'overleaf' : 'pdfjs';
-    await view.E(`document.getElementById('${buttons[first.engine]}').click(); true`);
+    await view.E(`${buttonOf(first.engine, 'switchViewer')}.click(); true`);
     console.log(`switched to the ${second} viewer:`, !!(await view.drawn(second, 60000)));
     await shots(second);
-    await view.E(`document.getElementById('${buttons[second]}').click(); true`);
+    await view.E(`${buttonOf(second, 'switchViewer')}.click(); true`);
     console.log(`switched back to the ${first.engine} viewer:`, !!(await view.drawn(first.engine, 60000)));
     console.log(`screenshots in ${outDir}`);
 } catch (error) {

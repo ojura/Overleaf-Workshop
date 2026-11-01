@@ -6,8 +6,8 @@
 // Open output.pdf in the instance first, for example with Overleaf Workshop's View PDF command.
 import { scriptOptions } from '../../lib/options.mjs';
 import {
-    checker, instance, INSTANCE_OPTION, newestViewer, rafOnTimer, settings, sleep, viewerOf, waitUntil, windowDraws,
-    workbench,
+    buttonOf, checker, instance, INSTANCE_OPTION, newestViewer, rafOnTimer, settings, showPageFunction, sleep, viewerOf,
+    windowDraws, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION });
@@ -33,9 +33,7 @@ try {
     const frameId = async () => (await view.context())?.auxData?.frameId;
     /** show page n and wait until it is drawn, and until the viewer has saved its position */
     const goTo = async (engine, n) => {
-        const V = viewerOf(engine);
-        await view.E(`(() => { const v = ${V}; v.currentPageNumber = ${n}; ${draws ? '' : 'v.update();'} return true; })()`);
-        await waitUntil(() => view.E(`${V}.getPageView(${n - 1})?.renderingState === 3`), { what: `page ${n} drawn in the ${engine} viewer`, limitMs: 15000 });
+        await view.E(`(${showPageFunction(engine, 15000)})(${n})`);
         await sleep(800); // the viewers save their position 500 ms after a scroll
     };
 
@@ -47,14 +45,13 @@ try {
     if (!now) { throw new Error('the setting did not switch the viewer'); }
 
     // each viewer's button, at a page of its own: at 60 % and at 35 % of the document
-    const buttons = { pdfjs: 'switchViewerButton', overleaf: 'switchViewer' };
     for (const n of [Math.max(1, Math.round(pages * 0.6)), Math.max(1, Math.round(pages * 0.35))]) {
         const from = now.engine;
         const to = other(from);
         await goTo(from, n);
         const before = await view.E(`${viewerOf(from)}.currentPageNumber`);
         const beforeFrame = await frameId();
-        await view.E(`document.getElementById('${buttons[from]}').click(); true`);
+        await view.E(`${buttonOf(from, 'switchViewer')}.click(); true`);
         now = await view.drawn(to, 90000);
         check(`the ${from} viewer's button switches the PDF to the ${to} viewer, in the same tab`, !!now && (await frameId()) !== beforeFrame, now ? `${now.ms} ms` : 'timed out');
         check(`the setting now says ${to}`, config.get(SETTING) === to, String(config.get(SETTING)));

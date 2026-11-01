@@ -6,14 +6,14 @@
 // with the sandbox and allow lists of VS Code's webview, as VS Code does. Use another --port to
 // run two drives at once. Screenshots go to --shots, by default shots/<engine> in the
 // work folder (common.mjs); --json writes the measurements and checks to a file.
-// The checks that need the viewer's objects read them from window.overleafViewer in the Overleaf
-// viewer and from window.PDFViewerApplication in the pdfjs viewer.
+// The checks find the viewer's objects in the page through viewers.mjs.
 import fs from 'node:fs';
 import path from 'node:path';
 import { notWithinLimit } from '../lib/devtools.mjs';
 import { scriptOptions } from '../lib/options.mjs';
 import { launchChrome } from './cdp.mjs';
 import { book, checker, defaultExt, startServer, work } from './common.mjs';
+import { OVERLEAF_DOCUMENTS, pageDrawn, SYNCTEX_HIGHLIGHT, viewerIfAny, viewerOf } from './viewers.mjs';
 
 const options = scriptOptions({ ext: 'value', engine: 'value', frame: 'flag', latency: 'number', shots: 'value', port: 'number', json: 'value' });
 
@@ -35,10 +35,10 @@ const resetStats = () => fetch(`${origin}/stats/reset`, { method: 'POST' });
 const mb = (bytes) => `${(bytes / 1048576).toFixed(2)} MB`;
 const traffic = (s) => `${s.bridgeRequests} bridge requests, ${mb(s.bridgeBytes)} through the bridge; server: ${s.outputRequests} output requests (${s.outputWholeRequests} whole), ${s.contentRequests} pieces, ${mb(s.outputBytes + s.contentBytes)}`;
 
-const VIEWER = engine === 'overleaf' ? 'window.overleafViewer?.wrapper?.viewer' : 'window.PDFViewerApplication?.pdfViewer';
+const VIEWER = viewerIfAny(engine);
 /** the same, for assignments */
-const V = engine === 'overleaf' ? 'window.overleafViewer.wrapper.viewer' : 'window.PDFViewerApplication.pdfViewer';
-const rendered = (page) => `(() => { const v = ${VIEWER}; return !!v && v.pagesCount > 0 && v.getPageView(${page - 1})?.renderingState === 3; })()`;
+const V = viewerOf(engine);
+const rendered = (page) => pageDrawn(engine, page);
 
 const { page, close } = await launchChrome({ dir: work });
 const problems = [];
@@ -109,7 +109,7 @@ try {
     }
     await new Promise(r => setTimeout(r, 500));
     if (engine === 'overleaf') {
-        const alive = await page.evaluate('window.overleafViewer.documents.owned.size');
+        const alive = await page.evaluate(`${OVERLEAF_DOCUMENTS}.owned.size`);
         check('reload: the old document was destroyed', alive === 1, `${alive} document(s) with a worker`);
     }
     await page.screenshot(path.join(shots, '3-after-reload.png'));
@@ -123,16 +123,16 @@ try {
     measure('update: a PDF read whole is shown', traffic(s));
     if (engine === 'overleaf') {
         await new Promise(r => setTimeout(r, 500));
-        const alive = await page.evaluate('window.overleafViewer.documents.owned.size');
+        const alive = await page.evaluate(`${OVERLEAF_DOCUMENTS}.owned.size`);
         check('update: the replaced document was destroyed', alive === 1, `${alive} document(s) with a worker`);
     }
     // back to a build in ranges
     await page.evaluate(`harness.load('a'); true`);
-    await page.waitFor(`${VIEWER}.pdfDocument && ${VIEWER}.pagesCount === 120 && window.overleafViewer?.documents?.inFlight === undefined`, 60000);
+    await page.waitFor(`${VIEWER}.pdfDocument && ${VIEWER}.pagesCount === 120${engine === 'overleaf' ? ` && ${OVERLEAF_DOCUMENTS}.inFlight === undefined` : ''}`, 60000);
 
     // 5. SyncTeX from the source: a highlight on page 30
     await page.evaluate(`harness.syncCode([{ page: 30, h: 72, v: 110, width: 320, height: 14 }]); true`);
-    const highlight = await page.waitFor(`[...document.querySelectorAll('.pdfViewer > div, .pdfViewer .page > div')].some(d => d.style.backgroundColor === 'rgb(255, 255, 0)')`, 10000).catch(notWithinLimit);
+    const highlight = await page.waitFor(`(${SYNCTEX_HIGHLIGHT}) !== undefined`, 10000).catch(notWithinLimit);
     check('forward SyncTeX: the highlight is drawn', !!highlight);
     // the highlight scrolls smoothly: read the page once the scroll has settled
     let at = -1;
@@ -231,7 +231,7 @@ try {
     // 10. pdf.js's viewer only: what a search downloads
     if (engine === 'pdfjs') {
         await resetStats();
-        await page.evaluate(`window.PDFViewerApplication.eventBus.dispatch('find', { source: window, type: '', query: 'zebra', caseSensitive: false, entireWord: false, highlightAll: true, findPrevious: false, matchDiacritics: false }); true`);
+        await page.evaluate(`${V}.eventBus.dispatch('find', { source: window, type: '', query: 'zebra', caseSensitive: false, entireWord: false, highlightAll: true, findPrevious: false, matchDiacritics: false }); true`);
         await new Promise(r => setTimeout(r, 300));
         const consent = await page.evaluate(`(() => { const bar = document.getElementById('findConsent'); if (!bar) { return null; } const text = bar.textContent.trim().slice(0, 160); bar.querySelector('button')?.click(); return text; })()`);
         check('find: the viewer asks before a search downloads the PDF', consent !== null, consent ?? 'the viewer searched without asking');

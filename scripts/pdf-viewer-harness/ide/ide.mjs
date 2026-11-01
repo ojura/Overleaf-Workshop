@@ -10,8 +10,11 @@ import { onCleanup, sleep } from '../../lib/cleanup.mjs';
 import { answerWithin, evaluate, waitForTarget, waitUntil, notWithinLimit } from '../../lib/devtools.mjs';
 import { checkInstanceFolder, connectWindow, drawsExpression, instanceHome, readRunningInstance, workbenchTarget } from '../../lib/test-instance.mjs';
 import { checker } from '../common.mjs';
+import { ENGINE_OF_PAGE, pageInViewDrawn, viewerOf } from '../viewers.mjs';
 
 export { evaluate, waitUntil, notWithinLimit, onCleanup, sleep };
+/** What the drivers use of the viewer pages (../viewers.mjs). */
+export * from '../viewers.mjs';
 
 /** The option that every driver takes: --instance DIR, the instance's folder, else $HIDDEN_IDE_HOME. */
 export const INSTANCE_OPTION = { instance: 'value' };
@@ -201,12 +204,6 @@ export async function viewerFrames(wb) {
     return targetInfos.filter(isViewerFrame);
 }
 
-/** The viewer object of a page, by the viewer it runs: an expression for the page. */
-export const viewerOf = (engine) => engine === 'overleaf' ? 'window.overleafViewer.wrapper.viewer' : 'window.PDFViewerApplication.pdfViewer';
-
-/** Whether the page in view is drawn in the viewer `engine`: an expression that is false until the viewer has a document. */
-const pageInViewDrawn = (engine) => `(() => { const v = ${viewerOf(engine).replaceAll('.', '?.')}; return !!v && v.pagesCount > 0 && v.getPageView(v.currentPageNumber - 1)?.renderingState === 3; })()`;
-
 /** The webview does not show a viewer page at the moment, for example while a new page replaces the old one. */
 export class NoPageError extends Error {}
 
@@ -252,7 +249,7 @@ export async function viewerPage(wb, frameTarget, { beforeLoad } = {}) {
             throw error;
         }
     };
-    const engine = () => E(`window.overleafViewer ? 'overleaf' : window.PDFViewerApplication ? 'pdfjs' : undefined`)
+    const engine = () => E(ENGINE_OF_PAGE)
         .catch((error) => { if (error instanceof NoPageError) { return undefined; } throw error; });
     /**
      * Wait until the webview shows a viewer that has drawn the page in view (`want`: that viewer only),

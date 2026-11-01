@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { work } from '../common.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
-import { instance, INSTANCE_OPTION, newestViewer, workbench } from './ide.mjs';
+import { instance, INSTANCE_OPTION, newestViewer, showPageFunction, switchThemeFunction, workbench } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, page: 'number', out: 'value' });
 
@@ -20,15 +20,13 @@ fs.mkdirSync(path.dirname(prefix), { recursive: true });
 const wb = await workbench(instance(options));
 try {
     const { view, engine, V } = await newestViewer(wb);
-    const button = engine === 'overleaf' ? `document.getElementById('themeToggle')` : `document.getElementById('themeButton')`;
     const shots = await view.E(`(async () => {
-        const v = ${V}; const idx = ${page - 1};
-        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-        const drawn = async () => { for (let i = 0; i < 400; i++) { if (v.getPageView(idx)?.renderingState === 3) return true; await sleep(50); } return false; };
-        v.currentPageNumber = ${page}; v.update(); await drawn(); await sleep(300);
-        const name = () => ${button}.dataset.theme;
-        const toTheme = async (t) => { for (let i = 0; i < 4 && name() !== t; i++) { ${button}.click(); await sleep(300); await drawn(); await sleep(300); } };
-        const shot = () => { const p = v.getPageView(idx); const c = p.canvas || p.div.querySelector('canvas'); const s = document.createElement('canvas'); s.width = Math.round(c.width / 3); s.height = Math.round(c.height / 3); s.getContext('2d').drawImage(c, 0, 0, s.width, s.height); return { url: s.toDataURL('image/png'), classes: p.div.className, canvasParent: c.parentElement?.className, filter: getComputedStyle(c).filter, pageColors: JSON.stringify(v.pageColors ?? null), theme: JSON.stringify(globalThis.pdfjsViewerColorTheme ?? null) }; };
+        const v = ${V}; const n = ${page};
+        const showPage = ${showPageFunction(engine)};
+        const switchTheme = ${switchThemeFunction(engine)};
+        await showPage(n);
+        const toTheme = (theme) => switchTheme(n, theme);
+        const shot = () => { const p = v.getPageView(n - 1); const c = p.canvas || p.div.querySelector('canvas'); const s = document.createElement('canvas'); s.width = Math.round(c.width / 3); s.height = Math.round(c.height / 3); s.getContext('2d').drawImage(c, 0, 0, s.width, s.height); return { url: s.toDataURL('image/png'), classes: p.div.className, canvasParent: c.parentElement?.className, filter: getComputedStyle(c).filter, pageColors: JSON.stringify(v.pageColors ?? null), theme: JSON.stringify(globalThis.pdfjsViewerColorTheme ?? null) }; };
         await toTheme('default'); const plain = shot();
         await toTheme('dark'); const dark = shot();
         await toTheme('default');

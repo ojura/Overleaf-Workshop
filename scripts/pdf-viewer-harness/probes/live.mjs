@@ -11,6 +11,7 @@ import path from 'node:path';
 import { notWithinLimit } from '../../lib/devtools.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 import { checker, openHarness, themeBook } from '../common.mjs';
+import { pageInViewDrawn } from '../viewers.mjs';
 
 const options = scriptOptions({ engine: 'value', ext: 'value', port: 'number', project: 'value', response: 'value', seconds: 'number' });
 
@@ -33,7 +34,6 @@ const { check, summary } = checker();
 const logs = [];
 page.on('Runtime.consoleAPICalled', (p) => { if (p.type === 'error' || p.type === 'warning') { logs.push(`${p.type}: ${p.args.map(a => a.value ?? a.description).join(' ').slice(0, 2500)}`); } });
 page.on('Runtime.exceptionThrown', (p) => logs.push(`exception: ${(p.exceptionDetails.exception?.description ?? p.exceptionDetails.text).slice(0, 300)}`));
-const V = engine === 'overleaf' ? 'window.overleafViewer?.wrapper?.viewer' : 'window.PDFViewerApplication?.pdfViewer';
 try {
     // print the tags that Overleaf's loader adds to its errors (OError's _oErrorTags)
     await page.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => {
@@ -46,7 +46,7 @@ try {
     const t0 = Date.now();
     await page.send('Page.navigate', { url: `${h.origin}/frame?engine=${engine}&doc=live-${engine}` });
     await page.useFrame();
-    const ok = await page.waitFor(`(() => { const v = ${V}; return !!v && v.getPageView(v.currentPageNumber - 1)?.renderingState === 3; })()`, seconds * 1000, 200)
+    const ok = await page.waitFor(pageInViewDrawn(engine), seconds * 1000, 200)
         .then(() => true, (error) => notWithinLimit(error) ?? false);
     check(`the first page is drawn within ${seconds} s`, ok, ok ? `after ${Date.now() - t0} ms` : `still not drawn after ${seconds} s`);
 } catch (error) {

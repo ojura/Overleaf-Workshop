@@ -13,8 +13,8 @@
 // Open output.pdf in the instance first, for example with Overleaf Workshop's View PDF command.
 import { scriptOptions } from '../../lib/options.mjs';
 import {
-    checker, instance, INSTANCE_OPTION, notWithinLimit, rafOnTimer, reopenTab, sleep, viewerOf, viewerPage,
-    waitUntil, windowDraws, workbench,
+    checker, instance, INSTANCE_OPTION, pagePixelsFunction, rafOnTimer, reopenTab, showPageFunction, sleep, switchThemeFunction,
+    viewerOf, viewerPage, windowDraws, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, 'theme-page': 'number' });
@@ -46,57 +46,32 @@ try {
     check('pdf.js 5.1.91 in its own worker', info.version === '5.1.91' && info.workerPort && !info.fakeWorker);
     check('the build is loaded in ranges', info.whole === 'only parts are loaded');
 
-    /** show page n and wait until it is drawn; returns the time taken, or undefined when it is not drawn within limitMs */
-    const goTo = async (n, limitMs = 30000) => {
-        const t = Date.now();
-        await E(`${V}.currentPageNumber = ${n}; ${draws ? '' : `${V}.update();`} true`);
-        const done = await waitUntil(() => E(`${V}.getPageView(${n - 1})?.renderingState === 3`), { what: `page ${n} drawn`, limitMs }).catch(notWithinLimit);
-        return done && Date.now() - t;
-    };
+    /** show page n and wait until it is drawn: the time that took, or the error */
+    const goTo = (n) => E(`(${showPageFunction(shown.engine)})(${n})`).then(ms => ({ ms }), error => ({ error: error.message }));
     for (const target of [...new Set([Math.min(200, info.pages), info.pages])]) {
-        const ms = await goTo(target);
-        check(`jump to page ${target}: drawn`, ms !== undefined, `${ms ?? 'more than 30000'} ms`);
+        const jump = await goTo(target);
+        check(`jump to page ${target}: drawn`, !jump.error, jump.error ?? `${jump.ms} ms`);
     }
 
     if (themePage) {
-        const button = shown.engine === 'overleaf' ? `document.getElementById('themeToggle')` : `document.getElementById('themeButton')`;
-        const themeName = () => E(`${button}?.dataset.theme`);
-        const index = themePage - 1;
-        await goTo(themePage);
-        const nextTheme = async () => {
-            await E(`${button}.click(); true`);
-            await sleep(400);
-            for (let i = 0; i < 200; i++) { if (await E(`${V}.getPageView(${index})?.renderingState === 3`)) { break; } await sleep(50); }
-            await sleep(300);
-        };
-        // pixels on a grid of about 80 x 120, each with whether it counts as an image's
+        const toTheme = (theme) => E(`(${switchThemeFunction(shown.engine)})(${themePage}, ${JSON.stringify(theme)})`);
+        const shownPage = await goTo(themePage);
+        if (shownPage.error) { throw new Error(shownPage.error); }
+        // pixels on a grid of about 80 x 120, each with whether it counts as an image's (pagePixelsFunction)
         const sample = `(async () => {
-            const p = ${V}.getPageView(${index});
-            const c = p.canvas || p.div.querySelector('canvas');
-            const g = c.getContext('2d', { willReadFrequently: true });
-            const d = g.getImageData(0, 0, c.width, c.height).data;
-            const colored = (x, y) => { const i = (y * c.width + x) * 4; return Math.max(d[i], d[i + 1], d[i + 2]) - Math.min(d[i], d[i + 1], d[i + 2]) > 40; };
-            // the text layer's spans in canvas pixels, 2 px wider on each side
-            for (let i = 0; i < 100 && !p.div.querySelector('.textLayer span'); i++) { await new Promise(r => setTimeout(r, 50)); }
-            const cr = c.getBoundingClientRect(), sx = c.width / cr.width, sy = c.height / cr.height;
-            const text = [...p.div.querySelectorAll('.textLayer span')].map(s => s.getBoundingClientRect()).filter(r => r.width > 0)
-                .map(r => [(r.left - cr.left) * sx - 2, (r.top - cr.top) * sy - 2, (r.right - cr.left) * sx + 2, (r.bottom - cr.top) * sy + 2]);
-            const inText = (x, y) => text.some(([x0, y0, x1, y1]) => x >= x0 && x <= x1 && y >= y0 && y <= y1);
+            const { width, height, data, inImage } = await (${pagePixelsFunction(shown.engine)})(${themePage});
             const pts = [];
-            for (let y = 2; y < c.height - 1; y += Math.max(1, Math.floor(c.height / 120))) {
-                for (let x = 2; x < c.width - 1; x += Math.max(1, Math.floor(c.width / 80))) {
-                    const i = (y * c.width + x) * 4;
-                    let area = !inText(x, y);
-                    for (let dy = -1; dy <= 1 && area; dy++) { for (let dx = -1; dx <= 1 && area; dx++) { area = colored(x + dx, y + dy); } }
-                    pts.push([d[i], d[i + 1], d[i + 2], area]);
+            for (let y = 2; y < height - 1; y += Math.max(1, Math.floor(height / 120))) {
+                for (let x = 2; x < width - 1; x += Math.max(1, Math.floor(width / 80))) {
+                    const i = (y * width + x) * 4;
+                    pts.push([data[i], data[i + 1], data[i + 2], inImage(x, y)]);
                 }
             }
             return pts;
         })()`;
-        let guard = 0;
-        while ((await themeName()) !== 'default' && guard++ < 4) { await nextTheme(); }
+        await toTheme('default');
         const plain = await E(sample);
-        while ((await themeName()) !== 'dark' && guard++ < 8) { await nextTheme(); }
+        await toTheme('dark');
         const dark = await E(sample);
         let kept = 0, changed = 0, white = 0, background = 0;
         plain.forEach(([r, gr, b, inImage], i) => {
@@ -107,7 +82,7 @@ try {
         });
         check(`dark theme on page ${themePage}: the images' colored pixels keep their colors`, kept > 0 && changed <= kept * 0.02, `${kept} kept, ${changed} changed`);
         check(`dark theme on page ${themePage}: the white background takes the theme's color`, white > 0 && background >= white * 0.9, `${background} of ${white}`);
-        while ((await themeName()) !== 'default' && guard++ < 12) { await nextTheme(); }
+        await toTheme('default');
     }
     // the extension keeps the view's position; leave it at the start of the document
     await E(`${V}.currentPageNumber = 1; ${V}.container.scrollTop = 0; true`);

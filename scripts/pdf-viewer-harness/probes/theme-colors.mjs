@@ -4,6 +4,7 @@
 //   node probes/theme-colors.mjs [--ext DIR] [--engine pdfjs|overleaf] [--port 8790]
 // It prints the colors it counts, for a person to read; its exit status says only whether it ran to its end.
 import { openHarness, shotPath, themeBook } from '../common.mjs';
+import { buttonOf, pageDrawn, switchThemeFunction, viewerOf } from '../viewers.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 
 const options = scriptOptions({ engine: 'value', ext: 'value', port: 'number' });
@@ -16,8 +17,8 @@ page.on('Runtime.consoleAPICalled', (p) => { if (p.type === 'error' || p.type ==
 page.on('Runtime.exceptionThrown', (p) => problems.push(`exception: ${p.exceptionDetails.exception?.description?.slice(0, 200)}`));
 await page.send('Page.navigate', { url: `${h.origin}/frame?engine=${engine}&doc=theme-${engine}` });
 await page.useFrame();
-const V = engine === 'overleaf' ? 'window.overleafViewer.wrapper.viewer' : 'window.PDFViewerApplication.pdfViewer';
-await page.waitFor(`${V.replaceAll('.', '?.')}?.getPageView(0)?.renderingState === 3`, 60000);
+const V = viewerOf(engine);
+await page.waitFor(pageDrawn(engine, 1), 60000);
 
 // [x0, y0, x1, y1] in PDF points
 const areas = {
@@ -53,23 +54,10 @@ const sample = `(() => {
     }
     return out;
 })()`;
-const themeName = engine === 'overleaf'
-    ? `document.getElementById('themeToggle').dataset.theme`
-    : `document.getElementById('themeButton')?.dataset.theme`;
-const clickTheme = engine === 'overleaf'
-    ? `document.getElementById('themeToggle').click(); true`
-    : `document.getElementById('themeButton').click(); true`;
-
-const redrawn = async () => {
-    await new Promise(r => setTimeout(r, 300));
-    await page.waitFor(`${V}.getPageView(0).renderingState === 3`, 20000);
-    await new Promise(r => setTimeout(r, 300));
-};
-console.log(`theme ${await page.evaluate(themeName)}:`, JSON.stringify(await page.evaluate(sample), null, 1));
+console.log(`theme ${await page.evaluate(`${buttonOf(engine, 'theme')}?.dataset.theme`)}:`, JSON.stringify(await page.evaluate(sample), null, 1));
 for (let i = 0; i < 3; i++) {
-    await page.evaluate(clickTheme);
-    await redrawn();
-    const name = await page.evaluate(themeName);
+    // the next theme, once page 1 is drawn in it
+    const name = await page.evaluate(`(${switchThemeFunction(engine)})(1)`);
     console.log(`theme ${name}:`, JSON.stringify(await page.evaluate(sample), null, 1));
     await page.screenshot(shotPath(`theme-${engine}-${name}.png`));
 }

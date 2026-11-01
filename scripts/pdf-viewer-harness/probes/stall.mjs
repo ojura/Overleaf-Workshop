@@ -6,6 +6,7 @@
 //   node probes/stall.mjs [--ext DIR] [--latency 150] [--steps update,load,sync] [--port 8767]
 // It prints what it sees, for a person to read; its exit status says only whether it ran to its end.
 import { openHarness } from '../common.mjs';
+import { OVERLEAF_DOCUMENTS, pageDrawn, viewerOf } from '../viewers.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 
 const options = scriptOptions({ ext: 'value', latency: 'number', port: 'number', steps: 'value' });
@@ -17,8 +18,8 @@ page.on('Runtime.consoleAPICalled', (p) => problems.push(`${p.type}: ${p.args.ma
 page.on('Runtime.exceptionThrown', (p) => problems.push(`exception: ${p.exceptionDetails.exception?.description?.slice(0, 300)}`));
 try {
     await page.send('Page.navigate', { url: `${h.origin}/page?engine=overleaf&doc=stall` });
-    const V = 'window.overleafViewer.wrapper.viewer';
-    await page.waitFor(`window.overleafViewer?.wrapper?.viewer?.getPageView(0)?.renderingState === 3`, 60000);
+    const V = viewerOf('overleaf');
+    await page.waitFor(pageDrawn('overleaf', 1), 60000);
     const states = (pages) => page.evaluate(`JSON.stringify([${pages}].map(n => [n, ${V}.getPageView(n - 1)?.renderingState, !!document.querySelector('.page[data-page-number="' + n + '"] .textLayer span')]))`);
     const steps = options.get('steps', 'update,load,sync');
     if (steps.includes('update')) {
@@ -29,7 +30,7 @@ try {
     if (steps.includes('load')) {
         const build = steps.includes('update') ? 'a' : 'b';
         await page.evaluate(`window.__old = ${V}.pdfDocument; harness.load('${build}'); true`);
-        await page.waitFor(`${V}.pdfDocument !== window.__old && window.overleafViewer.documents.inFlight === undefined`, 60000);
+        await page.waitFor(`${V}.pdfDocument !== window.__old && ${OVERLEAF_DOCUMENTS}.inFlight === undefined`, 60000);
         console.log(`after load ${build}, current`, await page.evaluate(`${V}.currentPageNumber`), await states('1,2'));
     }
     if (steps.includes('sync')) {

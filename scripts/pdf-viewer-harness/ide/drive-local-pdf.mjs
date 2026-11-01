@@ -13,8 +13,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { scriptOptions } from '../../lib/options.mjs';
 import {
-    associatePdfs, checker, click, instance, INSTANCE_OPTION, key, notWithinLimit, openWithQuickOpen, rafOnTimer,
-    settings, sleep, viewerOf, viewerPage, waitUntil, windowDraws, workbench,
+    associatePdfs, checker, click, instance, INSTANCE_OPTION, key, openWithQuickOpen, rafOnTimer, settings, showPageFunction,
+    sleep, switchThemeFunction, viewerOf, viewerPage, windowDraws, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, pdf: 'value', pages: 'number', find: 'value', 'theme-book': 'flag' });
@@ -61,11 +61,8 @@ try {
     check(`${expectedPages} pages`, info.pages === expectedPages, `${info.pages}`);
 
     if (expectedPages > 1) {
-        const tJump = Date.now();
-        await E(`${V}.currentPageNumber = ${expectedPages}; true`);
-        const drawn = await waitUntil(() => E(`${V}.getPageView(${expectedPages - 1})?.renderingState === 3`), { what: `page ${expectedPages} drawn`, limitMs: 20000 })
-            .catch(notWithinLimit);
-        check(`jump to page ${expectedPages}: drawn`, !!drawn, `${Date.now() - tJump} ms`);
+        const jump = await E(`(${showPageFunction(engine, 20000)})(${expectedPages})`).then(ms => `${ms} ms`, error => ({ error: error.message }));
+        check(`jump to page ${expectedPages}: drawn`, !jump.error, jump.error ?? jump);
     }
 
     // the dark theme on the page of theme_book.py: the line takes the theme's text color, the
@@ -88,14 +85,11 @@ try {
             }
             return out;
         })()`;
-        const button = engine === 'overleaf' ? `document.getElementById('themeToggle')` : `document.getElementById('themeButton')`;
-        const name = () => E(`${button}?.dataset.theme`);
-        const next = async () => { await E(`${button}.click(); true`); await sleep(400); for (let i = 0; i < 100; i++) { if (await E(`${V}.getPageView(0)?.renderingState === 3`)) { break; } await sleep(50); } await sleep(300); };
-        let guard = 0;
-        while ((await name()) !== 'dark' && guard++ < 4) { await next(); }
+        const toTheme = (theme) => E(`(${switchThemeFunction(engine)})(1, ${JSON.stringify(theme)})`);
+        await toTheme('dark');
         const dark = await E(sample);
         check('dark theme: background, line and image as expected', dark.background === '#4b4b4b' && dark.blackLine === '#fbf0d9' && dark.imageBlue === '#0000ff' && dark.imageGreen === '#00ff00', JSON.stringify(dark));
-        while ((await name()) !== 'default' && guard++ < 8) { await next(); }
+        await toTheme('default');
     }
 
     // Ctrl+= zooms the PDF, and VS Code's window keeps its zoom

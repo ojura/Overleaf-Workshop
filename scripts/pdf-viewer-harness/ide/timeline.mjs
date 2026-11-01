@@ -4,7 +4,7 @@
 // --tab is the start of the tab's label, for another PDF's tab. When the tab is not open, or the
 // viewer page does not appear in the new webview, it prints the error and exits with 1.
 import { scriptOptions } from '../../lib/options.mjs';
-import { evaluate, instance, INSTANCE_OPTION, reopenTab, sleep, viewerPage, workbench } from './ide.mjs';
+import { ANY_VIEWER, evaluate, instance, INSTANCE_OPTION, reopenTab, sleep, viewerPage, workbench } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, seconds: 'number', tab: 'value' });
 
@@ -34,7 +34,7 @@ try {
         const note = (s) => window.__tl.push(Math.round(performance.now() - t0) + ' ' + s);
         window.addEventListener('message', (e) => { const d = e.data; if (d && typeof d.type === 'string' && d.type !== 'fetchResponse' && d.type !== 'fetchError') note('host -> ' + d.type + (d.output ? ' build ' + d.output.file?.build : '')); });
         const hook = () => {
-            const bus = window.overleafViewer?.wrapper?.eventBus ?? window.PDFViewerApplication?.eventBus;
+            const bus = ${ANY_VIEWER}?.eventBus;
             if (!bus) { setTimeout(hook, 20); return; }
             for (const name of ['pagesinit', 'pagesloaded', 'documentloaded', 'pagerender', 'pagerendered', 'scalechanging', 'pagechanging', 'documentinit']) {
                 bus.on(name, (x) => note(name + (x?.pageNumber ? ' p' + x.pageNumber : '') + (x?.scale ? ' scale ' + x.scale : '') + (x?.error ? ' error ' + x.error : '')));
@@ -47,7 +47,7 @@ try {
     let last = '';
     const end = Date.now() + seconds * 1000;
     while (Date.now() < end) {
-        const s = await evaluate(view.session, `(() => { const v = window.overleafViewer?.wrapper?.viewer ?? window.PDFViewerApplication?.pdfViewer; if (!v || !v.pagesCount) return 'the viewer has not shown a document yet'; const p = v.getPageView(v.currentPageNumber - 1); return 'page ' + v.currentPageNumber + ' state ' + p?.renderingState + ' task ' + !!p?.renderTask + ' doc ' + (v.pdfDocument?.fingerprints?.[0]?.slice(0, 8) ?? '-'); })()`, ctx.id).catch(e => 'evaluation failed: ' + e.message);
+        const s = await evaluate(view.session, `(() => { const v = ${ANY_VIEWER}; if (!v || !v.pagesCount) return 'the viewer has not shown a document yet'; const p = v.getPageView(v.currentPageNumber - 1); return 'page ' + v.currentPageNumber + ' state ' + p?.renderingState + ' task ' + !!p?.renderTask + ' doc ' + (v.pdfDocument?.fingerprints?.[0]?.slice(0, 8) ?? '-'); })()`, ctx.id).catch(e => 'evaluation failed: ' + e.message);
         if (s !== last) { log.push(`${at()} ${s}`); last = s; }
         await sleep(100);
     }
