@@ -7,12 +7,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { onCleanup, sleep } from '../../lib/cleanup.mjs';
-import { answerWithin, clickAt, evaluate, notWithinLimit, pressKey, waitForTarget, waitUntil } from '../../lib/devtools.mjs';
+import { answerWithin, clickAt, evaluate, notWithinLimit, pressKey, waitForTarget, waitUntil, whenTruthy } from '../../lib/devtools.mjs';
 import { checkInstanceFolder, connectWindow, drawsExpression, instanceHome, readRunningInstance, workbenchTarget } from '../../lib/test-instance.mjs';
 import { checker } from '../common.mjs';
 import { ENGINE_OF_PAGE, pageInViewDrawn, viewerOf } from '../viewers.mjs';
 
-export { clickAt, evaluate, notWithinLimit, onCleanup, pressKey, sleep, waitUntil };
+export { clickAt, evaluate, notWithinLimit, onCleanup, pressKey, sleep, waitUntil, whenTruthy };
 /** What the drivers use of the viewer pages (../viewers.mjs). */
 export * from '../viewers.mjs';
 
@@ -87,40 +87,60 @@ export async function workbench(inst) {
     }
 }
 
-/** Run a command of the Command Palette by its title; returns whether the palette found it. */
+/** Whether Quick Open or the Command Palette is shown: an expression that is undefined while it is not. */
+export const QUICK_INPUT_SHOWN = `(() => { const w = document.querySelector('.quick-input-widget'); return !!w && getComputedStyle(w).display !== 'none' ? true : undefined; })()`;
+/** Whether Quick Open and the Command Palette are hidden: an expression that is undefined while one is shown. */
+export const QUICK_INPUT_HIDDEN = `(() => { const w = document.querySelector('.quick-input-widget'); return !w || getComputedStyle(w).display === 'none' ? true : undefined; })()`;
+/**
+ * How long the Command Palette gets to list a command after its title was typed: the list follows
+ * the typed text within a frame or two, and a command that it does not list by then is taken as
+ * not offered.
+ */
+const PALETTE_LIST_LIMIT_MS = 2000;
+
+/** Run a command of the Command Palette by its title; returns whether the palette offered it. */
 export async function runCommand(wb, title) {
     await pressKey(wb.session, 'Ctrl+Shift+P');
-    await sleep(400);
-    await wb.session.send('Input.insertText', { text: title });
-    await sleep(500);
-    const selected = await wb.E(`document.querySelector('.quick-input-widget .quick-input-list .monaco-list-row.focused')?.textContent ?? ''`);
-    if (!selected.toLowerCase().includes(title.toLowerCase())) {
-        await pressKey(wb.session, 'Escape');
-        return false;
+    if (!(await untilInPage(wb, `document.activeElement?.closest('.quick-input-widget') ? true : undefined`))) {
+        throw new Error(`the Command Palette did not take the keyboard focus within ${WORKBENCH_CHANGE_LIMIT_MS / 1000} s of Ctrl+Shift+P`);
     }
-    await pressKey(wb.session, 'Enter');
-    await sleep(500);
-    return true;
+    await wb.session.send('Input.insertText', { text: title });
+    const offered = await untilInPage(wb, `(document.querySelector('.quick-input-widget .quick-input-list .monaco-list-row.focused')?.textContent ?? '').toLowerCase().includes(${JSON.stringify(title.toLowerCase())}) ? true : undefined`, PALETTE_LIST_LIMIT_MS);
+    await pressKey(wb.session, offered ? 'Enter' : 'Escape');
+    if (!(await untilInPage(wb, QUICK_INPUT_HIDDEN))) {
+        throw new Error(`the Command Palette is still shown ${WORKBENCH_CHANGE_LIMIT_MS / 1000} s after ${offered ? 'Enter' : 'Escape'}`);
+    }
+    return !!offered;
 }
 
-/** Give the workbench the keyboard focus with a click on its title bar (or its status bar). */
+/** Give the workbench the keyboard focus with a click on its title bar (or its status bar), and wait until a webview no longer has it. */
 export async function focusWorkbench(wb) {
     const bar = await wb.E(`(() => { const s = document.querySelector('.part.titlebar') || document.querySelector('.statusbar'); const r = s.getBoundingClientRect(); return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
     await clickAt(wb.session, bar.x, bar.y);
-    await sleep(200);
+    if (!(await untilInPage(wb, `document.activeElement?.tagName !== 'IFRAME' ? true : undefined`))) {
+        throw new Error(`the workbench did not take the keyboard focus within ${WORKBENCH_CHANGE_LIMIT_MS / 1000} s of a click on its title bar`);
+    }
 }
+
+/**
+ * How long VS Code gets to read a change of settings.json: it reads the file when its file watcher
+ * reports the change, and the workbench's page does not show when that has happened, so this is a
+ * wait of a fixed time.
+ */
+const SETTINGS_READ_MS = 1500;
 
 /**
  * Open *.pdf files in the extension's viewer, through workbench.editorAssociations in the
  * instance's settings: the viewer's own selector takes only PDFs of the extension's file system.
  * Returns a function that restores the setting, which also runs when the script ends otherwise.
+ * A viewer that does not open after the change shows as openWithQuickOpen's failure.
  */
 export async function associatePdfs(config) {
     const name = 'workbench.editorAssociations';
     const before = config.get(name);
     if (before?.['*.pdf'] === 'overleaf-workshop.pdfViewer') { return () => {}; }
     const restore = config.change(name, { ...(before ?? {}), '*.pdf': 'overleaf-workshop.pdfViewer' });
-    await sleep(1500);
+    await sleep(SETTINGS_READ_MS);
     return restore;
 }
 
@@ -134,21 +154,11 @@ const VIEWER_OPEN_LIMIT_MS = 15000;
 
 /**
  * The value of `condition`, an expression for the workbench page, once it is truthy: the page
- * evaluates it again on each change of its DOM (a MutationObserver). After `limitMs` the page
- * answers undefined.
+ * evaluates it again on each change of its DOM and of its focus (whenTruthy in
+ * scripts/lib/devtools.mjs). After `limitMs` the page answers undefined.
  */
-function untilInPage(wb, condition, limitMs = WORKBENCH_CHANGE_LIMIT_MS) {
-    return wb.E(`new Promise((resolve) => {
-        const value = () => (${condition});
-        let observer;
-        let timer;
-        const done = (result) => { observer?.disconnect(); clearTimeout(timer); resolve(result); };
-        const first = value();
-        if (first) { done(first); return; }
-        observer = new MutationObserver(() => { const now = value(); if (now) { done(now); } });
-        observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true });
-        timer = setTimeout(() => done(undefined), ${Number(limitMs)});
-    })`);
+export function untilInPage(wb, condition, limitMs = WORKBENCH_CHANGE_LIMIT_MS) {
+    return wb.E(whenTruthy(condition, limitMs));
 }
 
 /**
@@ -290,21 +300,15 @@ export async function closeTab(wb, label) {
 
 /**
  * Close the editor tab with a label that starts with `label`, reopen it with View: Reopen Closed
- * Editor, and return the new viewer webview's target; undefined when the tab was not open, or
- * when it did not open again within `timeoutMs`.
+ * Editor, and return the new viewer webview's target, from the targets or the event of its
+ * creation; undefined when the tab was not open, or when it did not open again within `timeoutMs`.
  */
 export async function reopenTab(wb, label, timeoutMs = 10000) {
     const before = new Set((await viewerFrames(wb)).map(t => t.targetId));
     if (!(await closeTab(wb, label))) { return undefined; }
     await focusWorkbench(wb);
     await pressKey(wb.session, 'Ctrl+Shift+T');
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeoutMs) {
-        const frame = (await viewerFrames(wb)).find(t => !before.has(t.targetId));
-        if (frame) { return frame; }
-        await sleep(30);
-    }
-    return undefined;
+    return waitForTarget(wb.browser, (t) => isViewerFrame(t) && !before.has(t.targetId), { what: `a viewer of ${label}`, limitMs: timeoutMs }).catch(notWithinLimit);
 }
 
 /** Whether the window draws (drawsExpression in scripts/lib/test-instance.mjs). */

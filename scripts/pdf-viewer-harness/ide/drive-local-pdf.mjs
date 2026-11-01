@@ -16,9 +16,9 @@ import path from 'node:path';
 import { scriptOptions } from '../../lib/options.mjs';
 import { bookFacts } from '../common.mjs';
 import {
-    areaColorsFunction, associatePdfs, checker, clickAt, instance, INSTANCE_OPTION, openWithQuickOpen, pressKey, rafOnTimer, settings,
-    PDFJS_VERSION, showPageFunction, sleep, switchThemeFunction, themeColors, THEMES_SETTING, viewerOf, viewerPage, windowDraws,
-    workbench,
+    areaColorsFunction, associatePdfs, checker, clickAt, instance, INSTANCE_OPTION, openWithQuickOpen, PDFJS_VERSION,
+    popupShown, pressKey, QUICK_INPUT_HIDDEN, QUICK_INPUT_SHOWN, rafOnTimer, settings, showPageFunction, switchThemeFunction,
+    themeColors, THEMES_SETTING, untilInPage, viewerOf, viewerPage, whenTruthy, windowDraws, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, pdf: 'value', pages: 'number', find: 'value', 'theme-book': 'flag' });
@@ -97,9 +97,12 @@ try {
     // Ctrl+= zooms the PDF, and VS Code's window keeps its zoom
     const area = await E(`(() => { const r = ${V}.container.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
     const outer = await wb.E(`(() => { const f = [...document.querySelectorAll('iframe')].map(f => f.getBoundingClientRect()).filter(r => r.width > 200).sort((a, b) => b.width * b.height - a.width * a.height)[0]; return { x: f.left, y: f.top }; })()`);
-    const intoViewer = () => clickAt(wb.session, outer.x + area.x, outer.y + area.y);
+    /** a click in the viewer, which gives its webview the keyboard focus */
+    const intoViewer = async () => {
+        await clickAt(wb.session, outer.x + area.x, outer.y + area.y);
+        if (!(await untilInPage(wb, `document.activeElement?.tagName === 'IFRAME' ? true : undefined`))) { throw new Error('the viewer\'s webview did not take the keyboard focus after a click in it'); }
+    };
     await intoViewer();
-    await sleep(300);
     const scale0 = await E(`${V}.currentScale`);
     // the IDE zooms its window with Electron's webFrame, which changes the workbench page's
     // devicePixelRatio (View: Zoom In took it from 1 to 1.2) and leaves CSS zoom at 1
@@ -116,33 +119,26 @@ try {
     await pressKey(wb.session, 'Ctrl+-');
     await E('window.__scaleChange');
 
-    // Ctrl+P in the viewer opens Quick Open
+    // Ctrl+P in the viewer opens Quick Open; 3 s is the last resort, as the first Quick Open of a window takes longer
     await intoViewer();
-    await sleep(300);
     await pressKey(wb.session, 'Ctrl+P');
-    // the first Quick Open of a window takes longer
-    let quick = false;
-    for (let i = 0; i < 30 && !quick; i++) {
-        await sleep(100);
-        quick = await wb.E(`(() => { const w = document.querySelector('.quick-input-widget'); return !!w && getComputedStyle(w).display !== 'none'; })()`);
-    }
+    const quick = !!(await untilInPage(wb, QUICK_INPUT_SHOWN, 3000));
     check('Ctrl+P in the viewer opens Quick Open', quick);
     await pressKey(wb.session, 'Escape');
-    await sleep(300);
+    await untilInPage(wb, QUICK_INPUT_HIDDEN);
 
     // find, in a PDF read whole (the pdfjs viewer only)
     if (engine === 'pdfjs') {
         await intoViewer();
-        await sleep(200);
         await pressKey(wb.session, 'Ctrl+F');
-        await sleep(500);
-        const findOpen = await E(`(() => { const b = document.getElementById('findbar'); return !!b && !b.classList.contains('hidden'); })()`);
+        const findOpen = !!(await E(whenTruthy(popupShown('#findbar'), 5000)));
         check('Ctrl+F in the viewer opens pdf.js\'s find bar', findOpen);
         if (findOpen && !findText) {
             check('find finds a text without asking first', false, 'there is no text to look for: give --find TEXT');
         } else if (findOpen) {
             await view.session.send('Input.insertText', { text: findText });
-            await sleep(1500);
+            // the find bar shows the count of matches once the search has some, and the question before a download when it asks
+            await E(whenTruthy(`document.getElementById('findResultsCount')?.textContent.trim() || document.getElementById('findConsent') ? true : undefined`, 5000));
             const count = await E(`(() => { const c = PDFViewerApplication.findController; return { matches: c?._matchesCountTotal ?? null, consent: !!document.getElementById('findConsent') }; })()`);
             check(`find finds "${findText}" without asking first (the PDF is read whole)`, (count.matches ?? 0) > 0 && !count.consent, JSON.stringify(count));
             await pressKey(wb.session, 'Escape');

@@ -384,3 +384,28 @@ export async function clickAt(session, x, y) {
         await session.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
     }
 }
+
+/**
+ * An expression for a page that settles with the value of the expression `condition` once it is
+ * truthy, and with undefined after `limitMs`. The page evaluates `condition` at once and again on
+ * each change of its DOM (a MutationObserver on the document, with attributes and text) and of
+ * its focus (focusin and focusout in the document, blur and focus of the window), which do not
+ * change the DOM.
+ */
+export const whenTruthy = (condition, limitMs) => `new Promise((resolve) => {
+    const value = () => (${condition});
+    const first = value();
+    if (first) { resolve(first); return; }
+    const look = () => { const now = value(); if (now) { done(now); } };
+    const observer = new MutationObserver(look);
+    const focusEvents = [[document, 'focusin'], [document, 'focusout'], [window, 'blur'], [window, 'focus']];
+    const done = (result) => {
+        observer.disconnect();
+        focusEvents.forEach(([target, type]) => target.removeEventListener(type, look, true));
+        clearTimeout(timer);
+        resolve(result);
+    };
+    observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true });
+    focusEvents.forEach(([target, type]) => target.addEventListener(type, look, true));
+    const timer = setTimeout(() => done(undefined), ${Number(limitMs)});
+})`;

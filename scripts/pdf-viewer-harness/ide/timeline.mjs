@@ -20,6 +20,8 @@ try {
     view.session.on('Runtime.consoleAPICalled', (p) => log.push(`${at()} console.${p.type}: ${p.args.map(a => a.value ?? a.description).join(' ').slice(0, 260).replace(/\n/g, ' | ')}`));
     view.session.on('Runtime.exceptionThrown', (p) => log.push(`${at()} exception: ${(p.exceptionDetails.exception?.description ?? p.exceptionDetails.text).slice(0, 260)}`));
     log.push(`${at()} attached to the viewer's webview`);
+    // VS Code renames the webview's inner frame from pending-frame to active-frame without an
+    // event that DevTools reports, so the script looks for the page's context every 20 ms
     let ctx;
     while (!(ctx = await view.context()) && Date.now() - t0 < 15000) { await sleep(20); }
     if (!ctx) {

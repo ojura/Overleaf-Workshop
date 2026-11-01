@@ -14,8 +14,8 @@
 // Open output.pdf in the instance first, for example with Overleaf Workshop's View PDF command.
 import { scriptOptions } from '../../lib/options.mjs';
 import {
-    checker, instance, INSTANCE_OPTION, pagePixelsFunction, PDFJS_VERSION, rafOnTimer, reopenTab, settings, showPageFunction, sleep,
-    switchThemeFunction, themeColors, THEMES_SETTING, viewerOf, viewerPage, windowDraws, workbench,
+    checker, instance, INSTANCE_OPTION, pagePixelsFunction, PDFJS_VERSION, POSITION_SAVE_MS, rafOnTimer, reopenTab, settings,
+    showPageFunction, sleep, switchThemeFunction, themeColors, THEMES_SETTING, viewerOf, viewerPage, windowDraws, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, 'theme-page': 'number' });
@@ -89,7 +89,7 @@ try {
     }
     // the extension keeps the view's position; leave it at the start of the document
     await E(`${V}.currentPageNumber = 1; ${V}.container.scrollTop = 0; true`);
-    await sleep(1500);
+    await sleep(POSITION_SAVE_MS);
 } catch (error) {
     check('run', false, String(error?.message ?? error));
 } finally {

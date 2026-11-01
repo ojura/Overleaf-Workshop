@@ -6,8 +6,8 @@
 // Open output.pdf in the instance first, for example with Overleaf Workshop's View PDF command.
 import { scriptOptions } from '../../lib/options.mjs';
 import {
-    buttonOf, checker, ENGINE_SETTING, engineOfSetting, instance, INSTANCE_OPTION, newestViewer, otherEngine, rafOnTimer, settings,
-    showPageFunction, sleep, viewerOf, windowDraws, workbench,
+    buttonOf, checker, ENGINE_SETTING, engineOfSetting, instance, INSTANCE_OPTION, newestViewer, otherEngine, POSITION_SAVE_MS,
+    rafOnTimer, settings, showPageFunction, sleep, untilPageFunction, viewerOf, windowDraws, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION });
@@ -29,11 +29,8 @@ try {
 
     /** the inner frame's id, which changes when the webview loads a new page */
     const frameId = async () => (await view.context())?.auxData?.frameId;
-    /** show page n and wait until it is drawn, and until the viewer has saved its position */
-    const goTo = async (engine, n) => {
-        await view.E(`(${showPageFunction(engine, 15000)})(${n})`);
-        await sleep(800); // the viewers save their position 500 ms after a scroll
-    };
+    /** show page n and wait until it is drawn; a viewer's switch button saves the position at once */
+    const goTo = (engine, n) => view.E(`(${showPageFunction(engine, 15000)})(${n})`);
 
     // the setting
     const target = otherEngine(start.engine);
@@ -54,7 +51,8 @@ try {
         check(`the ${from} viewer's button switches the PDF to the ${to} viewer, in the same tab`, !!now && (await frameId()) !== beforeFrame, now ? `${now.ms} ms` : 'timed out');
         check(`the setting now says ${to}`, config.get(ENGINE_SETTING) === to, String(config.get(ENGINE_SETTING)));
         if (!now) { throw new Error('the button did not switch the viewer'); }
-        await sleep(800);
+        // the new viewer restores the saved position, possibly after it drew its first page
+        await view.E(`(${untilPageFunction(to)})(${before}, 5000)`);
         const at = await view.E(`${viewerOf(to)}.currentPageNumber`);
         check(`the ${to} viewer opens at the page the ${from} viewer showed`, at === before, `${before} -> ${at}`);
         if (to === 'overleaf') {
@@ -62,7 +60,9 @@ try {
             check('the Overleaf viewer loads the build in ranges', ranges === 'ranges', ranges);
         }
     }
+    // leave the PDF at its first page, where the extension then keeps it
     await goTo(now.engine, 1);
+    await sleep(POSITION_SAVE_MS);
 } catch (error) {
     check('run', false, String(error?.message ?? error));
 } finally {

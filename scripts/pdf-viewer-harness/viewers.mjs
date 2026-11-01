@@ -215,6 +215,29 @@ export const showPageFunction = (engine, limitMs = DRAW_LIMIT_MS) => `(async (pa
 })`;
 
 /**
+ * The source of an async function for a page of the viewer `engine`, (pageNumber, limitMs) =>
+ * whether the viewer shows page `pageNumber` as its current page within `limitMs`: at once, or
+ * when pdf.js's event bus reports the change of page ('pagechanging'), as when a viewer that
+ * opened restores its saved position.
+ */
+export const untilPageFunction = (engine) => `((pageNumber, limitMs) => new Promise((resolve) => {
+    const viewer = ${viewerOf(engine)};
+    if (viewer.currentPageNumber === pageNumber) { resolve(true); return; }
+    const changed = (event) => { if (event.pageNumber === pageNumber) { done(true); } };
+    const done = (result) => { clearTimeout(timer); viewer.eventBus.off('pagechanging', changed); resolve(result); };
+    const timer = setTimeout(() => done(false), limitMs);
+    viewer.eventBus.on('pagechanging', changed);
+}))`;
+
+/**
+ * How long a driver in the IDE waits for a viewer to save its position after a scroll: the
+ * viewers send saveState to the host 500 ms after the last scroll, and the host's side, which keeps
+ * it for the next viewer of the PDF, is not visible from the page, so this is a wait of a fixed
+ * time. A switch with a viewer's button saves the position at once and needs no wait.
+ */
+export const POSITION_SAVE_MS = 1000;
+
+/**
  * The source of an async function for a page of the viewer `engine`, (pageNumber, theme) => the
  * name of the theme now: it clicks the viewer's theme button and waits until page `pageNumber`,
  * which must be in view, is drawn again, once when `theme` is undefined, else until the button

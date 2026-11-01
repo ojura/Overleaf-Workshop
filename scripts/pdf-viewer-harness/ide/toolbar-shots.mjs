@@ -16,8 +16,8 @@ import path from 'node:path';
 import { work } from '../common.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 import {
-    associatePdfs, buttonOf, ENGINE_SETTING, instance, INSTANCE_OPTION, openWithQuickOpen, otherEngine, pastRightEdge, PDFJS_POPUPS,
-    runCommand, settings, sleep, TOOLBAR, viewerPage, workbench,
+    armResizeWait, associatePdfs, buttonOf, ENGINE_SETTING, instance, INSTANCE_OPTION, openWithQuickOpen, otherEngine,
+    pastRightEdge, PDFJS_POPUPS, popupShown, runCommand, settings, TOOLBAR, viewerPage, whenTruthy, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, pdf: 'value', widths: 'value', out: 'value' });
@@ -45,10 +45,18 @@ try {
     view = await viewerPage(wb, frame);
     /** the elements in `selector`'s element whose right edge is past the pane's */
     const past = (selector) => view.E(pastRightEdge(selector));
+    /**
+     * apply `change` to the window, and wait until the viewer page has laid out at its new size:
+     * the workbench lays out the editor and then resizes the webview, whose page gets a resize event
+     */
+    const resized = async (change) => {
+        await view.E(armResizeWait());
+        await change();
+        if (!(await view.E('window.__resized'))) { console.log('the viewer page did not report a resize within 5 s'); }
+    };
     const shots = async (engine) => {
         for (const width of widths) {
-            await wb.session.send('Emulation.setDeviceMetricsOverride', { width, height: 880, deviceScaleFactor: 1, mobile: false });
-            await sleep(1200);
+            await resized(() => wb.session.send('Emulation.setDeviceMetricsOverride', { width, height: 880, deviceScaleFactor: 1, mobile: false }));
             const rect = await wb.E(`(() => { const f = [...document.querySelectorAll('iframe')].map(f => f.getBoundingClientRect()).filter(r => r.width > 100 && r.height > 100).sort((a, b) => b.width * b.height - a.width * a.height)[0]; return f && { x: f.left, y: f.top, w: f.width, h: f.height }; })()`);
             const results = { toolbar: await past(TOOLBAR[engine]) };
             const s = await wb.session.send('Page.captureScreenshot', { format: 'png', clip: { x: rect.x, y: rect.y, width: rect.w, height: 40, scale: 1 } });
@@ -56,7 +64,7 @@ try {
             if (engine === 'pdfjs') {
                 for (const [name, button, popup] of PDFJS_POPUPS) {
                     await view.E(`document.getElementById('${button}').click(); true`);
-                    await sleep(400);
+                    await view.E(whenTruthy(popupShown(popup), 5000));
                     results[name] = await past(popup);
                     await view.E(`document.getElementById('${button}').click(); true`);
                 }
@@ -64,8 +72,7 @@ try {
             problems += Object.values(results).reduce((n, list) => n + list.length, 0);
             console.log(`${engine}: window ${width} px, pane ${Math.round(rect.w)} px; past the right edge: ${Object.entries(results).map(([name, list]) => `${name} ${JSON.stringify(list)}`).join(', ')}`);
         }
-        await wb.session.send('Emulation.clearDeviceMetricsOverride');
-        await sleep(800);
+        await resized(() => wb.session.send('Emulation.clearDeviceMetricsOverride'));
     };
     const first = await view.drawn(undefined, 60000);
     if (!first) { throw new Error('the viewer did not draw the page in view'); }
