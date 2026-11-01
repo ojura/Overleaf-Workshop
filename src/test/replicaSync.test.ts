@@ -572,6 +572,36 @@ describe('ReplicaSync', () => {
             assert.strictEqual(t.remote.docs.get('/a.tex'), text, 'Overleaf keeps its text');
         });
 
+        it('logs where it kept a local version aside when the check before the download stops the step after the copy', async () => {
+            const t = setup();
+            const store = new LockedStore();
+            store.lock = undefined;
+            // without saved state, both sides differ: Overleaf's version goes in place, and the local one is kept aside
+            t.remote.docs.set('/a.tex', text);
+            t.local.set('/a.tex', text + 'unsaved local work\n');
+            // Each copy has its own path. Right after the first copy, git takes its lock and replaces
+            // the file, as `git checkout -- a.tex` does.
+            let copies = 0;
+            store.keepCopy = async (path: string, content: Uint8Array) => {
+                const copy = `/.overleaf/conflicts/${++copies}${path}`;
+                store.copies.set(copy, content);
+                if (copies === 1) {
+                    store.lock = '/replica/.git/index.lock';
+                    t.local.set('/a.tex', text + 'written by git during its lock\n');
+                }
+                return copy;
+            };
+            const sync = new ReplicaSync(t.remote, t.local, store, t.ui, (p: string) => p.endsWith('.aux'));
+            const run = sync.syncAll();
+            await Promise.race([run, store.waitStarted]);
+            store.release();
+            const summary = await run;
+            assert.ok(t.ui.logs.some(line => line.includes('/.overleaf/conflicts/1/a.tex')), 'the log says where the first copy is');
+            assert.deepStrictEqual(summary.keptAside, [{ path: '/a.tex', copy: '/.overleaf/conflicts/2/a.tex' }], 'the copy of git\'s version, from the reconcile run again');
+            assert.deepStrictEqual([...store.copies.values()].map(copy => dec(copy)), [text + 'unsaved local work\n', text + 'written by git during its lock\n']);
+            assert.strictEqual(t.local.text('/a.tex'), text, 'Overleaf\'s version is in place');
+        });
+
         it('keeps what git writes into a file during the upload of its merge, at the merged text\'s local write', async () => {
             const t = await locked();
             t.store.lock = undefined;

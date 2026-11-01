@@ -1114,7 +1114,8 @@ export class ReplicaSync {
             } catch (error) {
                 if (error instanceof StaleReadError) {
                     // Every write of the work comes after a check, so what it decided before is not
-                    // carried out; only the copy that keepAside keeps before its download's check stays.
+                    // carried out; only the copy that keepAside keeps before its download's check
+                    // stays, and keepAside logs where it is.
                     this.ui.log(`${path}: ${error.message}`);
                     continue;
                 }
@@ -1570,7 +1571,14 @@ export class ReplicaSync {
         const summary = mode.summary;
         await this.beforeWrite(mode);
         const copy = await this.store.keepCopy(path, localContent ?? new Uint8Array());
-        await this.download(path, remote, remoteText, remoteContent, mode);
+        try {
+            await this.download(path, remote, remoteText, remoteContent, mode);
+        } catch (error) {
+            // e.g. the download's check met git's lock (StaleReadError): the copy stays, and it can be
+            // the only copy of the local version, when git's command replaced the file meanwhile
+            this.ui.log(`${path}: the local version is kept at ${copy}, and Overleaf's version was not put in place: ${errorMessage(error)}`);
+            throw error;
+        }
         summary.downloaded.pop();
         summary.keptAside.push({path, copy});
         this.ui.log(`${path}: differs from Overleaf and the saved state cannot tell which side changed; Overleaf's version is in place, the local one is kept at ${copy}`);
