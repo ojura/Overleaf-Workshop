@@ -1,5 +1,5 @@
 import * as assert from 'assert';
-import { errorMessage } from '../utils/errorMessage';
+import { ERROR_JSON_LIMIT, errorMessage } from '../utils/errorMessage';
 
 /** What Node's fetch throws when it cannot reach the server: the reason is in the cause. */
 const fetchFailure = () => Object.assign(new TypeError('fetch failed'), { cause: new Error('connect ECONNREFUSED 127.0.0.1:443') });
@@ -18,11 +18,22 @@ describe('the text of an error for a message (errorMessage)', () => {
         assert.strictEqual(errorMessage({ code: 'TooManyRequests' }), '{"code":"TooManyRequests"}');
     });
 
+    it('cuts the JSON of a large value to a length that a notification or a line can show, and says so', () => {
+        const text = errorMessage({ data: 'x'.repeat(1_000_000) });
+        assert.ok(text.startsWith('{"data":"xxx'), text.slice(0, 20));
+        assert.strictEqual(text, `${JSON.stringify({ data: 'x'.repeat(1_000_000) }).slice(0, ERROR_JSON_LIMIT)} [cut to ${ERROR_JSON_LIMIT} of 1000011 characters]`);
+        // a JSON text of the limit's length stays whole
+        const whole = { data: 'y'.repeat(ERROR_JSON_LIMIT - '{"data":""}'.length) };
+        assert.strictEqual(errorMessage(whole), JSON.stringify(whole));
+    });
+
     it('writes a value that JSON cannot write, and any other value, as text', () => {
         const cycle: Record<string, unknown> = {};
         cycle.self = cycle;
         assert.strictEqual(errorMessage(cycle), '[object Object]');
         assert.strictEqual(errorMessage({ size: 1n }), '[object Object]');
+        // JSON gives no text for it
+        assert.strictEqual(errorMessage({ toJSON: () => undefined }), '[object Object]');
         assert.strictEqual(errorMessage('not authorized'), 'not authorized');
         assert.strictEqual(errorMessage(undefined), 'undefined');
         assert.strictEqual(errorMessage(null), 'null');
