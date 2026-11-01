@@ -330,13 +330,14 @@ describe('local replica: git as the merge backend', function () {
         assert.deepStrictEqual(fs.readdirSync(path.join(t.folder, '.git', 'overleaf', 'tmp')), [], 'the temporary files are gone');
     });
 
-    it('tells git\'s index lock of another program, but not the lock of its own index write, and when the lock goes', async () => {
+    it('reports git\'s index lock of another program and its time, but not the lock of its own index write, and notices when the lock goes', async () => {
         const t = await world();
         const lock = path.join(t.folder, '.git', 'index.lock');
         assert.strictEqual(await t.store.foreignIndexLock(), undefined, 'before the lock');
         // another program's git takes the lock
         fs.writeFileSync(lock, '');
         assert.strictEqual(await t.store.foreignIndexLock(), lock);
+        assert.strictEqual(await t.store.indexLockTime(lock), fs.statSync(lock).mtimeMs, 'the time git last wrote the lock');
         assert.strictEqual(await t.store.git.ownIndexWrite(() => t.store.foreignIndexLock()), undefined, 'during the replica\'s own index write the lock is its own');
         const { released, dispose } = t.store.indexLockReleased(lock);
         try {
@@ -346,6 +347,7 @@ describe('local replica: git as the merge backend', function () {
             dispose();
         }
         assert.strictEqual(await t.store.foreignIndexLock(), undefined, 'after the lock');
+        assert.strictEqual(await t.store.indexLockTime(lock), undefined, 'the time of a lock that is gone');
     });
 
     it('reads both sides again when another program held git\'s index lock at the sync\'s write, and keeps the local change written during the lock', async () => {
