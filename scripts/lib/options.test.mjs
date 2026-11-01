@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseOptions, UsageError } from './options.mjs';
 
-const spec = { ext: 'value', port: 'number', frame: 'flag', 'theme-page': 'number' };
+const spec = { ext: 'value', port: 'number', frame: 'flag', 'theme-page': 'number', engine: ['pdfjs', 'overleaf'] };
 
 test('parseOptions reads --name value, --name=value, numbers and flags', () => {
-    assert.deepEqual(parseOptions(spec, ['--ext', 'a', '--port=8765', '--frame', '--theme-page', '3']),
-        { ext: 'a', port: 8765, frame: true, 'theme-page': 3 });
+    assert.deepEqual(parseOptions(spec, ['--ext', 'a', '--port=8765', '--frame', '--theme-page', '3', '--engine', 'overleaf']),
+        { ext: 'a', port: 8765, frame: true, 'theme-page': 3, engine: 'overleaf' });
     assert.deepEqual(parseOptions(spec, ['--ext=--odd']), { ext: '--odd' });
     assert.deepEqual(parseOptions(spec, []), {});
 });
@@ -22,6 +22,8 @@ test('parseOptions refuses what it cannot read as the script means it', () => {
         [['--frame=yes'], /--frame does not take a value/],
         [['--port', 'abc'], /--port needs a number, not abc/],
         [['--port='], /--port needs a number/],
+        [['--engine', 'overleef'], /--engine takes pdfjs, overleaf, not overleef/],
+        [['--engine'], /--engine needs a value/],
     ];
     for (const [argv, message] of cases) {
         assert.throws(() => parseOptions(spec, argv), (error) => error instanceof UsageError && message.test(error.message), argv.join(' '));

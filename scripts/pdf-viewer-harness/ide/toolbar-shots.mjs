@@ -16,8 +16,8 @@ import path from 'node:path';
 import { work } from '../common.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 import {
-    associatePdfs, buttonOf, instance, INSTANCE_OPTION, openWithQuickOpen, pastRightEdge, PDFJS_POPUPS, runCommand, settings,
-    sleep, TOOLBAR, viewerPage, workbench,
+    associatePdfs, buttonOf, ENGINE_SETTING, instance, INSTANCE_OPTION, openWithQuickOpen, otherEngine, pastRightEdge, PDFJS_POPUPS,
+    runCommand, settings, sleep, TOOLBAR, viewerPage, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION, pdf: 'value', widths: 'value', out: 'value' });
@@ -29,11 +29,10 @@ if (!fs.existsSync(path.resolve(pdf))) { console.error(`${path.resolve(pdf)} doe
 const widths = options.get('widths', '1440,1085,900,760,600,450,340,262').split(',').map(Number);
 const outDir = path.resolve(options.get('out', path.join(work, 'shots', 'ide-toolbars')));
 fs.mkdirSync(outDir, { recursive: true });
-const SETTING = 'overleaf-workshop.pdfViewer.engine';
 const inst = instance(options);
 const config = settings(inst);
 // the switch buttons write the viewer setting; it is restored when the script ends
-const restoreEngine = config.guard(SETTING);
+const restoreEngine = config.guard(ENGINE_SETTING);
 const restoreAssociation = await associatePdfs(config);
 const wb = await workbench(inst);
 let view;
@@ -72,7 +71,7 @@ try {
     if (!first) { throw new Error('the viewer did not draw the page in view'); }
     console.log(`the ${first.engine} viewer shows the PDF`);
     await shots(first.engine);
-    const second = first.engine === 'pdfjs' ? 'overleaf' : 'pdfjs';
+    const second = otherEngine(first.engine);
     await view.E(`${buttonOf(first.engine, 'switchViewer')}.click(); true`);
     console.log(`switched to the ${second} viewer:`, !!(await view.drawn(second, 60000)));
     await shots(second);

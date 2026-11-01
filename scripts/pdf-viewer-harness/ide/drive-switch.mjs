@@ -6,16 +6,15 @@
 // Open output.pdf in the instance first, for example with Overleaf Workshop's View PDF command.
 import { scriptOptions } from '../../lib/options.mjs';
 import {
-    buttonOf, checker, instance, INSTANCE_OPTION, newestViewer, rafOnTimer, settings, showPageFunction, sleep, viewerOf,
-    windowDraws, workbench,
+    buttonOf, checker, ENGINE_SETTING, engineOfSetting, instance, INSTANCE_OPTION, newestViewer, otherEngine, rafOnTimer, settings,
+    showPageFunction, sleep, viewerOf, windowDraws, workbench,
 } from './ide.mjs';
 
 const options = scriptOptions({ ...INSTANCE_OPTION });
 
-const SETTING = 'overleaf-workshop.pdfViewer.engine';
 const inst = instance(options);
 const config = settings(inst);
-const original = config.get(SETTING);
+const original = config.get(ENGINE_SETTING);
 let restoreSetting;
 const { check, summary } = checker();
 const wb = await workbench(inst);
@@ -26,7 +25,6 @@ try {
     const start = await newestViewer(wb, { beforeLoad: draws ? undefined : rafOnTimer });
     view = start.view;
     console.log(`output.pdf is in the ${start.engine} viewer; the setting is ${original ?? '(not set)'}`);
-    const other = (engine) => (engine === 'pdfjs' ? 'overleaf' : 'pdfjs');
     const pages = await view.E(`${viewerOf(start.engine)}.pagesCount`);
 
     /** the inner frame's id, which changes when the webview loads a new page */
@@ -38,8 +36,8 @@ try {
     };
 
     // the setting
-    const target = other(start.engine);
-    restoreSetting = config.change(SETTING, target);
+    const target = otherEngine(start.engine);
+    restoreSetting = config.change(ENGINE_SETTING, target);
     let now = await view.drawn(target, 90000);
     check(`a change of the setting to ${target} switches the open PDF to the ${target} viewer`, !!now, now ? `${now.ms} ms` : 'timed out');
     if (!now) { throw new Error('the setting did not switch the viewer'); }
@@ -47,14 +45,14 @@ try {
     // each viewer's button, at a page of its own: at 60 % and at 35 % of the document
     for (const n of [Math.max(1, Math.round(pages * 0.6)), Math.max(1, Math.round(pages * 0.35))]) {
         const from = now.engine;
-        const to = other(from);
+        const to = otherEngine(from);
         await goTo(from, n);
         const before = await view.E(`${viewerOf(from)}.currentPageNumber`);
         const beforeFrame = await frameId();
         await view.E(`${buttonOf(from, 'switchViewer')}.click(); true`);
         now = await view.drawn(to, 90000);
         check(`the ${from} viewer's button switches the PDF to the ${to} viewer, in the same tab`, !!now && (await frameId()) !== beforeFrame, now ? `${now.ms} ms` : 'timed out');
-        check(`the setting now says ${to}`, config.get(SETTING) === to, String(config.get(SETTING)));
+        check(`the setting now says ${to}`, config.get(ENGINE_SETTING) === to, String(config.get(ENGINE_SETTING)));
         if (!now) { throw new Error('the button did not switch the viewer'); }
         await sleep(800);
         const at = await view.E(`${viewerOf(to)}.currentPageNumber`);
@@ -70,7 +68,7 @@ try {
 } finally {
     // restore the setting, and wait for the viewer it picks
     restoreSetting?.();
-    const restored = await view?.drawn(original === 'overleaf' ? 'overleaf' : 'pdfjs', 90000)
+    const restored = await view?.drawn(engineOfSetting(original), 90000)
         .catch((error) => console.log(`the viewer after the restore: ${error.message}`));
     console.log(`the setting is ${original ?? '(not set)'} again; the PDF is in the ${restored?.engine ?? 'unknown'} viewer`);
     console.log('console problems in the viewer pages:', view?.problems.length ? view.problems.slice(0, 8) : 'none');

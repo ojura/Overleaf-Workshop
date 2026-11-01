@@ -15,9 +15,9 @@ import { clickAt, notWithinLimit, pressKey } from '../lib/devtools.mjs';
 import { scriptOptions } from '../lib/options.mjs';
 import { launchChrome } from './cdp.mjs';
 import { book, bookFacts, checker, defaultExt, startServer, work } from './common.mjs';
-import { highlightInView, OVERLEAF_DOCUMENTS, pageDrawn, SYNCTEX_HIGHLIGHT, TWO_FRAMES, viewerIfAny, viewerOf } from './viewers.mjs';
+import { ENGINES, highlightInView, OVERLEAF_DOCUMENTS, pageDrawn, SYNCTEX_HIGHLIGHT, TWO_FRAMES, viewerIfAny, viewerOf } from './viewers.mjs';
 
-const options = scriptOptions({ ext: 'value', engine: 'value', frame: 'flag', latency: 'number', shots: 'value', port: 'number', json: 'value' });
+const options = scriptOptions({ ext: 'value', engine: ENGINES, frame: 'flag', latency: 'number', shots: 'value', port: 'number', json: 'value' });
 
 const ext = path.resolve(options.get('ext', defaultExt));
 const engine = options.get('engine', 'overleaf');

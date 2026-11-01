@@ -2,7 +2,7 @@
 // each check that a run reported, by its name, with n/a for a run that did not report it (a check
 // of one viewer only).
 //   node compare.mjs [--ext <views/pdf-viewer dir>] [--overleaf DIR] [--pdfjs DIR] [--port N]
-//                    [--engines overleaf,pdfjs] [--runs frame:40,frame:150,plain:40] [--out DIR]
+//                    [--engines pdfjs,overleaf] [--runs frame:40,frame:150,plain:40] [--out DIR]
 // --ext defaults to the checkout's views/pdf-viewer; --overleaf and --pdfjs take one viewer from
 // another folder, for example another checkout's. By default each viewer runs as VS Code shows it
 // (frame) at 40 and 150 ms per request, and as a plain page at 40 ms. The results go to --out, by
@@ -16,8 +16,10 @@ import path from 'node:path';
 import { EXIT_CODES } from '../lib/cleanup.mjs';
 import { scriptOptions } from '../lib/options.mjs';
 import { defaultExt, here, work } from './common.mjs';
+import { ENGINES } from './viewers.mjs';
 
-const options = scriptOptions({ ext: 'value', overleaf: 'value', pdfjs: 'value', engines: 'value', port: 'number', runs: 'value', out: 'value' });
+// --<engine> DIR for each viewer, as --pdfjs and --overleaf
+const options = scriptOptions({ ext: 'value', ...Object.fromEntries(ENGINES.map(engine => [engine, 'value'])), engines: 'value', port: 'number', runs: 'value', out: 'value' });
 
 /**
  * The last resort for a drive that never ends: drive.mjs ends on its own, also when the viewer
@@ -26,8 +28,13 @@ const options = scriptOptions({ ext: 'value', overleaf: 'value', pdfjs: 'value',
 const RUN_LIMIT_MS = 600000;
 
 const ext = options.get('ext', defaultExt);
-const exts = { overleaf: options.get('overleaf', ext), pdfjs: options.get('pdfjs', ext) };
-const engines = (options.get('engines', 'overleaf,pdfjs')).split(',');
+const exts = Object.fromEntries(ENGINES.map(engine => [engine, options.get(engine, ext)]));
+const engines = options.get('engines', ENGINES.join(',')).split(',');
+const unknown = engines.filter(engine => !ENGINES.includes(engine));
+if (unknown.length) {
+    console.error(`--engines takes ${ENGINES.join(', ')}, not ${unknown.join(', ')}`);
+    process.exit(64);
+}
 const port = options.get('port');
 const runs = (options.get('runs', 'frame:40,frame:150,plain:40')).split(',').map(r => {
     const [mode, latency] = r.split(':');

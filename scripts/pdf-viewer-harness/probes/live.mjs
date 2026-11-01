@@ -11,9 +11,9 @@ import path from 'node:path';
 import { notWithinLimit } from '../../lib/devtools.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 import { checker, openHarness, themeBook } from '../common.mjs';
-import { pageInViewDrawn } from '../viewers.mjs';
+import { DEFAULT_ENGINE, ENGINES, pageInViewDrawn } from '../viewers.mjs';
 
-const options = scriptOptions({ engine: 'value', ext: 'value', port: 'number', project: 'value', response: 'value', seconds: 'number' });
+const options = scriptOptions({ engine: ENGINES, ext: 'value', port: 'number', project: 'value', response: 'value', seconds: 'number' });
 
 const response = options.get('response');
 const project = options.get('project');
@@ -21,7 +21,7 @@ if (!response || !project) {
     console.error('usage: node probes/live.mjs --response <compile-response.json> --project <project id> [--engine pdfjs|overleaf]');
     process.exit(2);
 }
-const engine = options.get('engine', 'pdfjs');
+const engine = options.get('engine', DEFAULT_ENGINE);
 const seconds = options.get('seconds', 60);
 // server.mjs reads a book at start; in live mode the pages show the compile response's build
 const h = await openHarness({

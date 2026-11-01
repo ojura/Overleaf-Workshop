@@ -5,12 +5,12 @@
 //   node probes/theme-colors.mjs [--ext DIR] [--engine pdfjs|overleaf] [--port N]
 // It prints the colors it counts, for a person to read; its exit status says only whether it ran to its end.
 import { bookFacts, openHarness, shotPath, themeBook } from '../common.mjs';
-import { areaColorsFunction, buttonOf, pageDrawn, switchThemeFunction } from '../viewers.mjs';
+import { areaColorsFunction, buttonOf, DEFAULT_ENGINE, ENGINES, pageDrawn, switchThemeFunction } from '../viewers.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 
-const options = scriptOptions({ engine: 'value', ext: 'value', port: 'number' });
+const options = scriptOptions({ engine: ENGINES, ext: 'value', port: 'number' });
 
-const engine = options.get('engine', 'pdfjs');
+const engine = options.get('engine', DEFAULT_ENGINE);
 const bookDir = themeBook();
 const h = await openHarness({ name: `theme-${engine}`, port: options.get('port'), ext: options.get('ext'), bookDir, latency: 5 });
 const { page } = h;

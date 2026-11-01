@@ -9,12 +9,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { book, openHarness, work } from '../common.mjs';
 import { notWithinLimit } from '../../lib/devtools.mjs';
-import { armResizeWait, pageDrawn, pastRightEdge, popupShown, PDFJS_POPUPS, TOOLBAR } from '../viewers.mjs';
+import { armResizeWait, DEFAULT_ENGINE, ENGINES, pageDrawn, pastRightEdge, PDFJS_POPUPS, popupShown, TOOLBAR } from '../viewers.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 
-const options = scriptOptions({ engine: 'value', ext: 'value', out: 'value', pages: 'number', port: 'number' });
+const options = scriptOptions({ engine: ENGINES, ext: 'value', out: 'value', pages: 'number', port: 'number' });
 
-const engine = options.get('engine', 'pdfjs');
+const engine = options.get('engine', DEFAULT_ENGINE);
 const pages = options.get('pages', 456);
 const outDir = path.resolve(options.get('out', path.join(work, 'shots', `toolbar-${engine}`)));
 fs.mkdirSync(outDir, { recursive: true });

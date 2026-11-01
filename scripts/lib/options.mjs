@@ -8,10 +8,11 @@ export class UsageError extends Error {}
 
 /**
  * The options in `argv` by `spec`, which gives each option's kind: 'value', 'number' (a value that
- * is a finite number) or 'flag'. Returns an object with the value of each option given: a string,
- * a number, or true for a flag. Throws a UsageError for an argument that is not an option of
- * `spec`, an option given twice, a flag given a value, and an option that takes a value given
- * without one, as when the next argument is another option.
+ * is a finite number), a list of the values that the option takes, or 'flag'. Returns an object
+ * with the value of each option given: a string, a number, or true for a flag. Throws a UsageError
+ * for an argument that is not an option of `spec`, an option given twice, a flag given a value, an
+ * option that takes a value given without one, as when the next argument is another option, and a
+ * value that is not in the option's list.
  */
 export function parseOptions(spec, argv) {
     const values = {};
@@ -32,6 +33,9 @@ export function parseOptions(spec, argv) {
             const number = Number(value);
             if (value.trim() === '' || !Number.isFinite(number)) { throw new UsageError(`--${name} needs a number, not ${value}`); }
             values[name] = number;
+        } else if (Array.isArray(spec[name])) {
+            if (!spec[name].includes(value)) { throw new UsageError(`--${name} takes ${spec[name].join(', ')}, not ${value}`); }
+            values[name] = value;
         } else {
             values[name] = value;
         }

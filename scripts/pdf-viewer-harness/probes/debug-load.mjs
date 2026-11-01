@@ -4,14 +4,14 @@
 // --book is a folder of make_book.py or theme_book.py; the default is the test book of book() in common.mjs.
 // It prints what it sees, for a person to read; its exit status says only whether it ran to its end.
 import { openHarness } from '../common.mjs';
-import { viewerIfAny } from '../viewers.mjs';
+import { DEFAULT_ENGINE, ENGINES, viewerIfAny } from '../viewers.mjs';
 import { scriptOptions } from '../../lib/options.mjs';
 
 /** When the probe looks at the viewer, after the navigation: the time it observes, not a wait for a state. */
 const LOOK_AFTER_MS = 8000;
-const options = scriptOptions({ book: 'value', engine: 'value', ext: 'value', port: 'number' });
+const options = scriptOptions({ book: 'value', engine: ENGINES, ext: 'value', port: 'number' });
 
-const engine = options.get('engine', 'pdfjs');
+const engine = options.get('engine', DEFAULT_ENGINE);
 const h = await openHarness({ name: `debug-${engine}`, port: options.get('port'), ext: options.get('ext'), bookDir: options.get('book'), latency: 5, stderr: 'pipe' });
 let serverErrors = '';
 h.server.stderr.on('data', d => { serverErrors += d; });

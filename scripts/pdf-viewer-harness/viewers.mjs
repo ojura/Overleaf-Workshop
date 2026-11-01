@@ -1,25 +1,59 @@
-// The two viewer pages, the pdfjs viewer and the Overleaf viewer, as the harness's scripts read and
-// drive them: expressions, and the sources of functions, that run in a viewer page, in headless
-// Chrome (cdp.mjs) and in a webview of the test instance (ide/ide.mjs) alike. Each fact about the
-// pages that the scripts use is written here once: where a page keeps its viewer object (pdf.js's
-// PDFViewer), when a page counts as drawn, the ids of the buttons and toolbars, the SyncTeX
-// highlight, how a theme switch waits for the new drawing, and which pixels of a page count as an
-// image's.
+// The viewer pages, as the harness's scripts read and drive them: expressions, and the sources of
+// functions, that run in a viewer page, in headless Chrome (cdp.mjs) and in a webview of the test
+// instance (ide/ide.mjs) alike. Each fact about the pages that the scripts use is written here
+// once: which viewers there are (the extension's PDF_VIEWER_ENGINES), where a page keeps its viewer
+// object (pdf.js's PDFViewer), when a page counts as drawn, the ids of the buttons and toolbars, the
+// SyncTeX highlight, how a theme switch waits for the new drawing, and which pixels of a page count
+// as an image's.
+import { protocol } from '../viewer-protocol.mjs';
+
+/** The viewers, by their names in the setting overleaf-workshop.pdfViewer.engine (src/core/viewerProtocol.ts). */
+export const ENGINES = [...protocol.PDF_VIEWER_ENGINES];
+/** The viewer that the extension shows when the setting names none of ENGINES. */
+export const DEFAULT_ENGINE = protocol.DEFAULT_PDF_VIEWER_ENGINE;
+/** The setting that picks the viewer. */
+export const ENGINE_SETTING = 'overleaf-workshop.pdfViewer.engine';
+/** The viewer that the extension shows for the setting's value `value` (as the provider picks it). */
+export const engineOfSetting = (value) => (protocol.isPdfViewerEngine(value) ? value : DEFAULT_ENGINE);
+
+/**
+ * What the page of each viewer has: the global that only that page makes, its viewer object, the
+ * ids of its color theme button and of its button to the other viewer, and its toolbar's selector.
+ */
+const PAGES = {
+    pdfjs: { global: 'PDFViewerApplication', viewer: 'window.PDFViewerApplication.pdfViewer', theme: 'themeButton', switchViewer: 'switchViewerButton', toolbar: '#toolbarContainer' },
+    overleaf: { global: 'overleafViewer', viewer: 'window.overleafViewer.wrapper.viewer', theme: 'themeToggle', switchViewer: 'switchViewer', toolbar: '#toolbar' },
+};
+if (JSON.stringify(Object.keys(PAGES).sort()) !== JSON.stringify([...ENGINES].sort())) {
+    throw new Error(`viewers.mjs describes the viewers ${Object.keys(PAGES).join(', ')}, and the extension has ${ENGINES.join(', ')} (PDF_VIEWER_ENGINES)`);
+}
+/** The facts of PAGES about the viewer `engine`; an engine that the extension does not have is refused. */
+const pageOf = (engine) => {
+    if (!Object.hasOwn(PAGES, engine)) { throw new Error(`not a viewer of the extension: ${engine} (it has ${ENGINES.join(', ')})`); }
+    return PAGES[engine];
+};
+
+/** The other viewer than `engine`, which a viewer's switch button shows the PDF in: the extension has two. */
+export const otherEngine = (engine) => {
+    pageOf(engine);
+    if (ENGINES.length !== 2) { throw new Error(`the switch buttons go to the other viewer, and the extension has ${ENGINES.length} viewers`); }
+    return ENGINES.find(e => e !== engine);
+};
 
 /** pdf.js's RenderingStates.FINISHED: the renderingState of a page view whose canvas is drawn. */
 export const RENDERING_FINISHED = 3;
 
-/** The viewer object (pdf.js's PDFViewer) of a page that runs the viewer `engine` ('pdfjs' or 'overleaf'): an expression for the page. */
-export const viewerOf = (engine) => (engine === 'overleaf' ? 'window.overleafViewer.wrapper.viewer' : 'window.PDFViewerApplication.pdfViewer');
+/** The viewer object (pdf.js's PDFViewer) of a page that runs the viewer `engine`: an expression for the page. */
+export const viewerOf = (engine) => pageOf(engine).viewer;
 
 /** viewerOf(engine), which is undefined while the page has not made its viewer. */
 export const viewerIfAny = (engine) => viewerOf(engine).replaceAll('.', '?.');
 
-/** The viewer object of a page that runs either viewer, undefined while the page has not made one. */
-export const ANY_VIEWER = `(${viewerIfAny('overleaf')} ?? ${viewerIfAny('pdfjs')})`;
+/** The viewer object of a page that runs any viewer, undefined while the page has not made one. */
+export const ANY_VIEWER = `(${ENGINES.map(viewerIfAny).join(' ?? ')})`;
 
-/** Which viewer a page runs: an expression that gives 'overleaf', 'pdfjs', or undefined while the page has not made its viewer. */
-export const ENGINE_OF_PAGE = `(window.overleafViewer ? 'overleaf' : window.PDFViewerApplication ? 'pdfjs' : undefined)`;
+/** Which viewer a page runs: an expression that gives its name in ENGINES, or undefined while the page has not made its viewer. */
+export const ENGINE_OF_PAGE = `(${ENGINES.map(engine => `window.${pageOf(engine).global} ? ${JSON.stringify(engine)} : `).join('')}undefined)`;
 
 /** The Overleaf viewer's documents (views/pdf-viewer/src/overleaf/documents.ts): owned, inFlight, shownUrl. */
 export const OVERLEAF_DOCUMENTS = 'window.overleafViewer.documents';
@@ -35,16 +69,13 @@ export const pageDrawn = (engine, page) => `(() => { const v = ${viewerIfAny(eng
 export const pageInViewDrawn = (engine) => pageDrawn(engine, 'v.currentPageNumber');
 
 /** The ids of each viewer's buttons: the color theme button, and the button that shows the PDF in the other viewer. */
-export const BUTTONS = {
-    pdfjs: { theme: 'themeButton', switchViewer: 'switchViewerButton' },
-    overleaf: { theme: 'themeToggle', switchViewer: 'switchViewer' },
-};
+export const BUTTONS = Object.fromEntries(ENGINES.map(engine => [engine, { theme: pageOf(engine).theme, switchViewer: pageOf(engine).switchViewer }]));
 
 /** The button `name` of BUTTONS in the viewer `engine`: an expression that is null when the page does not have it. */
 export const buttonOf = (engine, name) => `document.getElementById(${JSON.stringify(BUTTONS[engine][name])})`;
 
 /** The selector of each viewer's toolbar. */
-export const TOOLBAR = { pdfjs: '#toolbarContainer', overleaf: '#toolbar' };
+export const TOOLBAR = Object.fromEntries(ENGINES.map(engine => [engine, pageOf(engine).toolbar]));
 
 /** The pdfjs viewer's pop-ups that the toolbar opens: [name, the id of the button that opens and closes it, its selector]. */
 export const PDFJS_POPUPS = [['find bar', 'viewFindButton', '#findbar'], ['tools menu', 'secondaryToolbarToggleButton', '#secondaryToolbar']];
