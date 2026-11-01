@@ -8,6 +8,7 @@ import { HistoryViewProvider } from './historyViewProvider';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { EventBus } from '../utils/eventBus';
 import { ROOT_NAME } from '../consts';
+import { errorMessage } from '../utils/errorMessage';
 
 const supportedSCMs = [
     LocalReplicaSCMProvider,
@@ -273,7 +274,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
             await run();
         } catch (error) {
             const label = (scm.constructor as {label?: string}).label;
-            vscode.window.showErrorMessage(vscode.l10n.t('"{scm}": {action} failed: {error}', {scm: label, action, error: String((error as Error)?.message ?? error)}));
+            vscode.window.showErrorMessage(vscode.l10n.t('"{scm}": {action} failed: {error}', {scm: label, action, error: errorMessage(error)}));
         }
     }
 

@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { errorMessage } from '../utils/errorMessage';
 import { isReplicaOwnPath } from './ignorePatterns';
 import { gitMergeText } from './replicaGit';
 
@@ -600,19 +601,18 @@ export class ReplicaSync {
         let timer: NodeJS.Timeout | undefined;
         // Looked at again when the lock would stay by then: git may have replaced the lock with a
         // newer one meanwhile, at the same path.
-        const look = async () => {
-            const {reason, stays, staysFrom} = await this.lockReason(file);
+        const look = () => this.lockReason(file).then(({reason, stays, staysFrom}) => {
             if (over || staysFrom===undefined) { return; }
             if (!stays) {
-                timer = setTimeout(() => { look().catch(error => this.ui.log(`Looking at git's index lock ${file} failed: ${errorText(error)}`)); }, staysFrom - Date.now());
+                timer = setTimeout(look, staysFrom - Date.now());
                 return;
             }
             wait.stale = reason;
             this.ui.log(`The sync waits: ${reason}.`);
             this.ui.waiting?.(reason);
             this.ui.lockStays?.(reason);
-        };
-        look().catch(error => this.ui.log(`Looking at git's index lock ${file} failed: ${errorText(error)}`));
+        }).catch(error => this.ui.log(`Looking at git's index lock ${file} failed: ${errorMessage(error)}`));
+        void look();
         wait.released = Promise.race([watch.released, this.stopping]).finally(() => {
             over = true;
             clearTimeout(timer);
