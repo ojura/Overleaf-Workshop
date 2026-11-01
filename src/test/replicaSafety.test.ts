@@ -105,6 +105,44 @@ describe('local replica: what it deletes and what it never syncs', function () {
         });
     });
 
+    describe('a document write that Overleaf rejects', () => {
+        // as the VFS's writeDoc rejects, with a vscode.FileSystemError by its code
+        const rejections: [string, (path: string) => Error][] = [
+            ['not confirmed by Overleaf', path => Object.assign(new Error(`${path}: Overleaf has not confirmed the update (the test's)`), { code: 'Unavailable' })],
+            ['undetermined while the user decides', path => Object.assign(new Error(`${path}: it cannot be told whether Overleaf applied the update (the test's)`), { code: 'Unavailable' })],
+            ['for a path that is not a document', path => Object.assign(new Error(`${path}: not a document (the test's)`), { code: 'FileNotFound' })],
+        ];
+        for (const [what, rejection] of rejections) {
+            it(`fails the file, which keeps its local content and its entry, when the write is refused ${what}`, async () => {
+                const t = host();
+                project(t, { '/main.tex': 'v1\n', '/other.tex': 'other\n' });
+                const { scm, requestReplica } = await start(t);
+                await cleanup.fileAppears(path.join(t.folder, POINTER_FILE));
+                const vfs = t.vfs as any;
+                const writeDoc = vfs.writeDoc;
+                const error = rejection('/main.tex');
+                vfs.writeDoc = async () => { throw error; };
+                fs.writeFileSync(path.join(t.folder, 'main.tex'), 'v2, edited locally\n');
+                const answer: any = await requestReplica(t.folder, { op: 'sync' }, 10000);
+                assert.strictEqual(answer.ok, false, JSON.stringify(answer));
+                assert.deepStrictEqual(answer.summary.failed, [{ path: '/main.tex', error: error.message }], 'the file fails');
+                assert.ok(answer.error.includes(`/main.tex: ${error.message}`), answer.error);
+                // nothing takes it for an absence or a deletion
+                assert.strictEqual(read(path.join(t.folder, 'main.tex')), 'v2, edited locally\n', 'the local file keeps its content');
+                assert.strictEqual(await scm.sync.knows('/main.tex'), true, 'its entry stays');
+                assert.deepStrictEqual([...t.w.remote.entries()].sort(), [['/main.tex', 'v1\n'], ['/other.tex', 'other\n']], 'Overleaf keeps both files');
+                assert.deepStrictEqual(recorded(t.folder), ['main.tex', 'other.tex'], 'Overleaf\'s recorded state keeps the file');
+                assert.deepStrictEqual([answer.summary.deletedLocal, answer.summary.deletedRemote, answer.summary.keptAside], [[], [], []]);
+                assert.strictEqual(fs.existsSync(path.join(t.folder, '.overleaf', 'conflicts')), false, 'nothing is kept aside');
+                // once Overleaf takes the write, the next sync uploads the change
+                vfs.writeDoc = writeDoc;
+                const again: any = await requestReplica(t.folder, { op: 'sync' }, 10000);
+                assert.strictEqual(again.ok, true, JSON.stringify(again));
+                assert.strictEqual(t.w.remote.get('/main.tex'), 'v2, edited locally\n');
+            });
+        }
+    });
+
     describe('deletions made on Overleaf', () => {
         it('delete the local files of a folder deleted on Overleaf, which the project tree answers as not found', async () => {
             const t = host();
