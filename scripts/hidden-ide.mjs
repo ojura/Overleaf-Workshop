@@ -31,8 +31,10 @@
 // tests. start makes the folder for this user only (mode 700), and every command refuses a folder
 // that other users can enter or change, also through a folder above it (checkInstanceFolder in
 // scripts/lib/test-instance.mjs). It holds profile/, extensions/, replica/ and home/ (below),
-// instance.json and the logs. The replica folder is kept between starts, so only the first start
-// downloads the whole project.
+// instance.json and the logs. start makes the IDE's profile new each time, so that each start
+// begins from the same state: what an earlier run left there, such as the editor that a file was
+// last opened with, does not carry over. The replica folder and home/ are kept between starts, so
+// only the first start downloads the whole project, and Antigravity installs its agent once.
 //
 // Options for start (give --project or --folder; without either, start opens the project of the
 // previous start):
@@ -99,7 +101,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { answerWithin, evaluate, removeActivePort, WaitLimitError } from './lib/devtools.mjs';
-import { buildCheckout, installedExtension, installInto, removeExtensionCache } from './lib/install-build.mjs';
+import { buildCheckout, installedExtension, installInto } from './lib/install-build.mjs';
 import {
     bootId, checkInstanceFolder, connectMainProcess, connectWindow, inMainProcess, instanceHome, instanceProcesses, isRecordedProcess,
     processStat, readInstance, readRunningInstance, waitForInstance, workbenchTarget, writeInstance,
@@ -373,15 +375,21 @@ function startIde(home, runtime, ide, display, folder) {
 }
 
 /**
- * The instance's extensions: an exact copy (rsync --delete) of the installed Overleaf Workshop,
- * and of LaTeX Workshop for .tex files when it is installed, from the folders that the user's
- * extensions.json names. Returns Overleaf Workshop's folder in the instance.
+ * The instance's extensions: a copy of the installed Overleaf Workshop, and of LaTeX Workshop for
+ * .tex files when it is installed, from the folders that the user's extensions.json names. The
+ * instance's extensions folder then holds exactly these: rsync copies from the user's extensions
+ * folder with only their folders included, and deletes every other entry of the instance's folder,
+ * a folder that an earlier start copied as well as the IDE's own list there, extensions.json, which
+ * the IDE writes again from the folders. Returns Overleaf Workshop's folder in the instance.
  */
 function copyExtensions(home) {
     const source = installedExtension(userExtensions, 'iamhyc.overleaf-workshop');
     if (!source) { throw new Error(`${userExtensions}/extensions.json does not list Overleaf Workshop (iamhyc.overleaf-workshop)`); }
-    const others = ['james-yu.latex-workshop'].map(id => installedExtension(userExtensions, id)).filter(Boolean);
-    run('copying the installed extensions', 'rsync', ['-a', '--delete', source, ...others, `${path.join(home, 'extensions')}/`]);
+    const chosen = [source, ...['james-yu.latex-workshop'].map(id => installedExtension(userExtensions, id)).filter(Boolean)];
+    const included = chosen.flatMap(folder => ['--include', `/${path.basename(folder)}/***`]);
+    run('copying the installed extensions', 'rsync',
+        ['-a', '--delete', '--delete-excluded', ...included, '--exclude', '*', `${userExtensions}/`, `${path.join(home, 'extensions')}/`]);
+    fs.chmodSync(path.join(home, 'extensions'), 0o700); // rsync gave it the mode of the user's extensions folder
     return path.join(home, 'extensions', path.basename(source));
 }
 
@@ -489,6 +497,7 @@ async function start(...argv) {
         build = fs.realpathSync(options.build);
     }
 
+    fs.rmSync(path.join(home, 'profile'), { recursive: true, force: true });
     for (const dir of [['profile', 'User', 'globalStorage'], ['extensions'], ['home'], ...(project ? [['replica', '.overleaf']] : [])]) {
         fs.mkdirSync(path.join(home, ...dir), { recursive: true, mode: 0o700 });
     }
@@ -502,7 +511,6 @@ async function start(...argv) {
         }
         console.log(`installed the build of ${build} (${built.label}) into the instance; the chat view is the installed extension's`);
     }
-    removeExtensionCache(path.join(home, 'profile'));
     writeSettings(home);
 
     // From here on, start stops what it started when it fails or gets a signal.

@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { onCleanup, sleep } from '../../lib/cleanup.mjs';
-import { evaluate, waitUntil, notWithinLimit } from '../../lib/devtools.mjs';
+import { answerWithin, evaluate, waitUntil, notWithinLimit } from '../../lib/devtools.mjs';
 import { checkInstanceFolder, connectWindow, instanceHome, readRunningInstance, workbenchTarget } from '../../lib/test-instance.mjs';
 import { arg } from '../common.mjs';
 
@@ -65,16 +65,28 @@ export async function click(session, x, y) {
     }
 }
 
+/** The last resort for a workbench that never lays out its status bar, for example a window stuck on its start. */
+const WORKBENCH_LAYOUT_LIMIT_MS = 60000;
+
 /**
  * The instance's workbench window: `browser`, the checked connection to the instance's IDE,
  * `session` on the workbench page with the Runtime domain enabled, and E(expression), which
- * evaluates in that page. close() closes the connection, and with it every session of the script.
+ * evaluates in that page. It returns once the workbench has laid out its status bar: the page
+ * reports that from its own DOM changes (a MutationObserver), since the window's page exists some
+ * time before the workbench's parts do. close() closes the connection, and with it every session
+ * of the script.
  */
 export async function workbench(inst) {
     const browser = await connectWindow(inst);
     try {
         const session = await browser.attach((await workbenchTarget(browser)).targetId);
         await session.send('Runtime.enable');
+        await answerWithin(browser, "the workbench's layout", WORKBENCH_LAYOUT_LIMIT_MS, () => evaluate(session, `new Promise((resolve) => {
+            const laidOut = () => document.querySelector('.monaco-workbench .part.statusbar');
+            if (laidOut()) { resolve(true); return; }
+            const observer = new MutationObserver(() => { if (laidOut()) { observer.disconnect(); resolve(true); } });
+            observer.observe(document, { childList: true, subtree: true });
+        })`));
         return { browser, session, E: (expression) => evaluate(session, expression), close: () => browser.close() };
     } catch (error) {
         browser.close();
