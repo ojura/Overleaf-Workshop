@@ -67,8 +67,10 @@ describe('CompileManager with a local replica', () => {
             getRootDocName: () => '/main.tex',
             getCompiler: () => ({ name: 'pdfLaTeX' }),
             _resolveUri: async () => ({ fileType: 'folder', fileId: 'root' }),
-            // nothing changed since the last compile: no log to read
-            compile: async (_force: boolean, _draft: boolean, _stop: boolean, _root: string, fromScratch?: boolean) => {
+            // nothing changed since the last compile: no log to read; a stopped compile sends
+            // nothing, as VirtualFileSystem.compile
+            compile: async (_force: boolean, _draft: boolean, _stopOnFirstError: boolean, _root: string, fromScratch?: boolean, stop?: AbortSignal) => {
+                if (stop?.aborted) { return 'stopped'; }
                 events.push(fromScratch ? 'compile from scratch' : 'compile');
                 return undefined;
             },
@@ -89,6 +91,21 @@ describe('CompileManager with a local replica', () => {
         release();
         await ended;
         assert.deepStrictEqual(events, ['flush started', 'flush done', 'compile']);
+    });
+
+    it('ends the wait for the uploads at the user\'s Stop, and sends no compile', async () => {
+        let flushing!: () => void;
+        const flushStarted = new Promise<void>(resolve => { flushing = resolve; });
+        // the uploads do not end during this test
+        const { events, manager } = setup(() => { flushing(); return new Promise<void>(() => {}); });
+        const ended = compileEnd();
+        assert.deepStrictEqual(await manager.compile(true), { kind: 'started' });
+        await flushStarted;
+        await manager.stopCompile();
+        const { outcome } = await ended;
+        assert.strictEqual(outcome.result, 'failure');
+        assert.match(outcome.detail, /stopped before its request reached Overleaf/);
+        assert.deepStrictEqual(events, ['flush started']);
     });
 
     it('clears the compile output on Overleaf only for Recompile from Scratch', async () => {
