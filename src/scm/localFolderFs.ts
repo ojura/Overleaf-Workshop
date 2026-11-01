@@ -157,7 +157,8 @@ export async function rename(from: PathLike, to: PathLike): Promise<void> {
  * Move a file to a path where nothing is, creating its parent folders; fails with EEXIST when
  * something is there. A hard link to the new path, then the removal of the old one, keeps the
  * file itself, with its size and modification time; a rename would replace what is at the new
- * path. Where the file system has no hard links, a copy that refuses an existing target does it.
+ * path. Where the file system has no hard links, a copy that refuses an existing target does it,
+ * and the copy has a new modification time.
  */
 export async function moveFile(from: PathLike, to: PathLike): Promise<void> {
     const source = fsPath(from), target = fsPath(to);
