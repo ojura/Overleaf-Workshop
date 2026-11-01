@@ -576,6 +576,38 @@ describe('the build in use, from Overleaf to the window', function () {
             assert.deepStrictEqual(overleaf.to('/project/p1/user/u1/build/b-own/output/output.pdf'), []);
         });
 
+        // The cache keeps the build, but not under the shard that the build names: its address on
+        // the download domain answers 404, and the web server finds the build, since it asks the
+        // cache's instances to search for it (ClsiCacheHandler.getOutputFile).
+        it('saves another client\'s build whole through the web server when the cache\'s address on the download domain answers 404 too', async () => {
+            overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
+            const web = `/download/project/p1/build/${WEB_EDITOR}-b-web/output/cached/output.pdf`;
+            overleaf.files.set(web, PDF);
+            const { doc, panel } = await open();
+            await panel.first('load');
+            await provider.download(doc);
+            assert.deepStrictEqual(fs.readFileSync(target()), PDF);
+            assert.ok(rangesOf(`/cdn/project/p1/user/u1/build/${WEB_EDITOR}-b-web/output/output.pdf`).length > 0, 'the cache\'s address on the download domain comes first');
+            assert.deepStrictEqual(overleaf.to(web).map(r => [r.range, r.cookie]), [[undefined, identity.cookies]]);
+            assert.deepStrictEqual(partFiles(), []);
+        });
+
+        it('saves this window\'s build whole through the web server, with the window\'s editor, when the cache\'s address on the download domain answers 404 too', async () => {
+            overleaf.latest = { status: 404 };
+            overleaf.compiles.push(ownAnswer(overleaf, 'b-own'));
+            const web = '/project/p1/user/u1/build/b-own/output/output.pdf';
+            overleaf.files.set(web, PDF);
+            const ended = compileEnd();
+            const { doc, panel } = await open();
+            await panel.first('load');
+            await ended;
+            await provider.download(doc);
+            assert.deepStrictEqual(fs.readFileSync(target()), PDF);
+            assert.ok(rangesOf(`/cdn/project/p1/user/u1/build/${EDITOR_ID}-b-own/output/output.pdf`).length > 0, 'the cache\'s address on the download domain comes first');
+            assert.deepStrictEqual(overleaf.to(web).map(r => [r.range, r.query.get('clsiserverid'), r.query.get('editorId'), r.cookie]), [[undefined, 'clsi-vm-2', EDITOR_ID, identity.cookies]]);
+            assert.deepStrictEqual(partFiles(), []);
+        });
+
         it('saves a build whose compile named no shard of the cache whole through the web server, with the window\'s editor, when the compile server has deleted it', async () => {
             overleaf.latest = { status: 404 };
             const answer: any = ownAnswer(overleaf, 'b-own');

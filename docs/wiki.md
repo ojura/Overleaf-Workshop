@@ -226,7 +226,7 @@ Overleaf can answer with another client's build only when it keeps compiles in i
 
 Overleaf's compile servers delete a build after 90 minutes, or once two newer builds of the same user exist on that server; one user's compiles can run on several compile servers. When a viewer finds its build deleted everywhere, the window asks Overleaf for a newer one and, when there is none, compiles once on its own. If that build goes too before the viewer has shown it, the window waits for you: the line at the top of the viewer offers **Recompile**. The same line says when the window is checking or compiling, and why a compile failed.
 
-The viewer loads a build in ranges, as Overleaf's own viewer does, so a large PDF (the book that this fork was written for has 885 MB and 456 pages) shows its first pages without being downloaded whole. **Save PDF** saves it in ranges too, also when the compile server has deleted it and Overleaf's cache keeps it.
+The viewer loads a build in ranges, as Overleaf's own viewer does, so a large PDF (the book that this fork was written for has 885 MB and 456 pages) shows its first pages without being downloaded whole. **Save PDF** saves it in ranges too, also from Overleaf's cache when the compile server has deleted it. When the cache's address on the download domain does not have the build either, Save PDF reads it whole through Overleaf's web server, which finds it in the cache and ends a response after 10 minutes.
 
 #### SyncTeX and Reverse SyncTeX
 

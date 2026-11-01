@@ -2005,12 +2005,14 @@ export class VirtualFileSystem extends vscode.Disposable {
     /**
      * Save the build in use's output.pdf to `target`: from the download domain in ranges
      * (downloadInRanges). When the compile server has deleted the build and the download domain
-     * answers 404, from Overleaf's cache of compile outputs, in ranges on the download domain as
-     * the viewers' loader reads it (cachedDownloadDomainUrl), when the build names the cache's
-     * shard and its editor; else whole from the web server, which passes the request on to the
-     * cache (BaseAPI.webRouteOf), and ends a response after 10 minutes, too short for 885 MB on a
-     * link slower than about 1.5 MB/s. Each way the PDF goes to a part file first, which takes
-     * `target`'s name when it is complete.
+     * answers 404, from Overleaf's cache of compile outputs:
+     * - in ranges on the download domain, as the viewers' loader reads it
+     *   (cachedDownloadDomainUrl), when the build names the cache's shard and its editor;
+     * - else, or when that address answers 404 too, whole from the web server (BaseAPI.webRouteOf),
+     *   which asks the cache's instances to search for the build whichever shard keeps it
+     *   (ClsiCacheHandler.getOutputFile) and ends a response after 10 minutes, too short for
+     *   885 MB on a link slower than about 1.5 MB/s.
+     * Each way the PDF goes to a part file first, which takes `target`'s name when it is complete.
      */
     async savePdf(target: string, signal: AbortSignal, onProgress: (received: number) => void) {
         const build = this.builds.build;
@@ -2020,20 +2022,26 @@ export class VirtualFileSystem extends vscode.Disposable {
             throw new Error(vscode.l10n.t('There is no build of the PDF to save.'));
         }
         const size = output.file.size;
-        try {
-            await downloadInRanges(output.url, target, size, signal, { onProgress });
-        } catch (error) {
-            if (signal.aborted || (error as DownloadError).status!==404) { throw error; }
-            if (output.clsiCacheShard && build.editorId) {
-                const cached = cachedDownloadDomainUrl(output.downloadDomain, file.url, build.id, build.editorId, output.clsiCacheShard, build.record.response.compileGroup);
-                await downloadInRanges(cached, target, size, signal, { onProgress });
-                return;
+        /** Read `url` in ranges: undefined when the PDF is saved, the error when the server answers 404, which leaves the next way. */
+        const inRanges = async (url: string): Promise<DownloadError | undefined> => {
+            try {
+                await downloadInRanges(url, target, size, signal, { onProgress });
+                return undefined;
+            } catch (error) {
+                if (signal.aborted || (error as DownloadError).status!==404) { throw error; }
+                return error as DownloadError;
             }
-            const route = BaseAPI.webRouteOf(file, build.record.response, build.editorId);
-            if (route===undefined) { throw error; }
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-            await downloadWhole(this.api.serverUrl + route, target, { headers: {'Cookie': identity.cookies}, size, signal, onProgress });
+        };
+        let gone = await inRanges(output.url);
+        if (!gone) { return; }
+        if (output.clsiCacheShard && build.editorId) {
+            gone = await inRanges(cachedDownloadDomainUrl(output.downloadDomain, file.url, build.id, build.editorId, output.clsiCacheShard, build.record.response.compileGroup));
+            if (!gone) { return; }
         }
+        const route = BaseAPI.webRouteOf(file, build.record.response, build.editorId);
+        if (route===undefined) { throw gone; }
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        await downloadWhole(this.api.serverUrl + route, target, { headers: {'Cookie': identity.cookies}, size, signal, onProgress });
     }
 
     /** Download output file `file` of compile `response`: this window's, with any status, or one from Overleaf's cache. */
