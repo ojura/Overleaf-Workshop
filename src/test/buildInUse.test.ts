@@ -1033,6 +1033,33 @@ describe('the build in use, from Overleaf to the window', function () {
             overleaf.release('/project/p1/compile');
             await ended;
         });
+
+        it('does not send a compile that the user stopped while its editors were being saved, and says so', async () => {
+            overleaf.compiles.push(ownAnswer(overleaf, 'b-new'));
+            let saved!: () => void;
+            world.saveAll = () => new Promise<boolean>(resolve => { saved = () => resolve(true); });
+            const ended = compileEnd();
+            const start = manager.compile(true, false, projectUri);
+            await manager.stopCompile();
+            saved();
+            assert.deepStrictEqual(await start, { kind: 'started' });
+            const { outcome } = await ended;
+            assert.strictEqual(outcome.result, 'failure');
+            assert.match((outcome as { detail: string }).detail, /stopped before its request reached Overleaf/);
+            // neither the compile nor a stop: the compile never reached Overleaf
+            assert.deepStrictEqual(overleaf.to('/project/p1/compile').map(r => r.path), []);
+        });
+
+        it('sends nothing for a compile stopped before its request, and the project still counts as changed', async () => {
+            const stop = new AbortController();
+            stop.abort();
+            assert.strictEqual(await vfs.compile(false, false, false, undefined, false, stop.signal), 'stopped');
+            assert.deepStrictEqual(overleaf.to('/project/p1/compile').map(r => r.path), []);
+            // the next compile without force is sent, as it would have been without the stopped one
+            overleaf.compiles.push(ownAnswer(overleaf, 'b-new'));
+            assert.strictEqual(await vfs.compile(false), true);
+            assert.strictEqual(overleaf.to('/project/p1/compile').length, 1);
+        });
     });
 
     describe('5. the replica\'s .overleaf/output', () => {

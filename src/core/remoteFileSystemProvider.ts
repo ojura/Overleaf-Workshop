@@ -295,6 +295,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     private handlersRegistered: boolean = false;
     /** this window's last compile on Overleaf, whatever its status */
     lastCompile?: CompileRecord;
+    /** whether Overleaf has this window's compile request and has not answered it yet (compile) */
+    waitingForCompile = false;
     /** the build in use, which may be another client's (src/core/projectBuilds.ts) */
     readonly builds: ProjectBuilds;
     /** stops the listeners of `builds` and of the compiles' ends */
@@ -1891,11 +1893,24 @@ export class VirtualFileSystem extends vscode.Disposable {
      * first, as by "Recompile from scratch": this user's build is deleted, and the compile
      * sends every file and runs every pass. The main document is `rootDocId`, else the
      * project's. A compile that makes a build with output.pdf replaces the build in use.
+     *
+     * Answers true for a build, false for a compile without one, undefined when nothing changed
+     * since the last compile, and 'stopped' when `stop` was aborted before the request was sent:
+     * then the request is not sent, nor the clearing of the output when the stop came before it,
+     * and the project counts as changed as before. While Overleaf has the request and has not
+     * answered it, waitingForCompile is true.
      */
-    async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string, fromScratch:boolean=false) {
+    async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string, fromScratch:boolean=false, stop?: AbortSignal): Promise<boolean | 'stopped' | undefined> {
         if (force || fromScratch || (this.root && this.isDirty)) {
+            const wasDirty = this.isDirty;
             this.isDirty = false;
+            /** whether the user stopped the compile, which then sends nothing */
+            const stopped = () => {
+                if (stop?.aborted && wasDirty) { this.isDirty = true; }
+                return stop?.aborted === true;
+            };
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+            if (stopped()) { return 'stopped'; }
             if (fromScratch) {
                 const cleared = await this.api.deleteAuxFiles(identity, this.projectId);
                 if (cleared.type!=='success') {
@@ -1914,8 +1929,16 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             }
             const request: CompileRequest = {rootDocId: resolvedRootDocId, rootResourcePath, draft, stopOnFirstError};
+            // the last moment before the request: no wait between this check and the request
+            if (stopped()) { return 'stopped'; }
             const startedAt = Date.now();
-            const res = await this.api.compile(identity, this.projectId, request, {auto: true});
+            this.waitingForCompile = true;
+            let res: Awaited<ReturnType<BaseAPI['compile']>>;
+            try {
+                res = await this.api.compile(identity, this.projectId, request, {auto: true});
+            } finally {
+                this.waitingForCompile = false;
+            }
             this.lastCompile = {
                 response: res.type==='success' ? res.compile : undefined,
                 message: res.type==='success' ? undefined : res.message,

@@ -37,6 +37,9 @@ export function isMainDocument(content: string): boolean {
     return match !== null && match[1] !== 'subfiles';
 }
 
+/** Why a compile that the user stopped before its request was sent made no build. */
+const STOPPED_BEFORE_SENT = 'the compile was stopped before its request reached Overleaf';
+
 /** Why compile `record` made no build, as the viewers' banner says it. */
 function failureOf(record: CompileRecord | undefined): string {
     const status = record?.response?.status;
@@ -143,10 +146,10 @@ export class CompileManager {
     readonly status: vscode.StatusBarItem;
     /**
      * the compile that runs, from the request (compile) to its end (run): `ended` settles when the
-     * compile has ended, however it ended, and `project` is the project that it compiles, once the
-     * request has found it
+     * compile has ended, however it ended; `project` is the project that it compiles, once the
+     * request has found it; and `stop` is aborted when the user stops it (stopCompile)
      */
-    private running?: { ended: Promise<void>, project?: vscode.Uri };
+    private running?: { ended: Promise<void>, project?: vscode.Uri, stop: AbortController };
     private diagnosticProvider: CompileDiagnosticProvider;
     /** the saves of local replica logs, one after another */
     private outputSaves: Promise<void> = Promise.resolve();
@@ -270,7 +273,7 @@ export class CompileManager {
         if (this.running) { return { kind: 'busy', ended: this.running.ended }; }
         // taken before the first wait, so that a request meanwhile finds the window busy
         let settle!: () => void;
-        const running: { ended: Promise<void>, project?: vscode.Uri } = { ended: new Promise<void>(resolve => { settle = resolve; }) };
+        const running: { ended: Promise<void>, project?: vscode.Uri, stop: AbortController } = { ended: new Promise<void>(resolve => { settle = resolve; }), stop: new AbortController() };
         this.running = running;
         const end = () => {
             if (this.running === running) { this.running = undefined; }
@@ -283,15 +286,19 @@ export class CompileManager {
             if (!uri) { return { kind: 'unavailable' }; }
             running.project = uri;
             started = true;
-            void this.run(uri, force, fromScratch, end);
+            void this.run(uri, force, fromScratch, running.stop.signal, end);
             return { kind: 'started' };
         } finally {
             if (!started) { end(); }
         }
     }
 
-    /** The compile of the project at `uri` that `compile` started, up to its diagnostics; it calls `end` when it ends. */
-    private async run(uri: vscode.Uri, force: boolean, fromScratch: boolean, end: () => void) {
+    /**
+     * The compile of the project at `uri` that `compile` started, up to its diagnostics; it calls
+     * `end` when it ends. A compile that `stop` stopped before its request was sent ends as a
+     * failure that says so.
+     */
+    private async run(uri: vscode.Uri, force: boolean, fromScratch: boolean, stop: AbortSignal, end: () => void) {
         let outcome: CompileOutcome = { result: 'failure', detail: 'the compile did not start' };
         // before compile() answers 'started': the viewers say 'compiling' for this compile too
         EventBus.fire('compileStartedEvent', { uri });
@@ -306,7 +313,12 @@ export class CompileManager {
                 const content = new TextDecoder().decode( await vfs.openFile(uri) );
                 rootDocId = isMainDocument(content) ? fileId : undefined;
             }
-            const res = await vfs.compile(force, windowCompileSettings.draft, windowCompileSettings.stopOnFirstError, rootDocId, fromScratch);
+            const res = await vfs.compile(force, windowCompileSettings.draft, windowCompileSettings.stopOnFirstError, rootDocId, fromScratch, stop);
+            if (res==='stopped') {
+                outcome = { result: 'failure', detail: STOPPED_BEFORE_SENT };
+                await this.update('failed', uri);
+                return;
+            }
             if (res===undefined) {
                 // nothing changed since the last compile
                 outcome = { result: 'skipped' };
@@ -427,18 +439,28 @@ export class CompileManager {
     }
 
     /**
-     * Stop compilation: ask Overleaf to stop the running compile, of whichever project it is. The
-     * compile's end then says how it ended (run): Overleaf answers a stopped compile 'terminated',
-     * and a compile that the stop did not reach ends as it would have. Overleaf sends a stop to
-     * the compile server that it keeps for the project and the user (ClsiManager.mjs:396-421),
-     * which need not be the one that runs the compile; that one answers at once, and the compile
-     * goes on (the compile server's CompileManager.js:410-423).
+     * Stop compilation: stop the running compile, of whichever project it is. The compile keeps
+     * the stop: a compile whose request has not reached Overleaf yet, because it saves the
+     * editors, finds its project or waits for the local replica, sends nothing and ends as a
+     * failure that says so (VirtualFileSystem.compile). While Overleaf has the request, Overleaf
+     * is asked to stop it, and the compile's end says how it ended (run): Overleaf answers a
+     * stopped compile 'terminated', and a compile that the stop did not reach ends as it would
+     * have. Overleaf's stop is not sent before the request has reached Overleaf, since it stops
+     * the compile of the project and the user, whichever client started it (the compile server's
+     * CompileManager.js:410-421, getCompileName). Overleaf
+     * sends a stop to the compile server that it keeps for the project and the user
+     * (ClsiManager.mjs:396-421), which need not be the one that runs the compile; that one answers
+     * at once, and the compile goes on (the compile server's CompileManager.js:410-423).
      */
     async stopCompile() {
-        const project = this.running?.project;
-        if (!project) { return; }
-        const vfs = await this.vfsm.prefetch(project);
-        await vfs.stopCompile();
+        const running = this.running;
+        if (!running) { return; }
+        running.stop.abort();
+        if (!running.project) { return; }
+        const vfs = await this.vfsm.prefetch(running.project);
+        if (vfs.waitingForCompile) {
+            await vfs.stopCompile();
+        }
     }
 
     /**
