@@ -92,7 +92,10 @@ class FakeLocal implements ReplicaLocal {
         this.files.set(path, {content: typeof content==='string' ? enc(content) : content, mtime: this.clock});
     }
     text(path: string) { const f = this.files.get(path); return f && dec(f.content); }
+    /** while set, every listing waits for it, e.g. so that two scans list the folder at the same moment */
+    listGate?: Promise<void>;
     async list() {
+        if (this.listGate) { await this.listGate; }
         const all = new Map<string, LocalStat>();
         for (const [path, f] of this.files) { all.set(path, {size: f.content.byteLength, mtime: f.mtime}); }
         return all;
@@ -394,6 +397,29 @@ describe('ReplicaSync', () => {
         } finally {
             ReplicaSync.localDeleteDelayMs = saved;
         }
+    });
+
+    it('decides the deletions that a tool\'s request finds in the request\'s own step, also when another step has a reconcile of the same files waiting', async () => {
+        const t = setup();
+        const paths = Array.from({ length: 6 }, (_, i) => `/f${i}.png`);
+        paths.forEach((p, i) => t.remote.files.set(p, new Uint8Array([i])));
+        const sync = t.start();
+        await sync.syncAll();
+        // the files are deleted locally, as a landing's checkout deletes the files of its commit
+        for (const p of paths) { t.local.files.delete(p); }
+        // the window's question about them is never answered
+        t.ui.answer = new Promise(() => { /* the user is away */ });
+        // A periodic scan and a landing's request list the folder at the same moment. The scan
+        // schedules its reconciles first, and the request schedules its own before they start.
+        let release!: () => void;
+        t.local.listGate = new Promise<void>(resolve => { release = resolve; });
+        void sync.flush(true); // waits for the answer
+        const landing = sync.flush(true, { by: 'tool', approved: new Set(paths) });
+        t.local.listGate = undefined;
+        release();
+        const summary = await landing;
+        assert.deepStrictEqual([...summary.deletedRemote].sort(), paths);
+        assert.deepStrictEqual([...t.remote.files.keys()], [], 'the deletions that the request approves are made');
     });
 
     it('finishes the steps without deletions while a question about others waits for an answer', async () => {

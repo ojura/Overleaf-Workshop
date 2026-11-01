@@ -610,7 +610,10 @@ export class ReplicaSync {
             for (const path of Object.keys(this.state.entries)) {
                 if (!localFiles.has(path) && this.tracked(path)) { deleted.push(path); }
             }
-            const mode = collecting(summary, {live: true, tool: by==='tool', approved});
+            // A tool's request does not join a reconcile that another step scheduled and has not
+            // started: that step would decide the deletion, without the request's approvals and
+            // without the request learning about it. The request reconciles after it instead.
+            const mode = collecting(summary, {live: by!=='tool', tool: by==='tool', approved});
             // deletions after the rest, so that a renamed file is matched with its new name first
             await Promise.all(changed.map(path => this.schedule(path, mode)));
             await Promise.all(deleted.map(path => this.schedule(path, mode)));
