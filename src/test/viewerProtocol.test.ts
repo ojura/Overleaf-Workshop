@@ -36,7 +36,7 @@ describe('what the extension host and the PDF viewer pages share', function () {
         assert.strictEqual(pdfjsReleaseOf(packageJson), `vendor/pdfjs-${packageJson.devDependencies['pdfjs-dist']}`);
         assert.strictEqual(pdfjsReleaseOf({ dependencies: { 'pdfjs-dist': '9.8.7' } }), 'vendor/pdfjs-9.8.7');
         // a range names no one release, and so no folder
-        assert.throws(() => pdfjsReleaseOf({ devDependencies: { 'pdfjs-dist': '^5.1.91' } }), /one release/);
+        assert.throws(() => pdfjsReleaseOf({ devDependencies: { 'pdfjs-dist': '^9.8.7' } }), /one release/);
         assert.throws(() => pdfjsReleaseOf({}), /one release/);
     });
 
