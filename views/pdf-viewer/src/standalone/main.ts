@@ -1,8 +1,11 @@
 import { installPdfPrefetch } from '../common/pdf-prefetch';
 import { pdfCachePolicy, pdfDocumentCacheOptions } from '../common/scroll-prefetch';
-import { openHttpPdfRange } from './http-range';
 import { pageLink, readSiteConfig, sitePreviewDescriptor, type SiteConfig } from './config';
+import { captureSiteView, prepareSiteDocument } from './document-load';
+import { createSiteDocumentLifecycle } from './document-lifecycle';
+import { watchSitePublication } from './publication';
 import { httpPdfPreviewSource } from '../common/pdf-preview-http';
+import { pdfPerformance } from '../common/prefetch-performance';
 import './viewer.css';
 
 const elements = {
@@ -20,17 +23,22 @@ const elements = {
 };
 let settings: SiteConfig | undefined;
 let currentLink = location.href;
+let noticeTimer: number | undefined;
 
 /** The website always opens its configured document, including URLs copied from other viewers. */
 if (new URL(location.href).searchParams.has('file')) {
     history.replaceState(history.state, '', pageLink(location.href, location.hash));
 }
 
-function notice(message?: string, error = false) {
+function notice(message?: string, error = false, edition = false) {
+    window.clearTimeout(noticeTimer);
+    noticeTimer = undefined;
     elements.notice.hidden = !message;
     elements.noticeText.textContent = message ?? '';
     elements.notice.toggleAttribute('data-error', error);
+    elements.notice.toggleAttribute('data-edition', edition);
     elements.retry.hidden = !error;
+    if (edition) { noticeTimer = window.setTimeout(() => notice(), 4000); }
 }
 
 function errorText(error: unknown) {
@@ -85,8 +93,8 @@ const viewerReady = new Promise<any>((resolve) => {
     try { if (parent !== window) { parent.document.addEventListener('webviewerloaded', loaded); } } catch { /* Cross-origin embedding. */ }
 });
 
-async function readSettings(): Promise<SiteConfig> {
-    const response = await fetch(new URL('../config.json', import.meta.url), { cache: 'no-cache', credentials: 'same-origin' });
+async function readSettings(signal?: AbortSignal): Promise<SiteConfig> {
+    const response = await fetch(new URL('../config.json', import.meta.url), { cache: 'no-cache', credentials: 'same-origin', signal });
     if (!response.ok) { throw new Error('Konfiguracija nije dostupna (HTTP ' + response.status + ').'); }
     return readSiteConfig(await response.json(), new URL('../', import.meta.url).href);
 }
@@ -126,15 +134,19 @@ function installSharing(app: any) {
 
 async function start() {
     const [app, config] = await Promise.all([viewerReady, readSettings()]);
-    settings = config;
-    document.title = config.title;
-    elements.title.textContent = config.title;
-    elements.download.href = config.pdfUrl;
-    elements.download.download = config.filename;
-    if (config.sourceUrl) {
-        elements.source.href = config.sourceUrl;
-        elements.source.title = 'Izvorna knjiga na Nextcloudu';
+    function applySettings(value: SiteConfig) {
+        settings = value;
+        document.title = value.title;
+        elements.title.textContent = value.title;
+        elements.download.href = value.pdfUrl;
+        elements.download.download = value.filename;
+        elements.source.hidden = !value.sourceUrl;
+        if (value.sourceUrl) {
+            elements.source.href = value.sourceUrl;
+            elements.source.title = 'Izvorna knjiga na Nextcloudu';
+        }
     }
+    applySettings(config);
     await app.initializedPromise;
     const prefetch = installPdfPrefetch(app.pdfViewer, {
         diagnosticsToolbar: document.getElementById('spomenarActions')!,
@@ -143,67 +155,147 @@ async function start() {
     app.pdfViewer.viewer.classList.add('removePageBorders');
     installSharing(app);
 
-    let source: Awaited<ReturnType<typeof openHttpPdfRange>> | undefined;
+    let book: Awaited<ReturnType<typeof prepareSiteDocument>> | undefined;
     let attempt = 0;
     let loading: AbortController | undefined;
+    let automaticLoad = false;
+    let disposed = false, lastInput = -Infinity, inputVersion = 0, pressed = false, printing = false;
+    const interaction = (event: Event) => {
+        if (!event.isTrusted) { return; }
+        lastInput = performance.now();
+        inputVersion++;
+        if (event.type === 'pointerdown') { pressed = true; }
+        if (event.type === 'pointerup' || event.type === 'pointercancel') { pressed = false; }
+    };
+    const inputEvents = ['pointerdown', 'pointerup', 'pointercancel', 'wheel', 'keydown', 'touchstart', 'touchend'];
+    for (const name of inputEvents) { document.addEventListener(name, interaction, { capture: true, passive: true }); }
+    const beforePrint = () => { printing = true; };
+    const afterPrint = () => { printing = false; lastInput = performance.now(); };
+    const blur = () => { pressed = false; };
+    const visibility = () => { if (document.hidden && automaticLoad) { loading?.abort(); } };
+    window.addEventListener('beforeprint', beforePrint);
+    window.addEventListener('afterprint', afterPrint);
+    window.addEventListener('blur', blur);
+    document.addEventListener('visibilitychange', visibility);
+    const canCommit = () => !disposed && !document.hidden && !pressed && !printing && !app.pdfPresentationMode?.active
+        && !elements.shareDialog.open && performance.now() - lastInput >= 1800
+        && !document.activeElement?.closest('input, textarea, [contenteditable="true"]')
+        && window.getSelection()?.isCollapsed !== false;
+    const documentLifecycle = createSiteDocumentLifecycle(app, {
+        viewHash: () => new URL(currentLink).hash,
+        inputVersion: () => inputVersion,
+    });
     const resize = new ResizeObserver(() => app.eventBus.dispatch('resize', { source: window }));
     resize.observe(document.getElementById('outerContainer')!);
 
     app.eventBus.on('pagerendered', ({ error }: { error?: Error }) => {
-        if (!error && !elements.notice.hasAttribute('data-error')) { notice(); }
+        if (!error && !elements.notice.hasAttribute('data-error') && !elements.notice.hasAttribute('data-edition')) { notice(); }
     });
     app.eventBus.on('documenterror', ({ message }: { message: string }) => {
         notice('PDF se nije učitao. ' + message, true);
     });
 
-    async function openBook() {
+    async function openBook(value: SiteConfig, newEdition = false, automatic = false) {
         const current = ++attempt;
         loading?.abort();
-        source?.abort();
         loading = new AbortController();
-        const signal = loading.signal;
-        elements.share.disabled = true;
-        notice('Učitavam spomenar…');
+        automaticLoad = automatic;
+        const controller = loading, signal = controller.signal;
+        let prepared: Awaited<ReturnType<typeof prepareSiteDocument>> | undefined;
+        let cancelReplacement: (() => void) | undefined;
+        let committed = false;
+        const timeout = window.setTimeout(() => controller.abort(), 60_000);
+        if (!automatic) { elements.share.disabled = true; notice('Učitavam spomenar…'); }
         try {
-            await app.close();
-            if (signal.aborted) { return; }
-            // On retry the upstream history restores the last page and zoom.
-            app.initialBookmark = location.hash.slice(1);
-            const next = await openHttpPdfRange((window as any).pdfjsLib, config.pdfUrl, {
-                filename: config.filename,
-                signal,
+            const pdfjs = (window as any).pdfjsLib;
+            const options = (window as any).PDFViewerApplicationOptions;
+            // The pinned viewer uses OptionKind.WORKER=0x08 and API=0x04 in open().
+            Object.assign(pdfjs.GlobalWorkerOptions, options.getAll(0x08));
+            prepared = await prepareSiteDocument(pdfjs, value, {
+                signal, requirePreviewIdentity: automatic,
+                apiParams: { ...options.getAll(0x04), ...pdfDocumentCacheOptions() },
+                onProgress: automatic ? undefined : ({ loaded, total }) => app.progress(loaded / total),
                 onError(error) {
-                    if (current !== attempt) { return; }
-                    loading?.abort();
+                    if (!prepared || book !== prepared || disposed) { return; }
                     notice('Veza s knjigom je prekinuta. ' + error.message, true);
-                    void app.close().catch((reason: unknown) => console.error('spomenar: close', reason));
+                    void documentLifecycle.close(prepared).catch((reason: unknown) => console.error('spomenar: close', reason));
                 },
             });
-            if (signal.aborted || current !== attempt) { next.abort(); return; }
-            source = next;
-            elements.download.title = 'Preuzmi cijeli PDF (' + (next.length / 1e9).toLocaleString('hr', { maximumFractionDigits: 2 }) + ' GB)';
-            await app.open({ ...next.documentParams, ...pdfDocumentCacheOptions() });
-            if (signal.aborted || current !== attempt) { return; }
-            const preview = sitePreviewDescriptor(config, next);
-            prefetch.setPreviewSource(preview ? httpPdfPreviewSource(preview) : undefined, app.pdfDocument);
+            if (signal.aborted || current !== attempt || automatic && !canCommit()) { return false; }
+            const view = app.pdfDocument ? captureSiteView(app, new URL(currentLink).hash, prepared.document.numPages) : undefined;
+            const previous = book;
+            const preview = sitePreviewDescriptor(value, prepared.source);
+            automaticLoad = false;
+            window.clearTimeout(timeout);
+            if (view) {
+                const identity = preview?.identity.key ?? JSON.stringify([value.pdfUrl, prepared.source.length,
+                    prepared.source.validator, value.publicationGeneration ?? 0]);
+                cancelReplacement = prefetch.prepareReplacement(identity, signal);
+            }
+            await documentLifecycle.close(previous, signal);
+            if (signal.aborted || current !== attempt || disposed) { return false; }
+            const next = prepared;
+            app.initialBookmark = view?.hash ?? location.hash.slice(1);
+            app.initialRotation = view?.rotation ?? null;
+            app.pdfLoadingTask = next.task;
+            app.setTitleUsingUrl(value.pdfUrl, value.pdfUrl);
+            documentLifecycle.load(next.document, { view, automatic });
+            book = next;
+            applySettings(value);
+            committed = true;
+            elements.download.title = 'Preuzmi cijeli PDF (' + (next.source.length / 1e9).toLocaleString('hr', { maximumFractionDigits: 2 }) + ' GB)';
+            prefetch.setPreviewSource(preview ? httpPdfPreviewSource(preview) : undefined, next.document);
+            pdfPerformance.event('publication-open', { edition: newEdition, generation: value.publicationGeneration ?? 0,
+                pages: next.document.numPages, bytes: next.source.length });
+            if (newEdition) { notice('Nova knjiga je stigla. Ekipa, na posao!', false, true); }
+            return true;
         } catch (error) {
-            if (signal.aborted || current !== attempt) { return; }
-            source?.abort();
-            notice('PDF se nije učitao. ' + errorText(error), true);
+            if (current !== attempt || disposed || signal.aborted && document.hidden) { return false; }
+            if (automatic) { throw error; }
+            notice('PDF se nije učitao. ' + (signal.aborted ? 'Veza je prespora. Pokušajte ponovno.' : errorText(error)), true);
+            return false;
+        } finally {
+            window.clearTimeout(timeout);
+            if (!committed) { cancelReplacement?.(); prepared?.destroy(); }
+            if (loading === controller) { loading = undefined; automaticLoad = false; }
         }
     }
 
-    elements.retry.addEventListener('click', () => { void openBook(); });
+    elements.retry.addEventListener('click', () => {
+        void readSettings().then(value => openBook(value)).catch(error => notice(errorText(error), true));
+    });
+    const publication = watchSitePublication({
+        current: () => settings!, read: readSettings, canApply: () => !loading && canCommit(),
+        async apply(value, change) {
+            if (change.kind === 'document') { return openBook(value, change.newEdition, true); }
+            if (change.kind === 'previews' && book) {
+                const preview = sitePreviewDescriptor(value, book.source);
+                prefetch.setPreviewSource(preview ? httpPdfPreviewSource(preview) : undefined, book.document);
+                pdfPerformance.event('publication-previews', { generation: value.publicationGeneration ?? 0 });
+            }
+            applySettings(value);
+        },
+        onError: error => pdfPerformance.event('publication-check-error', { message: errorText(error) }),
+    });
     window.addEventListener('pagehide', (event) => {
         if (event.persisted) { return; }
+        disposed = true;
         ++attempt;
         loading?.abort();
-        source?.abort();
+        book?.destroy();
+        documentLifecycle.dispose();
+        publication.dispose();
+        window.clearTimeout(noticeTimer);
+        for (const name of inputEvents) { document.removeEventListener(name, interaction, true); }
+        window.removeEventListener('beforeprint', beforePrint);
+        window.removeEventListener('afterprint', afterPrint);
+        window.removeEventListener('blur', blur);
+        document.removeEventListener('visibilitychange', visibility);
         resize.disconnect();
         prefetch.dispose();
         void app.close().catch(() => {});
     });
-    await openBook();
+    await openBook(config);
 }
 
 start().catch(error => {

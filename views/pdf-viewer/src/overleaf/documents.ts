@@ -4,10 +4,13 @@ import { bridgeOutputsOf } from '../common/bridge';
 import { toPdfFile } from '../common/output';
 import type { PdfOutput, PdfPreviewDescriptor } from '../common/protocol';
 import { createWorkerPort } from '../common/worker';
+import { holdDocumentHeight } from '../common/document-height';
 
 export interface DocumentHooks {
     /** a load is about to replace the shown document: save what depends on it */
     beforeLoad(): void;
+    /** The validated proxy is being installed now, including a deferred native view transition. */
+    beforeSwap?(doc: any, build: string | undefined, signal: AbortSignal): (() => void) | undefined;
     /** `doc`, of build `build` or read whole, is shown */
     loaded(doc: any, build: string | undefined, preview?: PdfPreviewDescriptor): void;
     /** the load of build `build`, or of a PDF read whole, failed; `aborted` when a newer load stopped it */
@@ -16,15 +19,23 @@ export interface DocumentHooks {
     fetchFailed(error: unknown, build: string): void;
 }
 
+type Adoption = { doc: any } | { error: unknown };
+
 interface Job {
     abort: AbortController;
     task?: any;
+    adopted: Promise<Adoption>;
+    adopt(result: Adoption): void;
+    shown: boolean;
 }
 
 /** What the page ends together with a document it loaded. */
 interface Owned {
     /** the document's worker */
     worker: Worker;
+    job: Job;
+    signal: AbortSignal;
+    build?: string;
     /** the abort controller of the document's range requests (Overleaf's transport), for a build loaded in ranges */
     requests?: AbortController;
 }
@@ -64,8 +75,38 @@ export class Documents {
     private shownBuild?: string;
     /** the worker and the range requests of each document's loading task */
     private readonly owned = new Map<any, Owned>();
+    /** Deferred callbacks may still hold a proxy after its task was destroyed. */
+    private readonly retired = new WeakSet<object>();
 
-    constructor(private readonly wrapper: PDFJSWrapper, private readonly hooks: DocumentHooks) {}
+    constructor(private readonly wrapper: PDFJSWrapper, private readonly hooks: DocumentHooks) {
+        // loadDocument may return before its view-transition callback installs the
+        // proxy. Observe the actual assignment, with PDFViewer as the real receiver.
+        const viewer = wrapper.viewer;
+        const setDocument = viewer.setDocument;
+        viewer.setDocument = (doc) => {
+            const owned = this.owned.get(doc?.loadingTask);
+            if (this.retired.has(doc?.loadingTask) || owned?.signal.aborted) {
+                // Throw before the wrapper continues to linkService.setDocument as well.
+                throw new DOMException('The document load was cancelled.', 'AbortError');
+            }
+            let cancel: (() => void) | undefined;
+            if (doc && viewer.pdfDocument && doc !== viewer.pdfDocument && owned) {
+                try { cancel = hooks.beforeSwap?.(doc, owned.build, owned.signal); }
+                catch { /* Optional scene preparation cannot prevent useful document pixels. */ }
+            }
+            try { setDocument.call(viewer, doc); }
+            catch (error) {
+                try { cancel?.(); } catch { /* Keep the viewer's original load failure. */ }
+                owned?.job.adopt({ error });
+                throw error;
+            }
+            if (owned) {
+                owned.job.shown = true;
+                owned.job.adopt({ doc });
+                if (this.inFlight === owned.job) { this.inFlight = undefined; }
+            }
+        };
+    }
 
     /** whether a load is under way, whose document will replace the shown one */
     get loading() {
@@ -91,7 +132,9 @@ export class Documents {
     private enqueue(run: (job: Job) => Promise<void>) {
         // a newer load overtakes the one in flight: stop its requests and destroy its document
         if (this.inFlight) { this.stop(this.inFlight); }
-        const job: Job = { abort: new AbortController() };
+        let adopt!: (result: Adoption) => void;
+        const adopted = new Promise<Adoption>(resolve => { adopt = resolve; });
+        const job: Job = { abort: new AbortController(), adopted, adopt, shown: false };
         this.inFlight = job;
         this.queue = this.queue
             .then(() => run(job))
@@ -104,6 +147,7 @@ export class Documents {
         loadingTasks.delete(task);
         const owned = this.owned.get(task);
         this.owned.delete(task);
+        this.retired.add(task);
         owned?.requests?.abort();
         const timeout = new Promise(resolve => setTimeout(resolve, DESTROY_TIMEOUT_MS));
         Promise.race([task.destroy(), timeout])
@@ -120,10 +164,19 @@ export class Documents {
 
     /** Resolves with what `promise` gives, or with `undefined` once the job is aborted. */
     private untilAborted<T>(job: Job, promise: Promise<T>): Promise<T | undefined> {
-        return Promise.race([
-            promise,
-            new Promise<undefined>(resolve => job.abort.signal.addEventListener('abort', () => resolve(undefined), { once: true })),
-        ]);
+        return new Promise((resolve, reject) => {
+            const signal = job.abort.signal;
+            const aborted = () => { signal.removeEventListener('abort', aborted); resolve(undefined); };
+            signal.addEventListener('abort', aborted, { once: true });
+            if (signal.aborted) { aborted(); }
+            promise.then(value => {
+                signal.removeEventListener('abort', aborted);
+                resolve(signal.aborted ? undefined : value);
+            }, error => {
+                signal.removeEventListener('abort', aborted);
+                reject(error);
+            });
+        });
     }
 
     /** Start the job's worker; false if the job was overtaken meanwhile. */
@@ -145,7 +198,6 @@ export class Documents {
         bridgeOutputsOf(output);
         const { url, pdfFile } = toPdfFile(output);
         const before = new Set(loadingTasks);
-        let shown = false;
         const loading = this.wrapper.loadDocument({
             url,
             pdfFile,
@@ -156,15 +208,21 @@ export class Documents {
                 // Before the document is shown, a request that failed for good ends its load:
                 // pdf.js waits for the missing range forever. Stop the job, so that its worker
                 // goes and the next load can start.
-                if (!shown) { this.stop(job); }
+                if (!job.shown) { this.stop(job); }
             },
         });
         // loadDocument has created the task before its first await
         job.task = [...loadingTasks].find(task => !before.has(task));
-        if (job.task) { this.owned.set(job.task, { worker: port, requests: job.abort }); } else { port.terminate(); }
+        if (job.task) { this.owned.set(job.task, { worker: port, job, signal: job.abort.signal, build: output.file.build, requests: job.abort }); } else { port.terminate(); }
         let doc: any;
         try {
             doc = await this.untilAborted(job, loading);
+            if (doc) {
+                const adoption = await this.untilAborted(job, job.adopted);
+                if (!adoption) { doc = undefined; }
+                else if ('error' in adoption) { throw adoption.error; }
+                else { doc = adoption.doc; }
+            }
         } catch (error) {
             if (job.task) { this.destroy(job.task); }
             this.hooks.failed(error, job.abort.signal.aborted, output.file.build);
@@ -175,7 +233,6 @@ export class Documents {
             if (job.task) { this.destroy(job.task); }
             return;
         }
-        shown = true;
         this.shownBuild = output.file.build;
         this.destroyAllBut(doc);
         this.hooks.loaded(doc, output.file.build, preview);
@@ -193,11 +250,12 @@ export class Documents {
         // the wrapper loads URLs only; a PDF read whole is set the way loadDocument sets one
         const task = PDFJS.getDocument({ data, ...documentParams() });
         loadingTasks.add(task);
-        this.owned.set(task, { worker: port });
+        this.owned.set(task, { worker: port, job, signal: job.abort.signal });
         job.task = task;
         let doc: any;
         try {
             doc = await this.untilAborted(job, task.promise);
+            if (doc) { this.setDocument(doc); }
         } catch (error) {
             this.destroy(task);
             this.hooks.failed(error, job.abort.signal.aborted, undefined);
@@ -207,7 +265,6 @@ export class Documents {
             this.destroy(task);
             return;
         }
-        this.setDocument(doc);
         this.shownBuild = undefined;
         this.destroyAllBut(doc);
         this.hooks.loaded(doc, undefined);
@@ -217,17 +274,14 @@ export class Documents {
     private setDocument(doc: any) {
         const { wrapper } = this;
         const viewerEl = wrapper.container.querySelector('.pdfViewer') as HTMLElement;
-        const currentHeight = viewerEl.getBoundingClientRect().height;
-        if (currentHeight > 0) {
-            viewerEl.style.minHeight = `${currentHeight}px`;
-            const clearMinHeight = () => {
-                viewerEl.style.minHeight = '';
-                wrapper.eventBus.off('pagesinit', clearMinHeight);
-            };
-            wrapper.eventBus.on('pagesinit', clearMinHeight);
+        const releaseHeight = holdDocumentHeight(viewerEl, wrapper.eventBus, this.owned.get(doc?.loadingTask)?.signal);
+        try {
+            wrapper.viewer.setDocument(doc);
+            // the wrapper's own PDFLinkService, which the viewer was given
+            (wrapper.viewer.linkService as any).setDocument(doc);
+        } catch (error) {
+            releaseHeight();
+            throw error;
         }
-        wrapper.viewer.setDocument(doc);
-        // the wrapper's own PDFLinkService, which the viewer was given
-        (wrapper.viewer.linkService as any).setDocument(doc);
     }
 }

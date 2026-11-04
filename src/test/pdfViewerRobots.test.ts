@@ -26,7 +26,11 @@ class RobotElement {
     readonly style: Record<string, string> = {};
     readonly children: RobotElement[] = [];
     readonly attributes = new Map<string, string>();
-    readonly context = new Proxy({} as Record<string, any>, {
+    rect = { left: 0, top: 0, width: 480, height: 250 };
+    readonly texts: Array<{ text: string; x: number; y: number; font: string }> = [];
+    readonly context = new Proxy({ fillText: (text: string, x: number, y: number) => {
+        this.texts.push({ text, x, y, font: this.context.font });
+    } } as Record<string, any>, {
         get(target, key: string) {
             if (key in target) { return target[key]; }
             if (key === 'createLinearGradient' || key === 'createRadialGradient') { return () => ({ addColorStop() {} }); }
@@ -36,6 +40,7 @@ class RobotElement {
     });
     constructor(readonly ownerDocument: any) {}
     getContext() { return this.context; }
+    getBoundingClientRect() { return { ...this.rect }; }
     append(...elements: RobotElement[]) { this.children.push(...elements); }
     replaceChildren(...elements: RobotElement[]) { this.children.splice(0, this.children.length, ...elements); }
     setAttribute(name: string, value: string) { this.attributes.set(name, value); }
@@ -57,6 +62,7 @@ class RobotRuntime {
         const runtime = this;
         Object.assign(this.window, {
             devicePixelRatio: 1,
+            getComputedStyle: () => ({ objectFit: 'contain', objectPosition: '50% 50%' }),
             performance: { now: () => this.now },
             crypto: { getRandomValues: (values: Uint32Array) => { values[0] = seed; return values; } },
             matchMedia: () => this.media,
@@ -155,6 +161,9 @@ describe('the procedural PDF robot fleet', function () {
             const opened = runtime.lab.snapshot();
             assert.strictEqual(opened.renderer.active, true);
             assert.strictEqual(runtime.stage.children.length, 3);
+            const caption = runtime.stage.children.find(node => node.className === 'robot-caption')!;
+            assert.ok(parseFloat(caption.style.fontSize) >= 16 && caption.style.background === '#fffdf5'
+                && caption.style.color === '#17212b' && caption.style.opacity === '1');
             assert.strictEqual(runtime.callbacks.size, 0, 'a parked fleet needs no animation frame');
             const frames = opened.renderer.frames;
             for (let sample = 0; sample < 240; sample++) {
@@ -183,7 +192,7 @@ describe('the procedural PDF robot fleet', function () {
             assert.strictEqual(settled.queuedCargo.length, 0);
             assert.ok(settled.actors.every((actor: any) => actor.job === 'idle' && !actor.carrying && actor.notice === null
                 && Math.hypot(actor.x - actor.goal.x, actor.y - actor.goal.y) <= 1 && Math.hypot(actor.vx, actor.vy) <= 2),
-            'all return travel, docking and readable notice transitions finish before sleep');
+            'all return travel, docking and readable notice transitions finish before sleep: ' + JSON.stringify(settled.actors));
             assert.strictEqual(runtime.callbacks.size, 0);
             const frames = settled.renderer.frames;
             for (let sample = 0; sample < 240; sample++) {
@@ -207,7 +216,25 @@ describe('the procedural PDF robot fleet', function () {
             assert.strictEqual(runtime.callbacks.size, 1);
             for (let frame = 0; frame < 3000 && runtime.callbacks.size; frame++) { runtime.frame(); }
             assert.strictEqual(runtime.lab.snapshot().stats.deliveredCargo, 16);
-            assert.strictEqual(runtime.callbacks.size, 0);
+            assert.strictEqual(runtime.callbacks.size, 0, JSON.stringify(runtime.lab.snapshot().actors));
+        } finally { runtime.dispose(); }
+    });
+
+    it('places readable compact labels on a single unchanged-time resize without starting idle frames', () => {
+        const runtime = new RobotRuntime(robots);
+        try {
+            runtime.lab.update(ready); runtime.lab.setActive(true);
+            const canvas = runtime.stage.children.find(node => node.className === 'robot-canvas')!;
+            canvas.texts.length = 0;
+            canvas.rect.width = 300; canvas.rect.height = 86;
+            const before = runtime.lab.snapshot().renderer.frames;
+            runtime.resize();
+            const names = new Set(robots.ROBOT_VEHICLES.map((vehicle: any) => vehicle.name));
+            const labels = canvas.texts.filter(value => names.has(value.text));
+            assert.ok(labels.length > 0 && labels.length < names.size, 'the first static paint shows admitted labels and suppresses conflicting ones');
+            assert.ok(labels.every(value => parseFloat(value.font.split(' ')[1]) * (86 / 250) >= 16), 'drawing sizes compensate the fitted canvas');
+            assert.strictEqual(runtime.lab.snapshot().renderer.frames, before + 1);
+            assert.strictEqual(runtime.callbacks.size, 0, 'label placement does not need a fade-in animation');
         } finally { runtime.dispose(); }
     });
 

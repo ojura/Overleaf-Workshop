@@ -183,7 +183,7 @@ const DESTROY_TIMEOUT_MS = 10_000;
 let queue: Promise<void> = Promise.resolve();
 let inFlight: Job | undefined;
 /** the document that the app shows */
-let shown: { task: any, worker: Worker } | undefined;
+let shown: { task: any, worker: Worker, doc: any } | undefined;
 
 function destroy(task: any, worker?: Worker) {
     const timeout = new Promise(resolve => setTimeout(resolve, DESTROY_TIMEOUT_MS));
@@ -244,7 +244,7 @@ async function load(source: Source, job: Job) {
 
     let params: Record<string, unknown>;
     let url: string | undefined;
-    let isShown = false;
+    let committing = false;
     if (source.output) {
         bridgeOutputsOf(source.output);
         const file = toPdfFile(source.output);
@@ -255,7 +255,7 @@ async function load(source: Source, job: Job) {
                 if (job.abort.signal.aborted) { return; }
                 showLoadError(error, source.output?.file.build);
                 // before the document is shown, pdf.js would wait for the missing data for good
-                if (!isShown) { stop(job); }
+                if (!committing) { stop(job); }
             },
         });
         // as PDFJSWrapper.loadDocument: one chunk for a small PDF
@@ -264,11 +264,6 @@ async function load(source: Source, job: Job) {
     } else {
         params = { data: new Uint8Array(source.data!) };
     }
-
-    // the view to come back to: where the reader is now, or what was saved for the document
-    const view = a.pdfDocument
-        ? { position: positionOf(a), scale: a.pdfViewer.currentScaleValue }
-        : { position: savedState().position, scale: savedState().scale };
 
     // getDocument reads the worker from here
     PDFJS.GlobalWorkerOptions.workerPort = worker;
@@ -283,17 +278,17 @@ async function load(source: Source, job: Job) {
         return;
     }
     if (!doc) { return; }
-    isShown = true;
+    // Capture after preparation: the reader may have moved while ranges arrived.
+    const view = a.pdfDocument
+        ? { position: positionOf(a), scale: a.pdfViewer.currentScaleValue }
+        : { position: savedState().position, scale: savedState().scale };
+    committing = true;
     // from here on a newer load waits for this one and then replaces it, rather than stopping it
     if (inFlight === job) { inFlight = undefined; }
-    shownBuild = source.output?.file.build;
-    documentShown(shownBuild);
-    findAllowed = false;
-    rangeLoaded = source.output;
-
     // Hold the page viewer's height while the old pages go, so the scroll position stays until the
     // new pages are there (PDFJSWrapper.loadDocument); pagesinit releases it.
     const pages = a.pdfViewer.viewer as HTMLElement;
+    const previousHeight = pages.style.minHeight;
     const height = pages.getBoundingClientRect().height;
     if (height > 0) { pages.style.minHeight = `${height}px`; }
     restore = view;
@@ -301,12 +296,47 @@ async function load(source: Source, job: Job) {
 
     // the app destroys the old document; then its worker stops
     const old = shown;
-    await Promise.race([a.close(), new Promise(resolve => setTimeout(resolve, DESTROY_TIMEOUT_MS))]);
-    old?.worker.terminate();
-    a.pdfLoadingTask = task;
-    shown = { task, worker };
-    if (url) { a.setTitleUsingUrl(url, url); }
-    a.load(doc);
+    const releaseDetachedOld = () => {
+        // close can detach the document before its task destruction rejects. Keep an
+        // owner that is still live in the app, and release one that has left it.
+        if (old && shown === old && a.pdfLoadingTask !== old.task && a.pdfDocument !== old.doc) {
+            old.worker.terminate();
+            shown = undefined;
+        }
+    };
+    let cancelReplacement: (() => void) | undefined;
+    if (a.pdfDocument) {
+        try { cancelReplacement = previewController?.prepareReplacement(source.output?.file.build ?? doc.fingerprints?.[0] ?? 'inline', job.abort.signal); }
+        catch { /* Optional artwork cannot prevent useful document pixels. */ }
+    }
+    try {
+        await Promise.race([a.close(), new Promise(resolve => setTimeout(resolve, DESTROY_TIMEOUT_MS))]);
+        a.pdfLoadingTask = task;
+        if (url) { a.setTitleUsingUrl(url, url); }
+        a.load(doc);
+    } catch (error) {
+        try { cancelReplacement?.(); } catch { /* Keep the original app failure. */ }
+        pages.style.minHeight = previousHeight;
+        restore = undefined;
+        if (a.pdfLoadingTask === task) {
+            // load assigns the app's document before it calls the page viewer. A setter
+            // failure can therefore leave a partially adopted document that close must clear.
+            try { await Promise.race([a.close(), new Promise(resolve => setTimeout(resolve, DESTROY_TIMEOUT_MS))]); }
+            catch (closeError) { console.warn('pdf viewer: closing a failed document:', closeError); }
+            finally { worker.terminate(); }
+        } else {
+            destroy(task, worker);
+        }
+        releaseDetachedOld();
+        showLoadError(error, source.output?.file.build);
+        return;
+    }
+    releaseDetachedOld();
+    shown = { task, worker, doc };
+    shownBuild = source.output?.file.build;
+    findAllowed = false;
+    rangeLoaded = source.output;
+    documentShown(shownBuild);
     previewController?.setPreviewSource(hostPdfPreviewSource(source.preview), doc);
 }
 

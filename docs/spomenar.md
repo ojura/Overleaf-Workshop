@@ -30,22 +30,27 @@ node scripts/build-spomenar.mjs --out /tmp/spomenar-preview
 
 The export contains `index.html`, `config.json`, the website bundle and stylesheet, the pinned PDF.js release under `assets/pdfjs/`, and a favicon. Every asset URL is relative, so the same export works below `/spomenar/` or another directory. The build derives the viewer body from the pinned upstream `web/viewer.html`, preserving its controls and accessibility markup. The book is served separately.
 
-Public settings live in `views/pdf-viewer/src/standalone/config.json` and are copied into the export:
+The build packages `views/pdf-viewer/src/standalone/config.json` as the seed for a standalone export. Production serves `/spomenar/config.json` and `/spomenar/status.json` from the publication service's root-owned catalog. Deploying viewer assets preserves that catalog and omits the build's seed configuration.
+
+The published configuration identifies the immutable PDF and retains the reader's title, download filename and source link:
 
 ```json
 {
-  "pdfUrl": "./book.pdf",
+  "pdfUrl": "/spomenar-versions/<source-sha256>/book.pdf",
   "title": "30 godina LARICS-a",
   "filename": "Kako je LARICS postao 30-godišnjak.pdf",
-  "sourceUrl": "/nextcloud/s/spomenar-2026"
+  "sourceUrl": "/nextcloud/s/spomenar-2026",
+  "publicationGeneration": 1
 }
 ```
 
-`pdfUrl` must resolve to the website's HTTP origin. `title` names the book in the header and tab; `filename` names its download. The optional `sourceUrl` makes the book heading a link to the original publication. The public share is https://cloud.larics.fer.hr/nextcloud/s/spomenar-2026.
+`<source-sha256>` represents the PDF's full SHA-256 digest. `pdfUrl` must resolve to the website's HTTP origin. `title` names the book in the header and tab; `filename` names its download. The optional `sourceUrl` makes the book heading a link to the original publication. The public share is https://cloud.larics.fer.hr/nextcloud/s/spomenar-2026.
+
+The catalog also binds the matching preview manifest at `/spomenar/previews/<source-sha256>/manifest.json` to the PDF's digest, byte length and observed HTTP validator. A publication generation identifies a committed configuration; a separate manifest revision lets a fuller atlas replace an earlier checkpoint while the same PDF stays open. See [automatic publication](spomenar-watch.md#publication-files-and-public-access) for the complete configuration and public progress fields. Configuration and status remain separate from the replaceable viewer files.
 
 ## PDF endpoint
 
-The production source is `/spomenar/book.pdf`. It must serve the PDF directly and accept ordinary HTTP byte ranges:
+Production serves each edition directly at `/spomenar-versions/<source-sha256>/book.pdf`. Static nginx delivery provides HEAD, ordinary byte ranges and If-Range against that immutable file. The PDF endpoint must:
 
 - Return HTTP 206 with a valid `Content-Range: bytes start-end/total`.
 - Serve uncompressed byte ranges. A compressed transfer changes the byte offsets PDF.js requests.
@@ -53,7 +58,9 @@ The production source is `/spomenar/book.pdf`. It must serve the PDF directly an
 - Supply a strong ETag or Last-Modified value so later requests can carry `If-Range`.
 - Keep entry, configuration, and application assets revalidated together during deployment.
 
-The production route resolves the stable Nextcloud share token on every request through its native DAV handler. Renames and moves follow the share automatically; content replacement is detected through its validator, and revocation also closes the Spomenar route. Generated previews are independently bound to the exact PDF digest, size and validator.
+The publication service checks the stable Nextcloud share, waits for a changed source to settle, and snapshots its local PDF into an immutable edition. Nextcloud remains the authority for source discovery and public access. Renames and moves follow the shared node; reader byte requests use the published static file. A new edition and its matching preview identity become current through one atomic catalog update. Revocation removes the catalog's public link at the next service poll, withdrawing subsequent PDF, preview, configuration and status requests together.
+
+The service prepares priority-page previews first, then completes the remaining atlas. A fuller atlas updates its manifest revision without replacing the PDF. Retained editions let an existing reader finish its current load while publication advances; their count and storage limits can eventually retire an old version, at which point that reader needs to reload the current edition. The [publication guide](spomenar-watch.md) defines recovery, retention and withdrawal behavior.
 
 `http-range.ts` fetches the first 128 KiB, then only the ranges requested by PDF.js. It validates the response headers before reading the body and enforces the declared byte count while streaming. A full-file HTTP 200 response is cancelled before buffering. A changed length or validator ends the current load and shows a retry action. Retry uses the viewer's saved position.
 
@@ -63,7 +70,7 @@ Image decoding follows the displayed page and zoom on every device, with one ima
 
 The website's scripts, PDF.js worker, fonts, locales, and WASM files come from the same origin. It uses external scripts, system fonts, and `isEvalSupported: false`. PDF.js needs WASM execution, worker/blob sources, data/blob images and fonts, and dynamically applied styles. The deployment's CSP must allow those resources.
 
-See [Spomenar deployment](spomenar-deployment.md) for the server layout and the checked nginx deployment command.
+See [Spomenar deployment](spomenar-deployment.md) for the viewer deployment command and [automatic publication](spomenar-watch.md#installation-and-initial-adoption) for catalog bootstrap and service installation.
 
 ## LARICS identity
 
@@ -85,4 +92,4 @@ node node_modules/mocha/bin/mocha.js out/test/pdfViewerStandalone.test.js
 node node_modules/typescript/bin/tsc --noEmit --target ES2022 --module ES2022 --moduleResolution bundler --lib ES2022,DOM,DOM.Iterable --skipLibCheck views/pdf-viewer/src/standalone/main.ts
 ```
 
-See [PDF prefetching](pdf-prefetch.md) for the shared scheduler, measurements, and cache policies. The [physical iPhone validation](spomenar-mobile-validation.md) reports actual book traversals, adaptive decoding, browser memory, idle CPU and the document fleet, with [exact numeric results](spomenar-mobile-metrics.json).
+See [PDF prefetching](pdf-prefetch.md) for the shared scheduler, measurements, and cache policies.

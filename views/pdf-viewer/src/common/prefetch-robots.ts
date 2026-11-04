@@ -1,10 +1,16 @@
+import type { RobotExpression } from './robot-encounters';
+import { robotScreenMetrics, robotCaptionMetrics, ROBOT_CAPTION_STYLE } from './robot-screen-scale';
+import { paintEkokomvoz } from './robot-ekokomvoz-artwork';
+import { LabelPlacementSolver } from './label-placement';
+import { ROBOT_RESCUE_POLICY } from './robot-rescue';
+
 /**
  * The motion lab's crew keep their own jobs, destinations and patience. Scenarios give them
  * goals; steering, yielding, assistance and delivery completion follow from the simulation.
  * The model has no DOM dependency, so long outages and busy traffic can be tested directly.
  */
 export const ROBOT_VEHICLES = [
-    { id: 'quad', name: 'X-UFO', color: '#70e7d3', air: true, speed: 78, radius: 21 },
+    { id: 'quad', name: 'EagleRed', color: '#d9534f', air: true, speed: 78, radius: 21 },
     { id: 'heavyquad', name: 'MORUS', color: '#ffbd70', air: true, speed: 62, radius: 26 },
     { id: 'tiltwing', name: 'MetaMorpher', color: '#aab7ff', air: true, speed: 92, radius: 27 },
     { id: 'rover', name: 'VIV', color: '#f17c75', air: false, speed: 46, radius: 20 },
@@ -12,6 +18,8 @@ export const ROBOT_VEHICLES = [
     { id: 'forklift', name: 'Navines', color: '#769cdd', air: false, speed: 40, radius: 24 },
     { id: 'hexapod', name: 'ALKA', color: '#c5a1ef', air: false, speed: 38, radius: 24 },
     { id: 'walker', name: 'DynaRobin', color: '#a8db8b', air: false, speed: 64, radius: 19 },
+    { id: 'lugv', name: 'L-UGV', color: '#b9c5c8', air: false, speed: 42, radius: 18 },
+    { id: 'ekokomvoz', name: 'EKO-KOMVOZ', color: '#31599b', air: false, speed: 32, radius: 34 },
 ] as const;
 export type RobotVehicle = typeof ROBOT_VEHICLES[number]['id'];
 export const ROBOT_ARTWORK_SIZE = Object.freeze({ width: 128, height: 100 });
@@ -28,6 +36,13 @@ export const ROBOT_FORKLIFT_ATTACHMENT = Object.freeze({
     rearFork: Object.freeze({ left: 23, right: 43, y: 15, strokeWidth: 2 }),
     carryLift: 12,
     cargo: Object.freeze({ x: 33, y: -18 }),
+    pull: Object.freeze({ left: Object.freeze({ x: -43, y: -20 }), right: Object.freeze({ x: 42, y: -20 }) }),
+});
+/** Body-centered artwork coordinates; apply the corresponding internal and displayed scales. */
+export const ROBOT_AIRLIFT_ATTACHMENT = Object.freeze({
+    groundScale: GROUND_ARTWORK_SCALE, airScale: 0.83,
+    groundGrab: Object.freeze({ x: 0, y: -14 }), airGrab: Object.freeze({ x: 0, y: 32 }),
+    slingWidth: 12,
 });
 export interface RobotDispatchPoint { x: number; y: number; scale?: number }
 export interface RobotDispatchPort {
@@ -172,7 +187,11 @@ function trafficPriority(actor: Actor): number {
         && ['load', 'unload'].includes(actor.task!.steps[actor.task!.index].activity);
     // The departing courier clears the bay before another loaded courier enters it.
     const departing = delivery && actor.task!.index > 1;
-    return (docked ? 40 : departing ? 30 : actor.carrying ? 20 : delivery ? 10 : 0) - actor.id / 10;
+    // Unfinished travel has right of way over a settled idle body. This also lets a
+    // returning bulky vehicle clear a detour beside the stage boundary.
+    const travelling = distance(actor, actor.goal) > 1;
+    return (docked ? 40 : departing ? 30 : actor.carrying ? 20 : delivery ? 10
+        : actor.detour !== null ? 7 : travelling ? 5 : 0) - actor.id / 10;
 }
 
 function lastWhere<T>(values: readonly T[], predicate: (value: T) => boolean): T | undefined {
@@ -248,7 +267,7 @@ export class RobotChoreographer {
         const homes = [
             { x: 80, y: 54 }, { x: 386, y: 62 }, { x: 244, y: 44 },
             { x: 72, y: 202 }, { x: 155, y: 219 }, { x: 239, y: 200 },
-            { x: 327, y: 219 }, { x: 408, y: 204 },
+            { x: 327, y: 219 }, { x: 408, y: 204 }, { x: 290, y: 165 }, { x: 128, y: 165 },
         ];
         this.actors = ROBOT_VEHICLES.map((vehicle, id) => {
             const rng = new Random(Math.floor(this.rng.next() * 0xffffffff));
@@ -938,6 +957,7 @@ function label(ctx: Paint, text: string, x: number, y: number, color = '#bfd1e4'
     ctx.fillStyle = color; ctx.font = '600 ' + size + 'px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'; ctx.textAlign = align; ctx.fillText(text, x, y);
 }
 function bodyArtwork(ctx: Paint, vehicle: typeof ROBOT_VEHICLES[number]): void {
+    if (vehicle.id === 'ekokomvoz') { paintEkokomvoz(ctx, { phase: 0, direction: 1, working: false }); return; }
     const color = vehicle.color;
     const panel = ctx.createLinearGradient(0, -25, 0, 19);
     panel.addColorStop(0, LAB_LIGHT); panel.addColorStop(0.18, color); panel.addColorStop(1, '#324b62');
@@ -998,6 +1018,14 @@ function bodyArtwork(ctx: Paint, vehicle: typeof ROBOT_VEHICLES[number]): void {
             ellipse(ctx, -20, -30, 4, 2, '#7d9cb3');
             line(ctx, [[-25, 8], [-31, 8], [-31, 12]], LAB_STEEL, 2);
             label(ctx, 'VIV', 10, 9, '#ffe2d2', 6);
+        } else if (vehicle.id === 'lugv') {
+            // The lightweight frame leaves its center open for rotor airflow and grasping.
+            for (const x of [-21, 15]) { rounded(ctx, x, -10, 6, 23, 2, '#263037', '#a7b8bd'); }
+            for (const y of [-9, 11]) { line(ctx, [[-20, y], [20, y]], '#a8b8bf', 2.5); }
+            line(ctx, [[-16, -9], [-7, -14], [7, -14], [17, -9]], '#d3dadd', 2);
+            rounded(ctx, -7, -3, 14, 10, 2, '#4e665b', '#c1d1c8');
+            for (const x of [-18, 18]) { for (const y of [-7, 10]) { ellipse(ctx, x, y, 1.5, 1.5, '#e8f3ed'); } }
+            rounded(ctx, -6, -11, 12, 6, 2, LAB_INK, '#aabfc5');
         } else if (vehicle.id === 'mecanum') {
             rounded(ctx, -24, -5, 48, 18, 5, panel);
             rounded(ctx, -17, -13, 34, 11, 3, '#1e4053', '#b9ebff');
@@ -1078,10 +1106,19 @@ function parcel(ctx: Paint, x: number, y: number, cargo: RobotCargo, angle = 0):
 
 export type RobotArtworkActor = Pick<RobotFrame['actors'][number],
     'vehicle' | 'x' | 'y' | 'vx' | 'vy' | 'activity' | 'job' | 'temperament' | 'phase'
-    | 'distance' | 'needsHelp' | 'carrying' | 'cargo' | 'progress' | 'look' | 'notice'>;
+    | 'distance' | 'needsHelp' | 'carrying' | 'cargo' | 'progress' | 'look'> & {
+        notice: string | null;
+        expression?: RobotExpression;
+        gesturePhase?: number;
+        pullDirection?: -1 | 1;
+        labels?: boolean;
+        malfunction?: 'sparks' | 'smoke';
+    };
 
 /** Shared vehicle artwork for the lab tableau and on-document deliveries. */
 export function paintRobotVehicle(ctx: Paint, actor: RobotArtworkActor, time: number, mode: RobotFrame['mode'] = 'dispatch', reduced = false, body?: HTMLCanvasElement): void {
+    // Document sprites redraw a bounded set of gesture poses; the lab supplies its own time.
+    if (actor.gesturePhase !== undefined) { time = actor.gesturePhase * 0.11; }
     const spec = vehicleOf(actor);
     const moving = Math.hypot(actor.vx, actor.vy);
     const panicking = mode === 'outage' && (actor.needsHelp || actor.activity === 'yield' || actor.activity === 'replan' || actor.activity === 'balance');
@@ -1108,10 +1145,13 @@ export function paintRobotVehicle(ctx: Paint, actor: RobotArtworkActor, time: nu
             rounded(ctx, foot.x - 3, foot.y - 1, 7, 3, 1, '#20303e', '');
         });
     }
-    if (body) {
+    if (actor.vehicle === 'ekokomvoz') {
+        paintEkokomvoz(ctx, { phase: quiet ? 0 : actor.distance / 44, direction: actor.look < 0 ? -1 : 1,
+            working: moving > 2 && !quiet });
+    } else if (body) {
         ctx.drawImage(body, -ROBOT_ARTWORK_SIZE.width / 2, -ROBOT_ARTWORK_SIZE.height / 2, ROBOT_ARTWORK_SIZE.width, ROBOT_ARTWORK_SIZE.height);
     } else { bodyArtwork(ctx, spec); }
-    if (!spec.air && actor.vehicle !== 'walker' && actor.vehicle !== 'hexapod') {
+    if (!spec.air && actor.vehicle !== 'walker' && actor.vehicle !== 'hexapod' && actor.vehicle !== 'ekokomvoz') {
         const wheels = actor.vehicle === 'rover' ? [-20, 0, 20] : [-17, 16];
         for (const x of wheels) {
             const angle = quiet ? 0 : actor.distance / 7;
@@ -1135,15 +1175,26 @@ export function paintRobotVehicle(ctx: Paint, actor: RobotArtworkActor, time: nu
     if (actor.vehicle === 'forklift') { faceX = -1; faceY = -12; }
     if (actor.vehicle === 'hexapod') { faceY = -8; }
     if (actor.vehicle === 'walker') { faceX = 21; faceY = -11; }
-    const sleeping = actor.activity === 'sleep' || mode === 'quiet' && actor.job !== 'delivery';
+    if (actor.vehicle === 'lugv') { faceY = -8; }
+    if (actor.vehicle === 'ekokomvoz') { faceX = actor.look < 0 ? -28 : 28; faceY = -13; }
+    const sleeping = actor.activity === 'sleep' || actor.expression === 'drowsy' || mode === 'quiet' && actor.job !== 'delivery';
+    const startled = panicking || actor.expression === 'startled';
     const blink = sleeping || !quiet && Math.sin(time * 1.4 + actor.phase) > 0.995;
     for (const side of [-1, 1]) {
         const ex = faceX + side * (actor.vehicle === 'walker' || actor.vehicle === 'mecanum' ? 2.6 : 4);
         if (blink) { line(ctx, [[ex - 2, faceY], [ex + 2, faceY]], '#9adbcf', 1.2); }
         else {
-            ellipse(ctx, ex, faceY, panicking ? 2.9 : 2, panicking ? 3.3 : 2.5, panicking ? '#fff4dc' : '#a2eddd');
-            ellipse(ctx, ex + actor.look * 0.8, faceY + (panicking ? 0.6 : 0), 0.8, 1.2, LAB_INK);
+            ellipse(ctx, ex, faceY, startled ? 2.9 : 2, startled ? 3.3 : actor.expression === 'pleased' ? 1.7 : 2.5, startled ? '#fff4dc' : '#a2eddd');
+            ellipse(ctx, ex + actor.look * 0.8, faceY + (actor.vehicle === 'lugv' && actor.activity === 'signal' ? -1.2 : startled ? 0.6 : 0), 0.8, 1.2, LAB_INK);
         }
+    }
+    if (actor.expression === 'annoyed' || actor.expression === 'sheepish') {
+        const slope = actor.expression === 'annoyed' ? 1 : -1;
+        line(ctx, [[faceX - 6, faceY - 5 - slope], [faceX - 2, faceY - 5 + slope]], '#d5f4ea', 1.2);
+        line(ctx, [[faceX + 2, faceY - 5 + slope], [faceX + 6, faceY - 5 - slope]], '#d5f4ea', 1.2);
+    } else if (actor.expression === 'pleased') {
+        ctx.beginPath(); ctx.moveTo(faceX - 3, faceY + 5); ctx.quadraticCurveTo(faceX, faceY + 8, faceX + 3, faceY + 5);
+        ctx.strokeStyle = '#a2eddd'; ctx.lineWidth = 1.3; ctx.stroke();
     }
     if (panicking) {
         line(ctx, [[faceX - 6, faceY - 5], [faceX - 2, faceY - 6]], '#fff0c5', 1);
@@ -1171,10 +1222,12 @@ export function paintRobotVehicle(ctx: Paint, actor: RobotArtworkActor, time: nu
         line(ctx, [[frontFork.left, frontFork.y - lift], [frontFork.right, frontFork.y - lift]], '#7ea7df', frontFork.strokeWidth);
         line(ctx, [[rearFork.left, rearFork.y - lift], [rearFork.right, rearFork.y - lift]], '#a3bed8', rearFork.strokeWidth);
         const handling = actor.carrying || ['load', 'unload', 'lift'].includes(actor.activity);
-        const reach = handling ? { x: 31, y: -18 - lift * 0.45 }
+        const pull = actor.pullDirection ? ROBOT_FORKLIFT_ATTACHMENT.pull[actor.pullDirection === 1 ? 'right' : 'left'] : undefined;
+        const reach = pull && actor.pullDirection === -1 ? pull : handling ? { x: 31, y: -18 - lift * 0.45 }
             : gesturing ? { x: -25, y: -32 + Math.sin(time * 3 + actor.phase) * 5 } : { x: -27, y: -6 };
         drawArm(ctx, { x: -17, y: -20 }, reach, '#d7dee3', actor.activity === 'load' ? 5 : 2.5);
-        drawArm(ctx, { x: 10, y: -25 }, handling ? { x: 36, y: reach.y - 8 } : { x: 27, y: -29 }, '#a7b7c3', actor.activity === 'load' ? 5 : 2);
+        drawArm(ctx, { x: 10, y: -25 }, pull && actor.pullDirection === 1 ? pull
+            : handling ? { x: 36, y: reach.y - 8 } : { x: 27, y: -29 }, '#a7b7c3', actor.activity === 'load' ? 5 : 2);
     }
     if (actor.carrying && actor.cargo) {
         if (spec.air) {
@@ -1186,14 +1239,42 @@ export function paintRobotVehicle(ctx: Paint, actor: RobotArtworkActor, time: nu
             parcel(ctx, anchor.x, anchor.y - lift, actor.cargo);
         }
     }
-    if (actor.notice) {
+    if (actor.labels !== false && actor.notice) {
         const text = actor.notice;
         const width = text.length * 4.2 + 8;
         rounded(ctx, -width / 2, -45, width, 13, 4, '#ffebc9', '#bb8755');
         label(ctx, text, 0, -36, '#62412d', 6);
     }
-    label(ctx, spec.name, 0, spec.air ? -27 : 37, '#9fb7c9', 6);
+    if (actor.labels !== false) { label(ctx, spec.name, 0, spec.air ? -27 : 37, '#9fb7c9', 6); }
+    if (actor.malfunction === 'sparks') {
+        for (let index = 0; index < ROBOT_RESCUE_POLICY.maxSparks; index++) {
+            const angle = index * Math.PI * 2 / ROBOT_RESCUE_POLICY.maxSparks + (actor.gesturePhase ?? 0) * 0.3;
+            const x = Math.cos(angle) * 23, y = -8 + Math.sin(angle) * 18;
+            line(ctx, [[x, y], [x + Math.cos(angle) * 6, y + Math.sin(angle) * 6]], index % 2 ? '#ffd76c' : '#fff2bf', 2);
+        }
+    } else if (actor.malfunction === 'smoke') {
+        for (let index = 0; index < ROBOT_RESCUE_POLICY.maxSmokePuffs; index++) {
+            const phase = ((actor.gesturePhase ?? 0) / 12 + index / ROBOT_RESCUE_POLICY.maxSmokePuffs) % 1;
+            ellipse(ctx, -9 + Math.sin(index * 2 + phase) * 7, -16 - phase * 25, 4 + phase * 5, 3 + phase * 4, '#56616e99');
+        }
+    }
     ctx.restore();
+}
+
+function robotCanvasGeometry(canvas: HTMLCanvasElement) {
+    const rect = canvas.getBoundingClientRect(), win = canvas.ownerDocument.defaultView!;
+    const style = win.getComputedStyle(canvas);
+    let width = rect.width, height = rect.height;
+    if (style.objectFit === 'contain' || style.objectFit === 'cover') {
+        const scale = (style.objectFit === 'cover' ? Math.max : Math.min)(rect.width / ROBOT_LIMITS.width, rect.height / ROBOT_LIMITS.height);
+        width = ROBOT_LIMITS.width * scale; height = ROBOT_LIMITS.height * scale;
+    }
+    const positions = style.objectPosition.split(/\s+/);
+    const offset = (value: string | undefined, remaining: number) => value?.endsWith('%')
+        ? remaining * parseFloat(value) / 100 : value && Number.isFinite(parseFloat(value)) ? parseFloat(value) : remaining / 2;
+    const screen = robotScreenMetrics({ width, height, devicePixelRatio: win.devicePixelRatio });
+    return { left: rect.left + offset(positions[0], rect.width - width), top: rect.top + offset(positions[1], rect.height - height),
+        width, height, fit: Math.min(width / ROBOT_LIMITS.width, height / ROBOT_LIMITS.height), bodyScale: screen.cssScale };
 }
 
 class RobotStagePainter {
@@ -1201,6 +1282,8 @@ class RobotStagePainter {
     private readonly background: HTMLCanvasElement;
     private readonly bodies = new Map<RobotVehicle, HTMLCanvasElement>();
     private readonly ratio: number;
+    private readonly labels = new LabelPlacementSolver();
+    private labelGeometry = '';
     constructor(private readonly canvas: HTMLCanvasElement) {
         const doc = canvas.ownerDocument;
         this.ratio = Math.min(2, doc.defaultView?.devicePixelRatio || 1);
@@ -1254,6 +1337,7 @@ class RobotStagePainter {
 
     draw(frame: RobotFrame, reduced = false): void {
         const ctx = this.context;
+        const geometry = robotCanvasGeometry(this.canvas);
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.drawImage(this.background, 0, 0);
         ctx.setTransform(this.ratio, 0, 0, this.ratio, 0, 0);
@@ -1275,7 +1359,11 @@ class RobotStagePainter {
             ctx.setLineDash([]);
         }
         const ordered = frame.actors.filter(actor => !actor.outside).sort((a, b) => a.y - b.y);
-        for (const actor of ordered) { this.paintActor(ctx, actor, frame, time, reduced); }
+        for (const actor of ordered) {
+            ctx.save(); ctx.translate(actor.x, actor.y); ctx.scale(geometry.bodyScale, geometry.bodyScale); ctx.translate(-actor.x, -actor.y);
+            this.paintActor(ctx, actor, frame, time, reduced); ctx.restore();
+        }
+        this.paintLabels(ctx, ordered, frame.at, geometry);
         if (!reduced) {
             for (const particle of frame.particles) {
                 ctx.globalAlpha = Math.sin(Math.PI * particle.age / particle.life) * 0.8;
@@ -1291,7 +1379,36 @@ class RobotStagePainter {
     }
 
     private paintActor(ctx: Paint, actor: RobotFrame['actors'][number], frame: RobotFrame, time: number, reduced: boolean): void {
-        paintRobotVehicle(ctx, actor, time, frame.mode, reduced, this.bodies.get(actor.vehicle));
+        paintRobotVehicle(ctx, { ...actor, labels: false }, time, frame.mode, reduced, this.bodies.get(actor.vehicle));
+    }
+
+    private paintLabels(ctx: Paint, actors: RobotFrame['actors'], at: number, geometry: ReturnType<typeof robotCanvasGeometry>): void {
+        const metrics = robotCaptionMetrics({ devicePixelRatio: this.canvas.ownerDocument.defaultView!.devicePixelRatio,
+            displayScale: geometry.fit });
+        const geometryKey = [geometry.width, geometry.height, geometry.bodyScale, metrics.localFontSize, metrics.localLineHeight].join(',');
+        if (this.labelGeometry !== geometryKey) { this.labelGeometry = geometryKey; this.labels.reset(); }
+        ctx.font = ROBOT_CAPTION_STYLE.fontWeight + ' ' + metrics.localFontSize + 'px system-ui, sans-serif';
+        const text = new Map(actors.map(actor => [String(actor.id), [vehicleOf(actor).name, ...(actor.notice ? [actor.notice] : [])]]));
+        const placed = this.labels.layout({ now: at, bounds: { x: 4, y: 4, width: ROBOT_LIMITS.width - 8, height: ROBOT_LIMITS.height - 8 },
+            labels: actors.map(actor => {
+                const lines = text.get(String(actor.id))!;
+                const width = Math.max(...lines.map(value => ctx.measureText(value)?.width ?? value.length * metrics.localFontSize * 0.58));
+                return { id: String(actor.id), anchor: { x: actor.x, y: actor.y - 24 * geometry.bodyScale },
+                    width: Math.min(ROBOT_LIMITS.width - 12, width + metrics.localPaddingX * 2),
+                    height: lines.length * metrics.localLineHeight + metrics.localPaddingY * 2,
+                    radius: 8 * geometry.bodyScale, priority: actor.notice ? 2 : 1 };
+            }), obstacles: actors.map(actor => ({ x: actor.x - 25 * geometry.bodyScale, y: actor.y - 20 * geometry.bodyScale,
+                width: 50 * geometry.bodyScale, height: 40 * geometry.bodyScale })),
+        });
+        for (const placement of placed) {
+            if (placement.blocked) { continue; }
+            for (const leader of placement.leaders) { line(ctx, [[leader.from.x, leader.from.y], [leader.to.x, leader.to.y]], ROBOT_CAPTION_STYLE.borderColor, 1); }
+            rounded(ctx, placement.x, placement.y, placement.width, placement.height, 5,
+                ROBOT_CAPTION_STYLE.background, ROBOT_CAPTION_STYLE.borderColor);
+            text.get(placement.id)!.forEach((value, index) => label(ctx, value, placement.x + placement.width / 2,
+                placement.y + metrics.localPaddingY + metrics.localFontSize + index * metrics.localLineHeight,
+                ROBOT_CAPTION_STYLE.color, metrics.localFontSize));
+        }
     }
 
     private paintProp(ctx: Paint, prop: SceneProp, time: number, frame: RobotFrame): void {
@@ -1507,6 +1624,12 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
         const started = win.performance.now();
         latest = media.matches ? model.snapshot() : model.step(now);
         painter.draw(latest, media.matches);
+        const metrics = robotCaptionMetrics({ devicePixelRatio: win.devicePixelRatio });
+        Object.assign(caption.style, { padding: metrics.paddingY + 'px ' + metrics.paddingX + 'px',
+            fontSize: metrics.fontSize + 'px', lineHeight: metrics.lineHeight + 'px',
+            fontWeight: String(ROBOT_CAPTION_STYLE.fontWeight), color: ROBOT_CAPTION_STYLE.color,
+            background: ROBOT_CAPTION_STYLE.background, border: '1px solid ' + ROBOT_CAPTION_STYLE.borderColor,
+            borderRadius: '8px', whiteSpace: 'normal', overflowWrap: 'anywhere', opacity: '1' });
         if (caption.textContent !== latest.caption) { caption.textContent = latest.caption; }
         const working = latest.actors.filter(actor => actor.job === 'delivery').length;
         const text = latest.mode === 'quiet'
@@ -1572,22 +1695,11 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     observer.observe(stage);
 
     function viewportPoint(point: Point): RobotDispatchPoint {
-        const rect = canvas.getBoundingClientRect();
-        const style = win.getComputedStyle(canvas);
-        let width = rect.width, height = rect.height;
-        if (style.objectFit === 'contain' || style.objectFit === 'cover') {
-            const scale = (style.objectFit === 'cover' ? Math.max : Math.min)(
-                rect.width / ROBOT_LIMITS.width, rect.height / ROBOT_LIMITS.height);
-            width = ROBOT_LIMITS.width * scale;
-            height = ROBOT_LIMITS.height * scale;
-        }
-        const positions = style.objectPosition.split(/\s+/);
-        const offset = (value: string | undefined, remaining: number) => value?.endsWith('%')
-            ? remaining * parseFloat(value) / 100 : value && Number.isFinite(parseFloat(value)) ? parseFloat(value) : remaining / 2;
+        const geometry = robotCanvasGeometry(canvas);
         return {
-            x: rect.left + offset(positions[0], rect.width - width) + point.x / ROBOT_LIMITS.width * width,
-            y: rect.top + offset(positions[1], rect.height - height) + point.y / ROBOT_LIMITS.height * height,
-            scale: Math.min(width / ROBOT_LIMITS.width, height / ROBOT_LIMITS.height),
+            x: geometry.left + point.x / ROBOT_LIMITS.width * geometry.width,
+            y: geometry.top + point.y / ROBOT_LIMITS.height * geometry.height,
+            scale: geometry.fit * geometry.bodyScale,
         };
     }
 

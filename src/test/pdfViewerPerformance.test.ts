@@ -377,6 +377,7 @@ describe('PDF prefetch performance measurements', function () {
         document.defaultView = {
             innerWidth: 1024, innerHeight: 768, addEventListener: add, removeEventListener: remove,
             devicePixelRatio: 1, performance: { now: () => 0 },
+            getComputedStyle: () => ({ objectFit: 'contain', objectPosition: '50% 50%' }),
             crypto: { getRandomValues: (values: Uint32Array) => { values[0] = 13; return values; } },
             matchMedia: () => ({ matches: false, addEventListener: add, removeEventListener: remove }),
             setInterval(callback: () => void) {

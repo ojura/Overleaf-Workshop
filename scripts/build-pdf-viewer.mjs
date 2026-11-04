@@ -4,8 +4,8 @@
 //   overleaf  Overleaf's PDFJSWrapper with the extension's toolbar, views/pdf-viewer/src/overleaf/
 // Overleaf's files stay unmodified in views/pdf-viewer/overleaf/; the extension's stand-ins for
 // the parts of Overleaf's web app that they import are in views/pdf-viewer/src/shims/. The build
-// adapts its per-load cache flag and consumes owned bridge bodies without duplicate copies.
-// Both transforms stop when Overleaf's text is not the one they expect.
+// adapts its cache flag, consumes owned bridge bodies, and cleans up document transitions.
+// These transforms stop when Overleaf's text is not the one they expect.
 // Each viewer's page script src/<engine>/main.ts goes to views/pdf-viewer/dist/<engine>.mjs
 // (and .css), its page src/<engine>/index.html to dist/<engine>.html, which
 // src/core/pdfViewerPages.ts completes at run time.
@@ -75,6 +75,59 @@ function bridgeBodyReads(source, file) {
     return `import { readPdfResponse } from ${helper};\n` + source.replaceAll(from, 'await readPdfResponse(response)');
 }
 
+/** Observe native callback rejection and keep a height hold only around actual assignment. */
+function wrapperDocumentCommit(source, file) {
+    const original = `      // Hold the .pdfViewer element's height steady across the synchronous page-clear
+      // that setDocument() triggers, so the viewer doesn't visually collapse while the
+      // new pages are being initialised. The min-height is released on pagesinit.
+      const viewerEl = this.container.querySelector('.pdfViewer') as HTMLElement
+      const currentHeight = viewerEl.getBoundingClientRect().height
+      if (currentHeight > 0) {
+        viewerEl.style.minHeight = \`\${currentHeight}px\`
+        const clearMinHeight = () => {
+          viewerEl.style.minHeight = ''
+          this.eventBus.off('pagesinit', clearMinHeight)
+        }
+        this.eventBus.on('pagesinit', clearMinHeight)
+      }
+
+      const setDocument = () => {
+        this.viewer.setDocument(doc)
+        this.linkService.setDocument(doc)
+      }`;
+    const replacement = `      const setDocument = () => {
+        if (abortController.signal.aborted || url !== this.url) {
+          throw new DOMException('The document load was cancelled.', 'AbortError')
+        }
+        const releaseHeight = holdDocumentHeight(
+          this.container.querySelector('.pdfViewer') as HTMLElement,
+          this.eventBus,
+          abortController.signal,
+        )
+        try {
+          this.viewer.setDocument(doc)
+          this.linkService.setDocument(doc)
+        } catch (error) {
+          releaseHeight()
+          throw error
+        }
+      }`;
+    const changes = [
+        [original, replacement],
+        ['          ready: Promise<void>', '          ready: Promise<void>\n          updateCallbackDone: Promise<void>'],
+        ['        const transition = container.startViewTransition(setDocument)',
+            '        const transition = container.startViewTransition(setDocument)\n        void transition.updateCallbackDone.catch(() => {})'],
+    ];
+    for (const [from, to] of changes) {
+        if (source.split(from).length !== 2) {
+            throw new Error(`${file}: the build expects ${JSON.stringify(from)} once for document transition cleanup`);
+        }
+        source = source.replace(from, to);
+    }
+    const helper = JSON.stringify(path.join(src, 'common', 'document-height.ts'));
+    return `import { holdDocumentHeight } from ${helper};\n` + source;
+}
+
 export const standIns = {
     name: 'overleaf-stand-ins',
     setup(build) {
@@ -99,6 +152,12 @@ export const standIns = {
             const relative = path.relative(overleafJs, args.path).split(path.sep).join('/');
             return relative === 'features/pdf-preview/util/pdf-caching.ts'
                 ? { contents: bridgeBodyReads(readFileSync(args.path, 'utf8'), args.path), loader: 'ts' }
+                : undefined;
+        });
+        build.onLoad({ filter: /pdf-js-wrapper\.ts$/ }, (args) => {
+            const relative = path.relative(overleafJs, args.path).split(path.sep).join('/');
+            return relative === 'features/pdf-preview/util/pdf-js-wrapper.ts'
+                ? { contents: wrapperDocumentCommit(readFileSync(args.path, 'utf8'), args.path), loader: 'ts' }
                 : undefined;
         });
         build.onResolve({ filter: /pdf-caching-transport$/ }, (args) => {

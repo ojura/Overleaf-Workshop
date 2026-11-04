@@ -180,6 +180,19 @@ describe('measured robot caption placement', function () {
         assert.strictEqual(placed.leaders[0].from.x, 200);
     });
 
+    it('reports immediate admission before opacity advances on a single static paint', () => {
+        const solver = new api.LabelPlacementSolver();
+        const upper = label('upper', { priority: 10, width: 120, height: 56, candidates: [candidate(200, 100)] });
+        const lower = label('lower', { width: 120, height: 56, candidates: [candidate(200, 100)] });
+        const placed = frame(solver, 0, [lower, upper]);
+        assert.deepStrictEqual(placed.map(item => item.id), ['lower', 'upper']);
+        assert.deepStrictEqual(placed.map(item => item.opacity), [0, 0]);
+        assert.deepStrictEqual(placed.map(item => item.blocked), [true, false]);
+        const [released] = frame(solver, 0, [lower]);
+        assert.strictEqual(released.opacity, 0);
+        assert.strictEqual(released.blocked, false, 'static callers can show the newly admitted label without another frame');
+    });
+
     it('keeps a crowded lower-priority caption hidden until space becomes available', () => {
         const solver = new api.LabelPlacementSolver();
         const upper = label('upper', { priority: 10, width: 120, height: 56, candidates: [candidate(200, 100)] });

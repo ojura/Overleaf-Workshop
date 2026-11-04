@@ -3,6 +3,7 @@ import type { PdfHttpValidator } from './http-range';
 
 export interface SitePreviewConfig {
     manifestUrl: string;
+    manifestRevision?: string;
     sha256: string;
     size: number;
     validator: PdfHttpValidator;
@@ -15,6 +16,7 @@ export interface SiteConfig {
     filename: string;
     sourceUrl?: string;
     previews?: SitePreviewConfig;
+    publicationGeneration?: number;
 }
 
 function readPreviewConfig(value: unknown, base: URL): SitePreviewConfig | undefined {
@@ -34,7 +36,9 @@ function readPreviewConfig(value: unknown, base: URL): SitePreviewConfig | undef
         const url = new URL(input.manifestUrl, base);
         if (!['http:', 'https:'].includes(url.protocol) || url.origin !== base.origin || url.username || url.password) { return; }
         url.hash = '';
-        return { manifestUrl: url.href, sha256: input.sha256, size: input.size,
+        const manifestRevision = typeof input.manifestRevision === 'string' && /^[a-f0-9]{64}$/.test(input.manifestRevision)
+            ? input.manifestRevision : undefined;
+        return { manifestUrl: url.href, manifestRevision, sha256: input.sha256, size: input.size,
             validator: { header: validator.header, value: validator.value } };
     } catch { return; }
 }
@@ -62,7 +66,9 @@ export function readSiteConfig(value: unknown, baseUrl: string): SiteConfig {
         }
         sourceUrl = source.href;
     }
-    return { pdfUrl: pdf.href, title: input.title.trim(), filename: input.filename, sourceUrl,
+    const publicationGeneration = typeof input.publicationGeneration === 'number' && Number.isSafeInteger(input.publicationGeneration)
+        && input.publicationGeneration >= 0 ? input.publicationGeneration : undefined;
+    return { pdfUrl: pdf.href, title: input.title.trim(), filename: input.filename, sourceUrl, publicationGeneration,
         previews: readPreviewConfig(input.previews, base) };
 }
 

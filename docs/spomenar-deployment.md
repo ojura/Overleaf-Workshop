@@ -1,12 +1,28 @@
 # Standalone Spomenar deployment
 
 The public reader is served at [cloud.larics.fer.hr/spomenar/](https://cloud.larics.fer.hr/spomenar/).
-Its PDF endpoint is the same origin, at `/spomenar/book.pdf`. The source is the existing
-[Nextcloud public share](https://cloud.larics.fer.hr/nextcloud/s/spomenar-2026).
+Viewer assets and published books have separate lifetimes. The publication service turns the
+existing [Nextcloud public share](https://cloud.larics.fer.hr/nextcloud/s/spomenar-2026) into immutable
+PDF editions at `/spomenar-versions/<SHA>/book.pdf`, with matching preview atlases. Its root-owned
+catalog supplies the live configuration and remains outside the replaceable viewer directory.
 
 ## Build and deploy
 
-Run these commands from the repository:
+Both deployer modes require a bootstrapped publication catalog containing `config.json` and
+`status.json` under `/mnt/btrfs_storage/spomenar-public/catalog/`. For first installation, follow
+[automatic publication](spomenar-watch.md#installation-and-initial-adoption) to install the service
+scripts and settings, verify the render interpreter, and run:
+
+```sh
+/usr/bin/python3 -B /usr/local/lib/spomenar-watch/spomenar-watch.py \
+  --config /etc/spomenar-watch/config.json --bootstrap
+```
+
+Bootstrap creates the catalog, fallback configuration, status and public links after verifying
+the native share and local source. It exits before snapshotting or rendering. The initial
+fallback points at native DAV; the first verified publication replaces it with an immutable URL.
+
+From the repository, build and deploy the viewer:
 
 ```sh
 npm run build-spomenar
@@ -14,73 +30,115 @@ node scripts/deploy-spomenar.mjs --check
 node scripts/deploy-spomenar.mjs --deploy
 ```
 
-The build produces `dist/spomenar/`. A different existing build directory can be supplied with
-`--build-dir DIRECTORY`. The deployment script does not compile the book or run the extension.
+The build produces `dist/spomenar/`. Use `node scripts/build-spomenar.mjs --out DIRECTORY` for a
+different build destination, and `--build-dir DIRECTORY` when deploying an existing output.
+The deployer consumes that output; it does not run the build or compile the book. Static asset
+uploads are limited to 128 MiB and reject symlinks, unexpected filesystem entries and a copied
+`book.pdf`.
+
+On first installation, integrate the fixed nginx routes through this deployment before enabling
+the publication service. Then install and verify its systemd unit, reload the unit configuration,
+and enable/start the service as described in the publication guide. PDF snapshots and preview
+generation begin with the daemon. Later viewer deployments preserve the existing catalog.
 
 The machine-specific settings are grouped in `target` at the beginning of
 `scripts/deploy-spomenar.mjs`. It uses the existing SSH alias and the sudo-listener root channel
 on Steffy. That listener must already be running, with its key readable only by the invoking
 user. The script does not read the key into logs or change its permissions.
 
-`--check` is the default. It requests metadata from the named public share's native Nextcloud
-DAV endpoint, then verifies a conditional range of at most sixteen PDF bytes. It checks status,
-encoding, length, content range and the observed validator before reading that small body.
-It also runs `nginx -t` against temporary copies of the proposed configuration. It does not
-change live nginx files, publish assets, or reload the server. This check can run before the
-viewer build is ready.
+`--check` is the default. It performs HEAD against the named share's native Nextcloud DAV endpoint,
+then verifies a conditional range of at most sixteen PDF bytes. The preflight requires PDF
+content type, identity encoding, a strong ETag or valid Last-Modified, HTTP 206 and the matching
+length, Content-Range and validator. Redirects and whole-file responses are rejected before
+their bodies are read. This native request checks the publication source's public access.
 
-`--deploy` uploads only the small static build. It installs one location snippet into the
-existing TLS server, validates the live configuration with `nginx -t`, publishes the assets,
-and gracefully reloads nginx. Existing assets and configuration are retained during this
-operation and restored if publication fails. Successful deployments remove their old assets
-and local and remote staging files.
+The check also runs `nginx -t` against temporary copies of the proposed configuration. It leaves
+live nginx files and assets unchanged and does not reload the server. It can run before building
+the viewer assets, once catalog bootstrap is complete.
+
+`--deploy` uploads the static build and installs the checked publication snippet in the existing
+TLS server. The installer removes the staged build's `config.json` seed so the live catalog alias
+stays authoritative. It validates nginx, renames the previous asset tree aside, activates the new
+tree and gracefully reloads nginx. The migration removes only the recognized former Spomenar
+`REQUEST_URI` adapter; an unfamiliar remaining reference stops the operation for review.
+
+Failure during activation restores the preceding asset tree and both nginx files, validates
+them and reloads the restored configuration. A successful reload commits activation. Subsequent
+backup cleanup or final reporting can fail while the new site remains active, so inspect the
+served site and command's failure stage before assuming a nonzero result rolled it back.
+Normal success removes the old assets and local/remote staging. The catalog, immutable PDFs and
+atlas store remain outside this asset replacement.
 
 ## PDF delivery and updates
 
-Every request to `/spomenar/book.pdf` is internally routed to
-`/nextcloud/public.php/dav/files/spomenar-2026`. Nextcloud resolves the stable share token to
-its current node and applies its own access checks on each request. Renaming or moving the
-shared file therefore requires no viewer deployment. Replacing its contents changes the
-representation validator; revoking the share makes the PDF unavailable through Spomenar too.
-The installer retains no filesystem filename, inode, database credential or resolved private
-storage path.
+The single source for public locations is `scripts/spomenar-watch.nginx.conf`:
 
-The exact book location accepts GET and HEAD, strips caller query arguments, and forwards
-Range and If-Range through the existing Nextcloud PHP handler. A scoped FastCGI `REQUEST_URI`
-adapter supplies the canonical DAV URI after the internal rewrite. All other requests retain
-their original encoded URI and arguments. The native handler streams the existing PDF and
-supplies its content length, strong ETag, Last-Modified and range semantics. No PDF copy or
-additional service is created. The `/s/TOKEN/download` URL is intentionally not used here:
-it redirects, whereas the viewer requires a direct ranged response.
+| Public path | Source and behavior |
+| --- | --- |
+| `/spomenar/` | Replaceable viewer assets. |
+| `/spomenar/config.json` | Atomic configuration through the publication catalog's public link. |
+| `/spomenar/status.json` | Small publication progress record through the same link. |
+| `/spomenar-versions/<SHA>/book.pdf` | Static immutable PDF from the retained edition. |
+| `/spomenar/previews/<SHA>/manifest.json` and its relative assets | Matching published preview atlas. |
+| `/spomenar-previews` and paths below it | Explicit 404 for the direct storage namespace. |
 
-Preview manifests remain bound to a particular SHA-256, byte length and validator. After a
-content replacement, the reader uses normal PDF rendering until a matching atlas is generated
-and its configuration is published. A filename-only change leaves the existing atlas usable.
+Static nginx PDF delivery uses sendfile, HEAD, identity transfer, ETag, byte ranges and If-Range.
+The route accepts one range per request. The four publication locations disable open-file
+caching so removal of the shared public link withdraws subsequent requests together.
 
-To remove the viewer, remove its snippet include and the adjacent Spomenar `REQUEST_URI`
-adapter from the TLS server, validate nginx, and reload it. Leave the other locations unchanged.
+Nextcloud remains the authority for the source node and public access. The service polls that
+authority, follows renames and moves, waits for a changed source to settle, and creates a
+copy-on-write PDF snapshot under its SHA. It publishes priority-page previews, then the full
+atlas, with atomic configuration and manifest updates. Preview identity includes the exact
+source digest, byte length and observed static HTTP validator. A fuller manifest can replace
+an earlier checkpoint while the current PDF stays open.
+
+Confirmed share withdrawal removes the public link at the next service poll. Transient failures,
+resumable generation, edition retention and storage limits are defined in the
+[publication guide](spomenar-watch.md#recovery-withdrawal-and-retention).
+
+To unpublish, stop and disable the service and remove its public link. Keep the fixed nginx
+locations, including the direct-storage deny, while retaining published assets for rollback or
+inspection. This keeps requests on the withdrawn routes instead of falling through to the
+surrounding server configuration. Remove or move retained public assets before removing their
+protective locations during a later uninstall, then validate nginx and reload it.
 
 The bare `/spomenar` URL redirects to `/spomenar/`. Page links use a hash, so reloading or sharing
 a page link still requests the same entry document from nginx.
 
 ## Browser assets and headers
 
-Entry HTML, configuration, styles, modules, and runtime assets use `Cache-Control: no-cache` so
-the browser revalidates them across deployments. PDF headers come from the native share handler.
+Entry HTML, configuration, styles, modules and runtime assets use `Cache-Control: no-cache`.
+The publication routes use the same policy, including immutable PDF editions. Immutability
+describes the edition's bytes; browser requests still revalidate them. PDF and atlas locations
+retain normal validators. Configuration and status disable ETag and If-Modified-Since handling,
+so an equal-size atomic JSON update within one second still returns its new small body.
 
 The site's CSP permits only same-origin connections and scripts. It also permits PDF.js worker
 blobs, data/blob images and fonts, inline styles used by the viewer and robot panel, and WebAssembly
 compilation. JavaScript eval remains disabled in the viewer. CMaps, standard fonts, image decoders,
 and the pinned PDF.js worker are included under the site's relative asset directory.
 
-After publication, verify a small beginning and end range against `/spomenar/book.pdf`: each
-must return `206`, the requested byte count, and a `Content-Range` total matching the public PDF.
-The browser pass should use the served site to check workers, CSP, page links, touch controls,
-and visible page readiness.
+After publication, read the actual configuration and status, then verify HEAD and a small
+conditional range against the exact `pdfUrl` named by that configuration. The range must return
+206, the requested byte count and the correct Content-Range total and validator. Use the served
+site to check workers, CSP, page links, touch controls and visible page readiness.
 
-The focused deployment suite is `python3 scripts/test_spomenar_install.py`. Its isolated
-nginx/FastCGI fixture exercises rename, replacement, revocation, encoded unrelated requests,
-HEAD, conditional ranges, query stripping and method restrictions without reloading a live
-server. The preflight tests also reject redirects, encoded or inconsistent ranges and verify
-that a full-file response is closed before any body read. Run on a machine with nginx to include
-the three real-routing cases.
+The focused suites are:
+
+```sh
+python3 -B -m unittest scripts/test_spomenar_install.py -v
+python3 -B -m unittest scripts/test_spomenar_watch.py -v
+```
+
+Installer cases exercise bounded native preflight, invalid ranges and validators, closing a
+whole-file response before body consumption, exact adapter removal, catalog preservation,
+config-seed omission, activation rollback, and cleanup/reporting failure after successful
+activation. The activation fixture uses real filesystem commit/restore ordering with substituted
+nginx commands.
+
+The watch suite owns the actual nginx static-route fixture. It checks HEAD, Range, If-Range,
+same-second JSON replacement, the direct-storage deny, and withdrawal through the shared link.
+It also covers source snapshots, priority/full publication, restart recovery, stale jobs,
+backoff and retention. See the publication guide's [focused checks](spomenar-watch.md#focused-checks)
+for the optional Btrfs fixture settings.

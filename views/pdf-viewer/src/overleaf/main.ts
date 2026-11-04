@@ -149,6 +149,10 @@ const documents = new Documents(wrapper, {
         // the position to restore in the new build: where the reader is now
         storePosition();
     },
+    beforeSwap(doc, build, signal) {
+        storePosition();
+        return prefetch.prepareReplacement(build ?? doc.fingerprints?.[0] ?? 'inline', signal);
+    },
     loaded(doc, build, preview) {
         shownBuild = build;
         documentShown(build);

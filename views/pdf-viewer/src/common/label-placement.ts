@@ -26,6 +26,8 @@ export interface PlacementLeader { from: PlacementPoint; to: PlacementPoint }
 export interface LabelPlacement extends PlacementRect {
     id: string;
     opacity: number;
+    /** Immediate geometric admission, independent of animated opacity or the caller clock. */
+    blocked: boolean;
     leaders: readonly PlacementLeader[];
 }
 
@@ -262,7 +264,7 @@ export class LabelPlacementSolver {
             const blocked = covered(drawn, edge, placed);
             state.opacity = blocked ? Math.max(0, state.opacity - dt / fadeOut) : Math.min(1, state.opacity + dt / fadeIn);
             this.memory.set(label.id, state);
-            result.set(label.id, { id: label.id, ...drawn, opacity: state.opacity, leaders: leaders(drawn, anchors) });
+            result.set(label.id, { id: label.id, ...drawn, opacity: state.opacity, blocked, leaders: leaders(drawn, anchors) });
             if (!blocked) { placed.push(drawn); }
         }
         for (const id of this.memory.keys()) { if (!result.has(id)) { this.memory.delete(id); } }

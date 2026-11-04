@@ -1,7 +1,7 @@
 :root {
-    --spomenar-ink: #173c42;
-    --spomenar-paper: #edf3ed;
-    --spomenar-accent: #b2dac2;
+    --spomenar-ink: #242629;
+    --spomenar-paper: #faf9f6;
+    --spomenar-accent: #a8c6ec;
 }
 html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
 body {
@@ -39,28 +39,33 @@ body {
 #viewerContainer { scroll-padding-bottom: env(safe-area-inset-bottom); }
 #spomenarNotice {
     flex: 0 0 auto; display: flex; align-items: center; justify-content: center; gap: 12px;
-    padding: 9px 16px; color: #173c42; background: #e5efe7; font-size: 13px; line-height: 1.5;
+    padding: 9px 16px; color: var(--spomenar-ink); background: #f0f1f3; font-size: 13px; line-height: 1.5;
 }
 #spomenarNotice[hidden] { display: none; }
 #spomenarNotice[data-error] { color: #642519; background: #fff1e9; }
+#spomenarNotice[data-edition] {
+    position: fixed; top: max(76px, env(safe-area-inset-top)); right: 12px; z-index: 1000;
+    max-width: calc(100vw - 24px); box-sizing: border-box; border-radius: 8px;
+    box-shadow: 0 3px 18px #10131840; pointer-events: none;
+}
 #spomenarRetry, #spomenarCopy {
     min-height: 44px; border: 0; border-radius: 7px; padding: 8px 14px; font: inherit;
     background: var(--spomenar-ink); color: white; cursor: pointer; flex-shrink: 0;
 }
 #spomenarShareDialog {
-    border: 1px solid #8fa6a3; border-radius: 12px; width: min(420px, calc(100vw - 64px));
-    padding: 24px; background: #f5f8f4; color: #173c42; font: 14px/1.5 system-ui, sans-serif;
+    border: 1px solid #a0a4aa; border-radius: 12px; width: min(420px, calc(100vw - 64px));
+    padding: 24px; background: #fffefa; color: var(--spomenar-ink); font: 14px/1.5 system-ui, sans-serif;
 }
-#spomenarShareDialog::backdrop { background: #071b24a6; }
+#spomenarShareDialog::backdrop { background: #101318a6; }
 #spomenarShareDialog h2 { margin: 0 32px 8px 0; font-size: 20px; }
 #spomenarShareDialog p { margin: 0 0 16px; }
 #spomenarShareDialog label { display: block; font-size: 12px; }
-#spomenarShareUrl { display: block; width: 100%; box-sizing: border-box; min-height: 44px; margin: 4px 0 14px; padding: 8px; border: 1px solid #8fa6a3; border-radius: 5px; font-size: 16px; }
+#spomenarShareUrl { display: block; width: 100%; box-sizing: border-box; min-height: 44px; margin: 4px 0 14px; padding: 8px; border: 1px solid #a0a4aa; border-radius: 5px; font-size: 16px; }
 #spomenarCopyStatus { display: block; min-height: 1.5em; margin-top: 8px; }
 .spomenarDialogClose { position: absolute; top: 8px; right: 8px; min-width: 44px; min-height: 44px; border: 0; background: transparent; color: inherit; font-size: 26px; cursor: pointer; }
-.spomenarSkip { position: fixed; top: -80px; left: 12px; z-index: 100000; padding: 12px; color: #173c42; background: white; }
+.spomenarSkip { position: fixed; top: -80px; left: 12px; z-index: 100000; padding: 12px; color: var(--spomenar-ink); background: white; }
 .spomenarSkip:focus { top: 8px; }
-.spomenarNoScript { padding: 16px; background: white; color: #173c42; }
+.spomenarNoScript { padding: 16px; background: white; color: var(--spomenar-ink); }
 
 /* Opening a local file and editing annotations are outside this published book's reader. */
 #secondaryOpenFile, #editorModeButtons, #editorModeSeparator { display: none !important; }

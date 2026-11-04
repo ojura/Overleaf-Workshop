@@ -12,18 +12,25 @@ const promisesSettled = () => new Promise<void>(resolve => setImmediate(resolve)
 
 class Events {
     readonly listeners = new Map<string, Set<(event: any) => void>>();
-    addEventListener(name: string, listener: (event: any) => void) {
+    readonly captures = new Map<string, Map<(event: any) => void, boolean>>();
+    addEventListener(name: string, listener: (event: any) => void, options?: { capture?: boolean } | boolean) {
         if (!this.listeners.has(name)) { this.listeners.set(name, new Set()); }
         this.listeners.get(name)!.add(listener);
+        if (!this.captures.has(name)) { this.captures.set(name, new Map()); }
+        this.captures.get(name)!.set(listener, typeof options === 'boolean' ? options : options?.capture === true);
     }
-    removeEventListener(name: string, listener: (event: any) => void) {
+    removeEventListener(name: string, listener: (event: any) => void, options?: { capture?: boolean } | boolean) {
+        if (this.captures.get(name)?.get(listener) !== (typeof options === 'boolean' ? options : options?.capture === true)) { return; }
         this.listeners.get(name)?.delete(listener);
+        this.captures.get(name)?.delete(listener);
     }
     on(name: string, listener: (event: any) => void) { this.addEventListener(name, listener); }
     off(name: string, listener: (event: any) => void) { this.removeEventListener(name, listener); }
     emit(name: string, detail: Record<string, unknown> = {}) {
         const event = { type: name, target: this, currentTarget: this, ...detail };
-        for (const listener of [...(this.listeners.get(name) ?? [])]) { listener(event); }
+        for (const listener of [...(this.listeners.get(name) ?? [])]) {
+            if (!detail.stoppedAtTarget || this.captures.get(name)?.get(listener)) { listener(event); }
+        }
     }
     get listenerCount() { return [...this.listeners.values()].reduce((sum, set) => sum + set.size, 0); }
 }
@@ -81,6 +88,7 @@ interface RobotDelivery {
 class DocumentRobots {
     enabled = true;
     readonly deliveries: RobotDelivery[] = [];
+    readonly refinements: RobotDelivery[] = [];
     readonly offers: number[] = [];
     readonly visibleCalls: number[][] = [];
     readonly workCalls: Array<Array<{ key: string; pages: Array<{ pageNumber: number; pageElement: Element; label?: string; state: string }> }>> = [];
@@ -88,8 +96,14 @@ class DocumentRobots {
     readonly active = new Set<number>();
     readonly handled = new Set<number>();
     readonly deferred = new Set<number>();
+    readonly retirements: Array<{ identity: string; pages: RobotDelivery[]; sizes: number[][] }> = [];
+    replacement?: string;
+    replacementCancels = 0;
+    readonly columnMotions: any[] = [];
+    columnCancels = 0;
     maxActive = Infinity;
     onCapacityAvailable?: () => void;
+    onReplacementComplete?: (identity: string) => void;
     private blocked = false;
     resetCalls = 0;
     disposeCalls = 0;
@@ -121,15 +135,33 @@ class DocumentRobots {
         return 'started' as const;
     }
     deliver(value: RobotDelivery) { return this.offer(value) === 'started'; }
+    refine(value: RobotDelivery) {
+        if (!this.enabled || !this.active.has(value.pageNumber)) { return 0; }
+        this.refinements.push(value); return 1;
+    }
     complete(id: number) { if (this.active.delete(id)) { this.capacityAvailable(); } }
     private capacityAvailable() {
         if (!this.blocked) { return; }
         this.blocked = false;
         this.onCapacityAvailable?.();
     }
-    reset() { this.resetCalls++; this.blocked = false; this.active.clear(); this.handled.clear(); }
+    retireDocument(pages: RobotDelivery[], identity: string) {
+        this.reset(); this.replacement = identity;
+        this.retirements.push({ identity, pages: [...pages], sizes: pages.map(page => [page.canvas.width, page.canvas.height]) });
+    }
+    cancelReplacement(identity?: string) {
+        if (this.replacement === undefined || identity !== undefined && identity !== this.replacement) { return; }
+        const retired = this.replacement;
+        this.replacement = undefined; this.replacementCancels++;
+        this.onReplacementComplete?.(retired);
+    }
+    reset() { this.resetCalls++; this.blocked = false; this.active.clear(); this.handled.clear(); this.replacement = undefined; }
     snapshot() { return { enabled: this.enabled, activeEpisodes: this.active.size }; }
     setDispatchOrigin() {}
+    setColumnTransition(motion: any) { this.columnMotions.push(motion); }
+    cancelColumnMotion() { this.columnCancels++; }
+    revealedArrivals = 0;
+    revealArrivals() { this.revealedArrivals++; }
     dispose() { this.disposeCalls++; this.enabled = false; this.blocked = false; this.active.clear(); }
 }
 
@@ -293,6 +325,15 @@ class Fixture {
     readonly originalPriority: (...args: any[]) => any;
     readonly originalRenderView: (...args: any[]) => any;
     controller: any;
+    columnSettings: any;
+    readonly column = {
+        offsetX: 0, transition: undefined as any, updates: 0, disposed: false,
+        panels: [] as any[], layers: [] as Element[], releases: 0,
+        setPanel(value: any) { this.panels.push(value); },
+        update() { this.updates++; },
+        registerLayer(layer: Element) { this.layers.push(layer); return () => { this.releases++; }; },
+        dispose() { this.disposed = true; },
+    };
 
     constructor(options: FixtureOptions = {}) {
         if (options.mobile) { this.owner.defaultView.navigator = { userAgent: 'iPhone', maxTouchPoints: 5 }; }
@@ -346,6 +387,7 @@ class Fixture {
     install(module: any, overrides: Record<string, unknown> = {}) {
         this.controller = module.installPdfPrefetch(this.viewer, {
             robotsEnabled: false,
+            createDocumentColumn: (_container: Element, settings: any) => { this.columnSettings = settings; return this.column; },
             onIdleChange: (idle: boolean) => this.idleChanges.push(idle),
             now: () => this.time,
             requestFrame: (callback: (timestamp: number) => void) => {
@@ -412,6 +454,7 @@ class Fixture {
     }
 
     finishNative(id: number) {
+        this.pages[id - 1].renderingState = 1;
         this.eventBus.emit('pagerender', { pageNumber: id });
         this.time += 12;
         this.cachePage(id);
@@ -458,6 +501,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
                 build.onLoad({ filter: /.*/, namespace: 'prefetch-test' }, () => ({
                     contents: `export const pdfPerformance = globalThis.__pdfPrefetchTestPerformance;
                         export function installPrefetchDiagnostics(container, sample, options = {}) {
+                            container.diagnosticsOptions = options;
                             let enabled = options.enabled === true;
                             return {
                                 get enabled() { return enabled; },
@@ -526,19 +570,187 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         return result;
     }
 
+    it('shares docked column geometry with the document renderer and cancels retired editions before a pull', async () => {
+        const fleet = new DocumentRobots(); let settings: any;
+        const f = fixture({}, { robotsEnabled: true, createDocumentRobots: (_container: Element, value: any) => {
+            settings = value; fleet.onReplacementComplete = value.onReplacementComplete; return fleet;
+        } });
+        await f.frame();
+        assert.ok(f.columnSettings, 'the shared controller installs the column owner once');
+        assert.deepStrictEqual(f.columnSettings.pages(), [f.pages[19].div]);
+        f.column.offsetX = -80;
+        assert.strictEqual(settings.documentOffset(), -80, 'the renderer reads the actual applied translation');
+        const layer = new Element();
+        const unregister = settings.registerDocumentLayer(layer);
+        assert.deepStrictEqual(f.column.layers, [layer]);
+        unregister(); assert.strictEqual(f.column.releases, 1);
+        const panel = { visible: true, dock: 'right', rect: { x: 650, y: 40, width: 350, height: 500 }, reason: 'dock' };
+        (f.container as any).diagnosticsOptions.onPanelLayout(panel);
+        assert.deepStrictEqual(f.column.panels, [panel]);
+        f.controller.prepareReplacement('next-edition'); f.eventBus.emit('pagesdestroy');
+        assert.strictEqual(fleet.replacement, 'next-edition');
+        const motion = { id: 1, fromX: 0, toX: -80, startedAt: f.time, durationMs: 400, reason: 'dock', dock: 'right' };
+        f.columnSettings.onTransition(motion);
+        assert.strictEqual(fleet.replacement, undefined, 'a fresh docking scene cancels the captured retirement first');
+        assert.strictEqual(fleet.columnMotions.at(-1), motion);
+        f.columnSettings.onTransition(undefined);
+        assert.strictEqual(fleet.columnMotions.at(-1), undefined);
+        f.container.emit('pointerdown', { isTrusted: false });
+        assert.strictEqual(fleet.revealedArrivals, 0);
+        f.container.emit('pointerdown', { isTrusted: true, stoppedAtTarget: true });
+        assert.ok(fleet.columnCancels > 0, 'trusted navigation can end the optional pull immediately');
+        assert.strictEqual(fleet.revealedArrivals, 1, 'trusted annotation input exposes pixels before its native target stops propagation');
+        f.dispose();
+        assert.strictEqual(f.column.disposed, true);
+        const calls = fleet.columnMotions.length;
+        f.columnSettings.onTransition(motion);
+        assert.strictEqual(fleet.columnMotions.length, calls, 'late column completion cannot recreate scene work');
+    });
+
+    it('updates the translated page set after viewport changes without changing PDF scale or scroll', async () => {
+        const f = fixture(); await f.frame();
+        const before = { scale: f.viewer.currentScale, top: f.container.scrollTop, left: f.container.scrollLeft };
+        const updates = f.column.updates;
+        f.visibleIds = [20, 21]; f.eventBus.emit('updateviewarea'); await f.frame();
+        assert.ok(f.column.updates > updates);
+        assert.deepStrictEqual(f.columnSettings.pages(), [f.pages[19].div, f.pages[20].div]);
+        assert.deepStrictEqual({ scale: f.viewer.currentScale, top: f.container.scrollTop, left: f.container.scrollLeft }, before);
+    });
+
+    it('render timing omits native completions spanning hide, layout or document replacement', async () => {
+        for (const ending of ['hide', 'layout', 'replace', 'dispose']) {
+            const f = fixture({ pages: 1, startPage: 1 }); await f.frame();
+            const initialLatency = f.controller.snapshot().pageLatencyMs;
+            f.pages[0].renderingState = 1;
+            f.eventBus.emit('pagerender', { pageNumber: 1 });
+            f.time += 40;
+            if (ending === 'hide') { f.owner.visibilityState = 'hidden'; f.owner.emit('visibilitychange'); }
+            else if (ending === 'layout') { f.eventBus.emit('scalechanging'); }
+            else if (ending === 'replace') { f.replaceDocument(); }
+            else { f.dispose(); }
+            assert.strictEqual([...timers.values()].filter(timer => timer.delay === 1000).length, 0, ending + ' stops the active timing probe');
+            f.time += 43000;
+            f.pages[0].renderingState = 3;
+            f.eventBus.emit('pagerendered', { pageNumber: 1, error: null, cssTransform: false });
+            assert.strictEqual(f.controller.snapshot().pageLatencyMs, initialLatency, ending + ' cannot teach the predictor a paused render duration');
+        }
+    });
+
+    it('render timing omits a frame-suspended native sample while the document remains visible', async () => {
+        const f = fixture({ pages: 1, startPage: 1 }); await f.frame();
+        const initialLatency = f.controller.snapshot().pageLatencyMs;
+        f.pages[0].renderingState = 1;
+        f.eventBus.emit('pagerender', { pageNumber: 1 });
+        const probe = [...timers].find(([, timer]) => timer.delay === 1000);
+        assert.ok(probe, 'only active native work creates a frame-availability probe');
+        f.time += 1000; timers.delete(probe[0]); probe[1].callback();
+        f.time += 42000;
+        f.pages[0].renderingState = 3;
+        f.eventBus.emit('pagerendered', { pageNumber: 1, error: null, cssTransform: false });
+        assert.strictEqual(f.owner.visibilityState, 'visible');
+        assert.strictEqual(f.controller.snapshot().pageLatencyMs, initialLatency);
+        assert.strictEqual([...timers.values()].filter(timer => timer.delay === 1000).length, 0);
+        f.pages[0].renderingState = 1;
+        f.eventBus.emit('pagerender', { pageNumber: 1 });
+        f.time += 37; f.pages[0].renderingState = 3;
+        f.eventBus.emit('pagerendered', { pageNumber: 1, error: null, cssTransform: false });
+        assert.strictEqual(f.controller.snapshot().pageLatencyMs, 37, 'later active work resumes ordinary estimation');
+    });
+
+    it('render timing preserves a genuinely blocked foreground native duration', async () => {
+        const f = fixture({ pages: 1, startPage: 1 }); await f.frame();
+        f.pages[0].renderingState = 1;
+        f.eventBus.emit('pagerender', { pageNumber: 1 });
+        // Neither frame nor timer callbacks run during one blocking task.
+        f.time += 60000; f.pages[0].renderingState = 3;
+        f.eventBus.emit('pagerendered', { pageNumber: 1, error: null, cssTransform: false });
+        assert.strictEqual(f.controller.snapshot().pageLatencyMs, 60000, 'a real slow render is not capped or recast as suspension');
+        assert.strictEqual([...timers.values()].filter(timer => timer.delay === 1000).length, 0);
+    });
+
+    it('render timing omits a suspended preparation and releases its observation before cold-slot trimming', async () => {
+        const f = fixture({ pages: 2, startPage: 1 }); await f.frame();
+        const initialLatency = f.controller.snapshot().pageLatencyMs;
+        const render = f.pdf.activeRenders.find(value => value.id === 2);
+        assert.ok(render);
+        const probe = [...timers].find(([, timer]) => timer.delay === 1000);
+        assert.ok(probe);
+        f.time += 1000; timers.delete(probe[0]); probe[1].callback();
+        f.time += 42000; render.task.finish(); await promisesSettled();
+        assert.strictEqual(f.controller.snapshot().pageLatencyMs, initialLatency);
+        assert.strictEqual([...timers.values()].filter(timer => timer.delay === 1000).length, 0, 'settled preparation never leaves an idle timing heartbeat');
+    });
+
     function robotFixture(enabled = true) {
         const robots = new DocumentRobots();
         const factories: Element[] = [];
         const f = fixture({}, {
             robotsEnabled: enabled,
-            createDocumentRobots: (container: Element, options?: { onCapacityAvailable?: () => void }) => {
+            createDocumentRobots: (container: Element, options?: { onCapacityAvailable?: () => void; onReplacementComplete?: (identity: string) => void }) => {
                 factories.push(container);
                 robots.onCapacityAvailable = options?.onCapacityAvailable;
+                robots.onReplacementComplete = options?.onReplacementComplete;
                 return robots;
             },
         });
         return { f, robots, factories };
     }
+
+    it('replacement captures old visible pixels only at an armed successful document commit', async () => {
+        const { f, robots } = robotFixture(); await f.frame();
+        const old = f.pages[19], canvas = old.canvas, resets = robots.resetCalls;
+        const cancel = f.controller.prepareReplacement('edition-b');
+        assert.strictEqual(robots.retirements.length, 0, 'preflight alone cannot copy or dismantle the active edition');
+        assert.strictEqual(robots.resetCalls, resets);
+        f.replaceDocument();
+        assert.strictEqual(robots.retirements.length, 1);
+        assert.strictEqual(robots.retirements[0].identity, 'edition-b');
+        assert.strictEqual(robots.retirements[0].pages[0].canvas, canvas);
+        assert.strictEqual(robots.retirements[0].pages[0].pageElement, old.div);
+        assert.deepStrictEqual(robots.retirements[0].sizes[0], [800, 1000]);
+        assert.strictEqual(robots.resetCalls, resets + 1, 'pagesinit must not reset the separately owned retiring scene again');
+        f.eventBus.emit('scalechanging'); f.eventBus.emit('spreadmodechanged');
+        assert.strictEqual(robots.replacement, 'edition-b', 'automatic initial-view restoration preserves only the viewport-frozen teardown');
+        await f.frame();
+        assert.strictEqual(robots.replacement, 'edition-b');
+        assert.strictEqual(robots.deliveries[robots.deliveries.length - 1].pageElement, f.pages[19].div);
+        cancel();
+        assert.strictEqual(robots.replacement, undefined);
+        assert.ok(robots.hasHandled(20), 'late cancellation removes only teardown, not the new document episode history');
+    });
+
+    it('replacement cancellation and superseded preflights leave the current edition untouched', async () => {
+        const { f, robots } = robotFixture(); await f.frame();
+        const resets = robots.resetCalls, abort = new AbortController();
+        const canceled = f.controller.prepareReplacement('edition-failed', abort.signal);
+        abort.abort(); canceled();
+        assert.strictEqual(robots.resetCalls, resets);
+        assert.strictEqual(robots.retirements.length, 0);
+        const oldCancel = f.controller.prepareReplacement('edition-old');
+        const nextCancel = f.controller.prepareReplacement('edition-current');
+        oldCancel();
+        f.replaceDocument();
+        assert.deepStrictEqual(robots.retirements.map(value => value.identity), ['edition-current']);
+        nextCancel();
+        assert.strictEqual(robots.replacementCancels, 1);
+        f.replaceDocument();
+        assert.strictEqual(robots.retirements.length, 1, 'an unarmed later load cannot replay the consumed capture');
+    });
+
+    it('replacement teardown is canceled by lifecycle exits and real reader navigation', async () => {
+        for (const ending of ['hide', 'reader-layout', 'wheel', 'pointer', 'dispose']) {
+            const { f, robots } = robotFixture(); await f.frame();
+            f.controller.prepareReplacement('edition-b'); f.replaceDocument();
+            assert.strictEqual(robots.replacement, 'edition-b');
+            if (ending === 'hide') { f.owner.visibilityState = 'hidden'; f.owner.emit('visibilitychange'); }
+            else if (ending === 'reader-layout') { f.owner.emit('keydown', { isTrusted: true }); f.eventBus.emit('scalechanging'); }
+            else if (ending === 'wheel') { f.container.emit('wheel', { deltaY: 30, deltaMode: 0, isTrusted: true }); }
+            else if (ending === 'pointer') { f.container.emit('pointerdown', { isTrusted: true }); }
+            else { f.dispose(); }
+            assert.strictEqual(robots.replacement, undefined, ending);
+            assert.strictEqual(robots.replacementCancels, 1, ending + ' cancels the finite teardown once');
+        }
+    });
 
     function previewFixture(options: FixtureOptions = {}, robots?: DocumentRobots, installOverrides: Record<string, unknown> = {}) {
         const loaders: Array<any> = [];
@@ -574,6 +786,43 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         }
         return { f, source, loaders, bind, metadata, publish };
     }
+
+    it('refinement reaches an existing handled delivery when a sharper sidecar or native canvas arrives', async () => {
+        const robots = new DocumentRobots();
+        const h = previewFixture({ startPage: 99, pages: 100, autoPages: false }, robots), f = h.f;
+        f.pages[98].reset();
+        const loader = h.bind(); await f.frame();
+        const coarse = h.publish(loader, 99, 135, 192);
+        assert.strictEqual(coarse.accepted, true);
+        assert.strictEqual(robots.deliveries.length, 1);
+        assert.ok(robots.hasHandled(99));
+        const sharp = h.publish(loader, 99, 541, 768);
+        assert.strictEqual(sharp.accepted, true);
+        assert.strictEqual(sharp.canvas.parentNode, f.pages[98].div, 'new useful PDF pixels attach immediately');
+        assert.strictEqual(robots.refinements[robots.refinements.length - 1]?.canvas, sharp.canvas);
+        assert.strictEqual(robots.deliveries.length, 1, 'a finer tier does not replay the page episode');
+        f.finishNative(99);
+        assert.strictEqual(robots.refinements[robots.refinements.length - 1]?.canvas, f.pages[98].canvas);
+        assert.strictEqual(robots.deliveries.length, 1);
+    });
+
+    it('publishes visible prepared pixels before an unresolved worker trim releases the cold slot', async () => {
+        const { f, robots } = robotFixture();
+        f.pages[19].reset();
+        const trim = new Deferred<Record<string, number>>();
+        (f.pdf as any).getRangeCacheStats = async () => byteStats(1024);
+        (f.pdf as any).trimRangeCache = () => trim.promise;
+        await f.frame();
+        const render = f.pdf.activeRenders.find(value => value.id === 20)!;
+        assert.ok(render);
+        render.task.finish(); await promisesSettled();
+        const canvas = render.parameters.canvasContext.canvas;
+        assert.strictEqual(canvas.parentNode, f.pages[19].div, 'visible coverage is published before the trim promise');
+        assert.ok(f.controller.snapshot().pending.includes(20), 'the cold admission slot remains held while trimming');
+        assert.strictEqual(trim.settled, false);
+        assert.strictEqual(robots.deliveries[0]?.canvas, canvas, 'optional cargo uses the already attached useful pixels');
+        trim.resolve(byteStats(1024)); await promisesSettled();
+    });
 
     it('binds preview sources only to the exact document and fences replacement and stale publication', async () => {
         const h = previewFixture({ autoPages: false });
@@ -909,7 +1158,8 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         for (let index = 0; index < 5; index++) { f.eventBus.emit('updateviewarea'); await f.frame(); }
         assert.deepStrictEqual(robots.offers, [20, 21], 'ordinary refreshes do not retry a saturated fleet');
         assert.strictEqual(f.callbacks.size, 0, 'waiting for a courier does not keep animation frames running');
-        assert.strictEqual(timers.size, 0, 'courier capacity does not create a polling timer');
+        assert.ok(f.pdf.activeRenders.length > 0, 'the fixture still has independent PDF preparation work');
+        assert.strictEqual([...timers.values()].filter(timer => timer.delay !== 1000).length, 0, 'courier capacity does not create a polling timer');
         robots.complete(20);
         assert.strictEqual(f.callbacks.size, 1, 'completion requests one coalesced refresh');
         await f.frame();
@@ -971,6 +1221,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
             robots.deferred.add(20);
             await f.frame();
             assert.deepStrictEqual(robots.offers, [20]);
+            await f.frame(); // Deliver the one active-render observation frame before measuring viewport wakeups.
             assert.strictEqual(f.callbacks.size, 0);
             const containerGeometry = [f.container.scrollLeft, f.container.scrollTop, f.container.clientWidth, f.container.clientHeight];
             robots.deferred.delete(20);
@@ -1572,10 +1823,13 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         await f.frame();
         f.pages[0].renderingState = 1;
         f.eventBus.emit('pagerender', { pageNumber: 1 });
-        assert.strictEqual(timers.size, 1);
+        assert.deepStrictEqual([...timers.values()].map(timer => timer.delay).sort((a, b) => a - b), [250, 1000]);
         f.pages[0].reset();
         fireMemoryTimer();
         await promisesSettled();
+        assert.strictEqual([...timers.values()].filter(timer => timer.delay === 250).length, 0, 'canceled native work stops byte polling immediately');
+        const probe = [...timers].find(([, timer]) => timer.delay === 1000)!;
+        f.time += 1000; timers.delete(probe[0]); probe[1].callback();
         assert.strictEqual(timers.size, 0, 'a stale render-start timestamp cannot sustain idle polling');
     });
 
@@ -1793,6 +2047,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         const f = fixture();
         await f.frame();
         const idleLead = f.controller.snapshot().preloadPx;
+        const existingTimers = new Set(timers.keys());
         f.time += 16;
         f.container.scrollTop += 200;
         f.container.emit('scroll');
@@ -1803,8 +2058,9 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         // even when the next animation frame will continue the same movement.
         f.container.emit('scrollend');
         assert.strictEqual(f.controller.snapshot().velocityPxPerMs, moving.velocityPxPerMs);
-        assert.strictEqual(timers.size, 1, 'scrollend replaces the existing gesture timer');
-        const [timerId, timer] = [...timers][0];
+        const gestureTimers = [...timers].filter(([id]) => !existingTimers.has(id));
+        assert.strictEqual(gestureTimers.length, 1, 'scrollend replaces the existing gesture timer');
+        const [timerId, timer] = gestureTimers[0];
         assert.strictEqual(timer.delay, 250);
         await f.frame(249);
         assert.strictEqual(f.controller.snapshot().velocityPxPerMs, moving.velocityPxPerMs);
@@ -1822,6 +2078,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         const f = fixture({}, { cachePolicy: { ...base, limits: { ...base.limits, gestureGapMs: 1000 } } });
         await f.frame();
         const idleLead = f.controller.snapshot().preloadPx;
+        const existingTimers = new Set(timers.keys());
         f.container.emit('wheel', { deltaY: 320, deltaMode: 0 });
         f.time += 16;
         f.container.emit('wheel', { deltaY: 640, deltaMode: 0 });
@@ -1832,8 +2089,9 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.ok(continuing.velocityPxPerMs > moving.velocityPxPerMs / 2, '300ms remains inside the selected gesture');
         assert.ok(continuing.accelerationPxPerMs2 > 0);
         f.container.emit('scrollend');
-        assert.strictEqual(timers.size, 1);
-        const [id, timer] = [...timers][0];
+        const gestureTimers = [...timers].filter(([id]) => !existingTimers.has(id));
+        assert.strictEqual(gestureTimers.length, 1);
+        const [id, timer] = gestureTimers[0];
         assert.strictEqual(timer.delay, 1000);
         await f.frame(999);
         assert.strictEqual(f.controller.snapshot().velocityPxPerMs, continuing.velocityPxPerMs);

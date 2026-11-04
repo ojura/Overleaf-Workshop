@@ -222,8 +222,11 @@ Use the existing authenticated root deployment channel.
 Later site deployments must retain the fixed alias include and the root-owned
 catalog. The seed file is used only when no catalog config exists; it is not a
 second live copy of the public configuration. To unpublish, stop/disable the unit
-and remove the public link before removing its nginx include. Keep retained data
-until any desired rollback or inspection is complete.
+and remove the public link. Keep the fixed locations and direct-storage denial
+while retaining published assets for rollback or inspection, so requests stay on
+the withdrawn routes instead of falling through to the surrounding server.
+Remove or move those assets before removing their protective locations during a
+later uninstall, then validate nginx and reload it.
 
 ## Focused checks
 
