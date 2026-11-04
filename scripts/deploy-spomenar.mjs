@@ -8,13 +8,12 @@ import { fileURLToPath } from 'node:url';
 const repo = fileURLToPath(new URL('../', import.meta.url));
 
 // Machine-specific settings for the existing Steffy site and authenticated root channel.
-// The PDF path is resolved from this public share on every deployment.
+// Every PDF request uses this stable public share's native Nextcloud DAV route.
 const target = Object.freeze({
   host: 'steffy',
   url: 'https://cloud.larics.fer.hr/spomenar/',
   shareUrl: 'https://cloud.larics.fer.hr/nextcloud/s/spomenar-2026',
   webRoot: '/var/www/html',
-  nextcloudRoot: '/var/www/html/nextcloud',
   nginxMain: '/etc/nginx/nginx.conf',
   nginxSite: '/etc/nginx/conf.d/nextcloud.conf',
   nginxSnippet: '/etc/nginx/snippets/spomenar.conf',
@@ -74,7 +73,7 @@ async function main() {
     else if (arg === '--build-dir' && args[index + 1]) { build = path.resolve(args[++index]); }
     else if (arg === '--help') {
       console.log('node scripts/deploy-spomenar.mjs [--check | --deploy] [--build-dir DIRECTORY]');
-      console.log('--check resolves the public PDF and tests a temporary nginx configuration.');
+      console.log('--check verifies native public PDF metadata/ranges and a temporary nginx configuration.');
       console.log('--deploy also publishes the built assets and gracefully reloads nginx.');
       return;
     } else { throw new Error('Unknown or incomplete argument: ' + arg); }

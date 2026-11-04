@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Resolve the public Nextcloud file, validate nginx, and publish this site's assets."""
+"""Validate the native public Nextcloud route and nginx, then publish the site's assets."""
+from email.utils import parsedate_to_datetime
+import http.client
 import json
 import os
 from pathlib import Path
@@ -7,7 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 
 def command(args, **options):
@@ -21,48 +23,118 @@ def nginx_quote(value):
     return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
+def public_pdf_url(settings):
+    """The public DAV token root follows the share's current node, including renames."""
+    share = urlsplit(settings['shareUrl'])
+    site = urlsplit(settings['url'])
+    if (share.scheme not in ('http', 'https') or share.username or share.password
+            or share.query or share.fragment
+            or (share.scheme, share.hostname, share.port) != (site.scheme, site.hostname, site.port)):
+        raise ValueError('The public share must use the standalone site origin')
+    parts = share.path.rstrip('/').split('/')
+    if len(parts) < 3 or parts[-2] != 's':
+        raise ValueError('Expected a Nextcloud public share URL ending in /s/TOKEN')
+    decoded = [unquote(part) for part in parts[1:]]
+    if any(not part or part in ('.', '..') or re.search(r'[/\x00-\x20\x7f]', part) for part in decoded):
+        raise ValueError('Invalid public share path')
+    webroot = '/'.join(parts[:-2]).removesuffix('/index.php')
+    path = webroot + '/public.php/dav/files/' + quote(decoded[-1], safe='')
+    return urlunsplit((share.scheme, share.netloc, path, '', ''))
+
+
 def public_pdf(settings):
-    # Credentials stay inside this short PHP process. Only the named public share is read.
-    php = r'''
-try {
-    require $argv[1];
-    $prefix = $CONFIG["dbtableprefix"] ?? "oc_";
-    if (!preg_match("/^[a-zA-Z0-9_]+$/", $prefix)) { throw new RuntimeException("Unexpected table prefix"); }
-    if ($CONFIG["dbtype"] !== "mysql") { throw new RuntimeException("Unsupported database driver"); }
-    $dsn = "mysql:host=".$CONFIG["dbhost"].";dbname=".$CONFIG["dbname"].";charset=utf8mb4";
-    $db = new PDO($dsn, $CONFIG["dbuser"], $CONFIG["dbpassword"], [
-        PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC
-    ]);
-    $sql = "SELECT s.share_type,s.permissions,s.expiration,(s.password IS NOT NULL AND LENGTH(s.password)>0) AS protected,f.path,f.encrypted,st.id AS storage_id FROM ".$prefix."share s JOIN ".$prefix."filecache f ON f.fileid=s.file_source JOIN ".$prefix."storages st ON st.numeric_id=f.storage WHERE s.token=?";
-    $query = $db->prepare($sql); $query->execute([$argv[2]]); $rows = $query->fetchAll();
-    if (count($rows) !== 1) { throw new RuntimeException("Expected exactly one public share"); }
-    $row = $rows[0];
-    if ((int)$row["share_type"] !== 3 || !((int)$row["permissions"] & 1) || $row["protected"]
-        || ($row["expiration"] && strtotime($row["expiration"]) <= time())) {
-        throw new RuntimeException("The share is not an active public readable link");
-    }
-    if ($row["encrypted"] || !str_starts_with($row["storage_id"], "local::")) {
-        throw new RuntimeException("The public PDF needs unencrypted local storage for direct ranges");
-    }
-    $base = realpath(substr($row["storage_id"], strlen("local::")));
-    $file = $base ? realpath($base."/".$row["path"]) : false;
-    if (!$base || !$file || !str_starts_with($file, $base."/") || !is_file($file)
-        || file_get_contents($file, false, null, 0, 5) !== "%PDF-") {
-        throw new RuntimeException("The public share does not resolve to a local PDF");
-    }
-    echo json_encode(["file"=>$file,"bytes"=>filesize($file),"modified"=>filemtime($file)], JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
-} catch (Throwable $error) {
-    fwrite(STDERR, "Cannot resolve public PDF: ".$error->getMessage().PHP_EOL);
-    exit(1);
-}
+    """Observe metadata and at most sixteen PDF bytes through Nextcloud's own share guards."""
+    url = public_pdf_url(settings)
+    address = urlsplit(url)
+    connection_type = http.client.HTTPSConnection if address.scheme == 'https' else http.client.HTTPConnection
+
+    def headers(response):
+        if response.getheader('Content-Encoding', 'identity').lower() != 'identity':
+            raise RuntimeError('The public PDF response must use identity encoding')
+        if response.getheader('Content-Type', '').split(';', 1)[0].strip().lower() != 'application/pdf':
+            raise RuntimeError('The public share did not return a PDF response')
+        length = response.getheader('Content-Length', '')
+        if not re.fullmatch(r'[0-9]+', length):
+            raise RuntimeError('The public PDF response needs an exact Content-Length')
+        return int(length)
+
+    def request(method, extra=None):
+        connection = connection_type(address.hostname, address.port, timeout=20)
+        try:
+            connection.request(method, address.path, headers={
+                'Accept-Encoding': 'identity', 'Cache-Control': 'no-cache', **(extra or {}),
+            })
+            return connection, connection.getresponse()
+        except Exception:
+            connection.close()
+            raise
+
+    connection, response = request('HEAD')
+    try:
+        if response.status != 200:
+            raise RuntimeError(f'The native public PDF HEAD returned HTTP {response.status}')
+        size = headers(response)
+        if size < 5 or size > 2 ** 53 - 1:
+            raise RuntimeError('The public PDF has an invalid byte length')
+        etag = response.getheader('ETag', '')
+        modified = response.getheader('Last-Modified')
+        if re.fullmatch(r'"[^"\x00-\x20\x7f]*"', etag):
+            validator = {'header': 'ETag', 'value': etag}
+        elif modified and parsedate_to_datetime(modified) is not None:
+            validator = {'header': 'Last-Modified', 'value': modified}
+        else:
+            raise RuntimeError('The public PDF needs a strong ETag or Last-Modified validator')
+    finally:
+        response.close()
+        connection.close()
+
+    end = min(15, size - 1)
+    connection, response = request('GET', {'Range': f'bytes=0-{end}', 'If-Range': validator['value']})
+    try:
+        # Inspect status and bounds before reading: a redirect or full-file response has no body read.
+        if response.status != 206:
+            raise RuntimeError(f'The native public PDF range returned HTTP {response.status}, expected 206')
+        if (headers(response) != end + 1
+                or response.getheader('Content-Range') != f'bytes 0-{end}/{size}'
+                or response.getheader(validator['header']) != validator['value']):
+            raise RuntimeError('The native public PDF range disagrees with its observed representation')
+        sample = response.read(end + 2)
+        if len(sample) != end + 1 or not sample.startswith(b'%PDF-'):
+            raise RuntimeError('The public share did not return the exact requested PDF bytes')
+    finally:
+        response.close()
+        connection.close()
+    return {'url': url, 'bytes': size, 'validator': validator, 'lastModified': modified}
+
+
+def public_pdf_location(prefix, native_uri):
+    """Reuse Nextcloud's PHP/DAV handler; nginx keeps the original request URI across rewrites."""
+    return f'''# Resolve the current share on every request; no file path or inode is retained here.
+set $spomenar_request_uri $request_uri;
+location = {prefix}/book.pdf {{
+    if ($request_method !~ "^(GET|HEAD)$") {{ return 405; }}
+    set $spomenar_request_uri {nginx_quote(native_uri)};
+    rewrite ^ $spomenar_request_uri? last;
+}}
 '''
-    token = unquote(urlsplit(settings['shareUrl']).path.rstrip('/').rsplit('/', 1)[1])
-    result = command(
-        ['php', '-d', 'zend.exception_ignore_args=1', '-r', php,
-         str(Path(settings['nextcloudRoot']) / 'config/config.php'), token],
-        text=True, capture_output=True,
-    )
-    return json.loads(result.stdout)
+
+
+def native_request_uri(source):
+    """One adapter in the existing PHP location supplies the rewritten DAV URI to Nextcloud."""
+    directive = 'fastcgi_param REQUEST_URI $spomenar_request_uri;'
+    anchor = re.compile(r'^([ \t]*)fastcgi_pass[ \t]+php-handler;[ \t]*$', re.MULTILINE)
+    matches = list(anchor.finditer(source))
+    if len(matches) != 1:
+        raise RuntimeError('Cannot identify the existing Nextcloud PHP handler unambiguously')
+    match = matches[0]
+    if directive in source:
+        if source.count(directive) != 1 or not source[:match.start()].rstrip().endswith(directive):
+            raise RuntimeError('The canonical request URI adapter is not in its expected PHP location')
+        return source
+    indent = match.group(1)
+    adapter = (indent + '# Spomenar rewrites to native DAV; other requests keep their original URI.\n'
+               + indent + directive + '\n')
+    return source[:match.start()] + adapter + source[match.start():]
 
 
 def add_include(source, include, hostname):
@@ -123,10 +195,6 @@ def main():
     site_mode = nginx_site.stat().st_mode & 0o777
     main_text = nginx_main.read_text()
     pdf = public_pdf(settings)
-    worker = re.search(r'^\s*user\s+([^;\s]+)', main_text, re.MULTILINE)
-    if not worker:
-        raise RuntimeError('Cannot identify the nginx worker user')
-    command(['runuser', '-u', worker.group(1), '--', 'test', '-r', pdf['file']])
 
     csp = (
         "default-src 'self'; base-uri 'self'; connect-src 'self'; "
@@ -139,18 +207,7 @@ location = {prefix} {{
     return 301 {prefix}/$is_args$args;
 }}
 
-# Only this already-public file is exposed; Nextcloud's data directory remains private.
-location = {prefix}/book.pdf {{
-    alias {nginx_quote(pdf['file'])};
-    types {{ }}
-    default_type application/pdf;
-    sendfile on;
-    gzip off;
-    etag on;
-    open_file_cache off;
-    add_header Cache-Control "public, no-cache" always;
-    add_header X-Content-Type-Options "nosniff" always;
-}}
+{public_pdf_location(prefix, urlsplit(pdf['url']).path)}
 
 # Generated previews survive replacement of the standalone viewer's static directory.
 location ^~ {prefix}/previews/ {{
@@ -171,7 +228,7 @@ location ^~ {prefix}/ {{
 }}
 '''
     (stage / 'spomenar.conf').write_text(snippet)
-    desired = add_include(original_main.decode(), nginx_snippet, address.hostname)
+    desired = native_request_uri(add_include(original_main.decode(), nginx_snippet, address.hostname))
     test_site = desired.replace(nginx_quote(nginx_snippet), nginx_quote(stage / 'spomenar.conf'))
     test_site = absolute_includes(test_site, nginx_main.parent)
     (stage / 'nextcloud-check.conf').write_text(test_site)
@@ -224,7 +281,7 @@ location ^~ {prefix}/ {{
         command(['systemctl', 'reload', 'nginx'])
         if previous:
             shutil.rmtree(previous)
-        print('Published ' + settings['url'] + ' with a direct byte-range PDF alias.', flush=True)
+        print('Published ' + settings['url'] + ' with native Nextcloud share resolution for every PDF request.', flush=True)
     except Exception:
         if published:
             shutil.rmtree(site)

@@ -53,6 +53,8 @@ The production source is `/spomenar/book.pdf`. It must serve the PDF directly an
 - Supply a strong ETag or Last-Modified value so later requests can carry `If-Range`.
 - Keep entry, configuration, and application assets revalidated together during deployment.
 
+The production route resolves the stable Nextcloud share token on every request through its native DAV handler. Renames and moves follow the share automatically; content replacement is detected through its validator, and revocation also closes the Spomenar route. Generated previews are independently bound to the exact PDF digest, size and validator.
+
 `http-range.ts` fetches the first 128 KiB, then only the ranges requested by PDF.js. It validates the response headers before reading the body and enforces the declared byte count while streaming. A full-file HTTP 200 response is cancelled before buffering. A changed length or validator ends the current load and shows a retry action. Retry uses the viewer's saved position.
 
 PDF.js automatic streaming and automatic whole-document fetching are disabled. The shared predictor can still request nearby pages and their resources. Received bytes use the shared sparse worker cache, with a 32 MiB idle target on phones and tablets and 128 MiB on desktop. Old chunks can be evicted and fetched again. Fetch start, received bytes, elapsed time, and completion feed the same `PdfPerformance` collector used by the extension, so network backpressure and the robot delivery activity reflect actual requests.
