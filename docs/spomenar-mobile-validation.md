@@ -82,7 +82,7 @@ Raw cache residency briefly reached 71,956,727 bytes while work was active, then
 
 A separate bounded capability check fetched one exact JPEG stream from the book. The source was 4,320 × 3,240 pixels. On the physical phone, worker `createImageBitmap` with resize options produced a 1,080 × 810 bitmap in 122 ms. Its RGBA footprint was 3,499,200 bytes. The check closed the bitmap, terminated the temporary worker and revoked its object URL.
 
-This phone exposed `OffscreenCanvas` and `createImageBitmap`, while `ImageDecoder` was unavailable. The repository therefore uses the supported native bitmap path for suitable JPEGs, requests dimensions from their actual display placement, serializes mobile image jobs, and releases completed render resources. Higher-resolution zoom intents have separate cache identity in the worker tests.
+This phone exposed `OffscreenCanvas` and `createImageBitmap`, while `ImageDecoder` was unavailable. The repository therefore uses the supported native bitmap path for suitable JPEGs, requests dimensions from their actual display placement, serializes mobile image jobs, and releases completed render resources. Higher-resolution zoom intents have separate cache identity in the worker tests and were checked on the phone as described below.
 
 The book's photo collages make that sizing important. Server-side source inspection found twelve unique RGB JPEGs on page 90, totaling 364.86 MiB at full RGBA resolution, including four photographs whose full bitmap size is 53.39 MiB each. Those numbers describe source-image sizes, rather than simultaneous phone residency.
 
@@ -113,15 +113,33 @@ Two cold-page visual checks demonstrated the requested delivery behavior:
 - The two checks completed eight fragments. Afterwards the document effect reported zero actors, cargo, retained bytes and scheduled frames.
 - Every transit, vehicle and cargo element had `pointer-events: none`.
 
-The closed-lab screenshot exposed one presentation defect: a courier and cargo could cross the header while entering from the top. A narrow viewer-bounds correction is being validated separately. It does not change the decoder or the controlled memory comparison above.
+The first closed-lab screenshot exposed a presentation defect: a courier and cargo could cross the header while entering from the top. The final viewer-bounds correction was checked on the same phone after deployment. With four active couriers, the live viewer rectangle was x=0, y=106, width=402, height=548, and the fixed transit layer computed `clip-path: inset(106px 0px 0px)`. The screenshot showed a clear header with visible couriers and cargo below it. This presentation change leaves the decoder and controlled memory comparison above unchanged.
 
 The optional lab continued processing its finite telemetry cargo after the document couriers returned. Its stage paint averaged 1.15 ms, with a 3 ms maximum in that physical observation. The default-idle CPU measurement above was taken with the lab closed and the document fleet fully empty.
 
-## Genuine touch validation
+## Higher-zoom photo check
 
-The physical phone is ready for the invited user swipe, reverse, pinch, rotation, toggle and text-selection pass. A bounded passive logger records trusted input, visual viewport geometry, PDF scale, canvas dimensions, decode counters and selection length. It creates no DOM indicator, records no selected text, and runs no timer while idle.
+A separate scripted quality check on the physical phone doubled page 65's PDF scale through the viewer's `updateScale` API. Image arrivals were observed at `PDFObjects.resolve`, recording numeric dimensions without retaining bitmap references. The temporary method wrappers were restored before taking the screenshot.
 
-This section will be updated with the captured gesture results and high-zoom inspection. The current reading tab is being preserved.
+| Measurement | Page width | Enlarged view |
+| --- | ---: | ---: |
+| PDF scale | 0.44362745098039214 | 0.89 |
+| Finished page canvas | 1,083 × 1,404 | 2,008 × 2,600 |
+| Fresh photo bitmap dimensions | 864 × 648 | 1,472 × 1,104, then 1,600 × 1,200 |
+| Cumulative native decode count | 59 | 61 |
+| Cumulative native output pixels | 6,003,981 | 9,549,069 |
+| Visible pages missing pixels after settling | 0 | 0 |
+| Retained decoded image bytes after settling | 0 | 0 |
+
+The enlarged view settled in 100 ms. The screenshot showed clear enlarged photo detail with the same colors and orientation as the page-width view. The fresh larger bitmap arrivals confirm a new decode at the larger display resolution.
+
+The check then restored page 65, page-width scale, vertical scroll position 30,592 and horizontal scroll position 0. Pages 65 and 66 were ready, document robots were enabled, the optional lab was closed, and the document fleet had zero actors, retained bytes or scheduled frames. No user touch interrupted the check.
+
+## Touch, pinch and rotation
+
+Trusted touch, pinch, rotation and text-selection events have not yet been recorded. The user was invited to perform that pass; the passive capture was saved before the final refresh and rearmed afterwards. The scripted zoom check above is recorded separately.
+
+The bounded passive logger records trusted input, visual viewport geometry, PDF scale, canvas dimensions, decode counters and selection length. It creates no DOM indicator, records no selected text, and runs no timer while idle. The current reading tab remains open at the restored position.
 
 ## Narrow extension toolbar check
 

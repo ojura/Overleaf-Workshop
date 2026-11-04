@@ -126,7 +126,7 @@ node node_modules/.bin/mocha "out/test/**/*.test.js"
 
 The suites cover gesture dynamics, reversal, visible rendering priority, bounded preparation, spread holes, stale document completions, preview retention and cleanup, queue restoration, throughput accounting, actual worker image decoding, sparse byte refetches, disk accumulation, and document-courier lifecycle.
 
-The initial extension implementation at `0681c21` passed 678 Mocha tests and the build on 2026-11-04. Its benchmark results below precede the standalone site and device-specific retention changes. The follow-up adds mobile device selection, aggressive native-canvas pruning, long-traverse preview bounds, host idle leases and stale byte-stat completion tests.
+The initial extension implementation at `0681c21` passed 678 Mocha tests and the build on 2026-11-04. Its benchmark results below precede the standalone site and device-specific retention changes. The follow-up at `ec52ed4`, integrated with the local-project workflow change, passed 831 Mocha tests and all four Node API checks. Both extension viewers, the host, chat view and standalone site built successfully. It adds mobile device selection, native-canvas pruning, long-traverse preview bounds, host idle leases, actual adaptive-worker regressions and document-delivery lifecycle tests.
 
 The [physical iPhone report](spomenar-mobile-validation.md) records the adaptive follow-up on the actual 459-page, 1.61 GB book, including decoded-image memory, native browser memory, visible coverage, transferred bytes, idle CPU and document deliveries. Its exact measurements are retained in [spomenar-mobile-metrics.json](spomenar-mobile-metrics.json).
 

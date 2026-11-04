@@ -286,6 +286,137 @@
     "finalDocumentRetainedBytes": 0
   },
   "physicalGestures": {
-    "status": "Awaiting the invited user gesture pass"
+    "status": "Awaiting the invited user gesture pass",
+    "recordedTrustedInputCount": 0,
+    "passiveCaptureRearmed": true,
+    "page": 65,
+    "portraitViewportCssPixels": {
+      "width": 402,
+      "height": 654
+    }
+  },
+  "finalVisualCheck": {
+    "commit": "ec52ed4",
+    "viewer": {
+      "x": 0,
+      "y": 106,
+      "width": 402,
+      "height": 548
+    },
+    "transitClipPath": "inset(106px 0px 0px)",
+    "activeActors": 4,
+    "retainedBytes": 312320,
+    "pointerEvents": "none",
+    "headerClearInScreenshot": true
+  },
+  "scriptedZoom": {
+    "page": 65,
+    "method": "PDFViewer.updateScale with scaleFactor 2",
+    "baseline": {
+      "scale": 0.44362745098039214,
+      "canvasWidth": 1083,
+      "canvasHeight": 1404,
+      "visible": [
+        65,
+        66
+      ],
+      "missing": [],
+      "decodedImages": {
+        "pageBytes": 0,
+        "sharedBytes": 0,
+        "dataBytes": 0,
+        "bitmapBytes": 0,
+        "images": 0,
+        "supported": true,
+        "truncated": false
+      }
+    },
+    "enlarged": {
+      "scale": 0.89,
+      "canvasWidth": 2008,
+      "canvasHeight": 2600,
+      "visible": [
+        65
+      ],
+      "missing": [],
+      "decodedImages": {
+        "pageBytes": 0,
+        "sharedBytes": 0,
+        "dataBytes": 0,
+        "bitmapBytes": 0,
+        "images": 0,
+        "supported": true,
+        "truncated": false
+      }
+    },
+    "baselineNativeDecodeCount": 59,
+    "enlargedNativeDecodeCount": 61,
+    "baselineOutputPixels": 6003981,
+    "enlargedOutputPixels": 9549069,
+    "imageArrivals": [
+      {
+        "phase": "baseline",
+        "width": 864,
+        "height": 648,
+        "bitmap": true
+      },
+      {
+        "phase": "zoom",
+        "width": 1472,
+        "height": 1104,
+        "bitmap": true
+      },
+      {
+        "phase": "zoom",
+        "width": 1600,
+        "height": 1200,
+        "bitmap": true
+      }
+    ],
+    "readinessMs": 100,
+    "touchInterrupted": false,
+    "restored": {
+      "page": 65,
+      "scale": 0.44362745098039225,
+      "top": 30592,
+      "left": 0,
+      "visible": [
+        65,
+        66
+      ],
+      "missing": [],
+      "pending": [],
+      "pendingFetches": 0,
+      "robotsEnabled": true,
+      "diagnosticsEnabled": false,
+      "robots": {
+        "enabled": true,
+        "reducedMotion": false,
+        "scheduled": false,
+        "frames": 64,
+        "activeEpisodes": 0,
+        "activeActors": 0,
+        "cargoBytes": 0,
+        "spriteBytes": 0,
+        "retainedBytes": 0,
+        "maxActors": 4,
+        "maxCargoBytes": 524288,
+        "episodes": 3,
+        "deliveredFragments": 4,
+        "cancelledEpisodes": 1,
+        "rejected": 0,
+        "skipped": 1,
+        "pages": []
+      },
+      "decodedImages": {
+        "pageBytes": 0,
+        "sharedBytes": 0,
+        "dataBytes": 0,
+        "bitmapBytes": 0,
+        "images": 0,
+        "supported": true,
+        "truncated": false
+      }
+    }
   }
 }
