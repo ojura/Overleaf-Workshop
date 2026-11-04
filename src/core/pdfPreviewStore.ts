@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
-import type { PdfDiskCache } from './pdfDiskCache';
+import { PdfCacheCompletionError, type PdfDiskCache } from './pdfDiskCache';
 import type { PdfOutput, PdfPreviewIdentity } from './viewerProtocol';
 import { PDF_PREVIEW_MANIFEST_BYTES } from './viewerProtocol';
 
@@ -22,6 +22,11 @@ export interface PdfPreviewReceipt {
     pdf: string;
     outputDirectory: string;
 }
+export interface PdfPreviewExportProgress {
+    phase: 'fetching' | 'writing';
+    completedBytes: number;
+    totalBytes: number;
+}
 
 export class PdfPreviewExportError extends Error {
     constructor(readonly reason: 'incomplete' | 'superseded' | 'cancelled' | 'receipt', message: string) { super(message); }
@@ -33,6 +38,7 @@ export class PdfPreviewStore {
     private watcher?: fs.FSWatcher;
     private ready?: Promise<void>;
     private readonly pending = new Set<Promise<void>>();
+    private readonly exports = new Set<AbortController>();
     private closed = false;
 
     constructor(readonly root: string) {}
@@ -152,27 +158,50 @@ export class PdfPreviewStore {
         }
     }
 
-    /** Export only the captured cached build, then bind the generator receipt to its actual bytes. */
+    /** Complete the captured build, then bind its exported PDF and preview receipt to the same bytes. */
     async exportSource(cache: PdfDiskCache, output: PdfOutput, target: string, current: () => boolean,
-        signal?: AbortSignal, progress?: (bytes: number) => void): Promise<{ pdfPath: string, receiptPath: string, receipt: PdfPreviewReceipt }> {
+        signal?: AbortSignal, progress?: (value: PdfPreviewExportProgress) => void): Promise<{ pdfPath: string, receiptPath: string, receipt: PdfPreviewReceipt }> {
         const identity = cache.previewIdentity(output);
         const outputDirectory = this.directory(identity);
         const receiptPath = target + '.preview-source.json';
         const unique = randomUUID();
         const stagedPdf = target + '.' + unique + '.preview-source';
         const stagedReceipt = receiptPath + '.' + unique + '.tmp';
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        signal?.addEventListener('abort', abort, { once: true });
+        if (signal?.aborted) { abort(); }
+        this.exports.add(controller);
         let published = false;
         const checkCurrent = () => {
             if (!current()) { throw new PdfPreviewExportError('superseded', 'The shown build changed before its preview source was exported. Start the export again for the new build.'); }
-            if (this.closed || signal?.aborted) { throw new PdfPreviewExportError('cancelled', 'Preview source export was cancelled.'); }
+            if (this.closed || controller.signal.aborted) { throw new PdfPreviewExportError('cancelled', 'Preview source export was cancelled.'); }
         };
         try {
             checkCurrent();
+            try {
+                await cache.completeForExport(output, { signal: controller.signal, current,
+                    onProgress: (completedBytes, totalBytes) => {
+                        checkCurrent();
+                        progress?.({ phase: 'fetching', completedBytes, totalBytes });
+                    } });
+            } catch (error) {
+                checkCurrent();
+                if (error instanceof PdfCacheCompletionError) {
+                    throw new PdfPreviewExportError(error.reason === 'cancelled' ? 'cancelled' : 'incomplete', error.message);
+                }
+                throw error;
+            }
+            checkCurrent();
+            progress?.({ phase: 'writing', completedBytes: 0, totalBytes: identity.size });
             let sha256: string | undefined;
-            const copied = await cache.copyComplete(output, stagedPdf, signal, progress, value => { sha256 = value; });
+            const copied = await cache.copyComplete(output, stagedPdf, controller.signal, completedBytes => {
+                checkCurrent();
+                progress?.({ phase: 'writing', completedBytes, totalBytes: identity.size });
+            }, value => { sha256 = value; });
             checkCurrent();
             if (!copied || !sha256) {
-                throw new PdfPreviewExportError('incomplete', 'The exact build could not be exported from the cache. Wait for its disk accumulation to complete, then try again.');
+                throw new PdfPreviewExportError('incomplete', 'Cached bytes became unavailable while writing the exact PDF. Start the export again.');
             }
             const receipt: PdfPreviewReceipt = { version: 1, document: { ...identity, sha256 }, pdf: path.basename(target), outputDirectory };
             await fs.promises.writeFile(stagedReceipt, JSON.stringify(receipt, null, 2) + '\n', { flag: 'wx' });
@@ -188,6 +217,9 @@ export class PdfPreviewStore {
             checkCurrent();
             throw error;
         } finally {
+            controller.abort();
+            signal?.removeEventListener('abort', abort);
+            this.exports.delete(controller);
             await fs.promises.unlink(stagedPdf).catch(() => {});
             await fs.promises.unlink(stagedReceipt).catch(() => {});
         }
@@ -196,6 +228,7 @@ export class PdfPreviewStore {
     dispose() {
         if (this.closed) { return; }
         this.closed = true;
+        for (const controller of this.exports) { controller.abort(); }
         this.watcher?.close(); this.watcher = undefined;
         for (const entry of this.subscriptions.values()) { entry.watcher?.close(); entry.listeners.clear(); }
         this.subscriptions.clear();

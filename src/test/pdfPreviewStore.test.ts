@@ -191,6 +191,52 @@ describe('exact-build preview source export', () => {
         assert.strictEqual(fs.readdirSync(base).some(name => /\.preview-source$|\.tmp$|\.part$/.test(name)), false);
     });
 
+    it('completes only the captured build\'s missing bytes before exporting its digest and receipt', async () => {
+        await cache.dispose();
+        const source = output(), requests: Array<{ start: number, end: number }> = [];
+        cache = new PdfDiskCache(path.join(base, 'pieces'), 1024 * 1024, { fetchRange: async request => {
+            assert.strictEqual(request.output, source);
+            requests.push({ start: request.start, end: request.end });
+            return { id: 0, status: 206, statusText: 'Partial Content',
+                headers: [['content-range', 'bytes ' + request.start + '-' + (request.end - 1) + '/' + bytes.length], ['etag', '"exact"']],
+                body: bytes.slice(request.start, request.end) };
+        } });
+        await fill(source, 100);
+        const phases: string[] = [], target = path.join(base, 'completed.pdf');
+        const result = await store.exportSource(cache, source, target, () => true, undefined, progress => phases.push(progress.phase));
+        assert.deepStrictEqual(requests, [{ start: 100, end: bytes.length }]);
+        assert.deepStrictEqual(new Uint8Array(fs.readFileSync(target)), bytes);
+        assert.strictEqual(result.receipt.document.sha256, digest(bytes));
+        assert.deepStrictEqual([...new Set(phases)], ['fetching', 'writing']);
+        assert.strictEqual((await cache.snapshot(source)).complete, true);
+    });
+
+    it('aborts captured-build completion on replacement and leaves the destination and receipt intact', async () => {
+        await cache.dispose();
+        const source = output(), entered = deferred(), release = deferred();
+        let current = true, requestSignal: AbortSignal | undefined;
+        cache = new PdfDiskCache(path.join(base, 'pieces'), 1024 * 1024, { fetchRange: async request => {
+            requestSignal = request.signal; entered.resolve(); await release.promise;
+            return { id: 0, status: 206, statusText: 'Partial Content',
+                headers: [['content-range', 'bytes 0-' + (bytes.length - 1) + '/' + bytes.length], ['etag', '"exact"']], body: bytes };
+        } });
+        const target = path.join(base, 'replaced.pdf');
+        fs.writeFileSync(target, 'existing PDF'); fs.writeFileSync(target + '.preview-source.json', 'existing receipt');
+        const abort = new AbortController();
+        const exporting = store.exportSource(cache, source, target, () => current, abort.signal);
+        const settled = exporting.then(() => undefined, () => undefined);
+        try {
+            await Promise.race([entered.promise, exporting.then(() => { throw new Error('export finished before fetching its missing bytes'); })]);
+            current = false; abort.abort();
+            assert.strictEqual(requestSignal?.aborted, true);
+            release.resolve();
+            await assert.rejects(exporting, error => error instanceof PdfPreviewExportError && error.reason === 'superseded');
+            assert.strictEqual((await cache.snapshot(source)).covered, 0, 'a late response from the captured build cannot publish');
+            assert.strictEqual(fs.readFileSync(target, 'utf8'), 'existing PDF');
+            assert.strictEqual(fs.readFileSync(target + '.preview-source.json', 'utf8'), 'existing receipt');
+        } finally { release.resolve(); await settled; }
+    });
+
     it('deletes only owned staging files when a copied source is cancelled or superseded', async () => {
         const source = output(); await fill(source);
         for (const reason of ['cancelled', 'superseded']) {

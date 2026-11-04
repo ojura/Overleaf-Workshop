@@ -4,8 +4,8 @@
 //   overleaf  Overleaf's PDFJSWrapper with the extension's toolbar, views/pdf-viewer/src/overleaf/
 // Overleaf's files stay unmodified in views/pdf-viewer/overleaf/; the extension's stand-ins for
 // the parts of Overleaf's web app that they import are in views/pdf-viewer/src/shims/. The build
-// changes one condition of Overleaf's loader as it bundles it (perLoadCacheFlag), and stops when
-// Overleaf's text is not the one it expects.
+// adapts its per-load cache flag and consumes owned bridge bodies without duplicate copies.
+// Both transforms stop when Overleaf's text is not the one they expect.
 // Each viewer's page script src/<engine>/main.ts goes to views/pdf-viewer/dist/<engine>.mjs
 // (and .css), its page src/<engine>/index.html to dist/<engine>.html, which
 // src/core/pdfViewerPages.ts completes at run time.
@@ -65,6 +65,16 @@ function perLoadCacheFlag(source, file) {
     return source;
 }
 
+/** Keep native fetch fallback while consuming an owned host body without another byte copy. */
+function bridgeBodyReads(source, file) {
+    const from = 'await response.arrayBuffer()';
+    if (source.split(from).length !== 3) {
+        throw new Error(`${file}: the build expects ${JSON.stringify(from)} exactly twice for bridge body consumption`);
+    }
+    const helper = JSON.stringify(path.join(src, 'common', 'bridge-response.ts'));
+    return `import { readPdfResponse } from ${helper};\n` + source.replaceAll(from, 'await readPdfResponse(response)');
+}
+
 export const standIns = {
     name: 'overleaf-stand-ins',
     setup(build) {
@@ -83,6 +93,12 @@ export const standIns = {
             const relative = path.relative(overleafJs, args.path).split(path.sep).join('/');
             return relative === 'features/pdf-preview/util/pdf-caching-transport.ts'
                 ? { contents: perLoadCacheFlag(readFileSync(args.path, 'utf8'), args.path), loader: 'ts' }
+                : undefined;
+        });
+        build.onLoad({ filter: /pdf-caching\.ts$/ }, (args) => {
+            const relative = path.relative(overleafJs, args.path).split(path.sep).join('/');
+            return relative === 'features/pdf-preview/util/pdf-caching.ts'
+                ? { contents: bridgeBodyReads(readFileSync(args.path, 'utf8'), args.path), loader: 'ts' }
                 : undefined;
         });
         build.onResolve({ filter: /pdf-caching-transport$/ }, (args) => {

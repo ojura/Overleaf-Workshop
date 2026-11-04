@@ -15,6 +15,20 @@ export const ROBOT_VEHICLES = [
 ] as const;
 export type RobotVehicle = typeof ROBOT_VEHICLES[number]['id'];
 export const ROBOT_ARTWORK_SIZE = Object.freeze({ width: 128, height: 100 });
+const GROUND_ARTWORK_SCALE = 0.86;
+/**
+ * Navines attachment coordinates are relative to the vehicle center before its internal
+ * artwork scale. Multiply by scale, then by the displayed sprite scale, to place external
+ * cargo or lift hardware. The front fork supports cargo at y - carryLift while carrying.
+ */
+export const ROBOT_FORKLIFT_ATTACHMENT = Object.freeze({
+    scale: GROUND_ARTWORK_SCALE,
+    mast: Object.freeze({ left: 15, right: 23, top: -37, bottom: 15, strokeWidth: 2.6 }),
+    frontFork: Object.freeze({ left: 16, right: 42, y: 11, strokeWidth: 3 }),
+    rearFork: Object.freeze({ left: 23, right: 43, y: 15, strokeWidth: 2 }),
+    carryLift: 12,
+    cargo: Object.freeze({ x: 33, y: -18 }),
+});
 export interface RobotDispatchPoint { x: number; y: number; scale?: number }
 export interface RobotDispatchPort {
     reserve(vehicle: RobotVehicle): RobotDispatchPoint | undefined;
@@ -958,16 +972,18 @@ function bodyArtwork(ctx: Paint, vehicle: typeof ROBOT_VEHICLES[number]): void {
     } else {
         if (vehicle.id === 'forklift') {
             // Navines' Gazebo prototype: blue base, metal lift rails and side manipulators.
+            const mast = ROBOT_FORKLIFT_ATTACHMENT.mast;
             rounded(ctx, -25, -4, 44, 21, 4, '#254c8d', '#99b9e9');
             rounded(ctx, -20, -21, 34, 25, 3, '#a5b5bd', '#d5e0e5');
             rounded(ctx, -12, -17, 21, 10, 2, '#10243c');
             line(ctx, [[-18, -2], [10, -2]], '#5d707c', 1.2);
-            for (const x of [15, 23]) {
-                line(ctx, [[x, -38], [x, 17]], LAB_INK, 5);
-                line(ctx, [[x, -37], [x, 15]], '#c2d0d6', 2.6);
+            for (const x of [mast.left, mast.right]) {
+                line(ctx, [[x, mast.top - 1], [x, mast.bottom + 2]], LAB_INK, 5);
+                line(ctx, [[x, mast.top], [x, mast.bottom]], '#c2d0d6', mast.strokeWidth);
             }
-            line(ctx, [[14, -37], [24, -37]], '#dce6eb', 3);
-            line(ctx, [[19, -32], [19, 12]], '#485f73', 1.3);
+            line(ctx, [[mast.left - 1, mast.top], [mast.right + 1, mast.top]], '#dce6eb', 3);
+            const center = (mast.left + mast.right) / 2;
+            line(ctx, [[center, mast.top + 5], [center, mast.bottom - 3]], '#485f73', 1.3);
             rounded(ctx, -7, -32, 15, 9, 2, '#c6d3da', '#5c7080');
             ellipse(ctx, 0, -33, 5, 2.2, '#839ba9', '#cbdbe4');
             ellipse(ctx, 7, -26, 1.7, 1.7, '#ffb45b');
@@ -1069,7 +1085,7 @@ export function paintRobotVehicle(ctx: Paint, actor: RobotArtworkActor, time: nu
     const spec = vehicleOf(actor);
     const moving = Math.hypot(actor.vx, actor.vy);
     const panicking = mode === 'outage' && (actor.needsHelp || actor.activity === 'yield' || actor.activity === 'replan' || actor.activity === 'balance');
-    const scale = spec.air ? 0.83 : 0.86;
+    const scale = spec.air ? 0.83 : GROUND_ARTWORK_SCALE;
     const quiet = reduced || mode === 'quiet' && actor.job !== 'delivery' && actor.job !== 'help' && moving < 2;
     const bob = spec.air && !quiet ? Math.sin(time * (1.9 + actor.temperament) + actor.phase) * 1.2 : 0;
     const bank = spec.air && !quiet ? clamp(actor.vx / 450 + actor.vy / 350, -0.2, 0.2) : 0;
@@ -1149,10 +1165,11 @@ export function paintRobotVehicle(ctx: Paint, actor: RobotArtworkActor, time: nu
         drawArm(ctx, { x: 0, y: 14 }, { x: actor.carrying ? 2 : 25, y: actor.carrying ? 37 : 30 }, spec.color, actor.carrying ? 2 : 5);
     }
     if (actor.vehicle === 'forklift') {
-        const lift = actor.carrying ? actor.activity === 'unload' ? 10 + actor.progress * 25 : 12
+        const { frontFork, rearFork, carryLift } = ROBOT_FORKLIFT_ATTACHMENT;
+        const lift = actor.carrying ? actor.activity === 'unload' ? 10 + actor.progress * 25 : carryLift
             : actor.activity === 'lift' ? 8 + Math.sin(time * 2) * 12 : 0;
-        line(ctx, [[16, 11 - lift], [42, 11 - lift]], '#7ea7df', 3);
-        line(ctx, [[23, 15 - lift], [43, 15 - lift]], '#a3bed8', 2);
+        line(ctx, [[frontFork.left, frontFork.y - lift], [frontFork.right, frontFork.y - lift]], '#7ea7df', frontFork.strokeWidth);
+        line(ctx, [[rearFork.left, rearFork.y - lift], [rearFork.right, rearFork.y - lift]], '#a3bed8', rearFork.strokeWidth);
         const handling = actor.carrying || ['load', 'unload', 'lift'].includes(actor.activity);
         const reach = handling ? { x: 31, y: -18 - lift * 0.45 }
             : gesturing ? { x: -25, y: -32 + Math.sin(time * 3 + actor.phase) * 5 } : { x: -27, y: -6 };
@@ -1165,7 +1182,8 @@ export function paintRobotVehicle(ctx: Paint, actor: RobotArtworkActor, time: nu
             parcel(ctx, 0, 36, actor.cargo, quiet ? 0 : -bank * 0.8 + Math.sin(time * 2 + actor.phase) * 0.07);
         } else {
             const lift = actor.vehicle === 'forklift' && actor.activity === 'unload' ? actor.progress * 24 : 0;
-            parcel(ctx, actor.vehicle === 'forklift' ? 33 : 19, -18 - lift, actor.cargo);
+            const anchor = actor.vehicle === 'forklift' ? ROBOT_FORKLIFT_ATTACHMENT.cargo : { x: 19, y: -18 };
+            parcel(ctx, anchor.x, anchor.y - lift, actor.cargo);
         }
     }
     if (actor.notice) {

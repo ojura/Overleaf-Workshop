@@ -1,6 +1,6 @@
 # LARICS Motion Lab public-book generation
 
-On 4 November 2026, the generator completed a four-level preview pyramid for the public **459-page, 1,608,644,855-byte** LARICS book. The completed set contains **1,836 JPEG assets and 1,045 image placements**, occupying **179,305,543 bytes including the manifest**. Generation is complete; publication and live viewer consumption are the next validation steps.
+On 4 November 2026, the generator completed a four-level preview pyramid for the public **459-page, 1,608,644,855-byte** LARICS book. The completed set contains **1,836 JPEG assets and 1,045 image placements**, occupying **179,305,543 bytes including the manifest**. The complete atlas and its photo-aware viewer are published at https://cloud.larics.fer.hr/spomenar/; the production transport has verified the actual HTTPS manifest and selected page images.
 
 Exact values are retained in [motionlab-book-metrics.json](motionlab-book-metrics.json). See [Motion Lab previews](motionlab-previews.md) for generation, import and consumer behavior.
 
@@ -8,7 +8,7 @@ Exact values are retained in [motionlab-book-metrics.json](motionlab-book-metric
 
 The manifest binds the pyramid to SHA-256 `7ff0909e635aa4c4d65aeaa7903397da40cc8f2168af5d3c817cad8e59e496e6`, byte length 1,608,644,855 and page count 459. Its key is the `sha256:` prefix followed by that digest.
 
-This is the public book used by Spomenar. The current live Antigravity book has 460 pages and 1,608,164,635 bytes; its build `1a1a762ffd7-eac7495dfa2ef4ed` needs its own export receipt and generated manifest. The [desktop validation](pdf-desktop-validation.md) records that live document separately.
+This is the public book used by Spomenar. Live Antigravity builds use separate export receipts and generated manifests. The [desktop validation](pdf-desktop-validation.md) records a 460-page, 1,608,164,635-byte build; a later reload opened another 460-page build of 1,608,649,920 bytes. Neither identity is substituted for the public PDF.
 
 ## Duplex check and full resume
 
@@ -39,6 +39,12 @@ The manifest contains 1,045 normalized image-placement rectangles on 280 pages, 
 
 ## Validation and retained evidence
 
-The generator's 24 Python tests passed. The actual TypeScript consumer validator also accepted the cropped and rotated test fixture. The recorded real-book run produced eight `asset` events for the initial pair and 1,828 for the full resume, each enclosed by one `start` and one `complete` event.
+The generator's 24 Python tests passed. The actual TypeScript consumer validator accepted both the cropped/rotated fixture and the complete real-book manifest. The recorded real-book run produced eight `asset` events for the initial pair and 1,828 for the full resume, each enclosed by one `start` and one `complete` event.
 
 The read-only metadata check loaded the manifest, the two JSONL logs and the GNU time files on Steffy. It checked file existence and sizes for all 1,836 assets without rereading the source PDF or decoding the generated images. The evidence directory is `/home/juraj/.cache/larics-motionlab/book-previews-20261104`; its parent contains `book-two-page.jsonl`, `book-two-page.time`, `book-full.jsonl` and `book-full.time`. The compact metrics record includes the final manifest digest and the measured values.
+
+## Public deployment and transport
+
+The publisher passed 27 tests and verified every referenced asset's length and SHA-256 before replacing the public manifest. The real publication copied 178,710,389 JPEG bytes and the 595,154-byte manifest into the source SHA namespace in **33.445 seconds**. The generated and published manifest bytes matched exactly. Generated assets live in the sibling `spomenar-previews` directory, so later atomic viewer replacements preserve them.
+
+The site deployment uploaded **9,403,888 static bytes** and passed both candidate and final nginx configuration checks. Eleven primary HTTPS files, totaling 4,250,037 bytes, matched the local build. The production `httpPdfPreviewSource` loaded the exact full manifest and verified the 192- and 512-pixel assets for physical pages 99 and 100. The PDF still reports 1,608,644,855 bytes, ETag `"6aeafec1-5fe1f8f7"`, and byte-range support. Physical-phone delivery evidence is recorded separately in the [mobile report](spomenar-mobile-validation.md).

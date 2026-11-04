@@ -6,6 +6,7 @@
  */
 import type { HostMessage, ViewerMessage } from './protocol';
 import { pdfPerformance } from './prefetch-performance';
+import { createBridgeResponse } from './bridge-response';
 
 interface Pending { resolve: (response: Response) => void, reject: (error: unknown) => void, started: number, cleanup: () => void }
 
@@ -29,9 +30,11 @@ export function installBridgeFetch(post: (message: ViewerMessage) => void, bridg
         waiting.cleanup();
         if (message.type === 'fetchResponse') {
             pdfPerformance.fetch(message.body?.byteLength ?? 0, performance.now() - waiting.started);
-            waiting.resolve(new Response(NULL_BODY.has(message.status) ? null : message.body, {
-                status: message.status, statusText: message.statusText, headers: message.headers,
-            }));
+            try {
+                waiting.resolve(createBridgeResponse(NULL_BODY.has(message.status) ? null : message.body, {
+                    status: message.status, statusText: message.statusText, headers: message.headers,
+                }));
+            } catch (error) { waiting.reject(error); }
         } else {
             pdfPerformance.event('fetch-error');
             waiting.reject(new TypeError(message.message)); // as fetch rejects on network errors

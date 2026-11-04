@@ -242,6 +242,13 @@ export interface PrefetchDiagnosticSample {
     visibleMissing?: readonly number[];
     fetchBackpressure?: boolean;
     memoryBackpressure?: boolean;
+    robots?: {
+        frames: number;
+        paintTotalMs: number;
+        paintMaxMs: number;
+        paintLastMs: number;
+        activeActors?: number;
+    };
     performance?: ReturnType<PdfPerformance['snapshot']>;
 }
 
@@ -334,6 +341,8 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
         field('target', `${format(state.preloadPx)} px`);
         field('buffer', seconds(state.bufferSeconds));
         field('margin', seconds(state.safetySeconds, true));
+        const fleet = state.robots;
+        field('document-paint', fleet ? `Document fleet paint: last ${format(fleet.paintLastMs, 2)} ms; mean ${format(fleet.frames ? fleet.paintTotalMs / fleet.frames : 0, 2)} ms; max ${format(fleet.paintMaxMs, 2)} ms; ${format(fleet.frames)} paints${fleet.activeActors === undefined ? '' : `; ${format(fleet.activeActors)} active actors`}.` : '');
         field('cache', `${state.previewPages} previews; ${format(state.previewBytes / (1024 * 1024), 1)} MiB preview; ${format(state.canvasBytes / (1024 * 1024), 1)} MiB canvas`);
         const bytes = state.rangeCache;
         field('byte-cache', bytes ? `${state.cachePolicy ?? 'reader'}; ${format(bytes.residentBytes / (1024 * 1024), 1)} / ${format(bytes.maxBytes / (1024 * 1024))} MiB ranges; ${format(bytes.evictedBytes / (1024 * 1024), 1)} MiB evicted` : '');
@@ -418,7 +427,7 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
         root = host.attachShadow({ mode: 'open' });
         root.innerHTML = `
 <style>
-:host { all:initial; position:fixed; right:max(14px,env(safe-area-inset-right)); bottom:max(14px,env(safe-area-inset-bottom)); z-index:2147483647; display:block; color:#e8f0fa; font:12px/1.4 system-ui,sans-serif; color-scheme:dark; }
+:host { all:initial; position:fixed; right:max(14px,env(safe-area-inset-right)); bottom:max(14px,env(safe-area-inset-bottom)); z-index:2147483646; display:block; color:#e8f0fa; font:12px/1.4 system-ui,sans-serif; color-scheme:dark; }
 :host([hidden]) { display:none !important; }
 * { box-sizing:border-box; }
 section { width:456px; max-width:calc(100vw - 28px); max-height:calc(100vh - 70px); max-height:calc(100dvh - 70px); overflow:auto; overscroll-behavior:contain; padding:14px; border:1px solid #43566b; border-radius:12px; background:#101c2b; box-shadow:0 8px 36px #0007; }
@@ -485,6 +494,7 @@ ${ROBOT_ICON}
 <div><dt>Time margin</dt><dd class="margin" data-field="margin"></dd></div>
 </dl>
 <p class="explanation">Buffered time = ready distance / speed.<br>Time margin = buffered time − measured load delay.</p>
+<p class="storage" data-field="document-paint"></p>
 <p class="storage" data-field="cache"></p><p class="storage" data-field="byte-cache"></p><p class="storage" data-field="decoded-images"></p><p class="storage" data-field="image-work"></p><p class="storage" data-field="image-pixels"></p><p class="storage" data-field="disk-cache"></p><p class="storage" data-field="work"></p><p class="storage" data-field="transport"></p><p class="storage" data-field="total"></p>
 <div class="graph">
 <div class="legend"><span>Velocity; last 10 s</span><span data-field="speed-scale"></span></div>

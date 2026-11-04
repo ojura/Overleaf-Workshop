@@ -328,8 +328,9 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         const panelDisposal = webviewPanel.onDidDispose(editor.dispose);
         listeners.push(() => panelDisposal.dispose());
 
+        // Match previewDescriptor's file URI even when globalStorageUri uses vscode-userdata.
         webviewPanel.webview.options = {enableScripts:true, localResourceRoots:[this.context.extensionUri,
-            vscode.Uri.joinPath(this.context.globalStorageUri, 'pdf-previews')]};
+            vscode.Uri.file(this.previews.root)]};
 
         // register event listeners
         const viewState = webviewPanel.onDidChangeViewState((e) => {
@@ -488,11 +489,16 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                 const cancel = token.onCancellationRequested(() => abort.abort());
                 const change = editor.doc.onDidChange(() => { if (!current()) { abort.abort(); } });
                 const close = editor.panel.onDidDispose(() => abort.abort());
-                let reported = 0;
+                let reported = -1, phase: 'fetching' | 'writing' | undefined;
                 try {
-                    return await this.previews.exportSource(this.pieces, output, target.fsPath, current, abort.signal, bytes => {
-                        const percent = output.file.size ? bytes / output.file.size * 100 : 0;
-                        if (percent - reported >= 1 || percent === 100) { progress.report({ increment: percent - reported }); reported = percent; }
+                    return await this.previews.exportSource(this.pieces, output, target.fsPath, current, abort.signal, value => {
+                        const percent = Math.min(100, Math.floor(value.completedBytes / value.totalBytes * 100));
+                        if (value.phase !== phase || percent > reported) {
+                            progress.report({ message: value.phase === 'fetching'
+                                ? vscode.l10n.t('Downloading missing PDF bytes: {0}% cached', percent)
+                                : vscode.l10n.t('Writing PDF: {0}%', percent) });
+                            phase = value.phase; reported = percent;
+                        }
                     });
                 } finally { cancel.dispose(); change.dispose(); close.dispose(); }
             });

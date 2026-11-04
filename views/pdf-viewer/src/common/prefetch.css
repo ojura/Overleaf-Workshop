@@ -4,6 +4,11 @@
     visibility: hidden;
 }
 
+/* Keep page/annotation stacking below the toolbar without trapping document couriers
+   below the body-mounted lab. Isolation does not change PDF.js offset parents. */
+#viewerContainer { z-index: auto; }
+:is(#viewerContainer, .pdfjs-viewer-inner) > .pdfViewer { isolation: isolate; }
+
 /* The same control is mounted in both extension toolbars and the standalone header. */
 .pdf-prefetch-toggle {
     display: inline-flex;

@@ -13,12 +13,11 @@ class Emitter<T> {
     dispose() { this.listeners.clear(); }
 }
 class Uri {
-    readonly scheme = 'file';
-    constructor(readonly path: string) {}
+    constructor(readonly path: string, readonly scheme = 'file') {}
     get fsPath() { return this.path; }
-    toString() { return 'file://' + this.path; }
+    toString() { return this.scheme + '://' + this.path; }
     static file(value: string) { return new Uri(value); }
-    static joinPath(base: Uri, ...parts: string[]) { return new Uri(path.posix.join(base.path, ...parts)); }
+    static joinPath(base: Uri, ...parts: string[]) { return new Uri(path.posix.join(base.path, ...parts), base.scheme); }
 }
 class FakeCache {
     static invalid = false;
@@ -29,6 +28,7 @@ class FakeCache {
 }
 class FakePreviews extends PdfPreviewStore {
     static current: FakePreviews;
+    static exporter: ((...args: Parameters<PdfPreviewStore['exportSource']>) => ReturnType<PdfPreviewStore['exportSource']>) | undefined;
     readonly watched: Array<{ identity: PdfPreviewIdentity, callback: () => void, stopped: boolean }> = [];
     wasDisposed = false;
     constructor(root: string) { super(root); FakePreviews.current = this; }
@@ -38,16 +38,30 @@ class FakePreviews extends PdfPreviewStore {
         return () => { record.stopped = true; };
     }
     override dispose() { this.wasDisposed = true; super.dispose(); }
+    override exportSource(...args: Parameters<PdfPreviewStore['exportSource']>) {
+        if (!FakePreviews.exporter) { throw new Error('The test did not configure an export.'); }
+        return FakePreviews.exporter(...args);
+    }
 }
 const world = {
     engine: 'pdfjs',
     commands: new Map<string, (...args: any[]) => any>(),
     settings: new Emitter<{ affectsConfiguration: (key: string) => boolean }>(),
+    cancellation: new Emitter<void>(),
+    progress: [] as Array<{ message?: string, increment?: number }>,
+    notifications: [] as string[],
+    errors: [] as string[],
 };
 const vscode = strict('preview host vscode', {
-    Uri, EventEmitter: Emitter,
+    Uri, EventEmitter: Emitter, ProgressLocation: { Notification: 15 },
+    l10n: { t: (message: string, ...values: unknown[]) => message.replace(/\{(\d+)\}/g, (_all, index) => String(values[Number(index)])) },
     window: strict('preview host window', {
         state: { focused: true }, onDidChangeWindowState: () => disposable, registerCustomEditorProvider: () => disposable,
+        showSaveDialog: async () => Uri.file('/chosen/source.pdf'),
+        showInformationMessage: async (message: string) => { world.notifications.push(message); },
+        showErrorMessage: async (message: string) => { world.errors.push(message); },
+        withProgress: async (_options: unknown, action: (progress: any, token: any) => Promise<unknown>) =>
+            action({ report: (value: any) => world.progress.push(value) }, { onCancellationRequested: world.cancellation.event }),
     }),
     commands: strict('preview host commands', {
         registerCommand: (name: string, callback: (...args: any[]) => any) => {
@@ -58,6 +72,7 @@ const vscode = strict('preview host vscode', {
         getConfiguration: () => ({ get: (key: string, fallback: unknown) => key === 'engine' ? world.engine : fallback }),
         onDidChangeConfiguration: (listener: (event: { affectsConfiguration: (key: string) => boolean }) => void) => world.settings.event(listener),
         fs: { delete: async () => {}, readFile: async () => Buffer.from('<html>viewer</html>') },
+        workspaceFolders: [],
     }),
 });
 const { PdfViewEditorProvider } = loadWithVscode(vscode, () => require('../core/pdfViewEditorProvider'), {
@@ -76,6 +91,7 @@ class Panel {
     active = true;
     visible = true;
     readonly posted: any[] = [];
+    readonly resources: Uri[] = [];
     readonly changes = new Emitter<{ webviewPanel: Panel }>();
     readonly closing = new Emitter<void>();
     readonly pages = new Emitter<void>();
@@ -83,7 +99,7 @@ class Panel {
     private html = '';
     readonly webview = {
         options: {} as any,
-        asWebviewUri: (uri: Uri) => ({ toString: () => 'https://webview.test' + uri.path }),
+        asWebviewUri: (uri: Uri) => { this.resources.push(uri); return { toString: () => 'https://webview.test' + uri.path }; },
         postMessage: async (message: any) => { this.posted.push(message); return true; },
         onDidReceiveMessage: (callback: (message: any) => void) => { this.receive = callback; return disposable; },
         get html() { return ''; },
@@ -103,7 +119,9 @@ describe('host preview binding lifecycle', () => {
     let provider: any, panel: Panel, doc: any, changes: Emitter<void>, triggers: Array<{ dispose(): void }>;
     beforeEach(async () => {
         world.engine = 'pdfjs'; world.commands.clear(); world.settings = new Emitter(); FakeCache.invalid = false;
-        provider = new PdfViewEditorProvider({ globalStorageUri: Uri.file('/preview-test-storage'), extensionUri: Uri.file('/extension'),
+        world.cancellation = new Emitter(); world.progress = []; world.notifications = []; world.errors = []; FakePreviews.exporter = undefined;
+        // Desktop profiles expose vscode-userdata storage URIs; the Node preview store serves file URIs.
+        provider = new PdfViewEditorProvider({ globalStorageUri: new Uri('/preview-test-storage', 'vscode-userdata'), extensionUri: Uri.file('/extension'),
             extension: { packageJSON: { devDependencies: { 'pdfjs-dist': '5.1.91' } } } });
         triggers = provider.triggers;
         changes = new Emitter();
@@ -113,7 +131,7 @@ describe('host preview binding lifecycle', () => {
         panel = new Panel();
         await provider.resolveCustomEditor(doc, panel);
     });
-    afterEach(() => { panel.close(); triggers.forEach(trigger => trigger.dispose()); changes.dispose(); world.settings.dispose(); });
+    afterEach(() => { panel.close(); triggers.forEach(trigger => trigger.dispose()); changes.dispose(); world.settings.dispose(); world.cancellation.dispose(); });
 
     it('binds descriptors and notifications to the exact output and current engine page', async () => {
         const previews = FakePreviews.current;
@@ -143,6 +161,18 @@ describe('host preview binding lifecycle', () => {
         assert.strictEqual(last.key, 'b'.repeat(64));
     });
 
+    it('authorizes file preview requests from virtual storage without widening the allowed roots', () => {
+        panel.send({ type: 'ready' });
+        const request = panel.resources.find(uri => uri.path.endsWith('/manifest.json'))!;
+        assert.strictEqual(request.scheme, 'file');
+        const roots = panel.webview.options.localResourceRoots as Uri[];
+        // The installed workbench returns 401 unless both the scheme and directory prefix match.
+        const allowed = roots.filter(root => root.scheme === request.scheme && request.fsPath.startsWith(root.fsPath + '/'));
+        assert.strictEqual(allowed.length, 1, 'the actual file request must match its exact preview root');
+        assert.strictEqual(allowed[0].fsPath, '/preview-test-storage/pdf-previews');
+        assert.deepStrictEqual(roots.map(root => root.fsPath), ['/extension', '/preview-test-storage/pdf-previews']);
+    });
+
     it('withdraws watches on a repeated load, whole-data fallback and disposal', () => {
         const previews = FakePreviews.current;
         panel.send({ type: 'ready' }); const first = previews.watched[0];
@@ -168,4 +198,48 @@ describe('host preview binding lifecycle', () => {
         assert.strictEqual(panel.posted.find(message => message.type === 'load').preview, undefined);
         assert.strictEqual(FakePreviews.current.watched.length, 0);
     });
+
+    it('reports missing-byte completion and file writing as distinct export phases', async () => {
+        const captured = doc.output;
+        FakePreviews.exporter = async (_cache, source, target, current, signal, progress) => {
+            assert.strictEqual(source, captured); assert.strictEqual(current(), true); assert.strictEqual(signal?.aborted, false);
+            for (const value of [{ phase: 'fetching' as const, completedBytes: 512 }, { phase: 'fetching' as const, completedBytes: 515 },
+                { phase: 'fetching' as const, completedBytes: 1024 }, { phase: 'writing' as const, completedBytes: 0 }, { phase: 'writing' as const, completedBytes: 1024 }]) {
+                progress?.({ ...value, totalBytes: 1024 });
+            }
+            return { pdfPath: target, receiptPath: target + '.preview-source.json',
+                receipt: { version: 1, document: { key: 'a'.repeat(64), size: 1024, sha256: 'b'.repeat(64) }, pdf: 'source.pdf', outputDirectory: '/preview-test-storage/pdf-previews/' + 'a'.repeat(64) } };
+        };
+        await world.commands.get('overleaf-workshop.pdfViewer.exportPreviewSource')!(doc.uri);
+        assert.deepStrictEqual(world.progress, [
+            { message: 'Downloading missing PDF bytes: 50% cached' }, { message: 'Downloading missing PDF bytes: 100% cached' },
+            { message: 'Writing PDF: 0%' }, { message: 'Writing PDF: 100%' },
+        ]);
+        assert.strictEqual(world.errors.length, 0);
+        assert.strictEqual(world.notifications.length, 1);
+    });
+
+    for (const operation of ['replacement', 'close', 'cancel']) {
+        it('aborts the captured export when the host receives ' + operation, async () => {
+            let entered!: () => void, release!: () => void;
+            const fetching = new Promise<void>(resolve => { entered = resolve; }), stopped = new Promise<void>(resolve => { release = resolve; });
+            let requestSignal: AbortSignal | undefined, capturedCurrent: (() => boolean) | undefined;
+            FakePreviews.exporter = async (_cache, _source, _target, current, signal) => {
+                requestSignal = signal; capturedCurrent = current; entered(); await stopped;
+                throw new PdfPreviewExportError(operation === 'replacement' ? 'superseded' : 'cancelled', 'Export stopped.');
+            };
+            const exporting = world.commands.get('overleaf-workshop.pdfViewer.exportPreviewSource')!(doc.uri);
+            try {
+                await fetching;
+                if (operation === 'replacement') { doc.output = { file: { build: 'b', size: 1024 } }; changes.fire(); }
+                if (operation === 'close') { panel.close(); }
+                if (operation === 'cancel') { world.cancellation.fire(); }
+                assert.strictEqual(requestSignal?.aborted, true);
+                if (operation !== 'cancel') { assert.strictEqual(capturedCurrent?.(), false); }
+                release(); await exporting;
+                assert.strictEqual(world.errors.length, 0);
+                assert.strictEqual(world.notifications.length, 1);
+            } finally { release(); await exporting; }
+        });
+    }
 });

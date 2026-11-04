@@ -138,14 +138,10 @@ export class PdfFetchBridge {
 
     private async cachedRanges(request: BridgeRequest, output: PdfOutput, ranges: Array<{ start: number, end: number }>): Promise<BridgeResponse | undefined> {
         if (!this.cache) { return undefined; }
-        const parts = [];
-        for (const range of ranges) {
-            const cached = await this.cache.readRange(output, range.start, range.end).catch(() => undefined);
-            if (!cached) { return undefined; }
-            parts.push({ ...range, ...cached });
-        }
+        const cached = await this.cache.readRanges(output, ranges).catch(() => undefined);
+        if (!cached) { return undefined; }
+        const { parts, validator } = cached;
         const headers: Array<[string, string]> = [['accept-ranges', 'bytes']];
-        const validator = parts[0].validator;
         if (validator) { headers.push([validator.name, validator.value]); }
         if (parts.length === 1) {
             const part = parts[0];
@@ -199,7 +195,9 @@ export class PdfFetchBridge {
                         headers: [['content-type', 'application/octet-stream'], ['content-length', String(body.length)]], body };
                 }
             }
-            if (ranges && output) {
+            // Let the origin evaluate If-Range, including strong validators and HTTP dates:
+            // https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.5
+            if (ranges && output && !headers.some(([name]) => name.toLowerCase() === 'if-range')) {
                 const cached = await this.cachedRanges(request, output, ranges);
                 current();
                 if (cached) { return cached; }

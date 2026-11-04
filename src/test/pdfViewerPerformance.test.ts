@@ -315,6 +315,83 @@ describe('PDF prefetch performance measurements', function () {
         controls.dispose();
     });
 
+    it('keeps the fixed lab outside viewer input handlers while allowing couriers above it', () => {
+        const listeners = new Map<string, Set<unknown>>();
+        const add = (name: string, listener: unknown) => {
+            if (!listeners.has(name)) { listeners.set(name, new Set()); }
+            listeners.get(name)!.add(listener);
+        };
+        const remove = (name: string, listener: unknown) => { listeners.get(name)?.delete(listener); };
+        const canvases: Node[] = [], observers: Array<{ disconnected: boolean }> = [];
+        const document: any = { hidden: true, addEventListener: add, removeEventListener: remove };
+        const context = new Proxy({} as Record<string, unknown>, {
+            get(target, key: string) {
+                if (key in target) { return target[key]; }
+                if (key === 'createLinearGradient' || key === 'createRadialGradient') { return () => ({ addColorStop() {} }); }
+                return () => {};
+            },
+        });
+        class Node {
+            id = ''; hidden = false; width = 0; height = 0;
+            ownerDocument = document;
+            parentNode: Node | null = null;
+            readonly children: Node[] = [];
+            readonly style: Record<string, string> = {};
+            readonly dataset: Record<string, string> = {};
+            shadow: any;
+            append(...nodes: Node[]) { for (const node of nodes) { node.remove(); node.parentNode = this; this.children.push(node); } }
+            replaceChildren(...nodes: Node[]) { for (const node of [...this.children]) { node.remove(); } this.append(...nodes); }
+            remove() { if (this.parentNode) { this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1); this.parentNode = null; } }
+            setAttribute() {}
+            addEventListener() {}
+            getContext() { return context; }
+            attachShadow() {
+                const nodes = new Map<string, Node>();
+                return this.shadow = { innerHTML: '', querySelectorAll: () => [], querySelector(selector: string) {
+                    if (!nodes.has(selector)) { nodes.set(selector, new Node()); }
+                    return nodes.get(selector)!;
+                } };
+            }
+        }
+        class Observer {
+            disconnected = false;
+            constructor() { observers.push(this); }
+            observe() {}
+            disconnect() { this.disconnected = true; }
+        }
+        document.body = new Node();
+        document.createElement = (tag: string) => { const node = new Node(); if (tag === 'canvas') { canvases.push(node); } return node; };
+        document.defaultView = {
+            devicePixelRatio: 1, performance: { now: () => 0 },
+            crypto: { getRandomValues: (values: Uint32Array) => { values[0] = 13; return values; } },
+            matchMedia: () => ({ matches: false, addEventListener: add, removeEventListener: remove }),
+            setInterval() { assert.fail('a hidden lab does not poll'); }, clearInterval() {},
+            requestAnimationFrame() { assert.fail('a hidden lab does not animate'); }, cancelAnimationFrame() {},
+        };
+        for (const name of ['ResizeObserver', 'IntersectionObserver']) { document.defaultView[name] = Observer; }
+        const container = new Node(), transit = new Node(); transit.id = 'document-transit';
+        document.body.append(container); container.append(transit);
+        const diagnostics = performanceModule.installPrefetchDiagnostics(container, () => { assert.fail('a hidden document does not sample'); });
+        try {
+            diagnostics.setEnabled(true);
+            const host = [...container.children, ...document.body.children].find(node => node.id === 'pdf-prefetch-diagnostics')!;
+            assert.ok(host);
+            assert.strictEqual(host.parentNode, document.body, 'lab controls stay outside PDF scroll, wheel and capture handlers');
+            assert.ok(host.shadow.innerHTML.includes('position:fixed'), 'the lab keeps its viewport position when its sibling scrolls');
+            const layer = host.shadow.innerHTML.match(/:host\s*\{[^}]*z-index:(\d+)/)!;
+            assert.ok(Number(layer[1]) < 2147483647, 'the real courier may paint above the lab during departure and return');
+            diagnostics.setEnabled(false);
+            assert.strictEqual(host.hidden, true);
+            diagnostics.setEnabled(true);
+            assert.strictEqual(document.body.children.filter((node: Node) => node.id === host.id).length, 1);
+        } finally { diagnostics.dispose(); }
+        assert.deepStrictEqual(container.children, [transit]);
+        assert.deepStrictEqual(document.body.children, [container]);
+        assert.ok(canvases.every(canvas => canvas.width === 0 && canvas.height === 0));
+        assert.ok(observers.every(observer => observer.disconnected));
+        assert.ok([...listeners.values()].every(group => group.size === 0));
+    });
+
     it('supports an explicit diagnostics opt-out and removes its handlers on disposal', () => {
         const listeners = new Map<string, (event: unknown) => void>();
         let timers = 0;

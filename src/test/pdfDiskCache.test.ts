@@ -6,7 +6,7 @@ import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
 import type { AddressInfo } from 'net';
-import { PdfDiskCache, PDF_DISK_POLICY, PdfFillRequest } from '../core/pdfDiskCache';
+import { PdfCacheCompletionError, PdfDiskCache, PDF_DISK_POLICY, PdfFillRequest } from '../core/pdfDiskCache';
 import { PdfFetchBridge, outputsOf } from '../core/pdfFetchBridge';
 import type { BridgeResponse, PdfOutput } from '../core/viewerProtocol';
 
@@ -31,6 +31,22 @@ function response(bytes: Uint8Array, start: number, end: number, etag = '"editio
     return { id: 0, status: 206, statusText: 'Partial Content',
         headers: [['content-range', 'bytes ' + start + '-' + (end - 1) + '/' + bytes.length], ['etag', etag]],
         body: bytes.slice(start, end) };
+}
+
+function multipartParts(reply: BridgeResponse): Array<{ range: string, body: Uint8Array }> {
+    const type = reply.headers.find(([name]) => name.toLowerCase() === 'content-type')?.[1];
+    const boundary = /^multipart\/byteranges; boundary=(.+)$/.exec(type ?? '')?.[1];
+    assert.ok(boundary);
+    const parts = Buffer.from(reply.body).toString('latin1').split('--' + boundary);
+    assert.strictEqual(parts.shift(), '');
+    assert.strictEqual(parts.pop(), '--\r\n');
+    return parts.map(part => {
+        const headerEnd = part.indexOf('\r\n\r\n');
+        assert.ok(headerEnd >= 0 && part.endsWith('\r\n'));
+        const range = /\r\nContent-Range: ([^\r\n]+)/.exec(part.slice(0, headerEnd))?.[1];
+        assert.ok(range);
+        return { range, body: new Uint8Array(Buffer.from(part.slice(headerEnd + 4, -2), 'latin1')) };
+    });
 }
 
 class Timers {
@@ -130,6 +146,217 @@ describe('the shared persistent PDF disk budget', () => {
         assert.deepStrictEqual(new Uint8Array(fs.readFileSync(target)), bytes);
         assert.strictEqual(progress.at(-1), bytes.length);
         assert.ok(progress.every((value, i) => value - (progress[i - 1] ?? 0) <= PDF_DISK_POLICY.chunkBytes));
+    });
+
+    it('completes only missing intervals with four bounded export workers and reuses a complete result', async () => {
+        const chunk = PDF_DISK_POLICY.exportRangeBytes, bytes = content(6 * chunk + 73);
+        const piece = bytes.subarray(chunk, 2 * chunk);
+        const book = output(bytes.length, 'export', [{ start: chunk, end: 2 * chunk, hash: hash(piece) }]);
+        const entered = deferred<void>(), releases: Array<ReturnType<typeof deferred<void>>> = [];
+        const requests: PdfFillRequest[] = [], progress: number[] = [];
+        let blocking = true, active = 0, peak = 0;
+        const cache = make(16 * chunk, { fetchRange: async request => {
+            requests.push(request); active++; peak = Math.max(peak, active);
+            try {
+                if (blocking) {
+                    const release = deferred<void>(); releases.push(release);
+                    if (releases.length === PDF_DISK_POLICY.exportConcurrency) { entered.resolve(); }
+                    await release.promise;
+                }
+                return response(bytes, request.start, request.end);
+            } finally { active--; }
+        } });
+        await cache.put(hash(piece), piece);
+        await cache.storeRange(book, 0, 100, response(bytes, 0, 100));
+        await cache.storeRange(book, bytes.length - 128, bytes.length, response(bytes, bytes.length - 128, bytes.length));
+        const initial = (await cache.snapshot(book)).covered;
+        const completing = cache.completeForExport(book, { onProgress: covered => progress.push(covered) });
+        try {
+            await entered.promise;
+            assert.strictEqual(peak, 4);
+            assert.strictEqual(fs.existsSync(path.join(dir, '.writer')), false, 'network waits do not hold the writer lease');
+            assert.deepStrictEqual((await cache.readRange(book, 0, 100))?.body, bytes.slice(0, 100), 'foreground cached reads remain available');
+            const extra = content(20, 91); assert.strictEqual(await cache.put(hash(extra), extra), true, 'foreground admission remains available');
+            await assert.rejects(cache.completeForExport(book), error => error instanceof PdfCacheCompletionError && error.reason === 'busy');
+            blocking = false; releases.forEach(release => release.resolve());
+            await completing;
+            const ordered = [...requests].sort((a, b) => a.start - b.start);
+            assert.ok(ordered.every((request, index) => request.output === book && request.end - request.start <= chunk
+                && request.start >= 100 && request.end <= bytes.length - 128
+                && (request.end <= chunk || request.start >= 2 * chunk)
+                && (!index || request.start >= ordered[index - 1].end)));
+            assert.strictEqual(ordered.reduce((sum, request) => sum + request.end - request.start, 0), bytes.length - initial);
+            assert.strictEqual((await cache.snapshot(book)).complete, true);
+            assert.strictEqual(peak, 4, 'the four-worker limit holds through the complete operation');
+            assert.strictEqual(progress[0], initial); assert.strictEqual(progress.at(-1), bytes.length);
+            assert.ok(progress.every((value, index) => !index || value >= progress[index - 1]));
+            const count = requests.length;
+            await cache.completeForExport(book);
+            assert.strictEqual(requests.length, count, 'a complete cache hit does not fetch again');
+            const target = path.join(dir, 'export.pdf');
+            assert.strictEqual(await cache.copyComplete(book, target), true);
+            assert.deepStrictEqual(new Uint8Array(fs.readFileSync(target)), bytes);
+        } finally { blocking = false; releases.forEach(release => release.resolve()); await completing.catch(() => {}); }
+    });
+
+    it('pins the first range validator before parallel export and drains every changed-validator reply', async () => {
+        const chunk = PDF_DISK_POLICY.exportRangeBytes, bytes = content(6 * chunk);
+        const book = output(bytes.length), first = deferred<void>(), parallel = deferred<void>(), cancelled = deferred<void>();
+        const requests: Array<{ request: PdfFillRequest, reply: ReturnType<typeof deferred<BridgeResponse>> }> = [];
+        const cache = make(16 * chunk, { fetchRange: request => {
+            const reply = deferred<BridgeResponse>(); requests.push({ request, reply });
+            request.signal.addEventListener('abort', () => cancelled.resolve(), { once: true });
+            if (requests.length === 1) { first.resolve(); }
+            if (requests.length === 5) { parallel.resolve(); }
+            return reply.promise;
+        } });
+        const abort = new AbortController();
+        const completing = cache.completeForExport(book, { signal: abort.signal });
+        let settled = false; void completing.then(() => { settled = true; }, () => { settled = true; });
+        try {
+            await first.promise;
+            await cache.snapshot(book);
+            assert.strictEqual(requests.length, 1, 'the first validator must be known before concurrency starts');
+            requests[0].reply.resolve(response(bytes, requests[0].request.start, requests[0].request.end));
+            await parallel.promise;
+            assert.ok(requests.slice(1).every(({ request }) => request.validator?.name === 'etag' && request.validator.value === '"edition-a"'));
+            const changed = requests[1]; changed.reply.resolve(response(bytes, changed.request.start, changed.request.end, '"changed"'));
+            await cancelled.promise;
+            assert.ok(requests.every(({ request }) => request.signal.aborted));
+            assert.strictEqual(settled, false, 'completion waits for the other aborted transports to settle');
+            requests.slice(2).forEach(({ request, reply }) => reply.resolve(response(bytes, request.start, request.end)));
+            await assert.rejects(completing, error => error instanceof PdfCacheCompletionError && error.reason === 'validator');
+            assert.strictEqual((await cache.snapshot(book)).covered, chunk, 'late replies cannot replace the pinned representation');
+        } finally {
+            abort.abort();
+            requests.forEach(({ request, reply }) => reply.resolve(response(bytes, request.start, request.end)));
+            await completing.catch(() => {});
+        }
+    });
+
+    it('rejects invalid explicit-export ranges without another request or cache admission', async () => {
+        const bytes = content(2000), book = output(bytes.length);
+        for (const defect of ['status', 'range', 'encoding', 'length', 'validator']) {
+            let requests = 0;
+            const cache = make(1024 * 1024, { fetchRange: async request => {
+                requests++;
+                const reply = response(bytes, request.start, request.end);
+                if (defect === 'status') { reply.status = 200; }
+                if (defect === 'range') { reply.headers[0][1] = 'bytes 1-2000/2000'; }
+                if (defect === 'encoding') { reply.headers.push(['content-encoding', 'gzip']); }
+                if (defect === 'length') { reply.body = reply.body.subarray(1); }
+                if (defect === 'validator') { reply.headers = reply.headers.filter(([name]) => name !== 'etag'); }
+                return reply;
+            } });
+            await assert.rejects(cache.completeForExport(book), error => error instanceof PdfCacheCompletionError && error.reason === 'response', defect);
+            assert.strictEqual(requests, 1, defect);
+            assert.strictEqual((await cache.snapshot(book)).covered, 0, defect);
+            await cache.dispose();
+        }
+    });
+
+    it('fails an export budget check before downloading and stops after failed admission', async () => {
+        const bytes = content(2000), book = output(bytes.length);
+        let requests = 0;
+        const fetchRange = async (request: PdfFillRequest) => { requests++; return response(bytes, request.start, request.end); };
+        const small = make(1000, { fetchRange });
+        await assert.rejects(small.completeForExport(book), error => error instanceof PdfCacheCompletionError && error.reason === 'budget');
+        assert.strictEqual(requests, 0);
+        await small.dispose();
+        const cache = make(1024 * 1024, { fetchRange });
+        cache.storeRange = async () => false;
+        await assert.rejects(cache.completeForExport(book), error => error instanceof PdfCacheCompletionError && error.reason === 'admission');
+        assert.strictEqual(requests, 1);
+    });
+
+    for (const operation of ['abort', 'replacement', 'dispose']) {
+        it('drains explicit-export workers on ' + operation + ' without publishing late replies', async () => {
+            const chunk = PDF_DISK_POLICY.exportRangeBytes, bytes = content(5 * chunk), book = output(bytes.length);
+            const entered = deferred<void>(), requests: Array<{ request: PdfFillRequest, reply: ReturnType<typeof deferred<BridgeResponse>> }> = [];
+            const cache = make(16 * chunk, { fetchRange: request => {
+                const reply = deferred<BridgeResponse>(); requests.push({ request, reply });
+                if (requests.length === 4) { entered.resolve(); }
+                return reply.promise;
+            } });
+            await cache.storeRange(book, 0, 100, response(bytes, 0, 100));
+            const abort = new AbortController(); let current = true, settled = false;
+            const completing = cache.completeForExport(book, { signal: abort.signal, current: () => current });
+            void completing.then(() => { settled = true; }, () => { settled = true; });
+            let disposal: Promise<void> | undefined;
+            try {
+                await entered.promise;
+                if (operation === 'abort') { abort.abort(); }
+                if (operation === 'dispose') { disposal = cache.dispose(); }
+                if (operation === 'replacement') {
+                    current = false;
+                    const stopped = deferred<void>(); requests[0].request.signal.addEventListener('abort', () => stopped.resolve(), { once: true });
+                    requests[0].reply.resolve(response(bytes, requests[0].request.start, requests[0].request.end));
+                    await stopped.promise;
+                }
+                assert.ok(requests.every(({ request }) => request.signal.aborted));
+                assert.strictEqual(settled, false, 'retiring transfers hold the operation until their real replies settle');
+                requests.forEach(({ request, reply }) => reply.resolve(response(bytes, request.start, request.end)));
+                await assert.rejects(completing, error => error instanceof PdfCacheCompletionError && error.reason === 'cancelled');
+                await disposal;
+                assert.strictEqual((await cache.snapshot(book)).covered, 100);
+            } finally {
+                abort.abort(); requests.forEach(({ request, reply }) => reply.resolve(response(bytes, request.start, request.end)));
+                await completing.catch(() => {}); await disposal;
+            }
+        });
+    }
+
+    it('drains the local background transfer before explicit export takes its network slots', async () => {
+        const bytes = content(PDF_DISK_POLICY.exportRangeBytes * 2), book = output(bytes.length), timers = new Timers();
+        const entered = deferred<void>(), release = deferred<void>(), requests: PdfFillRequest[] = [];
+        const cache = make(8 * PDF_DISK_POLICY.exportRangeBytes, { setTimer: timers.set, clearTimer: timers.clear,
+            fetchRange: async request => {
+                requests.push(request);
+                if (requests.length === 1) { entered.resolve(); await release.promise; }
+                return response(bytes, request.start, request.end);
+            } });
+        const viewer = cache.createViewer(); viewer.setOutput(book); viewer.setActivity(true, true); timers.fire();
+        await entered.promise;
+        const completing = cache.completeForExport(book);
+        try {
+            assert.strictEqual(requests[0].signal.aborted, true);
+            await cache.snapshot(book);
+            assert.strictEqual(requests.length, 1, 'an aborted background response still owns its transfer until settlement');
+            release.resolve(); await completing;
+            assert.strictEqual((await cache.snapshot(book)).complete, true);
+            assert.strictEqual((await cache.snapshot()).foreground, 0);
+        } finally { release.resolve(); await completing.catch(() => {}); viewer.dispose(); }
+    });
+
+    it('keeps reads available while export admission waits for a foreign writer and cancels that wait', async () => {
+        const bytes = content(2000), book = output(bytes.length), cache = make(1024 * 1024, { fetchRange: async request => response(bytes, request.start, request.end) });
+        await cache.storeRange(book, 0, 100, response(bytes, 0, 100));
+        const entered = deferred<void>(), original = cache.storeRange.bind(cache);
+        cache.storeRange = (...args) => { entered.resolve(); return original(...args); };
+        fs.writeFileSync(path.join(dir, '.writer'), liveToken());
+        const abort = new AbortController(), completing = cache.completeForExport(book, { signal: abort.signal });
+        try {
+            await entered.promise;
+            assert.deepStrictEqual((await cache.readRange(book, 0, 100))?.body, bytes.slice(0, 100));
+            abort.abort();
+            await assert.rejects(completing, error => error instanceof PdfCacheCompletionError && error.reason === 'cancelled');
+            assert.strictEqual((await cache.snapshot(book)).covered, 100);
+        } finally { abort.abort(); fs.unlinkSync(path.join(dir, '.writer')); await completing.catch(() => {}); }
+    });
+
+    it('stops if an admitted export interval disappears instead of repeatedly downloading it', async () => {
+        const bytes = content(2000), book = output(bytes.length); let requests = 0;
+        const cache = make(1024 * 1024, { fetchRange: async request => { requests++; return response(bytes, request.start, request.end); } });
+        const original = cache.storeRange.bind(cache);
+        cache.storeRange = async (...args) => {
+            const stored = await original(...args);
+            const changed = deferred<void>(), stop = cache.onChange(() => changed.resolve());
+            try { fs.unlinkSync(path.join(dir, hash(bytes))); await changed.promise; }
+            finally { stop(); }
+            return stored;
+        };
+        await assert.rejects(cache.completeForExport(book), error => error instanceof PdfCacheCompletionError && error.reason === 'evicted');
+        assert.strictEqual(requests, 1);
     });
 
     it('does not admit ignored, shifted, compressed, truncated, or unvalidated range responses', async () => {
@@ -565,12 +792,11 @@ describe('the shared persistent PDF disk budget', () => {
             const single = await bridge.handle({ id: 1, url: book.url, headers: [['Range', 'bytes=10-20']] });
             assert.strictEqual(single.status, 206);
             assert.deepStrictEqual(single.body, bytes.slice(10, 21));
-            const multi = await bridge.handle({ id: 2, url: book.url, headers: [['Range', 'bytes=0-8,990-999']] });
+            const multi = await bridge.handle({ id: 2, url: book.url, headers: [['Range', 'bytes=990-999,0-8,4-11,0-8']] });
             assert.strictEqual(multi.status, 206);
-            const type = multi.headers.find(([name]) => name === 'content-type')?.[1];
-            assert.match(type ?? '', /^multipart\/byteranges; boundary=/);
-            assert.ok(Buffer.from(multi.body).includes(Buffer.from('Content-Range: bytes 990-999/1000')));
-            assert.ok(Buffer.from(multi.body).includes(Buffer.from(bytes.slice(990))));
+            assert.deepStrictEqual(multipartParts(multi), [[990, 1000], [0, 9], [4, 12], [0, 9]].map(([start, end]) => ({
+                range: 'bytes ' + start + '-' + (end - 1) + '/1000', body: bytes.slice(start, end),
+            })), 'multipart order, overlaps and duplicate ranges retain their requested bytes');
             const pieceUrl = book.downloadDomain + '/project/project-a/user/user-a/content/another-build/' + hash(piece);
             const object = await bridge.handle({ id: 3, url: pieceUrl });
             assert.strictEqual(object.status, 200);
@@ -578,6 +804,98 @@ describe('the shared persistent PDF disk budget', () => {
             bridge.setOutput(output(bytes.length, 'new'));
             await assert.rejects(bridge.handle({ id: 4, url: output(bytes.length, 'new').url, headers: [['Range', 'bytes=0-8']] }), /fetch|connect/i);
         } finally { bridge.dispose(); }
+    });
+
+    for (const evictCaptured of [false, true]) {
+        it(evictCaptured
+            ? 'rejects the whole multipart cache hit if its captured representation is evicted after the first read'
+            : 'keeps one multipart representation when another host changes the validator after its first part is read', async () => {
+            const first = content(1000), second = content(1000, 19), book = output(first.length);
+            const writer = make(), cache = make();
+            assert.strictEqual(await writer.storeRange(book, 0, first.length, response(first, 0, first.length)), true);
+            await cache.snapshot(book);
+            const original = (cache as any).readPlan.bind(cache);
+            let transition = false, plansRead = 0;
+            (cache as any).readPlan = async function* (...args: any[]) {
+                plansRead++;
+                for await (const bytes of original(...args)) {
+                    yield bytes;
+                    if (!transition) {
+                        transition = true;
+                        const observed = deferred<void>(), stop = cache.onChange(() => observed.resolve());
+                        try {
+                            assert.strictEqual(await writer.storeRange(book, 0, second.length,
+                                response(second, 0, second.length, '"edition-b"')), true);
+                            await observed.promise;
+                            if (evictCaptured) { fs.unlinkSync(path.join(dir, hash(first))); }
+                        } finally { stop(); }
+                    }
+                }
+            };
+            const bridge = new PdfFetchBridge(outputsOf(book.downloadDomain, book.projectId), cache, { output: book });
+            try {
+                const pending = bridge.handle({ id: 1, url: book.url, headers: [['Range', 'bytes=0-8,990-999']] });
+                let result: BridgeResponse | undefined;
+                if (evictCaptured) {
+                    // The fixture's origin is unavailable. A whole cache miss must reach it,
+                    // instead of publishing the already-read prefix with a different suffix.
+                    await assert.rejects(pending, /fetch|connect/i);
+                } else { result = await pending; }
+                assert.strictEqual(transition, true, 'the foreign write must occur while this response is being read');
+                assert.strictEqual(plansRead, 2, 'both response parts must pass through the controlled read seam');
+                assert.strictEqual((await writer.readRange(book, 990, 1000))?.validator?.value, '"edition-b"');
+                if (!result) {
+                    assert.strictEqual(fs.existsSync(path.join(dir, hash(first))), false, 'the captured blob was actually evicted');
+                    return;
+                }
+                assert.strictEqual(result.headers.find(([name]) => name === 'etag')?.[1], '"edition-a"');
+                assert.deepStrictEqual(multipartParts(result), [
+                    { range: 'bytes 0-8/1000', body: first.slice(0, 9) },
+                    { range: 'bytes 990-999/1000', body: first.slice(990) },
+                ], 'immutable captured bytes cannot be relabelled or mixed with the new representation');
+            } finally { bridge.dispose(); (cache as any).readPlan = original; }
+        });
+    }
+
+    it('sends cached conditional ranges to the origin and cancels its full response when If-Range does not match', async () => {
+        const first = content(1000), second = content(1000, 19);
+        const requests: Array<{ range?: string, ifRange?: string | string[] }> = [];
+        const cancelled = deferred<void>();
+        const server = http.createServer((request, reply) => {
+            requests.push({ range: request.headers.range, ifRange: request.headers['if-range'] });
+            reply.setHeader('ETag', '"edition-b"');
+            if (request.headers['if-range'] === '"edition-b"') {
+                reply.setHeader('Content-Range', 'bytes 0-99/' + second.length);
+                reply.writeHead(206); reply.end(second.subarray(0, 100));
+            } else {
+                // A false condition ignores Range. Do not send a body: the bridge must cancel
+                // after the status rather than wait for or allocate the complete document.
+                reply.setHeader('Content-Length', String(second.length));
+                reply.on('close', () => cancelled.resolve());
+                reply.writeHead(200); reply.flushHeaders();
+            }
+        });
+        await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+        const domain = 'http://127.0.0.1:' + (server.address() as AddressInfo).port;
+        const book = output(first.length); book.downloadDomain = domain; book.url = domain + book.file.url;
+        const cache = make();
+        const bridge = new PdfFetchBridge(outputsOf(domain, book.projectId), cache, { output: book });
+        try {
+            assert.strictEqual(await cache.storeRange(book, 0, first.length, response(first, 0, first.length)), true);
+            const result = await bridge.handle({ id: 1, url: book.url, headers: [['Range', 'bytes=0-99'], ['If-Range', '"edition-b"']] });
+            assert.deepStrictEqual(requests, [{ range: 'bytes=0-99', ifRange: '"edition-b"' }], 'a cached 206 cannot decide the origin condition');
+            assert.strictEqual(result.status, 206);
+            assert.deepStrictEqual(result.body, second.slice(0, 100));
+            assert.strictEqual(result.headers.find(([name]) => name === 'etag')?.[1], '"edition-b"');
+            await assert.rejects(bridge.handle({ id: 2, url: book.url,
+                headers: [['Range', 'bytes=0-99'], ['If-Range', '"edition-a"']] }), /ignored the requested byte ranges/);
+            await cancelled.promise;
+            assert.strictEqual(requests.length, 2);
+            assert.strictEqual(requests[1].ifRange, '"edition-a"');
+        } finally {
+            bridge.dispose(); server.closeAllConnections();
+            await new Promise<void>(resolve => server.close(() => resolve()));
+        }
     });
 
     it('refreshes another window and permits filling while both hosts remain open', async () => {

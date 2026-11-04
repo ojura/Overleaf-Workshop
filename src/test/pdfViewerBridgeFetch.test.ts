@@ -29,6 +29,7 @@ describe('the viewer\'s requests through the extension host (bridge-fetch.ts)', 
         dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-viewer-bridge-fetch-'));
         const entry = path.join(dir, 'entry.ts');
         fs.writeFileSync(entry, `export { installBridgeFetch } from ${JSON.stringify(path.join(viewerRoot, 'src', 'common', 'bridge-fetch.ts'))};
+export { createBridgeResponse, readPdfResponse } from ${JSON.stringify(path.join(viewerRoot, 'src', 'common', 'bridge-response.ts'))};
 export { pdfPerformance } from ${JSON.stringify(path.join(viewerRoot, 'src', 'common', 'prefetch-performance.ts'))};`);
         await esbuild.build({ ...bundleOptions, entryPoints: [entry], outfile: path.join(dir, 'bridge-fetch.mjs') });
         // esbuild's service process is not needed any more; another build starts it again
@@ -64,6 +65,133 @@ export { pdfPerformance } from ${JSON.stringify(path.join(viewerRoot, 'src', 'co
         deliver({ type: 'fetchResponse', page: 'page-2', id: 1, status: 206, statusText: 'Partial Content', headers: [], body: new Uint8Array([2, 2]) });
         const response = await answered;
         assert.deepStrictEqual(new Uint8Array(await response.arrayBuffer()), new Uint8Array([2, 2]));
+        assert.strictEqual(bridge.pdfPerformance.pendingFetchCount, 0);
+    });
+
+    it('exposes already-delivered host bytes as a native stream without copying the binary payload', async () => {
+        const bytes = new Uint8Array(1024 * 1024);
+        bytes[0] = 17; bytes[bytes.length - 1] = 93;
+        const length = bytes.length;
+        const original = bytes.buffer;
+        const answered = (globalThis as any).fetch('https://dl.test/project/p1/output.pdf', {
+            headers: { range: 'bytes=0-' + (bytes.length - 1) },
+        });
+        deliver({ type: 'fetchResponse', page: 'page-2', id: 1, status: 206, statusText: 'Partial Content',
+            headers: [['content-range', 'bytes 0-' + (bytes.length - 1) + '/2000000'], ['content-length', String(bytes.length)]], body: bytes });
+        const response = await answered;
+        assert.ok(response instanceof (globalThis as any).Response);
+        assert.strictEqual(response.status, 206);
+        assert.strictEqual(response.headers.get('content-range'), 'bytes 0-' + (length - 1) + '/2000000');
+        assert.strictEqual(original.byteLength, 0, 'native byte-stream enqueue transfers ownership instead of copying the payload');
+        assert.strictEqual(response.bodyUsed, false);
+        const reader = response.body.getReader();
+        try {
+            const first = await reader.read();
+            assert.strictEqual(first.value.byteOffset, 0);
+            assert.strictEqual(first.value.byteLength, length);
+            assert.strictEqual(first.value[0], 17);
+            assert.strictEqual(first.value[length - 1], 93);
+            assert.strictEqual((await reader.read()).done, true);
+            assert.strictEqual(response.bodyUsed, true);
+        } finally { reader.releaseLock(); }
+        assert.strictEqual(bridge.pdfPerformance.snapshot().fetchBytes, length);
+        assert.strictEqual(bridge.pdfPerformance.pendingFetchCount, 0);
+    });
+
+    it('consumes an owned response through EOF without native arrayBuffer materialization', async () => {
+        const bytes = new Uint8Array(1024 * 1024).fill(23);
+        const response = bridge.createBridgeResponse(bytes, { status: 206, statusText: 'Partial Content' });
+        let materializations = 0;
+        const original = response.arrayBuffer;
+        response.arrayBuffer = () => { materializations++; return original.call(response); };
+        const result = await bridge.readPdfResponse(response);
+        assert.strictEqual(result.byteLength, 1024 * 1024);
+        assert.strictEqual(new Uint8Array(result)[0], 23);
+        assert.strictEqual(materializations, 0);
+        assert.strictEqual(response.bodyUsed, true);
+        assert.strictEqual(response.body.locked, false, 'the real stream reader is released after EOF');
+        await assert.rejects(bridge.readPdfResponse(response), TypeError);
+        assert.throws(() => response.clone(), TypeError);
+    });
+
+    it('returns only a sliced host view and never the neighbouring bytes of its backing buffer', async () => {
+        const bytes = new Uint8Array([91, 92, 4, 5, 6, 93, 94]);
+        const response = bridge.createBridgeResponse(bytes.subarray(2, 5), { status: 206 });
+        const result = await bridge.readPdfResponse(response);
+        assert.deepStrictEqual(new Uint8Array(result), new Uint8Array([4, 5, 6]));
+        assert.strictEqual(result.byteLength, 3);
+        assert.strictEqual(response.bodyUsed, true);
+        assert.strictEqual(response.body.locked, false);
+    });
+
+    it('preserves native clone stream identity and independent raw reader bytes', async () => {
+        const response = bridge.createBridgeResponse(new Uint8Array([7, 8, 9]), { status: 206 });
+        const originalStream = response.body;
+        const clone = response.clone();
+        assert.notStrictEqual(response.body, originalStream, 'cloning replaces the marked stream with an unmarked tee branch');
+        const first = response.body.getReader(), second = clone.body.getReader();
+        try {
+            const one = await first.read();
+            one.value[0] = 99;
+            const two = await second.read();
+            assert.deepStrictEqual(two.value, new Uint8Array([7, 8, 9]), 'byte-stream tee isolates raw branch mutations');
+            assert.strictEqual((await first.read()).done, true);
+            assert.strictEqual((await second.read()).done, true);
+        } finally { first.releaseLock(); second.releaseLock(); }
+    });
+
+    it('uses ordinary body consumption for both cloned branches', async () => {
+        const response = bridge.createBridgeResponse(new Uint8Array([7, 8, 9]), { status: 206 });
+        const clone = response.clone();
+        let materializations = 0;
+        for (const branch of [response, clone]) {
+            const original = branch.arrayBuffer;
+            branch.arrayBuffer = () => { materializations++; return original.call(branch); };
+        }
+        const first = await bridge.readPdfResponse(response);
+        new Uint8Array(first)[0] = 99;
+        assert.deepStrictEqual(new Uint8Array(await bridge.readPdfResponse(clone)), new Uint8Array([7, 8, 9]));
+        assert.strictEqual(materializations, 2);
+    });
+
+    it('preserves native locked, used and cancelled body errors', async () => {
+        const response = bridge.createBridgeResponse(new Uint8Array([3, 4]), { status: 206 });
+        const reader = response.body.getReader();
+        await assert.rejects(bridge.readPdfResponse(response), TypeError);
+        reader.releaseLock();
+        assert.deepStrictEqual(new Uint8Array(await bridge.readPdfResponse(response)), new Uint8Array([3, 4]));
+        const used = bridge.createBridgeResponse(new Uint8Array([65]), { status: 200 });
+        assert.strictEqual(await used.text(), 'A');
+        await assert.rejects(bridge.readPdfResponse(used), TypeError);
+        const cancelled = bridge.createBridgeResponse(new Uint8Array([66]), { status: 200 });
+        await cancelled.body.cancel();
+        await assert.rejects(bridge.readPdfResponse(cancelled), TypeError);
+    });
+
+    it('keeps native empty, null, unmarked and errored-stream responses on their ordinary paths', async () => {
+        const empty = bridge.createBridgeResponse(new Uint8Array(), { status: 200 });
+        assert.strictEqual((await bridge.readPdfResponse(empty)).byteLength, 0);
+        assert.strictEqual(empty.bodyUsed, true);
+        assert.strictEqual(empty.body.locked, false);
+        const absent = bridge.createBridgeResponse(null, { status: 204 });
+        assert.strictEqual(absent.body, null);
+        assert.strictEqual((await bridge.readPdfResponse(absent)).byteLength, 0);
+        const native = new (globalThis as any).Response(new Uint8Array([5, 6]));
+        assert.deepStrictEqual(new Uint8Array(await bridge.readPdfResponse(native)), new Uint8Array([5, 6]));
+        const failure = new Error('body failed');
+        const stream = new (globalThis as any).ReadableStream({ start(controller: any) { controller.error(failure); } });
+        await assert.rejects(bridge.readPdfResponse(new (globalThis as any).Response(stream)), error => error === failure);
+    });
+
+    it('rejects detached or shared host buffers without stranding fetch pressure', async () => {
+        const bytes = new Uint8Array([1]);
+        bridge.createBridgeResponse(bytes, { status: 200 });
+        assert.throws(() => bridge.createBridgeResponse(bytes, { status: 200 }), TypeError);
+        const answered = (globalThis as any).fetch('https://dl.test/project/p1/output.pdf');
+        const rejected = assert.rejects(answered, TypeError);
+        deliver({ type: 'fetchResponse', page: 'page-2', id: 1, status: 200, headers: [],
+            body: new Uint8Array(new SharedArrayBuffer(4)) });
+        await rejected;
         assert.strictEqual(bridge.pdfPerformance.pendingFetchCount, 0);
     });
 

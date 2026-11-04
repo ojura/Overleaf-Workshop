@@ -32,6 +32,13 @@ const MOBILE_PREFETCH_LIMITS = Object.freeze({
     maxPreviewPages: 128,
 });
 
+export interface PdfSidecarDecodePolicy {
+    /** Concurrent browser decodes of sidecar images; separate from PDF worker image jobs. */
+    readonly concurrency: number;
+    /** Maximum encoded input edge as a multiple of limits.previewMaxDimension in raster pixels. */
+    readonly maxInputEdgeScale: number;
+}
+
 export interface PdfCachePolicy {
     readonly name: 'desktop' | 'mobile';
     readonly limits: Readonly<{ [Key in keyof typeof PREFETCH_LIMITS]: number }>;
@@ -41,6 +48,8 @@ export interface PdfCachePolicy {
     readonly releaseRenderedResources: boolean;
     readonly adaptiveImageDecoding: boolean;
     readonly imageDecodeConcurrency: number;
+    /** Optional so existing custom policies retain their previous sidecar defaults. */
+    readonly sidecarDecode?: PdfSidecarDecodePolicy;
 }
 
 export interface ReaderDevice {
@@ -49,13 +58,23 @@ export interface ReaderDevice {
     userAgentData?: { mobile?: boolean };
 }
 
+const SIDECAR_DECODE_POLICIES = Object.freeze({
+    desktop: Object.freeze({ concurrency: 2, maxInputEdgeScale: 2 }),
+    mobile: Object.freeze({ concurrency: 1, maxInputEdgeScale: 1 }),
+});
+const RGBA_BYTES_PER_PIXEL = 4;
+/** Input pixel area relative to the squared retained preview edge; independent of the device's edge cap. */
+const SIDECAR_INPUT_AREA_SCALE = 4;
+
 const DESKTOP_POLICY: PdfCachePolicy = Object.freeze({
     name: 'desktop', limits: PREFETCH_LIMITS, rangeCacheBytes: 128 * 1024 * 1024, pruneOffscreen: false,
     releaseRenderedResources: true, adaptiveImageDecoding: true, imageDecodeConcurrency: 2,
+    sidecarDecode: SIDECAR_DECODE_POLICIES.desktop,
 });
 const MOBILE_POLICY: PdfCachePolicy = Object.freeze({
     name: 'mobile', limits: MOBILE_PREFETCH_LIMITS, rangeCacheBytes: 32 * 1024 * 1024, pruneOffscreen: true,
     releaseRenderedResources: true, adaptiveImageDecoding: true, imageDecodeConcurrency: 1,
+    sidecarDecode: SIDECAR_DECODE_POLICIES.mobile,
 });
 
 /** iPad's desktop UA still reports several touch points; a Windows touch laptop stays desktop. */
@@ -69,6 +88,20 @@ export function pdfCachePolicy(device: ReaderDevice = typeof navigator === 'unde
 export function pdfDocumentCacheOptions(device?: ReaderDevice) {
     const { rangeCacheBytes, adaptiveImageDecoding, imageDecodeConcurrency } = pdfCachePolicy(device);
     return { rangeCacheBytes, adaptiveImageDecoding, imageDecodeConcurrency };
+}
+
+/** Keep sidecar input decoding within its edge limit and the retained RGBA raster byte budget. */
+export function pdfSidecarDecodeOptions(policy: PdfCachePolicy) {
+    // Custom policies written before sidecarDecode used their named profile. Preserve that
+    // fallback here; explicit settings are independent of the label and PDF worker options.
+    const sidecar = policy.sidecarDecode ?? SIDECAR_DECODE_POLICIES[policy.name];
+    const maxDecodeDimension = policy.limits.previewMaxDimension * sidecar.maxInputEdgeScale;
+    return {
+        decodeConcurrency: sidecar.concurrency,
+        maxDecodePixels: Math.min(policy.limits.maxPreviewBytes / RGBA_BYTES_PER_PIXEL,
+            policy.limits.previewMaxDimension ** 2 * SIDECAR_INPUT_AREA_SCALE),
+        maxDecodeDimension,
+    };
 }
 
 export type ScrollDirection = -1 | 0 | 1;
@@ -98,6 +131,8 @@ export class ScrollPrefetchDynamics {
     private acceleration = 0;
     private latency = INITIAL_PAGE_LATENCY_MS;
 
+    constructor(private readonly gestureGapMs: number = PREFETCH_LIMITS.gestureGapMs) {}
+
     get direction(): ScrollDirection {
         return Math.sign(this.lastDelta) as ScrollDirection;
     }
@@ -105,7 +140,7 @@ export class ScrollPrefetchDynamics {
     input(delta: number, now: number): void {
         if (!Number.isFinite(delta) || !delta || !Number.isFinite(now)) { return; }
         const elapsed = now - this.lastInputAt;
-        const continuing = elapsed >= 0 && elapsed <= PREFETCH_LIMITS.gestureGapMs;
+        const continuing = elapsed >= 0 && elapsed <= this.gestureGapMs;
         const interval = Math.max(16, continuing ? elapsed : 32);
         const speed = Math.abs(delta) / interval;
         const signedSpeed = delta / interval;

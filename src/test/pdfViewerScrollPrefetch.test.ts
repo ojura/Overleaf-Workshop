@@ -29,7 +29,7 @@ describe('shared PDF scroll prefetch policy', function () {
     let dir: string | undefined;
     let policy: {
         // eslint-disable-next-line @typescript-eslint/naming-convention -- name of the module's public export
-        ScrollPrefetchDynamics: new () => Dynamics;
+        ScrollPrefetchDynamics: new (gestureGapMs?: number) => Dynamics;
         // eslint-disable-next-line @typescript-eslint/naming-convention -- name of the module's public export
         PREFETCH_LIMITS: Readonly<Record<string, number>>;
         pdfCachePolicy: (device?: Record<string, unknown>) => { name: string; rangeCacheBytes: number; pruneOffscreen: boolean; limits: Readonly<Record<string, number>> };
@@ -110,6 +110,20 @@ describe('shared PDF scroll prefetch policy', function () {
         motion.input(320, 1001);
         assert.strictEqual(motion.snapshot(700).velocityPxPerMs, 20);
         assert.ok(Number.isFinite(motion.snapshot(700).accelerationPxPerMs2));
+    });
+
+    it('keeps motion across pauses within the configured gesture gap and resets beyond it', () => {
+        const motion = new policy.ScrollPrefetchDynamics(1000);
+        motion.input(320, 1000);
+        motion.input(640, 1016);
+        const moving = motion.snapshot(700);
+        motion.input(16, 1316);
+        const continuing = motion.snapshot(700);
+        assert.ok(continuing.velocityPxPerMs > moving.velocityPxPerMs / 2, 'a 300ms pause preserves the recent speed');
+        assert.ok(continuing.accelerationPxPerMs2 > 0, 'the same gesture retains its acceleration history');
+        motion.input(16, 2317);
+        assert.strictEqual(motion.snapshot(700).velocityPxPerMs, 0.5, 'a 1001ms pause starts a fresh gesture');
+        assert.strictEqual(motion.snapshot(700).accelerationPxPerMs2, 0);
     });
 
     it('changes direction immediately without carrying acceleration through a reversal', () => {

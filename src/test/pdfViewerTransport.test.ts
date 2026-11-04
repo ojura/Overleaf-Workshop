@@ -53,6 +53,8 @@ describe('the PDF viewers\' range transport', function () {
         const entry = path.join(dir, 'entry.ts');
         fs.writeFileSync(entry, [
             `export { generatePdfCachingTransportFactory } from ${JSON.stringify(path.join(viewerRoot, 'src', 'common', 'transport.ts'))};`,
+            `export { createBridgeResponse } from ${JSON.stringify(path.join(viewerRoot, 'src', 'common', 'bridge-response.ts'))};`,
+            `export { fallbackRequest } from ${JSON.stringify(path.join(viewerRoot, 'overleaf', 'services', 'web', 'frontend', 'js', 'features', 'pdf-preview', 'util', 'pdf-caching.ts'))};`,
             `export { getPdfCachingMetrics } from ${JSON.stringify(path.join(viewerRoot, 'overleaf', 'services', 'web', 'frontend', 'js', 'features', 'pdf-preview', 'util', 'metrics.ts'))};`,
         ].join('\n'));
         await esbuild.build({ ...bundleOptions, entryPoints: [entry], outfile: path.join(dir, 'transport.mjs') });
@@ -204,5 +206,79 @@ describe('the PDF viewers\' range transport', function () {
         assert.strictEqual(urls[0].searchParams.get('clsiserverid'), 'clsi-vm-7', 'first the compile server');
         assert.strictEqual(urls.at(-1)!.searchParams.get('clsiserverid'), 'clsi-cache-shard-1', 'then the cache');
         assert.ok(urls.at(-1)!.pathname.endsWith(`/build/${editorId}-${build}/output/output.pdf`), urls.at(-1)!.pathname);
+    });
+
+    it('consumes owned bridge streams in the pinned range assembler and fallback without body materialization', async () => {
+        requests.length = 0;
+        let materializations = 0;
+        const responses: any[] = [];
+        respond = async () => {
+            const response = loader.createBridgeResponse(new Uint8Array(1024).fill(37), {
+                status: 206, headers: { 'Content-Range': 'bytes 4096-5119/1000000', 'Content-Length': '1024' },
+            });
+            const original = response.arrayBuffer;
+            response.arrayBuffer = () => { materializations++; return original.call(response); };
+            responses.push(response);
+            return response;
+        };
+        let resolve!: (value: { begin: number, chunk: Uint8Array | null }) => void;
+        let reject!: (error: unknown) => void;
+        const result = new Promise<{ begin: number, chunk: Uint8Array | null }>((yes, no) => { resolve = yes; reject = no; });
+        const input = load(reject);
+        const transport = loader.generatePdfCachingTransportFactory()(input);
+        transport.onDataRange = (begin: number, chunk: Uint8Array | null) => resolve({ begin, chunk });
+        transport.requestDataRange(4096, 5120);
+        const received = await result;
+        assert.strictEqual(received.begin, 4096);
+        assert.deepStrictEqual(received.chunk, new Uint8Array(1024).fill(37));
+        const fallback = await loader.fallbackRequest({ file: transport.pdfFile, url: input.url,
+            start: 4096, end: 5120, abortSignal: input.abortController.signal });
+        assert.deepStrictEqual(new Uint8Array(fallback), new Uint8Array(1024).fill(37));
+        assert.deepStrictEqual(requests.map(request => request.range), ['bytes=4096-5119', 'bytes=4096-5119']);
+        assert.strictEqual(materializations, 0, 'both pinned response consumers must use the owned-stream path');
+        assert.strictEqual(responses.length, 2);
+        assert.ok(responses.every(response => response.bodyUsed && !response.body.locked));
+    });
+
+    it('keeps prefetched chunk bytes reusable after the delivered range is transferred to the worker', async () => {
+        requests.length = 0;
+        const prefix = new TextEncoder().encode('7 0 obj\n');
+        const expected = new Uint8Array(4096).fill(53);
+        expected.set(prefix);
+        respond = async () => loader.createBridgeResponse(new Uint8Array(4096 - prefix.length).fill(53), {
+            status: 200, headers: { 'Content-Length': String(4096 - prefix.length) },
+        });
+        let fail!: (error: unknown) => void;
+        const input = load(error => fail(error));
+        // The content-addressed piece extends beyond both PDF.js requests. The pinned loader
+        // adds its object prefix and keeps the complete piece in file.prefetched for later use.
+        const transport = loader.generatePdfCachingTransportFactory()({ ...input,
+            pdfFile: { ...input.pdfFile, ranges: [{ start: 4096 + prefix.length, end: 8192,
+                hash: 'a'.repeat(40), objectId: '7 0 obj\n' }] },
+        });
+        const deliver = (start: number, end: number) => new Promise<Uint8Array>((resolve, reject) => {
+            fail = reject;
+            transport.onDataRange = (begin: number, chunk: Uint8Array | null) => {
+                try {
+                    assert.strictEqual(begin, start);
+                    assert.ok(chunk);
+                    // PDFDataTransportStream transfers the final full-span buffer to its worker.
+                    const workerBytes = structuredClone(chunk, { transfer: [chunk.buffer] });
+                    assert.strictEqual(chunk.byteLength, 0);
+                    resolve(workerBytes);
+                } catch (error) { reject(error); }
+            };
+            transport.requestDataRange(start, end);
+        });
+        assert.deepStrictEqual(await deliver(4096, 5120), expected.subarray(0, 1024));
+        assert.strictEqual(transport.pdfFile.prefetched.length, 1);
+        const retained: Uint8Array = transport.pdfFile.prefetched[0].buffer;
+        const retainedSlice = retained.subarray(2048, 3072);
+        assert.deepStrictEqual(retained, expected, 'the first worker transfer must preserve the retained whole piece');
+        assert.deepStrictEqual(await deliver(6144, 7168), expected.subarray(2048, 3072));
+        assert.strictEqual(requests.length, 1, 'the later range must reuse the retained piece without another response');
+        assert.strictEqual(retained.buffer.byteLength, 4096);
+        assert.deepStrictEqual(retained, expected);
+        assert.deepStrictEqual(retainedSlice, expected.subarray(2048, 3072), 'pre-existing subarrays also remain usable');
     });
 });

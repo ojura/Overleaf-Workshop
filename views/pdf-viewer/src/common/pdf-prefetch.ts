@@ -1,4 +1,4 @@
-import { pdfCachePolicy, ScrollPrefetchDynamics, type PdfCachePolicy } from './scroll-prefetch';
+import { pdfCachePolicy, pdfSidecarDecodeOptions, ScrollPrefetchDynamics, type PdfCachePolicy } from './scroll-prefetch';
 import { installPrefetchDiagnostics, pdfPerformance, type DecodedImageSnapshot } from './prefetch-performance';
 import { PdfPreviewCache } from './pdf-preview-cache';
 import { installPdfDocumentRobots, type DocumentRobotWorkGroup } from './pdf-document-robots';
@@ -65,7 +65,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     const requestFrame = options.requestFrame ?? ((callback) => win!.requestAnimationFrame(callback));
     const cancelFrame = options.cancelFrame ?? ((id) => win!.cancelAnimationFrame(id));
     const createCanvas = options.createCanvas ?? (() => owner.createElement('canvas'));
-    const dynamics = new ScrollPrefetchDynamics();
+    const dynamics = new ScrollPrefetchDynamics(limits.gestureGapMs);
     const queue = viewer.renderingQueue;
     const originalPriority = queue.getHighestPriority;
     const originalDescriptor = Object.getOwnPropertyDescriptor(queue, 'getHighestPriority');
@@ -266,9 +266,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         try {
             previewLoader = (options.createPreviewSourceLoader ?? createPdfPreviewSourceLoader)(binding.source, {
                 pageCount: viewer.pagesCount,
-                decodeConcurrency: policy.name === 'mobile' ? 1 : 2,
-                maxDecodePixels: Math.min(limits.maxPreviewBytes / RGBA_BYTES, limits.previewMaxDimension ** 2 * 4),
-                maxDecodeDimension: limits.previewMaxDimension * (policy.name === 'mobile' ? 1 : 2),
+                ...pdfSidecarDecodeOptions(policy),
                 createCanvas,
                 quality: id => pageView(id)?.renderingState === FINISHED ? Infinity
                     : Math.max(previews.get(id)?.canvas.width ?? 0, previews.get(id)?.canvas.height ?? 0),

@@ -436,6 +436,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
     this.timeout(30 * 1000);
     let directory: string | undefined;
     let module: any;
+    let pdfCachePolicy: (device?: Record<string, unknown>) => any;
     const fixtures: Fixture[] = [];
     const fetches = new Fetches();
     const timers = new Map<number, { callback: () => void, delay: number }>();
@@ -473,7 +474,16 @@ describe('the PDF viewers\' shared prefetch controller', function () {
             },
         };
         try {
-            await esbuild.build({ ...bundleOptions, plugins: [diagnostics, ...bundleOptions.plugins], entryPoints: [path.join(viewerRoot, 'src', 'common', 'pdf-prefetch.ts')], outfile: output });
+            await esbuild.build({
+                ...bundleOptions, plugins: [diagnostics, ...bundleOptions.plugins],
+                entryPoints: {
+                    prefetch: path.join(viewerRoot, 'src', 'common', 'pdf-prefetch.ts'),
+                    policy: path.join(viewerRoot, 'src', 'common', 'scroll-prefetch.ts'),
+                },
+                outdir: directory,
+                // eslint-disable-next-line @typescript-eslint/naming-convention -- esbuild's extension map uses literal file extensions
+                outExtension: { '.js': '.mjs' },
+            });
         } finally { await esbuild.stop(); }
         const previous = Object.getOwnPropertyDescriptor(globalThis, '__pdfPrefetchTestPerformance');
         Object.defineProperty(globalThis, '__pdfPrefetchTestPerformance', { configurable: true, value: fetches });
@@ -482,6 +492,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
             if (previous) { Object.defineProperty(globalThis, '__pdfPrefetchTestPerformance', previous); }
             else { delete (globalThis as any).__pdfPrefetchTestPerformance; }
         }
+        ({ pdfCachePolicy } = await importModule(path.join(directory, 'policy.mjs')));
     });
 
     beforeEach(() => {
@@ -529,11 +540,12 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         return { f, robots, factories };
     }
 
-    function previewFixture(options: FixtureOptions = {}, robots?: DocumentRobots) {
+    function previewFixture(options: FixtureOptions = {}, robots?: DocumentRobots, installOverrides: Record<string, unknown> = {}) {
         const loaders: Array<any> = [];
         const source = { identity: { key: 'exact-output', size: 1000 }, loadManifest: async () => null,
             loadAsset: async () => new Uint8Array() };
         const f = fixture(options, {
+            ...installOverrides,
             robotsEnabled: !!robots,
             ...(robots ? { createDocumentRobots: (_container: Element, settings: any) => {
                 robots.onCapacityAvailable = settings.onCapacityAvailable; return robots;
@@ -595,7 +607,36 @@ describe('the PDF viewers\' shared prefetch controller', function () {
             const loader = h.bind(); await h.f.frame();
             assert.strictEqual(loader.settings.decodeConcurrency, mobile ? 1 : 2);
             assert.strictEqual(loader.settings.maxDecodeDimension, mobile ? 512 : 1536);
+            assert.strictEqual(loader.settings.maxDecodePixels, mobile ? 1_048_576 : 2_359_296);
             assert.ok(loader.updates[loader.updates.length - 1].requests.every((request: any) => request.maxDimension === (mobile ? 512 : 768)));
+        }
+    });
+
+    it('uses explicit sidecar decode policy independently of its display name and worker image settings', async () => {
+        const base = pdfCachePolicy({ userAgent: 'iPhone' });
+        const custom = {
+            ...base, name: 'desktop', imageDecodeConcurrency: 2,
+            limits: { ...base.limits, previewMaxDimension: 640, maxPreviewBytes: 1024 * 1024 },
+            sidecarDecode: { concurrency: 1, maxInputEdgeScale: 1.5 },
+        };
+        const h = previewFixture({ startPage: 1, pages: 1 }, undefined, { cachePolicy: custom });
+        const loader = h.bind(); await h.f.frame();
+        assert.strictEqual(loader.settings.decodeConcurrency, 1);
+        assert.strictEqual(loader.settings.maxDecodeDimension, 960);
+        assert.strictEqual(loader.settings.maxDecodePixels, 256 * 1024, 'decoded pixels also fit the selected raster byte budget');
+        assert.ok(loader.updates.at(-1).requests.every((request: any) => request.maxDimension === 640));
+    });
+
+    it('preserves legacy custom sidecar policies while deriving their input edge from the selected preview size', async () => {
+        for (const mobile of [true, false]) {
+            const base = pdfCachePolicy({ userAgent: mobile ? 'iPhone' : 'desktop' });
+            const custom = { ...base, sidecarDecode: undefined, imageDecodeConcurrency: 7,
+                limits: { ...base.limits, previewMaxDimension: 400 } };
+            const h = previewFixture({ startPage: 1, pages: 1 }, undefined, { cachePolicy: custom });
+            const loader = h.bind(); await h.f.frame();
+            assert.strictEqual(loader.settings.decodeConcurrency, mobile ? 1 : 2);
+            assert.strictEqual(loader.settings.maxDecodeDimension, mobile ? 400 : 800);
+            assert.strictEqual(loader.settings.maxDecodePixels, 640_000, 'the legacy area allowance remains independent of the edge ceiling');
         }
     });
 
@@ -1774,6 +1815,36 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         await f.frame(0);
         assert.strictEqual(f.controller.snapshot().velocityPxPerMs, 0);
         assert.strictEqual(f.controller.snapshot().preloadPx, idleLead);
+    });
+
+    it('uses the selected gesture gap for both motion continuity and idle settlement', async () => {
+        const base = pdfCachePolicy({ userAgent: 'desktop' });
+        const f = fixture({}, { cachePolicy: { ...base, limits: { ...base.limits, gestureGapMs: 1000 } } });
+        await f.frame();
+        const idleLead = f.controller.snapshot().preloadPx;
+        f.container.emit('wheel', { deltaY: 320, deltaMode: 0 });
+        f.time += 16;
+        f.container.emit('wheel', { deltaY: 640, deltaMode: 0 });
+        const moving = f.controller.snapshot();
+        f.time += 300;
+        f.container.emit('wheel', { deltaY: 16, deltaMode: 0 });
+        const continuing = f.controller.snapshot();
+        assert.ok(continuing.velocityPxPerMs > moving.velocityPxPerMs / 2, '300ms remains inside the selected gesture');
+        assert.ok(continuing.accelerationPxPerMs2 > 0);
+        f.container.emit('scrollend');
+        assert.strictEqual(timers.size, 1);
+        const [id, timer] = [...timers][0];
+        assert.strictEqual(timer.delay, 1000);
+        await f.frame(999);
+        assert.strictEqual(f.controller.snapshot().velocityPxPerMs, continuing.velocityPxPerMs);
+        f.time += 1;
+        timers.delete(id);
+        timer.callback();
+        await f.frame(0);
+        const settled = f.controller.snapshot();
+        assert.strictEqual(settled.velocityPxPerMs, 0);
+        assert.strictEqual(settled.accelerationPxPerMs2, 0);
+        assert.strictEqual(settled.preloadPx, idleLead);
     });
 
     it('keeps at most three previews in progress, including getPage requests', async () => {

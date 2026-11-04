@@ -11,6 +11,8 @@ export const PDF_DISK_POLICY = {
     paceMs: 250,
     memoryManifests: 128,
     ownerCheckMs: 1000,
+    exportRangeBytes: 1024 * 1024,
+    exportConcurrency: 4,
 } as const;
 
 const HASH = /^[a-f0-9]{64}$/;
@@ -47,6 +49,15 @@ export interface PdfDiskOptions {
     clearTimer?: (timer: unknown) => void;
     setWaitTimer?: (callback: () => void, ms: number) => unknown;
     clearWaitTimer?: (timer: unknown) => void;
+}
+export interface PdfCompletionOptions {
+    signal?: AbortSignal;
+    current?: () => boolean;
+    concurrency?: number;
+    onProgress?: (covered: number, total: number) => void;
+}
+export class PdfCacheCompletionError extends Error {
+    constructor(readonly reason: 'cancelled' | 'busy' | 'budget' | 'unavailable' | 'validator' | 'response' | 'admission' | 'evicted', message: string) { super(message); }
 }
 export interface PdfCacheViewer {
     setOutput(output: PdfOutput | undefined): void;
@@ -110,6 +121,7 @@ export class PdfDiskCache {
     private timer?: unknown;
     private filling?: { viewer: Viewer, output: PdfOutput, generation: number, controller: AbortController };
     private fillTask: Promise<void> = Promise.resolve();
+    private readonly completions = new Map<AbortController, Promise<void>>();
 
     constructor(readonly dir: string, readonly maxBytes: number, private readonly options: PdfDiskOptions = {}) {
         this.maxBytes = Number.isFinite(maxBytes) ? Math.max(0, Math.floor(maxBytes)) : 0;
@@ -623,21 +635,38 @@ export class PdfDiskCache {
         return this.mutate(() => this.blob(hash, content, new Set(), signal), signal);
     }
 
-    readRange(output: PdfOutput, start: number, end: number): Promise<{ body: Uint8Array, validator?: Validator } | undefined> {
+    async readRange(output: PdfOutput, start: number, end: number): Promise<{ body: Uint8Array, validator?: Validator } | undefined> {
+        const result = await this.readRanges(output, [{ start, end }]);
+        return result && { body: result.parts[0].body, validator: result.validator };
+    }
+
+    /** Capture every range from one representation before reading any bytes. Immutable blobs
+     * keep those plans valid across another host's publication; eviction makes the whole hit fail. */
+    readRanges(output: PdfOutput, ranges: ReadonlyArray<{ start: number, end: number }>): Promise<{
+        parts: Array<{ start: number, end: number, body: Uint8Array }>, validator?: Validator
+    } | undefined> {
         return this.run(async () => {
-            if (!this.maxBytes) { return undefined; }
+            if (!this.maxBytes || !ranges.length) { return undefined; }
             const layout = this.layout(output);
-            if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start || end > layout.size) { return undefined; }
+            const requested = ranges.map(({ start, end }) => ({ start, end }));
+            if (requested.some(({ start, end }) => !Number.isSafeInteger(start) || !Number.isSafeInteger(end) ||
+                start < 0 || end <= start || end > layout.size)) { return undefined; }
             const manifest = await this.manifest(layout);
-            const plan = this.plan(await this.segments(layout, manifest), start, end);
-            if (!plan) { return undefined; }
-            const result = new Uint8Array(end - start);
-            let cursor = 0;
+            const validator = manifest.validator;
+            const segments = await this.segments(layout, manifest);
+            const plans = requested.map(range => ({ ...range, plan: this.plan(segments, range.start, range.end) }));
+            if (plans.some(({ plan }) => !plan)) { return undefined; }
+            const parts: Array<{ start: number, end: number, body: Uint8Array }> = [];
             try {
-                for await (const bytes of this.readPlan(plan)) { result.set(bytes, cursor); cursor += bytes.length; }
+                for (const { start, end, plan } of plans) {
+                    const body = new Uint8Array(end - start);
+                    let cursor = 0;
+                    for await (const bytes of this.readPlan(plan!)) { body.set(bytes, cursor); cursor += bytes.length; }
+                    parts.push({ start, end, body });
+                }
             } catch { return undefined; }
             this.touch('build-' + layout.key + '.json');
-            return { body: result, validator: manifest.validator };
+            return { parts, validator };
         });
     }
 
@@ -647,18 +676,29 @@ export class PdfDiskCache {
         return ok;
     }
 
+    private rangeValidator(layout: Layout, start: number, end: number, response: BridgeResponse): Validator | undefined {
+        const headers = new Map(response.headers.map(([name, value]) => [name.toLowerCase(), value]));
+        const validator = this.validator(response.headers);
+        if (response.status !== 206 || !validator ||
+            headers.get('content-range') !== 'bytes ' + start + '-' + (end - 1) + '/' + layout.size ||
+            response.body.length !== end - start || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end > layout.size || end <= start ||
+            ![undefined, 'identity'].includes(headers.get('content-encoding'))) { return; }
+        return validator;
+    }
+
+    private sameValidator(first: Validator, second: Validator): boolean {
+        return first.name === second.name && first.value === second.value;
+    }
+
     /** Only exact 206 ranges with a stable validator enter the build's persistent byte map. */
-    storeRange(output: PdfOutput, start: number, end: number, response: BridgeResponse, signal?: AbortSignal): Promise<boolean> {
+    storeRange(output: PdfOutput, start: number, end: number, response: BridgeResponse, signal?: AbortSignal, expectedValidator?: Validator): Promise<boolean> {
         return this.mutate(async () => {
             const layout = this.layout(output);
-            const headers = new Map(response.headers.map(([name, value]) => [name.toLowerCase(), value]));
-            const validator = this.validator(response.headers);
-            if (!this.maxBytes || !alive(signal) || response.status !== 206 || !validator ||
-                headers.get('content-range') !== 'bytes ' + start + '-' + (end - 1) + '/' + layout.size ||
-                response.body.length !== end - start || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end > layout.size || end <= start ||
-                ![undefined, 'identity'].includes(headers.get('content-encoding'))) { return false; }
+            const validator = this.rangeValidator(layout, start, end, response);
+            if (!this.maxBytes || !alive(signal) || !validator || expectedValidator && !this.sameValidator(expectedValidator, validator)) { return false; }
             const old = await this.manifest(layout);
-            const changed = old.validator && (old.validator.name !== validator.name || old.validator.value !== validator.value);
+            if (expectedValidator && old.validator && !this.sameValidator(expectedValidator, old.validator)) { return false; }
+            const changed = old.validator && !this.sameValidator(old.validator, validator);
             const manifest: BuildManifest = { ...old, validator, parts: changed ? [] : [...old.parts] };
             const parts = await this.segments(layout, manifest);
             const protect = this.protect(layout, manifest, parts);
@@ -668,7 +708,7 @@ export class PdfDiskCache {
                 const covered = parts.find(p => p.start <= cursor && p.end > cursor);
                 if (covered) { cursor = Math.min(end, covered.end); continue; }
                 const next = parts.find(p => p.start > cursor)?.start ?? end;
-                const boundary = layout.pieces.flatMap(p => [p.start, p.end]).find(p => p > cursor) ?? end;
+                const boundary = this.nextPieceBoundary(layout, cursor);
                 const until = Math.min(end, next, boundary, cursor + PDF_DISK_POLICY.chunkBytes);
                 const content = response.body.subarray(cursor - start, until - start);
                 const hash = digest(content);
@@ -707,16 +747,150 @@ export class PdfDiskCache {
             if (this.closed || layout.size > this.maxBytes) { return undefined; }
             const manifest = await this.manifest(layout);
             const parts = await this.segments(layout, manifest);
-            let cursor = 0;
-            for (const part of parts) {
-                if (part.start > cursor) { break; }
-                cursor = Math.max(cursor, part.end);
-            }
-            if (cursor >= layout.size) { return undefined; }
-            const next = parts.find(p => p.start > cursor)?.start ?? layout.size;
-            const boundary = layout.pieces.flatMap(p => [p.start, p.end]).find(p => p > cursor) ?? layout.size;
-            return { start: cursor, end: Math.min(next, boundary, cursor + PDF_DISK_POLICY.chunkBytes), validator: manifest.validator };
+            const gap = this.nextGap(layout, parts, PDF_DISK_POLICY.chunkBytes);
+            return gap && { ...gap, validator: manifest.validator };
         });
+    }
+
+    private nextGap(layout: Layout, parts: Array<{ start: number, end: number }>, limit: number): { start: number, end: number } | undefined {
+        let cursor = 0;
+        for (const part of parts) {
+            if (part.start > cursor) { break; }
+            cursor = Math.max(cursor, part.end);
+        }
+        if (cursor >= layout.size) { return; }
+        const next = parts.find(part => part.start > cursor)?.start ?? layout.size;
+        const boundary = this.nextPieceBoundary(layout, cursor);
+        return { start: cursor, end: Math.min(next, boundary, cursor + limit) };
+    }
+
+    private nextPieceBoundary(layout: Layout, start: number): number {
+        let boundary = layout.size;
+        for (const piece of layout.pieces) {
+            if (piece.start > start) { boundary = Math.min(boundary, piece.start); }
+            if (piece.end > start) { boundary = Math.min(boundary, piece.end); }
+        }
+        return boundary;
+    }
+
+    private coveredBytes(parts: Array<{ start: number, end: number }>): number {
+        let covered = 0, last = 0;
+        for (const part of parts) { covered += Math.max(0, part.end - Math.max(last, part.start)); last = Math.max(last, part.end); }
+        return covered;
+    }
+
+    /** An explicit export fills only missing ranges, without the idle background pacing. */
+    completeForExport(output: PdfOutput, options: PdfCompletionOptions = {}): Promise<void> {
+        if (this.completions.size) { return Promise.reject(new PdfCacheCompletionError('busy', 'Another PDF export is already completing its cached bytes.')); }
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        options.signal?.addEventListener('abort', abort, { once: true });
+        if (options.signal?.aborted) { abort(); }
+        const task = this.completeCaptured(output, controller, options).finally(() => {
+            options.signal?.removeEventListener('abort', abort);
+            this.completions.delete(controller);
+        });
+        this.completions.set(controller, task);
+        return task;
+    }
+
+    private async completeCaptured(output: PdfOutput, controller: AbortController, options: PdfCompletionOptions): Promise<void> {
+        const layout = this.layout(output);
+        const check = () => {
+            if (this.closed || controller.signal.aborted || options.current && !options.current()) {
+                controller.abort();
+                throw new PdfCacheCompletionError('cancelled', 'Completing the captured PDF was cancelled.');
+            }
+        };
+        check();
+        const endForeground = this.beginForeground();
+        const reserved = new Map<number, { start: number, end: number }>();
+        const received: Array<{ start: number, end: number }> = [];
+        const workers: Promise<void>[] = [];
+        let validator: Validator | undefined, coveredBefore = -1;
+        let failure: unknown;
+        const inspect = (reserve: boolean) => this.run(async () => {
+            check();
+            const manifest = await this.manifest(layout);
+            if (validator && manifest.validator && !this.sameValidator(validator, manifest.validator)) {
+                throw new PdfCacheCompletionError('validator', 'The captured PDF changed its range validator while exporting.');
+            }
+            const parts = await this.segments(layout, manifest);
+            const covered = this.coveredBytes(parts);
+            if (covered < coveredBefore) { throw new PdfCacheCompletionError('evicted', 'Cached PDF bytes were evicted while completing the export.'); }
+            coveredBefore = covered;
+            const pending = [...parts, ...reserved.values()].sort((a, b) => a.start - b.start || b.end - a.end);
+            const gap = reserve ? this.nextGap(layout, pending, PDF_DISK_POLICY.exportRangeBytes) : undefined;
+            if (gap) {
+                if (received.some(part => part.start < gap.end && part.end > gap.start)) {
+                    throw new PdfCacheCompletionError('evicted', 'A completed PDF range became unavailable during export.');
+                }
+                reserved.set(gap.start, gap);
+            }
+            return { gap, covered, validator: manifest.validator };
+        });
+        const fetchGap = async (gap: { start: number, end: number }) => {
+            try {
+                check();
+                const response = await this.options.fetchRange!({ ...gap, output, url: output.url, validator, signal: controller.signal });
+                check();
+                const actual = this.rangeValidator(layout, gap.start, gap.end, response);
+                if (!actual) { throw new PdfCacheCompletionError('response', 'The PDF server did not return the exact requested byte range.'); }
+                if (validator && !this.sameValidator(validator, actual)) {
+                    throw new PdfCacheCompletionError('validator', 'The captured PDF changed its range validator while exporting.');
+                }
+                validator ??= actual;
+                const stored = await this.storeRange(output, gap.start, gap.end, response, controller.signal, validator);
+                check();
+                if (!stored) { throw new PdfCacheCompletionError('admission', 'The PDF cache could not retain a downloaded range within its disk budget.'); }
+                received.push(gap);
+                const state = await inspect(false);
+                options.onProgress?.(state.covered, layout.size);
+            } finally { reserved.delete(gap.start); }
+        };
+        const worker = async (first?: { start: number, end: number }) => {
+            try {
+                let gap = first;
+                for (;;) {
+                    check();
+                    gap ??= (await inspect(true)).gap;
+                    if (!gap) { return; }
+                    await fetchGap(gap);
+                    gap = undefined;
+                }
+            } catch (error) {
+                failure ??= error;
+                controller.abort();
+                throw error;
+            }
+        };
+        try {
+            await this.fillTask;
+            check();
+            const initial = await inspect(true);
+            if (initial.covered === layout.size) { return; }
+            if (layout.size >= this.maxBytes) { throw new PdfCacheCompletionError('budget', 'The captured PDF is larger than the available PDF cache budget.'); }
+            if (!this.options.fetchRange) { throw new PdfCacheCompletionError('unavailable', 'Downloading missing PDF bytes is unavailable for this cache.'); }
+            options.onProgress?.(initial.covered, layout.size);
+            validator = initial.validator;
+            let first = initial.gap;
+            // Establish one representation before concurrent requests can return different validators.
+            if (!validator && first) { await fetchGap(first); first = undefined; }
+            const requested = options.concurrency ?? PDF_DISK_POLICY.exportConcurrency;
+            const concurrency = Number.isFinite(requested) ? Math.max(1, Math.min(PDF_DISK_POLICY.exportConcurrency, Math.floor(requested))) : PDF_DISK_POLICY.exportConcurrency;
+            for (let index = 0; index < concurrency; index++) { workers.push(worker(index === 0 ? first : undefined)); }
+            await Promise.allSettled(workers);
+            if (failure) { throw failure; }
+            check();
+            if ((await inspect(false)).covered !== layout.size) {
+                throw new PdfCacheCompletionError('evicted', 'The captured PDF could not remain complete in the shared cache.');
+            }
+        } finally {
+            controller.abort();
+            await Promise.allSettled(workers);
+            reserved.clear();
+            endForeground();
+        }
     }
 
     /** Every foreground bridge demand revokes background ownership before any cache or network I/O. */
@@ -859,8 +1033,7 @@ export class PdfDiskCache {
             if (output) {
                 const layout = this.layout(output); total = layout.size;
                 const parts = await this.segments(layout, await this.manifest(layout));
-                let last = 0;
-                for (const part of parts) { covered += Math.max(0, part.end - Math.max(last, part.start)); last = Math.max(last, part.end); }
+                covered = this.coveredBytes(parts);
             }
             return { bytes: this.bytes, reserved: this.reserved, maxBytes: this.maxBytes, writer: !!this.owner,
                 files: this.entries.size, covered, total, complete: total > 0 && covered === total,
@@ -871,6 +1044,7 @@ export class PdfDiskCache {
 
     /** Useful for deterministic lifecycle tests and extension shutdown; no polling is involved. */
     async settled() {
+        await Promise.allSettled(this.completions.values());
         await this.fillTask;
         while (this.mutationRunning) { await this.mutations; }
         await this.serial;
@@ -885,6 +1059,7 @@ export class PdfDiskCache {
 
     async dispose() {
         this.closed = true;
+        for (const controller of this.completions.keys()) { controller.abort(); }
         this.pause();
         this.activeMutation?.cancel();
         for (const entry of [...this.mutationQueue]) { entry.cancel(); }
@@ -892,6 +1067,7 @@ export class PdfDiskCache {
         this.viewers.clear();
         this.changes.clear();
         this.watcher?.close();
+        await Promise.allSettled(this.completions.values());
         await this.fillTask;
         await this.mutations;
         await this.serial;

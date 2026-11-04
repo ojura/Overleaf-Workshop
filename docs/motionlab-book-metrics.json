@@ -179,8 +179,29 @@
     "generatorPythonTestsPassed": 24,
     "actualTypeScriptValidatorAcceptedCroppedRotatedFixture": true,
     "rootVisuallyCheckedDuplexAndImagePlacements": true,
-    "publication": "pending",
-    "liveConsumer": "pending"
+    "actualTypeScriptValidatorAcceptedFullBook": true,
+    "publisherTestsPassed": 27,
+    "publication": "verified",
+    "liveConsumer": "https-transport-verified",
+    "physicalPhone": "pending"
+  },
+  "publication": {
+    "toolCommit": "9c765dc84c752ae03cf846a12bb21ea56b4e1705",
+    "browserCommit": "9af6bee5949946506f15957924de9d7ea0a099fe",
+    "elapsedSeconds": 33.445,
+    "copiedAssets": 1836,
+    "reusedAssets": 0,
+    "assetBytes": 178710389,
+    "manifestBytes": 595154,
+    "manifestExact": true,
+    "allAssetSizesAndHashesVerified": true,
+    "staticUploadBytes": 9403888,
+    "candidateAndFinalNginxConfigurationValid": true,
+    "verifiedPrimaryHttpsAssets": 11,
+    "verifiedPrimaryHttpsBytes": 4250037,
+    "productionHttpAdapterVerified": true,
+    "pdfEtag": "\"6aeafec1-5fe1f8f7\"",
+    "pdfRangeSupport": true
   },
   "evidence": {
     "host": "steffy",

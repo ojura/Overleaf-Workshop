@@ -50,6 +50,7 @@ class Uri {
     constructor(readonly path: string) {}
     get fsPath() { return this.path; }
     toString() { return 'file://' + this.path; }
+    static file(value: string) { return new Uri(value); }
     static joinPath(base: Uri, ...parts: string[]) { return new Uri(path.posix.join(base.path, ...parts)); }
 }
 const vscode = {
