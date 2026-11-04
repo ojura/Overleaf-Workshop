@@ -6,6 +6,10 @@ const warnings: string[] = [];
 /** the save of the editors before a compile (vscode.workspace.saveAll) */
 let saveAll = async () => true;
 const disposable = { dispose() {} };
+const replicaFolder = {
+    scheme: 'file', authority: '', path: '/workspace/project', fsPath: '/workspace/project',
+    toString: () => 'file:///workspace/project',
+};
 const vscodeStandIn = strict('vscode', {
     Disposable: class { dispose() {} },
     EventEmitter: class { event = () => disposable; fire() {} dispose() {} },
@@ -25,7 +29,7 @@ const vscodeStandIn = strict('vscode', {
         createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
     }),
     workspace: strict('vscode.workspace', {
-        workspaceFolders: undefined,
+        workspaceFolders: [{ uri: replicaFolder }],
         saveAll: () => saveAll(),
         getConfiguration: () => ({ get: (_key: string, value: unknown) => value }),
     }),
@@ -59,7 +63,7 @@ describe('CompileManager with a local replica', () => {
 
     function setup(flush: () => Promise<void>, { replica = true } = {}) {
         const events: string[] = [];
-        LocalReplicaSCMProvider.readSettings = async () => (replica ? { uri: 'overleaf-workshop://server/project?user=u&project=p', enableCompileNPreview: true } : undefined);
+        LocalReplicaSCMProvider.readSettings = async () => (replica ? { uri: 'overleaf-workshop://server/project?user=u&project=p' } : undefined);
         LocalReplicaSCMProvider.flushAll = async () => { events.push('flush started'); await flush(); events.push('flush done'); };
         const vfs = {
             // the project is joined (VirtualFileSystem.init answers with its tree)

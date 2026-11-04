@@ -180,7 +180,7 @@ describe('a sandbox run', () => {
         fs.mkdirSync(path.join(replica, '.overleaf'), { recursive: true });
         fs.writeFileSync(path.join(replica, '.overleaf', 'settings.json'), JSON.stringify({
             uri: `overleaf-workshop://www.overleaf.com/Book?user%3D${USER}%26project%3D${SHARED}`,
-            serverName: 'www.overleaf.com', enableCompileNPreview: false, projectName: 'Book',
+            serverName: 'www.overleaf.com', projectName: 'Book',
         }));
         const shared = new FakeProject(SHARED, 'Book');
         shared.members = [{ _id: 'collaborator' }];

@@ -285,6 +285,20 @@
         "category": "%extension.displayName%"
       },
       {
+        "command": "overleaf-workshop.projectManager.openProjectRemoteInCurrentWindow",
+        "title": "%commands.projectManager.openProjectRemoteInCurrentWindow.title%",
+        "icon": "$(cloud)",
+        "enablement": "viewItem == project || viewItem == project_in_tag",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.projectManager.openProjectRemoteInNewWindow",
+        "title": "%commands.projectManager.openProjectRemoteInNewWindow.title%",
+        "icon": "$(cloud)",
+        "enablement": "viewItem == project || viewItem == project_in_tag",
+        "category": "%extension.displayName%"
+      },
+      {
         "command": "overleaf-workshop.projectHistory.refresh",
         "title": "%commands.projectHistory.refresh.title%",
         "icon": "$(refresh)",
@@ -348,12 +362,6 @@
         "title": "%commands.projectSCM.configSCM.title%",
         "icon": "$(gear)",
         "enablement": "resourceScheme == overleaf-workshop || overleaf-workshop.activate",
-        "category": "%extension.displayName%"
-      },
-      {
-        "command": "overleaf-workshop.localReplica.toggleCompileNPreview",
-        "title": "%commands.localReplica.toggleCompileNPreview.title%",
-        "enablement": "overleaf-workshop.activate",
         "category": "%extension.displayName%"
       },
       {
@@ -459,6 +467,12 @@
           "default": true,
           "scope": "machine",
           "markdownDescription": "%configuration.compileOnSave.enabled.markdownDescription%"
+        },
+        "overleaf-workshop.debug.disableLocalReplicaCompilePreview": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "markdownDescription": "%configuration.debug.disableLocalReplicaCompilePreview.markdownDescription%"
         },
         "overleaf-workshop.localReplica.syncOnFileChange.enabled": {
           "type": "boolean",
@@ -645,6 +659,12 @@
       ]
     },
     "menus": {
+      "commandPalette": [
+        {
+          "command": "overleaf-workshop.projectManager.openProjectLocalReplica",
+          "when": "false"
+        }
+      ],
       "explorer/context": [
         {
           "command": "overleaf-workshop.remoteFileSystem.refreshLinkedFile",
@@ -785,28 +805,33 @@
         },
         {
           "command": "overleaf-workshop.projectManager.openProjectInCurrentWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag)",
           "group": "inline@3"
         },
         {
           "command": "overleaf-workshop.projectManager.openProjectInNewWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag)",
           "group": "inline@4"
         },
         {
           "command": "overleaf-workshop.projectManager.openProjectInCurrentWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag)",
           "group": "1_openActions@1"
         },
         {
           "command": "overleaf-workshop.projectManager.openProjectInNewWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag)",
           "group": "1_openActions@2"
         },
         {
-          "command": "overleaf-workshop.projectManager.openProjectLocalReplica",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
-          "group": "1_openActions@3"
+          "command": "overleaf-workshop.projectManager.openProjectRemoteInCurrentWindow",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag)",
+          "group": "2_remoteActions@1"
+        },
+        {
+          "command": "overleaf-workshop.projectManager.openProjectRemoteInNewWindow",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag)",
+          "group": "2_remoteActions@2"
         },
         {
           "command": "overleaf-workshop.projectHistory.createLabel",

@@ -290,7 +290,6 @@ if project:
     if os.path.exists(settings):
         existing = json.load(open(settings))
     existing.update({"uri": uri, "serverName": server_name, "projectName": name})
-    existing.setdefault("enableCompileNPreview", False)
     json.dump(existing, open(settings, "w"), indent=4)
     print(f"replica of {name} ({project}) in {replica}")
 EOF

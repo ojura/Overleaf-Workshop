@@ -33,6 +33,13 @@ export class Uri {
     constructor(public readonly scheme: string, public readonly path: string, public readonly authority = '', public readonly query = '') {}
     get fsPath() { return this.path; }
     toString() { return `${this.scheme}://${this.authority}${this.path}${this.query ? `?${this.query}` : ''}`; }
+    with(change: Partial<Pick<Uri, 'scheme' | 'path' | 'authority' | 'query'>>) {
+        return new Uri(change.scheme ?? this.scheme, change.path ?? this.path, change.authority ?? this.authority, change.query ?? this.query);
+    }
+    static parse(value: string) {
+        const match = /^([\w+.-]+):(?:\/\/([^/?#]*))?([^?#]*)(?:\?([^#]*))?/.exec(value);
+        return match ? new Uri(match[1], match[3], match[2] ?? '', match[4] ?? '') : new Uri('', value);
+    }
     static file(p: string) { return new Uri('file', p); }
     static joinPath(base: Uri, ...parts: string[]) { return new Uri(base.scheme, path.posix.join(base.path, ...parts), base.authority, base.query); }
 }

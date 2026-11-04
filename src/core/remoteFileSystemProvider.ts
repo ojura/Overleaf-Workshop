@@ -2269,7 +2269,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     setProjectSCMPersist(scmKey: string, persist: any) {
-        GlobalStateManager.updateServerProjectSCMPersist(this.context, this.serverName, this.projectId, scmKey, persist);
+        return GlobalStateManager.updateServerProjectSCMPersist(this.context, this.serverName, this.projectId, scmKey, persist);
     }
 
     async updateSettings(setting: any) {

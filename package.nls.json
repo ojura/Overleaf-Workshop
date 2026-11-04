@@ -1,6 +1,6 @@
 {
     "extension.displayName": "Overleaf Workshop",
-    "extension.description": "Open Overleaf/ShareLaTex projects in VSCode, with full collaboration support.",
+    "extension.description": "Work on local Overleaf projects with live collaboration, Git history, compilation and PDF preview.",
 
     "commands.remoteFileSystem.refreshLinkedFile.title": "Overleaf: Refresh File",
     "commands.remoteFileSystem.createLinkedFile.title": "Overleaf: Import File ...",
@@ -25,9 +25,11 @@
     "commands.projectManager.deleteTag.title": "Delete Tag",
     "commands.projectManager.addProjectToTag.title": "Add Project to Tag",
     "commands.projectManager.removeProjectFromTag.title": "Remove Project from Tag",
-    "commands.projectManager.openProjectInCurrentWindow.title": "Open Project in Current Window",
-    "commands.projectManager.openProjectInNewWindow.title": "Open Project in New Window",
+    "commands.projectManager.openProjectInCurrentWindow.title": "Open Project Locally",
+    "commands.projectManager.openProjectInNewWindow.title": "Open Project Locally in New Window",
     "commands.projectManager.openProjectLocalReplica.title": "Open Project Locally ...",
+    "commands.projectManager.openProjectRemoteInCurrentWindow.title": "Open Remote Project in Current Window",
+    "commands.projectManager.openProjectRemoteInNewWindow.title": "Open Remote Project in New Window",
 
     "commands.projectHistory.refresh.title": "Refresh Project History",
     "commands.projectHistory.clearSelection.title": "Clear Selection",
@@ -42,7 +44,6 @@
 
     "commands.compileManager.compile.title": "Compile Project",
     "commands.compileManager.recompileFromScratch.title": "Recompile Project from Scratch",
-    "commands.localReplica.toggleCompileNPreview.title": "Turn Compile and Preview On or Off for the Local Replica",
     "commands.localReplica.syncNow.title": "Sync Local Replica Now",
     "commands.compileManager.viewPdf.title": "View Compiled PDF",
     "commands.compileManager.syncCode.title": "Jump to PDF",
@@ -55,6 +56,7 @@
     "commands.collaboration.jumpToUser.title": "Jump to Collaborator ...",
 
     "configuration.compileOnSave.enabled.markdownDescription": "Always update the compiled PDF when a file is saved.",
+    "configuration.debug.disableLocalReplicaCompilePreview.markdownDescription": "Advanced debugging option. Disable Overleaf compilation and PDF preview for this local replica while diagnosing extension problems. Compile and preview are available by default; automatic compilation on save has its own setting.",
     "configuration.localReplica.syncOnFileChange.enabled.markdownDescription": "Upload the changes that other programs make to the files of a Local Replica as they happen, and scan the folder once a minute for a change the watcher missed. When this is off, saves in the editor, new files and removed files sync as they happen, and other changes are uploaded by \"Sync Local Replica Now\" or the command-line tool's `replica-sync`. Takes effect after the window reloads.",
     "configuration.localReplica.fetchMode.markdownDescription": "How a Local Replica takes in the changes made on Overleaf. In every mode it reads them over the editor's connection and records Overleaf's states as commits in the replica folder's git repository; `mixed` and `bridge` also bring in the commits of Overleaf's git bridge. Takes effect after the window reloads.",
     "configuration.localReplica.fetchMode.native": "Overleaf's state, read over the editor's connection and recorded as local commits.",

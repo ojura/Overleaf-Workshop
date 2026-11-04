@@ -71,7 +71,7 @@ const projectUri = Uri.parse('overleaf-workshop://www.overleaf.com/Book?user%3Du
 describe('SyncTeX', () => {
     beforeEach(() => {
         files.clear();
-        settings = { uri: projectUri.toString().replace('?user=u1&project=p1', '?user%3Du1%26project%3Dp1'), enableCompileNPreview: true };
+        settings = { uri: projectUri.toString().replace('?user=u1&project=p1', '?user%3Du1%26project%3Dp1') };
         world.infos = [];
     });
 

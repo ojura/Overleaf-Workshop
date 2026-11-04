@@ -220,6 +220,7 @@ const world = {
     settings: {} as Record<string, unknown>,
     /** the editor that is active, with its document */
     activeEditor: undefined as { document: { uri: Uri } } | undefined,
+    workspaceFolders: undefined as Array<{ uri: Uri }> | undefined,
     /** the texts of the compile's status bar item, first to last */
     statusTexts: [] as string[],
     /** the lines of the window's log of the builds (VirtualFileSystem's log channel) */
@@ -294,7 +295,7 @@ const vscodeStandIn = strict('vscode', {
         },
     }),
     workspace: strict('vscode.workspace', {
-        workspaceFolders: undefined,
+        get workspaceFolders() { return world.workspaceFolders; },
         textDocuments: [],
         saveAll: () => world.saveAll(),
         onDidSaveTextDocument: () => disposable,
@@ -410,6 +411,7 @@ describe('the build in use, from Overleaf to the window', function () {
         world.saveAll = async () => true;
         world.settings = {};
         world.activeEditor = undefined;
+        world.workspaceFolders = undefined;
         world.statusTexts = [];
         world.statusWaiters = [];
         world.buildsLog = [];
@@ -1145,7 +1147,8 @@ describe('the build in use, from Overleaf to the window', function () {
     describe('5. the replica\'s .overleaf/output', () => {
         it('follows the build in use, also another client\'s from Overleaf\'s cache', async () => {
             const replica = path.join(scratch, 'replica');
-            LocalReplicaSCMProvider.readSettings = async () => ({ uri: projectUri.toString(), enableCompileNPreview: true });
+            world.workspaceFolders = [{ uri: Uri.file(replica) }];
+            LocalReplicaSCMProvider.readSettings = async () => ({ uri: projectUri.toString() });
             LocalReplicaSCMProvider.pathToUri = async (p: string) => Uri.file(path.join(replica, p));
             overleaf.latest = { status: 200, body: cachedAnswer(overleaf, 'b-web') };
             overleaf.files.set(`/download/project/p1/build/${WEB_EDITOR}-b-web/output/cached/output.log`, Buffer.from(LOG));

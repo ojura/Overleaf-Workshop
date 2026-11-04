@@ -247,7 +247,7 @@ export class GlobalStateManager {
                 scmPersists[scmKey] = scmPersist;
             }
             project.scm = scmPersists;
-            context.globalState.update(keyServerPersists, persists);
+            return context.globalState.update(keyServerPersists, persists);
         }
     }
 

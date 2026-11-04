@@ -10,6 +10,20 @@ code is in src/scm/ (replicaGit.ts, replicaSync.ts, replicaConnect.ts), src/sand
 src/gitbridge/ (connect.ts, the rebase and merge steps that connect a history; anchor.ts, which
 joins the git bridge's commits with the replica's).
 
+## Opening and compiling a project
+
+Opening a project from the project list uses its local replica. The extension
+reuses an existing local folder, offers a choice when several copies exist, or
+asks where to create one. The project menu provides local opening in the current
+window or a new window, with explicit remote-only actions as alternatives.
+
+Compile and PDF preview are available automatically in recognized replicas,
+including existing ones. **Compile Project** uploads local changes and compiles
+on Overleaf; **View Compiled PDF** opens the project's compiled output. Automatic
+compilation on save has its own setting. For diagnosis, the advanced setting
+`overleaf-workshop.debug.disableLocalReplicaCompilePreview` can disable the local
+compile/preview commands; its default is `false`.
+
 ## The repository
 
 The replica folder is the work tree of a repository of its own, with `.git` at the folder's

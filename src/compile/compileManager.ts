@@ -5,9 +5,9 @@ import { PdfDocument } from '../core/pdfViewEditorProvider';
 import { LatexParser, ErrorSchema } from './compileLogParser';
 import { EventBus } from '../utils/eventBus';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
-import { isReplicaOwnPath } from '../scm/ignorePatterns';
 import { CompileRecord, REPLICA_OUTPUT_FOLDER, saveCompileOutputs } from './outputFiles';
 import { windowCompileSettings } from './compileSettings';
+import { localReplicaPath, projectForResource, readLocalReplicaProject } from './projectContext';
 import { NO_OUTPUT_PDF, type CompileOutcome, type CompileStart } from '../core/projectBuilds';
 import { errorMessage } from '../utils/errorMessage';
 import type { HostMessage } from '../core/viewerProtocol';
@@ -202,19 +202,7 @@ export class CompileManager {
     }
 
     static async check(uri?: vscode.Uri) {
-        // check if supported vfs
-        uri = uri || vscode.window.activeTextEditor?.document.uri;
-        uri = uri || vscode.workspace.workspaceFolders?.[0].uri;
-        if (uri?.scheme === ROOT_NAME) {
-            return uri;
-        }
-        // check if supported local replica
-        const localSetting = await LocalReplicaSCMProvider.readSettings();
-        if (localSetting?.uri && localSetting?.enableCompileNPreview===true) {
-            return vscode.Uri.parse(localSetting.uri);
-        }
-        // otherwise return undefined
-        return undefined;
+        return projectForResource(uri);
     }
 
     /**
@@ -425,25 +413,6 @@ export class CompileManager {
         return this.outputSaves;
     }
 
-    /** Switch compiling on Overleaf and the PDF preview on or off for the workspace's local replica. */
-    async toggleLocalReplicaCompile() {
-        const setting = await LocalReplicaSCMProvider.readSettings();
-        if (!setting?.uri) {
-            vscode.window.showInformationMessage( vscode.l10n.t('This workspace is not a local replica of an Overleaf project.') );
-            return;
-        }
-        const enabled = setting.enableCompileNPreview!==true;
-        await LocalReplicaSCMProvider.writeSettings({...setting, enableCompileNPreview: enabled});
-        await vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activateCompile`, enabled);
-        if (enabled) {
-            await this.update('idle');
-            vscode.window.showInformationMessage( vscode.l10n.t('Compile and preview are on for this local replica: "Compile Project" compiles it on Overleaf and "View Compiled PDF" shows the result.') );
-        } else {
-            this.status.hide();
-            vscode.window.showInformationMessage( vscode.l10n.t('Compile and preview are off for this local replica.') );
-        }
-    }
-
     /**
      * Stop compilation: stop the running compile, of whichever project it is. The compile keeps
      * the stop: a compile whose request has not reached Overleaf yet, because it saves the
@@ -523,10 +492,8 @@ export class CompileManager {
             return parseUri(docUri).pathParts.join('/');
         }
         if (docUri.scheme==='file') {
-            const path = await LocalReplicaSCMProvider.uriToPath(docUri); // like '/dir/name.tex'
-            if (path!==undefined && path.startsWith('/') && !isReplicaOwnPath(path)) {
-                return path.slice(1);
-            }
+            const replica = await readLocalReplicaProject();
+            return replica ? localReplicaPath(docUri, replica) || undefined : undefined;
         }
         return undefined;
     }
@@ -557,13 +524,14 @@ export class CompileManager {
 
     async syncCode() {
         const editor = vscode.window.activeTextEditor;
-        const uri = await CompileManager.check();
-        if (!uri || !editor) { return; }
+        if (!editor) { return; }
         const filePath = await CompileManager.projectPathOf(editor.document.uri);
         if (!filePath) {
             vscode.window.showInformationMessage( vscode.l10n.t('This file is not part of the Overleaf project.') );
             return;
         }
+        const uri = await CompileManager.check(editor.document.uri);
+        if (!uri) { return; }
         const startPoint = editor.selection.start;
         const vfs = await this.vfsm.prefetch(uri);
         // SyncTeX counts lines from 1, as the web editor sends them
@@ -742,13 +710,12 @@ export class CompileManager {
             // (VirtualFileSystem.compileProject)
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.compile`, (target?: vscode.Uri) => this.compile(true, false, target)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.recompileFromScratch`, () => this.compile(true, true)),
-            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.viewPdf`, () =>  this.openPdf()),
+            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.viewPdf`, (target?: vscode.Uri) => this.openPdf(target)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncCode`, () => this.syncCode()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncPdf`, (r) => this.syncPdf(r)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compilerManager.settings`, ()=> this.compileSettings()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.setCompiler`, () => this.setCompiler()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.setRootDoc`, () => this.setRootDoc()),
-            vscode.commands.registerCommand(`${ROOT_NAME}.localReplica.toggleCompileNPreview`, () => this.toggleLocalReplicaCompile()),
             // register compile conditions
             vscode.workspace.onDidSaveTextDocument(async (e) => {
                 const uri = await CompileManager.check.bind(this)(e.uri);
@@ -756,7 +723,7 @@ export class CompileManager {
                 const compileCondition = vscode.workspace.getConfiguration(`${ROOT_NAME}.compileOnSave`).get('enabled', true);
                 const postfixCondition = e.fileName.match(/\.tex$|\.sty$|\.cls$|\.bib$/i);
                 if (compileCondition && postfixCondition && vfs?.isInvisibleMode===false) {
-                    this.compile();
+                    return this.compile(false, false, uri);
                 }
             }),
             EventBus.on('compilerUpdateEvent', () => {

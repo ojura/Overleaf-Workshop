@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as os from 'os';
 import { ROOT_NAME } from '../consts';
 import { BaseAPI, GitTokenInfo, Identity, ProjectTagsResponseSchema } from '../api/base';
 import { checkGitToken, formatGitTokenStatus, gitTokenStatus, knownGitBridgeUrl } from '../api/gitBridge';
@@ -7,6 +8,7 @@ import { VirtualFileSystem, parseUri } from './remoteFileSystemProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 import { OverleafClient } from '../sandbox/client';
 import { formatProjectInfo, gatherProjectInfo } from '../sandbox/projectInfo';
+import { errorMessage } from '../utils/errorMessage';
 
 class DataItem extends vscode.TreeItem {
     constructor(
@@ -68,6 +70,11 @@ class ProjectItem extends DataItem {
     }
 
     setStatus(status:'normal' | 'archived' | 'trashed') {
+        this.command = status === 'normal' ? {
+            command: `${ROOT_NAME}.projectManager.openProjectInCurrentWindow`,
+            title: vscode.l10n.t('Open Project Locally'),
+            arguments: [this],
+        } : undefined;
         switch (status) {
             case 'normal':
                 this.contextValue = 'project';
@@ -712,101 +719,127 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
     }
 
     openProjectInCurrentWindow(project: ProjectItem) {
-        const uri = vscode.Uri.parse(project.uri);
-        vscode.commands.executeCommand('remoteFileSystem.prefetch', uri)
-        .then(() => {
-            vscode.commands.executeCommand('vscode.openFolder', uri, false);
-            vscode.commands.executeCommand('workbench.view.explorer');
-        });
+        return this.openProjectLocalReplica(project, false);
     }
 
     openProjectInNewWindow(project: ProjectItem) {
+        return this.openProjectLocalReplica(project, true);
+    }
+
+    private async openRemoteProject(project: ProjectItem, newWindow: boolean) {
         const uri = vscode.Uri.parse(project.uri);
-        vscode.commands.executeCommand('remoteFileSystem.prefetch', uri)
-        .then(() => {
-            vscode.commands.executeCommand('vscode.openFolder', uri, true);
-            vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
-            vscode.commands.executeCommand('workbench.view.explorer');
+        await vscode.commands.executeCommand('remoteFileSystem.prefetch', uri);
+        await this.openFolder(uri, newWindow);
+    }
+
+    openProjectRemoteInCurrentWindow(project: ProjectItem) {
+        return this.openRemoteProject(project, false);
+    }
+
+    openProjectRemoteInNewWindow(project: ProjectItem) {
+        return this.openRemoteProject(project, true);
+    }
+
+    private async openFolder(uri: vscode.Uri, newWindow: boolean) {
+        await vscode.commands.executeCommand('vscode.openFolder', uri, newWindow);
+        if (newWindow) { await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup'); }
+        await vscode.commands.executeCommand('workbench.view.explorer');
+    }
+
+    private selectLocalReplica(serverName: string, projectId: string, replicas: {uri: vscode.Uri; keys: string[]}[]): Promise<vscode.Uri | undefined> {
+        type ReplicaItem = vscode.QuickPickItem & {uri: vscode.Uri; keys: string[]};
+        return new Promise(resolve => {
+            const quickPick = vscode.window.createQuickPick<ReplicaItem>();
+            quickPick.placeholder = vscode.l10n.t('Select the local replica below.');
+            quickPick.ignoreFocusOut = true; // removal is confirmed in a separate notification
+            const removeButton: vscode.QuickInputButton = {
+                iconPath: new vscode.ThemeIcon('trash'),
+                tooltip: vscode.l10n.t('Remove local replica registration'),
+            };
+            quickPick.items = replicas.map(replica => ({...replica, label: replica.uri.fsPath, buttons: [removeButton]}));
+            const listeners: vscode.Disposable[] = [];
+            let settled = false;
+            let removing = false;
+            const finish = (uri?: vscode.Uri) => {
+                if (settled) { return; }
+                settled = true;
+                listeners.forEach(listener => listener.dispose());
+                quickPick.dispose();
+                resolve(uri);
+            };
+            listeners.push(quickPick.onDidHide(() => finish()));
+            listeners.push(quickPick.onDidAccept(() => {
+                const item = quickPick.selectedItems[0];
+                if (!removing && item && quickPick.items.includes(item)) { finish(item.uri); }
+            }));
+            listeners.push(quickPick.onDidTriggerItemButton(async ({button, item}) => {
+                if (settled || removing || button !== removeButton) { return; }
+                removing = true;
+                quickPick.busy = true;
+                quickPick.enabled = false;
+                try {
+                    const answer = await vscode.window.showWarningMessage(
+                        vscode.l10n.t('Remove local replica registration "{label}" ?', {label: item.label}), 'Yes', 'No');
+                    if (settled || answer !== 'Yes') { return; }
+                    for (const key of item.keys) {
+                        await GlobalStateManager.updateServerProjectSCMPersist(this.context, serverName, projectId, key);
+                    }
+                    if (settled) { return; }
+                    quickPick.items = quickPick.items.filter(candidate => candidate !== item);
+                    if (quickPick.items.length === 0) { finish(); }
+                } catch (error) {
+                    await vscode.window.showErrorMessage(errorMessage(error));
+                } finally {
+                    removing = false;
+                    if (!settled) { quickPick.busy = false; quickPick.enabled = true; }
+                }
+            }));
+            quickPick.show();
         });
     }
 
-    async openProjectLocalReplica(project: ProjectItem) {
-        // should close other open vfs firstly
-        const vfsFolder = vscode.workspace.workspaceFolders?.find(folder => folder.uri.scheme===ROOT_NAME);
-        if (vfsFolder) {
-            vscode.window.showWarningMessage( vscode.l10n.t('Please close the open remote overleaf folder firstly.') );
-            return;
-        }
-
-        const uri = vscode.Uri.parse(project.uri);
-        const {serverName,projectId} = parseUri(uri);
-        // fetch existing local replica scm
-        let scmPersists = GlobalStateManager.getServerProjectSCMPersists(this.context, serverName, projectId);
-        let replicas = Object.values(scmPersists).filter(scmPersist => scmPersist.label===LocalReplicaSCMProvider.label);
-        // if not exist, create new one
-        if (replicas.length===0) {
-            const vfs = (await (await vscode.commands.executeCommand('remoteFileSystem.prefetch', uri))) as VirtualFileSystem;
-            await vfs.init();
-            const answer = await vscode.window.showWarningMessage( vscode.l10n.t('No local replica found, create one for project "{label}" ?', {label:project.label}), "Yes", "No");
-            if (answer === "Yes") {
-                await (await vscode.commands.executeCommand(`${ROOT_NAME}.projectSCM.newSCM`, LocalReplicaSCMProvider));
-                // fetch local replica scm again
-                scmPersists = GlobalStateManager.getServerProjectSCMPersists(this.context, serverName, projectId);
-                replicas = Object.values(scmPersists).filter(scmPersist => scmPersist.label===LocalReplicaSCMProvider.label);
-            } else {
-                vfs.dispose();
-                return;
+    async openProjectLocalReplica(project: ProjectItem, newWindow = false) {
+        try {
+            const projectUri = vscode.Uri.parse(project.uri);
+            const {serverName, projectId} = parseUri(projectUri);
+            const persists = GlobalStateManager.getServerProjectSCMPersists(this.context, serverName, projectId);
+            const replicas = new Map<string, {uri: vscode.Uri; keys: string[]}>();
+            for (const [key, persist] of Object.entries(persists)) {
+                if (persist.label !== LocalReplicaSCMProvider.label) { continue; }
+                // Older registrations stored Uri.path; newer ones store the full file URI.
+                const parsed = vscode.Uri.parse(persist.baseUri);
+                const uri = parsed.scheme ? parsed : parsed.with({scheme: 'file'});
+                if (uri.scheme !== 'file' || !await LocalReplicaSCMProvider.isReplicaForProject(uri, projectUri)) { continue; }
+                const identity = process.platform === 'win32' ? uri.toString().toLowerCase() : uri.toString();
+                const previous = replicas.get(identity);
+                if (previous) { previous.keys.push(key); }
+                else { replicas.set(identity, {uri, keys: [key]}); }
             }
-            vfs.dispose();
+            let folder: vscode.Uri | undefined;
+            if (replicas.size === 1) {
+                folder = [...replicas.values()][0].uri;
+            } else if (replicas.size > 1) {
+                folder = await this.selectLocalReplica(serverName, projectId, [...replicas.values()]);
+            } else {
+                const selected = await vscode.window.showOpenDialog({
+                    title: vscode.l10n.t('Choose a parent folder for the local replica of "{label}"', {label: project.label}),
+                    openLabel: vscode.l10n.t('Use Parent Folder'),
+                    canSelectFiles: false,
+                    canSelectFolders: true,
+                    canSelectMany: false,
+                    defaultUri: vscode.Uri.file(os.homedir()),
+                });
+                if (!selected?.[0]) { return; }
+                // This VFS is app-owned. Preparing the selected project's replica neither
+                // initializes nor disposes it; the local workspace starts its normal sync.
+                const vfs = await vscode.commands.executeCommand<VirtualFileSystem>('remoteFileSystem.prefetch', projectUri);
+                if (!vfs) { throw new Error(vscode.l10n.t('The selected project could not be opened.')); }
+                folder = await LocalReplicaSCMProvider.createReplica(vfs, selected[0]);
+            }
+            if (folder) { await this.openFolder(folder, newWindow); }
+        } catch (error) {
+            await vscode.window.showErrorMessage(vscode.l10n.t('Could not open local replica: {message}', {message: errorMessage(error)}));
         }
-
-        // open local replica
-        const replicasPath = replicas.map(scmPersist => vscode.Uri.parse(scmPersist.baseUri).fsPath);
-        if (replicasPath.length===0) { return; }
-        const quickPickItems = replicasPath.map(path => {
-            let label = path;
-            let buttons = [{
-                id: "removal",
-                iconPath: new vscode.ThemeIcon('trash'),
-                tooltip: vscode.l10n.t('Remove local replica'),
-            }];
-            return {label, buttons};
-        });
-
-        // select local replica via quick pick
-        new Promise(resolve => {
-            const quickPick = vscode.window.createQuickPick();
-            quickPick.placeholder = vscode.l10n.t('Select the local replica below.');
-            quickPick.items = quickPickItems;
-            quickPick.onDidTriggerItemButton(({button,item}) => {
-                if ((button as any).id === "removal") {
-                    vscode.window.showWarningMessage( vscode.l10n.t('Remove local replica "{label}" ?', {label:item.label}), 'Yes', 'No')
-                    .then(answer => {
-                        if (answer === 'Yes') {
-                            // remove local replica from scm persists
-                            const scmKey = Object.keys(scmPersists).find(key => vscode.Uri.parse(scmPersists[key].baseUri).fsPath===item.label)!;
-                            GlobalStateManager.updateServerProjectSCMPersist(this.context, serverName, projectId, scmKey);
-                            // remove entry from quick pick
-                            quickPick.items = quickPick.items.filter(item => item.label!==item.label);
-                        }
-                    });
-                }
-            });
-            quickPick.onDidAccept(() => {
-                const path = quickPick.selectedItems[0]?.label;
-                if (path) {
-                    quickPick.dispose();
-                    resolve(path);
-                }
-            });
-            quickPick.show();
-        })
-        .then(path => {
-            const uri = vscode.Uri.file(path as string);
-            // always open in current window
-            vscode.commands.executeCommand('vscode.openFolder', uri, false);
-            vscode.commands.executeCommand('workbench.view.explorer');
-        });
     }
 
     get triggers() {
@@ -877,15 +910,11 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
                 this.removeProjectFromTag(item);
             }),
             // register open project commands
-            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectInCurrentWindow`, (item) => {
-                this.openProjectInCurrentWindow(item);
-            }),
-            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectInNewWindow`, (item) => {
-                this.openProjectInNewWindow(item);
-            }),
-            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectLocalReplica`, (item) => {
-                this.openProjectLocalReplica(item);
-            }),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectInCurrentWindow`, item => this.openProjectInCurrentWindow(item)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectInNewWindow`, item => this.openProjectInNewWindow(item)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectLocalReplica`, item => this.openProjectLocalReplica(item)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectRemoteInCurrentWindow`, item => this.openProjectRemoteInCurrentWindow(item)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectRemoteInNewWindow`, item => this.openProjectRemoteInNewWindow(item)),
         ];
     }
 }

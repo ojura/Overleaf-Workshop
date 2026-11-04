@@ -1,14 +1,15 @@
 import * as vscode from 'vscode';
-import { ROOT_NAME, ELEGANT_NAME } from './consts';
+import { ROOT_NAME } from './consts';
 
-import { RemoteFileSystemProvider, VirtualFileSystem } from './core/remoteFileSystemProvider';
+import { RemoteFileSystemProvider } from './core/remoteFileSystemProvider';
 import { ProjectManagerProvider } from './core/projectManagerProvider';
 import { PdfViewEditorProvider } from './core/pdfViewEditorProvider';
 import { CompileManager } from './compile/compileManager';
+import { ProjectContexts } from './compile/projectContext';
 import { LangIntellisenseProvider } from './intellisense';
 import { LocalReplicaSCMProvider } from './scm/localReplicaSCM';
 
-export function activate(context: vscode.ExtensionContext) {
+export function activate(context: vscode.ExtensionContext): Promise<void> {
     // Register: [core] RemoteFileSystemProvider
     const remoteFileSystemProvider = new RemoteFileSystemProvider(context);
     context.subscriptions.push( ...remoteFileSystemProvider.triggers );
@@ -34,23 +35,13 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand(`${ROOT_NAME}.localReplica.syncNow`, () => LocalReplicaSCMProvider.syncNowCommand()),
     );
 
-    // activate vfs for local replica
-    LocalReplicaSCMProvider.readSettings()
-    .then(async setting => {
-        if (setting?.uri) {
-            const uri = vscode.Uri.parse(setting.uri);
-            if (uri.scheme===ROOT_NAME) {
-                // activate vfs
-                const vfs = (await (await vscode.commands.executeCommand('remoteFileSystem.prefetch', uri))) as VirtualFileSystem;
-                await vfs.init();
-                vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activate`, true);
-                // activate compile & preview
-                if (setting?.enableCompileNPreview) {
-                    vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activateCompile`, true);
-                }
-            }
-        }
+    // Recognize the local project and show its commands before its network connection starts.
+    const projectContexts = new ProjectContexts(async uri => {
+        const vfs = await remoteFileSystemProvider.prefetch(uri);
+        await vfs.init();
     });
+    context.subscriptions.push(projectContexts);
+    return projectContexts.ready;
 }
 
 export function deactivate() {

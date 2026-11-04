@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import { ROOT_NAME } from '../consts';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { FileRefEntity, FolderEntity, VirtualFileSystem, __OUTPUTS_ID, parseUri } from '../core/remoteFileSystemProvider';
 import {
@@ -15,8 +16,12 @@ import { ControlAnswer, ControlRequest, ReplicaControlServer } from './replicaCo
 import { ReplicaModes, replicaModes } from './replicaModes';
 import { GitReplicaStore, OVERLEAF_REF, Person } from './replicaGit';
 import type { HistoryUpdate } from '../gitbridge/history';
+import { errorMessage } from '../utils/errorMessage';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
+
+interface ReplicaProjectSettings { uri: string; [key: string]: unknown }
+class InvalidReplicaSettingsError extends Error {}
 
 /**
  * How often a replica that syncs the changes of other programs also scans its folder, in case a
@@ -102,6 +107,131 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return sanitized;
     }
 
+    private static async replicaSettings(baseUri: vscode.Uri): Promise<ReplicaProjectSettings | undefined> {
+        const file = vscode.Uri.joinPath(baseUri, REPLICA_SETTINGS_FILE).fsPath;
+        let text: string;
+        try { text = await fs.promises.readFile(file, 'utf8'); }
+        catch (error) {
+            if (localFs.isMissing(error)) { return undefined; }
+            throw error;
+        }
+        try {
+            const settings = JSON.parse(text);
+            if (!settings || typeof settings !== 'object' || typeof settings.uri !== 'string') {
+                throw new Error(vscode.l10n.t('The project URI is missing.'));
+            }
+            return settings;
+        } catch (error) {
+            throw new InvalidReplicaSettingsError(vscode.l10n.t('Could not read replica settings "{file}": {message}', {file, message: errorMessage(error)}));
+        }
+    }
+
+    private static settingsMatchProject(settings: ReplicaProjectSettings, projectUri: vscode.Uri): boolean {
+        try {
+            const storedUri = vscode.Uri.parse(settings.uri);
+            if (storedUri.scheme !== ROOT_NAME || projectUri.scheme !== ROOT_NAME) { return false; }
+            const stored = parseUri(storedUri), selected = parseUri(projectUri);
+            // Labels and the account opening a shared project can change. The server and
+            // project ID identify which project may sync with this folder.
+            return !!stored.projectId && !!stored.serverName
+                && stored.projectId === selected.projectId && stored.serverName === selected.serverName;
+        } catch { return false; }
+    }
+
+    private static assertSettingsMatchProject(settings: ReplicaProjectSettings, baseUri: vscode.Uri, projectUri: vscode.Uri) {
+        if (!LocalReplicaSCMProvider.settingsMatchProject(settings, projectUri)) {
+            throw new Error(vscode.l10n.t('The folder "{folder}" contains replica settings for a different project. Choose another folder.', {folder: baseUri.fsPath}));
+        }
+    }
+
+    /** Whether a registered folder still exists and belongs to the selected project. */
+    public static async isReplicaForProject(baseUri: vscode.Uri, projectUri: vscode.Uri): Promise<boolean> {
+        if (baseUri.scheme !== 'file') { return false; }
+        try {
+            if (!(await fs.promises.stat(baseUri.fsPath)).isDirectory()) { return false; }
+            const settings = await LocalReplicaSCMProvider.replicaSettings(baseUri);
+            return settings !== undefined && LocalReplicaSCMProvider.settingsMatchProject(settings, projectUri);
+        } catch (error) {
+            if (localFs.isMissing(error) || error instanceof InvalidReplicaSettingsError) { return false; }
+            throw error;
+        }
+    }
+
+    /** Write first-time metadata without replacing an existing folder's project identity. */
+    private static async initializeSettings(vfs: VirtualFileSystem, baseUri: vscode.Uri): Promise<void> {
+        const existing = await LocalReplicaSCMProvider.replicaSettings(baseUri);
+        if (existing) {
+            LocalReplicaSCMProvider.assertSettingsMatchProject(existing, baseUri, vfs.origin);
+            return;
+        }
+        const file = vscode.Uri.joinPath(baseUri, REPLICA_SETTINGS_FILE).fsPath;
+        await fs.promises.mkdir(path.dirname(file), {recursive: true});
+        let handle: fs.promises.FileHandle;
+        try { handle = await fs.promises.open(file, 'wx'); }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') { throw error; }
+            const appeared = await LocalReplicaSCMProvider.replicaSettings(baseUri);
+            if (!appeared) { throw error; }
+            LocalReplicaSCMProvider.assertSettingsMatchProject(appeared, baseUri, vfs.origin);
+            return;
+        }
+        let identity: fs.Stats | undefined;
+        try {
+            try {
+                identity = await handle.stat();
+                await handle.writeFile(JSON.stringify({
+                    uri: vfs.origin.toString(),
+                    serverName: vfs.serverName,
+                    projectName: vfs.projectName,
+                }, null, 4));
+                await handle.sync();
+            } finally { await handle.close(); }
+        } catch (error) {
+            // Only remove the partial file this call created, never a replacement by another
+            // writer. A later attempt can then create the settings again.
+            try {
+                const current = await fs.promises.lstat(file);
+                if (identity && current.dev === identity.dev && current.ino === identity.ino) { await fs.promises.unlink(file); }
+            } catch { /* preserve the original write failure */ }
+            throw error;
+        }
+    }
+
+    /**
+     * Prepare and register the selected project's local folder. No VFS is initialized or
+     * disposed here: opening this folder activates the ordinary replica sync in that window.
+     */
+    public static async createReplica(vfs: VirtualFileSystem, parent: vscode.Uri): Promise<vscode.Uri> {
+        if (parent.scheme !== 'file') {
+            throw new Error(vscode.l10n.t('Choose a local folder for the replica.'));
+        }
+        const selectedSettings = await LocalReplicaSCMProvider.replicaSettings(parent);
+        let baseUri = parent;
+        if (selectedSettings) {
+            LocalReplicaSCMProvider.assertSettingsMatchProject(selectedSettings, parent, vfs.origin);
+        } else {
+            const folderName = LocalReplicaSCMProvider.sanitizeProjectFolderName(vfs.projectName);
+            if (path.basename(parent.fsPath) !== folderName) { baseUri = vscode.Uri.joinPath(parent, folderName); }
+        }
+        await fs.promises.mkdir(baseUri.fsPath, {recursive: true});
+        const existing = await LocalReplicaSCMProvider.replicaSettings(baseUri);
+        if (existing) {
+            LocalReplicaSCMProvider.assertSettingsMatchProject(existing, baseUri, vfs.origin);
+        } else if ((await fs.promises.readdir(baseUri.fsPath)).length !== 0) {
+            throw new Error(vscode.l10n.t('The folder "{folder}" is not empty and is not a replica of this project. Choose another parent folder.', {folder: baseUri.fsPath}));
+        }
+        await LocalReplicaSCMProvider.initializeSettings(vfs, baseUri);
+        const key = baseUri.toString();
+        const registered = vfs.getProjectSCMPersist(key);
+        await vfs.setProjectSCMPersist(key, {
+            enabled: registered?.enabled ?? true,
+            label: LocalReplicaSCMProvider.label,
+            baseUri: key,
+            settings: registered?.settings ?? {},
+        });
+        return baseUri;
+    }
+
     public static async validateBaseUri(uri: string, projectName?: string): Promise<vscode.Uri> {
         try {
             let baseUri = vscode.Uri.file(uri);
@@ -153,14 +283,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         } catch (error) {
             return undefined;
         }
-    }
-
-    /** Write the settings file of the workspace's local replica. */
-    public static async writeSettings(settings: any): Promise<void> {
-        const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
-        if (workspaceRoot===undefined || workspaceRoot.scheme!=='file') { return; }
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, REPLICA_SETTINGS_FILE);
-        await vscode.workspace.fs.writeFile(settingUri, Buffer.from(JSON.stringify(settings, null, 4)));
     }
 
     public static async readSettings(): Promise<any | undefined> {
@@ -965,19 +1087,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 throw error;
             }
         };
-        // write the settings file if it does not exist
         const settingUri = vscode.Uri.joinPath(this.baseUri, REPLICA_SETTINGS_FILE);
-        await step(`The replica's settings file ${settingUri.fsPath} could not be written`, async () => {
-            if (await localFs.exists(settingUri)) { return; }
-            await localFs.writeFile(settingUri, Buffer.from(
-                JSON.stringify({
-                    'uri': this.vfs.origin.toString(),
-                    'serverName': this.vfs.serverName,
-                    'enableCompileNPreview': false,
-                    'projectName': this.vfs.projectName,
-                }, null, 4)
-            ), this.temporaryFolder);
-        });
+        await step(`The replica's settings file ${settingUri.fsPath} could not be prepared`,
+                   () => LocalReplicaSCMProvider.initializeSettings(this.vfs, this.baseUri));
 
         // One sync per folder: a reconnect creates a new provider for the same folder, and
         // its sync starts only after the previous one has stopped.

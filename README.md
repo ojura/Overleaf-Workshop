@@ -5,11 +5,18 @@
 [![installs](https://vsmarketplacebadges.dev/installs-short/iamhyc.overleaf-workshop.jpg)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop)
 [![rating](https://vsmarketplacebadges.dev/rating-short/iamhyc.overleaf-workshop.jpg)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop&ssr=false#review-details)
 
-Open Overleaf (ShareLatex) projects in VSCode, with full collaboration support.
+Work on Overleaf projects in a local folder, with live collaboration, Git history,
+compilation on Overleaf and integrated PDF preview.
+
+Opening a project creates or reuses its local replica. **Compile Project** and
+**View Compiled PDF** are available as soon as the folder is recognized, including
+for existing replicas. The project menu also offers explicit remote-only opening
+in the current window or a new one.
 
 ### User Guide
 
-The full user guide is available at [GitHub Wiki](https://github.com/overleaf-workshop/Overleaf-Workshop/wiki).
+The [user guide](docs/wiki.md) covers the local workflow, and
+[replica workflows](docs/replica-workflows.md) describes synchronization and Git.
 
 ### Features
 
@@ -34,7 +41,7 @@ The full user guide is available at [GitHub Wiki](https://github.com/overleaf-wo
 
     <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo06-chat.gif" height=400px/>
 
-- Open Project Locally, Compile/Preview with [LaTeX-Workshop](https://github.com/James-Yu/LaTeX-Workshop)
+- Edit Local Files with Live Overleaf Sync and Integrated Compile/PDF Controls
 
     <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo07-local.gif" height=400px/>
 

@@ -78,6 +78,7 @@ const uri = (value: string) => {
     const query = value.split('?')[1] ?? '';
     return { scheme: value.split(':')[0], path: '/Book', query: decodeURIComponent(query), authority: 'www.overleaf.com', fsPath: value.replace(/^file:\/\//, ''), toString: () => value };
 };
+let replicaFolder: { scheme: string, authority: string, path: string, fsPath: string, toString(): string } | undefined;
 const vscodeMock = withStubs({
     Disposable: class { dispose() {} },
     EventEmitter: class { event = () => ({ dispose() {} }); fire() {} dispose() {} },
@@ -86,7 +87,10 @@ const vscodeMock = withStubs({
     Uri: { parse: uri },
     l10n: { t: (message: string) => message },
     window: withStubs({ showWarningMessage: async () => undefined, createStatusBarItem: () => withStubs({ show() {}, hide() {} }) }),
-    workspace: withStubs({ saveAll: async () => true, getConfiguration: () => ({ get: (_key: string, value: any) => value }), textDocuments: [] }),
+    workspace: withStubs({
+        get workspaceFolders() { return replicaFolder ? [{ uri: replicaFolder }] : undefined; },
+        saveAll: async () => true, getConfiguration: () => ({ get: (_key: string, value: any) => value }), textDocuments: [],
+    }),
 });
 const { CompileManager, LocalReplicaSCMProvider } = loadWithVscode(vscodeMock, () => ({
     CompileManager: require('../compile/compileManager').CompileManager,
@@ -96,14 +100,18 @@ const { CompileManager, LocalReplicaSCMProvider } = loadWithVscode(vscodeMock, (
 describe('CompileManager and a local replica\'s logs', () => {
     const saved = { readSettings: LocalReplicaSCMProvider.readSettings, pathToUri: LocalReplicaSCMProvider.pathToUri, flushAll: LocalReplicaSCMProvider.flushAll };
     let dir: string;
-    beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'replica-compile-test-')); });
+    beforeEach(() => {
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), 'replica-compile-test-'));
+        replicaFolder = { scheme: 'file', authority: '', path: dir, fsPath: dir, toString: () => 'file://' + dir };
+    });
     afterEach(() => {
         Object.assign(LocalReplicaSCMProvider, saved);
+        replicaFolder = undefined;
         fs.rmSync(dir, { recursive: true, force: true });
     });
 
     async function compileWith(projectInSettings: string, compiled: boolean) {
-        LocalReplicaSCMProvider.readSettings = async () => ({ uri: `overleaf-workshop://www.overleaf.com/Book?user%3Du%26project%3D${projectInSettings}`, enableCompileNPreview: true });
+        LocalReplicaSCMProvider.readSettings = async () => ({ uri: `overleaf-workshop://www.overleaf.com/Book?user%3Du%26project%3D${projectInSettings}` });
         LocalReplicaSCMProvider.pathToUri = async (p: string) => uri(`file://${path.join(dir, p)}`);
         LocalReplicaSCMProvider.flushAll = async () => {};
         const downloads: string[] = [];
@@ -125,7 +133,7 @@ describe('CompileManager and a local replica\'s logs', () => {
             downloadCompileOutput: async (file: any) => { downloads.push(file.path); return new TextEncoder().encode('log'); },
         };
         const manager = new CompileManager({ prefetch: async () => vfs });
-        await manager.compile(true);
+        await manager.compile(true, false, uri('overleaf-workshop://www.overleaf.com/Book?user%3Du%26project%3Dp1'));
         await called;
         for (let i = 0; i < 20; i++) { await new Promise(resolve => setImmediate(resolve)); }
         await (manager as any).outputSaves;

@@ -127,40 +127,39 @@ If you want to add a project to multiple tags, please manage the tags on the web
 
 ### Open Project
 
-#### Open Project in Current/New Window
+#### Work in a local replica
 
-![screenshot-open-project](assets/screenshot-open-project.png)
+Select a project in the project list, or choose **Open Project Locally**. The
+extension opens its local replica, a folder on your computer that stays in sync
+with Overleaf. **Open Project Locally in New Window** opens it alongside your
+current workspace.
 
-The Overleaf Workshop extension by default will open you project in a [virtual workspace](https://code.visualstudio.com/api/extension-guides/virtual-workspaces), just like the [WSL Extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-wsl).
-You can choose to open the project in the current window or a new window. If you open the project in the current window, the current workspace will be replaced with the corresponding virtual workspace of the project.
+An existing replica opens directly when it is the project's only valid local
+copy. If you have several replicas, choose the folder to open. For a project
+without a replica, choose a parent folder. The extension creates a subfolder
+named after the project, or reuses a matching replica already there. A destination
+containing unrelated files needs a different location.
 
-However, due to the [limitation of the virtual workspace](https://github.com/microsoft/vscode/wiki/Virtual-Workspaces#signal-whether-your-extension-can-handle-virtual-workspaces), most of the existing VS Code extensions does not work in the virtual workspace. Meanwhile, the Overleaf Workshop extension is still under active development, and cannot compete with the matured [LaTeX Workshop Extension](https://github.com/James-Yu/LaTeX-Workshop) in terms of features and stability. In this case, you can choose to open the project locally.
+The local folder provides **Compile Project**, **View Compiled PDF** and source/PDF
+jumps automatically. Compilation runs on Overleaf after the local changes are
+uploaded. Use **Ctrl+Alt+B** to compile and **Ctrl+Alt+V** to open the PDF
+(**Cmd+Alt+B/V** on macOS). Automatic compilation on save has its own preference.
 
-#### Open Project Locally
+The files are also available to your other editor extensions, command-line tools
+and Git. [Local replica settings and synchronization](#local-replica-settings-and-synchronization)
+describes how changes reach Overleaf and how to use the replica's Git history.
 
-> [!NOTE]
-> The Overleaf features are not completely enabled in a local folder. Specifically, the [compile](#compile-project), [PDF preview](#preview-document), [intellisense](#intellisense) and [project history](#history-of-changes) features are disabled by default.
-> 
-> Currently, there is no way to enable these features in a local folder, especially considering people would like to use the LaTeX Workshop extension in a local folder. If you are in demand of these features, please consider to create a discussion in the [GitHub Discussions](https://github.com/overleaf-workshop/Overleaf-Workshop/discussions)
+#### Open a remote project
 
-The "Open Project Locally" feature is provided via a [local replica](#local-replica). The local replica is a folder on your local machine with a `.overleaf` folder presence, which is kept in sync with the project on the Overleaf server.
-
-Please follow the steps below to setup a local replica and open the project locally:
-1. Right click on the project and select `Open Project Locally...` in the context menu. A dialog will pop up to ask you to select a folder to create the local replica, if you have not created one before.
-
-    ![screenshot-create-local-replica](assets/screenshot-create-local-replica.png)
-
-2. After confirm to create the local replica, a input box will pop up to ask you to choose the local parent folder to store the local replica. The auto-completion is supported with the start path as the root filesystem `/` (for Windows, it is actually `C:\`).
-
-    When the parent folder path is chosen, please click the `Check` button on the right upper corner to submit the path. Please make sure the parent folder is writable and the local replica path will be created under the parent folder as `${parentFolder}/${projectName}`. If the local replica path already exists, it will be overwritten.
-
-    ![screenshots-setup-local-replica-folder](assets/screenshot-setup-local-replica-folder.png)
-
-3. After the local replica is created, a input box will pop up to ask you to choose the local replica folder to open. Then you can open the project locally.
+For a remote-only workspace, use **Open Remote Project in Current Window** or
+**Open Remote Project in New Window** in the project's context menu. This opens
+the project through the extension's virtual filesystem. The current-window
+choice replaces the workspace; the new-window choice leaves it open.
 
 ## Basic Usage
 
-In this section, we assume you have opened a project in a default way (i.e., in a virtual workspace), cause [some features are not available in a local folder](#open-project-locally).
+The normal workflow uses a local replica. Compile and PDF preview are available
+for both local replicas and remote project workspaces.
 
 ### Files Management
 
@@ -318,14 +317,11 @@ To enhance the experience of collaboration via chat, we propose the following ad
 
 ![screenshot-advance-chat](assets/screenshot-advance-chat.png)
 
-### Local Replica (Source Control)
-> [!WARNING]
-> This feature is not considered robust yet, and may not work as expected, especially under unstable network environment.
-> Please use it with caution.
+## Local replica settings and synchronization
 
-The Local Replica feature is a implementation of [Source Control Manager](anatomy.md#srcscm), which enables the possibility of "Open Project Locally".
-
-The entrance is available on the status bar when you open the project locally. Or you can configure it via the "Configure Source Control" command in the command palette.
+A local replica is the project's ordinary working folder. Its source-control
+status appears in the status bar. Use **Configure Source Control** to change its
+sync options and ignored paths.
 
 ![screenshot-local-replica-status](assets/screenshot-local-replica-status.png)
 
@@ -333,16 +329,30 @@ In the Local Replica configuration, you can choose to enable/disable the Local R
 
 ![screenshot-config-local-replica](assets/screenshot-config-local-replica.png)
 
-The project-related metadata for local replica are located in `.overleaf/settings.json` in the following format:
+The project association is stored in `.overleaf/settings.json`:
+
 ```json
 {
-    "uri": "overleaf-workshop://overleaf.com/example-project?user%3D<user_id>%26project%3D<project_id>",
-    "serverName": "overleaf.com",
-    "enableCompileNPreview": false,
-    "projectName": "example-project",
+    "uri": "overleaf-workshop://www.overleaf.com/example-project?user%3D<user_id>%26project%3D<project_id>",
+    "serverName": "www.overleaf.com",
+    "projectName": "example-project"
 }
 ```
-Most of the items are immutable, except for `enableCompileNPreview`, which is used to enable/disable the compile and preview feature in local folder. The default value is `false`.
+
+Compile and PDF preview are available when the extension recognizes this
+association. Existing replicas receive the same behavior, including those with
+an old `enableCompileNPreview` field.
+
+### Debugging compile and preview
+
+The advanced setting
+`overleaf-workshop.debug.disableLocalReplicaCompilePreview` temporarily disables
+these features for a local replica. It defaults to `false` and takes effect
+without a reload. Use it when diagnosing extension problems. Automatic
+compilation on save is controlled separately by
+`overleaf-workshop.compileOnSave.enabled`.
+
+### Synchronization
 
 Files that other programs write into the local replica are uploaded as well when the setting `overleaf-workshop.localReplica.syncOnFileChange.enabled` is on. The extension watches the folder itself, and also scans it once a minute for a change it missed. With the setting off, saves in the editor, new files and removed files sync as they happen, and other changes wait for a sync.
 
@@ -353,7 +363,7 @@ node out/sandbox/cli.js replica-status --replica <folder>
 ```
 The window answers on a local socket that only your account on the computer can reach, and names it in `.overleaf/control.json`. When the socket's path is longer than the operating system allows (107 bytes on Linux, 103 on macOS), the window does not listen, says why in its log and in that file, and the tools report it; a shorter `XDG_RUNTIME_DIR` fixes it.
 
-#### The replica's git repository
+### The replica's git repository
 
 The local replica is a git repository (`.git` in its folder, never uploaded), and git merges the changes made on both sides:
 - Overleaf's states are commits on `refs/remotes/overleaf/main`, made about ten seconds after a change: by the person the project's history names for an edit made on Overleaf, and by you (`user.name` and `user.email`) for an upload from the folder. The checked-out branch takes them as a fast-forward, or as a merge when it has commits of its own.
@@ -368,7 +378,7 @@ The commit must descend from the checked-out one, which Overleaf must hold. A de
 
 The settings `overleaf-workshop.localReplica.fetchMode` and `overleaf-workshop.localReplica.pushMode` also bring in the commits of Overleaf's git bridge, or make pushes go through it. [docs/replica-workflows.md](replica-workflows.md) describes all of it.
 
-### Invisible Mode
+## Invisible Mode
 > [!WARNING]
 > This feature is not considered robust yet, and may not work as expected, especially under unstable network environment.
 > Please use it with caution.
