@@ -323,6 +323,9 @@ describe('PDF prefetch performance measurements', function () {
         };
         const remove = (name: string, listener: unknown) => { listeners.get(name)?.delete(listener); };
         const canvases: Node[] = [], observers: Array<{ disconnected: boolean }> = [];
+        const layouts: any[] = [];
+        const timers = new Map<number, () => void>(), frames = new Map<number, (time: number) => void>();
+        let scheduleId = 0;
         const document: any = { hidden: true, addEventListener: add, removeEventListener: remove };
         const context = new Proxy({} as Record<string, unknown>, {
             get(target, key: string) {
@@ -338,19 +341,29 @@ describe('PDF prefetch performance measurements', function () {
             readonly children: Node[] = [];
             readonly style: Record<string, string> = {};
             readonly dataset: Record<string, string> = {};
+            readonly handlers = new Map<string, Set<() => void>>();
             shadow: any;
             append(...nodes: Node[]) { for (const node of nodes) { node.remove(); node.parentNode = this; this.children.push(node); } }
             replaceChildren(...nodes: Node[]) { for (const node of [...this.children]) { node.remove(); } this.append(...nodes); }
             remove() { if (this.parentNode) { this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1); this.parentNode = null; } }
             setAttribute() {}
-            addEventListener() {}
+            addEventListener(name: string, listener: () => void) {
+                if (!this.handlers.has(name)) { this.handlers.set(name, new Set()); }
+                this.handlers.get(name)!.add(listener);
+            }
+            removeEventListener(name: string, listener: () => void) { this.handlers.get(name)?.delete(listener); }
+            emit(name: string) { for (const listener of [...this.handlers.get(name) ?? []]) { listener(); } }
+            focus() { document.activeElement = this; }
+            getBoundingClientRect() { return { x: 500, y: 100, left: 500, top: 100, right: 956, bottom: 600, width: 456, height: 500 }; }
             getContext() { return context; }
             attachShadow() {
                 const nodes = new Map<string, Node>();
-                return this.shadow = { innerHTML: '', querySelectorAll: () => [], querySelector(selector: string) {
+                const lookup = (selector: string) => {
                     if (!nodes.has(selector)) { nodes.set(selector, new Node()); }
                     return nodes.get(selector)!;
-                } };
+                };
+                const fields = ['margin', 'status'].map(name => { const node = lookup('[data-field="' + name + '"]'); node.dataset.field = name; return node; });
+                return this.shadow = { innerHTML: '', querySelectorAll: () => fields, querySelector: lookup };
             }
         }
         class Observer {
@@ -362,16 +375,26 @@ describe('PDF prefetch performance measurements', function () {
         document.body = new Node();
         document.createElement = (tag: string) => { const node = new Node(); if (tag === 'canvas') { canvases.push(node); } return node; };
         document.defaultView = {
+            innerWidth: 1024, innerHeight: 768, addEventListener: add, removeEventListener: remove,
             devicePixelRatio: 1, performance: { now: () => 0 },
             crypto: { getRandomValues: (values: Uint32Array) => { values[0] = 13; return values; } },
             matchMedia: () => ({ matches: false, addEventListener: add, removeEventListener: remove }),
-            setInterval() { assert.fail('a hidden lab does not poll'); }, clearInterval() {},
-            requestAnimationFrame() { assert.fail('a hidden lab does not animate'); }, cancelAnimationFrame() {},
+            setInterval(callback: () => void) {
+                assert.ok(!document.hidden, 'a hidden lab does not poll');
+                const id = ++scheduleId; timers.set(id, callback); return id;
+            },
+            clearInterval(id: number) { timers.delete(id); },
+            requestAnimationFrame(callback: (time: number) => void) {
+                assert.ok(!document.hidden, 'a hidden lab does not animate');
+                const id = ++scheduleId; frames.set(id, callback); return id;
+            },
+            cancelAnimationFrame(id: number) { frames.delete(id); },
         };
         for (const name of ['ResizeObserver', 'IntersectionObserver']) { document.defaultView[name] = Observer; }
         const container = new Node(), transit = new Node(); transit.id = 'document-transit';
         document.body.append(container); container.append(transit);
-        const diagnostics = performanceModule.installPrefetchDiagnostics(container, () => { assert.fail('a hidden document does not sample'); });
+        const diagnostics = performanceModule.installPrefetchDiagnostics(container, () => { assert.fail('a hidden document does not sample'); },
+            { onPanelLayout: (layout: any) => layouts.push(layout) });
         try {
             diagnostics.setEnabled(true);
             const host = [...container.children, ...document.body.children].find(node => node.id === 'pdf-prefetch-diagnostics')!;
@@ -380,16 +403,59 @@ describe('PDF prefetch performance measurements', function () {
             assert.ok(host.shadow.innerHTML.includes('position:fixed'), 'the lab keeps its viewport position when its sibling scrolls');
             const layer = host.shadow.innerHTML.match(/:host\s*\{[^}]*z-index:(\d+)/)!;
             assert.ok(Number(layer[1]) < 2147483647, 'the real courier may paint above the lab during departure and return');
+            assert.deepStrictEqual(layouts.map(layout => [layout.visible, layout.reason]), [[true, 'open']]);
+            assert.ok(host.shadow.innerHTML.includes('class="panel-drag" tabindex="0"'), 'the title has keyboard movement access');
+            host.shadow.querySelector('[data-panel-dock="left"]').emit('click');
+            assert.strictEqual(layouts.at(-1).dock, 'left');
+            assert.strictEqual(layouts.at(-1).reason, 'dock');
+            assert.strictEqual(layouts.at(-1).rect.x, 8);
             diagnostics.setEnabled(false);
             assert.strictEqual(host.hidden, true);
+            assert.strictEqual(layouts.at(-1).visible, false);
             diagnostics.setEnabled(true);
             assert.strictEqual(document.body.children.filter((node: Node) => node.id === host.id).length, 1);
         } finally { diagnostics.dispose(); }
         assert.deepStrictEqual(container.children, [transit]);
         assert.deepStrictEqual(document.body.children, [container]);
+        assert.strictEqual(layouts.at(-1).visible, false, 'disposal reports the final closed layout');
         assert.ok(canvases.every(canvas => canvas.width === 0 && canvas.height === 0));
         assert.ok(observers.every(observer => observer.disconnected));
         assert.ok([...listeners.values()].every(group => group.size === 0));
+
+        document.hidden = false;
+        for (const when of ['open', 'close']) {
+            let controls: any, opened = 0;
+            const reports: any[] = [];
+            controls = performanceModule.installPrefetchDiagnostics(container, () => ({
+                direction: 0, velocityPxPerMs: 0, accelerationPxPerMs2: 0, pageLatencyMs: 0,
+                preloadPx: 0, readyDistancePx: 0, safetySeconds: null, bufferSeconds: null,
+                visible: [], renderAhead: [], prepared: [], pending: [], failed: [],
+                previewPages: 0, previewBytes: 0, canvasBytes: 0,
+            }), {
+                measurementsMenu: new Node(),
+                onOpen: () => { opened++; },
+                onPanelLayout: (layout: any) => {
+                    reports.push(layout);
+                    if (layout.visible === (when === 'open')) { controls.dispose(); }
+                },
+            });
+            try {
+                assert.doesNotThrow(() => controls.setEnabled(true), 'a callback can dispose while opening with a measurements menu');
+                if (when === 'close') {
+                    assert.strictEqual(timers.size, 1, 'the ordinary open panel starts its sampling interval');
+                    assert.doesNotThrow(() => controls.setEnabled(false), 'a callback can dispose during close');
+                }
+                assert.strictEqual(opened, when === 'open' ? 0 : 1, 'disposed opening does not continue into onOpen or focus');
+                assert.strictEqual(controls.enabled, false);
+                assert.deepStrictEqual(reports.map(report => report.visible), [true, false]);
+                assert.deepStrictEqual(document.body.children, [container]);
+                assert.strictEqual(timers.size, 0);
+                assert.strictEqual(frames.size, 0);
+                assert.ok(canvases.every(canvas => canvas.width === 0 && canvas.height === 0));
+                assert.ok(observers.every(observer => observer.disconnected));
+                assert.ok([...listeners.values()].every(group => group.size === 0));
+            } finally { controls.dispose(); }
+        }
     });
 
     it('supports an explicit diagnostics opt-out and removes its handlers on disposal', () => {

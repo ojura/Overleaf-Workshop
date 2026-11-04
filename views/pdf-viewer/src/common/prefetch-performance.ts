@@ -1,4 +1,5 @@
 import { installPrefetchRobots, type RobotDispatchPort, type RobotLab } from './prefetch-robots';
+import { installMotionLabPanel, type MotionLabPanelLayout } from './motion-lab-panel';
 
 /** Bounded measurements shared by both PDF viewers and their fetch bridge. */
 export const PERFORMANCE_LIMITS = Object.freeze({
@@ -264,6 +265,7 @@ interface DiagnosticsOptions {
     toolbarBefore?: HTMLElement;
     measurementsMenu?: HTMLElement;
     onOpen?: () => void;
+    onPanelLayout?: (layout: MotionLabPanelLayout) => void;
     enabled?: boolean;
     robots?: {
         readonly enabled: boolean;
@@ -286,6 +288,7 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
     let root: ShadowRoot | undefined;
     let timer: number | undefined;
     let robots: RobotLab | undefined;
+    let panel: ReturnType<typeof installMotionLabPanel> | undefined;
     let button: HTMLButtonElement | undefined;
     let measurementsButton: HTMLButtonElement | undefined;
     let shown = false;
@@ -430,8 +433,17 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
 :host { all:initial; position:fixed; right:max(14px,env(safe-area-inset-right)); bottom:max(14px,env(safe-area-inset-bottom)); z-index:2147483646; display:block; color:#e8f0fa; font:12px/1.4 system-ui,sans-serif; color-scheme:dark; }
 :host([hidden]) { display:none !important; }
 * { box-sizing:border-box; }
-section { width:456px; max-width:calc(100vw - 28px); max-height:calc(100vh - 70px); max-height:calc(100dvh - 70px); overflow:auto; overscroll-behavior:contain; padding:14px; border:1px solid #43566b; border-radius:12px; background:#101c2b; box-shadow:0 8px 36px #0007; }
+section { position:relative; display:flex; flex-direction:column; width:456px; max-width:calc(100vw - 28px); max-height:calc(100vh - 70px); max-height:calc(100dvh - 70px); overflow:hidden; padding:14px; border:1px solid #43566b; border-radius:12px; background:#101c2b; box-shadow:0 8px 36px #0007; }
 header { display:flex; align-items:center; gap:9px; }
+.panel-content { min-height:0; overflow:auto; overscroll-behavior:contain; }
+.panel-drag { cursor:move; touch-action:none; user-select:none; border-radius:3px; }
+.panel-drag:focus-visible { outline:2px solid #66e5cf; outline-offset:3px; }
+.panel-position { flex:none; display:flex; flex-wrap:wrap; gap:5px; margin:7px 0 2px; }
+.panel-position button { font-size:10px; padding:4px 7px; }
+.panel-position button[aria-pressed="true"] { border-color:#66e5cf; color:#66e5cf; }
+.panel-resize { position:absolute; right:0; bottom:0; width:26px; height:26px; padding:0; border:0; border-radius:8px 0; cursor:nwse-resize; touch-action:none; z-index:1; }
+:host([data-dock="left"]) .panel-resize { cursor:ew-resize; }
+:host([data-dock="right"]) .panel-resize { left:0; right:auto; cursor:ew-resize; border-radius:0 8px; }
 .robot-icon { flex:none; width:25px; height:25px; color:#66e5cf; }
 h2 { flex:1; margin:0; font-size:14px; font-weight:600; }
 button { border:1px solid #4b6178; border-radius:5px; color:inherit; background:#203248; padding:5px 8px; cursor:pointer; font:inherit; }
@@ -473,13 +485,17 @@ footer span { font-size:10px; color:#b2c0cf; }
     section:not(:has(.measurements[open])) .measurements { margin-top:4px; padding-top:0; }
     .measurements > summary { min-height:44px; padding:12px 0; }
     .copy { min-height:44px; }
+    .panel-position button { min-height:36px; }
+    .panel-resize { width:36px; height:36px; }
 }
 </style>
 <section role="region" aria-label="PDF motion diagnostics">
 <header>
 ${ROBOT_ICON}
-<h2>LARICS Motion Lab</h2><button class="close" type="button" aria-label="Close motion diagnostics">×</button>
+<h2 class="panel-drag" tabindex="0" title="Drag to move; arrow keys move the panel" aria-label="LARICS Motion Lab; use arrow keys to move">LARICS Motion Lab</h2><button class="close" type="button" aria-label="Close motion diagnostics">×</button>
 </header>
+<div class="panel-position" role="group" aria-label="Motion Lab position"><button type="button" data-panel-dock="left" aria-pressed="false">Dock left</button><button type="button" data-panel-dock="right" aria-pressed="false">Dock right</button><button type="button" data-panel-dock="float" aria-pressed="true">Float</button></div>
+<div class="panel-content">
 <div class="meta"><span class="status" data-field="status">Motion stopped</span></div>
 <div class="robot-stage" data-robot-stage></div>
 <details class="measurements"><summary>Motion and buffer measurements</summary>
@@ -505,6 +521,8 @@ ${ROBOT_ICON}
 <details><summary>Event buffer; <span data-field="event-count"></span></summary><pre data-field="events"></pre></details>
 <footer><button type="button" class="copy">Copy measurements</button><span role="status" data-field="copy-status"></span></footer>
 </details>
+</div>
+<button type="button" class="panel-resize" aria-label="Resize Motion Lab with arrow keys" title="Drag to resize; arrow keys change size">↘</button>
 </section>`;
         root.querySelector<HTMLDetailsElement>('.measurements')!.open = !!win?.matchMedia('(min-width:701px) and (pointer:fine)').matches;
         for (const element of root.querySelectorAll<HTMLElement>('[data-field]')) {
@@ -514,6 +532,17 @@ ${ROBOT_ICON}
         root.querySelector('.copy')!.addEventListener('click', () => { void copySnapshot(); });
         (doc.body ?? doc.documentElement).append(host);
         robots = installPrefetchRobots(root.querySelector<HTMLElement>('[data-robot-stage]')!);
+        panel = installMotionLabPanel(host, {
+            surface: root.querySelector<HTMLElement>('section')!,
+            dragHandle: root.querySelector<HTMLElement>('.panel-drag')!,
+            resizeHandle: root.querySelector<HTMLElement>('.panel-resize')!,
+            dockButtons: {
+                left: root.querySelector<HTMLButtonElement>('[data-panel-dock="left"]')!,
+                right: root.querySelector<HTMLButtonElement>('[data-panel-dock="right"]')!,
+                float: root.querySelector<HTMLButtonElement>('[data-panel-dock="float"]')!,
+            },
+            onLayout: options.onPanelLayout,
+        });
     }
 
     function setEnabled(enabled: boolean): void {
@@ -525,12 +554,17 @@ ${ROBOT_ICON}
             previousFocus = doc.activeElement;
             if (!host) { createPanel(); }
             host!.hidden = false;
+            panel?.setVisible(true);
+            if (disposed || !shown) { return; }
             startTimer();
             options.onOpen?.();
+            if (disposed || !shown) { return; }
             if (options.measurementsMenu) { root!.querySelector<HTMLButtonElement>('.close')?.focus({ preventScroll: true }); }
         } else {
             const restoreFocus = doc.activeElement === host;
             stopTimer();
+            panel?.setVisible(false);
+            if (disposed || shown) { return; }
             host!.hidden = true;
             history.length = 0;
             if (restoreFocus) {
@@ -609,6 +643,8 @@ ${ROBOT_ICON}
             if (disposed) { return; }
             disposed = true;
             stopTimer();
+            panel?.dispose();
+            panel = undefined;
             doc?.removeEventListener?.('keydown', keydown, true);
             doc?.removeEventListener?.('visibilitychange', visibility);
             robots?.dispose();
