@@ -49,6 +49,16 @@ describe('bounded PDF preview resource transport', function () {
         assert.strictEqual(metrics.state.bytes, Buffer.byteLength(JSON.stringify(manifest)) + 8);
     });
 
+    it('accepts the IDE image/jpg response header for a canonical JPEG asset', async () => {
+        const bytes = new Uint8Array([255, 216, 255, 224, 0, 2, 255, 217]);
+        const metrics = measured();
+        const source = adapter.httpPdfPreviewSource(descriptor, { metrics, fetch: async () =>
+            new browser.Response(bytes, { headers: { 'Content-Type': 'image/jpg', 'Content-Length': String(bytes.length) } }) });
+        assert.deepStrictEqual(await source.loadAsset(asset, new browser.AbortController().signal), bytes);
+        assert.strictEqual(asset.mime, 'image/jpeg');
+        assert.deepStrictEqual(metrics.state, { active: 0, ended: 1, bytes: bytes.length });
+    });
+
     it('cancels an oversized declared manifest before reading its body', async () => {
         let cancelled = 0, reads = 0;
         const metrics = measured();

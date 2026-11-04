@@ -42,7 +42,9 @@ export function httpPdfPreviewSource(descriptor: PdfPreviewDescriptor, options: 
             const length = header === null || encoding && encoding !== 'identity' ? undefined : Number(header);
             if (length !== undefined && (!Number.isSafeInteger(length) || length < 0 || length > limit
                 || expected !== undefined && length !== expected)) { throw new Error('Preview response length exceeds its allowed size.'); }
-            const contentType = response.headers.get('Content-Type')?.split(';')[0].trim().toLowerCase();
+            let contentType = response.headers.get('Content-Type')?.split(';')[0].trim().toLowerCase();
+            // The IDE's local-resource server labels JPEG files as image/jpg.
+            if (contentType === 'image/jpg') { contentType = 'image/jpeg'; }
             if (mime && contentType && contentType !== mime && contentType !== 'application/octet-stream') {
                 throw new Error('Preview response has a different image type.');
             }
