@@ -1,8 +1,10 @@
 import { paintRobotVehicle, RobotRandom, ROBOT_ARTWORK_SIZE, ROBOT_VEHICLES, type RobotArtworkActor, type RobotVehicle, type RobotDispatchPort, type RobotDispatchPoint } from './prefetch-robots';
+import { pdfCachePolicy } from './scroll-prefetch';
 
 export const DOCUMENT_ROBOT_LIMITS = Object.freeze({
     maxActors: 4,
     maxCargoBytes: 512 * 1024,
+    maxSpriteBytes: 4 * ROBOT_ARTWORK_SIZE.width * ROBOT_ARTWORK_SIZE.height * 4,
     maxFragmentsPerPage: 3,
     fragmentDimension: 160,
     sampleDimension: 64,
@@ -10,6 +12,20 @@ export const DOCUMENT_ROBOT_LIMITS = Object.freeze({
     minDurationMs: 1800,
     maxDurationMs: 2900,
     spriteScale: 0.64,
+    desktop: Object.freeze({
+        minWidth: 700,
+        minHeight: 480,
+        maxActors: 12,
+        minActors: 6,
+        pixelsPerActor: 100000,
+        maxCargoBytes: 3 * 1024 * 1024,
+        maxSpriteBytes: 24 * 1024 * 1024,
+        fragmentDimension: 256,
+        spriteScale: 1.92,
+        minSpriteScale: 1.4,
+        scaleWidth: 560,
+        maxDpr: 3,
+    }),
 });
 
 interface Options {
@@ -20,7 +36,11 @@ interface Options {
     seed?: number;
     maxActors?: number;
     maxCargoBytes?: number;
+    device?: 'desktop' | 'mobile';
+    onCapacityAvailable?: () => void;
 }
+
+export type DocumentRobotOffer = 'started' | 'busy' | 'deferred' | 'skipped';
 
 export interface DocumentRobotDelivery {
     pageNumber: number;
@@ -53,6 +73,8 @@ interface Courier {
     delay: number;
     duration: number;
     sprite: HTMLCanvasElement;
+    spriteBytes: number;
+    spriteScale: number;
     cargo?: HTMLCanvasElement;
     cargoBytes: number;
     pose: RobotArtworkActor;
@@ -68,9 +90,20 @@ interface Episode {
     kind: DocumentRobotDelivery['kind'];
     actors: Courier[];
 }
+interface Presentation {
+    kind: 'compact' | 'desktop';
+    maxActors: number;
+    maxCargoBytes: number;
+    maxSpriteBytes: number;
+    maxFragmentsPerPage: number;
+    fragmentDimension: number;
+    spriteScale: number;
+    spriteDpr: number;
+    minimumWidth: number;
+    minimumHeight: number;
+}
 
 const RGBA_BYTES = 4;
-const SPRITE_BYTES = ROBOT_ARTWORK_SIZE.width * ROBOT_ARTWORK_SIZE.height * RGBA_BYTES;
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
 const ease = (value: number) => value * value * (3 - 2 * value);
 const curve = (start: Point, control: Point, end: Point, amount: number): Point => {
@@ -96,8 +129,6 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     const seed = new Uint32Array(1);
     if (options.seed === undefined) { win.crypto.getRandomValues(seed); }
     const random = new RobotRandom(options.seed ?? seed[0]);
-    const maxActors = clamp(Math.floor(options.maxActors ?? DOCUMENT_ROBOT_LIMITS.maxActors), 0, ROBOT_VEHICLES.length);
-    const maxCargoBytes = Math.max(0, Math.floor(options.maxCargoBytes ?? DOCUMENT_ROBOT_LIMITS.maxCargoBytes));
     const media = win.matchMedia('(prefers-reduced-motion: reduce)');
     const episodes = new Map<number, Episode>();
     const transit = doc.createElement('div');
@@ -120,6 +151,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     let frames = 0;
     let stats = counters();
     let dispatchOrigin: RobotDispatchPort | undefined;
+    let activePresentation: Presentation['kind'] | undefined;
+    let capacityBlocked = false;
+    let capacityFreed = false;
+    let capacityOnMotionResume = false;
 
     const hidden = () => doc.hidden || doc.visibilityState === 'hidden';
     const actorCount = () => [...episodes.values()].reduce((sum, episode) => sum + episode.actors.length, 0);
@@ -132,6 +167,37 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const right = Math.min(bounds.right, (visual?.offsetLeft ?? 0) + (visual?.width ?? win.innerWidth));
         const bottom = Math.min(bounds.bottom, (visual?.offsetTop ?? 0) + (visual?.height ?? win.innerHeight));
         return { left, top, right: Math.max(left, right), bottom: Math.max(top, bottom) };
+    }
+
+    function presentation(viewport = viewportBounds()): Presentation {
+        const width = viewport.right - viewport.left, height = viewport.bottom - viewport.top;
+        const policy = DOCUMENT_ROBOT_LIMITS.desktop;
+        const desktop = (options.device ?? pdfCachePolicy(win.navigator).name) === 'desktop'
+            && width >= policy.minWidth && height >= policy.minHeight;
+        const maxActors = desktop ? clamp(Math.round(width * height / policy.pixelsPerActor), policy.minActors, policy.maxActors)
+            : DOCUMENT_ROBOT_LIMITS.maxActors;
+        const maxCargoBytes = desktop ? policy.maxCargoBytes : DOCUMENT_ROBOT_LIMITS.maxCargoBytes;
+        return {
+            kind: desktop ? 'desktop' : 'compact',
+            maxActors: clamp(Math.floor(options.maxActors ?? maxActors), 0, maxActors),
+            maxCargoBytes: clamp(Math.floor(options.maxCargoBytes ?? maxCargoBytes), 0, maxCargoBytes),
+            maxSpriteBytes: desktop ? policy.maxSpriteBytes : DOCUMENT_ROBOT_LIMITS.maxSpriteBytes,
+            maxFragmentsPerPage: desktop ? policy.maxActors : DOCUMENT_ROBOT_LIMITS.maxFragmentsPerPage,
+            fragmentDimension: desktop ? policy.fragmentDimension : DOCUMENT_ROBOT_LIMITS.fragmentDimension,
+            spriteScale: desktop ? clamp(width / policy.scaleWidth, policy.minSpriteScale, policy.spriteScale) : DOCUMENT_ROBOT_LIMITS.spriteScale,
+            spriteDpr: desktop ? clamp(win.devicePixelRatio || 1, 1, policy.maxDpr) : 1,
+            minimumWidth: desktop ? 160 : 128,
+            minimumHeight: desktop ? 120 : 96,
+        };
+    }
+
+    function notifyCapacity(): void {
+        const freed = capacityFreed;
+        capacityFreed = false;
+        if (!freed || !capacityBlocked || disposed || !enabled || hidden() || media.matches
+            || actorCount() >= presentation().maxActors) { return; }
+        capacityBlocked = false;
+        options.onCapacityAvailable?.();
     }
 
     function geometry(element: HTMLElement, viewport = viewportBounds()): Geometry | undefined {
@@ -172,9 +238,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             y: route === 1 ? area.top - 0.10 : area.bottom + 0.10 };
     }
 
-    function selectCrops(source: HTMLCanvasElement, area: Geometry): Crop[] {
-        const width = Math.min(0.24, 128 / area.width, (area.right - area.left) * 0.75);
-        const height = Math.min(0.16, 96 / area.height, (area.bottom - area.top) * 0.75);
+    function selectCrops(source: HTMLCanvasElement, area: Geometry, policy: Presentation): Crop[] {
+        const width = Math.min(policy.kind === 'desktop' ? 0.36 : 0.24, policy.minimumWidth / area.width, (area.right - area.left) * 0.75);
+        const height = Math.min(policy.kind === 'desktop' ? 0.24 : 0.16, policy.minimumHeight / area.height, (area.bottom - area.top) * 0.75);
         const candidates: Crop[] = [];
         for (let row = 0; row < 4; row++) {
             for (let column = 0; column < 3; column++) {
@@ -221,18 +287,39 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     function drawVehicle(actor: Courier): void {
         const context = actor.sprite.getContext('2d');
         if (!context) { throw new Error('Robot artwork canvas is unavailable'); }
+        context.setTransform(1, 0, 0, 1, 0, 0);
         context.clearRect(0, 0, actor.sprite.width, actor.sprite.height);
+        context.setTransform(actor.sprite.width / ROBOT_ARTWORK_SIZE.width, 0, 0, actor.sprite.height / ROBOT_ARTWORK_SIZE.height, 0, 0);
         paintRobotVehicle(context, actor.pose, actor.started / 1000 + actor.id);
+        context.setTransform(1, 0, 0, 1, 0, 0);
     }
 
-    function makeCourier(source: HTMLCanvasElement, crop: Crop, area: Geometry, index: number, used: ReadonlySet<RobotVehicle>): Courier | undefined {
+    function spriteSize(policy: Presentation, origin?: RobotDispatchPoint) {
+        const scale = policy.kind === 'desktop' ? Math.max(policy.spriteScale, origin?.scale ?? 0) * policy.spriteDpr : 1;
+        const width = Math.ceil(ROBOT_ARTWORK_SIZE.width * scale), height = Math.ceil(ROBOT_ARTWORK_SIZE.height * scale);
+        return { width, height, bytes: width * height * RGBA_BYTES };
+    }
+
+    function resizeSprite(actor: Courier, policy: Presentation): boolean {
+        const size = spriteSize(policy, actor.origin);
+        actor.spriteScale = policy.spriteScale;
+        if (actor.sprite.width === size.width && actor.sprite.height === size.height) { return true; }
+        if (spriteBytes - actor.spriteBytes + size.bytes > policy.maxSpriteBytes) { return false; }
+        actor.sprite.width = size.width; actor.sprite.height = size.height;
+        spriteBytes += size.bytes - actor.spriteBytes;
+        actor.spriteBytes = size.bytes;
+        drawVehicle(actor);
+        return true;
+    }
+
+    function makeCourier(source: HTMLCanvasElement, crop: Crop, area: Geometry, index: number, used: ReadonlySet<RobotVehicle>, policy: Presentation): Courier | undefined {
         const sourceX = Math.floor(crop.x * source.width), sourceY = Math.floor(crop.y * source.height);
         const sourceWidth = Math.max(1, Math.min(source.width - sourceX, Math.ceil(crop.width * source.width)));
         const sourceHeight = Math.max(1, Math.min(source.height - sourceY, Math.ceil(crop.height * source.height)));
-        const scale = Math.min(1, DOCUMENT_ROBOT_LIMITS.fragmentDimension / Math.max(sourceWidth, sourceHeight));
+        const scale = Math.min(1, policy.fragmentDimension / Math.max(sourceWidth, sourceHeight));
         const width = Math.max(1, Math.floor(sourceWidth * scale)), height = Math.max(1, Math.floor(sourceHeight * scale));
         const bytes = width * height * RGBA_BYTES;
-        if (cargoBytes + bytes > maxCargoBytes) { return; }
+        if (cargoBytes + bytes > policy.maxCargoBytes) { return; }
         let cargo: HTMLCanvasElement | undefined, sprite: HTMLCanvasElement | undefined;
         let reserved: { port: RobotDispatchPort; vehicle: RobotVehicle } | undefined;
         try {
@@ -241,13 +328,11 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const context = cargo.getContext('2d', { alpha: true });
             if (!context) { return; }
             context.drawImage(source, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, width, height);
-            sprite = createCanvas();
-            sprite.width = ROBOT_ARTWORK_SIZE.width; sprite.height = ROBOT_ARTWORK_SIZE.height;
             let vehicle: RobotVehicle | undefined;
             let origin: RobotDispatchPoint | undefined;
             for (let attempt = 0; attempt < ROBOT_VEHICLES.length * 2; attempt++) {
                 const candidate = nextVehicle();
-                if (used.has(candidate)) { continue; }
+                if (used.has(candidate) && (dispatchOrigin || used.size < ROBOT_VEHICLES.length)) { continue; }
                 const point = dispatchOrigin?.reserve(candidate);
                 if (dispatchOrigin && !point) { continue; }
                 vehicle = candidate;
@@ -256,6 +341,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 break;
             }
             if (!vehicle) { return; }
+            const size = spriteSize(policy, origin);
+            if (spriteBytes + size.bytes > policy.maxSpriteBytes) { return; }
+            sprite = createCanvas();
+            sprite.width = size.width; sprite.height = size.height;
             const route = nextRoute();
             const target = { x: crop.x + crop.width / 2, y: crop.y + crop.height / 2 };
             const start = edge(route, area, target);
@@ -264,9 +353,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 id: ++serial, vehicle, route, crop, start,
                 control: { x: (start.x + target.x) / 2 + bend, y: (start.y + target.y) / 2 - Math.abs(bend) },
                 departure: edge((route + 1 + Math.floor(random.next() * 2)) % 4, area, target),
-                started: now(), delay: origin ? 0 : index * random.range(90, 180),
+                started: now(), delay: origin ? 0 : index * (policy.kind === 'desktop' ? random.range(40, 85) : random.range(90, 180)),
                 duration: random.range(DOCUMENT_ROBOT_LIMITS.minDurationMs, DOCUMENT_ROBOT_LIMITS.maxDurationMs),
-                sprite, cargo, cargoBytes: bytes, deposited: false, departing: false, port: reserved?.port, origin,
+                sprite, spriteBytes: size.bytes, spriteScale: policy.spriteScale, cargo, cargoBytes: bytes,
+                deposited: false, departing: false, port: reserved?.port, origin,
                 pose: { vehicle, x: ROBOT_ARTWORK_SIZE.width / 2, y: ROBOT_ARTWORK_SIZE.height / 2,
                     vx: 50, vy: 0, activity: 'deliver', job: 'delivery', temperament: 1,
                     phase: random.range(0, Math.PI * 2), distance: random.range(0, 80), needsHelp: false,
@@ -284,7 +374,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             Object.assign(cargo.style, { zIndex: '1', boxShadow: '0 2px 7px #0003', borderRadius: '2px' });
             Object.assign(sprite.style, { zIndex: '2' });
             cargoBytes += bytes;
-            spriteBytes += SPRITE_BYTES;
+            spriteBytes += actor.spriteBytes;
             cargo = sprite = undefined;
             reserved = undefined;
             return actor;
@@ -302,7 +392,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             cargoBytes -= actor.cargoBytes;
         }
         release(actor.sprite);
-        spriteBytes -= SPRITE_BYTES;
+        spriteBytes -= actor.spriteBytes;
+        capacityFreed = true;
         actor.port?.release(actor.vehicle);
         actor.port = undefined;
     }
@@ -321,8 +412,12 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     }
 
     function clearActive(): void {
+        capacityBlocked = false;
+        capacityOnMotionResume = false;
         if (frame) { cancelFrame(frame.id); frame = undefined; }
         for (const episode of [...episodes.values()]) { dropEpisode(episode, true); }
+        activePresentation = undefined;
+        capacityFreed = false;
         lastPaint = -Infinity;
     }
 
@@ -339,8 +434,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const target = project({ x: actor.crop.x + actor.crop.width / 2, y: actor.crop.y + actor.crop.height / 2 });
         const carrying = progress < 0.62;
         const air = ROBOT_VEHICLES.find(vehicle => vehicle.id === actor.vehicle)!.air;
-        const offset = { x: air ? 0 : -29, y: air ? -34 : 25 };
-        const normalScale = DOCUMENT_ROBOT_LIMITS.spriteScale;
+        const normalScale = actor.spriteScale;
+        const bodyScale = normalScale / DOCUMENT_ROBOT_LIMITS.spriteScale;
+        const offset = { x: air ? 0 : -29 * bodyScale, y: (air ? -34 : 25) * bodyScale };
         const originScale = actor.origin?.scale ?? normalScale;
         let spriteScale = actor.origin ? originScale + (normalScale - originScale) * ease(clamp(progress / 0.20, 0, 1)) : normalScale;
         const start = actor.origin ? {
@@ -367,6 +463,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 if (actor.cargo) {
                     release(actor.cargo); actor.cargo = undefined;
                     cargoBytes -= actor.cargoBytes;
+                    capacityFreed = true;
                 }
             }
             const destination = actor.port === dispatchOrigin ? actor.port?.destination(actor.vehicle) : undefined;
@@ -407,6 +504,15 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
 
     function paint(at: number): void {
         const viewport = viewportBounds();
+        const policy = presentation(viewport);
+        if (activePresentation && activePresentation !== policy.kind) {
+            const blocked = capacityBlocked;
+            clearActive();
+            capacityBlocked = blocked;
+            capacityFreed = true;
+            notifyCapacity();
+            return;
+        }
         const bounds = transit.getBoundingClientRect();
         // Fixed transit may cross page edges, but never covers the viewer's controls.
         transit.style.clipPath = 'inset(' + Math.max(0, viewport.top - bounds.top) + 'px '
@@ -419,7 +525,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             for (let index = episode.actors.length - 1; index >= 0; index--) {
                 const actor = episode.actors[index];
                 try {
-                    if (paintActor(actor, area, at)) { continue; }
+                    if (actorCount() <= policy.maxActors && resizeSprite(actor, policy) && paintActor(actor, area, at)) { continue; }
                 } catch { stats.rejected++; }
                 releaseActor(actor);
                 episode.actors.splice(index, 1);
@@ -427,6 +533,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             if (!episode.actors.length) { dropEpisode(episode, false); }
         }
         frames++;
+        notifyCapacity();
     }
 
     function schedule(): void {
@@ -445,23 +552,38 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         });
     }
 
-    function deliver(value: DocumentRobotDelivery): boolean {
+    function offer(value: DocumentRobotDelivery): DocumentRobotOffer {
         if (disposed || !enabled || hidden() || !visible.has(value.pageNumber)
-            || !Number.isSafeInteger(value.pageNumber) || value.pageNumber < 1 || seen.has(value.pageNumber)) { return false; }
-        if (media.matches) { seen.add(value.pageNumber); stats.skipped++; return false; }
-        if (!value.canvas.width || !value.canvas.height || actorCount() >= maxActors) { return false; }
-        const area = geometry(value.pageElement);
-        if (!area) { return false; }
-        const crops = selectCrops(value.canvas, area);
-        if (!crops.length) { seen.add(value.pageNumber); stats.skipped++; return false; }
-        const count = Math.min(maxActors - actorCount(), DOCUMENT_ROBOT_LIMITS.maxFragmentsPerPage, 2 + Math.floor(random.next() * 2), crops.length);
-        const actors: Courier[] = [];
+            || !Number.isSafeInteger(value.pageNumber) || value.pageNumber < 1 || seen.has(value.pageNumber)) { return 'skipped'; }
+        if (media.matches) { seen.add(value.pageNumber); stats.skipped++; return 'skipped'; }
+        if (!value.canvas.width || !value.canvas.height) { return 'deferred'; }
+        const viewport = viewportBounds();
+        const policy = presentation(viewport);
+        const area = geometry(value.pageElement, viewport);
+        if (!area || area.width * (area.right - area.left) < policy.minimumWidth
+            || area.height * (area.bottom - area.top) < policy.minimumHeight) { return 'deferred'; }
+        if (!policy.maxActors || !policy.maxCargoBytes) { seen.add(value.pageNumber); stats.skipped++; return 'skipped'; }
         const used = new Set([...episodes.values()].flatMap(episode => episode.actors.map(actor => actor.vehicle)));
+        if (actorCount() >= policy.maxActors || episodes.size && activePresentation !== policy.kind
+            || dispatchOrigin && used.size >= ROBOT_VEHICLES.length) {
+            capacityBlocked = true; return 'busy';
+        }
+        const crops = selectCrops(value.canvas, area, policy);
+        if (!crops.length) { seen.add(value.pageNumber); stats.skipped++; return 'skipped'; }
+        const pageArea = area.width * (area.right - area.left) * area.height * (area.bottom - area.top);
+        const crew = policy.kind === 'desktop' ? Math.max(2, Math.round(pageArea / DOCUMENT_ROBOT_LIMITS.desktop.pixelsPerActor))
+            : 2 + Math.floor(random.next() * 2);
+        const count = Math.min(policy.maxActors - actorCount(), policy.maxFragmentsPerPage, crew, crops.length,
+            dispatchOrigin ? ROBOT_VEHICLES.length - used.size : Infinity);
+        const actors: Courier[] = [];
         for (let index = 0; index < count; index++) {
-            const actor = makeCourier(value.canvas, crops[index], area, index, used);
+            const actor = makeCourier(value.canvas, crops[index], area, index, used, policy);
             if (actor) { actors.push(actor); used.add(actor.vehicle); }
         }
-        if (!actors.length) { stats.rejected++; return false; }
+        if (!actors.length) {
+            if (actorCount()) { capacityBlocked = true; return 'busy'; }
+            stats.rejected++; seen.add(value.pageNumber); return 'skipped';
+        }
         let layer: HTMLDivElement | undefined;
         try {
             layer = doc.createElement('div');
@@ -474,30 +596,43 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             transit.append(layer);
             const episode = { page: value.pageNumber, element: value.pageElement, kind: value.kind, layer, actors };
             episodes.set(value.pageNumber, episode);
+            activePresentation = policy.kind;
             seen.add(value.pageNumber);
             paint(now());
             schedule();
             stats.episodes++;
-            return true;
+            return 'started';
         } catch {
             const episode = episodes.get(value.pageNumber);
             if (episode) { dropEpisode(episode, true); }
             else { for (const actor of actors) { releaseActor(actor); } }
             layer?.remove();
             if (!episodes.size) { transit.remove(); }
-            seen.delete(value.pageNumber);
+            seen.add(value.pageNumber);
             stats.rejected++;
-            return false;
+            return 'skipped';
         }
     }
 
     function visibilityChanged(): void { if (hidden()) { clearActive(); } }
-    function motionChanged(): void { if (media.matches) { clearActive(); } }
+    function motionChanged(): void {
+        if (media.matches) {
+            const waiting = capacityBlocked || capacityOnMotionResume;
+            clearActive();
+            capacityOnMotionResume = waiting;
+        } else if (capacityOnMotionResume) {
+            capacityOnMotionResume = false;
+            capacityBlocked = capacityFreed = true;
+            notifyCapacity();
+        }
+    }
     doc.addEventListener('visibilitychange', visibilityChanged);
     media.addEventListener('change', motionChanged);
 
     return {
-        deliver,
+        offer,
+        deliver(value: DocumentRobotDelivery): boolean { return offer(value) === 'started'; },
+        hasHandled(page: number): boolean { return seen.has(page); },
         setDispatchOrigin(port: RobotDispatchPort | undefined) {
             dispatchOrigin = port;
             if (episodes.size) {
@@ -511,13 +646,16 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             visible = new Set(ids);
             for (const episode of [...episodes.values()]) { if (!visible.has(episode.page)) { dropEpisode(episode, true); } }
             cancelFrameIfEmpty();
+            notifyCapacity();
         },
         reset() { clearActive(); seen.clear(); visible.clear(); stats = counters(); frames = 0; },
         snapshot() {
+            const policy = presentation();
             return {
                 enabled, reducedMotion: media.matches, scheduled: frame !== undefined, frames,
                 activeEpisodes: episodes.size, activeActors: actorCount(), cargoBytes, spriteBytes,
-                retainedBytes: cargoBytes + spriteBytes, maxActors, maxCargoBytes, ...stats,
+                retainedBytes: cargoBytes + spriteBytes, maxActors: policy.maxActors, maxCargoBytes: policy.maxCargoBytes,
+                maxSpriteBytes: policy.maxSpriteBytes, presentation: policy.kind, spriteScale: policy.spriteScale, ...stats,
                 pages: [...episodes.values()].map(episode => ({
                     page: episode.page, kind: episode.kind,
                     actors: episode.actors.map(actor => ({ id: actor.id, vehicle: actor.vehicle, route: actor.route,

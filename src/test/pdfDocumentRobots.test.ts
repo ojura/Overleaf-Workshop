@@ -30,7 +30,11 @@ class Element {
     get isConnected(): boolean { return this === this.ownerDocument.body || !!this.parentNode?.isConnected; }
     get clientWidth() { return this.rect.width; }
     get clientHeight() { return this.rect.height; }
-    getBoundingClientRect() { return { ...this.rect, x: this.rect.left, y: this.rect.top, right: this.rect.left + this.rect.width, bottom: this.rect.top + this.rect.height }; }
+    getBoundingClientRect() {
+        const rect = this.style.position === 'fixed' && this.style.inset === '0'
+            ? { left: 0, top: 0, width: this.ownerDocument.defaultView.innerWidth, height: this.ownerDocument.defaultView.innerHeight } : this.rect;
+        return { ...rect, x: rect.left, y: rect.top, right: rect.left + rect.width, bottom: rect.top + rect.height };
+    }
     append(...children: Element[]) {
         for (const child of children) { child.remove(); child.parentNode = this; this.children.push(child); }
     }
@@ -45,9 +49,11 @@ class Canvas extends Element {
     height = 0;
     readonly copies: any[][] = [];
     readonly contextOptions: any[] = [];
+    readonly transforms: number[][] = [];
     failCopy = false;
     noContext = false;
     readonly context = new Proxy({
+        setTransform: (...values: number[]) => this.transforms.push(values),
         drawImage: (...args: any[]) => {
             if (this.failCopy && args.length === 9) { throw new Error('copy failed'); }
             this.copies.push(args);
@@ -92,6 +98,7 @@ class Fixture {
         const fixture = this;
         Object.assign(this.window, {
             innerWidth: 800, innerHeight: 700, devicePixelRatio: 1,
+            navigator: { userAgent: 'iPhone', maxTouchPoints: 5 },
             performance: { now: () => this.now },
             crypto: { getRandomValues: (values: Uint32Array) => { values[0] = 13; return values; } },
             getComputedStyle: (element: Element) => ({ objectFit: element.objectFit, objectPosition: '50% 50%' }),
@@ -131,6 +138,18 @@ class Fixture {
         element.append(source, text);
         this.container.append(element);
         return { pageNumber: number, pageElement: element, canvas: source, kind: 'page' as const, text };
+    }
+    desktop(dpr = 1, width = 1076, height = 1459) {
+        Object.assign(this.window, { innerWidth: width, innerHeight: height, devicePixelRatio: dpr,
+            navigator: { userAgent: 'Linux x86_64', maxTouchPoints: 0 } });
+        this.container.rect = { left: 0, top: 32, width, height: height - 32 };
+    }
+    spread() {
+        return [21, 22, 23, 24].map((number, index) => {
+            const page = this.page(number);
+            page.pageElement.rect = { left: index % 2 ? 520 : 40, top: index < 2 ? 32 : 708, width: 465, height: 661 };
+            return page;
+        });
     }
     frame() {
         // Cross the 30 Hz draw boundary explicitly instead of relying on floating equality.
@@ -249,6 +268,181 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             assert.ok(40 + (crop.x + crop.width) * 400 <= 550 + 1e-6 && 60 + (crop.y + crop.height) * 600 <= 520 + 1e-6,
                 'source fragments finish inside the visible PDF region');
         }
+    });
+
+    it('fills the measured desktop spread with a large crisp crew and accounts every sprite backing byte', () => {
+        for (const dpr of [1, 2, 3]) {
+            const f = fixture();
+            f.desktop(dpr);
+            const pages = f.spread();
+            f.api.setVisiblePages(pages.map(page => page.pageNumber));
+            for (const page of pages) { assert.strictEqual(f.api.deliver(page), true); }
+            const state = f.api.snapshot();
+            assert.strictEqual(state.maxActors, 12);
+            assert.strictEqual(state.activeActors, 12, 'four full 465 by 661 pages receive three couriers each');
+            assert.strictEqual(state.maxCargoBytes, 3 * 1024 * 1024);
+            assert.strictEqual(state.maxSpriteBytes, 24 * 1024 * 1024);
+            assert.ok(state.cargoBytes <= state.maxCargoBytes && state.spriteBytes <= state.maxSpriteBytes);
+            for (let i = 0; i < 12; i++) { f.frame(); }
+            const sprites = f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width);
+            assert.strictEqual(sprites.length, 12);
+            for (const sprite of sprites) {
+                assert.ok(Math.abs(parseFloat(sprite.style.width) - 128 * 1.92) < 0.02, 'desktop bodies are three times the previous apparent size');
+                assert.deepStrictEqual([sprite.width, sprite.height], [Math.ceil(128 * 1.92 * dpr), Math.ceil(100 * 1.92 * dpr)]);
+                assert.ok(sprite.transforms.some(values => values[0] > 1.9 * dpr && values[3] > 1.9 * dpr), 'artwork is redrawn into display-resolution backing');
+            }
+            assert.strictEqual(f.api.snapshot().spriteBytes, sprites.reduce((bytes, sprite) => bytes + sprite.width * sprite.height * 4, 0));
+            assert.strictEqual(f.api.snapshot().retainedBytes, f.owned.reduce((bytes, canvas) => bytes + canvas.width * canvas.height * 4, 0));
+            if (dpr === 1) {
+                const before = f.api.snapshot().spriteBytes;
+                f.window.innerWidth = f.container.rect.width = 860;
+                f.frame();
+                assert.ok(f.api.snapshot().spriteBytes < before, 'an active resize redraws smaller backing instead of leaving oversized sprites');
+                assert.ok(sprites.every(sprite => parseFloat(sprite.style.width) < 210));
+            }
+            f.finish();
+            assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+            assert.strictEqual(f.callbacks.size, 0);
+        }
+    });
+
+    it('keeps rotated mobile and narrow views compact while sharing the cache device policy', () => {
+        const profiles = [
+            { device: undefined, agent: 'iPhone', touch: 5, width: 844, height: 390 },
+            { device: undefined, agent: 'Macintosh', touch: 5, width: 1366, height: 1024 },
+            { device: undefined, agent: 'Windows NT 10.0', touch: 10, width: 600, height: 900 },
+            { device: 'mobile', agent: 'Windows NT 10.0', touch: 10, width: 1076, height: 1459 },
+        ];
+        for (const profile of profiles) {
+            const f = fixture({ device: profile.device });
+            f.desktop(3, profile.width, profile.height);
+            f.window.navigator = { userAgent: profile.agent, maxTouchPoints: profile.touch };
+            const pages = [1, 2, 3, 4].map(id => f.page(id));
+            f.api.setVisiblePages([1, 2, 3, 4]);
+            for (const page of pages) { f.api.deliver(page); }
+            const state = f.api.snapshot();
+            assert.strictEqual(state.maxActors, 4);
+            assert.strictEqual(state.maxCargoBytes, 512 * 1024);
+            assert.strictEqual(state.maxSpriteBytes, 4 * 128 * 100 * 4);
+            assert.ok(state.activeActors <= 4 && state.cargoBytes <= 512 * 1024 && state.spriteBytes <= state.maxSpriteBytes);
+            assert.ok(f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle').every(canvas => canvas.width === 128 && canvas.height === 100));
+        }
+        const touchscreenDesktop = fixture();
+        touchscreenDesktop.desktop();
+        touchscreenDesktop.window.navigator = { userAgent: 'Windows NT 10.0', maxTouchPoints: 10 };
+        assert.strictEqual(touchscreenDesktop.api.snapshot().maxActors, 12, 'a touchscreen desktop uses the same desktop policy as the PDF cache');
+    });
+
+    it('defers edge slivers without spending the one-delivery budget or allocating fragments', () => {
+        const f = fixture();
+        f.desktop();
+        const page = f.page();
+        page.pageElement.rect = { left: 40, top: 1446, width: 465, height: 661 };
+        f.api.setVisiblePages([1]);
+        assert.strictEqual(f.api.offer(page), 'deferred');
+        assert.strictEqual(f.api.hasHandled(1), false);
+        assert.strictEqual(f.owned.length, 0);
+        assert.strictEqual(f.callbacks.size, 0);
+        page.pageElement.rect.top = 400;
+        assert.strictEqual(f.api.offer(page), 'started');
+        assert.strictEqual(f.api.hasHandled(1), true);
+        f.finish();
+        const allocations = f.owned.length;
+        assert.strictEqual(f.api.offer(page), 'skipped');
+        assert.strictEqual(f.owned.length, allocations);
+    });
+
+    it('wakes a busy visible-page queue once after a release batch without idle polling', () => {
+        let available = 0;
+        const f = fixture({ maxActors: 2, onCapacityAvailable: () => available++ });
+        const first = f.page(1), next = f.page(2);
+        f.api.setVisiblePages([1, 2]);
+        assert.strictEqual(f.api.offer(first), 'started');
+        assert.strictEqual(f.api.offer(next), 'busy');
+        assert.strictEqual(f.api.hasHandled(2), false);
+        assert.strictEqual(available, 0);
+        f.now += 5000; f.frame();
+        assert.strictEqual(available, 1, 'multiple finishing couriers coalesce into one capacity notification');
+        assert.strictEqual(f.callbacks.size, 0, 'the host callback, not an idle frame loop, admits the waiting page');
+        assert.strictEqual(f.api.offer(next), 'started');
+        f.finish();
+        assert.strictEqual(available, 1, 'there is no notification without a blocked offer');
+        const third = f.page(3), fourth = f.page(4);
+        f.api.setVisiblePages([3, 4]);
+        assert.strictEqual(f.api.offer(third), 'started');
+        assert.strictEqual(f.api.offer(fourth), 'busy');
+        f.api.setVisiblePages([4]);
+        assert.strictEqual(available, 2, 'dropping an obsolete page also releases the queue');
+    });
+
+    it('suppresses queued capacity notifications after reset, hide, disable and disposal', () => {
+        for (const ending of ['reset', 'hide', 'disable', 'dispose']) {
+            let available = 0;
+            const f = fixture({ maxActors: 2, onCapacityAvailable: () => available++ });
+            const first = f.page(1), next = f.page(2);
+            f.api.setVisiblePages([1, 2]);
+            assert.strictEqual(f.api.offer(first), 'started');
+            assert.strictEqual(f.api.offer(next), 'busy');
+            const late = [...f.callbacks.values()];
+            if (ending === 'hide') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+            else if (ending === 'disable') { f.api.setEnabled(false); }
+            else { f.api[ending](); }
+            for (const callback of late) { callback(f.now + 10000); }
+            assert.strictEqual(available, 0, ending + ' cannot wake a retired controller');
+            assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+            assert.strictEqual(f.callbacks.size, 0);
+        }
+    });
+
+    it('resumes a saturated visible-page queue after reduced motion without waking retired documents', () => {
+        for (const ending of ['resume', 'reset', 'hide', 'disable', 'dispose']) {
+            let available = 0;
+            const f = fixture({ maxActors: 2, onCapacityAvailable: () => available++ });
+            const first = f.page(1), next = f.page(2);
+            f.api.setVisiblePages([1, 2]);
+            assert.strictEqual(f.api.offer(first), 'started');
+            assert.strictEqual(f.api.offer(next), 'busy');
+            f.media.matches = true;
+            f.media.emit('change');
+            assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+            assert.strictEqual(f.callbacks.size, 0);
+            assert.strictEqual(available, 0, 'reduced motion starts no replacement episode');
+            if (ending === 'hide') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+            else if (ending === 'disable') { f.api.setEnabled(false); }
+            else if (ending !== 'resume') { f.api[ending](); }
+            f.media.matches = false;
+            f.media.emit('change');
+            assert.strictEqual(available, ending === 'resume' ? 1 : 0, 'only the current visible queue wakes on motion resume');
+            assert.strictEqual(f.callbacks.size, 0, 'motion resume needs no renderer polling loop');
+            if (ending === 'resume') {
+                assert.strictEqual(f.api.hasHandled(1), true);
+                assert.strictEqual(f.api.hasHandled(2), false);
+                assert.strictEqual(f.api.offer(next), 'started');
+                f.finish();
+                assert.strictEqual(available, 1);
+            }
+        }
+    });
+
+    it('enlarges desktop lab departures continuously while borrowing each actual actor only once', () => {
+        const f = fixture();
+        f.desktop(2);
+        const { lab } = f.openLab();
+        f.api.setDispatchOrigin(lab.dispatch);
+        const pages = f.spread();
+        f.api.setVisiblePages(pages.map(page => page.pageNumber));
+        for (const page of pages) { f.api.offer(page); }
+        const actors = f.api.snapshot().pages.flatMap((page: any) => page.actors);
+        assert.strictEqual(actors.length, module.ROBOT_VEHICLES.length);
+        assert.strictEqual(new Set(actors.map((actor: any) => actor.vehicle)).size, actors.length);
+        assert.strictEqual(lab.snapshot().actors.filter((actor: any) => actor.outside).length, actors.length);
+        const sprites = f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width);
+        assert.ok(sprites.every(sprite => Math.abs(parseFloat(sprite.style.width) - 128 * 86 / 250) < 0.02));
+        f.now += 700; f.frame();
+        assert.ok(sprites.every(sprite => Math.abs(parseFloat(sprite.style.width) - 128 * 1.92) < 0.02));
+        f.finish();
+        assert.ok(lab.snapshot().actors.every((actor: any) => !actor.outside));
+        assert.strictEqual(f.api.snapshot().retainedBytes, 0);
     });
 
     it('coalesces preview and native readiness and never replays a delivered page on revisit or zoom', () => {

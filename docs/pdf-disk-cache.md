@@ -58,3 +58,11 @@ An interrupted write leaves a temporary file, which the next writer removes. Inv
 The host sends `cacheProgress` events at most once per second, keyed by webview page and shown build. They report readable cached bytes, PDF size, total stored file bytes, configured budget, whether this build is filling, and whether its byte coverage is complete. Motion Lab displays the current build's report. Progress comes from cache events, not a polling loop.
 
 The focused tests cover actual disk persistence and streaming export, the 1.6 GB advertised size, simultaneous admission, old piece files, corrupt data, validator changes, full-URL identity, moved object prefixes, 25 rapid replacements, multiple viewers, an abort-ignoring transfer, readonly takeover, and two-process stale-lock recovery. They also exercise the existing build-in-use and viewer-switch integration behavior.
+
+### Installed book check, 4 November 2026
+
+The running Antigravity book host acquired the writer role with a live PID and matching process-start identity. Its installed budget was 4096 MiB, with no user or book-workspace override. The active 460-page build advertised 1,608,163,850 bytes.
+
+A metadata-only observation over 52.714 seconds saw stored file bytes grow from 962,302,442 to 988,118,341. Blob data grew by 25,786,704 bytes and manifests by 29,195 bytes. The 116 added blobs included 84 complete 256 KiB blocks and 32 smaller range or piece tails. Explicit build-map coverage grew from 42,579,713 to 68,366,417 bytes; the viewer's cache-progress report also includes reusable content pieces already in the store.
+
+The final store held 1,166 blobs, one build map and 57 complete reusable object maps, using 23.01% of the configured file-byte budget. The largest individual file was 18,859,867 bytes. Every persisted map reference resolved to a present blob, and there were no temporary writes, stale reaper claims or invalid maps. The observation used file metadata and small manifests without instantiating another cache writer.

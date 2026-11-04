@@ -24,7 +24,7 @@ interface Options {
     onDiagnosticsOpen?: () => void;
     diagnosticsEnabled?: boolean;
     robotsEnabled?: boolean;
-    createDocumentRobots?: (container: HTMLElement) => ReturnType<typeof installPdfDocumentRobots>;
+    createDocumentRobots?: typeof installPdfDocumentRobots;
     now?: () => number;
     requestFrame?: (callback: FrameRequestCallback) => number;
     cancelFrame?: (id: number) => void;
@@ -55,6 +55,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     const container: HTMLElement = viewer.container;
     const owner = container.ownerDocument;
     const win = owner.defaultView;
+    const visualViewport = win?.visualViewport;
     const policy = options.cachePolicy ?? pdfCachePolicy(win?.navigator);
     const limits = policy.limits;
     const now = options.now ?? (() => performance.now());
@@ -77,7 +78,10 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     const declinedPreviews = new Set<number>();
     const failed = new Set<number>();
     const renderStarts = new Map<number, number>();
-    const waitingForPixels = new Set<number>();
+    const pendingRobotPages = new Set<number>();
+    const deferredRobotPages = new Set<number>();
+    let robotCapacityBlocked = false;
+    let robotGeometry = '';
     let documentRobots: ReturnType<typeof installPdfDocumentRobots> | undefined;
     let diagnostics: ReturnType<typeof installPrefetchDiagnostics> | undefined;
     let dispatchOrigin: RobotDispatchPort | undefined;
@@ -116,37 +120,82 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     const retainResources = (id: number) => policy.pruneOffscreen
         ? nativeTarget(id) && pageView(id)?.renderingState !== FINISHED : prepared.includes(id);
 
+    function clearRobotPending(): void {
+        pendingRobotPages.clear();
+        deferredRobotPages.clear();
+        robotCapacityBlocked = false;
+        robotGeometry = '';
+    }
+
+    function updateRobotPages(): void {
+        if (!documentRobots?.enabled) { return; }
+        const geometry = [container.scrollLeft, container.scrollTop, container.clientWidth, container.clientHeight,
+            visualViewport?.offsetLeft ?? 0, visualViewport?.offsetTop ?? 0,
+            visualViewport?.width ?? win?.innerWidth, visualViewport?.height ?? win?.innerHeight, ...visible].join(',');
+        if (geometry !== robotGeometry) { deferredRobotPages.clear(); robotGeometry = geometry; }
+        for (const id of pendingRobotPages) {
+            if (!visible.includes(id) || documentRobots.hasHandled(id) || failed.has(id)) {
+                pendingRobotPages.delete(id);
+                deferredRobotPages.delete(id);
+            }
+        }
+        for (const id of visible) {
+            if (!documentRobots.hasHandled(id) && !failed.has(id)) { pendingRobotPages.add(id); }
+        }
+        // Removing an offscreen courier can release capacity synchronously. Update the
+        // waiting IDs first so its notification cannot retain an obsolete page.
+        documentRobots.setVisiblePages(visible);
+    }
+
+    function onRobotCapacityAvailable(): void {
+        robotCapacityBlocked = false;
+        scheduleRobotUpdate();
+    }
+
+    function scheduleRobotUpdate(): void {
+        if (!disposed && documentRobots?.enabled && !hidden() && document && document === viewer.pdfDocument
+            && pendingRobotPages.size > 0) { schedule(); }
+    }
+
     function setDocumentRobotsEnabled(enabled: boolean): void {
         if (disposed) { return; }
         if (enabled && !documentRobots) {
-            try { documentRobots = (options.createDocumentRobots ?? installPdfDocumentRobots)(container); }
+            try {
+                documentRobots = (options.createDocumentRobots ?? installPdfDocumentRobots)(container, {
+                    device: policy.name,
+                    onCapacityAvailable: onRobotCapacityAvailable,
+                });
+            }
             catch { pdfPerformance.event('document-robots-unavailable'); }
         }
+        if (!enabled) { clearRobotPending(); }
         documentRobots?.setEnabled(enabled);
         if (enabled && documentRobots) {
             documentRobots.setDispatchOrigin(dispatchOrigin);
-            documentRobots.setVisiblePages(visible);
-            for (const id of visible) { if (!isReady(id) && !failed.has(id)) { waitingForPixels.add(id); } }
+            updateRobotPages();
             if (document) { schedule(); }
-        } else {
-            waitingForPixels.clear();
         }
     }
 
-    /** Only a real visible loading gap earns a delivery; ready cache hits remain quiet. */
+    /** Each page can deliver its real pixels on first useful entry, including a ready cache hit. */
     function deliverPixels(id: number): void {
-        if (!documentRobots?.enabled || !waitingForPixels.has(id) || !visible.includes(id)
+        if (!documentRobots?.enabled || !pendingRobotPages.has(id) || !visible.includes(id)
+            || robotCapacityBlocked || deferredRobotPages.has(id)
             || hidden() || !document || document !== viewer.pdfDocument) { return; }
+        if (documentRobots.hasHandled(id)) { pendingRobotPages.delete(id); return; }
         const view = pageView(id);
         const native = view?.renderingState === FINISHED && view.canvas?.width && view.canvas?.height ? view.canvas : undefined;
         const canvas = native ?? previews.get(id)?.canvas;
         if (!canvas?.width || !canvas?.height || !view?.div) { return; }
-        // A bounded fleet may decline an arrival. Do not retry it on every idle refresh or
-        // replay the preview's episode when the native canvas replaces it.
-        waitingForPixels.delete(id);
         try {
-            documentRobots.deliver({ pageNumber: id, pageElement: view.div, canvas, kind: native ? 'page' : 'preview' });
-        } catch { pdfPerformance.event('document-robot-delivery-failed', { page: id }); }
+            const result = documentRobots.offer({ pageNumber: id, pageElement: view.div, canvas, kind: native ? 'page' : 'preview' });
+            if (result === 'busy') { robotCapacityBlocked = true; }
+            else if (result === 'deferred') { deferredRobotPages.add(id); }
+            else { pendingRobotPages.delete(id); }
+        } catch {
+            deferredRobotPages.add(id);
+            pdfPerformance.event('document-robot-delivery-failed', { page: id });
+        }
     }
 
     function setIdle(next: boolean) {
@@ -560,11 +609,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         const nextSignature = visible.join(',');
         if (signature !== nextSignature) { declinedPreviews.clear(); }
         signature = nextSignature;
-        documentRobots?.setVisiblePages(visible);
-        for (const id of waitingForPixels) { if (!visible.includes(id)) { waitingForPixels.delete(id); } }
-        if (documentRobots?.enabled) {
-            for (const id of visible) { if (!isReady(id) && !failed.has(id)) { waitingForPixels.add(id); } }
-        }
+        updateRobotPages();
         if (!visible.length) { return; }
         const box = container.getBoundingClientRect();
         const viewport = viewportSize();
@@ -719,7 +764,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
                 optionalContentConfigPromise: viewer.optionalContentConfigPromise,
                 ...imageHints,
             });
-            task.onContinue = (resume) => {
+            task.onContinue = (resume: () => void) => {
                 if (!current(job)) { task.cancel(); }
                 else { resume(); }
             };
@@ -803,8 +848,8 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
 
     function clearDocument() {
         setIdle(false);
+        clearRobotPending();
         documentRobots?.reset();
-        waitingForPixels.clear();
         stopRangeChecks();
         generation++;
         document = undefined;
@@ -837,8 +882,8 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
 
     function layout(invalidate = false) {
         stop();
+        clearRobotPending();
         documentRobots?.setVisiblePages([]);
-        waitingForPixels.clear();
         layoutPending = true;
         signature = '';
         lastPosition = position();
@@ -914,11 +959,15 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     listen(container, 'scroll', onScroll);
     listen(container, 'wheel', onWheel as EventListener);
     listen(container, 'scrollend', settle);
+    if (visualViewport) {
+        listen(visualViewport, 'scroll', scheduleRobotUpdate);
+        listen(visualViewport, 'resize', scheduleRobotUpdate);
+    }
     listen(owner, 'visibilitychange', () => {
         if (hidden()) {
             setIdle(false);
+            clearRobotPending();
             documentRobots?.setVisiblePages([]);
-            waitingForPixels.clear();
             stopRangeChecks();
             rangeFreshRequired = !!document?.getRangeCacheStats;
             for (const job of jobs.values()) { cancel(job); }

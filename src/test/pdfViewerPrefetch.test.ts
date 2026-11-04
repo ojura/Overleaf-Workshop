@@ -75,31 +75,51 @@ interface RobotDelivery {
 class DocumentRobots {
     enabled = true;
     readonly deliveries: RobotDelivery[] = [];
+    readonly offers: number[] = [];
     readonly visibleCalls: number[][] = [];
     readonly enabledCalls: boolean[] = [];
     readonly active = new Set<number>();
+    readonly handled = new Set<number>();
+    readonly deferred = new Set<number>();
+    maxActive = Infinity;
+    onCapacityAvailable?: () => void;
+    private blocked = false;
     resetCalls = 0;
     disposeCalls = 0;
     setEnabled(value: boolean) {
         this.enabled = value;
         this.enabledCalls.push(value);
-        if (!value) { this.active.clear(); }
+        if (!value) { this.blocked = false; this.active.clear(); }
     }
     setVisiblePages(ids: readonly number[]) {
         this.visibleCalls.push([...ids]);
+        const previous = this.active.size;
+        if (!ids.length) { this.blocked = false; }
         for (const id of this.active) { if (!ids.includes(id)) { this.active.delete(id); } }
+        if (this.active.size < previous) { this.capacityAvailable(); }
     }
-    deliver(value: RobotDelivery) {
-        // Deliberately do not deduplicate: the controller must emit one real delivery,
-        // rather than relying on the animation module to reject repeated callbacks.
+    hasHandled(id: number) { return this.handled.has(id); }
+    offer(value: RobotDelivery) {
+        this.offers.push(value.pageNumber);
+        if (!this.enabled || this.hasHandled(value.pageNumber)) { return 'skipped' as const; }
+        if (this.deferred.has(value.pageNumber)) { return 'deferred' as const; }
+        if (this.active.size >= this.maxActive) { this.blocked = true; return 'busy' as const; }
+        this.handled.add(value.pageNumber);
         this.deliveries.push(value);
         this.active.add(value.pageNumber);
-        return true;
+        return 'started' as const;
     }
-    reset() { this.resetCalls++; this.active.clear(); }
+    deliver(value: RobotDelivery) { return this.offer(value) === 'started'; }
+    complete(id: number) { if (this.active.delete(id)) { this.capacityAvailable(); } }
+    private capacityAvailable() {
+        if (!this.blocked) { return; }
+        this.blocked = false;
+        this.onCapacityAvailable?.();
+    }
+    reset() { this.resetCalls++; this.blocked = false; this.active.clear(); this.handled.clear(); }
     snapshot() { return { enabled: this.enabled, activeEpisodes: this.active.size }; }
     setDispatchOrigin() {}
-    dispose() { this.disposeCalls++; this.enabled = false; this.active.clear(); }
+    dispose() { this.disposeCalls++; this.enabled = false; this.blocked = false; this.active.clear(); }
 }
 
 class Deferred<T> {
@@ -237,7 +257,9 @@ class PageView {
 interface FixtureOptions { startPage?: number, pages?: number, width?: number, height?: number, autoPages?: boolean, mobile?: boolean }
 
 class Fixture {
-    readonly owner = Object.assign(new Events(), { visibilityState: 'visible', defaultView: { devicePixelRatio: 1, navigator: { userAgent: 'desktop test reader', maxTouchPoints: 0 } } });
+    readonly visualViewport = Object.assign(new Events(), { offsetLeft: 0, offsetTop: 0, width: 800, height: 1000 });
+    readonly owner = Object.assign(new Events(), { visibilityState: 'visible', defaultView: { devicePixelRatio: 1,
+        navigator: { userAgent: 'desktop test reader', maxTouchPoints: 0 }, visualViewport: this.visualViewport } });
     readonly container = new Element();
     readonly eventBus = new Events();
     readonly callbacks = new Map<number, (timestamp: number) => void>();
@@ -269,6 +291,8 @@ class Fixture {
         this.container.ownerDocument = this.owner;
         this.container.clientWidth = width;
         this.container.clientHeight = height;
+        this.visualViewport.width = width;
+        this.visualViewport.height = height;
         this.container.scrollTop = ((options.startPage ?? 20) - 1) * height;
         this.pages = Array.from({ length: count }, (_, index) => new PageView(index + 1, width, height, this));
         this.queue = {
@@ -392,7 +416,7 @@ class Fixture {
         this.eventBus.emit('pagesinit');
     }
 
-    get listenerCount() { return this.owner.listenerCount + this.container.listenerCount + this.eventBus.listenerCount; }
+    get listenerCount() { return this.owner.listenerCount + this.container.listenerCount + this.eventBus.listenerCount + this.visualViewport.listenerCount; }
     dispose() { this.controller?.dispose(); }
 }
 
@@ -484,7 +508,11 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         const factories: Element[] = [];
         const f = fixture({}, {
             robotsEnabled: enabled,
-            createDocumentRobots: (container: Element) => { factories.push(container); return robots; },
+            createDocumentRobots: (container: Element, options?: { onCapacityAvailable?: () => void }) => {
+                factories.push(container);
+                robots.onCapacityAvailable = options?.onCapacityAvailable;
+                return robots;
+            },
         });
         return { f, robots, factories };
     }
@@ -506,8 +534,8 @@ describe('the PDF viewers\' shared prefetch controller', function () {
 
     it('delivers the real retained visible preview to document robots once, including after native completion', async () => {
         const { f, robots, factories, render } = await visibleRobotPreview();
-        assert.strictEqual(robots.deliveries.length, 1, 'the newly covered visible page starts one delivery');
-        const delivery = robots.deliveries[0];
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20, 21], 'each first visible page starts one delivery');
+        const delivery = robots.deliveries[1];
         const canvas = render.parameters.canvasContext.canvas;
         assert.deepStrictEqual(factories, [f.container], 'one lazy robot instance belongs to the PDF scroll container');
         assert.strictEqual(delivery.pageNumber, 21);
@@ -519,25 +547,28 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.ok(robots.visibleCalls.some(ids => ids.includes(21)));
         f.finishNative(21);
         await f.frame();
-        assert.strictEqual(robots.deliveries.length, 1, 'native replacement of a delivered preview does not replay the episode');
+        assert.strictEqual(robots.deliveries.length, 2, 'native replacement of a delivered preview does not replay the episode');
     });
 
-    it('keeps document robots silent for already-covered pages and offscreen prefetch completions', async () => {
+    it('offers ready pages on first visible entry and keeps offscreen prefetch completions quiet', async () => {
         const { f, robots, factories } = robotFixture();
         await f.frame();
         assert.deepStrictEqual(factories, [f.container]);
-        assert.deepStrictEqual(robots.deliveries, [], 'the initially finished page is already covered');
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20], 'the initially finished page gets a delivery');
+        assert.strictEqual(robots.deliveries[0].canvas, f.pages[19].canvas, 'ready native pixels are offered directly');
         const render = f.pdf.activeRenders.find(candidate => candidate.id === 21)!;
         render.task.finish();
         await promisesSettled();
         await f.frame();
-        assert.deepStrictEqual(robots.deliveries, [], 'offscreen preparation does not create an animation');
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20], 'offscreen preparation does not create an animation');
         f.scrollBy(1000);
         await f.frame();
         assert.strictEqual(render.parameters.canvasContext.canvas.parentNode, f.pages[20].div);
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20, 21], 'the warmed page gets its first episode on entry');
+        assert.strictEqual(robots.deliveries[1].canvas, render.parameters.canvasContext.canvas);
         f.finishNative(21);
         await f.frame();
-        assert.deepStrictEqual(robots.deliveries, [], 'returning to ready pixels is immediately covered without an episode');
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20, 21], 'the native replacement does not replay the episode');
     });
 
     it('delivers a newly finished visible native page to document robots when no preview covered it', async () => {
@@ -548,15 +579,15 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.ok(f.controller.snapshot().visibleMissing.includes(21));
         f.finishNative(21);
         await f.frame();
-        assert.strictEqual(robots.deliveries.length, 1);
-        assert.strictEqual(robots.deliveries[0].kind, 'page');
-        assert.strictEqual(robots.deliveries[0].pageElement, f.pages[20].div);
-        assert.strictEqual(robots.deliveries[0].canvas, f.pages[20].canvas, 'native cargo uses the completed page canvas');
+        assert.strictEqual(robots.deliveries.length, 2);
+        assert.strictEqual(robots.deliveries[1].kind, 'page');
+        assert.strictEqual(robots.deliveries[1].pageElement, f.pages[20].div);
+        assert.strictEqual(robots.deliveries[1].canvas, f.pages[20].canvas, 'native cargo uses the completed page canvas');
         const render = f.pdf.activeRenders.find(candidate => candidate.id === 21)!;
         render.task.finish();
         await promisesSettled();
         await f.frame();
-        assert.strictEqual(robots.deliveries.length, 1, 'a later auxiliary completion cannot replay native delivery');
+        assert.strictEqual(robots.deliveries.length, 2, 'a later auxiliary completion cannot replay native delivery');
     });
 
     it('resets document robots on replacement and rejects a stale preview before delivering the new document', async () => {
@@ -574,7 +605,8 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         await promisesSettled();
         await f.frame();
         assert.ok(robots.resetCalls > resets, 'replacement clears the previous document episode history');
-        assert.strictEqual(robots.deliveries.length, 0, 'the old document completion must never reach the robot module');
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20, 21], 'the replacement document gets its own first visible episode');
+        assert.ok(robots.deliveries.every(delivery => delivery.pageElement !== oldElement), 'the old document completion must never reach the robot module');
         assert.strictEqual(stale.parameters.canvasContext.canvas.width, 0);
         const fresh = f.pdf.activeRenders.find(candidate => candidate.id === 22)!;
         assert.ok(fresh);
@@ -583,11 +615,149 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         fresh.task.finish();
         await promisesSettled();
         await f.frame();
-        assert.strictEqual(robots.deliveries.length, 1);
-        assert.strictEqual(robots.deliveries[0].pageNumber, 22);
-        assert.strictEqual(robots.deliveries[0].pageElement, f.pages[21].div);
-        assert.notStrictEqual(robots.deliveries[0].pageElement, oldElement);
+        assert.strictEqual(robots.deliveries.length, 3);
+        assert.strictEqual(robots.deliveries[2].pageNumber, 22);
+        assert.strictEqual(robots.deliveries[2].pageElement, f.pages[21].div);
+        assert.notStrictEqual(robots.deliveries[2].pageElement, oldElement);
     });
+
+    it('waits for courier capacity once and drains ready visible pages without idle polling', async () => {
+        const { f, robots } = robotFixture();
+        robots.maxActive = 1;
+        f.visibleIds = [20, 21, 22];
+        f.pages[19].reset();
+        await f.frame();
+        for (const id of f.visibleIds) { f.finishNative(id); }
+        await f.frame();
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20]);
+        assert.deepStrictEqual(robots.offers, [20, 21], 'the first busy result stops further allocation attempts');
+        for (let index = 0; index < 5; index++) { f.eventBus.emit('updateviewarea'); await f.frame(); }
+        assert.deepStrictEqual(robots.offers, [20, 21], 'ordinary refreshes do not retry a saturated fleet');
+        assert.strictEqual(f.callbacks.size, 0, 'waiting for a courier does not keep animation frames running');
+        assert.strictEqual(timers.size, 0, 'courier capacity does not create a polling timer');
+        robots.complete(20);
+        assert.strictEqual(f.callbacks.size, 1, 'completion requests one coalesced refresh');
+        await f.frame();
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20, 21]);
+        assert.strictEqual(robots.deliveries[1].canvas, f.pages[20].canvas, 'a deferred offer reads the current native canvas');
+        robots.complete(21);
+        await f.frame();
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20, 21, 22]);
+        robots.complete(22);
+        assert.strictEqual(f.callbacks.size, 0, 'the final courier does not wake an empty waiting list');
+    });
+
+    it('drops offscreen pending deliveries and resumes only the currently visible queue on cancellation', async () => {
+        const { f, robots } = robotFixture();
+        robots.maxActive = 1;
+        f.visibleIds = [20, 21, 22];
+        for (const id of f.visibleIds) { f.cachePage(id); }
+        await f.frame();
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20]);
+        assert.deepStrictEqual(robots.offers, [20, 21]);
+        f.visibleIds = [22, 23];
+        f.cachePage(23);
+        f.eventBus.emit('updateviewarea');
+        await f.frame();
+        await f.frame();
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20, 22], 'cancelling an offscreen courier releases capacity for a visible page');
+        assert.ok(!robots.hasHandled(21), 'the offscreen waiting page keeps its future first-entry opportunity');
+        robots.complete(22);
+        await f.frame();
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20, 22, 23]);
+        assert.ok(!robots.deliveries.some(delivery => delivery.pageNumber === 21));
+        f.visibleIds = [21];
+        f.eventBus.emit('updateviewarea');
+        await f.frame();
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20, 22, 23, 21], 'the unhandled page can run when it is visible again');
+    });
+
+    it('defers a visible sliver without spending its episode and retries after real geometry changes', async () => {
+        const { f, robots } = robotFixture();
+        robots.deferred.add(20);
+        await f.frame();
+        assert.deepStrictEqual(robots.offers, [20]);
+        assert.strictEqual(robots.hasHandled(20), false);
+        assert.strictEqual(robots.deliveries.length, 0);
+        for (let index = 0; index < 4; index++) { f.eventBus.emit('updateviewarea'); await f.frame(); }
+        assert.deepStrictEqual(robots.offers, [20], 'an unchanged sliver does not repeatedly sample or allocate');
+        robots.deferred.delete(20);
+        f.visibleIds = [20];
+        f.container.scrollTop += 10;
+        f.container.emit('scroll');
+        await f.frame();
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20], 'a larger intersection gets the original first-entry episode');
+        assert.strictEqual(robots.hasHandled(20), true);
+    });
+
+    for (const event of ['scroll', 'resize'] as const) {
+        it('retries deferred document pixels after a visual-viewport-only ' + event, async () => {
+            const { f, robots } = robotFixture();
+            robots.deferred.add(20);
+            await f.frame();
+            assert.deepStrictEqual(robots.offers, [20]);
+            assert.strictEqual(f.callbacks.size, 0);
+            const containerGeometry = [f.container.scrollLeft, f.container.scrollTop, f.container.clientWidth, f.container.clientHeight];
+            robots.deferred.delete(20);
+            if (event === 'scroll') { f.visualViewport.offsetTop += 30; }
+            else { f.visualViewport.width -= 40; }
+            f.visualViewport.emit(event);
+            f.visualViewport.emit(event);
+            assert.strictEqual(f.callbacks.size, 1, 'visual viewport changes request one coalesced refresh');
+            await f.frame();
+            assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20], 'changed visual clipping reconsiders the deferred page');
+            assert.deepStrictEqual([f.container.scrollLeft, f.container.scrollTop, f.container.clientWidth, f.container.clientHeight], containerGeometry);
+            assert.strictEqual(f.callbacks.size, 0, 'viewport handling leaves an idle reader asleep');
+            f.dispose();
+            assert.strictEqual(f.visualViewport.listenerCount, 0, 'both visual viewport listeners are removed on disposal');
+            f.visualViewport.emit(event);
+            assert.strictEqual(f.callbacks.size, 0);
+        });
+    }
+
+    it('uses robot-owned page history across refresh, zoom, hide and toggles', async () => {
+        const { f, robots } = robotFixture();
+        await f.frame();
+        assert.deepStrictEqual(robots.offers, [20]);
+        for (let index = 0; index < 3; index++) { f.eventBus.emit('updateviewarea'); await f.frame(); }
+        f.eventBus.emit('scalechanging');
+        await f.frame();
+        f.owner.visibilityState = 'hidden';
+        f.owner.emit('visibilitychange');
+        f.owner.visibilityState = 'visible';
+        f.owner.emit('visibilitychange');
+        await f.frame();
+        f.controller.setRobotsEnabled(false);
+        f.controller.setRobotsEnabled(true);
+        await f.frame();
+        assert.deepStrictEqual(robots.offers, [20], 'handled IDs are rejected before another robot offer');
+        assert.strictEqual(robots.deliveries.length, 1);
+        f.replaceDocument();
+        await f.frame();
+        assert.deepStrictEqual(robots.offers, [20, 20], 'only a new document clears the authoritative history');
+        assert.strictEqual(robots.deliveries.length, 2);
+    });
+
+    for (const lifecycle of ['hide', 'disable', 'dispose'] as const) {
+        it('ignores an obsolete courier-capacity callback after ' + lifecycle, async () => {
+            const { f, robots } = robotFixture();
+            robots.maxActive = 1;
+            f.visibleIds = [20, 21];
+            f.cachePage(21);
+            await f.frame();
+            assert.deepStrictEqual(robots.offers, [20, 21]);
+            const callback = robots.onCapacityAvailable;
+            assert.ok(callback);
+            if (lifecycle === 'hide') { f.owner.visibilityState = 'hidden'; f.owner.emit('visibilitychange'); }
+            else if (lifecycle === 'disable') { f.controller.setRobotsEnabled(false); }
+            else { f.dispose(); }
+            await promisesSettled();
+            await f.frame();
+            callback();
+            assert.strictEqual(f.callbacks.size, 0, 'a late capacity notification cannot restart hidden, disabled or disposed work');
+            assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20]);
+        });
+    }
 
     for (const lifecycle of ['rotation', 'hide', 'dispose'] as const) {
         it('cancels document robots immediately on ' + lifecycle, async () => {
