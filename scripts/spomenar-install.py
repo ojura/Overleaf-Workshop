@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the native public Nextcloud route and nginx, then publish the site's assets."""
+"""Validate the public share and immutable publication routes, then publish site assets."""
 from email.utils import parsedate_to_datetime
 import http.client
 import json
@@ -107,34 +107,27 @@ def public_pdf(settings):
     return {'url': url, 'bytes': size, 'validator': validator, 'lastModified': modified}
 
 
-def public_pdf_location(prefix, native_uri):
-    """Reuse Nextcloud's PHP/DAV handler; nginx keeps the original request URI across rewrites."""
-    return f'''# Resolve the current share on every request; no file path or inode is retained here.
-set $spomenar_request_uri $request_uri;
-location = {prefix}/book.pdf {{
-    if ($request_method !~ "^(GET|HEAD)$") {{ return 405; }}
-    set $spomenar_request_uri {nginx_quote(native_uri)};
-    rewrite ^ $spomenar_request_uri? last;
-}}
-'''
+def remove_native_request_uri(source):
+    """Retire only the exact earlier Spomenar adapter, preserving all native handlers."""
+    source = re.sub(
+        r'^[ \t]*# Spomenar rewrites to native DAV; other requests keep their original URI\.\n',
+        '', source, flags=re.MULTILINE)
+    source = re.sub(
+        r'^[ \t]*fastcgi_param REQUEST_URI \$spomenar_request_uri;[ \t]*\n',
+        '', source, flags=re.MULTILINE)
+    if '$spomenar_request_uri' in source:
+        raise RuntimeError('An unrecognized Spomenar URI adapter needs explicit review')
+    return source
 
 
-def native_request_uri(source):
-    """One adapter in the existing PHP location supplies the rewritten DAV URI to Nextcloud."""
-    directive = 'fastcgi_param REQUEST_URI $spomenar_request_uri;'
-    anchor = re.compile(r'^([ \t]*)fastcgi_pass[ \t]+php-handler;[ \t]*$', re.MULTILINE)
-    matches = list(anchor.finditer(source))
-    if len(matches) != 1:
-        raise RuntimeError('Cannot identify the existing Nextcloud PHP handler unambiguously')
-    match = matches[0]
-    if directive in source:
-        if source.count(directive) != 1 or not source[:match.start()].rstrip().endswith(directive):
-            raise RuntimeError('The canonical request URI adapter is not in its expected PHP location')
-        return source
-    indent = match.group(1)
-    adapter = (indent + '# Spomenar rewrites to native DAV; other requests keep their original URI.\n'
-               + indent + directive + '\n')
-    return source[:match.start()] + adapter + source[match.start():]
+def publication_routes(stage, settings, prefix):
+    """Read the fixed publication aliases after the catalog has been bootstrapped."""
+    root = Path(settings['publicationRoot'])
+    if prefix != '/spomenar' or root != Path('/mnt/btrfs_storage/spomenar-public'):
+        raise RuntimeError('The publication snippet is configured for the existing Spomenar site')
+    if not all((root / 'catalog' / name).is_file() for name in ('config.json', 'status.json')):
+        raise RuntimeError('Bootstrap spomenar-watch before enabling its publication routes')
+    return (stage / 'spomenar-watch.nginx.conf').read_text()
 
 
 def add_include(source, include, hostname):
@@ -186,7 +179,6 @@ def main():
         raise RuntimeError('Invalid site path')
     web_root = Path(settings['webRoot'])
     site = web_root / prefix[1:]
-    preview_site = site.with_name(site.name + '-previews')
     nginx_main = Path(settings['nginxMain'])
     nginx_site = Path(settings['nginxSite'])
     nginx_snippet = Path(settings['nginxSnippet'])
@@ -195,6 +187,7 @@ def main():
     site_mode = nginx_site.stat().st_mode & 0o777
     main_text = nginx_main.read_text()
     pdf = public_pdf(settings)
+    publication = publication_routes(stage, settings, prefix)
 
     csp = (
         "default-src 'self'; base-uri 'self'; connect-src 'self'; "
@@ -207,16 +200,7 @@ location = {prefix} {{
     return 301 {prefix}/$is_args$args;
 }}
 
-{public_pdf_location(prefix, urlsplit(pdf['url']).path)}
-
-# Generated previews survive replacement of the standalone viewer's static directory.
-location ^~ {prefix}/previews/ {{
-    alias {nginx_quote(str(preview_site) + '/')};
-    autoindex off;
-    add_header Cache-Control "no-cache" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header Content-Security-Policy "{csp}" always;
-}}
+{publication}
 
 location ^~ {prefix}/ {{
     root {nginx_quote(web_root)};
@@ -228,7 +212,7 @@ location ^~ {prefix}/ {{
 }}
 '''
     (stage / 'spomenar.conf').write_text(snippet)
-    desired = native_request_uri(add_include(original_main.decode(), nginx_snippet, address.hostname))
+    desired = remove_native_request_uri(add_include(original_main.decode(), nginx_snippet, address.hostname))
     test_site = desired.replace(nginx_quote(nginx_snippet), nginx_quote(stage / 'spomenar.conf'))
     test_site = absolute_includes(test_site, nginx_main.parent)
     (stage / 'nextcloud-check.conf').write_text(test_site)
@@ -255,15 +239,15 @@ location ^~ {prefix}/ {{
     for file in source.rglob('*'):
         if file.is_symlink() or file.name == 'book.pdf':
             raise RuntimeError('The static build must not contain symlinks or a PDF copy')
-    if preview_site.is_symlink() or (preview_site.exists() and not preview_site.is_dir()):
-        raise RuntimeError('The preview destination is not an ordinary directory')
-    preview_site.mkdir(mode=0o755, parents=True, exist_ok=True)
     next_site = Path(tempfile.mkdtemp(prefix='.' + site.name + '-next-', dir=site.parent))
     previous = None
     published = False
     changed = False
     try:
         shutil.copytree(source, next_site, dirs_exist_ok=True)
+        # The root-owned catalog is authoritative; a build-time seed must not be
+        # served through an alternate path or overwrite a later publication.
+        (next_site / 'config.json').unlink(missing_ok=True)
         for file in [next_site, *next_site.rglob('*')]:
             file.chmod(0o755 if file.is_dir() else 0o644)
         changed = True
@@ -279,9 +263,6 @@ location ^~ {prefix}/ {{
         os.replace(next_site, site)
         published = True
         command(['systemctl', 'reload', 'nginx'])
-        if previous:
-            shutil.rmtree(previous)
-        print('Published ' + settings['url'] + ' with native Nextcloud share resolution for every PDF request.', flush=True)
     except Exception:
         if published:
             shutil.rmtree(site)
@@ -299,6 +280,11 @@ location ^~ {prefix}/ {{
     finally:
         if next_site.exists():
             shutil.rmtree(next_site)
+    # The reload commits activation. Later backup cleanup or a closed reporting
+    # pipe must never roll back a working site to a partly deleted old tree.
+    if previous:
+        shutil.rmtree(previous)
+    print('Published ' + settings['url'] + ' with the watcher-owned immutable publication catalog.', flush=True)
 
 
 if __name__ == '__main__':

@@ -1,20 +1,19 @@
-"""Stable-share preflight and nginx routing tests using only small temporary files."""
+"""Native-share preflight and retired adapter checks using only small temporary files."""
 
 from email.utils import formatdate
+import contextlib
 import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
+import io
+import json
 from pathlib import Path
 import re
 import shutil
-import socket
-import socketserver
-import struct
 import subprocess
 import tempfile
 import threading
-import time
 import unittest
 from unittest import mock
 
@@ -24,7 +23,6 @@ SPEC = importlib.util.spec_from_file_location(
 INSTALL = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(INSTALL)
 NATIVE_URI = "/nextcloud/public.php/dav/files/stable-token"
-NGINX = shutil.which("nginx")
 
 
 class PublicShare:
@@ -186,208 +184,131 @@ class NativePreflightTest(unittest.TestCase):
         whole.close.assert_called_once()
         connections[1].close.assert_called_once()
 
-    def test_php_adapter_is_idempotent_and_rejects_ambiguous_handlers(self):
+
+class AdapterRetirementTest(unittest.TestCase):
+    def test_native_handler_is_unchanged_without_an_old_adapter(self):
         source = "location ~ php {\n    include fastcgi_params;\n    fastcgi_pass php-handler;\n}\n"
-        adapted = INSTALL.native_request_uri(source)
-        self.assertEqual(INSTALL.native_request_uri(adapted), adapted)
-        self.assertIn("fastcgi_param REQUEST_URI $spomenar_request_uri;", adapted)
-        for bad in ["", source + source, source.replace("php-handler", "another-handler")]:
-            with self.subTest(source=bad), self.assertRaises(RuntimeError):
-                INSTALL.native_request_uri(bad)
+        self.assertEqual(INSTALL.remove_native_request_uri(source), source)
+
+    def test_only_the_exact_old_adapter_is_removed_and_removal_is_idempotent(self):
+        native = "location ~ php {\n    include fastcgi_params;\n    fastcgi_pass php-handler;\n}\n"
+        old = native.replace(
+            "    fastcgi_pass php-handler;",
+            "    # Spomenar rewrites to native DAV; other requests keep their original URI.\n"
+            "    fastcgi_param REQUEST_URI $spomenar_request_uri;\n"
+            "    fastcgi_pass php-handler;")
+        result = INSTALL.remove_native_request_uri(old)
+        self.assertEqual(result, native)
+        self.assertEqual(INSTALL.remove_native_request_uri(result), native)
+
+    def test_unrecognized_references_require_review(self):
+        with self.assertRaisesRegex(RuntimeError, "explicit review"):
+            INSTALL.remove_native_request_uri("set $spomenar_request_uri /unrecognized;\n")
 
 
-class FastcgiShareHandler(socketserver.StreamRequestHandler):
-    """Minimal FastCGI responder for observing nginx's real forwarded parameter stream."""
-
-    def handle(self):
-        encoded = bytearray()
-        request_id = 1
-        while True:
-            header = self.rfile.read(8)
-            if not header:
-                return
-            version, kind, request_id, length, padding, _reserved = struct.unpack("!BBHHBB", header)
-            if version != 1:
-                return
-            content = self.rfile.read(length)
-            self.rfile.read(padding)
-            if kind == 4:
-                encoded.extend(content)
-            if kind == 5 and not content:
-                break
-        offset = 0
-
-        def next_length():
-            nonlocal offset
-            value = encoded[offset]
-            if value & 0x80:
-                value = int.from_bytes(encoded[offset:offset + 4], "big") & 0x7fffffff
-                offset += 4
-            else:
-                offset += 1
-            return value
-
-        params = {}
-        while offset < len(encoded):
-            name_size, value_size = next_length(), next_length()
-            name = bytes(encoded[offset:offset + name_size]).decode()
-            offset += name_size
-            params[name] = bytes(encoded[offset:offset + value_size]).decode()
-            offset += value_size
-        self.server.params.append(params)
-        headers = {name[5:].replace("_", "-"): value for name, value in params.items() if name.startswith("HTTP_")}
-        status, fields, body = self.server.share.response(params["REQUEST_METHOD"], params["REQUEST_URI"], headers)
-        payload = (f"Status: {status}\r\n"
-                   + "".join(f"{name}: {value}\r\n" for name, value in fields.items())
-                   + "\r\n").encode() + body
-
-        def record(kind, data):
-            self.wfile.write(struct.pack("!BBHHBB", 1, kind, request_id, len(data), 0, 0) + data)
-
-        record(6, payload)
-        record(6, b"")
-        record(3, b"\x00" * 8)
-
-
-class UnixHttpConnection(http.client.HTTPConnection):
-    def __init__(self, filename):
-        super().__init__("localhost", timeout=5)
-        self.filename = str(filename)
-
-    def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(self.filename)
-
-
-@unittest.skipUnless(NGINX, "nginx is required for the isolated routing fixture")
-class NativeNginxRoutingTest(unittest.TestCase):
+class PublicationInstallTest(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="spomenar-nginx-test-")
+        temporary = tempfile.TemporaryDirectory(prefix="spomenar-install-test-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.share = PublicShare(self.root)
-        self.http_socket = self.root / "http.sock"
-        self.fcgi = socketserver.UnixStreamServer(str(self.root / "fcgi.sock"), FastcgiShareHandler)
-        self.fcgi.share = self.share
-        self.fcgi.params = []
-        thread = threading.Thread(target=self.fcgi.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(self.close_fcgi, thread)
-        (self.root / "nextcloud").mkdir()
-        (self.root / "nextcloud/public.php").touch()
-        params = self.root / "fastcgi_params"
-        params.write_text(
-            "fastcgi_param REQUEST_METHOD $request_method;\n"
-            "fastcgi_param REQUEST_URI $request_uri;\n"
-            "fastcgi_param SCRIPT_NAME $fastcgi_script_name;\n"
-            "fastcgi_param QUERY_STRING $query_string;\n")
-        php = INSTALL.native_request_uri(r'''
-        location ~ \.php(?:$|/) {
-            fastcgi_split_path_info ^(.+?\.php)(/.*)$;
-            set $path_info $fastcgi_path_info;
-            try_files $fastcgi_script_name =404;
-            include ''' + INSTALL.nginx_quote(params) + r''';
-            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-            fastcgi_param PATH_INFO $path_info;
-            fastcgi_pass php-handler;
+        self.stage = self.root / "stage"
+        self.stage.mkdir()
+        self.source = self.stage / "site"
+        self.source.mkdir()
+        (self.source / "index.html").write_text("new viewer")
+        (self.source / "config.json").write_text('{"edition":"stale build seed"}')
+        self.web = self.root / "www"
+        self.site = self.web / "spomenar"
+        self.site.mkdir(parents=True)
+        (self.site / "index.html").write_text("old viewer")
+        self.catalog = self.root / "publication" / "catalog"
+        self.catalog.mkdir(parents=True)
+        self.config = self.catalog / "config.json"
+        self.config.write_text('{"publicationGeneration":7,"edition":"current"}')
+        self.config_before = self.config.read_bytes()
+        nginx = self.root / "nginx"
+        (nginx / "conf.d").mkdir(parents=True)
+        (nginx / "snippets").mkdir()
+        self.nginx_main = nginx / "nginx.conf"
+        self.nginx_main.write_text("http { include " + str(nginx / "conf.d/*.conf") + "; }\n")
+        self.nginx_site = nginx / "conf.d/nextcloud.conf"
+        self.nginx_site.write_text("server {\n    server_name example.test;\n    ssl_certificate fixture;\n}\n")
+        self.nginx_snippet = nginx / "snippets/spomenar.conf"
+        self.nginx_snippet.write_text("# previous routes\n")
+        self.old_site = self.nginx_site.read_bytes()
+        self.old_snippet = self.nginx_snippet.read_bytes()
+        settings = {
+            "url": "https://example.test/spomenar/", "apply": True,
+            "shareUrl": "https://example.test/nextcloud/s/token",
+            "webRoot": str(self.web), "publicationRoot": str(self.catalog.parent),
+            "nginxMain": str(self.nginx_main), "nginxSite": str(self.nginx_site),
+            "nginxSnippet": str(self.nginx_snippet),
         }
-''')
-        configuration = self.root / "nginx.conf"
-        configuration.write_text(f'''
-daemon off;
-master_process off;
-error_log {INSTALL.nginx_quote(self.root / "error.log")};
-pid {INSTALL.nginx_quote(self.root / "nginx.pid")};
-events {{ worker_connections 32; }}
-http {{
-    access_log off;
-    client_body_temp_path {INSTALL.nginx_quote(self.root / "body")};
-    fastcgi_temp_path {INSTALL.nginx_quote(self.root / "fastcgi")};
-    upstream php-handler {{ server unix:{self.root}/fcgi.sock; }}
-    server {{
-        listen unix:{self.http_socket};
-        root {INSTALL.nginx_quote(self.root)};
-        {INSTALL.public_pdf_location("/spomenar", NATIVE_URI)}
-        {php}
-    }}
-}}
-''')
-        subprocess.run([NGINX, "-t", "-p", str(self.root), "-c", str(configuration)],
-                       check=True, capture_output=True, text=True)
-        self.nginx = subprocess.Popen([NGINX, "-p", str(self.root), "-c", str(configuration)],
-                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        self.addCleanup(self.close_nginx)
-        for _ in range(100):
-            if self.http_socket.exists():
-                break
-            if self.nginx.poll() is not None:
-                self.fail(self.nginx.stderr.read().decode())
-            time.sleep(.01)
-        self.assertTrue(self.http_socket.exists(), "the isolated nginx listener did not start")
+        (self.stage / "deployment.json").write_text(json.dumps(settings))
+        self.reloads = 0
 
-    def close_nginx(self):
-        self.nginx.terminate()
-        self.nginx.wait(timeout=5)
-        self.nginx.stderr.close()
+    def invoke(self, *, activation_failure=False, cleanup_failure=False, reporting_failure=False):
+        original_remove = shutil.rmtree
+        original_print = print
 
-    def close_fcgi(self, thread):
-        self.fcgi.shutdown()
-        self.fcgi.server_close()
-        thread.join()
+        def command(arguments, **_options):
+            if arguments == ["systemctl", "reload", "nginx"]:
+                self.reloads += 1
+                if activation_failure and self.reloads == 1:
+                    raise subprocess.CalledProcessError(1, arguments)
 
-    def request(self, method="GET", uri="/spomenar/book.pdf", headers=None):
-        connection = UnixHttpConnection(self.http_socket)
-        try:
-            connection.request(method, uri, headers=headers or {})
-            response = connection.getresponse()
-            return response.status, dict(response.getheaders()), response.read()
-        finally:
-            connection.close()
+        def remove(path, *args, **kwargs):
+            if cleanup_failure and Path(path).name.startswith(".spomenar-previous-"):
+                (Path(path) / "index.html").unlink()
+                raise OSError("fixture interrupted backup cleanup")
+            return original_remove(path, *args, **kwargs)
 
-    def test_same_book_route_resolves_move_replacement_and_revocation_without_reload(self):
-        first = self.request(headers={"Range": "bytes=0-15"})
-        self.assertEqual((first[0], len(first[2])), (206, 16))
-        moved = self.root / "Moved folder" / "Renamed č.pdf"
-        moved.parent.mkdir()
-        self.share.file.rename(moved)
-        self.share.file = moved
-        after_move = self.request(headers={"Range": "bytes=0-15", "If-Range": first[1]["ETag"]})
-        self.assertEqual(after_move[0], 206)
-        self.assertEqual(after_move[2], first[2])
-        self.assertEqual(after_move[1]["ETag"], first[1]["ETag"])
-        moved.write_bytes(b"%PDF-2.0\nnew representation\n")
-        stale = self.request(headers={"Range": "bytes=0-15", "If-Range": first[1]["ETag"]})
-        self.assertEqual(stale[0], 200)
-        self.assertNotEqual(stale[1]["ETag"], first[1]["ETag"])
-        fresh = self.request(headers={"Range": "bytes=0-15", "If-Range": stale[1]["ETag"]})
-        self.assertEqual((fresh[0], len(fresh[2])), (206, 16))
-        self.share.revoked = True
-        self.assertEqual(self.request(headers={"Range": "bytes=0-15"})[0], 404)
-        self.assertEqual(len(self.fcgi.params), 5, "every request reaches the authoritative handler")
-        self.assertTrue(all(entry["REQUEST_URI"] == NATIVE_URI for entry in self.fcgi.params))
+        def report(*args, **kwargs):
+            if reporting_failure and args and str(args[0]).startswith("Published "):
+                raise BrokenPipeError("fixture closed reporting pipe")
+            return original_print(*args, **kwargs)
 
-    def test_head_and_range_headers_reach_native_dav_and_book_arguments_cannot_change_the_share(self):
-        head = self.request("HEAD")
-        self.assertEqual(head[0], 200)
-        self.assertEqual(head[2], b"")
-        self.assertEqual(int(head[1]["Content-Length"]), self.share.file.stat().st_size)
-        result = self.request(uri="/spomenar/book.pdf?files=another.pdf",
-                              headers={"Range": "bytes=5-20", "If-Range": head[1]["ETag"]})
-        self.assertEqual((result[0], len(result[2])), (206, 16))
-        params = self.fcgi.params[-1]
-        self.assertEqual(params["PATH_INFO"], "/dav/files/stable-token")
-        self.assertEqual(params["QUERY_STRING"], "")
-        self.assertEqual(params["HTTP_RANGE"], "bytes=5-20")
-        self.assertEqual(params["HTTP_IF_RANGE"], head[1]["ETag"])
-        self.assertEqual(self.request("POST")[0], 405)
-        self.assertEqual(len(self.fcgi.params), 2)
+        # Native transport and the exact static locations have their own real
+        # HTTP/nginx fixtures; this exercises main's filesystem commit boundary.
+        with mock.patch.object(INSTALL, "__file__", str(self.stage / "install.py")), \
+                mock.patch.object(INSTALL, "public_pdf", return_value={"bytes": 100, "validator": {"header": "ETag", "value": '"pdf"'}}), \
+                mock.patch.object(INSTALL, "publication_routes", return_value="# fixed publication aliases\n"), \
+                mock.patch.object(INSTALL, "command", side_effect=command), \
+                mock.patch.object(INSTALL.shutil, "rmtree", side_effect=remove), \
+                mock.patch("builtins.print", side_effect=report), contextlib.redirect_stdout(io.StringIO()):
+            INSTALL.main()
 
-    def test_unrelated_native_requests_keep_their_original_encoded_uri_and_arguments(self):
-        uri = "/nextcloud/public.php/dav/files/another%20token?x=a%20b"
-        self.assertEqual(self.request(uri=uri)[0], 404)
-        self.assertEqual(self.fcgi.params[-1]["REQUEST_URI"], uri)
-        self.assertEqual(self.fcgi.params[-1]["QUERY_STRING"], "x=a%20b")
+    def test_activation_preserves_catalog_and_omits_stale_asset_seed(self):
+        self.invoke()
+        self.assertEqual((self.site / "index.html").read_text(), "new viewer")
+        self.assertFalse((self.site / "config.json").exists())
+        self.assertEqual(self.config.read_bytes(), self.config_before)
+        self.assertEqual(self.reloads, 1)
+        self.assertFalse(list(self.web.glob(".spomenar-*")))
+
+    def test_failed_activation_restores_old_site_and_both_nginx_files(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.invoke(activation_failure=True)
+        self.assertEqual((self.site / "index.html").read_text(), "old viewer")
+        self.assertEqual(self.nginx_site.read_bytes(), self.old_site)
+        self.assertEqual(self.nginx_snippet.read_bytes(), self.old_snippet)
+        self.assertEqual(self.config.read_bytes(), self.config_before)
+        self.assertEqual(self.reloads, 2)
+        self.assertFalse(list(self.web.glob(".spomenar-*")))
+
+    def test_post_commit_cleanup_failure_keeps_the_activated_site(self):
+        with self.assertRaisesRegex(OSError, "backup cleanup"):
+            self.invoke(cleanup_failure=True)
+        self.assertEqual((self.site / "index.html").read_text(), "new viewer")
+        self.assertEqual(self.reloads, 1)
+        self.assertEqual(self.config.read_bytes(), self.config_before)
+
+    def test_post_commit_reporting_failure_keeps_the_activated_site(self):
+        with self.assertRaises(BrokenPipeError):
+            self.invoke(reporting_failure=True)
+        self.assertEqual((self.site / "index.html").read_text(), "new viewer")
+        self.assertEqual(self.reloads, 1)
+        self.assertEqual(self.config.read_bytes(), self.config_before)
 
 
 if __name__ == "__main__":

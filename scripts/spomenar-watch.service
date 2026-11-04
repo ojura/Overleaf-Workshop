@@ -1,0 +1,30 @@
+[Unit]
+Description=Publish settled Spomenar PDF editions and Motion Lab previews
+Wants=network-online.target
+After=network-online.target nginx.service
+RequiresMountsFor=/mnt/btrfs_storage/spomenar-public
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -B /usr/local/lib/spomenar-watch/spomenar-watch.py --config /etc/spomenar-watch/config.json
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=45
+UMask=0022
+Nice=10
+CPUQuota=100%
+MemoryMax=2G
+TasksMax=32
+StateDirectory=spomenar-watch
+StateDirectoryMode=0700
+CacheDirectory=spomenar-watch
+CacheDirectoryMode=0755
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/mnt/btrfs_storage/spomenar-public /var/www/html/spomenar-previews /var/lib/spomenar-watch /var/cache/spomenar-watch
+
+[Install]
+WantedBy=multi-user.target

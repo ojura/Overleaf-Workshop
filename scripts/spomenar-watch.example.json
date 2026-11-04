@@ -1,0 +1,16 @@
+{
+  "publication_root": "/mnt/btrfs_storage/spomenar-public",
+  "preview_root": "/var/www/html/spomenar-previews",
+  "work_root": "/var/cache/spomenar-watch",
+  "state_root": "/var/lib/spomenar-watch",
+  "base_config": "/etc/spomenar-watch/base-config.json",
+  "python": "/home/juraj/.cache/larics-motionlab/venv-pymupdf-1.23.7/bin/python",
+  "nextcloud_root": "/var/www/html/nextcloud",
+  "source_root": "/mnt/btrfs_storage/nextcloud_data",
+  "native_url": "https://cloud.larics.fer.hr/nextcloud/public.php/dav/files/spomenar-2026",
+  "share_token": "spomenar-2026",
+  "renderer_user": "juraj",
+  "nextcloud_user": "www-data",
+  "adopt_atlas": "/home/juraj/.cache/larics-motionlab/public-36d99a2-3UknX45m/atlas",
+  "priority_pages": [99, 100]
+}

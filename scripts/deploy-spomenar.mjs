@@ -8,12 +8,13 @@ import { fileURLToPath } from 'node:url';
 const repo = fileURLToPath(new URL('../', import.meta.url));
 
 // Machine-specific settings for the existing Steffy site and authenticated root channel.
-// Every PDF request uses this stable public share's native Nextcloud DAV route.
+// Native DAV authorizes publication; immutable snapshots use the watcher catalog.
 const target = Object.freeze({
   host: 'steffy',
   url: 'https://cloud.larics.fer.hr/spomenar/',
   shareUrl: 'https://cloud.larics.fer.hr/nextcloud/s/spomenar-2026',
   webRoot: '/var/www/html',
+  publicationRoot: '/mnt/btrfs_storage/spomenar-public',
   nginxMain: '/etc/nginx/nginx.conf',
   nginxSite: '/etc/nginx/conf.d/nextcloud.conf',
   nginxSnippet: '/etc/nginx/snippets/spomenar.conf',
@@ -57,7 +58,7 @@ function checkAssets(directory) {
     }
   }
   visit(directory);
-  // The PDF is 1.61 GB; its bytes must stay in Nextcloud's existing storage.
+  // The PDF stays on Steffy; the watcher creates local copy-on-write snapshots.
   if (bytes > 128 * 1024 * 1024) { throw new Error('Static assets unexpectedly exceed 128 MiB.'); }
   return bytes;
 }
@@ -73,7 +74,7 @@ async function main() {
     else if (arg === '--build-dir' && args[index + 1]) { build = path.resolve(args[++index]); }
     else if (arg === '--help') {
       console.log('node scripts/deploy-spomenar.mjs [--check | --deploy] [--build-dir DIRECTORY]');
-      console.log('--check verifies native public PDF metadata/ranges and a temporary nginx configuration.');
+      console.log('--check verifies the native share, bootstrapped publication catalog and temporary nginx configuration.');
       console.log('--deploy also publishes the built assets and gracefully reloads nginx.');
       return;
     } else { throw new Error('Unknown or incomplete argument: ' + arg); }
@@ -84,6 +85,7 @@ async function main() {
   try {
     fs.writeFileSync(path.join(temporary, 'deployment.json'), JSON.stringify({ ...target, apply }) + '\n');
     fs.copyFileSync(path.join(repo, 'scripts', 'spomenar-install.py'), path.join(temporary, 'install.py'));
+    fs.copyFileSync(path.join(repo, 'scripts', 'spomenar-watch.nginx.conf'), path.join(temporary, 'spomenar-watch.nginx.conf'));
     staging = remote('mktemp -d /tmp/spomenar-deploy.XXXXXXXX').trim();
     if (!/^\/tmp\/spomenar-deploy\.[a-zA-Z0-9]+$/.test(staging)) {
       throw new Error('Unexpected remote staging directory.');
