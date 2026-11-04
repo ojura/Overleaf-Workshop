@@ -17,6 +17,9 @@ try {
     }
     $root = realpath($argv[1]);
     define('OC_CONSOLE', 1);
+    // Nextcloud's CLI checks config.php writability during startup. This metadata
+    // command uses its supported read-only setting without changing the live config.
+    putenv('NC_config_is_read_only=1');
     chdir($root);
     require $root . '/lib/base.php';
     // Match public.php's supported application-loading sequence so group-folder

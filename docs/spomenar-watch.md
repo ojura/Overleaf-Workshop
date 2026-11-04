@@ -19,6 +19,10 @@ access. The resolver uses `OCP\App\IAppManager`, `OCP\Share\IManager`, the share
 node, and the public local-storage API. Loading the filesystem applications is
 necessary for group-folder mounts in a CLI process. It does not query Nextcloud
 tables or read database settings into Python.
+The resolver sets `NC_config_is_read_only=1` in its own PHP process before
+Nextcloud starts. This enables Nextcloud's supported read-only configuration
+mode under the service's filesystem restrictions; the live site configuration
+stays unchanged.
 
 The candidate identity includes Nextcloud file ID and ETag, resolved local path,
 and the file's device, inode, size, modification time and change time. A new
