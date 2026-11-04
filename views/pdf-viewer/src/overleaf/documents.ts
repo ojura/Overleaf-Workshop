@@ -2,14 +2,14 @@ import type PDFJSWrapper from '@/features/pdf-preview/util/pdf-js-wrapper';
 import { PDFJS, documentParams, loadingTasks } from '../shims/pdf-js';
 import { bridgeOutputsOf } from '../common/bridge';
 import { toPdfFile } from '../common/output';
-import type { PdfOutput } from '../common/protocol';
+import type { PdfOutput, PdfPreviewDescriptor } from '../common/protocol';
 import { createWorkerPort } from '../common/worker';
 
 export interface DocumentHooks {
     /** a load is about to replace the shown document: save what depends on it */
     beforeLoad(): void;
     /** `doc`, of build `build` or read whole, is shown */
-    loaded(doc: any, build: string | undefined): void;
+    loaded(doc: any, build: string | undefined, preview?: PdfPreviewDescriptor): void;
     /** the load of build `build`, or of a PDF read whole, failed; `aborted` when a newer load stopped it */
     failed(error: unknown, aborted: boolean, build: string | undefined): void;
     /** a request of build `build`'s document failed (the transport's handleFetchError) */
@@ -78,9 +78,9 @@ export class Documents {
     }
 
     /** Load the build `output` in ranges, unless it is the build shown already. */
-    load(output: PdfOutput, force = false) {
+    load(output: PdfOutput, force = false, preview?: PdfPreviewDescriptor) {
         if (!force && !this.inFlight && output.file.build === this.shownBuild) { return; }
-        this.enqueue(job => this.loadOutput(output, job));
+        this.enqueue(job => this.loadOutput(output, job, preview));
     }
 
     /** Load a PDF read whole. */
@@ -139,7 +139,7 @@ export class Documents {
         return port;
     }
 
-    private async loadOutput(output: PdfOutput, job: Job) {
+    private async loadOutput(output: PdfOutput, job: Job, preview?: PdfPreviewDescriptor) {
         const port = await this.prepare(job);
         if (!port) { return; }
         bridgeOutputsOf(output);
@@ -178,7 +178,7 @@ export class Documents {
         shown = true;
         this.shownBuild = output.file.build;
         this.destroyAllBut(doc);
-        this.hooks.loaded(doc, output.file.build);
+        this.hooks.loaded(doc, output.file.build, preview);
     }
 
     /** End `job` now: stop its requests and destroy its document. */

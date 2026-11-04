@@ -227,6 +227,206 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         return { x: Number(match[1]) + parseFloat(canvas.style.width) / 2, y: Number(match[2]) + parseFloat(canvas.style.height) / 2 };
     }
 
+    function work(pages: ReturnType<Fixture['page']>[], states = pages.map(() => 'waiting'), key = pages.map(page => page.pageNumber).join(':')) {
+        return { key, pages: pages.map((page, index) => ({ pageNumber: page.pageNumber, pageElement: page.pageElement,
+            label: String(page.pageNumber - 11), state: states[index] })) };
+    }
+
+    it('stages one duplex advance crew without cargo, then parks without idle frames or repeated allocations', () => {
+        const f = fixture(); f.desktop();
+        const pages = [f.page(99), f.page(100)];
+        pages[1].pageElement.rect.left = 540;
+        assert.strictEqual(typeof f.api.setVisibleWork, 'function', 'visible blank spreads can request a bounded advance crew');
+        f.api.setVisibleWork([work(pages)]);
+        const began = f.api.snapshot();
+        assert.strictEqual(began.advance.length, 1);
+        assert.strictEqual(began.advance[0].key, '99:100');
+        assert.strictEqual(began.advance[0].actors.length, 2);
+        assert.ok(began.advance[0].message.includes('88') && began.advance[0].message.includes('89'));
+        assert.strictEqual(began.activePayloads, 0);
+        assert.strictEqual(began.cargoBytes, 0);
+        assert.strictEqual(f.owned.flatMap(canvas => canvas.copies).filter(args => args.length === 9).length, 0);
+        assert.strictEqual(f.api.hasHandled(99), false);
+        assert.strictEqual(f.api.hasHandled(100), false);
+        f.finish();
+        assert.strictEqual(f.api.snapshot().advance[0].phase, 'parked');
+        assert.strictEqual(f.callbacks.size, 0, 'a waiting crew has no perpetual loading animation');
+        const allocated = f.owned.length, frames = f.api.snapshot().frames;
+        for (let i = 0; i < 50; i++) { f.api.setVisibleWork([work(pages)]); }
+        assert.strictEqual(f.owned.length, allocated);
+        assert.strictEqual(f.api.snapshot().frames, frames);
+        assert.strictEqual(f.callbacks.size, 0);
+        f.api.setVisibleWork([work(pages, ['preparing', 'preparing'])]);
+        assert.strictEqual(f.callbacks.size, 1, 'a real work transition can trigger one short coordination gesture');
+        f.finish();
+        const coordinated = f.api.snapshot().frames;
+        for (let i = 0; i < 20; i++) { f.api.setVisibleWork([work(pages, ['preparing', 'preparing'])]); }
+        assert.strictEqual(f.api.snapshot().frames, coordinated);
+        assert.strictEqual(f.callbacks.size, 0);
+    });
+
+    it('promotes staged lab actors into real pixels while the other duplex half is still preparing', () => {
+        const f = fixture(); f.desktop();
+        const held = new Set<string>(), released: string[] = [];
+        const port = { reserve: (vehicle: string) => {
+            if (held.has(vehicle)) { return; } held.add(vehicle); return { x: 700, y: 110, scale: 0.5 };
+        }, destination: () => ({ x: 700, y: 110, scale: 0.5 }), release: (vehicle: string) => { held.delete(vehicle); released.push(vehicle); } };
+        f.api.setDispatchOrigin(port);
+        const pages = [f.page(99), f.page(100)]; pages[1].pageElement.rect.left = 540;
+        assert.strictEqual(typeof f.api.setVisibleWork, 'function');
+        f.api.setVisibleWork([work(pages, ['preparing', 'preparing'])]); f.finish();
+        const stage = f.api.snapshot().advance[0];
+        const stagedIds = stage.actors.map((actor: any) => actor.id);
+        const sprites = f.owned.filter(canvas => stagedIds.includes(Number(canvas.dataset.courier)));
+        const parked = sprites.map(point);
+        f.api.setVisibleWork([work(pages, ['ready', 'preparing'])]);
+        assert.strictEqual(f.api.offer(pages[0]), 'started');
+        const first = f.api.snapshot();
+        assert.ok(first.pages[0].actors.some((actor: any) => stagedIds.includes(actor.id)), 'a real delivery reuses its waiting actors');
+        for (let index = 0; index < sprites.length; index++) {
+            if (!first.pages[0].actors.some((actor: any) => actor.id === Number(sprites[index].dataset.courier))) { continue; }
+            const location = point(sprites[index]);
+            assert.ok(Math.hypot(location.x - parked[index].x, location.y - parked[index].y) < 1, 'the promoted robot starts from its parked position');
+        }
+        assert.ok(first.advance[0].message.includes('89'));
+        assert.strictEqual(f.api.hasHandled(99), true);
+        assert.strictEqual(f.api.hasHandled(100), false);
+        assert.ok(f.owned.flatMap(canvas => canvas.copies).filter(args => args.length === 9).every(args => args[0] === pages[0].canvas));
+        f.finish();
+        f.api.setVisibleWork([work(pages, ['ready', 'ready'])]);
+        assert.strictEqual(f.api.offer(pages[1]), 'started');
+        assert.strictEqual(f.api.offer(pages[0]), 'skipped');
+        f.finish();
+        assert.strictEqual(f.api.snapshot().advance.length, 0);
+        assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+        assert.strictEqual(held.size, 0);
+        assert.ok(released.length >= stagedIds.length);
+        assert.strictEqual(f.callbacks.size, 0);
+    });
+
+    it('keeps advance crews inside the shared actor budget and gives ready cargo priority', () => {
+        const f = fixture({ maxActors: 2 }); f.desktop();
+        const a = f.page(99), b = f.page(100), ready = f.page(101);
+        b.pageElement.rect.left = 540; ready.pageElement.rect = { left: 40, top: 760, width: 465, height: 600 };
+        assert.strictEqual(typeof f.api.setVisibleWork, 'function');
+        f.api.setVisibleWork([work([a, b]), work([ready], ['ready'])]);
+        assert.ok(f.api.snapshot().activeActors <= 1, 'staging leaves capacity for real payloads');
+        assert.strictEqual(f.api.offer(ready), 'started');
+        assert.ok(f.api.snapshot().activeActors <= 2);
+        f.api.setVisibleWork([work([ready], ['ready'])]);
+        assert.ok(f.api.snapshot().advance.every((group: any) => group.pages.every((id: number) => id === 101)));
+        f.finish();
+        assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+        assert.strictEqual(f.callbacks.size, 0);
+    });
+
+    it('releases advance reservations once on every lifecycle exit and ignores old animation callbacks', () => {
+        for (const ending of ['offscreen', 'hidden', 'disabled', 'reset', 'dispose', 'failed', 'reduced']) {
+            const f = fixture();
+            const reservations: string[] = [], returns: string[] = [];
+            f.api.setDispatchOrigin({ reserve: (vehicle: string) => { reservations.push(vehicle); return { x: 650, y: 90, scale: 0.4 }; },
+                destination: () => ({ x: 650, y: 90, scale: 0.4 }), release: (vehicle: string) => returns.push(vehicle) });
+            const page = f.page(99);
+            assert.strictEqual(typeof f.api.setVisibleWork, 'function');
+            f.api.setVisibleWork([work([page])]);
+            const pending = [...f.callbacks.values()];
+            if (ending === 'offscreen') { f.api.setVisiblePages([]); }
+            if (ending === 'hidden') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+            if (ending === 'disabled') { f.api.setEnabled(false); }
+            if (ending === 'reset') { f.api.reset(); }
+            if (ending === 'dispose') { f.api.dispose(); }
+            if (ending === 'failed') { f.api.setVisibleWork([work([page], ['failed'])]); f.finish(); }
+            if (ending === 'reduced') { f.media.matches = true; f.media.emit('change'); }
+            for (const callback of pending) { callback(f.now + 10000); }
+            assert.strictEqual(f.api.snapshot().retainedBytes, 0, ending);
+            assert.strictEqual(f.callbacks.size, 0, ending);
+            assert.deepStrictEqual(returns.sort(), reservations.sort(), ending + ' returns each borrowed actor exactly once');
+            assert.strictEqual(f.api.hasHandled(99), false, 'waiting does not spend the real delivery episode');
+        }
+    });
+
+    it('uses static waiting status for reduced motion and defers clipped advance crews without marking history', () => {
+        const f = fixture();
+        const page = f.page(99);
+        assert.strictEqual(typeof f.api.setVisibleWork, 'function');
+        f.media.matches = true;
+        f.api.setVisibleWork([work([page], ['preparing'])]);
+        assert.ok(f.api.snapshot().advance[0].message.includes('88'));
+        assert.strictEqual(f.api.snapshot().activeActors, 0);
+        assert.strictEqual(f.owned.length, 0);
+        assert.strictEqual(f.callbacks.size, 0);
+        f.api.setVisiblePages([]); f.media.matches = false;
+        page.pageElement.rect.top = 695;
+        f.api.setVisibleWork([work([page])]);
+        assert.strictEqual(f.api.snapshot().activeActors, 0);
+        assert.strictEqual(f.owned.length, 0);
+        page.pageElement.rect.top = 60;
+        f.api.setVisibleWork([work([page])]);
+        assert.strictEqual(f.api.snapshot().activeActors, 1);
+        assert.strictEqual(f.api.hasHandled(99), false);
+    });
+
+    it('does not retry failed advance artwork on every refresh and still accepts later real pixels', () => {
+        const f = fixture();
+        const page = f.page(99), original = Canvas.prototype.getContext;
+        assert.strictEqual(typeof f.api.setVisibleWork, 'function');
+        Canvas.prototype.getContext = function () { return null; };
+        try {
+            f.api.setVisibleWork([work([page])]);
+            const allocations = f.owned.length;
+            for (let i = 0; i < 20; i++) { f.api.setVisibleWork([work([page])]); }
+            assert.strictEqual(f.owned.length, allocations);
+            assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+            assert.strictEqual(f.callbacks.size, 0);
+        } finally { Canvas.prototype.getContext = original; }
+        f.api.setVisibleWork([work([page], ['ready'])]);
+        assert.strictEqual(f.api.offer(page), 'started');
+        f.finish();
+    });
+
+    it('rolls back advance sprites and lab reservations if their layer cannot accept a body', () => {
+        const f = fixture();
+        const page = f.page(99), held = new Set<string>();
+        f.api.setDispatchOrigin({ reserve: (vehicle: string) => { held.add(vehicle); return { x: 600, y: 100 }; },
+            destination: () => ({ x: 600, y: 100 }), release: (vehicle: string) => held.delete(vehicle) });
+        const original = Element.prototype.append;
+        Element.prototype.append = function (...children: Element[]) {
+            if (this.className === 'pdfDocumentRobotAdvance' && children.some(child => child instanceof Canvas)) { throw new Error('sprite attachment failed'); }
+            original.apply(this, children);
+        };
+        try {
+            assert.doesNotThrow(() => f.api.setVisibleWork([work([page])]));
+            const allocations = f.owned.length;
+            for (let i = 0; i < 10; i++) { f.api.setVisibleWork([work([page])]); }
+            assert.strictEqual(f.owned.length, allocations);
+            assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+            assert.strictEqual(held.size, 0);
+            assert.strictEqual(f.callbacks.size, 0);
+        } finally { Element.prototype.append = original; }
+        f.api.setVisibleWork([work([page], ['ready'])]);
+        assert.strictEqual(f.api.offer(page), 'started');
+        f.finish();
+    });
+
+    it('prefers an actual image placement and carries its exact rendered crop cooperatively', () => {
+        const f = fixture({ maxActors: 2 }); f.desktop();
+        const page = f.page(99);
+        page.pageElement.rect = { left: 40, top: 60, width: 465, height: 661 };
+        f.api.setVisiblePages([99]);
+        const image = { id: 'photo-499-placement-1', x: 0.125, y: 0.25, width: 0.625, height: 0.5 };
+        assert.strictEqual(f.api.offer({ ...page, imageRegions: [image] }), 'started');
+        const payload = f.api.snapshot().pages[0].payloads[0];
+        assert.strictEqual(payload.imageId, image.id, 'trusted PDF placement metadata selects recognizable image cargo');
+        assert.deepStrictEqual(payload.target, { x: image.x, y: image.y, width: image.width, height: image.height });
+        assert.strictEqual(payload.helpers.length, 2, 'a substantial photograph uses one shared raster and two carriers');
+        const copies = f.owned.flatMap(canvas => canvas.copies).filter(args => args.length === 9);
+        assert.strictEqual(copies.length, 1);
+        assert.deepStrictEqual(copies[0].slice(1, 5), [540, 1620, 2700, 3240]);
+        assert.ok(f.api.snapshot().cargoBytes <= f.api.snapshot().maxCargoBytes);
+        assert.ok(f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotCargo')
+            .every(canvas => Math.max(canvas.width, canvas.height) <= 384));
+    });
+
     it('copies real bounded fragments into a transparent viewport transit layer and finishes without idle frames', () => {
         const f = fixture();
         const page = f.page();

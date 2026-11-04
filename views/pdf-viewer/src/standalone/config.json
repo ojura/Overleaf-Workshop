@@ -2,5 +2,11 @@
   "pdfUrl": "./book.pdf",
   "title": "30 godina LARICS-a",
   "filename": "Kako je LARICS postao 30-godišnjak.pdf",
-  "sourceUrl": "/nextcloud/s/spomenar-2026"
+  "sourceUrl": "/nextcloud/s/spomenar-2026",
+  "previews": {
+    "manifestUrl": "./previews/7ff0909e635aa4c4d65aeaa7903397da40cc8f2168af5d3c817cad8e59e496e6/manifest.json",
+    "sha256": "7ff0909e635aa4c4d65aeaa7903397da40cc8f2168af5d3c817cad8e59e496e6",
+    "size": 1608644855,
+    "validator": { "header": "ETag", "value": "\"6aeafec1-5fe1f8f7\"" }
+  }
 }

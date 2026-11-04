@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { BridgeResponse, PdfOutput } from './viewerProtocol';
+import type { BridgeResponse, PdfOutput, PdfPreviewIdentity } from './viewerProtocol';
 
 /** One budget for all generations, content pieces, range blobs, and their manifests. */
 export const PDF_DISK_POLICY = {
@@ -807,8 +807,15 @@ export class PdfDiskCache {
         }
     }
 
+    /** The same exact-build key used by stored ranges, without I/O or a second identity scheme. */
+    previewIdentity(output: PdfOutput): PdfPreviewIdentity {
+        const { key, size } = this.layout(output);
+        return { key, size };
+    }
+
     /** Write a complete cached build to a user-selected path using one small buffer at a time. */
-    copyComplete(output: PdfOutput, target: string, signal?: AbortSignal, progress?: (bytes: number) => void): Promise<boolean> {
+    copyComplete(output: PdfOutput, target: string, signal?: AbortSignal, progress?: (bytes: number) => void,
+        completedDigest?: (sha256: string) => void): Promise<boolean> {
         return this.run(async () => {
             const layout = this.layout(output);
             const manifest = await this.manifest(layout);
@@ -818,6 +825,7 @@ export class PdfDiskCache {
             let handle: fs.promises.FileHandle | undefined;
             try {
                 handle = await fs.promises.open(temp, 'wx');
+                const check = completedDigest && createHash('sha256');
                 let written = 0;
                 for await (const bytes of this.readPlan(plan, signal)) {
                     for (let cursor = 0; cursor < bytes.length;) {
@@ -825,12 +833,14 @@ export class PdfDiskCache {
                         if (!bytesWritten) { throw new Error('PDF cache save made no progress'); }
                         cursor += bytesWritten;
                     }
+                    check?.update(bytes);
                     written += bytes.length;
                     progress?.(written);
                 }
                 await handle.close(); handle = undefined;
                 if (!alive(signal)) { throw new Error('PDF cache save aborted'); }
                 await fs.promises.rename(temp, target);
+                if (check) { completedDigest?.(check.digest('hex')); }
                 return true;
             } catch (error) {
                 if (!alive(signal)) { throw error; }

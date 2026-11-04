@@ -43,6 +43,7 @@
     "commands.projectSCM.configSCM.title": "Configure Source Control ...",
 
     "commands.compileManager.compile.title": "Compile Project",
+    "commands.pdfViewer.exportPreviewSource.title": "Export PDF for LARICS Motion Lab",
     "commands.compileManager.recompileFromScratch.title": "Recompile Project from Scratch",
     "commands.localReplica.syncNow.title": "Sync Local Replica Now",
     "commands.compileManager.viewPdf.title": "View Compiled PDF",

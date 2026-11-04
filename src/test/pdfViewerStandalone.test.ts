@@ -213,6 +213,48 @@ describe('the standalone PDF range source', function () {
         const result = configModule.pageLink('https://cloud.larics.fer.hr/spomenar/?file=old.pdf#page=1', '#page=60&zoom=125,0,320');
         assert.strictEqual(result, 'https://cloud.larics.fer.hr/spomenar/#page=60&zoom=125,0,320');
     });
+
+    it('exposes the actual first PDF response validator for content-bound previews', async () => {
+        const source = await rangeModule.openHttpPdfRange(pdfjs, 'https://reader.test/book.pdf', {
+            fetch: async () => response(0, 8, 8), metrics: metrics(), onError: assert.fail,
+        });
+        try {
+            assert.deepStrictEqual(source.validator, { header: 'ETag', value: '"book-a"' });
+            source.validator.value = 'mutated';
+            assert.strictEqual(source.validator.value, '"book-a"', 'callers cannot mutate the transport validator');
+        } finally { source.abort(); }
+    });
+
+    it('binds optional site previews to the exact observed PDF size and HTTP validator', () => {
+        const base = 'https://reader.test/book/';
+        const sha256 = 'a'.repeat(64);
+        const settings = { pdfUrl: './book.pdf', title: 'Book', filename: 'book.pdf', previews: {
+            manifestUrl: './previews/manifest.json', size: 5000, sha256,
+            validator: { header: 'ETag', value: '"book-a"' },
+        } };
+        const config = configModule.readSiteConfig(settings, base);
+        assert.strictEqual(config.previews?.manifestUrl, base + 'previews/manifest.json');
+        const observed = { length: 5000, validator: { header: 'ETag', value: '"book-a"' } };
+        assert.deepStrictEqual(configModule.sitePreviewDescriptor(config, observed), {
+            identity: { key: 'sha256:' + sha256, size: 5000, sha256 }, manifestUrl: base + 'previews/manifest.json',
+        });
+        for (const wrong of [
+            { ...observed, length: 5001 },
+            { length: 5000 },
+            { ...observed, validator: { header: 'ETag', value: '"book-b"' } },
+            { ...observed, validator: { header: 'Last-Modified', value: '"book-a"' } },
+        ]) { assert.strictEqual(configModule.sitePreviewDescriptor(config, wrong), undefined); }
+        for (const previews of [
+            { ...settings.previews, manifestUrl: 'https://elsewhere.test/manifest.json' },
+            { ...settings.previews, sha256: 'wrong' },
+            { ...settings.previews, validator: { header: 'ETag', value: 'W/"book-a"' } },
+            { ...settings.previews, size: -1 },
+        ]) {
+            const invalid = configModule.readSiteConfig({ ...settings, previews }, base);
+            assert.strictEqual(invalid.previews, undefined, 'invalid optional preview settings leave the PDF usable');
+            assert.strictEqual(invalid.pdfUrl, base + 'book.pdf');
+        }
+    });
 });
 
 describe('the standalone website export', function () {

@@ -146,6 +146,25 @@ Over the following 8,067 ms, the frame count remained 121, event count 311 and f
 
 The check restored page 65 at page-width scale, scroll top 30,592 and left 0, with robots enabled and the lab closed. The CPU recorder detached, temporary observers and driver listeners were removed, and passive trusted-input capture was rearmed.
 
+## Cooperative payload follow-up
+
+Commit `6942622` added shared-payload teams. One bounded check on the same phone visited nearby physical pages 67, 69 and 71, then restored page 65. It recorded 196 snapshots and one screenshot, with no native memory or CPU recording. No trusted input or script error occurred.
+
+On physical page 71, whose printed label is 60, a mecanum vehicle and a hexapod carried one shared page fragment. The DOM contained exactly one cargo canvas for that payload, measuring 239 × 207 pixels and accounting for 197,892 bytes. Both helpers referenced the same payload and destination. The screenshot captured their entry from the left; part of the load remained outside the viewer clip. The transit kept `clip-path: inset(106px 0px 0px)`, and the cargo retained `pointer-events: none`.
+
+| Measurement across the bounded check | Observed value |
+| --- | ---: |
+| Peak active couriers | 3 |
+| Peak retained cargo | 286,212 bytes |
+| Peak sprite backing | 153,600 bytes |
+| Peak combined robot backing | 439,812 bytes |
+| Phone actor limit | 4 |
+| Phone image decoder concurrency | 1 |
+
+The screenshot and inspector reattachment left a 32,441 ms observation gap. At the next observation, the two active payloads had completed, taking the delivered-fragment count from five to seven. Active actors, payloads, cargo bytes and sprite bytes were all zero, and no animation frame was scheduled. The exact completion time falls inside that gap.
+
+After restoration, the frame count stayed at 178 for 1,502 ms. Pages 65 and 66 were ready at the original page-width scale, scroll top 30,592 and left 0. Robots remained enabled and the lab closed. The temporary guard was removed, the inspector detached, and only passive trusted-input capture was rearmed.
+
 ## Higher-zoom photo check
 
 A separate scripted quality check on the physical phone doubled page 65's PDF scale through the viewer's `updateScale` API. Image arrivals were observed at `PDFObjects.resolve`, recording numeric dimensions without retaining bitmap references. The temporary method wrappers were restored before taking the screenshot.

@@ -52,6 +52,11 @@ class Element extends Events {
         }
     }
     setAttribute(name: string, value: string) { this.attributes.set(name, value); }
+    getAttribute(name: string) { return this.attributes.get(name) ?? null; }
+    closest(selector: string): Element | null {
+        if (selector === '.spread' && this.className.split(' ').includes('spread')) { return this; }
+        return this.parentNode?.closest(selector) ?? null;
+    }
     getBoundingClientRect() {
         return { x: 0, y: 0, left: 0, top: 0, right: this.clientWidth, bottom: this.clientHeight, width: this.clientWidth, height: this.clientHeight };
     }
@@ -70,6 +75,7 @@ interface RobotDelivery {
     pageElement: Element;
     canvas: Canvas;
     kind: 'preview' | 'page';
+    imageRegions?: Array<{ id: string; x: number; y: number; width: number; height: number }>;
 }
 
 class DocumentRobots {
@@ -77,6 +83,7 @@ class DocumentRobots {
     readonly deliveries: RobotDelivery[] = [];
     readonly offers: number[] = [];
     readonly visibleCalls: number[][] = [];
+    readonly workCalls: Array<Array<{ key: string; pages: Array<{ pageNumber: number; pageElement: Element; label?: string; state: string }> }>> = [];
     readonly enabledCalls: boolean[] = [];
     readonly active = new Set<number>();
     readonly handled = new Set<number>();
@@ -97,6 +104,10 @@ class DocumentRobots {
         if (!ids.length) { this.blocked = false; }
         for (const id of this.active) { if (!ids.includes(id)) { this.active.delete(id); } }
         if (this.active.size < previous) { this.capacityAvailable(); }
+    }
+    setVisibleWork(groups: DocumentRobots['workCalls'][number]) {
+        this.workCalls.push(groups.map(group => ({ ...group, pages: group.pages.map(page => ({ ...page })) })));
+        this.setVisiblePages(groups.flatMap(group => group.pages.map(page => page.pageNumber)));
     }
     hasHandled(id: number) { return this.handled.has(id); }
     offer(value: RobotDelivery) {
@@ -239,6 +250,7 @@ class PageView {
     get renderingId() { return 'page' + this.id; }
     constructor(readonly id: number, readonly width: number, readonly height: number, readonly fixture: Fixture) {
         this.div.ownerDocument = fixture.owner;
+        this.div.setAttribute('data-page-number', String(id));
         this.div.getBoundingClientRect = () => {
             const top = (id - 1) * height - fixture.container.scrollTop;
             return { x: 0, y: top, left: 0, top, right: width, bottom: top + height, width, height };
@@ -516,6 +528,228 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         });
         return { f, robots, factories };
     }
+
+    function previewFixture(options: FixtureOptions = {}, robots?: DocumentRobots) {
+        const loaders: Array<any> = [];
+        const source = { identity: { key: 'exact-output', size: 1000 }, loadManifest: async () => null,
+            loadAsset: async () => new Uint8Array() };
+        const f = fixture(options, {
+            robotsEnabled: !!robots,
+            ...(robots ? { createDocumentRobots: (_container: Element, settings: any) => {
+                robots.onCapacityAvailable = settings.onCapacityAvailable; return robots;
+            } } : {}),
+            createPreviewSourceLoader: (_source: any, settings: any) => {
+                const loader: any = { settings, disposed: false, active: false, state: 'ready', pending: new Set<number>(),
+                    metadata: new Map<number, any>(), updates: [] as any[],
+                    page(id: number) { return this.metadata.get(id); },
+                    isPending(id: number) { return this.pending.has(id); },
+                    update(requests: any[], active: boolean) { this.active = active; this.updates.push({ requests, active }); },
+                    snapshot() { return { state: this.state, pending: this.pending.size }; },
+                    dispose() { this.disposed = true; this.active = false; },
+                };
+                loaders.push(loader); return loader;
+            },
+        });
+        function bind() { f.controller.setPreviewSource(source, f.pdf); return loaders[loaders.length - 1]; }
+        function metadata(id: number) {
+            return { pageNumber: id, width: f.pdf.width, height: f.pdf.height, rotation: 0, assets: [],
+                imageRegions: [{ id: 'photo-' + id, x: 0.125, y: 0.25, width: 0.5, height: 0.25 }] };
+        }
+        function publish(loader: any, id: number, width = 160, height = 200) {
+            const page = loader.metadata.get(id) ?? metadata(id); loader.metadata.set(id, page);
+            const canvas = new Canvas(); canvas.width = width; canvas.height = height;
+            return { canvas, accepted: loader.settings.onPreview(page, canvas) };
+        }
+        return { f, source, loaders, bind, metadata, publish };
+    }
+
+    it('binds preview sources only to the exact document and fences replacement and stale publication', async () => {
+        const h = previewFixture({ autoPages: false });
+        const { f } = h;
+        await f.frame();
+        f.controller.setPreviewSource(h.source, {});
+        assert.strictEqual(h.loaders.length, 0);
+        const oldDocument = f.pdf, old = h.bind();
+        h.bind(); assert.strictEqual(h.loaders.length, 1, 'the same source does not restart a loader');
+        await f.frame();
+        f.replaceDocument();
+        assert.strictEqual(old.disposed, true);
+        const late = h.publish(old, 21);
+        assert.strictEqual(late.accepted, false); assert.strictEqual(late.canvas.width * late.canvas.height, 0);
+        f.controller.setPreviewSource(h.source, oldDocument);
+        assert.strictEqual(h.loaders.length, 1);
+        const next = h.bind();
+        assert.notStrictEqual(next, old);
+        await f.frame();
+        const before = f.callbacks.size;
+        old.settings.onChange();
+        assert.strictEqual(f.callbacks.size, before, 'the previous source cannot wake the replacement document');
+        f.controller.setPreviewSource(undefined, f.pdf);
+        assert.strictEqual(next.disposed, true);
+        assert.strictEqual(f.controller.snapshot().previewSource, undefined);
+    });
+
+    it('passes a 512-pixel mobile source decode ceiling while preserving bounded desktop refinement', async () => {
+        for (const mobile of [true, false]) {
+            const h = previewFixture({ mobile, startPage: 1, pages: 1 });
+            const loader = h.bind(); await h.f.frame();
+            assert.strictEqual(loader.settings.decodeConcurrency, mobile ? 1 : 2);
+            assert.strictEqual(loader.settings.maxDecodeDimension, mobile ? 512 : 1536);
+            assert.ok(loader.updates[loader.updates.length - 1].requests.every((request: any) => request.maxDimension === (mobile ? 512 : 768)));
+        }
+    });
+
+    it('preserves a source attached before pagesinit for the exact incoming document', async () => {
+        const h = previewFixture({ autoPages: false });
+        const { f } = h;
+        f.eventBus.emit('pagesdestroy');
+        f.pdf = new PdfDocument(800, 1000, false); f.viewer.pdfDocument = f.pdf;
+        h.bind();
+        assert.strictEqual(h.loaders.length, 0, 'construction waits for document installation');
+        f.eventBus.emit('pagesinit');
+        assert.strictEqual(h.loaders.length, 1);
+        await f.frame();
+        assert.strictEqual(h.loaders[0].active, true);
+        assert.ok(h.loaders[0].updates.at(-1).requests.some((request: any) => request.pageNumber === 20 && request.visible));
+    });
+
+    it('groups actual spread members independently from printed labels and preserves a single visible half', async () => {
+        const robots = new DocumentRobots();
+        const h = previewFixture({ startPage: 99, pages: 120, autoPages: false }, robots);
+        const { f } = h;
+        const spread = new Element(); spread.className = 'spread';
+        for (const id of [99, 100]) { spread.prepend(f.pages[id - 1].div); f.pages[id - 1].reset(); }
+        (f.pages[98] as any).pageLabel = '88'; (f.pages[99] as any).pageLabel = '89';
+        f.visibleIds = [99, 100];
+        const loader = h.bind(); await f.frame();
+        const initial = robots.workCalls.find(groups => groups.some(group => group.key === '99,100' && group.pages.every(page => page.state === 'waiting')));
+        assert.ok(initial, 'the real physical spread arrives before preparation starts');
+        const group = robots.workCalls[robots.workCalls.length - 1][0];
+        assert.strictEqual(group.key, '99,100');
+        assert.deepStrictEqual(group.pages.map(page => [page.pageNumber, page.label, page.state]), [[99, '88', 'preparing'], [100, '89', 'preparing']]);
+        const ready = h.publish(loader, 99);
+        assert.strictEqual(ready.accepted, true);
+        assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [99], 'one ready half delivers without waiting for its partner');
+        loader.settings.onChange(); await f.frame();
+        assert.deepStrictEqual(robots.workCalls[robots.workCalls.length - 1][0].pages.map(page => page.state), ['ready', 'preparing']);
+        f.visibleIds = [100]; f.container.emit('scroll'); await f.frame();
+        const half = robots.workCalls[robots.workCalls.length - 1][0];
+        assert.strictEqual(half.key, '99,100');
+        assert.deepStrictEqual(half.pages.map(page => page.pageNumber), [100]);
+    });
+
+    it('uses retained sidecar pixels as real cargo and rotates its image placements with the viewer', async () => {
+        const robots = new DocumentRobots();
+        const h = previewFixture({ startPage: 21, autoPages: false }, robots);
+        const { f } = h;
+        f.pages[20].reset(); f.viewer.pagesRotation = 90;
+        const loader = h.bind(); await f.frame();
+        const result = h.publish(loader, 21, 200, 160);
+        assert.strictEqual(result.accepted, true);
+        assert.strictEqual(result.canvas.parentNode, f.pages[20].div);
+        const delivery = robots.deliveries[0];
+        assert.strictEqual(delivery.canvas, result.canvas);
+        assert.strictEqual(delivery.kind, 'preview');
+        assert.deepStrictEqual(delivery.imageRegions, [{ id: 'photo-21', x: 0.5, y: 0.125, width: 0.25, height: 0.5 }]);
+        assert.deepStrictEqual(f.controller.snapshot().visibleMissing, []);
+        f.finishNative(21); await f.frame();
+        assert.strictEqual(robots.deliveries.length, 1, 'native promotion does not replay a handled page');
+        assert.strictEqual(loader.settings.quality(21), Infinity);
+    });
+
+    it('attaches sidecar image placements to an already finished native page without downloading a raster', async () => {
+        const robots = new DocumentRobots();
+        const h = previewFixture({ startPage: 21, autoPages: false }, robots);
+        const loader = h.bind(); loader.metadata.set(21, h.metadata(21));
+        await h.f.frame();
+        assert.strictEqual(robots.deliveries[0].canvas, h.f.pages[20].canvas);
+        assert.strictEqual(robots.deliveries[0].kind, 'page');
+        assert.deepStrictEqual(robots.deliveries[0].imageRegions, h.metadata(21).imageRegions);
+        assert.strictEqual(loader.settings.quality(21), Infinity);
+    });
+
+    it('cancels incompatible sidecars synchronously on layout, hidden state and layer changes', async () => {
+        const h = previewFixture({ startPage: 21, autoPages: false });
+        const { f } = h;
+        f.pages[20].reset();
+        const loader = h.bind(); await f.frame();
+        f.viewer.pagesRotation = 90; f.eventBus.emit('rotationchanging');
+        assert.strictEqual(loader.active, false);
+        assert.strictEqual(h.publish(loader, 21).accepted, false, 'a completion before the layout frame cannot publish the old orientation');
+        await f.frame();
+        assert.strictEqual(loader.active, true);
+        assert.strictEqual(loader.updates.at(-1).requests.find((request: any) => request.pageNumber === 21).rotation, 90);
+        f.owner.visibilityState = 'hidden'; f.owner.emit('visibilitychange');
+        assert.strictEqual(loader.active, false);
+        const hidden = h.publish(loader, 21);
+        assert.strictEqual(hidden.accepted, false); assert.strictEqual(hidden.canvas.width, 0);
+        f.owner.visibilityState = 'visible'; f.owner.emit('visibilitychange'); await f.frame();
+        f.eventBus.emit('optionalcontentconfigchanged'); await f.frame();
+        assert.strictEqual(loader.active, false);
+        assert.strictEqual(h.publish(loader, 21).accepted, false, 'default-layer sidecars stay disabled after user layer changes');
+    });
+
+    it('ignores mismatched placement geometry while preserving a finished native page delivery', async () => {
+        const robots = new DocumentRobots();
+        const h = previewFixture({ startPage: 21, autoPages: false }, robots);
+        const loader = h.bind(); loader.metadata.set(21, { ...h.metadata(21), width: 1600 });
+        await h.f.frame();
+        assert.strictEqual(robots.deliveries[0].canvas, h.f.pages[20].canvas);
+        assert.strictEqual(robots.deliveries[0].imageRegions, undefined);
+    });
+
+    it('honors the extension theme global and restores sidecars only after plain colors return', async () => {
+        const h = previewFixture({ startPage: 21, autoPages: false });
+        const { f } = h;
+        f.pages[20].reset();
+        const loader = h.bind(); await f.frame();
+        const previous = Object.getOwnPropertyDescriptor(globalThis, 'pdfjsViewerColorTheme');
+        try {
+            Object.defineProperty(globalThis, 'pdfjsViewerColorTheme', { configurable: true, writable: true,
+                value: { fontColor: '#ffffff', bgColor: '#222222' } });
+            f.eventBus.emit('prefetchthemechanged'); await f.frame();
+            assert.strictEqual(loader.active, false);
+            assert.strictEqual(h.publish(loader, 21).accepted, false);
+            (globalThis as any).pdfjsViewerColorTheme = null;
+            f.eventBus.emit('prefetchthemechanged'); await f.frame();
+            assert.strictEqual(loader.active, true);
+        } finally {
+            if (previous) { Object.defineProperty(globalThis, 'pdfjsViewerColorTheme', previous); }
+            else { delete (globalThis as any).pdfjsViewerColorTheme; }
+        }
+    });
+
+    it('rejects sidecar pixels whose page geometry disagrees with the installed PDF page', async () => {
+        const h = previewFixture({ startPage: 21, autoPages: false });
+        const { f } = h;
+        f.pages[20].reset();
+        const loader = h.bind(); await f.frame();
+        loader.metadata.set(21, { ...h.metadata(21), width: 1600 });
+        const result = h.publish(loader, 21);
+        assert.strictEqual(result.accepted, false);
+        assert.strictEqual(result.canvas.width * result.canvas.height, 0);
+        assert.ok(f.controller.snapshot().visibleMissing.includes(21));
+    });
+
+    it('keeps sidecar requests in the idle decision and removes source callbacks on disposal', async () => {
+        const h = previewFixture({ pages: 1, startPage: 1, autoPages: false });
+        const loader = h.bind();
+        loader.pending.add(1); await h.f.frame();
+        assert.strictEqual(h.f.controller.snapshot().idle, false);
+        loader.pending.clear(); loader.settings.onChange(); await h.f.frame();
+        assert.strictEqual(h.f.controller.snapshot().idle, true);
+        assert.strictEqual(h.f.callbacks.size, 0);
+        for (let i = 0; i < 5; i++) { await h.f.frame(); }
+        assert.strictEqual(h.f.pdf.requests.length, 0, 'finished native pixels and settled sidecars never rewarm at idle');
+        loader.state = 'loading'; loader.settings.onChange();
+        assert.strictEqual(h.f.controller.snapshot().idle, false, 'new manifest work revokes idle before the next animation frame');
+        h.f.controller.setPreviewSource(undefined, h.f.pdf); await h.f.frame();
+        assert.strictEqual(h.f.controller.snapshot().idle, true, 'withdrawing the optional source restores idle without another reader event');
+        h.f.dispose(); assert.strictEqual(loader.disposed, true);
+        loader.settings.onChange();
+        assert.strictEqual(h.f.callbacks.size, 0);
+    });
+
 
     async function visibleRobotPreview() {
         const state = robotFixture();

@@ -515,5 +515,81 @@
       "diagnosticsEnabled": false,
       "passiveCaptureRearmed": true
     }
+  },
+  "cooperativePayloadFollowup": {
+    "commit": "6942622",
+    "method": {
+      "kind": "Bounded cooperative payload ownership and lifecycle observation",
+      "nearbyPhysicalPageEntries": [
+        67,
+        69,
+        71
+      ],
+      "snapshotCount": 196,
+      "nativeMemoryOrCpuRecording": false,
+      "trustedInputInterrupted": false,
+      "scriptErrors": []
+    },
+    "activePayload": {
+      "physicalPage": 71,
+      "displayedPageLabel": "60",
+      "mode": "formation",
+      "stage": "carry",
+      "helperCount": 2,
+      "vehicles": [
+        "mecanum",
+        "hexapod"
+      ],
+      "cargoCanvasCount": 1,
+      "width": 239,
+      "height": 207,
+      "cargoBytes": 197892,
+      "pointerEvents": "none",
+      "clipPath": "inset(106px 0px 0px)",
+      "imageDecodeConcurrency": 1
+    },
+    "fleet": {
+      "peakActors": 3,
+      "peakPayloads": 3,
+      "peakCargoBytes": 286212,
+      "peakSpriteBytes": 153600,
+      "peakRetainedBytes": 439812,
+      "maxActors": 4,
+      "maxCargoBytes": 524288,
+      "maxSpriteBytes": 204800
+    },
+    "completion": {
+      "unobservedScreenshotReattachGapMs": 32441,
+      "deliveredFragmentsBeforeCapture": 5,
+      "deliveredFragmentsAtCompletion": 7,
+      "activeActors": 0,
+      "activePayloads": 0,
+      "cargoBytes": 0,
+      "spriteBytes": 0,
+      "retainedBytes": 0,
+      "scheduled": false
+    },
+    "idle": {
+      "durationMs": 1502,
+      "frameCount": 178,
+      "frameDelta": 0
+    },
+    "restored": {
+      "page": 65,
+      "scale": 0.44362745098039214,
+      "scaleValue": "page-width",
+      "top": 30592,
+      "left": 0,
+      "robots": true,
+      "lab": false,
+      "visible": [
+        65,
+        66
+      ],
+      "missing": [],
+      "passiveCaptureRearmed": true,
+      "temporaryGuardRemoved": true,
+      "inspectorDetached": true
+    }
   }
 }

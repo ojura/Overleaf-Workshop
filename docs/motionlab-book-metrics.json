@@ -1,0 +1,196 @@
+{
+  "schemaVersion": 1,
+  "dateUTC": "2026-11-04",
+  "sourceDocument": {
+    "key": "sha256:7ff0909e635aa4c4d65aeaa7903397da40cc8f2168af5d3c817cad8e59e496e6",
+    "size": 1608644855,
+    "sha256": "7ff0909e635aa4c4d65aeaa7903397da40cc8f2168af5d3c817cad8e59e496e6",
+    "pageCount": 459
+  },
+  "manifest": {
+    "version": 1,
+    "bytes": 595154,
+    "sha256": "32fd293d4751d8abbbc7f065ee7f12214e56288f3c5f2aa4a30256530604869b",
+    "pageEntries": 459,
+    "imageRegions": 1045,
+    "pagesWithImageRegions": 280,
+    "maxImageRegionsPerPage": 17,
+    "rotationCounts": {
+      "0": 459
+    }
+  },
+  "pyramid": {
+    "assetCount": 1836,
+    "assetBytes": 178710389,
+    "outputBytes": 179305543,
+    "largestAssetBytes": 399813,
+    "mimeCounts": {
+      "image/jpeg": 1836
+    },
+    "tiers": [
+      {
+        "maximumDimension": 192,
+        "assets": 459,
+        "bytes": 2853963
+      },
+      {
+        "maximumDimension": 512,
+        "assets": 459,
+        "bytes": 18415162
+      },
+      {
+        "maximumDimension": 768,
+        "assets": 459,
+        "bytes": 37543324
+      },
+      {
+        "maximumDimension": 1536,
+        "assets": 459,
+        "bytes": 119897940
+      }
+    ]
+  },
+  "duplex": [
+    {
+      "physicalPage": 99,
+      "printedLabel": "88",
+      "width": 612.0,
+      "height": 792.0,
+      "rotation": 0,
+      "imageRegions": 10,
+      "assets": [
+        {
+          "width": 148,
+          "height": 192,
+          "bytes": 6663
+        },
+        {
+          "width": 396,
+          "height": 512,
+          "bytes": 33737
+        },
+        {
+          "width": 593,
+          "height": 768,
+          "bytes": 70417
+        },
+        {
+          "width": 1187,
+          "height": 1536,
+          "bytes": 234448
+        }
+      ]
+    },
+    {
+      "physicalPage": 100,
+      "printedLabel": "89",
+      "width": 612.0,
+      "height": 792.0,
+      "rotation": 0,
+      "imageRegions": 17,
+      "assets": [
+        {
+          "width": 148,
+          "height": 192,
+          "bytes": 7275
+        },
+        {
+          "width": 396,
+          "height": 512,
+          "bytes": 37720
+        },
+        {
+          "width": 593,
+          "height": 768,
+          "bytes": 72057
+        },
+        {
+          "width": 1187,
+          "height": 1536,
+          "bytes": 231411
+        }
+      ]
+    }
+  ],
+  "runs": {
+    "initialTwoPages": {
+      "workers": 1,
+      "renderer": "pymupdf",
+      "selectedPageCount": 2,
+      "priorityPages": [
+        99,
+        100
+      ],
+      "tiers": [
+        192,
+        512,
+        768,
+        1536
+      ],
+      "eventCounts": {
+        "start": 1,
+        "asset": 8,
+        "complete": 1
+      },
+      "completedPageCount": 2,
+      "completedAssetCount": 8,
+      "newlyPublishedAssets": 8,
+      "outputBytes": 699246,
+      "elapsedSeconds": 5.82,
+      "gnuTimeMaxRssKiB": 128012,
+      "exitCode": 0
+    },
+    "fullResume": {
+      "workers": 2,
+      "renderer": "pymupdf",
+      "selectedPageCount": 459,
+      "priorityPages": [
+        99,
+        100
+      ],
+      "tiers": [
+        192,
+        512,
+        768,
+        1536
+      ],
+      "eventCounts": {
+        "start": 1,
+        "asset": 1828,
+        "complete": 1
+      },
+      "completedPageCount": 459,
+      "completedAssetCount": 1836,
+      "newlyPublishedAssets": 1828,
+      "outputBytes": 179305543,
+      "elapsedSeconds": 153.65,
+      "gnuTimeMaxRssKiB": 207156,
+      "exitCode": 0,
+      "niceness": 10,
+      "reusedAssets": 8
+    }
+  },
+  "metadataVerification": {
+    "missingAssetFiles": 0,
+    "assetSizeMismatches": 0,
+    "sourcePdfRereadForThisReport": false
+  },
+  "validation": {
+    "generatorPythonTestsPassed": 24,
+    "actualTypeScriptValidatorAcceptedCroppedRotatedFixture": true,
+    "rootVisuallyCheckedDuplexAndImagePlacements": true,
+    "publication": "pending",
+    "liveConsumer": "pending"
+  },
+  "evidence": {
+    "host": "steffy",
+    "directory": "/home/juraj/.cache/larics-motionlab/book-previews-20261104",
+    "files": [
+      "manifest.json",
+      "../book-two-page.jsonl",
+      "../book-two-page.time",
+      "../book-full.jsonl",
+      "../book-full.time"
+    ]
+  }
+}

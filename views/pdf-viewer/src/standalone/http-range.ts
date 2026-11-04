@@ -18,7 +18,7 @@ interface Options {
 }
 
 interface ByteRange { begin: number; end: number; total: number }
-interface Validator { header: string; value: string }
+export interface PdfHttpValidator { header: 'ETag' | 'Last-Modified'; value: string }
 
 function contentRange(response: Response, begin: number, end: number, total?: number): ByteRange {
     const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range') ?? '');
@@ -43,7 +43,7 @@ function contentRange(response: Response, begin: number, end: number, total?: nu
     return range;
 }
 
-function responseValidator(response: Response): Validator | undefined {
+function responseValidator(response: Response): PdfHttpValidator | undefined {
     const etag = response.headers.get('ETag');
     if (etag && !etag.startsWith('W/')) { return { header: 'ETag', value: etag }; }
     const modified = response.headers.get('Last-Modified');
@@ -65,7 +65,7 @@ export async function openHttpPdfRange(pdfjs: any, url: string, options: Options
     const request = options.fetch ?? globalThis.fetch.bind(globalThis);
     const metrics = options.metrics ?? pdfPerformance;
     const pending = new Set<Promise<void>>();
-    let validator: Validator | undefined;
+    let validator: PdfHttpValidator | undefined;
     let total: number | undefined;
     let delivered = 0;
 
@@ -160,6 +160,7 @@ export async function openHttpPdfRange(pdfjs: any, url: string, options: Options
         };
         return {
             length: total!,
+            get validator(): PdfHttpValidator | undefined { return validator ? { ...validator } : undefined; },
             transport,
             documentParams: {
                 url, range: transport, length: total,

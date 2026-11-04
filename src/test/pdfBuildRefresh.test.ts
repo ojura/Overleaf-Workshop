@@ -99,6 +99,7 @@ const vscode = strict('vscode', {
         showErrorMessage: (message: string) => { throw new Error(message); },
     }),
     commands: strict('vscode.commands', {
+        registerCommand: () => disposable,
         executeCommand: async (name: string) => {
             assert.strictEqual(name, 'remoteFileSystem.prefetch');
             return world.vfs;

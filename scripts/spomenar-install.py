@@ -114,6 +114,7 @@ def main():
         raise RuntimeError('Invalid site path')
     web_root = Path(settings['webRoot'])
     site = web_root / prefix[1:]
+    preview_site = site.with_name(site.name + '-previews')
     nginx_main = Path(settings['nginxMain'])
     nginx_site = Path(settings['nginxSite'])
     nginx_snippet = Path(settings['nginxSnippet'])
@@ -149,6 +150,15 @@ location = {prefix}/book.pdf {{
     open_file_cache off;
     add_header Cache-Control "public, no-cache" always;
     add_header X-Content-Type-Options "nosniff" always;
+}}
+
+# Generated previews survive replacement of the standalone viewer's static directory.
+location ^~ {prefix}/previews/ {{
+    alias {nginx_quote(str(preview_site) + '/')};
+    autoindex off;
+    add_header Cache-Control "no-cache" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Content-Security-Policy "{csp}" always;
 }}
 
 location ^~ {prefix}/ {{
@@ -188,6 +198,9 @@ location ^~ {prefix}/ {{
     for file in source.rglob('*'):
         if file.is_symlink() or file.name == 'book.pdf':
             raise RuntimeError('The static build must not contain symlinks or a PDF copy')
+    if preview_site.is_symlink() or (preview_site.exists() and not preview_site.is_dir()):
+        raise RuntimeError('The preview destination is not an ordinary directory')
+    preview_site.mkdir(mode=0o755, parents=True, exist_ok=True)
     next_site = Path(tempfile.mkdtemp(prefix='.' + site.name + '-next-', dir=site.parent))
     previous = None
     published = False

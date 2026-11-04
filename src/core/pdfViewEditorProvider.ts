@@ -9,8 +9,9 @@ import { parseUri } from './remoteFileSystemProvider';
 import type { VirtualFileSystem } from './remoteFileSystemProvider';
 import { outputsOf, PdfFetchBridge, PieceCache } from './pdfFetchBridge';
 import { PDF_DISK_POLICY } from './pdfDiskCache';
+import { PdfPreviewExportError, PdfPreviewStore } from './pdfPreviewStore';
 import { completeViewerPage, isBuildPath } from './pdfViewerPages';
-import { DEFAULT_PDF_VIEWER_ENGINE, HostMessage, isPdfViewerEngine, pdfjsReleaseOf, PdfOutput, PdfViewerEngine, ViewerMessage } from './viewerProtocol';
+import { DEFAULT_PDF_VIEWER_ENGINE, HostMessage, isPdfViewerEngine, pdfjsReleaseOf, PdfOutput, PdfPreviewDescriptor, PdfViewerEngine, ViewerMessage } from './viewerProtocol';
 import { errorMessage } from '../utils/errorMessage';
 
 export class PdfDocument implements vscode.CustomDocument {
@@ -119,6 +120,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
 
     /** One disk budget for all builds' incremental ranges and reusable content pieces. */
     private readonly pieces: PieceCache;
+    private readonly previews: PdfPreviewStore;
     /** the open viewers, which a change of overleaf-workshop.pdfViewer.engine reloads */
     private readonly editors = new Set<{ doc: PdfDocument, panel: vscode.WebviewPanel, render: () => Promise<void>, dispose: () => void }>();
     /** the folder of pdf.js's release in views/pdf-viewer/, from the extension's package.json */
@@ -129,6 +131,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         this.pdfjsRelease = pdfjsReleaseOf(context.extension.packageJSON);
         const sizeMB = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer').get<number>('pieceCacheSizeMB', PDF_DISK_POLICY.defaultMaxBytes / (1024 * 1024));
         this.pieces = new PieceCache(path.join(context.globalStorageUri.fsPath, 'pdf-pieces'), Math.max(0, sizeMB) * 1024 * 1024, { fetchRange: PdfFetchBridge.fetchRange });
+        this.previews = new PdfPreviewStore(path.join(context.globalStorageUri.fsPath, 'pdf-previews'));
         // the folder where the PDF viewer of earlier versions (pdf.js 3.10.111's) downloaded the
         // builds it showed, one book-sized file per project
         void Promise.resolve(vscode.workspace.fs.delete(vscode.Uri.joinPath(context.globalStorageUri, 'legacy-viewer-builds'), { recursive: true, useTrash: false })).catch(() => {});
@@ -202,12 +205,31 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         const post = (message: HostMessage) => webviewPanel.webview.postMessage(message);
         let cacheIdle = false;
         let cacheBuild = doc.output?.file.build;
+        let stopPreview: (() => void) | undefined;
+        let previewGeneration = 0;
+        const clearPreviewWatch = () => {
+            previewGeneration++;
+            stopPreview?.(); stopPreview = undefined;
+        };
         const updateWebview = () => {
+            clearPreviewWatch();
             if (cacheBuild !== doc.output?.file.build) { cacheIdle = false; cacheBuild = doc.output?.file.build; }
             bridge.fetches.setOutput(doc.output);
             bridge.fetches.setActivity(webviewPanel.visible, cacheIdle);
             if (doc.output) {
-                post({type:'load', output:doc.output});
+                const output = doc.output, asked = bridge, generation = previewGeneration;
+                let preview: PdfPreviewDescriptor | undefined;
+                try {
+                    const identity = this.pieces.previewIdentity(output);
+                    const manifest = this.previews.manifestPath(identity);
+                    preview = { identity, manifestUrl: webviewPanel.webview.asWebviewUri(vscode.Uri.file(manifest)).toString() };
+                    stopPreview = this.previews.watch(identity, () => {
+                        if (!panelDisposed && generation === previewGeneration && asked === bridge && output === doc.output) {
+                            post({ type: 'previewChanged', page: asked.page, key: identity.key });
+                        }
+                    });
+                } catch { /* A build without an exact range identity has no registered preview source. */ }
+                post({type:'load', output, preview});
             } else if (doc.cache.buffer.byteLength !== 0) {
                 post({type:'update', content:doc.cache.buffer as ArrayBuffer});
             }
@@ -283,6 +305,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             panel: webviewPanel,
             render: async () => {
                 if (panelDisposed) { return; }
+                clearPreviewWatch();
                 bridge.fetches.dispose();
                 cacheIdle = false;
                 bridge = newBridge();
@@ -292,6 +315,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             dispose: () => {
                 if (panelDisposed) { return; }
                 panelDisposed = true;
+                clearPreviewWatch();
                 progressDirty = false;
                 if (progressTimer) { clearTimeout(progressTimer); progressTimer = undefined; }
                 bridge.fetches.dispose();
@@ -304,7 +328,8 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         const panelDisposal = webviewPanel.onDidDispose(editor.dispose);
         listeners.push(() => panelDisposal.dispose());
 
-        webviewPanel.webview.options = {enableScripts:true, localResourceRoots:[this.context.extensionUri]};
+        webviewPanel.webview.options = {enableScripts:true, localResourceRoots:[this.context.extensionUri,
+            vscode.Uri.joinPath(this.context.globalStorageUri, 'pdf-previews')]};
 
         // register event listeners
         const viewState = webviewPanel.onDidChangeViewState((e) => {
@@ -404,8 +429,10 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         return [
             { dispose: () => {
                 for (const editor of this.editors) { editor.dispose(); }
+                this.previews.dispose();
                 void this.pieces.dispose();
             } },
+            vscode.commands.registerCommand(`${ROOT_NAME}.pdfViewer.exportPreviewSource`, (uri?: vscode.Uri) => this.exportPreviewSource(uri)),
             vscode.workspace.onDidChangeConfiguration((e) => {
                 if (e.affectsConfiguration('overleaf-workshop.pdfViewer.engine')) {
                     this.applyEngine().catch((error) => console.error('overleaf-workshop: switching the PDF viewer:', error));
@@ -434,6 +461,49 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             throw new Error(`the ${engine} PDF viewer is not built: run npm run build-pdf-viewer`);
         }
         return completeViewerPage(template, { engine, base: webview.asWebviewUri(this.viewerFile()).toString() + '/', page, pdfjsRelease: this.pdfjsRelease });
+    }
+
+    private async exportPreviewSource(uri?: vscode.Uri) {
+        const editor = [...this.editors].find(item => uri ? item.doc.uri.toString() === uri.toString() : item.panel.active);
+        const output = editor?.doc.output;
+        if (!editor || !output) {
+            await vscode.window.showInformationMessage(vscode.l10n.t('Open the build PDF before exporting its preview source.'));
+            return;
+        }
+        const current = () => this.editors.has(editor) && editor.doc.output === output;
+        const name = path.posix.basename(editor.doc.uri.path);
+        const folder = vscode.workspace.workspaceFolders?.find(f => f.uri.scheme === 'file')?.uri ?? vscode.Uri.file(os.homedir());
+        const target = await vscode.window.showSaveDialog({ title: vscode.l10n.t('Export exact PDF build for preview generation'),
+            // eslint-disable-next-line @typescript-eslint/naming-convention
+            defaultUri: vscode.Uri.joinPath(folder, name), filters: { PDF: ['pdf'] } });
+        if (!target) { return; }
+        if (target.scheme !== 'file') {
+            await vscode.window.showErrorMessage(vscode.l10n.t('Preview source export needs a local file destination.'));
+            return;
+        }
+        try {
+            const result = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification,
+                title: vscode.l10n.t('Exporting exact build {0}', name), cancellable: true }, async (progress, token) => {
+                const abort = new AbortController();
+                const cancel = token.onCancellationRequested(() => abort.abort());
+                const change = editor.doc.onDidChange(() => { if (!current()) { abort.abort(); } });
+                const close = editor.panel.onDidDispose(() => abort.abort());
+                let reported = 0;
+                try {
+                    return await this.previews.exportSource(this.pieces, output, target.fsPath, current, abort.signal, bytes => {
+                        const percent = output.file.size ? bytes / output.file.size * 100 : 0;
+                        if (percent - reported >= 1 || percent === 100) { progress.report({ increment: percent - reported }); reported = percent; }
+                    });
+                } finally { cancel.dispose(); change.dispose(); close.dispose(); }
+            });
+            await vscode.window.showInformationMessage(vscode.l10n.t('Exported the exact PDF and preview receipt: {0}', result.receiptPath));
+            return result;
+        } catch (error) {
+            const message = vscode.l10n.t('Could not export the preview source: {0}', errorMessage(error));
+            if (error instanceof PdfPreviewExportError && (error.reason === 'cancelled' || error.reason === 'superseded')) {
+                await vscode.window.showInformationMessage(message);
+            } else { await vscode.window.showErrorMessage(message); }
+        }
     }
 
     /**

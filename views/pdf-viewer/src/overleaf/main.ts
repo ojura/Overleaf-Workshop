@@ -7,6 +7,8 @@ import { documentShown, showBuildState, showLoadError } from '../common/banner';
 import { goToCode, listenForDoubleClick, showHighlights } from '../common/synctex';
 import { applyTheme, themesFrom, type Theme } from '../common/theme';
 import { installPdfPrefetch } from '../common/pdf-prefetch';
+import { hostPdfPreviewSource } from '../common/pdf-preview-bridge';
+import { createPdfPreviewBinding } from '../common/pdf-preview-binding';
 import { config } from '../common/config';
 import { Documents } from './documents';
 import { Outline } from './outline';
@@ -31,6 +33,8 @@ const prefetch = installPdfPrefetch(wrapper.viewer, {
     diagnosticsToolbar: document.getElementById('toolbar')!,
     onIdleChange: idle => { if (shownBuild) { post({ type: 'cacheActivity', page: config.page, build: shownBuild, idle }); } },
 });
+const previewBinding = createPdfPreviewBinding(wrapper.viewer, (source, doc) => prefetch.setPreviewSource(source, doc));
+window.addEventListener('pagehide', event => { if (!event.persisted) { previewBinding.dispose(); } });
 
 /** the zoom, kept per document; Overleaf's default is the page width (pdf-js-viewer.tsx:34-37) */
 let scale = 'page-width';
@@ -141,12 +145,14 @@ const outline = new Outline(wrapper.viewer.linkService);
 
 const documents = new Documents(wrapper, {
     beforeLoad() {
+        previewBinding.clear();
         // the position to restore in the new build: where the reader is now
         storePosition();
     },
-    loaded(doc, build) {
+    loaded(doc, build, preview) {
         shownBuild = build;
         documentShown(build);
+        previewBinding.set(hostPdfPreviewSource(preview), doc);
         toolbar.setPagesCount(doc.numPages);
         void outline.render(doc);
     },
@@ -225,7 +231,7 @@ outline.setOpen(saved.sidebarView === SIDEBAR_OUTLINE);
 toolbar.setOutlineOpen(outline.open);
 
 // the host sends these after 'initState'; host.ts keeps them until a handler is set
-onMessage('load', (message) => documents.load(message.output));
+onMessage('load', message => documents.load(message.output, false, message.preview));
 onMessage('update', (message) => documents.loadData(message.content));
 onMessage('buildState', (message) => showBuildState(message));
 onMessage('syncCode', (message) => {

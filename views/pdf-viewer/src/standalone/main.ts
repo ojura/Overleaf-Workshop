@@ -1,7 +1,8 @@
 import { installPdfPrefetch } from '../common/pdf-prefetch';
 import { pdfCachePolicy, pdfDocumentCacheOptions } from '../common/scroll-prefetch';
 import { openHttpPdfRange } from './http-range';
-import { pageLink, readSiteConfig, type SiteConfig } from './config';
+import { pageLink, readSiteConfig, sitePreviewDescriptor, type SiteConfig } from './config';
+import { httpPdfPreviewSource } from '../common/pdf-preview-http';
 import './viewer.css';
 
 const elements = {
@@ -182,6 +183,9 @@ async function start() {
             source = next;
             elements.download.title = 'Preuzmi cijeli PDF (' + (next.length / 1e9).toLocaleString('hr', { maximumFractionDigits: 2 }) + ' GB)';
             await app.open({ ...next.documentParams, ...pdfDocumentCacheOptions() });
+            if (signal.aborted || current !== attempt) { return; }
+            const preview = sitePreviewDescriptor(config, next);
+            prefetch.setPreviewSource(preview ? httpPdfPreviewSource(preview) : undefined, app.pdfDocument);
         } catch (error) {
             if (signal.aborted || current !== attempt) { return; }
             source?.abort();

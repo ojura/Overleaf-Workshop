@@ -20,17 +20,19 @@ import { errorMessage } from '../common/errorMessage';
 import { onMessage, post, ready, savedState, saveState } from '../common/host';
 import type { InitState } from '../common/host';
 import { toPdfFile } from '../common/output';
-import type { PdfOutput, Position, SyncBox } from '../common/protocol';
+import type { PdfOutput, PdfPreviewDescriptor, Position, SyncBox } from '../common/protocol';
 import { goToCode, listenForDoubleClick, showHighlights } from '../common/synctex';
 import { applyTheme, themesFrom } from '../common/theme';
 import type { Theme } from '../common/theme';
 import { createWorkerPort } from '../common/worker';
 import { installPdfPrefetch } from '../common/pdf-prefetch';
+import { hostPdfPreviewSource } from '../common/pdf-preview-bridge';
 import { documentParams, PDFJS } from '../shims/pdf-js';
 import '../common/icons.css';
 import './viewer.css';
 
 const CHUNK_SIZE = 128 * 1024; // PDFJSWrapper's
+let previewController: ReturnType<typeof installPdfPrefetch> | undefined;
 /** the zoom step of Overleaf's zoom buttons and keys (pdf-js-viewer.tsx); pdf.js's own is about 1.1 */
 const ZOOM_STEP = 1.25;
 const ScrollMode: Record<string, number> = { vertical: 0, horizontal: 1, wrapped: 2, page: 3 };
@@ -216,7 +218,9 @@ function untilStopped<T>(job: Job, promise: Promise<T>): Promise<T | undefined> 
  * build again when the PDF's tab becomes active, and a build that is in view already stays as it
  * is, as in the Overleaf viewer.
  */
-function show(source: { output?: PdfOutput, data?: ArrayBuffer }) {
+interface Source { output?: PdfOutput; data?: ArrayBuffer; preview?: PdfPreviewDescriptor }
+
+function show(source: Source) {
     if (source.output && !inFlight && app()?.pdfDocument && rangeLoaded?.file.build === source.output.file.build) { return; }
     if (inFlight) { stop(inFlight); }
     const job: Job = { abort: new AbortController() };
@@ -227,7 +231,7 @@ function show(source: { output?: PdfOutput, data?: ArrayBuffer }) {
         .finally(() => { if (inFlight === job) { inFlight = undefined; } });
 }
 
-async function load(source: { output?: PdfOutput, data?: ArrayBuffer }, job: Job) {
+async function load(source: Source, job: Job) {
     if (job.abort.signal.aborted) { return; }
     await initialized;
     const a = app();
@@ -303,6 +307,7 @@ async function load(source: { output?: PdfOutput, data?: ArrayBuffer }, job: Job
     shown = { task, worker };
     if (url) { a.setTitleUsingUrl(url, url); }
     a.load(doc);
+    previewController?.setPreviewSource(hostPdfPreviewSource(source.preview), doc);
 }
 
 function positionOf(a: any): Position | undefined {
@@ -430,7 +435,7 @@ function addToolbarButtons(a: any) {
 }
 
 async function start() {
-    onMessage('load', (message: { output: PdfOutput }) => show({ output: message.output }));
+    onMessage('load', message => show({ output: message.output, preview: message.preview }));
     onMessage('update', (message: { content: ArrayBuffer }) => show({ data: message.content }));
     onMessage('buildState', (message) => showBuildState(message));
     onMessage('syncCode', (message: { content: SyncBox[] }) => {
@@ -452,6 +457,7 @@ async function start() {
         onDiagnosticsOpen: () => a.secondaryToolbar.close(),
         onIdleChange: idle => { if (shownBuild) { post({ type: 'cacheActivity', page: config.page, build: shownBuild, idle }); } },
     });
+    previewController = prefetch;
     (window as any).pdfjsViewer.prefetch = prefetch;
     (window as any).pdfPrefetch = prefetch;
     // pdf.js's pages have a transparent 9 px border. PDFJSWrapper's currentPosition measures from

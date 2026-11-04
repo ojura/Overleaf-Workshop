@@ -1,7 +1,8 @@
 import { pdfCachePolicy, ScrollPrefetchDynamics, type PdfCachePolicy } from './scroll-prefetch';
 import { installPrefetchDiagnostics, pdfPerformance, type DecodedImageSnapshot } from './prefetch-performance';
 import { PdfPreviewCache } from './pdf-preview-cache';
-import { installPdfDocumentRobots } from './pdf-document-robots';
+import { installPdfDocumentRobots, type DocumentRobotWorkGroup } from './pdf-document-robots';
+import { createPdfPreviewSourceLoader, rotatePdfPreviewImageRegions, type PdfPreviewSource } from './pdf-preview-source';
 import type { RobotDispatchPort } from './prefetch-robots';
 import './prefetch.css';
 
@@ -29,6 +30,8 @@ interface Options {
     requestFrame?: (callback: FrameRequestCallback) => number;
     cancelFrame?: (id: number) => void;
     createCanvas?: () => HTMLCanvasElement;
+    previewSource?: PdfPreviewSource;
+    createPreviewSourceLoader?: typeof createPdfPreviewSourceLoader;
 }
 
 interface Preparation {
@@ -85,6 +88,9 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     let documentRobots: ReturnType<typeof installPdfDocumentRobots> | undefined;
     let diagnostics: ReturnType<typeof installPrefetchDiagnostics> | undefined;
     let dispatchOrigin: RobotDispatchPort | undefined;
+    let previewBinding: { source: PdfPreviewSource; document: any } | undefined;
+    let previewLoader: ReturnType<typeof createPdfPreviewSourceLoader> | undefined;
+    let previewAppearanceCompatible = true;
     let generation = 0;
     let document: any;
     let disposed = false;
@@ -116,9 +122,30 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     const position = () => horizontal() ? container.scrollLeft * (rtl() ? -1 : 1) : container.scrollTop;
     const isReady = (id: number) => pageView(id)?.renderingState === FINISHED || previews.has(id);
     const hidden = () => owner.visibilityState === 'hidden';
+    const previewCompatible = () => previewAppearanceCompatible && !viewer.pageColors && !(globalThis as any).pdfjsViewerColorTheme;
     const nativeTarget = (id: number) => nativePages.includes(id) || renderAhead.includes(id);
     const retainResources = (id: number) => policy.releaseRenderedResources
         ? nativeTarget(id) && pageView(id)?.renderingState !== FINISHED : prepared.includes(id);
+
+    function visibleRobotWork(): DocumentRobotWorkGroup[] {
+        const groups = new Map<string, { key: string; pages: DocumentRobotWorkGroup['pages'][number][] }>();
+        for (const id of visible) {
+            const view = pageView(id);
+            if (!view?.div) { continue; }
+            const spread = view.div.closest?.('.spread') as HTMLElement | undefined;
+            const members = spread ? [...spread.children].map(child => Number(child.getAttribute('data-page-number')))
+                .filter(member => Number.isSafeInteger(member) && member > 0 && member <= viewer.pagesCount).sort((a, b) => a - b) : [];
+            const key = (members.length ? members : [id]).join(',');
+            let group = groups.get(key);
+            if (!group) { groups.set(key, group = { key, pages: [] }); }
+            const label = view.pageLabel ?? viewer._pageLabels?.[id - 1];
+            group.pages.push({ pageNumber: id, pageElement: view.div,
+                ...(typeof label === 'string' && label.length <= 128 ? { label } : {}),
+                state: isReady(id) ? 'ready' : failed.has(id) ? 'failed'
+                    : jobs.has(id) || previewLoader?.isPending(id) || [RUNNING, PAUSED].includes(view.renderingState) ? 'preparing' : 'waiting' });
+        }
+        return [...groups.values()];
+    }
 
     function clearRobotPending(): void {
         pendingRobotPages.clear();
@@ -144,7 +171,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         }
         // Removing an offscreen courier can release capacity synchronously. Update the
         // waiting IDs first so its notification cannot retain an obsolete page.
-        documentRobots.setVisiblePages(visible);
+        documentRobots.setVisibleWork(visibleRobotWork());
     }
 
     function onRobotCapacityAvailable(): void {
@@ -188,7 +215,10 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         const canvas = native ?? previews.get(id)?.canvas;
         if (!canvas?.width || !canvas?.height || !view?.div) { return; }
         try {
-            const result = documentRobots.offer({ pageNumber: id, pageElement: view.div, canvas, kind: native ? 'page' : 'preview' });
+            const page = previewLoader?.page(id);
+            const imageRegions = page && previewCompatible() && previewGeometryMatches(page, view)
+                ? rotatePdfPreviewImageRegions(page.imageRegions, viewer.pagesRotation || 0) : undefined;
+            const result = documentRobots.offer({ pageNumber: id, pageElement: view.div, canvas, kind: native ? 'page' : 'preview', imageRegions });
             if (result === 'busy') { robotCapacityBlocked = true; }
             else if (result === 'deferred') { deferredRobotPages.add(id); }
             else { pendingRobotPages.delete(id); }
@@ -207,9 +237,74 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     function updateIdle() {
         setIdle(!disposed && !!document && document === viewer.pdfDocument && !hidden()
             && !memoryAdmissionBlocked() && !workerBytesBusy()
+            && !previewLoader?.snapshot().pending && previewLoader?.snapshot().state !== 'loading'
             && dynamics.direction === 0 && jobs.size === 0 && pdfPerformance.pendingFetchCount === 0
             && visible.length > 0 && visible.every(isReady)
             && [...nativePages, ...renderAhead].every(id => ![RUNNING, PAUSED].includes(pageView(id)?.renderingState)));
+    }
+
+    function updatePreviewSource(): void {
+        const active = !disposed && !hidden() && !!document && document === viewer.pdfDocument && previewCompatible();
+        previewLoader?.update([...new Set([...nativePages, ...prepared])].map(pageNumber => ({
+            pageNumber, visible: nativePages.includes(pageNumber), maxDimension: limits.previewMaxDimension, rotation: viewer.pagesRotation || 0,
+        })), active);
+    }
+
+    function previewGeometryMatches(page: { width: number; height: number; rotation: number }, view: any): boolean {
+        if (!view?.pdfPage) { return true; }
+        const intrinsic = ((view.pdfPage.rotate || 0) % 360 + 360) % 360;
+        const natural = view.pdfPage.getViewport({ scale: 1, rotation: intrinsic });
+        return intrinsic === page.rotation && Math.abs(natural.width - page.width) <= 1 && Math.abs(natural.height - page.height) <= 1;
+    }
+
+    function attachPreviewSource(): void {
+        previewLoader?.dispose();
+        previewLoader = undefined;
+        const binding = previewBinding;
+        if (!binding || binding.document !== document || document !== viewer.pdfDocument || disposed) { return; }
+        const current = () => !disposed && previewBinding === binding && document === binding.document && document === viewer.pdfDocument;
+        try {
+            previewLoader = (options.createPreviewSourceLoader ?? createPdfPreviewSourceLoader)(binding.source, {
+                pageCount: viewer.pagesCount,
+                decodeConcurrency: policy.name === 'mobile' ? 1 : 2,
+                maxDecodePixels: Math.min(limits.maxPreviewBytes / RGBA_BYTES, limits.previewMaxDimension ** 2 * 4),
+                maxDecodeDimension: limits.previewMaxDimension * (policy.name === 'mobile' ? 1 : 2),
+                createCanvas,
+                quality: id => pageView(id)?.renderingState === FINISHED ? Infinity
+                    : Math.max(previews.get(id)?.canvas.width ?? 0, previews.get(id)?.canvas.height ?? 0),
+                onPreview(page, canvas) {
+                    const release = () => { canvas.remove(); canvas.width = canvas.height = 0; return false; };
+                    if (!current() || hidden() || layoutPending || !previewCompatible()) { return release(); }
+                    const view = pageView(page.pageNumber);
+                    if (!view || view.renderingState === FINISHED) { return release(); }
+                    // A trusted identity still needs the same page geometry before pixels are attached.
+                    if (!previewGeometryMatches(page, view)) { return release(); }
+                    const retained = retainPreview(page.pageNumber, canvas);
+                    if (retained) { showPreviews(); pdfPerformance.event('preview-ready', { page: page.pageNumber, sidecar: true }); }
+                    return retained;
+                },
+                onChange() {
+                    if (current() && !hidden()) {
+                        const state = previewLoader?.snapshot();
+                        if (state?.pending || state?.state === 'loading') { setIdle(false); }
+                        schedule();
+                    }
+                },
+                onEvent(type, data) { if (current()) { pdfPerformance.event('sidecar-' + type, data); } },
+            });
+            updatePreviewSource();
+            schedule();
+        } catch { pdfPerformance.event('sidecar-unavailable'); }
+    }
+
+    /** Root adapters supply a trusted source only for the exact installed PDFDocumentProxy. */
+    function setPreviewSource(source: PdfPreviewSource | undefined, pdfDocument: any): void {
+        if (disposed || !pdfDocument || pdfDocument !== viewer.pdfDocument) { return; }
+        if (previewBinding && previewBinding.source === source && previewBinding.document === pdfDocument) { return; }
+        previewLoader?.dispose(); previewLoader = undefined;
+        previewBinding = source ? { source, document: pdfDocument } : undefined;
+        if (pdfDocument === document) { attachPreviewSource(); }
+        schedule();
     }
 
     function memoryBackpressure() {
@@ -836,6 +931,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         // layout correction may reset the baseline; otherwise that would erase real motion.
         if (layoutPending) { lastPosition = position(); }
         layoutPending = false;
+        updatePreviewSource();
         releaseColdPages();
         showPreviews();
         // update() protects visible pages in PDF.js's private LRU before it picks more work.
@@ -843,6 +939,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         refreshing = true;
         try { viewer.update(); } finally { refreshing = false; }
         pump();
+        updateRobotPages();
         updateIdle();
     }
 
@@ -850,6 +947,8 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         setIdle(false);
         clearRobotPending();
         documentRobots?.reset();
+        previewLoader?.dispose(); previewLoader = undefined; previewBinding = undefined;
+        previewAppearanceCompatible = true;
         stopRangeChecks();
         generation++;
         document = undefined;
@@ -871,8 +970,11 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     }
 
     function activate() {
+        const binding = previewBinding?.document === viewer.pdfDocument ? previewBinding : undefined;
         clearDocument();
         document = viewer.pdfDocument;
+        previewBinding = binding;
+        if (binding) { attachPreviewSource(); }
         rangeFreshRequired = !!document?.getRangeCacheStats;
         void sampleRangeCache(false, true);
         lastPosition = position();
@@ -882,6 +984,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
 
     function layout(invalidate = false) {
         stop();
+        previewLoader?.update([], false);
         clearRobotPending();
         documentRobots?.setVisiblePages([]);
         layoutPending = true;
@@ -912,6 +1015,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         return {
             ...sample, cachePolicy: policy.name, cacheLimits: limits, idle: !!idle,
             rangeCache: rangeCache ? { ...rangeCache } : undefined,
+            previewSource: previewLoader?.snapshot(),
             decodedImages: decodedImages(),
             robots: documentRobots?.snapshot(),
             labRobots: diagnostics?.labSnapshot(),
@@ -931,10 +1035,12 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     bus('pagesdestroy', clearDocument);
     bus('updateviewarea', () => { if (!refreshing) { schedule(); } });
     for (const name of ['scalechanging', 'scrollmodechanged', 'spreadmodechanged']) { bus(name, () => layout()); }
-    for (const name of ['rotationchanging', 'prefetchthemechanged', 'optionalcontentconfigchanged']) { bus(name, () => layout(true)); }
+    for (const name of ['rotationchanging', 'prefetchthemechanged']) { bus(name, () => layout(true)); }
+    bus('optionalcontentconfigchanged', () => { previewAppearanceCompatible = false; updatePreviewSource(); layout(true); });
     bus('pagerender', ({ pageNumber }: { pageNumber: number }) => {
         setIdle(false);
         renderStarts.set(pageNumber, now());
+        updateRobotPages();
         maintainRangeChecks();
         // setPdfPage/reset removed our earlier child; restore it before the first native paint.
         showPreviews();
@@ -968,6 +1074,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             setIdle(false);
             clearRobotPending();
             documentRobots?.setVisiblePages([]);
+            previewLoader?.update([], false);
             stopRangeChecks();
             rangeFreshRequired = !!document?.getRangeCacheStats;
             for (const job of jobs.values()) { cancel(job); }
@@ -996,9 +1103,11 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         },
     });
     if (viewer.pdfDocument) { activate(); }
+    if (options.previewSource && viewer.pdfDocument) { setPreviewSource(options.previewSource, viewer.pdfDocument); }
 
     return {
         snapshot,
+        setPreviewSource,
         toggleDiagnostics: () => diagnostics!.toggle(),
         setDiagnosticsEnabled: (enabled: boolean) => diagnostics!.setEnabled(enabled),
         get diagnosticsEnabled() { return diagnostics!.enabled; },

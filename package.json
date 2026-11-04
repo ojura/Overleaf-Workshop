@@ -116,6 +116,11 @@
     ],
     "commands": [
       {
+        "command": "overleaf-workshop.pdfViewer.exportPreviewSource",
+        "title": "%commands.pdfViewer.exportPreviewSource.title%",
+        "category": "%extension.displayName%"
+      },
+      {
         "command": "overleaf-workshop.remoteFileSystem.refreshLinkedFile",
         "title": "%commands.remoteFileSystem.refreshLinkedFile.title%",
         "icon": "$(refresh)",

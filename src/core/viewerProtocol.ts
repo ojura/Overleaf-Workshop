@@ -97,6 +97,22 @@ export interface PdfOutput {
     clsiCacheShard?: string;
 }
 
+/** Shared bound for host and browser manifest reads. */
+export const PDF_PREVIEW_MANIFEST_BYTES = 4 * 1024 * 1024;
+
+/** Exact source identity shared by offline preview manifests and their consumers. */
+export interface PdfPreviewIdentity {
+    key: string;
+    size: number;
+    sha256?: string;
+}
+
+/** The host selects this local resource; the viewer never chooses a filesystem path. */
+export interface PdfPreviewDescriptor {
+    identity: PdfPreviewIdentity;
+    manifestUrl: string;
+}
+
 /**
  * What happens to the project's build (src/core/projectBuilds.ts), as the viewers' line about it
  * shows it (views/pdf-viewer/src/common/banner.ts has the texts):
@@ -187,7 +203,8 @@ export interface BridgeResponse {
  */
 export type HostMessage =
     | { type: 'initState', content?: SavedState, colorThemes?: Record<string, ThemeColors>, defaults?: { scrollMode?: string, spreadMode?: string } }
-    | { type: 'load', output: PdfOutput }
+    | { type: 'load', output: PdfOutput, preview?: PdfPreviewDescriptor }
+    | { type: 'previewChanged', page: string, key: string }
     | { type: 'update', content: ArrayBuffer }
     | ({ type: 'buildState' } & BuildStatus)
     | { type: 'syncCode', content: SyncBox[] }

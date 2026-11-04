@@ -136,6 +136,8 @@ The initial extension implementation at `0681c21` passed 678 Mocha tests and the
 
 The [physical iPhone report](spomenar-mobile-validation.md) records the adaptive follow-up on the actual 459-page, 1.61 GB book, including decoded-image memory, native browser memory, visible coverage, transferred bytes, idle CPU and document deliveries. Its exact measurements are retained in [spomenar-mobile-metrics.json](spomenar-mobile-metrics.json).
 
+The [live desktop report](pdf-desktop-validation.md) records installed `7c70643` in Antigravity against the subsequent 460-page build: completed photo and 270% zoom renders at the 2.915-second and 1.491-second checkpoints, twelve active couriers, cooperative shared cargo, exact reader restoration and continuing disk accumulation after idle. Its [numeric record](pdf-desktop-metrics.json) preserves the measured values.
+
 The [prefetch probe](../scripts/pdf-viewer-harness/probes/prefetch.mjs) compares native scheduling with the shared controller for both engines:
 
 ```sh
