@@ -339,6 +339,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.scmCollectionItem?.triggers.forEach((trigger) => trigger.dispose());
             this.scmCollectionItem = undefined;
             this.changes.dispose();
+            this.builds.dispose();
             this.buildListeners.forEach(stop => stop());
             // the updates waiting for an answer end, with their timers
             this.answersLost('the project was closed');

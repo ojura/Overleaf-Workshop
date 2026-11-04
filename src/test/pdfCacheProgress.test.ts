@@ -54,6 +54,7 @@ class Uri {
 }
 const vscode = {
     Uri,
+    window: { state: { focused: true } },
     EventEmitter: class {
         event() { return { dispose() {} }; }
         dispose() {}
@@ -101,7 +102,7 @@ describe('host disk progress delivery', () => {
         };
         const panel = {
             visible: true,
-            onDidDispose: (callback: () => void) => { close = callback; },
+            onDidDispose: (callback: () => void) => { close = callback; return { dispose() {} }; },
             onDidChangeViewState: () => ({ dispose() {} }),
             webview: {
                 html: '', options: {}, asWebviewUri: (uri: Uri) => uri,

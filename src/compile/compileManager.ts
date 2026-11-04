@@ -699,6 +699,15 @@ export class CompileManager {
         }
     }
 
+    /** Header actions supply a URI; a keyboard command uses the focused project PDF when present. */
+    private compileTarget(target?: vscode.Uri): vscode.Uri | undefined {
+        if (target) { return target; }
+        for (const { doc, webviewPanel } of this.viewers.values()) {
+            if (webviewPanel.active) { return doc.uri; }
+        }
+        return undefined;
+    }
+
     get triggers() {
         return [
             ...this.listeners,
@@ -708,8 +717,8 @@ export class CompileManager {
             // the editor's title menu passes the editor's file; the compiles for a project's build,
             // the automatic one and the viewers' Recompile, pass the project's folder
             // (VirtualFileSystem.compileProject)
-            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.compile`, (target?: vscode.Uri) => this.compile(true, false, target)),
-            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.recompileFromScratch`, () => this.compile(true, true)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.compile`, (target?: vscode.Uri) => this.compile(true, false, this.compileTarget(target))),
+            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.recompileFromScratch`, (target?: vscode.Uri) => this.compile(true, true, this.compileTarget(target))),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.viewPdf`, (target?: vscode.Uri) => this.openPdf(target)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncCode`, () => this.syncCode()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncPdf`, (r) => this.syncPdf(r)),

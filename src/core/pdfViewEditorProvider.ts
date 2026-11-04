@@ -120,7 +120,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
     /** One disk budget for all builds' incremental ranges and reusable content pieces. */
     private readonly pieces: PieceCache;
     /** the open viewers, which a change of overleaf-workshop.pdfViewer.engine reloads */
-    private readonly editors = new Set<{ doc: PdfDocument, panel: vscode.WebviewPanel, render: () => Promise<void> }>();
+    private readonly editors = new Set<{ doc: PdfDocument, panel: vscode.WebviewPanel, render: () => Promise<void>, dispose: () => void }>();
     /** the folder of pdf.js's release in views/pdf-viewer/, from the extension's package.json */
     private readonly pdfjsRelease: string;
 
@@ -271,7 +271,8 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         });
         listeners.push(() => docOnDidChangeListener.dispose());
         if (builds) {
-            // while this viewer is visible, a missing build is compiled (ProjectBuilds)
+            // ProjectBuilds owns one freshness check loop for all visible viewers of this project.
+            builds.setWindowFocused(vscode.window.state.focused);
             listeners.push(builds.attachViewer(webviewPanel), builds.onDidChangeStatus(postStatus));
         }
 
@@ -281,45 +282,40 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             doc,
             panel: webviewPanel,
             render: async () => {
+                if (panelDisposed) { return; }
                 bridge.fetches.dispose();
                 cacheIdle = false;
                 bridge = newBridge();
-                webviewPanel.webview.html = await this.getViewerPage(webviewPanel.webview, doc.engine, bridge.page);
+                const html = await this.getViewerPage(webviewPanel.webview, doc.engine, bridge.page);
+                if (!panelDisposed) { webviewPanel.webview.html = html; }
+            },
+            dispose: () => {
+                if (panelDisposed) { return; }
+                panelDisposed = true;
+                progressDirty = false;
+                if (progressTimer) { clearTimeout(progressTimer); progressTimer = undefined; }
+                bridge.fetches.dispose();
+                listeners.forEach(stop => stop());
+                this.editors.delete(editor);
             },
         };
         this.editors.add(editor);
 
-        webviewPanel.onDidDispose(() => {
-            panelDisposed = true;
-            progressDirty = false;
-            if (progressTimer) { clearTimeout(progressTimer); progressTimer = undefined; }
-            bridge.fetches.dispose();
-            listeners.forEach(stop => stop());
-            this.editors.delete(editor);
-        });
+        const panelDisposal = webviewPanel.onDidDispose(editor.dispose);
+        listeners.push(() => panelDisposal.dispose());
 
         webviewPanel.webview.options = {enableScripts:true, localResourceRoots:[this.context.extensionUri]};
-        await editor.render();
-        // opened: ask Overleaf for the latest compile, which another client may have made
-        void builds?.check();
 
         // register event listeners
-        // the panel's view state changes when it becomes visible or hidden, and also when it gains
-        // or loses the focus, which does not call for a check
-        let wasVisible = webviewPanel.visible;
-        webviewPanel.onDidChangeViewState((e) => {
+        const viewState = webviewPanel.onDidChangeViewState((e) => {
             if (e.webviewPanel.active && doc.isProjectFile) {
                 EventBus.fire('fileWillOpenEvent', {uri: doc.uri});
             }
-            // shown again: another client (the web editor, another window, a command-line tool)
-            // may have compiled meanwhile
-            if (e.webviewPanel.visible && !wasVisible) {
-                void builds?.check();
-            }
-            wasVisible = e.webviewPanel.visible;
-            bridge.fetches.setActivity(wasVisible, cacheIdle);
+            builds?.viewerStateChanged();
+            bridge.fetches.setActivity(e.webviewPanel.visible, cacheIdle);
         });
-        webviewPanel.webview.onDidReceiveMessage((e: ViewerMessage) => {
+        listeners.push(() => viewState.dispose());
+        const messages = webviewPanel.webview.onDidReceiveMessage((e: ViewerMessage) => {
             switch (e.type) {
                 case 'syncPdf':
                     if (doc.isProjectFile) {
@@ -393,25 +389,32 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     break;
             }
         });
+        listeners.push(() => messages.dispose());
+        try {
+            await editor.render();
+        } catch (error) {
+            editor.dispose();
+            throw error;
+        }
+        // Opening may compile a missing build; subsequent freshness checks only read metadata.
+        if (!panelDisposed) { void builds?.check(); }
     }
 
     public get triggers(): vscode.Disposable[] {
         return [
-            { dispose: () => { void this.pieces.dispose(); } },
+            { dispose: () => {
+                for (const editor of this.editors) { editor.dispose(); }
+                void this.pieces.dispose();
+            } },
             vscode.workspace.onDidChangeConfiguration((e) => {
                 if (e.affectsConfiguration('overleaf-workshop.pdfViewer.engine')) {
                     this.applyEngine().catch((error) => console.error('overleaf-workshop: switching the PDF viewer:', error));
                 }
             }),
-            // back from the browser or another window, where the project may have been compiled:
-            // the builds in view ask for the latest compile
+            // A project's owner pauses on blur and checks immediately when its viewer is in use again.
             vscode.window.onDidChangeWindowState((state) => {
-                if (!state.focused) { return; }
-                for (const editor of this.editors) {
-                    if (editor.panel.visible) {
-                        void editor.doc.vfs?.builds.check();
-                    }
-                }
+                const projects = new Set([...this.editors].map(editor => editor.doc.vfs?.builds));
+                for (const builds of projects) { builds?.setWindowFocused(state.focused); }
             }),
             vscode.window.registerCustomEditorProvider(`${ROOT_NAME}.pdfViewer`, this, {
                 webviewOptions: {

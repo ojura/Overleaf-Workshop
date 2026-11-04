@@ -374,7 +374,7 @@
         "command": "overleaf-workshop.compileManager.compile",
         "title": "%commands.compileManager.compile.title%",
         "icon": "$(debug-start)",
-        "enablement": "(resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex",
+        "enablement": "((resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex) || (resourceScheme == overleaf-workshop && resourceExtname == .pdf)",
         "category": "%extension.displayName%"
       },
       {
@@ -438,7 +438,7 @@
         "key": "ctrl+alt+b",
         "mac": "cmd+alt+b",
         "command": "overleaf-workshop.compileManager.compile",
-        "when": "editorTextFocus && (resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex"
+        "when": "(editorTextFocus && (resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex) || (resourceScheme == overleaf-workshop && resourceExtname == .pdf)"
       },
       {
         "key": "ctrl+alt+v",
@@ -710,7 +710,7 @@
       "editor/title": [
         {
           "command": "overleaf-workshop.compileManager.compile",
-          "when": "(resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex",
+          "when": "((resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex) || (resourceScheme == overleaf-workshop && resourceExtname == .pdf)",
           "group": "navigation@1"
         },
         {

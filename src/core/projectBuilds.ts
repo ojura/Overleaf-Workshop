@@ -237,6 +237,25 @@ export interface BuildViewer {
     readonly visible: boolean;
 }
 
+/** Overleaf publishes cached builds asynchronously and sends no external compile-completion event.
+ * Ask for their small metadata response every five seconds after the previous check settles,
+ * while a PDF is visible in the focused window. This never starts a compile.
+ */
+export const BUILD_REFRESH_INTERVAL_MS = 5000;
+
+/** Schedule one callback; the returned function cancels it. Tests supply their own elapsed time. */
+export interface BuildRefreshScheduler {
+    after(ms: number, callback: () => void): () => void;
+}
+
+const refreshScheduler: BuildRefreshScheduler = {
+    after(ms, callback) {
+        const timer = setTimeout(callback, ms);
+        timer.unref();
+        return () => { clearTimeout(timer); };
+    },
+};
+
 /**
  * Where to ask: Overleaf's answer about the latest compile, the settings the window compiles with,
  * and the window's compile path (CompileManager.compile).
@@ -311,6 +330,12 @@ function notify<T>(listeners: Set<(value: T) => void>, value: T) {
  * comes with the project's tree. At the opening the waiting checks are the opening's own check;
  * after a reconnect, one check runs (rejoined). An answer that comes after the window lost the
  * project decides nothing and compiles nothing; the check waits for the next join.
+ *
+ * A visible PDF in the focused window also follows external compiles with metadata-only checks
+ * (checkForUpdates). One timer belongs to the project, however many viewers it has. It pauses
+ * while the window is blurred, no viewer is visible, the project is disconnected, or its own
+ * compile runs. These checks share the ordinary checks' queue but never grant permission to
+ * compile when the cache has no usable build.
  */
 export class ProjectBuilds {
     private current?: Build;
@@ -330,6 +355,18 @@ export class ProjectBuilds {
     private compile: CompileState = { state: 'idle' };
     private readonly viewers = new Set<BuildViewer>();
     private readonly checks = new CoalescedRuns(() => this.runCheck());
+    /** Only an ordinary check can grant the next queued run permission to compile. */
+    private nextCheckMayCompile = false;
+    /** A run requested only by the automatic follower still needs a visible, focused viewer. */
+    private nextCheckRequiresActivity = true;
+    private requestedChecks = 0;
+    private disposed = false;
+    private windowFocused = false;
+    private refreshActive = false;
+    private refreshTimer?: { cancel: () => void };
+    /** useOwn arrives before compileEnded, so the new build alone does not end this pause. */
+    private ownCompileRunning = false;
+    private activeJoinWaiter?: () => void;
     /** the handling of the project's opening (opened) */
     private opening?: Promise<void>;
     /** whether a build ID of another form than Overleaf's was logged (beganLater) */
@@ -350,7 +387,7 @@ export class ProjectBuilds {
     private readonly buildListeners = new Set<(build: Build) => void>();
     private readonly statusListeners = new Set<(status: BuildStatus) => void>();
 
-    constructor(private readonly host: BuildsHost) {}
+    constructor(private readonly host: BuildsHost, private readonly scheduler: BuildRefreshScheduler = refreshScheduler) {}
 
     /** the build in use */
     get build(): Build | undefined {
@@ -363,13 +400,13 @@ export class ProjectBuilds {
 
     /** Call `listener` with each new build in use; returns the function that stops it. */
     onDidChangeBuild(listener: (build: Build) => void): () => void {
-        this.buildListeners.add(listener);
+        if (!this.disposed) { this.buildListeners.add(listener); }
         return () => { this.buildListeners.delete(listener); };
     }
 
     /** Call `listener` with each change of the status; returns the function that stops it. */
     onDidChangeStatus(listener: (status: BuildStatus) => void): () => void {
-        this.statusListeners.add(listener);
+        if (!this.disposed) { this.statusListeners.add(listener); }
         return () => { this.statusListeners.delete(listener); };
     }
 
@@ -384,7 +421,105 @@ export class ProjectBuilds {
      * window's settings, against which an answer is taken, are not known before it (waitForJoin).
      */
     check(): Promise<void> {
-        return this.host.joined() ? this.checks.request() : this.waitForJoin();
+        if (this.disposed) { return Promise.resolve(); }
+        if (!this.host.joined()) {
+            this.refreshStateChanged();
+            return this.waitForJoin();
+        }
+        return this.requestCheck(true);
+    }
+
+    /** Read cached-build metadata only. A missing, expired or failed answer never asks for a compile. */
+    checkForUpdates(): Promise<void> {
+        if (this.disposed || !this.host.joined() || this.compile.state === 'running' || this.ownCompileRunning) {
+            this.refreshStateChanged();
+            return Promise.resolve();
+        }
+        return this.requestCheck(false);
+    }
+
+    /** The provider supplies the actual window state, including its initial state. */
+    setWindowFocused(focused: boolean) {
+        this.windowFocused = focused;
+        this.refreshStateChanged();
+    }
+
+    /** A registered viewer became visible or hidden; active-editor changes alone do not matter. */
+    viewerStateChanged() {
+        this.refreshStateChanged();
+    }
+
+    /** Stop following this project, including queued checks and late answers. */
+    dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this.cancelRefresh();
+        this.waitingForJoin?.resolve();
+        this.waitingForJoin = undefined;
+        this.activeJoinWaiter?.();
+        this.activeJoinWaiter = undefined;
+        this.viewers.clear();
+        this.buildListeners.clear();
+        this.statusListeners.clear();
+    }
+
+    private canRefresh(): boolean {
+        return !this.disposed && this.windowFocused && this.host.joined()
+            && this.compile.state !== 'running' && !this.ownCompileRunning
+            && [...this.viewers].some(viewer => viewer.visible);
+    }
+
+    private refreshStateChanged() {
+        const active = this.canRefresh();
+        const resumed = active && !this.refreshActive;
+        this.refreshActive = active;
+        if (!active) {
+            this.cancelRefresh();
+        } else if (resumed) {
+            this.refreshInBackground();
+        } else {
+            this.scheduleRefresh();
+        }
+    }
+
+    private refreshInBackground() {
+        if (!this.canRefresh()) { return; }
+        void this.requestCheck(false, true).catch(error => {
+            if (!this.disposed) { this.host.log(`check: failed: ${errorMessage(error)}`); }
+        });
+    }
+
+    private cancelRefresh() {
+        const timer = this.refreshTimer;
+        this.refreshTimer = undefined;
+        timer?.cancel();
+    }
+
+    private scheduleRefresh() {
+        if (this.refreshTimer || this.requestedChecks || !this.canRefresh()) { return; }
+        const timer = { cancel: () => {} };
+        this.refreshTimer = timer;
+        timer.cancel = this.scheduler.after(BUILD_REFRESH_INTERVAL_MS, () => {
+            if (this.refreshTimer !== timer) { return; }
+            this.refreshTimer = undefined;
+            if (this.canRefresh()) {
+                this.refreshInBackground();
+            } else {
+                this.refreshActive = false;
+            }
+        });
+    }
+
+    private requestCheck(mayCompile: boolean, requiresActivity = false): Promise<void> {
+        this.cancelRefresh();
+        this.nextCheckMayCompile ||= mayCompile;
+        this.nextCheckRequiresActivity &&= requiresActivity;
+        this.requestedChecks += 1;
+        return this.checks.request().finally(() => {
+            this.requestedChecks -= 1;
+            this.refreshActive = this.canRefresh();
+            this.scheduleRefresh();
+        });
     }
 
     /**
@@ -393,7 +528,12 @@ export class ProjectBuilds {
      * opening's check is that check (opened).
      */
     rejoined(): Promise<void> {
-        return this.waitingForJoin ? this.checks.request() : Promise.resolve();
+        if (this.disposed) { return Promise.resolve(); }
+        if (this.waitingForJoin) { return this.check(); }
+        // A disconnect may have ended before the pending timer noticed it. A join is itself a
+        // reason to check immediately, even when refreshActive still describes the old join.
+        this.refreshActive = this.canRefresh();
+        return this.refreshActive ? this.checkForUpdates() : Promise.resolve();
     }
 
     /**
@@ -420,6 +560,7 @@ export class ProjectBuilds {
      * (local-compile-context.tsx:383-425). Every call answers with the same promise.
      */
     opened(): Promise<void> {
+        if (this.disposed) { return Promise.resolve(); }
         this.opening ??= (async () => {
             this.host.log('opening: asks Overleaf for its latest compile');
             await this.check();
@@ -441,7 +582,7 @@ export class ProjectBuilds {
      * longer in use is ignored: the viewer gets the build in use next.
      */
     reportGone(id: string): Promise<void> {
-        if (id !== this.current?.id) {
+        if (this.disposed || id !== this.current?.id) {
             return Promise.resolve();
         }
         this.gone = true;
@@ -457,15 +598,20 @@ export class ProjectBuilds {
      * compiles on its own again for a viewer without a build to show (compiledForViewer).
      */
     buildShown(id: string) {
-        if (id === this.current?.id) {
+        if (!this.disposed && id === this.current?.id) {
             this.compiledForViewer = false;
         }
     }
 
     /** Follow `viewer` while it is open; returns the function to call when it closes. */
     attachViewer(viewer: BuildViewer): () => void {
+        if (this.disposed) { return () => {}; }
         this.viewers.add(viewer);
-        return () => { this.viewers.delete(viewer); };
+        this.refreshStateChanged();
+        return () => {
+            this.viewers.delete(viewer);
+            this.refreshStateChanged();
+        };
     }
 
     /**
@@ -475,7 +621,9 @@ export class ProjectBuilds {
      * (compileEnded). A compile that this project asked for is running already.
      */
     compileStarted(ofThisProject: boolean) {
-        if (ofThisProject && this.compile.state !== 'running') {
+        if (this.disposed || !ofThisProject) { return; }
+        this.ownCompileRunning = true;
+        if (this.compile.state !== 'running') {
             // a compile that the user started, from an editor or with a save; whether it compiles
             // anything shows only at its end, which puts this state back when it did not
             this.beforeStart = { compile: this.compile, compiledForViewer: this.compiledForViewer };
@@ -483,6 +631,7 @@ export class ProjectBuilds {
             this.compile = { state: 'running', started: true };
             this.update();
         }
+        this.refreshStateChanged();
     }
 
     /**
@@ -492,9 +641,10 @@ export class ProjectBuilds {
     compileEnded(outcome: CompileOutcome, ofThisProject: boolean) {
         // another project's compile made no build of this project; a request of this project that
         // waited for it asks again when it has ended (startCompile)
-        if (!ofThisProject) {
+        if (this.disposed || !ofThisProject) {
             return;
         }
+        this.ownCompileRunning = false;
         this.host.log(`compile ended: ${outcome.result === 'failure' ? `failure: ${outcome.detail}` : outcome.result}`);
         const before = this.beforeStart;
         this.beforeStart = undefined;
@@ -510,6 +660,7 @@ export class ProjectBuilds {
                 }
                 this.update();
             }
+            this.refreshStateChanged();
             return;
         }
         if (this.hasBuildToShow()) {
@@ -518,11 +669,13 @@ export class ProjectBuilds {
                 this.compile = { state: 'idle' };
                 this.update();
             }
+            this.refreshStateChanged();
             return;
         }
         const detail = outcome.result === 'failure' ? outcome.detail : NO_OUTPUT_PDF;
         this.compile = { state: 'failed', status: { state: 'compile-failed', detail } };
         this.update();
+        this.refreshStateChanged();
     }
 
     private hasBuildToShow(): boolean {
@@ -530,29 +683,42 @@ export class ProjectBuilds {
     }
 
     private async runCheck(): Promise<void> {
+        const mayCompile = this.nextCheckMayCompile;
+        const requiresActivity = this.nextCheckRequiresActivity;
+        this.nextCheckMayCompile = false;
+        this.nextCheckRequiresActivity = true;
+        if (this.disposed || (requiresActivity && !this.canRefresh())) { return; }
         // this check is the one that the checks waiting for the join wait for
-        const waited = this.waitingForJoin;
-        this.waitingForJoin = undefined;
+        const waited = mayCompile ? this.waitingForJoin : undefined;
+        if (mayCompile) { this.waitingForJoin = undefined; }
+        this.activeJoinWaiter = waited?.resolve;
         let lost = false;
         try {
-            lost = (await this.checkOnce()) === 'lost';
+            // A metadata request queued before an own compile started leaves the next refresh
+            // to that compile's end.
+            if (mayCompile || (this.compile.state !== 'running' && !this.ownCompileRunning)) {
+                lost = (await this.checkOnce(mayCompile)) === 'lost';
+            }
         } finally {
-            if (!lost) {
+            this.activeJoinWaiter = undefined;
+            if (!lost || this.disposed) {
                 waited?.resolve();
             }
         }
-        if (lost) {
+        if (lost && !this.disposed) {
+            this.refreshStateChanged();
             // the window lost the project before the answer: this check waits for the next join,
             // and so do the checks that waited for it
-            const next = this.waitForJoin();
-            if (waited) {
-                void next.then(waited.resolve);
+            if (mayCompile) {
+                const next = this.waitForJoin();
+                if (waited) { void next.then(waited.resolve); }
             }
         }
     }
 
     /** One check: 'lost' when the window lost the project before Overleaf answered, and the answer decided nothing. */
-    private async checkOnce(): Promise<'decided' | 'lost'> {
+    private async checkOnce(mayCompile: boolean): Promise<'decided' | 'lost'> {
+        if (!this.host.joined()) { return 'lost'; }
         this.checking = true;
         this.update();
         let answer: LatestAnswer;
@@ -562,6 +728,7 @@ export class ProjectBuilds {
             answer = { kind: 'failed', detail: errorMessage(error) };
         }
         this.checking = false;
+        if (this.disposed) { return 'decided'; }
         if (!this.host.joined()) {
             // the connection was lost while Overleaf answered: without the window's settings the
             // answer decides nothing, and nothing compiles; a check after the join decides
@@ -588,7 +755,7 @@ export class ProjectBuilds {
             }
         }
         // a compile that starts now is shown at once, without the state before it
-        await this.compileIfNeeded();
+        if (mayCompile) { await this.compileIfNeeded(); }
         this.update();
         return 'decided';
     }
@@ -632,6 +799,7 @@ export class ProjectBuilds {
     }
 
     private replace(build: Build) {
+        if (this.disposed) { return; }
         if (this.current && this.current.id !== build.id) {
             this.superseded.add(this.current.id);
         }
@@ -639,9 +807,13 @@ export class ProjectBuilds {
         this.gone = false;
         // the window has a new build: an earlier failure to ask Overleaf no longer says anything about it
         this.checkError = undefined;
-        this.compile = { state: 'idle' };
+        if (!this.ownCompileRunning) { this.compile = { state: 'idle' }; }
         notify(this.buildListeners, build);
         this.update();
+        // The just-adopted build already supplies freshness. Resume the cadence without asking
+        // for the same metadata immediately, including at the project's first join.
+        this.refreshActive = this.canRefresh();
+        this.scheduleRefresh();
     }
 
     /** Start the one compile that makes a build to show, while a viewer of the build is visible. */
@@ -680,6 +852,7 @@ export class ProjectBuilds {
 
     /** Ask the window's compile path for the compile that `asker` wants, if it asks now (whyNotCompile). */
     private async startCompile(asker: Asker): Promise<void> {
+        if (this.disposed) { return; }
         const whyNot = this.whyNotCompile(asker);
         // a viewer's request comes with each check: logged only when there is no build to show
         if (asker !== 'viewer' || !this.hasBuildToShow()) {
@@ -694,6 +867,7 @@ export class ProjectBuilds {
         const request: CompileState = { state: 'running', started: false };
         this.compile = request;
         this.update();
+        this.refreshStateChanged();
         let start: CompileStart;
         let detail = 'this window has no Overleaf project to compile';
         try {
@@ -703,13 +877,14 @@ export class ProjectBuilds {
             detail = errorMessage(error);
         }
         // the compile may have ended meanwhile (compileEnded), or a build may have come
-        if (this.compile !== request) {
+        if (this.disposed || this.compile !== request) {
             return;
         }
         if (start.kind === 'unavailable') {
             this.host.log(`${asker}: the compile cannot start: ${detail}`);
             this.compile = { state: 'failed', status: { state: 'compile-unavailable', detail } };
             this.update();
+            this.refreshStateChanged();
         } else if (start.kind === 'started') {
             if (asker === 'viewer') {
                 this.compiledForViewer = true;
@@ -723,7 +898,7 @@ export class ProjectBuilds {
             // settles `ended`. Not awaited, so that checks go on meanwhile.
             this.host.log(`${asker}: another compile of the window runs; asks again when it has ended`);
             void start.ended.then(() => {
-                if (this.compile === request) {
+                if (!this.disposed && this.compile === request) {
                     this.compile = { state: 'idle' };
                     void this.startCompile(asker);
                 }
@@ -759,6 +934,7 @@ export class ProjectBuilds {
     }
 
     private update() {
+        if (this.disposed) { return; }
         const next = this.derive();
         if (next.state === this.shown.state && next.detail === this.shown.detail) {
             return;

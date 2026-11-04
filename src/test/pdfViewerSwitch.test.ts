@@ -48,7 +48,7 @@ const vscodeMock = withStubs({
     TreeItem: class {},
     ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     l10n: { t: (message: string) => message },
-    window: withStubs({ registerCustomEditorProvider: () => ({ dispose() {} }) }),
+    window: withStubs({ state: { focused: true }, registerCustomEditorProvider: () => ({ dispose() {} }) }),
     workspace: withStubs({
         getConfiguration: () => ({
             get: (key: string, value: unknown) => (key in world.settings ? world.settings[key] : value),
@@ -95,7 +95,7 @@ function panel() {
         nextPage: () => new Promise<void>(resolve => pageWaiters.push(resolve)),
         send: (message: any) => onMessage(message),
         dispose: () => onDispose(),
-        webviewPanel: { webview, onDidDispose: (listener: () => void) => { onDispose = listener; }, onDidChangeViewState: () => ({ dispose() {} }) },
+        webviewPanel: { webview, onDidDispose: (listener: () => void) => { onDispose = listener; return { dispose() {} }; }, onDidChangeViewState: () => ({ dispose() {} }) },
     };
 }
 const viewerOf = (page: string | undefined) => /the (\w+) viewer/.exec(page ?? '')?.[1];

@@ -24,6 +24,17 @@ compilation on save has its own setting. For diagnosis, the advanced setting
 `overleaf-workshop.debug.disableLocalReplicaCompilePreview` can disable the local
 compile/preview commands; its default is `false`.
 
+**Compile Project** remains in the compiled PDF's editor header, and its
+`Ctrl+Alt+B` shortcut (`Cmd+Alt+B` on macOS) compiles the project whose PDF has
+focus. While the PDF is visible in a focused window, the extension checks for
+completed builds made by the same Overleaf account in other clients every five
+seconds after the previous check finishes. Returning to the window or showing
+the PDF again checks immediately.
+These checks read build metadata and use the existing project build owner; they
+do not start a compile. They pause while the window is unfocused, every PDF of the
+project is hidden, the project is disconnected, or this window is compiling it.
+Closing the project cancels its refresh lifecycle.
+
 ## The repository
 
 The replica folder is the work tree of a repository of its own, with `.git` at the folder's

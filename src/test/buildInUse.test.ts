@@ -264,6 +264,7 @@ const vscodeStandIn = strict('vscode', {
         },
     }),
     window: strict('vscode.window', {
+        state: { focused: true },
         get activeTextEditor() { return world.activeEditor; },
         visibleTextEditors: [],
         showInformationMessage: show('information'),
@@ -395,6 +396,7 @@ describe('the build in use, from Overleaf to the window', function () {
     let manager: any;
     let managerTriggers: Array<{ dispose(): void }>;
     let provider: any;
+    let providerTriggers: Array<{ dispose(): void }>;
     let scratch: string;
     const flushAll = LocalReplicaSCMProvider.flushAll;
     const readSettings = LocalReplicaSCMProvider.readSettings;
@@ -424,12 +426,14 @@ describe('the build in use, from Overleaf to the window', function () {
         manager = new CompileManager({ prefetch: async () => vfs });
         managerTriggers = manager.triggers;
         provider = new PdfViewEditorProvider({ globalStorageUri: Uri.file(path.join(scratch, 'storage')), extensionUri: Uri.file('/extension'), extension: { packageJSON } });
+        providerTriggers = provider.triggers;
     });
 
     afterEach(async () => {
         // the Problems view and the replica's logs of a build from the cache, which may still be read
         await manager.cachedBuildShown;
         managerTriggers.forEach(trigger => trigger.dispose());
+        providerTriggers.forEach(trigger => trigger.dispose());
         vfs.dispose();
         overleaf.close();
         LocalReplicaSCMProvider.flushAll = flushAll;

@@ -50,6 +50,7 @@ function scenario() {
     const startupRejected = new Signal<Error>();
     const settingsContinuations: Promise<unknown>[] = [];
     const subscriptions: Array<{ dispose(): void }> = [];
+    const closeViewers: Array<() => Promise<void>> = [];
     const contexts = new Map<string, unknown>();
     const commands = new Map<string, (...args: any[]) => unknown>();
     const opened: Uri[] = [];
@@ -149,6 +150,7 @@ function scenario() {
     const loaded = loadWithVscode(vscode, () => ({
         ...require('../extension'),
         ...require('../compile/compileManager'),
+        ...require('../utils/eventBus'),
     }), {
         './core/remoteFileSystemProvider': { RemoteFileSystemProvider: RemoteProvider },
         '../core/remoteFileSystemProvider': {
@@ -174,9 +176,18 @@ function scenario() {
             subscriptions.push(...manager.triggers);
             return manager;
         },
+        openViewer: (uri: Uri) => {
+            const closing = new Listeners<void>();
+            const panel = { active: true, visible: true, onDidDispose: closing.event };
+            loaded.EventBus.fire('pdfWillOpenEvent', { uri, doc: { uri }, webviewPanel: panel });
+            const close = () => closing.fire();
+            closeViewers.push(close);
+            return { panel, close };
+        },
         async dispose() {
             joined.resolve();
             await Promise.allSettled(settingsContinuations);
+            await Promise.all(closeViewers.map(close => close()));
             subscriptions.forEach(subscription => subscription.dispose());
         },
     };
@@ -253,6 +264,39 @@ describe('manual compile and preview for a local replica', () => {
         await host.commands.get('overleaf-workshop.compileManager.viewPdf')!(SOURCE);
         assert.deepStrictEqual(host.opened.map(uri => uri.toString()), [Uri.joinPath(PROJECT, '.output', 'output.pdf').toString()]);
     });
+
+    for (const command of ['compile', 'recompileFromScratch']) {
+        it(command + ' uses the active PDF project when no editor-title target is provided', async () => {
+            host.world.editor = { document: { uri: Uri.file('/unrelated/main.tex') } };
+            host.world.folders = [{ uri: Uri.file('/unrelated') }];
+            host.world.settings = undefined;
+            const manager = host.manager();
+            const pdf = Uri.joinPath(PROJECT, '.output', 'output.pdf');
+            const viewer = host.openViewer(pdf);
+            const calls: unknown[][] = [];
+            manager.compile = async (...args: unknown[]) => { calls.push(args); };
+            const run = host.commands.get('overleaf-workshop.compileManager.' + command)!;
+            await run();
+            assert.deepStrictEqual(calls.pop(), [true, command === 'recompileFromScratch', pdf]);
+            viewer.panel.active = false;
+            await run();
+            assert.deepStrictEqual(calls.pop(), [true, command === 'recompileFromScratch', undefined], 'an inactive viewer does not redirect a command');
+            viewer.panel.active = true;
+            await viewer.close();
+            await run();
+            assert.deepStrictEqual(calls.pop(), [true, command === 'recompileFromScratch', undefined], 'a closed viewer does not redirect a command');
+        });
+
+        it(command + ' keeps an explicit command target ahead of the active PDF', async () => {
+            const manager = host.manager();
+            host.openViewer(Uri.joinPath(PROJECT, '.output', 'output.pdf'));
+            const explicit = Uri.parse('overleaf-workshop://www.overleaf.com/Other/main.tex?user=u&project=other');
+            const calls: unknown[][] = [];
+            manager.compile = async (...args: unknown[]) => { calls.push(args); };
+            await host.commands.get('overleaf-workshop.compileManager.' + command)!(explicit);
+            assert.deepStrictEqual(calls, [[true, command === 'recompileFromScratch', explicit]]);
+        });
+    }
 
     it('continues to obey the separate compile-on-save preference', async () => {
         const manager = host.manager();
