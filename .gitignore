@@ -6,3 +6,4 @@ out
 
 **/vendor/**
 views/pdf-viewer/dist
+dist/spomenar

@@ -7,6 +7,7 @@ import { documentShown, showBuildState, showLoadError } from '../common/banner';
 import { goToCode, listenForDoubleClick, showHighlights } from '../common/synctex';
 import { applyTheme, themesFrom, type Theme } from '../common/theme';
 import { installPdfPrefetch } from '../common/pdf-prefetch';
+import { config } from '../common/config';
 import { Documents } from './documents';
 import { Outline } from './outline';
 import { Toolbar } from './toolbar';
@@ -25,7 +26,11 @@ const SIDEBAR_OUTLINE = 2;
 
 const container = document.getElementById('viewerContainer') as HTMLDivElement;
 const wrapper = new PDFJSWrapper(container);
-const prefetch = installPdfPrefetch(wrapper.viewer);
+let shownBuild: string | undefined;
+const prefetch = installPdfPrefetch(wrapper.viewer, {
+    diagnosticsToolbar: document.getElementById('toolbar')!,
+    onIdleChange: idle => { if (shownBuild) { post({ type: 'cacheActivity', page: config.page, build: shownBuild, idle }); } },
+});
 
 /** the zoom, kept per document; Overleaf's default is the page width (pdf-js-viewer.tsx:34-37) */
 let scale = 'page-width';
@@ -140,6 +145,7 @@ const documents = new Documents(wrapper, {
         storePosition();
     },
     loaded(doc, build) {
+        shownBuild = build;
         documentShown(build);
         toolbar.setPagesCount(doc.numPages);
         void outline.render(doc);

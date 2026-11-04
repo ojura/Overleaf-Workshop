@@ -6,6 +6,114 @@ import * as path from 'path';
 const importModule = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
 const repo = path.resolve(__dirname, '..', '..');
 
+class RobotEvents {
+    readonly listeners = new Map<string, Set<() => void>>();
+    addEventListener(name: string, listener: () => void) {
+        if (!this.listeners.has(name)) { this.listeners.set(name, new Set()); }
+        this.listeners.get(name)!.add(listener);
+    }
+    removeEventListener(name: string, listener: () => void) { this.listeners.get(name)?.delete(listener); }
+    emit(name: string) { for (const listener of this.listeners.get(name) ?? []) { listener(); } }
+    get count() { return [...this.listeners.values()].reduce((sum, set) => sum + set.size, 0); }
+}
+
+class RobotElement {
+    width = 0;
+    height = 0;
+    className = '';
+    textContent = '';
+    readonly dataset: Record<string, string> = {};
+    readonly style: Record<string, string> = {};
+    readonly children: RobotElement[] = [];
+    readonly attributes = new Map<string, string>();
+    readonly context = new Proxy({} as Record<string, any>, {
+        get(target, key: string) {
+            if (key in target) { return target[key]; }
+            if (key === 'createLinearGradient' || key === 'createRadialGradient') { return () => ({ addColorStop() {} }); }
+            return () => {};
+        },
+        set(target, key: string, value) { target[key] = value; return true; },
+    });
+    constructor(readonly ownerDocument: any) {}
+    getContext() { return this.context; }
+    append(...elements: RobotElement[]) { this.children.push(...elements); }
+    replaceChildren(...elements: RobotElement[]) { this.children.splice(0, this.children.length, ...elements); }
+    setAttribute(name: string, value: string) { this.attributes.set(name, value); }
+}
+
+class RobotRuntime {
+    now = 0;
+    readonly callbacks = new Map<number, (at: number) => void>();
+    readonly canvases: RobotElement[] = [];
+    readonly observers: Array<{ kind: string, callback: (entries: any[]) => void, disconnected: boolean }> = [];
+    readonly window = new RobotEvents() as RobotEvents & Record<string, any>;
+    readonly document = new RobotEvents() as RobotEvents & Record<string, any>;
+    readonly media = new RobotEvents() as RobotEvents & { matches: boolean };
+    readonly stage: RobotElement;
+    readonly lab: any;
+    private frameId = 0;
+    constructor(module: any, reduced = false, seed = 13) {
+        this.media.matches = reduced;
+        const runtime = this;
+        Object.assign(this.window, {
+            devicePixelRatio: 1,
+            performance: { now: () => this.now },
+            crypto: { getRandomValues: (values: Uint32Array) => { values[0] = seed; return values; } },
+            matchMedia: () => this.media,
+            requestAnimationFrame: (callback: (at: number) => void) => { this.callbacks.set(++this.frameId, callback); return this.frameId; },
+            cancelAnimationFrame: (id: number) => this.callbacks.delete(id),
+            ['IntersectionObserver']: class {
+                readonly state;
+                constructor(callback: (entries: any[]) => void) {
+                    this.state = { kind: 'intersection', callback, disconnected: false };
+                    runtime.observers.push(this.state);
+                }
+                observe() {}
+                disconnect() { this.state.disconnected = true; }
+            },
+            ['ResizeObserver']: class {
+                readonly state;
+                constructor(callback: (entries: any[]) => void) {
+                    this.state = { kind: 'resize', callback, disconnected: false };
+                    runtime.observers.push(this.state);
+                }
+                observe() {}
+                disconnect() { this.state.disconnected = true; }
+            },
+        });
+        Object.assign(this.document, {
+            hidden: false, defaultView: this.window,
+            createElement: (tag: string) => {
+                const element = new RobotElement(this.document);
+                if (tag === 'canvas') { this.canvases.push(element); }
+                return element;
+            },
+        });
+        this.stage = new RobotElement(this.document);
+        this.lab = module.installPrefetchRobots(this.stage);
+    }
+    frame() {
+        this.now += 1000 / 30;
+        const pending = [...this.callbacks.values()];
+        this.callbacks.clear();
+        for (const callback of pending) { callback(this.now); }
+    }
+    tick(milliseconds: number) { this.now += milliseconds; }
+    resize() {
+        for (const observer of this.observers) {
+            if (observer.kind === 'resize' && !observer.disconnected) { observer.callback([]); }
+        }
+    }
+    dispose() {
+        this.lab.dispose();
+        assert.strictEqual(this.callbacks.size, 0);
+        assert.strictEqual(this.document.count + this.media.count + this.window.count, 0);
+        assert.ok(this.observers.every(observer => observer.disconnected));
+        assert.ok(this.canvases.every(canvas => canvas.width * canvas.height === 0));
+    }
+}
+
+
 describe('the procedural PDF robot fleet', function () {
     this.timeout(30 * 1000);
     let dir: string;
@@ -36,6 +144,96 @@ describe('the procedural PDF robot fleet', function () {
 
     after(() => {
         if (dir) { fs.rmSync(dir, { recursive: true, force: true }); }
+    });
+
+
+    it('stops idle animation frames and ignores unchanged telemetry while the fleet stays visible', () => {
+        const runtime = new RobotRuntime(robots);
+        try {
+            runtime.lab.update(ready);
+            runtime.lab.setActive(true);
+            const opened = runtime.lab.snapshot();
+            assert.strictEqual(opened.renderer.active, true);
+            assert.strictEqual(runtime.stage.children.length, 3);
+            assert.strictEqual(runtime.callbacks.size, 0, 'a parked fleet needs no animation frame');
+            const frames = opened.renderer.frames;
+            for (let sample = 0; sample < 240; sample++) {
+                runtime.tick(250);
+                runtime.lab.update({ ...ready, visible: [12], pending: [] });
+            }
+            assert.strictEqual(runtime.lab.snapshot().renderer.frames, frames, 'identical quarter-second diagnostics do not repaint a settled canvas');
+            assert.strictEqual(runtime.callbacks.size, 0);
+        } finally { runtime.dispose(); }
+    });
+
+    it('finishes real deliveries, returns and readable notices before sleeping, then wakes on new work and user events', () => {
+        const runtime = new RobotRuntime(robots);
+        try {
+            runtime.lab.update(ready);
+            runtime.lab.setActive(true);
+            const events = Array.from({ length: 15 }, (_, index) => ({
+                sequence: index + 1, at: 10, type: 'fetch', data: { bytes: 131072 },
+            }));
+            runtime.tick(10);
+            runtime.lab.update({ ...ready, performance: { events } });
+            assert.strictEqual(runtime.callbacks.size, 1, 'completed PDF work wakes the crew');
+            for (let frame = 0; frame < 6000 && runtime.callbacks.size; frame++) { runtime.frame(); }
+            const settled = runtime.lab.snapshot();
+            assert.strictEqual(settled.stats.deliveredCargo, 15);
+            assert.strictEqual(settled.queuedCargo.length, 0);
+            assert.ok(settled.actors.every((actor: any) => actor.job === 'idle' && !actor.carrying && actor.notice === null
+                && Math.hypot(actor.x - actor.goal.x, actor.y - actor.goal.y) <= 1 && Math.hypot(actor.vx, actor.vy) <= 2),
+            'all return travel, docking and readable notice transitions finish before sleep');
+            assert.strictEqual(runtime.callbacks.size, 0);
+            const frames = settled.renderer.frames;
+            for (let sample = 0; sample < 240; sample++) {
+                runtime.tick(250);
+                runtime.lab.update({ ...ready, performance: { events } });
+            }
+            assert.strictEqual(runtime.lab.snapshot().renderer.frames, frames);
+            runtime.document.emit('pointerdown');
+            assert.strictEqual(runtime.lab.snapshot().renderer.frames, frames + 1, 'an input event refreshes the visible settled stage once');
+            runtime.resize();
+            assert.strictEqual(runtime.lab.snapshot().renderer.frames, frames + 2, 'a resized stage repaints once');
+            assert.strictEqual(runtime.callbacks.size, 0);
+            runtime.document.hidden = true;
+            runtime.document.emit('visibilitychange');
+            const next = [...events, { sequence: 16, at: runtime.now, type: 'fetch', data: { bytes: 2048 } }];
+            runtime.lab.update({ ...ready, performance: { events: next } });
+            assert.strictEqual(runtime.callbacks.size, 0);
+            runtime.document.hidden = false;
+            runtime.document.emit('visibilitychange');
+            assert.strictEqual(runtime.lab.snapshot().stats.acceptedCargo, 16, 'new work observed while hidden is accepted on return');
+            assert.strictEqual(runtime.callbacks.size, 1);
+            for (let frame = 0; frame < 3000 && runtime.callbacks.size; frame++) { runtime.frame(); }
+            assert.strictEqual(runtime.lab.snapshot().stats.deliveredCargo, 16);
+            assert.strictEqual(runtime.callbacks.size, 0);
+        } finally { runtime.dispose(); }
+    });
+
+    it('keeps reduced-motion updates event-driven and resumes an observed outage without a permanent frame loop', () => {
+        const runtime = new RobotRuntime(robots, true);
+        try {
+            runtime.lab.update(ready);
+            runtime.lab.setActive(true);
+            const frames = runtime.lab.snapshot().renderer.frames;
+            for (let sample = 0; sample < 8; sample++) {
+                runtime.tick(250);
+                runtime.lab.update({ ...ready });
+            }
+            assert.strictEqual(runtime.lab.snapshot().renderer.frames, frames, 'unchanged reduced-motion samples do not repaint');
+            runtime.lab.update(outage);
+            runtime.tick(robots.ROBOT_LIMITS.outageConfirmMs + 1);
+            runtime.lab.update(outage);
+            assert.strictEqual(runtime.lab.snapshot().mode, 'outage');
+            assert.ok(runtime.lab.snapshot().renderer.frames > frames);
+            assert.strictEqual(runtime.callbacks.size, 0, 'reduced motion never starts a physics frame loop');
+            runtime.media.matches = false;
+            runtime.media.emit('change');
+            assert.strictEqual(runtime.callbacks.size, 1, 'returning to full motion resumes a real outage');
+            runtime.lab.setActive(false);
+            assert.strictEqual(runtime.callbacks.size, 0);
+        } finally { runtime.dispose(); }
     });
 
     it('uses every outage scenario once before settling, without starting another loop', () => {
@@ -137,6 +335,80 @@ describe('the procedural PDF robot fleet', function () {
         assert.strictEqual(frame.stats.fetchBytes, 1048576);
         for (let at = 50; at <= 30000; at += 1000 / 30) { frame = fleet.step(at); }
         assert.ok(frame.stats.deliveredCargo >= 3);
+    });
+
+    it('finishes a dock service even when avoidance has displaced an already-arrived courier', () => {
+        const fleet = new robots.RobotChoreographer(13);
+        fleet.step(0, ready);
+        const actor = fleet.actors.find((candidate: any) => candidate.vehicle === 'mecanum');
+        fleet.delivery(actor, { kind: 'preview', bytes: 0, page: 2, count: 1 });
+        actor.task.index = actor.task.steps.findIndex((target: any) => target.activity === 'unload');
+        actor.task.arrivedAt = 500;
+        actor.goal = { x: 428, y: 193 };
+        actor.x = 462;
+        actor.y = 185;
+        actor.vx = actor.vy = 0;
+        actor.carrying = true;
+        actor.activity = 'unload';
+        const frame = fleet.step(2000, ready);
+        assert.strictEqual(frame.stats.deliveredCargo, 1, 'a completed service cannot wait forever for the old arrival radius');
+        assert.strictEqual(frame.actors[actor.id].carrying, false);
+    });
+
+    it('finishes a stationary fifteen-parcel burst and clears every courier from the shared dock', () => {
+        const events = Array.from({ length: 15 }, (_, index) => ({
+            sequence: index + 1, at: 10,
+            type: index < 8 ? 'fetch' : index < 13 ? 'preview-ready' : 'page-render',
+            data: index < 8 ? { bytes: 131072 } : { page: index - 7 },
+        }));
+        for (const seed of [11, 13, 42]) {
+            const fleet = new robots.RobotChoreographer(seed);
+            fleet.step(0, ready);
+            let frame = fleet.step(10, { ...ready, performance: { events } });
+            for (let at = 50; at <= 120000; at += 1000 / 30) { frame = fleet.step(at); }
+            assert.strictEqual(frame.stats.deliveredCargo, 15, 'seed ' + seed + ' must finish its finite stationary backlog');
+            assert.strictEqual(frame.queuedCargo.length, 0);
+            assert.ok(frame.actors.every((actor: any) => actor.job !== 'delivery'));
+        }
+    });
+
+    it('keeps traffic labels readable through brief yield/replan changes while still showing actual trouble', () => {
+        const fleet = new robots.RobotChoreographer(13);
+        fleet.step(0, ready);
+        const events = Array.from({ length: 40 }, (_, index) => ({
+            sequence: index + 1, at: 10, type: 'fetch', data: { bytes: 4096 },
+        }));
+        fleet.step(10, { ...ready, performance: { events } });
+        const shown = new Map<number, { label: string | null, since: number }>();
+        let labels = 0;
+        for (let at = 50; at < 60000; at += 1000 / 30) {
+            const frame = fleet.step(at);
+            for (const actor of frame.actors) {
+                const previous = shown.get(actor.id);
+                if (previous && previous.label && previous.label !== actor.notice && actor.notice !== 'SOS') {
+                    assert.ok(at - previous.since >= robots.ROBOT_LIMITS.noticeHoldMs - 1,
+                        'a shown traffic label should survive long enough to read');
+                }
+                if (!previous || previous.label !== actor.notice) {
+                    shown.set(actor.id, { label: actor.notice, since: at });
+                    if (actor.notice) { labels++; }
+                }
+            }
+        }
+        assert.ok(labels > 0, 'persistent traffic conditions still produce labels');
+        const rescue = new robots.RobotChoreographer(17, { sceneOrder: ['rescue'] });
+        const distressed = startOutage(rescue).actors.filter((actor: any) => actor.needsHelp);
+        assert.ok(distressed.length > 0);
+        assert.ok(distressed.every((actor: any) => actor.notice === 'SOS'), 'a stranded robot announces distress immediately');
+    });
+
+    it('publishes distress labels for reduced-motion telemetry updates without physics frames', () => {
+        const fleet = new robots.RobotChoreographer(17, { sceneOrder: ['rescue'] });
+        fleet.update(0, outage);
+        fleet.update(robots.ROBOT_LIMITS.outageConfirmMs + 1, outage);
+        const distressed = fleet.snapshot().actors.filter((actor: any) => actor.needsHelp);
+        assert.ok(distressed.length > 0);
+        assert.ok(distressed.every((actor: any) => actor.notice === 'SOS'));
     });
 
     it('bounds the delivery queue and actors during a burst while accounting for all bytes', () => {

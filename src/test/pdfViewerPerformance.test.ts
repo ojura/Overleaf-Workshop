@@ -63,6 +63,21 @@ describe('PDF prefetch performance measurements', function () {
         assert.strictEqual(recorder.snapshot().events[0].type, 'preview-ready');
     });
 
+    it('keeps one copy-safe numeric disk-cache report and clears it with the document', () => {
+        const recorder = new performanceModule.PdfPerformance(() => 10);
+        const progress = { storedBytes: 256, totalBytes: 1024, diskBytes: 512, budgetBytes: 4096, filling: true, complete: false, url: 'not telemetry' };
+        recorder.setDiskCache(progress);
+        progress.storedBytes = 999;
+        const saved = recorder.snapshot().diskCache;
+        assert.deepStrictEqual(saved, { storedBytes: 256, totalBytes: 1024, diskBytes: 512, budgetBytes: 4096, filling: true, complete: false });
+        saved.storedBytes = 777;
+        assert.strictEqual(recorder.snapshot().diskCache.storedBytes, 256);
+        recorder.setDiskCache({ ...progress, totalBytes: NaN });
+        assert.strictEqual(recorder.snapshot().diskCache.totalBytes, 1024);
+        recorder.reset();
+        assert.strictEqual(recorder.snapshot().diskCache, undefined);
+    });
+
     it('measures overlapping transfers over their shared elapsed time and ages them out', () => {
         let now = 2000;
         const recorder = new performanceModule.PdfPerformance(() => now);
@@ -216,7 +231,91 @@ describe('PDF prefetch performance measurements', function () {
         assert.strictEqual(recorder.snapshot().fetchMiBPerSecond, 2);
     });
 
-    it('leaves diagnostics dormant until opened and removes its handlers on disposal', () => {
+    it('keeps document robots enabled while measurements stay closed and toggles them independently', () => {
+        class Button {
+            id = '';
+            readonly attributes = new Map<string, string>();
+            readonly listeners = new Map<string, () => void>();
+            removed = false;
+            setAttribute(name: string, value: string) { this.attributes.set(name, value); }
+            addEventListener(name: string, listener: () => void) { this.listeners.set(name, listener); }
+            removeEventListener(name: string, listener: () => void) {
+                assert.strictEqual(this.listeners.get(name), listener);
+                this.listeners.delete(name);
+            }
+            remove() { this.removed = true; }
+        }
+        const buttons: Button[] = [];
+        const listeners = new Map<string, unknown>();
+        let enabled = true;
+        let timers = 0;
+        let samples = 0;
+        const document = {
+            defaultView: { setInterval() { timers++; }, clearInterval() {} },
+            createElement(tag: string) {
+                assert.strictEqual(tag, 'button', 'closed measurements do not allocate a panel or a lab stage');
+                return new Button();
+            },
+            addEventListener(name: string, listener: unknown) { listeners.set(name, listener); },
+            removeEventListener(name: string, listener: unknown) {
+                assert.strictEqual(listeners.get(name), listener);
+                listeners.delete(name);
+            },
+        };
+        const controls = performanceModule.installPrefetchDiagnostics({ id: 'viewerContainer', ownerDocument: document },
+            () => { samples++; }, {
+                enabled: false,
+                toolbar: { append(button: Button) { buttons.push(button); } },
+                robots: { get enabled() { return enabled; }, setEnabled(value: boolean) { enabled = value; } },
+            });
+        const robot = buttons.find(button => button.id === 'pdf-prefetch-toggle')!;
+        const measurements = buttons.find(button => button.id === 'pdf-prefetch-measurements')!;
+        assert.strictEqual(robot.attributes.get('aria-pressed'), 'true');
+        assert.ok(measurements, 'numeric measurements have their own header control');
+        assert.strictEqual(measurements.attributes.get('aria-expanded'), 'false');
+        assert.strictEqual(controls.enabled, false);
+        robot.listeners.get('click')!();
+        assert.strictEqual(enabled, false);
+        assert.strictEqual(robot.attributes.get('aria-pressed'), 'false');
+        controls.setRobotsEnabled(true);
+        assert.strictEqual(enabled, true);
+        assert.strictEqual(robot.attributes.get('aria-pressed'), 'true');
+        assert.strictEqual(controls.enabled, false);
+        assert.strictEqual(timers, 0);
+        assert.strictEqual(samples, 0);
+        controls.dispose();
+        assert.ok(buttons.every(button => button.removed && button.listeners.size === 0));
+        assert.strictEqual(listeners.size, 0);
+    });
+
+    it('keeps the tools launcher last and places the lab in the supplied labeled menu', () => {
+        const launcher = { id: 'secondaryToolbarToggle' };
+        const toolbar: any[] = [launcher];
+        const menu: any[] = [];
+        const document = {
+            defaultView: {},
+            createElement() {
+                return { id: '', innerHTML: '', attributes: new Map<string, string>(),
+                    setAttribute(name: string, value: string) { this.attributes.set(name, value); },
+                    addEventListener() {}, removeEventListener() {}, remove() {} };
+            },
+            addEventListener() {}, removeEventListener() {},
+        };
+        const controls = performanceModule.installPrefetchDiagnostics({ id: 'viewerContainer', ownerDocument: document },
+            () => { throw new Error('A closed lab must not sample'); }, {
+                toolbar: { append(button: any) { toolbar.push(button); }, insertBefore(button: any, before: any) { toolbar.splice(toolbar.indexOf(before), 0, button); } },
+                toolbarBefore: launcher,
+                measurementsMenu: { append(button: any) { menu.push(button); } },
+                robots: { enabled: true, setEnabled() {} },
+            });
+        assert.deepStrictEqual(toolbar.map(button => button.id), ['pdf-prefetch-toggle', 'secondaryToolbarToggle']);
+        assert.deepStrictEqual(menu.map(button => button.id), ['pdf-prefetch-measurements']);
+        assert.ok(menu[0].innerHTML.includes('LARICS Motion Lab'), 'the menu item has a readable label');
+        assert.strictEqual(menu[0].attributes.get('aria-expanded'), 'false');
+        controls.dispose();
+    });
+
+    it('supports an explicit diagnostics opt-out and removes its handlers on disposal', () => {
         const listeners = new Map<string, (event: unknown) => void>();
         let timers = 0;
         let elements = 0;
@@ -230,9 +329,10 @@ describe('PDF prefetch performance measurements', function () {
                 listeners.delete(name);
             },
         };
-        const diagnostics = performanceModule.installPrefetchDiagnostics({ ownerDocument: document }, () => { samples++; });
+        const diagnostics = performanceModule.installPrefetchDiagnostics({ ownerDocument: document }, () => { samples++; }, { enabled: false });
         assert.strictEqual(listeners.size, 2);
-        listeners.get('keydown')!({ key: 'r', code: 'KeyR', ctrlKey: true, altKey: true, shiftKey: false });
+        listeners.get('keydown')!({ key: 'r', code: 'KeyR', ctrlKey: true, altKey: true, shiftKey: true });
+        assert.strictEqual(diagnostics.enabled, false);
         assert.strictEqual(timers, 0);
         assert.strictEqual(elements, 0);
         assert.strictEqual(samples, 0);

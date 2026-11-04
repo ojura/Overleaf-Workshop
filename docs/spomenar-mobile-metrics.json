@@ -1,0 +1,291 @@
+{
+  "date": "2026-11-04",
+  "device": {
+    "productType": "iPhone17,1",
+    "iosVersion": "27.2",
+    "safariVersion": "27.2",
+    "pymobiledevice3Version": "11.20.2",
+    "viewportCssPixels": {
+      "width": 402,
+      "height": 654
+    },
+    "devicePixelRatio": 3
+  },
+  "document": {
+    "pages": 459,
+    "bytes": 1608644855
+  },
+  "units": {
+    "MB": 1000000,
+    "MiB": 1048576
+  },
+  "method": {
+    "fromPage": 60,
+    "furthestPage": 90,
+    "returnPage": 65,
+    "forwardDurationMs": 3000,
+    "reverseDurationMs": 2500,
+    "passes": 2,
+    "movingSampleIntervalMs": 200,
+    "gapDefinition": "At least one visible page lacks both a finished native canvas and a cached preview.",
+    "forcedGcDuringComparisons": false,
+    "nativeMemorySampleIntervalMs": 500
+  },
+  "baseline": {
+    "description": "Graduated preview cache before adaptive JPEG decoding; old stage presentation.",
+    "passes": [
+      {
+        "pass": 1,
+        "movingSamples": 28,
+        "missingSamples": 20,
+        "fetches": 121,
+        "fetchBytes": 44040192,
+        "recovery": {
+          "settled": true,
+          "visibleReadyMs": 0,
+          "settledMs": 307
+        },
+        "maxPendingFetches": 15
+      },
+      {
+        "pass": 2,
+        "movingSamples": 28,
+        "missingSamples": 17,
+        "fetches": 78,
+        "fetchBytes": 27918336,
+        "recovery": {
+          "settled": true,
+          "visibleReadyMs": 0,
+          "settledMs": 307
+        },
+        "maxPendingFetches": 9
+      }
+    ],
+    "peakNativeMemory": {
+      "totalBytes": 730389035,
+      "categories": {
+        "javascript": 445196843,
+        "jit": 13500416,
+        "images": 0,
+        "layers": 0,
+        "page": 243970048,
+        "other": 27721728
+      }
+    },
+    "peakDecodedBytes": 197485056,
+    "rawPeakBytes": 44562679,
+    "naturalIdleMemory": {
+      "totalBytes": 308964352,
+      "categories": {
+        "javascript": 92337607,
+        "jit": 13910016,
+        "images": 0,
+        "layers": 0,
+        "page": 174028345,
+        "other": 28688384
+      }
+    },
+    "oldVisibleStageCpuMeanPercent": 16.72777721616957,
+    "oldStageRendererScheduled": true
+  },
+  "adaptive": {
+    "description": "Display-size JPEG decoding, one active image job, document effects enabled and optional lab closed.",
+    "passes": [
+      {
+        "pass": 1,
+        "movingSamples": 28,
+        "missingSamples": 14,
+        "fetches": 258,
+        "fetchBytes": 118487287,
+        "recovery": {
+          "settled": true,
+          "visibleReadyMs": 0,
+          "settledMs": 304
+        },
+        "maxPendingFetches": 23
+      },
+      {
+        "pass": 2,
+        "movingSamples": 28,
+        "missingSamples": 11,
+        "fetches": 216,
+        "fetchBytes": 103938295,
+        "recovery": {
+          "settled": true,
+          "visibleReadyMs": 0,
+          "settledMs": 303
+        },
+        "maxPendingFetches": 19
+      }
+    ],
+    "peakNativeMemory": {
+      "totalBytes": 560226304,
+      "categories": {
+        "javascript": 132028100,
+        "jit": 11354112,
+        "images": 0,
+        "layers": 0,
+        "page": 382372156,
+        "other": 34471936
+      }
+    },
+    "immediateFinalNativeMemory": {
+      "totalBytes": 485667840,
+      "categories": {
+        "javascript": 56637068,
+        "jit": 11517952,
+        "images": 0,
+        "layers": 0,
+        "page": 383171956,
+        "other": 34340864
+      }
+    },
+    "peakDecodedBytes": 2731008,
+    "rawFinal": {
+      "length": 1608644855,
+      "residentBytes": 33552631,
+      "residentChunks": 256,
+      "totalChunks": 12273,
+      "evictedBytes": 196342254,
+      "maxBytes": 33554432,
+      "peakBytes": 71956727,
+      "activeOperations": 0,
+      "pendingRequests": 0,
+      "imageDecodeConcurrency": 1,
+      "imageDecodeActive": 0,
+      "imageDecodeQueued": 0,
+      "imageDecodePeakActive": 1,
+      "imageDecodeCompletedNative": 304,
+      "imageDecodeCompletedFallback": 2,
+      "imageDecodeOriginalPixels": 808694954,
+      "imageDecodeOutputPixels": 33136036
+    },
+    "maxDecodeQueued": 13,
+    "naturalIdle": {
+      "unobservedGapSeconds": 86.27457328003645,
+      "durationSeconds": 20,
+      "samples": 40,
+      "firstMemory": {
+        "totalBytes": 256013312,
+        "categories": {
+          "javascript": 52148719,
+          "jit": 11517952,
+          "images": 0,
+          "layers": 0,
+          "page": 158398993,
+          "other": 33947648
+        }
+      },
+      "lastMemory": {
+        "totalBytes": 257733632,
+        "categories": {
+          "javascript": 53717026,
+          "jit": 11550720,
+          "images": 0,
+          "layers": 0,
+          "page": 158469086,
+          "other": 33996800
+        }
+      },
+      "meanCpuPercent": 0.22894737889107905,
+      "maxCpuPercent": 1.9000002145767212,
+      "eventCounts": [
+        727
+      ],
+      "fetchCounts": [
+        504
+      ],
+      "documentRobotFrames": [
+        14
+      ],
+      "maxActiveActors": 0,
+      "maxRetainedRobotBytes": 0,
+      "scheduled": [
+        false
+      ],
+      "decodedBytes": 0,
+      "rangeRequests": 0
+    },
+    "network": {
+      "count": 487,
+      "statuses": {
+        "206": 487
+      },
+      "failed": 0
+    },
+    "memoryPressureEvents": 0,
+    "scriptErrors": []
+  },
+  "policy": {
+    "name": "mobile",
+    "limits": {
+      "gestureGapMs": 250,
+      "maxPreparedPages": 6,
+      "maxConcurrentPrepares": 2,
+      "maxPendingFetches": 6,
+      "slowPendingFetches": 3,
+      "fetchBackpressureMs": 1500,
+      "maxRenderedPages": 3,
+      "maxCanvasBytes": 50331648,
+      "previewMaxDimension": 512,
+      "trailPreviewMaxDimension": 192,
+      "maxPreviewBytes": 8388608,
+      "maxPreviewPages": 128
+    },
+    "rawCacheBytes": 33554432
+  },
+  "ui": {
+    "headerTargets": [
+      {
+        "id": "spomenarShare",
+        "x": 206,
+        "y": 6.5,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "id": "spomenarDownload",
+        "x": 254,
+        "y": 6.5,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "id": "pdf-prefetch-toggle",
+        "x": 302,
+        "y": 6.5,
+        "width": 44,
+        "height": 44
+      },
+      {
+        "id": "pdf-prefetch-measurements",
+        "x": 350,
+        "y": 6.5,
+        "width": 44,
+        "height": 44
+      }
+    ],
+    "labPanel": {
+      "x": 54,
+      "y": 445,
+      "width": 340,
+      "height": 201
+    },
+    "labStage": {
+      "x": 64,
+      "y": 503,
+      "width": 320,
+      "height": 86
+    },
+    "documentClosedLabActors": 4,
+    "documentClosedLabRetainedBytes": 312320,
+    "documentFromLabActors": 4,
+    "completedFragmentsAfterCaptures": 8,
+    "borrowedActorsRemainingOutside": 0,
+    "finalDocumentActors": 0,
+    "finalDocumentRetainedBytes": 0
+  },
+  "physicalGestures": {
+    "status": "Awaiting the invited user gesture pass"
+  }
+}

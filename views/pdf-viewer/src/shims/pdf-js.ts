@@ -4,6 +4,7 @@
 // build/pdf.mjs that the page loads first), the worker is the page's (common/worker.ts), and the
 // URLs are the webview's (common/config.ts).
 import { config } from '../common/config';
+import { pdfDocumentCacheOptions } from '../common/scroll-prefetch';
 
 /** The page's pdf.js; read when used, since the page loads it as a module. */
 export const PDFJS: any = new Proxy({}, {
@@ -23,6 +24,7 @@ export const documentParams = (): Record<string, unknown> => ({
     useWorkerFetch: false,
     disableAutoFetch: true, // only fetch the data needed for the displayed pages
     disableStream: true,
+    ...pdfDocumentCacheOptions(),
     isEvalSupported: false,
     enableXfa: false,
 });

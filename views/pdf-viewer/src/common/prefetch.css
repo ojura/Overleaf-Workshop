@@ -3,3 +3,24 @@
 .page:has(> .pdfPrefetchPreview) > .canvasWrapper {
     visibility: hidden;
 }
+
+/* The same control is mounted in both extension toolbars and the standalone header. */
+.pdf-prefetch-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    min-width: 28px;
+    min-height: 28px;
+    padding: 3px;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+}
+.pdf-prefetch-toggle::before { content: none !important; }
+.pdf-prefetch-toggle .robot-icon { width: 20px; height: 20px; pointer-events: none; }
+.pdf-prefetch-toggle[aria-pressed="true"], .pdf-prefetch-toggle[aria-expanded="true"] { background: #39bca233; box-shadow: inset 0 -2px 0 var(--pdf-prefetch-accent, #2f9b84); }
+.pdf-prefetch-toggle:hover { background: #88a4bb33; }
+.pdf-prefetch-toggle:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }

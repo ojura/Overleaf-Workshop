@@ -1,0 +1,30 @@
+<a class="spomenarSkip" href="#viewerContainer">Preskoči na knjigu</a>
+<header id="spomenarHeader">
+  <a id="spomenarSource" class="spomenarBrand" target="_blank" rel="noopener">
+    <span class="spomenarBrandText"><img class="spomenarMark" src="assets/larics-logo.svg" alt="LARICS" width="110" height="24"><h1 id="spomenarTitle">Učitavam knjigu</h1></span>
+  </a>
+  <div id="spomenarActions" role="group" aria-label="Knjiga i prikaz">
+    <button id="spomenarShare" class="spomenarAction" type="button" aria-label="Podijeli poveznicu na ovu stranicu" title="Podijeli ovu stranicu" disabled>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 15l6-6m-8 4-2 2a4 4 0 0 0 6 6l3-3m-1-11 2-2a4 4 0 1 1 6 6l-3 3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      <span>Podijeli</span>
+    </button>
+    <a id="spomenarDownload" class="spomenarAction" download aria-label="Preuzmi cijeli PDF" title="Preuzmi cijeli PDF">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M4 16v5h16v-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>PDF</span>
+    </a>
+  </div>
+</header>
+<div id="spomenarNotice" role="status" aria-live="polite">
+  <span id="spomenarNoticeText">Učitavam spomenar…</span>
+  <button id="spomenarRetry" type="button" hidden>Pokušaj ponovno</button>
+</div>
+<dialog id="spomenarShareDialog" aria-labelledby="spomenarShareTitle">
+  <form method="dialog"><button class="spomenarDialogClose" aria-label="Zatvori" type="submit">×</button></form>
+  <h2 id="spomenarShareTitle">Poveznica na ovu stranicu</h2>
+  <p>Otvara knjigu na istom mjestu i pri istom uvećanju.</p>
+  <label for="spomenarShareUrl">Poveznica</label>
+  <input id="spomenarShareUrl" type="url" readonly>
+  <button id="spomenarCopy" type="button">Kopiraj poveznicu</button>
+  <span id="spomenarCopyStatus" role="status" aria-live="polite"></span>
+</dialog>
+<noscript><p class="spomenarNoScript">Za čitanje knjige uključite JavaScript. <a href="book.pdf" download>Preuzmite PDF.</a></p></noscript>

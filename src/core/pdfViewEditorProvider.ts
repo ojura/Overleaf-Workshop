@@ -8,6 +8,7 @@ import { GlobalStateManager } from '../utils/globalStateManager';
 import { parseUri } from './remoteFileSystemProvider';
 import type { VirtualFileSystem } from './remoteFileSystemProvider';
 import { outputsOf, PdfFetchBridge, PieceCache } from './pdfFetchBridge';
+import { PDF_DISK_POLICY } from './pdfDiskCache';
 import { completeViewerPage, isBuildPath } from './pdfViewerPages';
 import { DEFAULT_PDF_VIEWER_ENGINE, HostMessage, isPdfViewerEngine, pdfjsReleaseOf, PdfOutput, PdfViewerEngine, ViewerMessage } from './viewerProtocol';
 import { errorMessage } from '../utils/errorMessage';
@@ -116,7 +117,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
     private readonly _onDidChangeCustomDocument = new vscode.EventEmitter<vscode.CustomDocumentEditEvent<PdfDocument>>();
     readonly onDidChangeCustomDocument = this._onDidChangeCustomDocument.event;
 
-    /** the pieces of compiled PDFs kept between builds and sessions (src/core/pdfFetchBridge.ts) */
+    /** One disk budget for all builds' incremental ranges and reusable content pieces. */
     private readonly pieces: PieceCache;
     /** the open viewers, which a change of overleaf-workshop.pdfViewer.engine reloads */
     private readonly editors = new Set<{ doc: PdfDocument, panel: vscode.WebviewPanel, render: () => Promise<void> }>();
@@ -126,8 +127,8 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
     constructor(private readonly context:vscode.ExtensionContext) {
         this.context = context;
         this.pdfjsRelease = pdfjsReleaseOf(context.extension.packageJSON);
-        const sizeMB = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer').get<number>('pieceCacheSizeMB', 1024);
-        this.pieces = new PieceCache(path.join(context.globalStorageUri.fsPath, 'pdf-pieces'), Math.max(0, sizeMB) * 1024 * 1024);
+        const sizeMB = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer').get<number>('pieceCacheSizeMB', PDF_DISK_POLICY.defaultMaxBytes / (1024 * 1024));
+        this.pieces = new PieceCache(path.join(context.globalStorageUri.fsPath, 'pdf-pieces'), Math.max(0, sizeMB) * 1024 * 1024, { fetchRange: PdfFetchBridge.fetchRange });
         // the folder where the PDF viewer of earlier versions (pdf.js 3.10.111's) downloaded the
         // builds it showed, one book-sized file per project
         void Promise.resolve(vscode.workspace.fs.delete(vscode.Uri.joinPath(context.globalStorageUri, 'legacy-viewer-builds'), { recursive: true, useTrash: false })).catch(() => {});
@@ -199,7 +200,12 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         }
 
         const post = (message: HostMessage) => webviewPanel.webview.postMessage(message);
+        let cacheIdle = false;
+        let cacheBuild = doc.output?.file.build;
         const updateWebview = () => {
+            if (cacheBuild !== doc.output?.file.build) { cacheIdle = false; cacheBuild = doc.output?.file.build; }
+            bridge.fetches.setOutput(doc.output);
+            bridge.fetches.setActivity(webviewPanel.visible, cacheIdle);
             if (doc.output) {
                 post({type:'load', output:doc.output});
             } else if (doc.cache.buffer.byteLength !== 0) {
@@ -218,19 +224,50 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         // its own, under the page's ID: the page numbers its requests from 1, so the requests of a
         // page that a new page replaced, as after a switch of the viewer, are stopped, and their
         // answers do not reach the new page.
-        const newBridge = () => ({
-            page: randomUUID(),
-            fetches: new PdfFetchBridge(
+        const newBridge = () => {
+            const fetches = new PdfFetchBridge(
                 (url) => doc.output!==undefined && outputsOf(doc.output.downloadDomain, doc.output.projectId)(url),
                 this.pieces,
-                { buildSize: () => doc.output?.file.size },
-            ),
-        });
+                { buildSize: () => doc.output?.file.size, output: doc.output },
+            );
+            fetches.setActivity(webviewPanel.visible, false);
+            return { page: randomUUID(), fetches };
+        };
         let bridge = newBridge();
 
         const listeners: Array<() => void> = [];
+        // Accumulation events are coalesced to at most one report a second, without polling.
+        let progressTimer: NodeJS.Timeout | undefined;
+        let progressInFlight = false;
+        let progressDirty = false;
+        let panelDisposed = false;
+        const reportCache = () => {
+            if (panelDisposed) { return; }
+            progressDirty = true;
+            if (progressTimer || progressInFlight) { return; }
+            progressTimer = setTimeout(() => {
+                progressTimer = undefined;
+                progressDirty = false;
+                const output = doc.output;
+                const asked = bridge;
+                if (!output || panelDisposed) { return; }
+                progressInFlight = true;
+                void this.pieces.snapshot(output).then(async snapshot => {
+                    if (panelDisposed || asked !== bridge || output !== doc.output) { return; }
+                    await post({ type: 'cacheProgress', page: asked.page, build: output.file.build,
+                        storedBytes: snapshot.covered, totalBytes: snapshot.total, diskBytes: snapshot.bytes,
+                        budgetBytes: snapshot.maxBytes, filling: snapshot.filling, complete: snapshot.complete });
+                }).catch(() => {}).finally(() => {
+                    progressInFlight = false;
+                    if (progressDirty) { reportCache(); }
+                });
+            }, 1000);
+            progressTimer.unref();
+        };
+        listeners.push(this.pieces.onChange(reportCache));
         const docOnDidChangeListener = doc.onDidChange(() => {
             updateWebview();
+            reportCache();
         });
         listeners.push(() => docOnDidChangeListener.dispose());
         if (builds) {
@@ -244,7 +281,8 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             doc,
             panel: webviewPanel,
             render: async () => {
-                bridge.fetches.abortAll();
+                bridge.fetches.dispose();
+                cacheIdle = false;
                 bridge = newBridge();
                 webviewPanel.webview.html = await this.getViewerPage(webviewPanel.webview, doc.engine, bridge.page);
             },
@@ -252,7 +290,10 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         this.editors.add(editor);
 
         webviewPanel.onDidDispose(() => {
-            bridge.fetches.abortAll();
+            panelDisposed = true;
+            progressDirty = false;
+            if (progressTimer) { clearTimeout(progressTimer); progressTimer = undefined; }
+            bridge.fetches.dispose();
             listeners.forEach(stop => stop());
             this.editors.delete(editor);
         });
@@ -276,6 +317,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                 void builds?.check();
             }
             wasVisible = e.webviewPanel.visible;
+            bridge.fetches.setActivity(wasVisible, cacheIdle);
         });
         webviewPanel.webview.onDidReceiveMessage((e: ViewerMessage) => {
             switch (e.type) {
@@ -302,6 +344,12 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                 }
                 case 'fetchAbort':
                     if (e.page === bridge.page) { bridge.fetches.abort(e.id); }
+                    break;
+                case 'cacheActivity':
+                    if (e.page === bridge.page && e.build === doc.output?.file.build) {
+                        cacheIdle = e.idle === true;
+                        bridge.fetches.setActivity(webviewPanel.visible, cacheIdle);
+                    }
                     break;
                 case 'recompile':
                     // the project of this build, whichever editor is active; only a build's viewer
@@ -339,6 +387,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     post({type:'initState', content:state, colorThemes, defaults});
                     updateWebview();
                     postStatus();
+                    reportCache();
                     break;
                 default:
                     break;
@@ -348,6 +397,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
 
     public get triggers(): vscode.Disposable[] {
         return [
+            { dispose: () => { void this.pieces.dispose(); } },
             vscode.workspace.onDidChangeConfiguration((e) => {
                 if (e.affectsConfiguration('overleaf-workshop.pdfViewer.engine')) {
                     this.applyEngine().catch((error) => console.error('overleaf-workshop: switching the PDF viewer:', error));
@@ -396,7 +446,8 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         const target = await vscode.window.showSaveDialog({ defaultUri: vscode.Uri.joinPath(folder, name), filters: { PDF: ['pdf'] } });
         if (!target) { return; }
         const vfs = doc.vfs;
-        const size = doc.output?.file.size;
+        const output = doc.output;
+        const size = output?.file.size;
         try {
             if (vfs && size && target.scheme === 'file') {
                 await vscode.window.withProgress({
@@ -406,12 +457,15 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     token.onCancellationRequested(() => abort.abort());
                     let reported = 0;
                     // a download from Overleaf's cache starts again from 0; it reports from where the first one got to
-                    await vfs.savePdf(target.fsPath, abort.signal, (received: number) => {
+                    const onProgress = (received: number) => {
                         if (received - reported >= size / 100 || received === size) {
                             progress.report({ increment: (received - reported) / size * 100 });
                             reported = received;
                         }
-                    });
+                    };
+                    if (!output || !await this.pieces.copyComplete(output, target.fsPath, abort.signal, onProgress)) {
+                        await vfs.savePdf(target.fsPath, abort.signal, onProgress);
+                    }
                 });
             } else {
                 const content = doc.output ? new Uint8Array(await vscode.workspace.fs.readFile(doc.uri)) : doc.cache;

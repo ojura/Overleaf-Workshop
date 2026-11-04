@@ -12,9 +12,62 @@ export const PREFETCH_LIMITS = Object.freeze({
     maxRenderedPages: 8,
     maxCanvasBytes: 192 * 1024 * 1024,
     previewMaxDimension: 768,
+    trailPreviewMaxDimension: 768,
     maxPreviewBytes: 64 * 1024 * 1024,
     maxPreviewPages: 128,
 });
+
+/** A small resident working set for phones; disk accumulation belongs to the extension host. */
+const MOBILE_PREFETCH_LIMITS = Object.freeze({
+    ...PREFETCH_LIMITS,
+    maxPreparedPages: 6,
+    maxConcurrentPrepares: 2,
+    maxPendingFetches: 6,
+    slowPendingFetches: 3,
+    maxRenderedPages: 3,
+    maxCanvasBytes: 48 * 1024 * 1024,
+    previewMaxDimension: 512,
+    trailPreviewMaxDimension: 192,
+    maxPreviewBytes: 8 * 1024 * 1024,
+    maxPreviewPages: 128,
+});
+
+export interface PdfCachePolicy {
+    readonly name: 'desktop' | 'mobile';
+    readonly limits: Readonly<{ [Key in keyof typeof PREFETCH_LIMITS]: number }>;
+    readonly rangeCacheBytes: number;
+    readonly pruneOffscreen: boolean;
+    readonly adaptiveImageDecoding: boolean;
+    readonly imageDecodeConcurrency: number;
+}
+
+export interface ReaderDevice {
+    userAgent?: string;
+    maxTouchPoints?: number;
+    userAgentData?: { mobile?: boolean };
+}
+
+const DESKTOP_POLICY: PdfCachePolicy = Object.freeze({
+    name: 'desktop', limits: PREFETCH_LIMITS, rangeCacheBytes: 128 * 1024 * 1024, pruneOffscreen: false,
+    adaptiveImageDecoding: false, imageDecodeConcurrency: 0,
+});
+const MOBILE_POLICY: PdfCachePolicy = Object.freeze({
+    name: 'mobile', limits: MOBILE_PREFETCH_LIMITS, rangeCacheBytes: 32 * 1024 * 1024, pruneOffscreen: true,
+    adaptiveImageDecoding: true, imageDecodeConcurrency: 1,
+});
+
+/** iPad's desktop UA still reports several touch points; a Windows touch laptop stays desktop. */
+export function pdfCachePolicy(device: ReaderDevice = typeof navigator === 'undefined' ? {} : navigator): PdfCachePolicy {
+    const agent = device.userAgent ?? '';
+    return device.userAgentData?.mobile || /Android|iPhone|iPad|iPod|Mobile/i.test(agent)
+        || /Macintosh/i.test(agent) && (device.maxTouchPoints ?? 0) > 1 ? MOBILE_POLICY : DESKTOP_POLICY;
+}
+
+/** Pass the same device policy to every PDF.js document-loading entry point. */
+export function pdfDocumentCacheOptions(device?: ReaderDevice) {
+    const { rangeCacheBytes, adaptiveImageDecoding, imageDecodeConcurrency } = pdfCachePolicy(device);
+    return { rangeCacheBytes, adaptiveImageDecoding, imageDecodeConcurrency };
+}
 
 export type ScrollDirection = -1 | 0 | 1;
 

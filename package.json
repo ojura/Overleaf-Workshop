@@ -587,7 +587,7 @@
         },
         "overleaf-workshop.pdfViewer.pieceCacheSizeMB": {
           "type": "number",
-          "default": 1024,
+          "default": 4096,
           "minimum": 0,
           "scope": "machine",
           "markdownDescription": "%configuration.pdfViewer.pieceCacheSizeMB.markdownDescription%"
@@ -896,6 +896,7 @@
     "update-l10n": "npx @vscode/l10n-dev export -o ./l10n ./src",
     "compile": "tsc -p ./ && npm run build-pdf-viewer && cd views/chat-view && npm run build",
     "build-pdf-viewer": "node scripts/build-pdf-viewer.mjs",
+    "build-spomenar": "node scripts/build-spomenar.mjs",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",

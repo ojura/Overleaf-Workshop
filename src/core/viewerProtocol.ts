@@ -192,7 +192,9 @@ export type HostMessage =
     | ({ type: 'buildState' } & BuildStatus)
     | { type: 'syncCode', content: SyncBox[] }
     | ({ type: 'fetchResponse', page: string } & BridgeResponse)
-    | { type: 'fetchError', page: string, id: number, message: string };
+    | { type: 'fetchError', page: string, id: number, message: string }
+    | { type: 'cacheProgress', page: string, build: string, storedBytes: number, totalBytes: number,
+        diskBytes: number, budgetBytes: number, filling: boolean, complete: boolean };
 
 /**
  * A page's messages to the host:
@@ -218,5 +220,7 @@ export type ViewerMessage =
     | { type: 'buildShown', build: string }
     | { type: 'download' }
     | { type: 'switchViewer', engine: PdfViewerEngine }
+    /** Whether this shown build is quiet enough for the host's paced disk accumulation. */
+    | { type: 'cacheActivity', page: string, build: string, idle: boolean }
     | ({ type: 'fetch', page: string } & BridgeRequest)
     | { type: 'fetchAbort', page: string, id: number };

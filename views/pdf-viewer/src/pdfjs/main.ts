@@ -37,6 +37,7 @@ const ScrollMode: Record<string, number> = { vertical: 0, horizontal: 1, wrapped
 const SpreadMode: Record<string, number> = { none: 0, odd: 1, even: 2 };
 
 const app = (): any => (window as any).PDFViewerApplication;
+let shownBuild: string | undefined;
 
 forwardKeysToVsCode();
 setOptionsWhenTheAppStarts();
@@ -281,7 +282,8 @@ async function load(source: { output?: PdfOutput, data?: ArrayBuffer }, job: Job
     isShown = true;
     // from here on a newer load waits for this one and then replaces it, rather than stopping it
     if (inFlight === job) { inFlight = undefined; }
-    documentShown(source.output?.file.build);
+    shownBuild = source.output?.file.build;
+    documentShown(shownBuild);
     findAllowed = false;
     rangeLoaded = source.output;
 
@@ -443,7 +445,13 @@ async function start() {
 
     await initialized;
     const a = app();
-    const prefetch = installPdfPrefetch(a.pdfViewer);
+    const prefetch = installPdfPrefetch(a.pdfViewer, {
+        diagnosticsToolbar: document.getElementById('toolbarViewerRight')!,
+        diagnosticsToolbarBefore: document.getElementById('secondaryToolbarToggle')!,
+        diagnosticsMenu: document.getElementById('secondaryToolbarButtonContainer')!,
+        onDiagnosticsOpen: () => a.secondaryToolbar.close(),
+        onIdleChange: idle => { if (shownBuild) { post({ type: 'cacheActivity', page: config.page, build: shownBuild, idle }); } },
+    });
     (window as any).pdfjsViewer.prefetch = prefetch;
     (window as any).pdfPrefetch = prefetch;
     // pdf.js's pages have a transparent 9 px border. PDFJSWrapper's currentPosition measures from

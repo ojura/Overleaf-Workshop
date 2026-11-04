@@ -65,6 +65,43 @@ class Canvas extends Element {
     getContext(kind: string) { assert.strictEqual(kind, '2d'); return this.context; }
 }
 
+interface RobotDelivery {
+    pageNumber: number;
+    pageElement: Element;
+    canvas: Canvas;
+    kind: 'preview' | 'page';
+}
+
+class DocumentRobots {
+    enabled = true;
+    readonly deliveries: RobotDelivery[] = [];
+    readonly visibleCalls: number[][] = [];
+    readonly enabledCalls: boolean[] = [];
+    readonly active = new Set<number>();
+    resetCalls = 0;
+    disposeCalls = 0;
+    setEnabled(value: boolean) {
+        this.enabled = value;
+        this.enabledCalls.push(value);
+        if (!value) { this.active.clear(); }
+    }
+    setVisiblePages(ids: readonly number[]) {
+        this.visibleCalls.push([...ids]);
+        for (const id of this.active) { if (!ids.includes(id)) { this.active.delete(id); } }
+    }
+    deliver(value: RobotDelivery) {
+        // Deliberately do not deduplicate: the controller must emit one real delivery,
+        // rather than relying on the animation module to reject repeated callbacks.
+        this.deliveries.push(value);
+        this.active.add(value.pageNumber);
+        return true;
+    }
+    reset() { this.resetCalls++; this.active.clear(); }
+    snapshot() { return { enabled: this.enabled, activeEpisodes: this.active.size }; }
+    setDispatchOrigin() {}
+    dispose() { this.disposeCalls++; this.enabled = false; this.active.clear(); }
+}
+
 class Deferred<T> {
     readonly promise: Promise<T>;
     settled = false;
@@ -121,8 +158,10 @@ class RenderTask {
 class PdfPage {
     cleanupCalls = 0;
     readonly _intentStates = new Map<string, object>();
+    readonly objs = new Map<string, any>();
     private cleanupPending = false;
     constructor(readonly document: PdfDocument, readonly pageNumber: number) {}
+    get commonObjs() { return this.document.commonObjs; }
     getViewport({ scale, rotation }: { scale: number, rotation: number }) {
         return { width: this.document.width * scale, height: this.document.height * scale, scale, rotation };
     }
@@ -139,6 +178,7 @@ class PdfPage {
     private tryCleanup() {
         if (!this.cleanupPending || this.document.activeRenders.some(render => render.page === this)) { return false; }
         this._intentStates.clear();
+        this.objs.clear();
         this.cleanupPending = false;
         return true;
     }
@@ -148,6 +188,7 @@ class PdfDocument {
     readonly requests: Array<{ id: number, result: Deferred<PdfPage> }> = [];
     readonly renders: Array<{ id: number, page: PdfPage, task: RenderTask, parameters: any }> = [];
     readonly pages = new Map<number, PdfPage>();
+    readonly commonObjs = new Map<string, any>();
     maxActive = 0;
     constructor(readonly width = 800, readonly height = 1000, readonly autoPages = true) {}
     page(id: number) {
@@ -193,17 +234,19 @@ class PageView {
     destroy() { this.destroyCalls++; this.reset(); this.pdfPage?.cleanup(); }
 }
 
-interface FixtureOptions { startPage?: number, pages?: number, width?: number, height?: number, autoPages?: boolean }
+interface FixtureOptions { startPage?: number, pages?: number, width?: number, height?: number, autoPages?: boolean, mobile?: boolean }
 
 class Fixture {
-    readonly owner = Object.assign(new Events(), { visibilityState: 'visible', defaultView: { devicePixelRatio: 1 } });
+    readonly owner = Object.assign(new Events(), { visibilityState: 'visible', defaultView: { devicePixelRatio: 1, navigator: { userAgent: 'desktop test reader', maxTouchPoints: 0 } } });
     readonly container = new Element();
     readonly eventBus = new Events();
     readonly callbacks = new Map<number, (timestamp: number) => void>();
     readonly canvases: Canvas[] = [];
+    createCanvas = () => new Canvas();
     readonly cached = new Set<PageView>();
     readonly nativeRenders: any[] = [];
     readonly nativeFencePages: number[][] = [];
+    readonly idleChanges: boolean[] = [];
     pages: PageView[];
     visibleIds?: number[];
     pdf: PdfDocument;
@@ -218,6 +261,7 @@ class Fixture {
     controller: any;
 
     constructor(options: FixtureOptions = {}) {
+        if (options.mobile) { this.owner.defaultView.navigator = { userAgent: 'iPhone', maxTouchPoints: 5 }; }
         const count = options.pages ?? 100;
         const width = options.width ?? 800;
         const height = options.height ?? 1000;
@@ -263,8 +307,10 @@ class Fixture {
         this.cachePage(this.visible().first.id);
     }
 
-    install(module: any) {
+    install(module: any, overrides: Record<string, unknown> = {}) {
         this.controller = module.installPdfPrefetch(this.viewer, {
+            robotsEnabled: false,
+            onIdleChange: (idle: boolean) => this.idleChanges.push(idle),
             now: () => this.time,
             requestFrame: (callback: (timestamp: number) => void) => {
                 const id = this.nextFrame++;
@@ -273,11 +319,12 @@ class Fixture {
             },
             cancelFrame: (id: number) => this.callbacks.delete(id),
             createCanvas: () => {
-                const canvas = new Canvas();
+                const canvas = this.createCanvas();
                 canvas.ownerDocument = this.owner;
                 this.canvases.push(canvas);
                 return canvas;
             },
+            ...overrides,
         });
     }
 
@@ -372,7 +419,19 @@ describe('the PDF viewers\' shared prefetch controller', function () {
             setup(build: any) {
                 build.onResolve({ filter: /^\.\/prefetch-performance$/ }, () => ({ path: 'diagnostics', namespace: 'prefetch-test' }));
                 build.onLoad({ filter: /.*/, namespace: 'prefetch-test' }, () => ({
-                    contents: 'export const pdfPerformance = globalThis.__pdfPrefetchTestPerformance; export function installPrefetchDiagnostics() { return { toggle() {}, dispose() {} }; }',
+                    contents: `export const pdfPerformance = globalThis.__pdfPrefetchTestPerformance;
+                        export function installPrefetchDiagnostics(container, sample, options = {}) {
+                            let enabled = options.enabled === true;
+                            return {
+                                get enabled() { return enabled; },
+                                toggle() { enabled = !enabled; },
+                                setEnabled(value) { enabled = value; },
+                                setRobotsEnabled(value) { options.robots?.setEnabled(value); },
+                                get robotsEnabled() { return options.robots?.enabled ?? false; },
+                                labSnapshot() { return undefined; },
+                                dispose() {},
+                            };
+                        }`,
                     loader: 'js',
                 }));
             },
@@ -412,13 +471,166 @@ describe('the PDF viewers\' shared prefetch controller', function () {
 
     after(() => { if (directory) { fs.rmSync(directory, { recursive: true, force: true }); } });
 
-    function fixture(options: FixtureOptions = {}) {
+    function fixture(options: FixtureOptions = {}, installOverrides: Record<string, unknown> = {}) {
         const result = new Fixture(options);
         fixtures.push(result);
         fetches.now = () => result.time;
-        result.install(module);
+        result.install(module, installOverrides);
         return result;
     }
+
+    function robotFixture(enabled = true) {
+        const robots = new DocumentRobots();
+        const factories: Element[] = [];
+        const f = fixture({}, {
+            robotsEnabled: enabled,
+            createDocumentRobots: (container: Element) => { factories.push(container); return robots; },
+        });
+        return { f, robots, factories };
+    }
+
+    async function visibleRobotPreview() {
+        const state = robotFixture();
+        const { f } = state;
+        await f.frame();
+        const render = f.pdf.activeRenders.find(candidate => candidate.id === 21)!;
+        assert.ok(render, 'the real controller starts the next page preparation');
+        f.scrollBy(1000);
+        await f.frame();
+        assert.ok(f.controller.snapshot().visibleMissing.includes(21));
+        render.task.finish();
+        await promisesSettled();
+        await f.frame();
+        return { ...state, render };
+    }
+
+    it('delivers the real retained visible preview to document robots once, including after native completion', async () => {
+        const { f, robots, factories, render } = await visibleRobotPreview();
+        assert.strictEqual(robots.deliveries.length, 1, 'the newly covered visible page starts one delivery');
+        const delivery = robots.deliveries[0];
+        const canvas = render.parameters.canvasContext.canvas;
+        assert.deepStrictEqual(factories, [f.container], 'one lazy robot instance belongs to the PDF scroll container');
+        assert.strictEqual(delivery.pageNumber, 21);
+        assert.strictEqual(delivery.kind, 'preview');
+        assert.strictEqual(delivery.canvas, canvas, 'cargo comes from the actual completed preparation');
+        assert.strictEqual(delivery.pageElement, f.pages[20].div);
+        assert.strictEqual(canvas.parentNode, f.pages[20].div, 'the same retained pixels cover the visible page');
+        assert.ok(canvas.width > 0 && canvas.height > 0);
+        assert.ok(robots.visibleCalls.some(ids => ids.includes(21)));
+        f.finishNative(21);
+        await f.frame();
+        assert.strictEqual(robots.deliveries.length, 1, 'native replacement of a delivered preview does not replay the episode');
+    });
+
+    it('keeps document robots silent for already-covered pages and offscreen prefetch completions', async () => {
+        const { f, robots, factories } = robotFixture();
+        await f.frame();
+        assert.deepStrictEqual(factories, [f.container]);
+        assert.deepStrictEqual(robots.deliveries, [], 'the initially finished page is already covered');
+        const render = f.pdf.activeRenders.find(candidate => candidate.id === 21)!;
+        render.task.finish();
+        await promisesSettled();
+        await f.frame();
+        assert.deepStrictEqual(robots.deliveries, [], 'offscreen preparation does not create an animation');
+        f.scrollBy(1000);
+        await f.frame();
+        assert.strictEqual(render.parameters.canvasContext.canvas.parentNode, f.pages[20].div);
+        f.finishNative(21);
+        await f.frame();
+        assert.deepStrictEqual(robots.deliveries, [], 'returning to ready pixels is immediately covered without an episode');
+    });
+
+    it('delivers a newly finished visible native page to document robots when no preview covered it', async () => {
+        const { f, robots } = robotFixture();
+        await f.frame();
+        f.scrollBy(1000);
+        await f.frame();
+        assert.ok(f.controller.snapshot().visibleMissing.includes(21));
+        f.finishNative(21);
+        await f.frame();
+        assert.strictEqual(robots.deliveries.length, 1);
+        assert.strictEqual(robots.deliveries[0].kind, 'page');
+        assert.strictEqual(robots.deliveries[0].pageElement, f.pages[20].div);
+        assert.strictEqual(robots.deliveries[0].canvas, f.pages[20].canvas, 'native cargo uses the completed page canvas');
+        const render = f.pdf.activeRenders.find(candidate => candidate.id === 21)!;
+        render.task.finish();
+        await promisesSettled();
+        await f.frame();
+        assert.strictEqual(robots.deliveries.length, 1, 'a later auxiliary completion cannot replay native delivery');
+    });
+
+    it('resets document robots on replacement and rejects a stale preview before delivering the new document', async () => {
+        const { f, robots } = robotFixture();
+        await f.frame();
+        const stale = f.pdf.activeRenders.find(candidate => candidate.id === 21)!;
+        stale.task.completeAfterCancellation = true;
+        const oldElement = f.pages[20].div;
+        f.scrollBy(1000);
+        await f.frame();
+        const resets = robots.resetCalls;
+        f.replaceDocument();
+        await f.frame();
+        stale.task.finish();
+        await promisesSettled();
+        await f.frame();
+        assert.ok(robots.resetCalls > resets, 'replacement clears the previous document episode history');
+        assert.strictEqual(robots.deliveries.length, 0, 'the old document completion must never reach the robot module');
+        assert.strictEqual(stale.parameters.canvasContext.canvas.width, 0);
+        const fresh = f.pdf.activeRenders.find(candidate => candidate.id === 22)!;
+        assert.ok(fresh);
+        f.scrollBy(1000);
+        await f.frame();
+        fresh.task.finish();
+        await promisesSettled();
+        await f.frame();
+        assert.strictEqual(robots.deliveries.length, 1);
+        assert.strictEqual(robots.deliveries[0].pageNumber, 22);
+        assert.strictEqual(robots.deliveries[0].pageElement, f.pages[21].div);
+        assert.notStrictEqual(robots.deliveries[0].pageElement, oldElement);
+    });
+
+    for (const lifecycle of ['rotation', 'hide', 'dispose'] as const) {
+        it('cancels document robots immediately on ' + lifecycle, async () => {
+            const { f, robots } = await visibleRobotPreview();
+            assert.deepStrictEqual([...robots.active], [21]);
+            if (lifecycle === 'rotation') {
+                f.viewer.pagesRotation = 90;
+                f.eventBus.emit('rotationchanging');
+            } else if (lifecycle === 'hide') {
+                f.owner.visibilityState = 'hidden';
+                f.owner.emit('visibilitychange');
+            } else { f.dispose(); }
+            assert.strictEqual(robots.active.size, 0, 'old geometry and hidden/disposed effects cannot remain active');
+            if (lifecycle === 'dispose') {
+                assert.strictEqual(robots.disposeCalls, 1);
+                f.dispose();
+                assert.strictEqual(robots.disposeCalls, 1, 'disposal stays idempotent');
+            } else {
+                assert.deepStrictEqual(robots.visibleCalls[robots.visibleCalls.length - 1], [], 'the controller clears effect visibility before another frame');
+            }
+        });
+    }
+
+    it('enables document robots lazily and independently of the closed Motion Lab', async () => {
+        const { f, robots, factories } = robotFixture(false);
+        await f.frame();
+        assert.deepStrictEqual(factories, [], 'disabled effects do not create robot DOM');
+        assert.strictEqual(f.controller.diagnosticsEnabled, false);
+        f.controller.setRobotsEnabled(true);
+        assert.deepStrictEqual(factories, [f.container]);
+        assert.strictEqual(f.controller.robotsEnabled, true);
+        assert.strictEqual(robots.enabled, true);
+        assert.strictEqual(f.controller.diagnosticsEnabled, false);
+        f.controller.setRobotsEnabled(false);
+        assert.strictEqual(f.controller.robotsEnabled, false);
+        assert.strictEqual(robots.enabled, false);
+        assert.strictEqual(f.controller.diagnosticsEnabled, false);
+        f.controller.setRobotsEnabled(true);
+        assert.strictEqual(factories.length, 1, 're-enabling reuses the same lifecycle-owned instance');
+        f.controller.setDiagnosticsEnabled(true);
+        f.controller.setRobotsEnabled(false);
+        assert.strictEqual(f.controller.diagnosticsEnabled, true, 'the robot toggle also leaves an open lab open');
+    });
 
     it('gives unfinished visible pages priority over every speculative render', async () => {
         const f = fixture();
@@ -433,6 +645,554 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         visible.renderingState = 3;
         const next = f.choose();
         assert.ok(next && f.controller.snapshot().renderAhead.includes(next.id));
+    });
+
+    it('prunes offscreen native canvases on mobile even below the byte limit', async () => {
+        const f = fixture({ mobile: true });
+        for (const id of [17, 18, 19, 21, 22, 23, 24]) { f.cachePage(id); }
+        await f.frame();
+        const state = f.controller.snapshot();
+        assert.strictEqual(state.cachePolicy, 'mobile');
+        assert.ok(state.prepared.length <= 6);
+        assert.ok(state.renderAhead.length + state.visible.length <= 3);
+        assert.ok(f.pdf.maxActive <= 2);
+        const keep = new Set([...state.visible, ...state.renderAhead]);
+        for (const view of f.cached) {
+            if (keep.has(view.id)) { continue; }
+            assert.strictEqual(view.canvas, null, 'offscreen canvas ' + view.id + ' is released without waiting for memory pressure');
+        }
+        assert.ok(f.pages[19].canvas, 'the visible page remains rendered');
+    });
+
+    it('settles mobile cached offscreen previews without an idle cleanup and preparation loop', async () => {
+        const f = fixture({ mobile: true, startPage: 65 });
+        f.container.clientHeight = 2000;
+        for (const id of [66, 67, 68]) { f.cachePage(id); }
+        for (let step = 0; step < 8; step++) {
+            await f.frame();
+            for (const render of [...f.pdf.activeRenders]) { render.task.finish(); }
+            await promisesSettled();
+        }
+        await f.frame();
+        const state = f.controller.snapshot();
+        assert.ok(state.prepared.includes(68) && !state.renderAhead.includes(68));
+        assert.strictEqual(f.pages[67].destroyCalls, 1, 'the old native page is pruned once');
+        assert.strictEqual(f.pdf.renders.filter(render => render.id === 68).length, 0, 'its retained raster needs no new decode');
+        assert.strictEqual(f.pdf.page(68)._intentStates.size, 0);
+        assert.deepStrictEqual(state.pending, []);
+        assert.strictEqual(f.callbacks.size, 0, 'finished raster preparation cannot sustain an idle animation loop');
+        assert.strictEqual(timers.size, 0);
+
+        // PDF.js's idle cleanup releases intent resources without clearing finished canvases.
+        for (const page of f.pdf.pages.values()) { page.cleanup(); }
+        const renders = f.pdf.renders.length;
+        for (let step = 0; step < 4; step++) {
+            f.eventBus.emit('updateviewarea');
+            await f.frame(30_000);
+        }
+        assert.strictEqual(f.pdf.renders.length, renders, 'idle cleanup does not restart finished native or raster-only pages');
+        assert.strictEqual(f.callbacks.size, 0);
+        assert.ok(f.pages[64].canvas && f.pages[65].canvas, 'visible canvases survive resource cleanup');
+    });
+
+    it('releases mobile far-preview resources and warms them only when native rendering needs the page', async () => {
+        const f = fixture({ mobile: true });
+        await f.frame();
+        const farId = f.controller.snapshot().prepared.find((id: number) => id !== 20 && !f.controller.snapshot().renderAhead.includes(id));
+        assert.ok(farId);
+        for (let step = 0; step < 6; step++) {
+            for (const render of [...f.pdf.activeRenders]) { render.task.finish(); }
+            await promisesSettled();
+            await f.frame();
+        }
+        const first = f.pdf.renders.find(render => render.id === farId)!;
+        assert.ok(first);
+        const raster: Canvas = first.parameters.canvasContext.canvas;
+        assert.ok(raster.width > 0);
+        assert.strictEqual(first.page._intentStates.size, 0, 'a completed far raster releases decoded images and its operator list');
+        assert.strictEqual(f.pdf.renders.filter(render => render.id === farId).length, 1);
+        assert.strictEqual(f.callbacks.size, 0);
+        f.scrollBy((farId - 20) * 1000);
+        await f.frame();
+        assert.strictEqual(raster.parentNode, f.pages[farId - 1].div, 'the retained raster immediately covers the returning page');
+        assert.strictEqual(f.pdf.renders.filter(render => render.id === farId).length, 2, 'a native target receives exactly one new completion fence');
+    });
+
+    it('keeps a finished native canvas after its display resources were cleaned', async () => {
+        for (const mobile of [false, true]) {
+            const f = fixture({ mobile, pages: 1, startPage: 1 });
+            await f.frame();
+            const canvas = f.pages[0].canvas;
+            f.pdf.page(1).cleanup();
+            f.eventBus.emit('updateviewarea');
+            await f.frame(30_000);
+            assert.strictEqual(f.pdf.renders.length, 0, 'finished pixels do not require another preview render');
+            assert.strictEqual(f.pages[0].canvas, canvas);
+            assert.strictEqual(f.callbacks.size, 0);
+        }
+    });
+
+    for (const nativeFirst of [true, false]) {
+        it('releases finished mobile native resources after ' + (nativeFirst ? 'its auxiliary render finishes' : 'native rendering follows auxiliary completion'), async () => {
+            const f = fixture({ mobile: true });
+            await f.frame();
+            const preparation = f.pdf.activeRenders.find(render => render.id === 21)!;
+            const view = f.pages[20];
+            view.pdfPage = preparation.page;
+            view.renderingState = 1;
+            preparation.page.objs.set('photo', { width: 100, height: 100, data: new Uint8Array(40_000) });
+            if (nativeFirst) {
+                f.finishNative(view.id);
+                assert.ok(preparation.page._intentStates.size > 0, 'the auxiliary render still needs the shared resources');
+                assert.ok(preparation.page.objs.size > 0);
+                preparation.task.finish();
+                await promisesSettled();
+            } else {
+                preparation.task.finish();
+                await promisesSettled();
+                assert.ok(preparation.page._intentStates.size > 0, 'the unfinished native canvas still needs the prepared resources');
+                assert.ok(preparation.page.objs.size > 0);
+                f.finishNative(view.id);
+            }
+            const canvas = view.canvas;
+            assert.strictEqual(preparation.page._intentStates.size, 0, 'finished pixels no longer retain original photo bitmaps');
+            assert.strictEqual(preparation.page.objs.size, 0);
+            await f.frame();
+            assert.strictEqual(view.canvas, canvas);
+            assert.strictEqual(f.pdf.renders.filter(render => render.id === view.id).length, 1, 'the completed canvas stays ready without another decode');
+
+            f.scrollBy(1000);
+            view.renderingState = 0;
+            f.eventBus.emit('scalechanging');
+            await promisesSettled();
+            await f.frame();
+            assert.ok(view.div.children.some(child => child.className === 'pdfPrefetchPreview'), 'zoom keeps raster coverage while resources return');
+            assert.strictEqual(f.pdf.renders.filter(render => render.id === view.id).length, 2, 'a later native redraw prepares fresh resources');
+        });
+    }
+
+    it('defers finished mobile page cleanup while another PDF.js render still uses its resources', async () => {
+        const f = fixture({ mobile: true, startPage: 1, pages: 1 });
+        await f.frame();
+        const page = f.pdf.page(1);
+        const canvas = f.pages[0].canvas;
+        const otherRender = page.render({ viewport: page.getViewport({ scale: 1, rotation: 0 }) });
+        page.objs.set('photo', { width: 100, height: 100, data: new Uint8Array(40_000) });
+        const cleanups = page.cleanupCalls;
+        f.eventBus.emit('pagerendered', { pageNumber: 1, error: null, cssTransform: false });
+        assert.ok(page.cleanupCalls > cleanups, 'the completed native page requests safe deferred cleanup');
+        assert.ok(page.objs.size > 0, 'an additional active PDF.js render keeps its images until completion');
+        otherRender.finish();
+        await promisesSettled();
+        assert.strictEqual(page.objs.size, 0);
+        assert.strictEqual(page._intentStates.size, 0);
+        assert.strictEqual(f.pages[0].canvas, canvas);
+        await f.frame();
+        assert.strictEqual(f.pdf.renders.length, 1, 'finished native pixels do not restart preparation');
+    });
+
+    it('prepares mobile images for native pixel density and invalidates warm admission on larger zoom', async () => {
+        const f = fixture({ mobile: true });
+        f.owner.defaultView.devicePixelRatio = 2;
+        const view: any = f.pages[20];
+        view.viewport = { width: 800, height: 1000, scale: 1 };
+        await f.frame();
+        const first = f.pdf.activeRenders.find(render => render.id === 21)!;
+        assert.strictEqual(first.parameters.imageDecodeScale, 2, 'a small preview prepares the native display density');
+        assert.strictEqual(first.parameters.imageDecodeMaxDimension, 2000);
+        first.task.finish();
+        await promisesSettled();
+        view.viewport = { width: 1600, height: 2000, scale: 2 };
+        const transfers = Array.from({ length: 6 }, () => fetches.begin());
+        f.scrollBy(1000);
+        f.eventBus.emit('scalechanging');
+        await promisesSettled();
+        await f.frame();
+        assert.ok(first.page._intentStates.size > 0, 'old display resources still exist during the zoom transition');
+        assert.strictEqual(f.queue.renderView(view), false, 'the old lower-resolution intent cannot bypass cold-work pressure');
+        for (const transfer of transfers) { fetches.end(transfer); }
+        await f.frame();
+        const last = f.pdf.renders.filter(render => render.id === 21).at(-1)!;
+        assert.notStrictEqual(last, first);
+        assert.strictEqual(last.parameters.imageDecodeScale, 4);
+        assert.strictEqual(last.parameters.imageDecodeMaxDimension, 4000);
+    });
+
+    it('accounts decoded image allocations once, classifying shared storage before page storage', async () => {
+        const f = fixture({ pages: 1, startPage: 1 });
+        await f.frame();
+        const page = f.pdf.page(1);
+        const sharedBytes = new Uint8Array(64);
+        const bitmap = { width: 10, height: 20, close() {} };
+        const sharedImage = { width: 4, height: 4, data: sharedBytes };
+        f.pdf.commonObjs.set('font', { name: 'font without pixel storage' });
+        f.pdf.commonObjs.set('image', sharedImage);
+        f.pdf.commonObjs.set('bitmap', { width: 10, height: 20, bitmap });
+        page.objs.set('shared image alias', sharedImage);
+        page.objs.set('shared buffer view', { width: 2, height: 2, data: sharedBytes.subarray(0, 16) });
+        page.objs.set('shared bitmap alias', { width: 10, height: 20, bitmap });
+        page.objs.set('local image', { width: 3, height: 2, data: new Uint8Array(24) });
+        assert.deepStrictEqual(f.controller.snapshot().decodedImages, {
+            pageBytes: 24, sharedBytes: 864, dataBytes: 88, bitmapBytes: 800, images: 3, supported: true, truncated: false,
+        });
+        page.cleanup();
+        assert.strictEqual(f.controller.snapshot().decodedImages.pageBytes, 0, 'accounting observes cleanup without retaining image objects');
+    });
+
+    it('accounts an open VideoFrame through display dimensions and drops its bytes after close', async () => {
+        const f = fixture({ pages: 1, startPage: 1 });
+        await f.frame();
+        const bitmap = {
+            displayWidth: 40, displayHeight: 30,
+            close() { this.displayWidth = this.displayHeight = 0; },
+        };
+        f.pdf.page(1).objs.set('native JPEG frame', { width: 160, height: 120, bitmap });
+        assert.deepStrictEqual(f.controller.snapshot().decodedImages, {
+            pageBytes: 4800, sharedBytes: 0, dataBytes: 0, bitmapBytes: 4800, images: 1, supported: true, truncated: false,
+        }, 'the live frame owns its resized pixels, not the source image dimensions');
+        bitmap.close();
+        assert.deepStrictEqual(f.controller.snapshot().decodedImages, {
+            pageBytes: 0, sharedBytes: 0, dataBytes: 0, bitmapBytes: 0, images: 0, supported: true, truncated: false,
+        }, 'closing the frame releases its pixels even while the image descriptor remains in the store');
+    });
+
+    it('bounds decoded-image inspection and reports unavailable object-store iteration', async () => {
+        const f = fixture({ pages: 1, startPage: 1 });
+        await f.frame();
+        const page = f.pdf.page(1);
+        let visited = 0;
+        (page as any).objs = {
+            *[Symbol.iterator]() {
+                for (let id = 0; id < 10_000; id++) {
+                    visited++;
+                    yield [String(id), { width: 1, height: 1, data: new Uint8Array(4) }];
+                }
+            },
+        };
+        const bounded = f.controller.snapshot().decodedImages;
+        assert.strictEqual(bounded.supported, true);
+        assert.strictEqual(bounded.truncated, true);
+        assert.ok(visited <= 513, 'a diagnostics sample must not traverse unbounded object stores');
+        (page as any).objs = { get() {} };
+        assert.strictEqual(f.controller.snapshot().decodedImages.supported, false);
+    });
+
+    it('grants the host an idle lease only after visible work and pauses on motion, fetches, hiding and disposal', async () => {
+        const f = fixture({ pages: 1, startPage: 1 });
+        await f.frame();
+        assert.deepStrictEqual(f.idleChanges, [false, true]);
+        f.container.emit('wheel', { deltaY: 10, deltaX: 0, deltaMode: 0 });
+        assert.strictEqual(f.idleChanges.at(-1), false, 'input revokes the lease before another frame');
+        for (const timer of [...timers.values()]) { timer.callback(); }
+        await f.frame();
+        assert.strictEqual(f.idleChanges.at(-1), true);
+        const transfer = fetches.begin();
+        assert.strictEqual(f.idleChanges.at(-1), false, 'a foreground transfer revokes it synchronously');
+        fetches.end(transfer);
+        await f.frame();
+        assert.strictEqual(f.idleChanges.at(-1), true);
+        f.pages[0].renderingState = 1;
+        f.eventBus.emit('pagerender', { pageNumber: 1 });
+        await f.frame();
+        assert.strictEqual(f.idleChanges.at(-1), false);
+        f.finishNative(1);
+        await f.frame();
+        assert.strictEqual(f.idleChanges.at(-1), true);
+        f.owner.visibilityState = 'hidden';
+        f.owner.emit('visibilitychange');
+        assert.strictEqual(f.idleChanges.at(-1), false);
+        f.owner.visibilityState = 'visible';
+        f.owner.emit('visibilitychange');
+        await f.frame();
+        assert.strictEqual(f.idleChanges.at(-1), true);
+        f.dispose();
+        assert.strictEqual(f.idleChanges.at(-1), false);
+    });
+
+    it('samples byte-cache residency without duplicate RPCs or stale-document results', async () => {
+        const f = fixture({ pages: 1, startPage: 1 });
+        let calls = 0;
+        const old = new Deferred<Record<string, number>>();
+        (f.pdf as any).getRangeCacheStats = () => { calls++; return old.promise; };
+        f.controller.snapshot();
+        f.controller.snapshot();
+        await promisesSettled();
+        assert.strictEqual(calls, 1);
+        f.replaceDocument();
+        const current = { residentBytes: 1024, maxBytes: 4096, evictedBytes: 2048 };
+        (f.pdf as any).getRangeCacheStats = async () => current;
+        f.controller.snapshot();
+        await promisesSettled();
+        old.resolve({ residentBytes: 9999, maxBytes: 9999, evictedBytes: 0 });
+        await promisesSettled();
+        assert.deepStrictEqual(f.controller.snapshot().rangeCache, current, 'old document completion cannot replace current residency');
+    });
+
+    const mobileByteBudget = 32 * 1024 * 1024;
+    const byteStats = (residentBytes: number, activeOperations = 0, pendingRequests = 0) => ({
+        residentBytes, activeOperations, pendingRequests, maxBytes: mobileByteBudget,
+        length: 1_608_644_855, residentChunks: Math.ceil(residentBytes / 131072),
+        totalChunks: 12274, peakBytes: residentBytes, evictedBytes: 0,
+    });
+
+    function fireMemoryTimer() {
+        const entry = [...timers].find(([, timer]) => timer.delay === 250);
+        assert.ok(entry, 'active byte pressure has one coalesced wakeup');
+        timers.delete(entry[0]);
+        entry[1].callback();
+    }
+
+    it('drains overlapping cold jobs before admitting another page when mobile bytes exceed their budget', async () => {
+        const f = fixture({ mobile: true });
+        f.controller.setDiagnosticsEnabled(false);
+        const trims: Deferred<Record<string, number>>[] = [];
+        (f.pdf as any).getRangeCacheStats = async () => byteStats(mobileByteBudget);
+        (f.pdf as any).trimRangeCache = () => {
+            const trim = new Deferred<Record<string, number>>();
+            trims.push(trim);
+            return trim.promise;
+        };
+        await f.frame();
+        assert.strictEqual(f.pdf.activeRenders.length, 2);
+        const [first, second] = f.pdf.activeRenders;
+        first.task.finish();
+        await promisesSettled();
+        assert.strictEqual(trims.length, 1, 'completion checks worker bytes before freeing its cold slot');
+        assert.strictEqual(f.controller.snapshot().pending.length, 2);
+        await f.frame();
+        assert.strictEqual(f.pdf.requests.length, 2, 'a pending trim cannot be bypassed by the next frame');
+        trims[0].resolve(byteStats(mobileByteBudget + 131072, 1, 1));
+        await promisesSettled();
+        for (let step = 0; step < 3; step++) {
+            f.container.emit('wheel', { deltaY: 400, deltaX: 0, deltaMode: 0 });
+            await f.frame();
+        }
+        assert.strictEqual(f.controller.snapshot().memoryBackpressure, true);
+        assert.strictEqual(f.pdf.requests.length, 2, 'continuous motion cannot replenish a pressured worker');
+        assert.strictEqual(second.task.cancellationCalls, 0, 'admitted decoding drains normally');
+        second.task.finish();
+        await promisesSettled();
+        assert.strictEqual(trims.length, 2);
+        trims[1].resolve(byteStats(mobileByteBudget));
+        await promisesSettled();
+        assert.strictEqual(f.controller.snapshot().memoryBackpressure, false, 'exactly the target budget permits admission');
+        assert.strictEqual(f.callbacks.size, 1, 'trim and completion coalesce into one render wakeup');
+        await f.frame();
+        assert.ok(f.pdf.requests.length > 2);
+        assert.ok(f.pdf.maxActive <= 2);
+        assert.strictEqual(f.controller.diagnosticsEnabled, false, 'memory control does not require the Motion Lab');
+    });
+
+    it('polls only unsettled byte pressure and wakes once when detached worker activity drains without frames', async () => {
+        const f = fixture({ mobile: true, pages: 1, startPage: 1 });
+        f.controller.setDiagnosticsEnabled(false);
+        let stats = byteStats(mobileByteBudget + 131072, 1);
+        let calls = 0;
+        (f.pdf as any).getRangeCacheStats = async () => stats;
+        (f.pdf as any).trimRangeCache = async () => { calls++; return stats; };
+        await f.frame();
+        assert.strictEqual(f.callbacks.size, 0);
+        assert.strictEqual(timers.size, 1);
+        fireMemoryTimer();
+        await promisesSettled();
+        assert.strictEqual(calls, 1);
+        assert.strictEqual(timers.size, 1, 'one busy result creates one successor wakeup');
+        assert.strictEqual(f.callbacks.size, 0, 'still-busy sampling does not sustain animation frames');
+        stats = byteStats(mobileByteBudget, 0);
+        fireMemoryTimer();
+        await promisesSettled();
+        assert.strictEqual(calls, 2);
+        assert.strictEqual(timers.size, 0, 'quiescent bytes do not leave a periodic idle timer');
+        assert.strictEqual(f.callbacks.size, 1);
+        await f.frame();
+        await f.frame();
+        assert.strictEqual(calls, 2);
+        assert.strictEqual(f.callbacks.size, 0);
+        assert.strictEqual(timers.size, 0);
+        assert.strictEqual(f.idleChanges.at(-1), true);
+    });
+
+    it('keeps warm and running visible work available while byte pressure blocks cold pages', async () => {
+        const f = fixture({ mobile: true });
+        await f.frame();
+        const prepared = f.pdf.activeRenders.find(render => render.id === 21)!;
+        prepared.task.finish();
+        await promisesSettled();
+        (f.pdf as any).getRangeCacheStats = async () => byteStats(mobileByteBudget + 131072, 1);
+        (f.pdf as any).trimRangeCache = async () => byteStats(mobileByteBudget + 131072, 1);
+        f.controller.snapshot();
+        await promisesSettled();
+        f.scrollBy(1000);
+        await f.frame();
+        const visible = f.pages[20];
+        assert.strictEqual(f.choose(), visible, 'completed preview resources retain visible-first native priority');
+        assert.strictEqual(f.queue.renderView(visible), true);
+        for (const state of [1, 2]) {
+            visible.renderingState = state;
+            assert.strictEqual(f.choose(), visible);
+            assert.strictEqual(f.queue.renderView(visible), true);
+        }
+        f.finishNative(visible.id);
+        visible.renderingState = 0;
+        assert.strictEqual(f.choose(), null, 'finished native resources are released, so a later redraw needs cold admission');
+        assert.strictEqual(f.queue.renderView(visible), false);
+        assert.strictEqual(f.queue.renderView(f.pages[22]), false);
+    });
+
+    it('removes a scheduled memory check on hide and samples fresh bytes before resuming admission', async () => {
+        const f = fixture({ mobile: true, pages: 1, startPage: 1 });
+        const reply = new Deferred<Record<string, number>>();
+        let trims = 0;
+        (f.pdf as any).getRangeCacheStats = async () => byteStats(mobileByteBudget + 131072, 1);
+        (f.pdf as any).trimRangeCache = () => { trims++; return reply.promise; };
+        await f.frame();
+        assert.strictEqual(timers.size, 1);
+        f.owner.visibilityState = 'hidden';
+        f.owner.emit('visibilitychange');
+        assert.strictEqual(timers.size, 0, 'hiding removes the timer before it fires');
+        f.owner.visibilityState = 'visible';
+        f.owner.emit('visibilitychange');
+        await f.frame();
+        assert.strictEqual(trims, 1, 'showing initiates one fresh worker trim');
+        assert.strictEqual(f.controller.snapshot().memoryBackpressure, true);
+        reply.resolve(byteStats(mobileByteBudget));
+        await promisesSettled();
+        assert.strictEqual(f.callbacks.size, 1);
+        await f.frame();
+        assert.strictEqual(f.controller.snapshot().memoryBackpressure, false);
+        assert.strictEqual(timers.size, 0);
+    });
+
+    it('stops byte sampling when a native render is canceled without a pagerendered event', async () => {
+        const f = fixture({ mobile: true, pages: 1, startPage: 1 });
+        (f.pdf as any).getRangeCacheStats = async () => byteStats(1024);
+        (f.pdf as any).trimRangeCache = async () => byteStats(1024);
+        await f.frame();
+        f.pages[0].renderingState = 1;
+        f.eventBus.emit('pagerender', { pageNumber: 1 });
+        assert.strictEqual(timers.size, 1);
+        f.pages[0].reset();
+        fireMemoryTimer();
+        await promisesSettled();
+        assert.strictEqual(timers.size, 0, 'a stale render-start timestamp cannot sustain idle polling');
+    });
+
+    for (const lifecycle of ['hide', 'replace', 'dispose'] as const) {
+        it('cancels byte-pressure timers and ignores late trim replies on ' + lifecycle, async () => {
+            const f = fixture({ mobile: true, pages: 1, startPage: 1 });
+            const reply = new Deferred<Record<string, number>>();
+            (f.pdf as any).getRangeCacheStats = async () => byteStats(mobileByteBudget + 131072, 1);
+            (f.pdf as any).trimRangeCache = () => reply.promise;
+            await f.frame();
+            assert.strictEqual(timers.size, 1);
+            fireMemoryTimer();
+            await promisesSettled();
+            if (lifecycle === 'hide') {
+                f.owner.visibilityState = 'hidden';
+                f.owner.emit('visibilitychange');
+            } else if (lifecycle === 'replace') { f.replaceDocument(); }
+            else { f.dispose(); }
+            const callbacks = f.callbacks.size;
+            assert.strictEqual(timers.size, 0);
+            reply.resolve(byteStats(1024));
+            await promisesSettled();
+            assert.strictEqual(timers.size, 0);
+            assert.strictEqual(f.callbacks.size, callbacks, 'the retired RPC cannot wake or mutate the current view');
+            const state = f.controller.snapshot();
+            if (lifecycle === 'hide') { assert.strictEqual(state.rangeCache.residentBytes, mobileByteBudget + 131072); }
+            else { assert.strictEqual(state.rangeCache, undefined); }
+        });
+    }
+
+    it('keeps a graduated mobile preview trail below 8 MiB and 128 pages during a long traverse', async () => {
+        const f = fixture({ mobile: true, pages: 180, startPage: 1 });
+        await f.frame();
+        for (let id = 2; id <= 160; id++) { f.finishNative(id); }
+        const state = f.controller.snapshot();
+        assert.ok(state.previewBytes <= 8 * 1024 * 1024, 'mobile raster cache is bounded throughout traversal');
+        assert.ok(state.previewPages > 24 && state.previewPages <= 128, 'smaller trail rasters retain more history under the same byte cap');
+        assert.ok(f.canvases.filter(canvas => canvas.width > 0).every(canvas => Math.max(canvas.width, canvas.height) <= 512));
+        assert.ok(f.canvases.some(canvas => Math.max(canvas.width, canvas.height) === 192), 'old detached previews become small trail rasters');
+        const visible = f.pages[0];
+        visible.renderingState = 0;
+        await f.frame();
+        assert.ok(visible.div.children.some(canvas => canvas.className === 'pdfPrefetchPreview'), 'visible preview survives LRU eviction');
+    });
+
+    it('upgrades a small mobile trail raster from a finished native canvas without decoding again', async () => {
+        const f = fixture({ mobile: true, startPage: 1, pages: 80 });
+        await f.frame();
+        for (let id = 2; id <= 30; id++) { f.finishNative(id); }
+        f.scrollBy(14_000);
+        await f.frame();
+        const view = f.pages[14];
+        const trail = view.div.children.find(canvas => canvas.className === 'pdfPrefetchPreview') as Canvas;
+        assert.ok(trail && Math.max(trail.width, trail.height) === 192, 'the old page is immediately covered by its small raster');
+        const before = f.pdf.renders.filter(render => render.id === view.id).length;
+        f.finishNative(view.id);
+        const replacement = view.div.children.find(canvas => canvas.className === 'pdfPrefetchPreview') as Canvas;
+        assert.ok(replacement && replacement !== trail);
+        assert.strictEqual(Math.max(replacement.width, replacement.height), 512);
+        assert.strictEqual(replacement.copies, 1, 'the native canvas supplies the higher-quality preview');
+        assert.strictEqual(trail.width, 0);
+        assert.strictEqual(f.pdf.renders.filter(render => render.id === view.id).length, before);
+    });
+
+    for (const fault of ['null context', 'draw failure']) {
+        it('preserves a trail preview and releases its failed native copy after ' + fault, async () => {
+            const f = fixture({ mobile: true, startPage: 1, pages: 80 });
+            await f.frame();
+            for (let id = 2; id <= 30; id++) { f.finishNative(id); }
+            f.scrollBy(14_000);
+            await f.frame();
+            const view = f.pages[14];
+            const trail = view.div.children.find(canvas => canvas.className === 'pdfPrefetchPreview') as Canvas;
+            assert.strictEqual(Math.max(trail.width, trail.height), 192);
+            const attempted: Canvas[] = [];
+            f.createCanvas = () => {
+                const canvas = new Canvas();
+                attempted.push(canvas);
+                if (fault === 'null context') { canvas.getContext = () => null as any; }
+                else { canvas.context.drawImage = () => { throw new Error('canvas memory pressure'); }; }
+                return canvas;
+            };
+            assert.doesNotThrow(() => f.finishNative(view.id), 'a preview copy failure must not escape PDF.js rendering events');
+            assert.strictEqual(attempted.length, 1);
+            assert.strictEqual(attempted[0].width * attempted[0].height, 0, 'the failed temporary raster releases its allocation');
+            assert.strictEqual(trail.parentNode, view.div, 'the previous attached preview remains until the native view replaces it');
+            assert.strictEqual(Math.max(trail.width, trail.height), 192);
+            for (let step = 0; step < 3; step++) {
+                f.eventBus.emit('updateviewarea');
+                await f.frame();
+            }
+            assert.strictEqual(attempted.length, 1, 'the same failed copy is not allocated on every refresh');
+            assert.deepStrictEqual(f.controller.snapshot().failed, [], 'copy pressure does not mark the PDF page as failed');
+            f.createCanvas = () => new Canvas();
+            const before = f.canvases.length;
+            f.eventBus.emit('scalechanging');
+            await f.frame();
+            assert.ok(f.canvases.slice(before).some(canvas => Math.max(canvas.width, canvas.height) === 512), 'a changed layout permits a fresh native copy');
+            assert.strictEqual(trail.width, 0, 'successful replacement releases the old trail raster');
+        });
+    }
+
+    it('settles raster admission when zoomed-out visible pages exceed the mobile preview budget', async () => {
+        const f = fixture({ mobile: true, startPage: 1, pages: 12 });
+        f.visibleIds = Array.from({ length: 12 }, (_, id) => id + 1);
+        f.container.clientHeight = 12_000;
+        for (let step = 0; step < 16; step++) {
+            await f.frame();
+            for (const render of [...f.pdf.activeRenders]) { render.task.finish(); }
+            await promisesSettled();
+        }
+        await f.frame();
+        const state = f.controller.snapshot();
+        assert.ok(state.previewBytes <= 8 * 1024 * 1024);
+        assert.ok(state.previewPages < 12, 'the protected raster set cannot exceed its byte cap');
+        assert.deepStrictEqual(state.failed, [], 'cache pressure is not a PDF page failure');
+        assert.ok(f.pdf.renders.length <= 11, 'rejected rasters are not decoded repeatedly within the same plan');
+        assert.deepStrictEqual(state.pending, []);
+        assert.strictEqual(f.callbacks.size, 0);
     });
 
     it('finishes a finite idle render window without repeatedly redrawing evicted pages', async () => {

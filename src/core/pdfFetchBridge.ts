@@ -1,116 +1,88 @@
-import { createHash } from 'crypto';
+import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { setTimeout as sleep } from 'timers/promises';
 import { Agent, fetch } from 'undici';
-import type { BridgeRequest, BridgeResponse } from './viewerProtocol';
+import { cachedDownloadDomainUrl } from '../api/downloadDomain';
+import { PdfDiskCache, PdfCacheViewer, PdfFillRequest } from './pdfDiskCache';
+import type { BridgeRequest, BridgeResponse, PdfOutput } from './viewerProtocol';
 
-/**
- * The PDF viewer loads compiled PDFs with Overleaf's loader, which fetches byte ranges and
- * the content-addressed pieces of Overleaf's PDF caching from the download domain. That
- * server sends no CORS headers, so the webview cannot fetch from it; it sends each request
- * here instead, and the extension host fetches it.
- */
+// The old public name remains for the harness and callers that only use content pieces.
+export { PdfDiskCache as PieceCache } from './pdfDiskCache';
 
-/** A request of the viewer's loader. */
-/** A piece of Overleaf's PDF caching: /content/<contentId>/<SHA-256 of the piece> */
 const PIECE = /\/content\/[^/]+\/([0-9a-f]{64})$/;
-/** the request headers the loader needs; others are not sent on */
-const FORWARDED_HEADERS = new Set(['range', 'accept']);
+const FORWARDED_HEADERS = new Set(['range', 'accept', 'if-range']);
 
-const sha256 = (content: Uint8Array) => createHash('sha256').update(content).digest('hex');
-
-/**
- * Pieces of compiled PDFs kept on disk, by the SHA-256 that Overleaf's compile server
- * computes over the same bytes. The web viewer keeps them in the browser's HTTP cache; here
- * they survive a reload and serve every later build that contains the same piece, e.g. the
- * images of a book after a change to its text. A piece is stored only when it matches its
- * hash, and the least recently used ones go when the cache outgrows `maxBytes`.
- */
-export class PieceCache {
-    private bytes?: number;
-
-    constructor(readonly dir: string, readonly maxBytes: number) {}
-
-    async get(hash: string): Promise<Uint8Array | undefined> {
-        if (!/^[0-9a-f]{64}$/.test(hash)) { return undefined; }
-        const file = path.join(this.dir, hash);
-        try {
-            const content = new Uint8Array(await fs.promises.readFile(file));
-            const now = new Date();
-            await fs.promises.utimes(file, now, now).catch(() => {});
-            return content;
-        } catch {
-            return undefined;
-        }
-    }
-
-    /** Store `content` as `hash`; false when it does not match the hash or the cache is off. */
-    async put(hash: string, content: Uint8Array): Promise<boolean> {
-        if (this.maxBytes <= 0 || content.byteLength > this.maxBytes || sha256(content) !== hash) { return false; }
-        await fs.promises.mkdir(this.dir, { recursive: true });
-        const file = path.join(this.dir, hash);
-        const tmp = `${file}.${process.pid}.tmp`;
-        await fs.promises.writeFile(tmp, content);
-        await fs.promises.rename(tmp, file);
-        this.bytes = (this.bytes ?? await this.measure()) + content.byteLength;
-        if (this.bytes > this.maxBytes) { await this.evict(); }
-        return true;
-    }
-
-    private async entries() {
-        let names: string[] = [];
-        try { names = await fs.promises.readdir(this.dir); } catch { return []; }
-        const entries = await Promise.all(names.filter(name => /^[0-9a-f]{64}$/.test(name)).map(async name => {
-            const stat = await fs.promises.stat(path.join(this.dir, name)).catch(() => undefined);
-            return stat && { name, size: stat.size, used: stat.mtimeMs };
-        }));
-        return entries.filter((entry): entry is { name: string, size: number, used: number } => entry !== undefined);
-    }
-
-    private async measure() {
-        return (await this.entries()).reduce((total, entry) => total + entry.size, 0);
-    }
-
-    /** Remove the least recently used pieces until the cache holds at most 80% of `maxBytes`. */
-    private async evict() {
-        const entries = (await this.entries()).sort((a, b) => a.used - b.used);
-        let total = entries.reduce((sum, entry) => sum + entry.size, 0);
-        for (const entry of entries) {
-            if (total <= this.maxBytes * 0.8) { break; }
-            await fs.promises.unlink(path.join(this.dir, entry.name)).catch(() => {});
-            total -= entry.size;
-        }
-        this.bytes = total;
-    }
-}
-
-/** Whether `url` is an output of `projectId` on `downloadDomain`, e.g. https://compiles.overleafusercontent.com/zone/d */
 export function outputsOf(downloadDomain: string, projectId: string): (url: URL) => boolean {
-    const base = new URL(`${downloadDomain.replace(/\/+$/, '')}/project/${projectId}/`);
-    return (url: URL) => url.protocol === base.protocol && url.origin === base.origin && url.pathname.startsWith(base.pathname);
+    const base = new URL(downloadDomain.replace(/\/+$/, '') + '/project/' + projectId + '/');
+    return url => url.protocol === base.protocol && url.origin === base.origin && url.pathname.startsWith(base.pathname);
 }
 
 export interface BridgeOptions {
-    /** the size of the build's output.pdf, from the compile response */
     buildSize?: () => number | undefined;
+    output?: PdfOutput;
 }
 
+function cacheUrl(output: PdfOutput): string | undefined {
+    if (!output.file.editorId || !output.clsiCacheShard) { return undefined; }
+    return cachedDownloadDomainUrl(output.downloadDomain, output.file.url, output.file.build,
+        output.file.editorId, output.clsiCacheShard, new URL(output.url).searchParams.get('compileGroup') ?? undefined);
+}
+
+function outputRequest(url: URL, output: PdfOutput | undefined): output is PdfOutput {
+    if (!output) { return false; }
+    return [output.url, cacheUrl(output)].some(candidate => {
+        if (!candidate) { return false; }
+        const expected = new URL(candidate);
+        const actual = new URL(url.href);
+        expected.searchParams.sort(); actual.searchParams.sort();
+        return expected.href === actual.href;
+    });
+}
+
+function requestedRanges(value: string | undefined, size: number): Array<{ start: number, end: number }> | undefined {
+    if (!value?.startsWith('bytes=')) { return undefined; }
+    const ranges = value.slice(6).split(',').map(text => {
+        const match = /^(\d+)-(\d+)$/.exec(text.trim());
+        return match && { start: Number(match[1]), end: Number(match[2]) + 1 };
+    });
+    if (!ranges.length || ranges.length > 128 || ranges.some(r => !r ||
+        !Number.isSafeInteger(r.start) || !Number.isSafeInteger(r.end) || r.start < 0 || r.end <= r.start || r.end > size)) { return undefined; }
+    return ranges as Array<{ start: number, end: number }>;
+}
+
+/** Never let a range server's ignored Range turn into a book-sized arrayBuffer. */
+async function boundedBody(response: Awaited<ReturnType<typeof fetch>>, limit?: number): Promise<Uint8Array> {
+    if (limit === undefined) { return new Uint8Array(await response.arrayBuffer()); }
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+        for await (const chunk of response.body ?? []) {
+            size += chunk.length;
+            if (size > limit) { throw new Error('PDF response exceeds the requested byte ranges'); }
+            chunks.push(chunk);
+        }
+    } catch (error) { await response.body?.cancel().catch(() => {}); throw error; }
+    return new Uint8Array(Buffer.concat(chunks, size));
+}
+
+/** The shared host transport and persistent cache for both PDF viewer engines. */
 export class PdfFetchBridge {
-    /** a response stalls for at most this long between two pieces of data */
     static idleTimeoutMs = 60 * 1000;
-    /**
-     * Overleaf's loader asks for output.pdf whole, without a Range header, only when the PDF is
-     * smaller than two of pdf.js's 128 KB chunks (pdf-js-wrapper.ts:71-76 with
-     * pdf-caching.ts:497-503). For a larger build such a request comes from pdf.js itself, which
-     * starts with the whole file when it has no range transport; this bridge answers only once it
-     * has read the whole response, so it refuses those requests.
-     */
     static readonly wholeFileLimit = 2 * 128 * 1024;
     private static agent?: { timeoutMs: number, agent: Agent };
     private readonly running = new Map<number, AbortController>();
+    private readonly viewer?: PdfCacheViewer;
+    private output?: PdfOutput;
+    private readonly outputs: PdfOutput[] = [];
+    private disposed = false;
 
-    constructor(private readonly allowed: (url: URL) => boolean, private readonly cache?: PieceCache, private readonly options: BridgeOptions = {}) {}
+    constructor(private readonly allowed: (url: URL) => boolean, private readonly cache?: PdfDiskCache, private readonly options: BridgeOptions = {}) {
+        this.output = options.output;
+        if (this.output) { this.outputs.push(this.output); }
+        this.viewer = cache?.createViewer();
+        this.viewer?.setOutput(this.output);
+    }
 
     static get dispatcher() {
         const timeoutMs = PdfFetchBridge.idleTimeoutMs;
@@ -120,55 +92,137 @@ export class PdfFetchBridge {
         return PdfFetchBridge.agent.agent;
     }
 
-    /** Stop the request `id`, which the viewer no longer needs. */
-    abort(id: number) {
-        this.running.get(id)?.abort();
+    /** The background adapter uses the same bounded transport and cached-build fallback. */
+    static async fetchRange(request: PdfFillRequest): Promise<BridgeResponse> {
+        const headers: Array<[string, string]> = [
+            ['range', 'bytes=' + request.start + '-' + (request.end - 1)],
+            ['accept-encoding', 'identity'],
+        ];
+        if (request.validator) { headers.push(['if-range', request.validator.value]); }
+        let response = await fetch(request.url, { headers, signal: request.signal, dispatcher: PdfFetchBridge.dispatcher });
+        const fallback = cacheUrl(request.output);
+        if (response.status === 404 && fallback && fallback !== request.url) {
+            await response.body?.cancel();
+            response = await fetch(fallback, { headers, signal: request.signal, dispatcher: PdfFetchBridge.dispatcher });
+        }
+        // A 200 answer to a range can be the whole 1.6 GB book. Inspect status before reading.
+        const body = response.status === 206
+            ? await boundedBody(response, request.end - request.start)
+            : (await response.body?.cancel(), new Uint8Array());
+        return { id: 0, status: response.status, statusText: response.statusText, headers: [...response.headers.entries()], body };
     }
 
-    /** Stop every running request: the page that asked for them is gone. */
-    abortAll() {
-        this.running.forEach(controller => controller.abort());
+    setOutput(output: PdfOutput | undefined) {
+        if (output === this.output) { return; }
+        // Both engines retain the old rendered document while its replacement loads. Its
+        // foreground fetches stay valid until their loader aborts them or this page is disposed.
+        this.output = output;
+        if (output) {
+            this.outputs.unshift(output);
+            this.outputs.splice(4);
+        }
+        this.viewer?.setOutput(output);
+    }
+
+    setActivity(visible: boolean, idle: boolean) { this.viewer?.setActivity(visible, idle); }
+
+    abort(id: number) { this.running.get(id)?.abort(); }
+
+    abortAll() { this.running.forEach(controller => controller.abort()); }
+
+    dispose() {
+        this.disposed = true;
+        this.abortAll();
+        this.viewer?.dispose();
+    }
+
+    private async cachedRanges(request: BridgeRequest, output: PdfOutput, ranges: Array<{ start: number, end: number }>): Promise<BridgeResponse | undefined> {
+        if (!this.cache) { return undefined; }
+        const parts = [];
+        for (const range of ranges) {
+            const cached = await this.cache.readRange(output, range.start, range.end).catch(() => undefined);
+            if (!cached) { return undefined; }
+            parts.push({ ...range, ...cached });
+        }
+        const headers: Array<[string, string]> = [['accept-ranges', 'bytes']];
+        const validator = parts[0].validator;
+        if (validator) { headers.push([validator.name, validator.value]); }
+        if (parts.length === 1) {
+            const part = parts[0];
+            headers.push(['content-type', 'application/pdf'], ['content-length', String(part.body.length)],
+                ['content-range', 'bytes ' + part.start + '-' + (part.end - 1) + '/' + output.file.size]);
+            return { id: request.id, status: 206, statusText: 'Partial Content', headers, body: part.body };
+        }
+        const boundary = 'slipstream-' + randomUUID();
+        const body = Buffer.concat(parts.flatMap(part => [
+            Buffer.from('--' + boundary + '\r\nContent-Type: application/pdf\r\nContent-Range: bytes ' +
+                part.start + '-' + (part.end - 1) + '/' + output.file.size + '\r\n\r\n'),
+            part.body, Buffer.from('\r\n'),
+        ]).concat([Buffer.from('--' + boundary + '--\r\n')]));
+        headers.push(['content-type', 'multipart/byteranges; boundary=' + boundary], ['content-length', String(body.length)]);
+        return { id: request.id, status: 206, statusText: 'Partial Content', headers, body };
     }
 
     async handle(request: BridgeRequest): Promise<BridgeResponse> {
         const url = new URL(request.url);
-        if (!this.allowed(url)) {
-            throw new Error(`not fetched: ${url.origin}${url.pathname} is not an output of this project`);
-        }
+        if (!this.allowed(url)) { throw new Error('not fetched: ' + url.origin + url.pathname + ' is not an output of this project'); }
         const method = (request.method ?? 'GET').toUpperCase();
-        if (method !== 'GET' && method !== 'HEAD') {
-            throw new Error(`not fetched: ${method} requests are not sent`);
-        }
+        if (method !== 'GET' && method !== 'HEAD') { throw new Error('not fetched: ' + method + ' requests are not sent'); }
         const headers = (request.headers ?? []).filter(([name]) => FORWARDED_HEADERS.has(name.toLowerCase()));
-        const whole = method === 'GET' && !headers.some(([name]) => name.toLowerCase() === 'range');
+        const rangeHeader = headers.find(([name]) => name.toLowerCase() === 'range')?.[1];
+        const whole = method === 'GET' && !rangeHeader;
+        const output = this.outputs.find(candidate => outputRequest(url, candidate));
         if (whole && url.pathname.endsWith('/output.pdf')) {
-            const size = this.options.buildSize?.();
+            const size = output?.file.size ?? this.options.buildSize?.();
             if (size === undefined || size > PdfFetchBridge.wholeFileLimit) {
-                throw new Error(`not fetched: output.pdf is fetched whole only up to ${PdfFetchBridge.wholeFileLimit} bytes, and this build has ${size ?? 'an unknown number of'} bytes`);
+                throw new Error('not fetched: output.pdf is fetched whole only up to ' + PdfFetchBridge.wholeFileLimit +
+                    ' bytes, and this build has ' + (size ?? 'an unknown number of') + ' bytes');
             }
         }
         const piece = whole ? PIECE.exec(url.pathname)?.[1] : undefined;
-        if (piece && this.cache) {
-            const cached = await this.cache.get(piece);
-            if (cached) {
-                return {
-                    id: request.id, status: 200, statusText: 'OK',
-                    headers: [['content-type', 'application/octet-stream'], ['content-length', String(cached.byteLength)]],
-                    body: cached,
-                };
-            }
-        }
+        const ranges = method === 'GET' && url.pathname.endsWith('/output.pdf')
+            ? requestedRanges(rangeHeader, output?.file.size ?? Number.MAX_SAFE_INTEGER) : undefined;
         const controller = new AbortController();
+        const current = () => {
+            if (controller.signal.aborted || this.disposed) { throw new Error('PDF request aborted'); }
+        };
+        this.running.get(request.id)?.abort();
         this.running.set(request.id, controller);
+        const endForeground = this.cache?.beginForeground();
         try {
-            const res = await fetch(url, { method, headers, signal: controller.signal, dispatcher: PdfFetchBridge.dispatcher });
-            const body = new Uint8Array(await res.arrayBuffer());
-            if (piece && this.cache && res.status === 200) {
-                await this.cache.put(piece, body).catch(() => false);
+            current();
+            if (piece && this.cache) {
+                const body = await this.cache.get(piece).catch(() => undefined);
+                current();
+                if (body) {
+                    return { id: request.id, status: 200, statusText: 'OK',
+                        headers: [['content-type', 'application/octet-stream'], ['content-length', String(body.length)]], body };
+                }
             }
-            return { id: request.id, status: res.status, statusText: res.statusText, headers: [...res.headers.entries()], body };
+            if (ranges && output) {
+                const cached = await this.cachedRanges(request, output, ranges);
+                current();
+                if (cached) { return cached; }
+            }
+            const response = await fetch(url, { method, headers, signal: controller.signal, dispatcher: PdfFetchBridge.dispatcher });
+            if (ranges && response.status === 200) {
+                await response.body?.cancel();
+                throw new Error('PDF server ignored the requested byte ranges');
+            }
+            const limit = ranges ? ranges.reduce((sum, range) => sum + range.end - range.start, 0) + 128 * 1024
+                : whole && url.pathname.endsWith('/output.pdf') ? PdfFetchBridge.wholeFileLimit : undefined;
+            const body = await boundedBody(response, limit);
+            current();
+            const result: BridgeResponse = { id: request.id, status: response.status, statusText: response.statusText, headers: [...response.headers.entries()], body };
+            if (piece && this.cache && response.status === 200) { await this.cache.put(piece, body).catch(() => false); }
+            if (ranges?.length === 1 && output && this.cache) {
+                await this.cache.storeRange(output, ranges[0].start, ranges[0].end, result, controller.signal).catch(() => false);
+            }
+            current();
+            return result;
         } finally {
-            this.running.delete(request.id);
+            if (this.running.get(request.id) === controller) { this.running.delete(request.id); }
+            endForeground?.();
         }
     }
 }

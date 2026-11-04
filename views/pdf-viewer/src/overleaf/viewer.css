@@ -106,6 +106,48 @@ html, body {
     min-width: 0;
 }
 
+#toolbar #toolbarMoreToggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    width: 28px;
+    padding: 0;
+}
+#toolbar #toolbarMoreToggle[hidden], #toolbarMore[hidden] { display: none; }
+#toolbar .more-label { display: none; }
+#toolbarMore {
+    position: absolute;
+    top: calc(100% + 2px);
+    right: 4px;
+    width: 220px;
+    max-width: calc(100vw - 8px);
+    max-height: calc(100vh - var(--toolbar-height) - 8px);
+    overflow: auto;
+    box-sizing: border-box;
+    padding: 4px;
+    border: 1px solid var(--vscode-widget-border, #555);
+    border-radius: 5px;
+    background: var(--vscode-menu-background, #252526);
+    color: var(--vscode-menu-foreground, #ccc);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+#toolbar #toolbarMore button {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 8px;
+    width: 100%;
+    min-width: 0;
+    min-height: 30px;
+    height: auto;
+    padding: 5px 7px;
+    text-align: left;
+}
+#toolbar #toolbarMore button[hidden] { display: none; }
+#toolbarMore .more-label { display: inline; }
+#toolbarMore svg, #toolbarMore button.icon::before { flex: none; }
+
 /* the icon buttons on the right: go to the source, the color theme, save, and the switch to the
    pdf.js viewer (common/icons.css) */
 #toolbar button.icon {
@@ -152,6 +194,7 @@ html, body {
     #toolbar { padding: 0 2px; gap: 1px; }
     #toolbar button { min-width: 22px; padding: 0 4px; }
     #toolbar button.icon { width: 24px; }
+    #toolbar .pdf-prefetch-toggle { padding: 0 2px; }
     #pageNumber { width: 3.2em; }
 }
 

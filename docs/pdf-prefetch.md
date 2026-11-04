@@ -1,6 +1,6 @@
-# Predictive PDF preloading
+# Slipstream: predictive PDF loading
 
-Both PDF viewers use the same controller, [pdf-prefetch.ts](../views/pdf-viewer/src/common/pdf-prefetch.ts), with PDF.js 5.1.91. The pdfjs application and the Overleaf wrapper each pass their `PDFViewer` to `installPdfPrefetch` once during viewer startup. Document replacement resets that controller through the page lifecycle events. [scroll-prefetch.ts](../views/pdf-viewer/src/common/scroll-prefetch.ts) owns the motion estimator and cache budgets.
+Slipstream is the shared viewer, predictive loading, and cache layer behind both extension engines and the standalone [Spomenar site](spomenar.md). They use the same controller, [pdf-prefetch.ts](../views/pdf-viewer/src/common/pdf-prefetch.ts), with PDF.js 5.1.91. Each passes its `PDFViewer` to `installPdfPrefetch` once during startup. Document replacement resets the controller through the page lifecycle events. [scroll-prefetch.ts](../views/pdf-viewer/src/common/scroll-prefetch.ts) owns the motion estimator and device cache policies.
 
 ## Scheduling and cache layers
 
@@ -8,56 +8,92 @@ The estimator follows CoS's `TimelineScrollDynamics`: react immediately to faste
 
 The desired distance starts at two viewports, with a 480 px minimum. It grows with speed and page latency, up to twelve viewports or 12,000 px, whichever is smaller, while preserving the base distance for large viewports. Direction changes immediately on reversal.
 
-The controller uses four existing or added layers:
+The controller uses five cache layers:
 
-1. PDF.js retains received byte ranges within its active document; the extension keeps hash-addressed pieces on disk across builds.
-2. Prepared PDF pages retain PDF.js display operators and decoded resources.
-3. Small raster previews cover pages while full-resolution rendering catches up.
-4. PDF.js owns the full-resolution page canvases and their rendering queue.
+1. The extension keeps verified content-addressed pieces and incremental range blobs on disk, under one budget across all builds.
+2. PDF.js stores received bytes as sparse chunks within its active document.
+3. Prepared PDF pages retain PDF.js display operators and decoded resources.
+4. Small raster previews cover pages while full-resolution rendering catches up. Mobile retains nearby previews at up to 512 px and reduces older detached previews to 192 px before eviction.
+5. PDF.js owns the full-resolution page canvases and their rendering queue.
 
-The persistent [piece cache](../src/core/pdfFetchBridge.ts) accepts complete GET requests to `/content/<contentId>/<SHA-256>` when the response bytes match the hash. Dynamic `output.pdf` range requests go to the remote download server each time the bridge receives them. Reusing the harness server or its piece-cache directory therefore does not make another engine's dynamic ranges local.
+The persistent [disk cache](../src/core/pdfDiskCache.ts) accepts complete GET requests to `/content/<contentId>/<SHA-256>` when the response bytes match the hash, and verified `output.pdf` ranges with stable validators. A build is represented by byte-interval metadata and received blobs. The host fills missing intervals gradually while every visible reader is idle. The configured `pieceCacheSizeMB` budget, 4096 MiB by default, includes old and new builds, reusable content pieces, range blobs, metadata, and bytes reserved for current writes. A new build does not create a full-size file. `0` disables disk caching and background fill.
 
-Preparation uses small `pdfPage.render()` calls with the display intent shared by native rendering. At most three cold pages are admitted across speculative previews and the auxiliary renders that track native resource preparation. A new cold native render starts only after its small auxiliary render is running. That auxiliary render holds its slot until preparation actually completes. Completed native renders and previews mark resources warm; PDF.js clearing the same page proxy's rendering-intent map revokes that status.
+The [pinned PDF.js patch](../views/pdf-viewer/vendor/pdfjs-5.1.91-dist.patch) adds `rangeCacheBytes`, `getRangeCacheStats()` and `trimRangeCache()` to the same runtime used by both engines and the website. Reading a range checks that each chunk is resident, including the initial progressive prefix. Old chunks can be fetched again after eviction. Active parsing, asynchronous page work, rendering tasks and detached image decodes hold the bytes they may still need. Once those operations finish, the worker trims its LRU to the selected budget.
+
+The worker budget is its idle residency target. One active PDF stream can exceed it temporarily, so the shared controller also stops new cold-page work while the byte cache is over budget. A completed preparation keeps its admission slot until the worker has answered a trim request. Running and fully prepared native pages can continue. A 250 ms memory check runs only while work or memory pressure remains; it operates even with Motion Lab closed, and stops when the document is hidden or disposed. This lets ongoing work finish and gives the worker a chance to release bytes during continuous scrolling.
+
+Preparation uses small `pdfPage.render()` calls with the display intent shared by native rendering. At most three cold pages on desktop, or two on mobile, are admitted across speculative previews and the auxiliary renders that track native resource preparation. A new cold native render starts only after its small auxiliary render is running. That auxiliary render holds its slot until preparation actually completes. Completed native renders and previews mark resources warm; PDF.js clearing the same page proxy's rendering-intent map revokes that status.
 
 Native visible pages and holes in spread layouts retain their rendering priority. An uncovered visible page blocks further offscreen admission. When scrolling makes an already-started preview obsolete, it becomes `retiring` and finishes while holding its slot. This prevents repeated canvas cancellation from launching unbounded worker decoding. Obsolete `getPage` requests whose render has not started are discarded. Document replacement, layout changes, hidden documents, and disposal still cancel work; completion checks reject stale results.
 
 Full-resolution lookahead stays within two viewports. Counting visible pages and spread holes in that window avoids repeatedly evicting and redrawing pages through PDF.js's default ten-view buffer. Rotation, theme, and optional-content changes invalidate saved previews; zoom can reuse and resize them. Disposing the controller removes listeners and restores the queue methods.
 
+On mobile, a retained distant preview is sufficient coverage without keeping its original decoded photo resources. Finished native canvases also release those original resources, including when they are still visible. PDF.js defers cleanup until every active render and its operator list have finished. The native canvas and retained preview remain ready, and neither starts another decode merely to warm resources again. A later zoom requests fresh rendering at the new scale.
+
+The [graduated preview cache](../views/pdf-viewer/src/common/pdf-preview-cache.ts) protects visible, attached, and prepared rasters, reduces the oldest unprotected entries first, then evicts only if needed. A returning finished native canvas upgrades its smaller trail preview with `drawImage`, without decoding the PDF again. Replacing an attached raster publishes its new node before releasing the previous bitmap. Failed admissions and canvas-allocation failures wait for the visible-page plan to change instead of retrying on every refresh.
+
+### Display-sized image decoding
+
+`pdfDocumentCacheOptions()` supplies the same document options to the extension's two engines and Spomenar. Mobile enables adaptive image decoding and admits one image job per document. This limit covers image construction as well as decoding: one admitted collage page can contain many large photographs. Desktop keeps its existing image resolution and concurrency behavior, and printing requests original detail.
+
+The display proxy derives image density from the page viewport and actual output transform. Auxiliary previews request the native canvas's density so they can prepare the same decoded resources. Resolution is part of the display-intent identity; a prepared higher-resolution intent can satisfy a smaller render, while a larger zoom requests new detail. Warm-resource records carry the same density and are rejected if the new zoom needs more pixels.
+
+The worker composes each image's placement matrix, including nested Form matrices, and rounds the requested dimensions upward. Repeated image XObjects at different sizes have separate cache entries. Tiling patterns use a conservative page-sized bound when the placement cannot be determined. Adaptive intents avoid the original reference-only global image cache, which could otherwise reuse a smaller image at a larger zoom.
+
+Plain, unmasked DeviceRGB JPEGs decode directly to their required bitmap dimensions through the browser's native decoder. Orientation, color conversion and alpha premultiplication options are explicit, and the existing PDF.js JPEG compatibility checks and EXIF removal remain in use. A decoder that returns the wrong dimensions has its bitmap closed. If the native path is unavailable, a fresh JPEG decoder produces scaled pixels; reusing the same compressed stream at a later zoom therefore cannot reuse an earlier small output buffer. Other image semantics keep the existing PDF.js decoding path.
+
+Queued and active image jobs retain their required PDF ranges until completion. Document termination rejects waiting jobs and closes late native bitmaps. Image statistics travel with the existing range-cache statistics request, so the feature adds no separate polling loop.
+
 ### Transfer admission
 
-PDF.js can continue worker image and range requests after a render task is cancelled. Before admitting a page whose resources are cold, the controller also checks unfinished viewer fetches. It pauses new cold native renders and cold preview preparations when at least twelve fetches are pending, or when at least six are pending and the oldest has reached 1,500 ms. Up to five pending transfers can overlap independently of their age, preserving concurrency on high-latency connections. Existing running or paused native renders can continue or resume, and pages with fully warmed resources can render from those resources.
+PDF.js can continue worker image and range requests after a render task is cancelled. Before admitting a page whose resources are cold, the controller also checks unfinished viewer fetches. On desktop it pauses new cold native renders and cold preview preparations when at least twelve fetches are pending, or when at least six are pending and the oldest has reached 1,500 ms. Mobile uses thresholds of six and three respectively. Existing running or paused native renders can continue or resume, and pages with fully warmed resources can render from those resources.
 
-These are admission thresholds: one admitted page can request several images, so the number of pending fetches can exceed twelve. `onFetchChange` schedules a coalesced refresh as requests finish, allowing waiting work to resume from observed completions. The shared limit of three cold pages also includes work still decoding after its transfers finish.
+These are admission thresholds: one admitted page can request several images, so the number of pending fetches can exceed its threshold. `onFetchChange` schedules a coalesced refresh as requests finish, allowing waiting work to resume from observed completions. The cold-page limit also includes work still decoding after its transfers finish.
 
 ### Budgets and thresholds
 
-The authoritative values are `PREFETCH_LIMITS` in [scroll-prefetch.ts](../views/pdf-viewer/src/common/scroll-prefetch.ts).
+The authoritative values are selected by `pdfCachePolicy()` in [scroll-prefetch.ts](../views/pdf-viewer/src/common/scroll-prefetch.ts). Phones and tablets use the mobile policy, including iPads with desktop-mode user agents. A touchscreen desktop keeps the desktop policy. Callers can provide an explicit `cachePolicy` to the shared controller.
 
-| Resource | Budget |
-|---|---:|
-| Planned preparation window | 16 pages |
-| Cold page preparations across native auxiliary renders and previews, including pending `getPage` and retiring jobs | 3 |
-| Pending-fetch threshold for pausing cold work at any age | 12 |
-| Pending-fetch threshold when the oldest reaches the age limit | 6 |
-| Oldest-fetch age limit, combined with the six-fetch threshold | 1,500 ms |
-| Full-resolution targets, including visible pages and spread holes | 8 |
-| Full-resolution canvas admission and cleanup target | 192 MiB |
-| Preview maximum dimension | 768 px |
-| Retained preview raster storage | 64 MiB |
-| Retained preview count | 128 |
+| Resource | Desktop | Mobile |
+|---|---:|---:|
+| Planned preparation window | 16 pages | 6 pages |
+| Cold page preparations, including pending `getPage` and retiring jobs | 3 | 2 |
+| Pending-fetch threshold for pausing cold work at any age | 12 | 6 |
+| Pending-fetch threshold when the oldest reaches the age limit | 6 | 3 |
+| Oldest-fetch age limit | 1,500 ms | 1,500 ms |
+| Full-resolution targets, including visible pages and spread holes | 8 | 3 |
+| Full-resolution canvas admission and cleanup target | 192 MiB | 48 MiB |
+| Preview maximum dimension | 768 px | 512 px |
+| Distant trail preview maximum dimension | No downsampling | 192 px |
+| Retained preview raster storage | 64 MiB | 8 MiB |
+| Retained preview count | 128 | 128 |
+| Sparse worker byte-cache target | 128 MiB | 32 MiB |
+| Concurrent adaptive image jobs | Existing PDF.js behavior | 1 |
 
-Visible pages remain protected. PDF.js also maintains decoded resources outside the raster byte counters.
+Visible pages remain protected. Mobile destroys native canvases outside its current visible/render-ahead plan when their active preparation has finished, even when their total is below 48 MiB. It retains the graduated preview LRU for revisits and releases unneeded display resources. PDF.js also maintains decoded resources outside the raster byte counters.
 
-## Diagnostics
+## Document deliveries and diagnostics
 
-Focus the PDF pane and press **Ctrl+Alt+Shift+R** to open or close the LARICS motion lab. **Copy measurements** copies a JSON snapshot. In the viewer's developer console:
+The SVG robot button in every viewer header enables the document effect, which starts on. When a visibly uncovered page receives real rendered pixels, the fleet carries bounded fragments from that canvas to their positions on the PDF. The underlying page and its text layer remain readable and selectable. Offscreen prefetch completions and already-ready cached pages do not summon a delivery. A preview and its native replacement share one episode per page and document; revisiting or zooming a delivered page does not repeat it.
+
+[The document robot module](../views/pdf-viewer/src/common/pdf-document-robots.ts) varies the vehicles, entry sides, paths and ink-bearing fragment targets. It copies small fragments synchronously and never retains the source page canvas. At most four couriers run at once, with a 512 KiB cargo limit and small vehicle canvases. Their pointer-transparent layer follows current page geometry and clips to the visible reading area, keeping the toolbar clear. Finished deliveries stop requesting animation frames; hidden or removed pages, layout invalidation, disabling, document replacement and disposal release active cargo. Reduced-motion mode skips moving cargo.
+
+A separate measurement button opens **LARICS Motion Lab**, initially closed. It also provides the optional **LARICS Fleet dispatch** window for summoning the crew while the document is ready. If the window is open when a document delivery starts, its actors leave from their actual window positions and return there afterward. The same actor is hidden in the window while it is dispatched. Closing the window lets an active courier depart from the viewport instead.
+
+The full PDF.js extension keeps the lab entry in its existing tools menu and the robot button directly in the header. Overleaf's compact viewer moves secondary actions into a More menu below 601 px. Both layouts keep the robot and tools launcher reachable in a 220 px editor pane. Spomenar has enough room for both controls in its phone header.
+
+On mobile, detailed measurements start collapsed behind **Motion and buffer measurements**. The document toggle exposes `aria-pressed`; the lab control exposes `aria-expanded`. Escape closes the panel when focus is inside it. There is no global keyboard shortcut. **Copy measurements** copies a JSON snapshot. In the viewer's developer console:
 
 ```js
 window.pdfPrefetch.snapshot()
+window.pdfPrefetch.setRobotsEnabled(false)
+window.pdfPrefetch.robotsEnabled
 window.pdfPrefetch.toggleDiagnostics()
+window.pdfPrefetch.setDiagnosticsEnabled(false)
+window.pdfPrefetch.diagnosticsEnabled
 ```
 
-[The diagnostics module](../views/pdf-viewer/src/common/prefetch-performance.ts) samples every 250 ms while open. Its charts cover ten seconds; event storage holds the newest 512 events and transfer storage the newest 2,048 samples. The dashboard and robot animation start when opened and stop sampling when closed or when the document is hidden.
+[The diagnostics module](../views/pdf-viewer/src/common/prefetch-performance.ts) samples every 250 ms while open. Its charts cover ten seconds; event storage holds the newest 512 events and transfer storage the newest 2,048 samples. Closing the panel or hiding the document stops chart sampling and lab animation. The document effect has its own finite scheduling and works with the lab closed. `installPdfPrefetch` accepts `diagnosticsToolbar`, an optional `robotsEnabled` preference, and an independent `diagnosticsEnabled` initial preference. The controller snapshot includes bounded document-robot counters and the optional lab state for performance inspection.
 
 | Measurement | Meaning |
 |---|---|
@@ -70,6 +106,11 @@ window.pdfPrefetch.toggleDiagnostics()
 | Viewer fetch throughput | Bytes delivered through the viewer fetch bridge, including cache hits, over a rolling five-second window. Bytes are distributed across each transfer's measured duration. |
 | Preview targets | `prepared` is the current plan's page IDs. `pending` lists unfinished admitted preparations, including the `retiring` subset that is finishing obsolete work. `previewPages` counts retained raster previews. |
 | Transfer pressure | `fetchBackpressure` reports the request-admission condition. The performance snapshot includes `pendingFetchCount` and `oldestFetchMs`. |
+| Device retention | `cachePolicy` and `cacheLimits` expose the selected device budget. `rangeCache` reports worker residency, eviction and peak byte counts. `memoryBackpressure` explains when new cold work is waiting for cleanup. Results from replaced documents are discarded. |
+| Decoded images | `decodedImages` counts retained image backing buffers and estimates bitmap storage as width × height × four bytes. Shared objects and aliased buffers are counted once, with shared storage attributed first. The scan is bounded to 512 page views and 512 stored objects; unsupported or incomplete results are labeled. These readings are separate from raw PDF bytes, preview rasters, native canvases, and total browser memory. |
+| Image decoding | The worker statistics include current and peak active image jobs, queued jobs, completed native and fallback decodes, and cumulative original/output pixel counts. They use the existing byte-statistics request and stop with its lifecycle. Pixel totals describe decoded work; retained memory is reported separately by `decodedImages`. |
+| Disk accumulation | `performance.diskCache` reports this build's stored/total bytes, all builds' disk usage and budget, and whether filling is active, paused or complete. Host updates are coalesced to at most one per second. |
+| Idle fill eligibility | `idle` becomes true only with a covered viewport, no motion, no cold-page jobs, no foreground fetches, no active native render and no unsettled worker-byte operations or memory pressure. Both extension engines send this state with their page ID and displayed build ID. Motion, fetch admission, rendering, hiding and disposal revoke it immediately. |
 | Visible-content status | `visibleMissing` lists visible pages awaiting both a full render and a preview; `starved` is true when that list is nonempty. |
 
 The time margin extrapolates the present speed and recent loading cost. Abrupt jumps and changes in page complexity change those estimates.
@@ -80,12 +121,14 @@ From the checkout:
 
 ```sh
 node node_modules/typescript/bin/tsc -p ./
-node node_modules/.bin/mocha "out/test/pdfViewer*.test.js"
+node node_modules/.bin/mocha "out/test/**/*.test.js"
 ```
 
-The focused suites cover gesture dynamics, reversal, visible rendering priority, bounded preparation, spread holes, stale document completions, preview retention and cleanup, queue restoration, and throughput accounting.
+The suites cover gesture dynamics, reversal, visible rendering priority, bounded preparation, spread holes, stale document completions, preview retention and cleanup, queue restoration, throughput accounting, actual worker image decoding, sparse byte refetches, disk accumulation, and document-courier lifecycle.
 
-Repository verification on 2026-11-04 passed 678 Mocha tests and the build. Lint reported zero errors and three pre-existing warnings.
+The initial extension implementation at `0681c21` passed 678 Mocha tests and the build on 2026-11-04. Its benchmark results below precede the standalone site and device-specific retention changes. The follow-up adds mobile device selection, aggressive native-canvas pruning, long-traverse preview bounds, host idle leases and stale byte-stat completion tests.
+
+The [physical iPhone report](spomenar-mobile-validation.md) records the adaptive follow-up on the actual 459-page, 1.61 GB book, including decoded-image memory, native browser memory, visible coverage, transferred bytes, idle CPU and document deliveries. Its exact measurements are retained in [spomenar-mobile-metrics.json](spomenar-mobile-metrics.json).
 
 The [prefetch probe](../scripts/pdf-viewer-harness/probes/prefetch.mjs) compares native scheduling with the shared controller for both engines:
 

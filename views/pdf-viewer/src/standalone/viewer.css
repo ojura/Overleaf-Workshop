@@ -1,0 +1,101 @@
+:root {
+    --spomenar-ink: #173c42;
+    --spomenar-paper: #edf3ed;
+    --spomenar-accent: #b2dac2;
+}
+html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+body {
+    display: flex; flex-direction: column; height: 100dvh;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--spomenar-ink);
+}
+#spomenarHeader {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    flex: 0 0 auto; min-height: 64px; box-sizing: border-box;
+    padding: 6px max(16px, env(safe-area-inset-right)) 6px max(16px, env(safe-area-inset-left));
+    padding-top: max(6px, env(safe-area-inset-top));
+    color: var(--spomenar-paper); background: var(--spomenar-ink);
+    border-bottom: 1px solid #ffffff20; z-index: 100;
+}
+.spomenarBrand { display: flex; align-items: center; gap: 10px; min-width: 0; color: inherit; text-decoration: none; }
+.spomenarMark { display: block; width: 110px; height: auto; }
+.spomenarBrandText { min-width: 0; }
+#spomenarTitle { margin: 3px 0 0; font-size: 18px; line-height: 1.25; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#spomenarActions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.spomenarAction, #spomenarActions > button {
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    min-width: 44px; min-height: 44px; box-sizing: border-box; padding: 8px 10px;
+    border: 1px solid #ffffff38; border-radius: 8px; background: #ffffff0a;
+    color: inherit; text-decoration: none; cursor: pointer; font: inherit; font-size: 12px;
+}
+.spomenarAction svg { width: 20px; height: 20px; flex: 0 0 auto; }
+.spomenarAction:hover, #spomenarActions > button:hover { background: #ffffff18; }
+.spomenarAction:disabled { opacity: .45; cursor: default; }
+.spomenarAction:focus-visible, #spomenarActions > button:focus-visible, .spomenarBrand:focus-visible {
+    outline: 3px solid var(--spomenar-accent); outline-offset: 3px;
+}
+#outerContainer { flex: 1 1 auto; min-height: 0; height: auto; width: 100%; position: relative; }
+#mainContainer { min-width: 0; }
+#viewerContainer { scroll-padding-bottom: env(safe-area-inset-bottom); }
+#spomenarNotice {
+    flex: 0 0 auto; display: flex; align-items: center; justify-content: center; gap: 12px;
+    padding: 9px 16px; color: #173c42; background: #e5efe7; font-size: 13px; line-height: 1.5;
+}
+#spomenarNotice[hidden] { display: none; }
+#spomenarNotice[data-error] { color: #642519; background: #fff1e9; }
+#spomenarRetry, #spomenarCopy {
+    min-height: 44px; border: 0; border-radius: 7px; padding: 8px 14px; font: inherit;
+    background: var(--spomenar-ink); color: white; cursor: pointer; flex-shrink: 0;
+}
+#spomenarShareDialog {
+    border: 1px solid #8fa6a3; border-radius: 12px; width: min(420px, calc(100vw - 64px));
+    padding: 24px; background: #f5f8f4; color: #173c42; font: 14px/1.5 system-ui, sans-serif;
+}
+#spomenarShareDialog::backdrop { background: #071b24a6; }
+#spomenarShareDialog h2 { margin: 0 32px 8px 0; font-size: 20px; }
+#spomenarShareDialog p { margin: 0 0 16px; }
+#spomenarShareDialog label { display: block; font-size: 12px; }
+#spomenarShareUrl { display: block; width: 100%; box-sizing: border-box; min-height: 44px; margin: 4px 0 14px; padding: 8px; border: 1px solid #8fa6a3; border-radius: 5px; font-size: 16px; }
+#spomenarCopyStatus { display: block; min-height: 1.5em; margin-top: 8px; }
+.spomenarDialogClose { position: absolute; top: 8px; right: 8px; min-width: 44px; min-height: 44px; border: 0; background: transparent; color: inherit; font-size: 26px; cursor: pointer; }
+.spomenarSkip { position: fixed; top: -80px; left: 12px; z-index: 100000; padding: 12px; color: #173c42; background: white; }
+.spomenarSkip:focus { top: 8px; }
+.spomenarNoScript { padding: 16px; background: white; color: #173c42; }
+
+/* Opening a local file and editing annotations are outside this published book's reader. */
+#secondaryOpenFile, #editorModeButtons, #editorModeSeparator { display: none !important; }
+#findbar { min-width: 0; max-width: calc(100vw - 40px); }
+#findbar #findInputContainer #findInput { width: min(200px, calc(100vw - 126px)); }
+#secondaryToolbar { max-width: calc(100vw - 8px); }
+
+/* PDF.js derives its buttons, sidebar and menus from one toolbar height. The four
+   pixels of vertical toolbar padding leave a 44 px touch target inside 48 px. */
+@media (max-width: 640px), (pointer: coarse) {
+    body { --toolbar-height: 48px; --icon-size: 20px; }
+    #toolbarContainer #toolbarViewer input, #findbar input[type="text"] { font-size: 16px; }
+    #pageNumber { height: 44px; margin: 0; box-sizing: border-box; width: 56px; }
+    #secondaryToolbar { --menuitem-height: 44px; }
+}
+@media (max-width: 480px) {
+    #numPages { display: none; }
+}
+
+@media (max-width: 640px) {
+    #spomenarHeader { gap: 6px; min-height: 58px; padding-right: max(8px, env(safe-area-inset-right)); padding-left: max(8px, env(safe-area-inset-left)); }
+    .spomenarBrand { gap: 6px; }
+    .spomenarMark { width: 84px; }
+    #spomenarTitle { font-size: 14px; }
+    #spomenarActions { gap: 4px; }
+    .spomenarAction { padding: 8px; }
+    .spomenarAction > span { display: none; }
+    #spomenarNotice { flex-wrap: wrap; gap: 6px; padding: 6px 12px; font-size: 12px; }
+}
+@media (max-width: 360px) {
+    #spomenarTitle { font-size: 13px; }
+}
+@media (max-width: 300px) {
+    #findbar > * { height: auto; min-height: var(--toolbar-height); flex-wrap: wrap; }
+}
+@media print {
+    #spomenarHeader, #spomenarNotice, .spomenarSkip { display: none !important; }
+}

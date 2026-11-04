@@ -9,11 +9,18 @@ export const ROBOT_VEHICLES = [
     { id: 'tiltwing', name: 'MetaMorpher', color: '#aab7ff', air: true, speed: 92, radius: 27 },
     { id: 'rover', name: 'VIV', color: '#f17c75', air: false, speed: 46, radius: 20 },
     { id: 'mecanum', name: 'XENA', color: '#72cfed', air: false, speed: 55, radius: 20 },
-    { id: 'forklift', name: 'VMAC', color: '#ffd36b', air: false, speed: 40, radius: 22 },
+    { id: 'forklift', name: 'Navines', color: '#769cdd', air: false, speed: 40, radius: 24 },
     { id: 'hexapod', name: 'ALKA', color: '#c5a1ef', air: false, speed: 38, radius: 24 },
     { id: 'walker', name: 'DynaRobin', color: '#a8db8b', air: false, speed: 64, radius: 19 },
 ] as const;
 export type RobotVehicle = typeof ROBOT_VEHICLES[number]['id'];
+export const ROBOT_ARTWORK_SIZE = Object.freeze({ width: 128, height: 100 });
+export interface RobotDispatchPoint { x: number; y: number; scale?: number }
+export interface RobotDispatchPort {
+    reserve(vehicle: RobotVehicle): RobotDispatchPoint | undefined;
+    destination(vehicle: RobotVehicle): RobotDispatchPoint | undefined;
+    release(vehicle: RobotVehicle): void;
+}
 
 // Fixed artwork and animated propellers use the same airframe geometry.
 const ROTOR_LAYOUT: Partial<Record<RobotVehicle, readonly (readonly [number, number])[]>> = {
@@ -26,7 +33,7 @@ export const ROBOT_SCENES = [
     { id: 'covariance', title: 'The covariance ellipse has become a lifestyle.', durationMs: 7200 },
     { id: 'replan', title: 'Plan B has requested a Plan C.', durationMs: 6800 },
     { id: 'rescue', title: 'MORUS airlift. Ground crew: remain approximately calm.', durationMs: 9500 },
-    { id: 'traffic', title: 'VMAC dispatch invokes the Banker’s algorithm.', durationMs: 8000 },
+    { id: 'traffic', title: 'Navines dispatch invokes the Banker’s algorithm.', durationMs: 8000 },
     { id: 'repair', title: 'XENA has selected the large diagnostic spanner.', durationMs: 7800 },
     { id: 'calibration', title: 'X-UFO gyro calibration. Again, with feeling.', durationMs: 7300 },
     { id: 'deadlock', title: 'Three robots have reserved the same loading dock.', durationMs: 7600 },
@@ -67,6 +74,9 @@ export const ROBOT_LIMITS = Object.freeze({
     readinessConfirmMs: 700,
     recoveryMs: 2600,
     quietDetailMs: 22000,
+    noticeConfirmMs: 200,
+    noticeClearMs: 350,
+    noticeHoldMs: 1200,
 });
 
 export interface RobotEvent {
@@ -91,6 +101,7 @@ type Mode = 'dispatch' | 'outage' | 'quiet' | 'recovery';
 type Activity = 'park' | 'navigate' | 'load' | 'deliver' | 'unload' | 'inspect' | 'scan' | 'signal'
     | 'lift' | 'weld' | 'calibrate' | 'balance' | 'yield' | 'replan' | 'assist' | 'stranded'
     | 'charge' | 'read' | 'sleep' | 'celebrate';
+type Notice = 'SOS' | 'After you?' | 'Replan' | null;
 export interface RobotCargo {
     kind: 'bytes' | 'preview' | 'page';
     bytes: number;
@@ -120,6 +131,10 @@ interface Actor {
     patienceLimit: number;
     blockedMs: number;
     yieldTo: number | null;
+    notice: Notice;
+    noticeSince: number;
+    noticeCandidate: Notice;
+    noticeCandidateSince: number;
     detour: Point | null;
     needsHelp: boolean;
     partner: number | null;
@@ -128,6 +143,7 @@ interface Actor {
     idleUntil: number;
     phase: number;
     look: number;
+    reservedAt: number | null;
     rng: Random;
 }
 interface Particle extends Point { vx: number; vy: number; life: number; age: number; color: string; kind: 'dust' | 'spark' | 'confetti' }
@@ -135,6 +151,15 @@ interface SceneProp extends Point { kind: string; angle?: number; label?: string
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
 const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);
 const vehicleOf = (actor: { vehicle: RobotVehicle }) => ROBOT_VEHICLES.find(vehicle => vehicle.id === actor.vehicle)!;
+
+function trafficPriority(actor: Actor): number {
+    const delivery = actor.task?.kind === 'delivery';
+    const docked = delivery && actor.task!.arrivedAt !== null
+        && ['load', 'unload'].includes(actor.task!.steps[actor.task!.index].activity);
+    // The departing courier clears the bay before another loaded courier enters it.
+    const departing = delivery && actor.task!.index > 1;
+    return (docked ? 40 : departing ? 30 : actor.carrying ? 20 : delivery ? 10 : 0) - actor.id / 10;
+}
 
 function lastWhere<T>(values: readonly T[], predicate: (value: T) => boolean): T | undefined {
     for (let index = values.length - 1; index >= 0; index--) {
@@ -161,6 +186,8 @@ class Random {
         return result;
     }
 }
+
+export { Random as RobotRandom };
 
 function counters() {
     return { acceptedCargo: 0, deliveredCargo: 0, fetchBytes: 0, yields: 0, replans: 0, assists: 0, cargoReroutes: 0, recoveries: 0 };
@@ -217,8 +244,9 @@ export class RobotChoreographer {
                 id, vehicle: vehicle.id, ...homes[id], home: { ...homes[id] }, goal: { ...homes[id] },
                 vx: 0, vy: 0, activity: 'park', task: null, carrying: false,
                 temperament, patience: patienceLimit, patienceLimit, blockedMs: 0, yieldTo: null,
+                notice: null, noticeSince: 0, noticeCandidate: null, noticeCandidateSince: 0,
                 detour: null, needsHelp: false, partner: null, battery: rng.range(0.55, 1),
-                distance: 0, idleUntil: rng.range(1000, 6000), phase: rng.range(0, Math.PI * 2), look: 0, rng,
+                distance: 0, idleUntil: rng.range(1000, 6000), phase: rng.range(0, Math.PI * 2), look: 0, reservedAt: null, rng,
             };
         });
     }
@@ -232,7 +260,7 @@ export class RobotChoreographer {
         this.riskSince = this.readySince = null;
         this.queue.length = this.particles.length = 0;
         this.lastSequence = -1;
-        for (const actor of this.actors) { this.release(actor); }
+        for (const actor of this.actors) { this.release(actor); actor.notice = actor.noticeCandidate = null; }
         this.update(now, input);
     }
 
@@ -269,6 +297,44 @@ export class RobotChoreographer {
                 this.emit({ x: 240, y: 70 }, 'confetti', ['#70e7d3', '#ffd36b', '#aab7ff'][index % 3]);
             }
         }
+        // Telemetry also advances finite scene/caption deadlines while the canvas sleeps.
+        // Reduced motion observes these changes without advancing the physics loop.
+        this.advanceScene();
+        for (const actor of this.actors) { this.updateNotice(actor); }
+    }
+
+    /** The crew sleeps only after its real work, return travel and readable badges settle. */
+    needsAnimation(): boolean {
+        return this.mode === 'outage' || this.mode === 'recovery' || this.queue.length > 0 || this.particles.length > 0
+            || this.actors.some(actor => {
+                if (actor.reservedAt !== null) { return false; }
+                const task = actor.task;
+                const timedTask = task && (task.arrivedAt === null || Number.isFinite(task.steps[task.index]?.holdMs));
+                const returning = !task && distance(actor, actor.goal) > 1;
+                return !!timedTask || returning || actor.detour !== null || Math.hypot(actor.vx, actor.vy) > 2
+                    || actor.notice !== actor.noticeCandidate;
+            });
+    }
+
+    reserveVehicle(vehicle: RobotVehicle, at: number): Point | undefined {
+        const actor = this.actors.find(candidate => candidate.vehicle === vehicle);
+        if (!actor || actor.reservedAt !== null) { return; }
+        actor.reservedAt = at;
+        return { x: actor.x, y: actor.y };
+    }
+
+    reservedPosition(vehicle: RobotVehicle): Point | undefined {
+        const actor = this.actors.find(candidate => candidate.vehicle === vehicle && candidate.reservedAt !== null);
+        return actor ? { x: actor.x, y: actor.y } : undefined;
+    }
+
+    returnVehicle(vehicle: RobotVehicle, at: number): void {
+        const actor = this.actors.find(candidate => candidate.vehicle === vehicle);
+        if (!actor || actor.reservedAt === null) { return; }
+        if (actor.task?.arrivedAt !== null && actor.task) {
+            actor.task.arrivedAt += Math.max(0, at - actor.reservedAt);
+        }
+        actor.reservedAt = null;
     }
 
     step(now: number, input?: RobotTelemetry) {
@@ -295,7 +361,7 @@ export class RobotChoreographer {
             caption: this.mode === 'quiet'
                 ? this.quietDetails.length ? ROBOT_QUIET_DETAILS[this.quietDetails.at(-1)!] : 'The crew is standing by. The rescue repertoire is resting.'
                 : this.mode === 'recovery' ? 'Buffer restored. Everybody act like that was planned.'
-                    : scene?.title ?? 'LARICS dispatch · every parcel is a completed fetch or page.',
+                    : scene?.title ?? 'LARICS dispatch; every parcel is a completed fetch or page.',
             episode: this.episode, opening: this.opening, sceneIndex: this.sceneIndex,
             nextTransitionAt: this.nextTransitionAt, sceneStartedAt: this.sceneStartedAt,
             missingPage: this.input.visibleMissing?.[0] ?? null,
@@ -310,7 +376,8 @@ export class RobotChoreographer {
                 job: actor.task?.kind ?? 'idle', carrying: actor.carrying,
                 cargo: actor.task?.cargo ? { ...actor.task.cargo } : null,
                 temperament: actor.temperament, patience: actor.patience, needsHelp: actor.needsHelp,
-                partner: actor.partner, yieldTo: actor.yieldTo, battery: actor.battery,
+                partner: actor.partner, yieldTo: actor.yieldTo, notice: actor.notice, battery: actor.battery,
+                outside: actor.reservedAt !== null,
                 distance: actor.distance, phase: actor.phase, look: actor.look,
                 progress: actor.task?.arrivedAt === null || !actor.task ? 0
                     : clamp((this.now - actor.task.arrivedAt) / Math.max(1, actor.task.steps[actor.task.index]?.holdMs ?? 1), 0, 1),
@@ -378,14 +445,15 @@ export class RobotChoreographer {
         this.nextTransitionAt = this.sceneStartedAt + scene.durationMs;
         this.props = [];
         for (const actor of this.actors) {
+            if (actor.reservedAt !== null) { continue; }
             if (actor.task?.kind !== 'delivery') { this.release(actor); }
             actor.needsHelp = false;
         }
         const used = new Set<number>();
         const actorFor = (vehicle: RobotVehicle) => {
-            const preferred = this.actors.find(actor => actor.vehicle === vehicle && actor.task?.kind !== 'delivery');
+            const preferred = this.actors.find(actor => actor.vehicle === vehicle && actor.reservedAt === null && actor.task?.kind !== 'delivery');
             const actor = preferred && !used.has(preferred.id) ? preferred
-                : this.actors.find(candidate => !used.has(candidate.id) && candidate.task?.kind !== 'delivery'
+                : this.actors.find(candidate => !used.has(candidate.id) && candidate.reservedAt === null && candidate.task?.kind !== 'delivery'
                     && vehicleOf(candidate).air === ROBOT_VEHICLES.find(spec => spec.id === vehicle)!.air);
             if (actor) { used.add(actor.id); }
             return actor;
@@ -409,7 +477,7 @@ export class RobotChoreographer {
         case 'replan':
             task('mecanum', [step(202, 174, 'inspect', 700), step(153, 211, 'replan', 500), step(294, 215, 'signal', 700)]);
             task('walker', [step(304, 177, 'inspect', 1000), step(220, 208, 'read', 1500)]);
-            prop('cones', 240, 186); prop('map', 303, 156, 'PLAN C');
+            prop('cones', 240, 186); prop('map', 303, 156, 'Plan C');
             break;
         case 'rescue': {
             const stranded = task('rover', [step(235, 187, 'stranded', Infinity)], true);
@@ -422,7 +490,7 @@ export class RobotChoreographer {
             task('forklift', [step(285, 193, 'signal', 1200), step(155, 193, 'inspect', 600)]);
             task('mecanum', [step(196, 193, 'signal', 1200), step(320, 193, 'inspect', 600)]);
             task('walker', [step(239, 171, 'signal', 1800)]);
-            prop('traffic', 240, 150, 'BANKER');
+            prop('traffic', 240, 150, 'Banker');
             break;
         case 'repair': {
             const broken = task('mecanum', [step(245, 187, 'stranded', Infinity)], true);
@@ -440,7 +508,7 @@ export class RobotChoreographer {
             task('forklift', [step(230, 188, 'load', 1400)]);
             task('mecanum', [step(247, 188, 'load', 1400)]);
             task('hexapod', [step(238, 204, 'inspect', 1800)]);
-            prop('parcel-pile', 239, 180, 'RESERVED');
+            prop('parcel-pile', 239, 180, 'Reserved');
             break;
         case 'battery': {
             const flat = task('quad', [step(190, 98, 'stranded', Infinity)], true);
@@ -477,7 +545,7 @@ export class RobotChoreographer {
         case 'cable':
             task('forklift', [step(194, 200, 'load', 650), step(296, 190, 'lift', 1100)]);
             task('hexapod', [step(310, 212, 'inspect', 900), step(240, 211, 'weld', 1100)]);
-            prop('cable', 242 + offset, 207, 'CAT ∞');
+            prop('cable', 242 + offset, 207, 'Cat ∞');
             break;
         }
     }
@@ -492,7 +560,7 @@ export class RobotChoreographer {
             this.mode = 'dispatch';
             this.sceneId = 'dispatch';
             this.riskSince = this.readySince = null;
-            for (const actor of this.actors) { this.release(actor); }
+            for (const actor of this.actors) { this.release(actor); actor.notice = actor.noticeCandidate = null; }
             this.lastSequence = 0;
         }
         if (document) { this.lastDocumentAt = document.at; }
@@ -549,7 +617,7 @@ export class RobotChoreographer {
                     [this.vehicleOrder[0], this.vehicleOrder[1]] = [this.vehicleOrder[1], this.vehicleOrder[0]];
                 }
             }
-            const index = this.vehicleOrder.findIndex(id => !this.actors[id].needsHelp && this.actors[id].task?.kind !== 'delivery' && this.actors[id].task?.kind !== 'help');
+            const index = this.vehicleOrder.findIndex(id => this.actors[id].reservedAt === null && !this.actors[id].needsHelp && this.actors[id].task?.kind !== 'delivery' && this.actors[id].task?.kind !== 'help');
             if (index < 0) { this.vehicleOrder = []; break; }
             const actor = this.actors[this.vehicleOrder.splice(index, 1)[0]];
             this.lastVehicle = actor.id;
@@ -590,18 +658,20 @@ export class RobotChoreographer {
         actor.detour = null;
         actor.carrying = false;
         actor.partner = partner ?? null;
+        actor.yieldTo = null;
         actor.blockedMs = 0;
         actor.patience = actor.patienceLimit;
     }
 
     private think(actor: Actor): void {
+        if (actor.reservedAt !== null) { return; }
         if (actor.needsHelp) { actor.activity = 'stranded'; return; }
         if (actor.task?.kind === 'help') {
             const partner = this.actors[actor.task.partner!];
             if (!partner?.needsHelp) { this.release(actor); }
         }
         if (!actor.task || actor.task.kind === 'idle') {
-            const stranded = this.actors.filter(other => other.needsHelp && other.id !== actor.id
+            const stranded = this.actors.filter(other => other.reservedAt === null && other.needsHelp && other.id !== actor.id
                 && !this.actors.some(helper => helper.task?.kind === 'help' && helper.partner === other.id))
                 .sort((a, b) => distance(actor, a) - distance(actor, b))[0];
             if (stranded) {
@@ -611,6 +681,10 @@ export class RobotChoreographer {
             }
         }
         if (actor.task || this.now < actor.idleUntil) { return; }
+        // Idle reading/scanning may accompany real traffic, but must not keep generating
+        // new trips after the last courier has returned. A parked crew keeps its last pose.
+        if (this.mode === 'dispatch' && !this.queue.length
+            && !this.actors.some(other => other.task?.kind === 'delivery' || other.task?.kind === 'help')) { return; }
         if (this.mode === 'quiet') {
             this.assign(actor, 'idle', [step(actor.home.x, actor.home.y, 'sleep', Infinity)]);
         } else if (actor.battery < 0.25) {
@@ -631,6 +705,13 @@ export class RobotChoreographer {
         if (!task) { return; }
         const target = task.steps[task.index];
         if (!target) { this.release(actor); return; }
+        if (task.arrivedAt === null && task.kind === 'delivery' && ['load', 'unload'].includes(target.activity)) {
+            const occupied = this.actors.find(other => other !== actor && vehicleOf(other).air === vehicleOf(actor).air
+                && other.task?.kind === 'delivery' && other.task.arrivedAt !== null
+                && ['load', 'unload'].includes(other.task.steps[other.task.index].activity)
+                && distance(other.goal, target) < 1);
+            if (occupied) { actor.yieldTo = occupied.id; actor.activity = 'yield'; return; }
+        }
         if (task.arrivedAt === null) { task.arrivedAt = this.now; }
         actor.activity = target.activity;
         if (this.now - task.arrivedAt < target.holdMs) { return; }
@@ -664,7 +745,19 @@ export class RobotChoreographer {
     private simulate(dt: number): void {
         for (const actor of this.actors) { this.think(actor); }
         for (const actor of this.actors) {
+            if (actor.reservedAt !== null) { continue; }
             const spec = vehicleOf(actor);
+            // A timed service remains started if avoidance previously displaced its actor.
+            // Advancing that timer only inside the arrival radius stranded unloading jobs.
+            if (actor.task && actor.task.arrivedAt !== null) { this.arrive(actor); }
+            if (actor.task?.kind === 'delivery' && actor.task.arrivedAt !== null
+                && ['load', 'unload'].includes(actor.task.steps[actor.task.index].activity)) {
+                // A docked courier owns its service position; approaching traffic yields
+                // for the short load/unload interval instead of pushing it off the dock.
+                actor.vx = actor.vy = 0;
+                actor.yieldTo = null;
+                continue;
+            }
             const target = actor.detour ?? actor.goal;
             const dx = target.x - actor.x, dy = target.y - actor.y;
             const gap = Math.hypot(dx, dy);
@@ -673,19 +766,30 @@ export class RobotChoreographer {
             speed *= clamp(gap / 28, 0, 1);
             let desiredX = gap > 0.1 ? dx / gap * speed : 0;
             let desiredY = gap > 0.1 ? dy / gap * speed : 0;
+            let avoidanceX = 0, avoidanceY = 0;
             let yielding: Actor | undefined;
             for (const other of this.actors) {
-                if (actor === other || spec.air !== vehicleOf(other).air || actor.partner === other.id || other.partner === actor.id) { continue; }
+                if (actor === other || other.reservedAt !== null || spec.air !== vehicleOf(other).air || actor.partner === other.id || other.partner === actor.id) { continue; }
                 const separation = distance(actor, other);
                 const reach = (spec.radius + vehicleOf(other).radius) * 0.82;
                 if (separation < reach + 15 && separation > 0.01) {
-                    const priority = (actor.carrying ? 20 : actor.task?.kind === 'delivery' ? 10 : 0) - actor.id / 10;
-                    const otherPriority = (other.carrying ? 20 : other.task?.kind === 'delivery' ? 10 : 0) - other.id / 10;
+                    const priority = trafficPriority(actor);
+                    const otherPriority = trafficPriority(other);
                     const toward = dx * (other.x - actor.x) + dy * (other.y - actor.y);
                     if (!actor.detour && toward > 0 && priority < otherPriority && speed > 1) { yielding = other; }
                     const push = Math.max(0, reach - separation) * 3.2;
-                    desiredX += (actor.x - other.x) / separation * push;
-                    desiredY += (actor.y - other.y) / separation * push;
+                    let pushX = (actor.x - other.x) / separation * push;
+                    let pushY = (actor.y - other.y) / separation * push;
+                    if (priority > otherPriority && gap > 0.1) {
+                        // The robot with right of way may steer sideways, but a yielding
+                        // robot cannot cancel its forward progress through the shared bay.
+                        // Symmetric braking left both robots at a permanent force balance.
+                        const opposing = Math.min(0, (pushX * dx + pushY * dy) / gap);
+                        pushX -= dx / gap * opposing;
+                        pushY -= dy / gap * opposing;
+                    }
+                    avoidanceX += pushX;
+                    avoidanceY += pushY;
                 }
             }
             if (yielding) {
@@ -715,7 +819,7 @@ export class RobotChoreographer {
                 }
             }
             if (actor.blockedMs > 3400 && actor.carrying && actor.task?.kind === 'delivery' && !spec.air) {
-                const courier = this.actors.find(candidate => vehicleOf(candidate).air && !candidate.needsHelp
+                const courier = this.actors.find(candidate => candidate.reservedAt === null && vehicleOf(candidate).air && !candidate.needsHelp
                     && (!candidate.task || candidate.task.kind === 'idle'));
                 if (courier) {
                     const cargo = actor.task.cargo!;
@@ -724,6 +828,10 @@ export class RobotChoreographer {
                     this.stats.cargoReroutes++;
                 }
             }
+            // Yielding slows progress into another robot's path, not the movement needed
+            // to get out of that path. Scaling both terms made polite robots block the bay.
+            desiredX += avoidanceX;
+            desiredY += avoidanceY;
             const response = 1 - Math.exp(-dt * 7);
             actor.vx += (desiredX - actor.vx) * response;
             actor.vy += (desiredY - actor.vy) * response;
@@ -741,9 +849,11 @@ export class RobotChoreographer {
                 else { this.arrive(actor); }
             }
         }
+        for (const actor of this.actors) { this.updateNotice(actor); }
         if (this.now >= this.emitAt) {
             this.emitAt = this.now + 100;
             for (const actor of this.actors) {
+                if (actor.reservedAt !== null) { continue; }
                 if (actor.activity === 'weld' || actor.activity === 'assist') {
                     this.emit({ x: actor.x + 22, y: actor.y - 13 }, 'spark', '#ffcf7e');
                 } else if (!vehicleOf(actor).air && Math.hypot(actor.vx, actor.vy) > 30 && this.mode !== 'quiet') {
@@ -758,6 +868,23 @@ export class RobotChoreographer {
             particle.x += particle.vx * dt;
             particle.y += particle.vy * dt;
             particle.vy += dt * (particle.kind === 'confetti' ? 45 : 20);
+        }
+    }
+
+    private updateNotice(actor: Actor): void {
+        const candidate: Notice = actor.needsHelp ? 'SOS' : actor.yieldTo !== null ? 'After you?' : actor.activity === 'replan' ? 'Replan' : null;
+        if (candidate !== actor.noticeCandidate) {
+            actor.noticeCandidate = candidate;
+            actor.noticeCandidateSince = this.now;
+        }
+        if (candidate === actor.notice) { return; }
+        // Distress is immediate. Routine traffic must persist before appearing, and an
+        // existing badge remains readable through brief steering changes or clear frames.
+        const confirmed = this.now - actor.noticeCandidateSince >= (candidate ? ROBOT_LIMITS.noticeConfirmMs : ROBOT_LIMITS.noticeClearMs);
+        const readable = !actor.notice || this.now - actor.noticeSince >= ROBOT_LIMITS.noticeHoldMs;
+        if (candidate === 'SOS' || confirmed && readable) {
+            actor.notice = candidate;
+            actor.noticeSince = this.now;
         }
     }
 
@@ -794,7 +921,7 @@ function ellipse(ctx: Paint, x: number, y: number, rx: number, ry: number, fill:
     if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 1.2; ctx.stroke(); }
 }
 function label(ctx: Paint, text: string, x: number, y: number, color = '#bfd1e4', size = 8, align: CanvasTextAlign = 'center'): void {
-    ctx.fillStyle = color; ctx.font = '600 ' + size + 'px ui-monospace, monospace'; ctx.textAlign = align; ctx.fillText(text, x, y);
+    ctx.fillStyle = color; ctx.font = '600 ' + size + 'px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'; ctx.textAlign = align; ctx.fillText(text, x, y);
 }
 function bodyArtwork(ctx: Paint, vehicle: typeof ROBOT_VEHICLES[number]): void {
     const color = vehicle.color;
@@ -830,15 +957,21 @@ function bodyArtwork(ctx: Paint, vehicle: typeof ROBOT_VEHICLES[number]): void {
         }
     } else {
         if (vehicle.id === 'forklift') {
-            rounded(ctx, -25, -6, 41, 22, 5, panel);
-            rounded(ctx, -13, -25, 24, 25, 3, '#1a3149', '#ecbc5f');
-            line(ctx, [[-15, -27], [14, -27], [17, 7]], '#ffe4a0', 3);
-            rounded(ctx, -10, -20, 18, 10, 2, '#10243c');
-            rounded(ctx, -23, -12, 11, 8, 2, '#d99641');
-            line(ctx, [[22, -30], [22, 17], [29, 17]], LAB_INK, 5);
-            line(ctx, [[22, -28], [22, 15]], '#f1be5b', 2);
-            for (let y = -24; y < 14; y += 6) { line(ctx, [[21, y], [24, y + 2]], '#2d4055', 1); }
-            rounded(ctx, -7, -31, 8, 4, 2, '#ff906e');
+            // Navines' Gazebo prototype: blue base, metal lift rails and side manipulators.
+            rounded(ctx, -25, -4, 44, 21, 4, '#254c8d', '#99b9e9');
+            rounded(ctx, -20, -21, 34, 25, 3, '#a5b5bd', '#d5e0e5');
+            rounded(ctx, -12, -17, 21, 10, 2, '#10243c');
+            line(ctx, [[-18, -2], [10, -2]], '#5d707c', 1.2);
+            for (const x of [15, 23]) {
+                line(ctx, [[x, -38], [x, 17]], LAB_INK, 5);
+                line(ctx, [[x, -37], [x, 15]], '#c2d0d6', 2.6);
+            }
+            line(ctx, [[14, -37], [24, -37]], '#dce6eb', 3);
+            line(ctx, [[19, -32], [19, 12]], '#485f73', 1.3);
+            rounded(ctx, -7, -32, 15, 9, 2, '#c6d3da', '#5c7080');
+            ellipse(ctx, 0, -33, 5, 2.2, '#839ba9', '#cbdbe4');
+            ellipse(ctx, 7, -26, 1.7, 1.7, '#ffb45b');
+            line(ctx, [[-23, 9], [-15, 9]], '#7fe6fa', 1.7);
         } else if (vehicle.id === 'rover') {
             rounded(ctx, -25, -9, 48, 23, 5, panel);
             rounded(ctx, -17, -19, 34, 15, 4, '#28465c', '#efb5a2');
@@ -927,6 +1060,124 @@ function parcel(ctx: Paint, x: number, y: number, cargo: RobotCargo, angle = 0):
     ctx.restore();
 }
 
+export type RobotArtworkActor = Pick<RobotFrame['actors'][number],
+    'vehicle' | 'x' | 'y' | 'vx' | 'vy' | 'activity' | 'job' | 'temperament' | 'phase'
+    | 'distance' | 'needsHelp' | 'carrying' | 'cargo' | 'progress' | 'look' | 'notice'>;
+
+/** Shared vehicle artwork for the lab tableau and on-document deliveries. */
+export function paintRobotVehicle(ctx: Paint, actor: RobotArtworkActor, time: number, mode: RobotFrame['mode'] = 'dispatch', reduced = false, body?: HTMLCanvasElement): void {
+    const spec = vehicleOf(actor);
+    const moving = Math.hypot(actor.vx, actor.vy);
+    const panicking = mode === 'outage' && (actor.needsHelp || actor.activity === 'yield' || actor.activity === 'replan' || actor.activity === 'balance');
+    const scale = spec.air ? 0.83 : 0.86;
+    const quiet = reduced || mode === 'quiet' && actor.job !== 'delivery' && actor.job !== 'help' && moving < 2;
+    const bob = spec.air && !quiet ? Math.sin(time * (1.9 + actor.temperament) + actor.phase) * 1.2 : 0;
+    const bank = spec.air && !quiet ? clamp(actor.vx / 450 + actor.vy / 350, -0.2, 0.2) : 0;
+    ellipse(ctx, actor.x, spec.air ? 222 - (222 - actor.y) * 0.07 : actor.y + 17,
+        spec.air ? 15 : 22, spec.air ? 3 : 4, spec.air ? '#05111c35' : '#06132080');
+    ctx.save(); ctx.translate(actor.x, actor.y + bob); ctx.rotate(bank);
+    ctx.scale(scale, scale);
+    const gait = quiet ? actor.phase : actor.distance / 11;
+    if (actor.vehicle === 'walker' || actor.vehicle === 'hexapod') {
+        const feet = actor.vehicle === 'walker' ? [-17, -10, 11, 18] : [-19, -11, -3, 5, 13, 21];
+        feet.forEach((hip, index) => {
+            const phase = gait + (index % 2) * Math.PI;
+            const stride = moving > 2 && !quiet ? Math.sin(phase) * 7 : 0;
+            const lift = moving > 2 && !quiet ? Math.max(0, Math.cos(phase)) * 6 : 0;
+            const foot = { x: hip + stride + (index % 2 ? 4 : -4), y: 23 - lift };
+            const knee = { x: hip + 6 * (index % 2 ? 1 : -1) + stride * 0.4, y: 10 };
+            line(ctx, [[hip, 2], [knee.x, knee.y], [foot.x, foot.y]], LAB_INK, 5);
+            line(ctx, [[hip, 2], [knee.x, knee.y], [foot.x, foot.y]], index % 2 ? spec.color : '#677c95', 2.7);
+            ellipse(ctx, knee.x, knee.y, 2.1, 2.1, '#d4d9e6');
+            rounded(ctx, foot.x - 3, foot.y - 1, 7, 3, 1, '#20303e', '');
+        });
+    }
+    if (body) {
+        ctx.drawImage(body, -ROBOT_ARTWORK_SIZE.width / 2, -ROBOT_ARTWORK_SIZE.height / 2, ROBOT_ARTWORK_SIZE.width, ROBOT_ARTWORK_SIZE.height);
+    } else { bodyArtwork(ctx, spec); }
+    if (!spec.air && actor.vehicle !== 'walker' && actor.vehicle !== 'hexapod') {
+        const wheels = actor.vehicle === 'rover' ? [-20, 0, 20] : [-17, 16];
+        for (const x of wheels) {
+            const angle = quiet ? 0 : actor.distance / 7;
+            line(ctx, [[x - Math.cos(angle) * 3.7, 14 - Math.sin(angle) * 3.7], [x + Math.cos(angle) * 3.7, 14 + Math.sin(angle) * 3.7]], '#d4e0e5', 1);
+        }
+    }
+    if (spec.air) {
+        const motors = ROTOR_LAYOUT[actor.vehicle]!;
+        motors.forEach(([x, y], index) => {
+            const phase = quiet ? index : time * (38 + actor.temperament * 5) + index;
+            ctx.save(); ctx.translate(x, y - 3); ctx.scale(1, 0.32);
+            ctx.rotate(phase);
+            ellipse(ctx, 0, 0, 13, 2, quiet ? '#8ba6b966' : '#c1e8ec80');
+            ellipse(ctx, 0, 0, 2, 13, quiet ? '#6f879966' : '#8ec6d280');
+            ctx.restore();
+        });
+    }
+    let faceX = 0, faceY = -5;
+    if (actor.vehicle === 'rover') { faceY = -11; }
+    if (actor.vehicle === 'mecanum') { faceX = 13; faceY = -6; }
+    if (actor.vehicle === 'forklift') { faceX = -1; faceY = -12; }
+    if (actor.vehicle === 'hexapod') { faceY = -8; }
+    if (actor.vehicle === 'walker') { faceX = 21; faceY = -11; }
+    const sleeping = actor.activity === 'sleep' || mode === 'quiet' && actor.job !== 'delivery';
+    const blink = sleeping || !quiet && Math.sin(time * 1.4 + actor.phase) > 0.995;
+    for (const side of [-1, 1]) {
+        const ex = faceX + side * (actor.vehicle === 'walker' || actor.vehicle === 'mecanum' ? 2.6 : 4);
+        if (blink) { line(ctx, [[ex - 2, faceY], [ex + 2, faceY]], '#9adbcf', 1.2); }
+        else {
+            ellipse(ctx, ex, faceY, panicking ? 2.9 : 2, panicking ? 3.3 : 2.5, panicking ? '#fff4dc' : '#a2eddd');
+            ellipse(ctx, ex + actor.look * 0.8, faceY + (panicking ? 0.6 : 0), 0.8, 1.2, LAB_INK);
+        }
+    }
+    if (panicking) {
+        line(ctx, [[faceX - 6, faceY - 5], [faceX - 2, faceY - 6]], '#fff0c5', 1);
+        line(ctx, [[faceX + 2, faceY - 6], [faceX + 6, faceY - 4]], '#fff0c5', 1);
+        const sway = quiet ? 0 : Math.sin(time * 8 + actor.phase) * 1.5;
+        ctx.beginPath(); ctx.moveTo(faceX + 11, faceY - 7 + sway);
+        ctx.quadraticCurveTo(faceX + 17, faceY - 1 + sway, faceX + 12, faceY + 1 + sway);
+        ctx.quadraticCurveTo(faceX + 8, faceY - 1 + sway, faceX + 11, faceY - 7 + sway);
+        ctx.fillStyle = '#8addf5'; ctx.fill();
+    }
+    const gesturing = ['weld', 'assist', 'signal', 'calibrate', 'balance', 'read', 'celebrate'].includes(actor.activity);
+    if (actor.vehicle === 'mecanum' || actor.vehicle === 'rover') {
+        const reach = actor.carrying ? { x: 24, y: -20 }
+            : actor.activity === 'celebrate' ? { x: 8 + Math.sin(time * 5) * 12, y: -43 }
+                : gesturing ? { x: 25, y: -16 + Math.sin(time * 3 + actor.phase) * 5 } : { x: -12, y: -28 };
+        drawArm(ctx, { x: -9, y: -10 }, reach, spec.color, actor.activity === 'load' ? 6 : 2.5);
+    }
+    if (actor.vehicle === 'heavyquad' && (gesturing || actor.carrying)) {
+        drawArm(ctx, { x: 0, y: 14 }, { x: actor.carrying ? 2 : 25, y: actor.carrying ? 37 : 30 }, spec.color, actor.carrying ? 2 : 5);
+    }
+    if (actor.vehicle === 'forklift') {
+        const lift = actor.carrying ? actor.activity === 'unload' ? 10 + actor.progress * 25 : 12
+            : actor.activity === 'lift' ? 8 + Math.sin(time * 2) * 12 : 0;
+        line(ctx, [[16, 11 - lift], [42, 11 - lift]], '#7ea7df', 3);
+        line(ctx, [[23, 15 - lift], [43, 15 - lift]], '#a3bed8', 2);
+        const handling = actor.carrying || ['load', 'unload', 'lift'].includes(actor.activity);
+        const reach = handling ? { x: 31, y: -18 - lift * 0.45 }
+            : gesturing ? { x: -25, y: -32 + Math.sin(time * 3 + actor.phase) * 5 } : { x: -27, y: -6 };
+        drawArm(ctx, { x: -17, y: -20 }, reach, '#d7dee3', actor.activity === 'load' ? 5 : 2.5);
+        drawArm(ctx, { x: 10, y: -25 }, handling ? { x: 36, y: reach.y - 8 } : { x: 27, y: -29 }, '#a7b7c3', actor.activity === 'load' ? 5 : 2);
+    }
+    if (actor.carrying && actor.cargo) {
+        if (spec.air) {
+            line(ctx, [[-7, 14], [-7, 33], [0, 38], [7, 33], [7, 14]], '#9cbdc6', 1);
+            parcel(ctx, 0, 36, actor.cargo, quiet ? 0 : -bank * 0.8 + Math.sin(time * 2 + actor.phase) * 0.07);
+        } else {
+            const lift = actor.vehicle === 'forklift' && actor.activity === 'unload' ? actor.progress * 24 : 0;
+            parcel(ctx, actor.vehicle === 'forklift' ? 33 : 19, -18 - lift, actor.cargo);
+        }
+    }
+    if (actor.notice) {
+        const text = actor.notice;
+        const width = text.length * 4.2 + 8;
+        rounded(ctx, -width / 2, -45, width, 13, 4, '#ffebc9', '#bb8755');
+        label(ctx, text, 0, -36, '#62412d', 6);
+    }
+    label(ctx, spec.name, 0, spec.air ? -27 : 37, '#9fb7c9', 6);
+    ctx.restore();
+}
+
 class RobotStagePainter {
     private readonly context: Paint;
     private readonly background: HTMLCanvasElement;
@@ -945,9 +1196,9 @@ class RobotStagePainter {
         this.paintBackground(bg);
         for (const vehicle of ROBOT_VEHICLES) {
             const image = doc.createElement('canvas');
-            image.width = Math.ceil(128 * this.ratio); image.height = Math.ceil(100 * this.ratio);
+            image.width = Math.ceil(ROBOT_ARTWORK_SIZE.width * this.ratio); image.height = Math.ceil(ROBOT_ARTWORK_SIZE.height * this.ratio);
             const ctx = image.getContext('2d')!;
-            ctx.scale(this.ratio, this.ratio); ctx.translate(64, 50);
+            ctx.scale(this.ratio, this.ratio); ctx.translate(ROBOT_ARTWORK_SIZE.width / 2, ROBOT_ARTWORK_SIZE.height / 2);
             bodyArtwork(ctx, vehicle);
             this.bodies.set(vehicle.id, image);
         }
@@ -965,18 +1216,18 @@ class RobotStagePainter {
             rounded(ctx, 20, y, 32, 9, 2, '#20374e', '#4a5e72');
             ellipse(ctx, 25, y + 4, 1.3, 1.3, '#79dbc9');
         }
-        label(ctx, 'FETCH', 37, 104, '#91b4ce', 9);
+        label(ctx, 'Fetch', 37, 104, '#91b4ce', 9);
         rounded(ctx, 401, 92, 66, 114, 4, '#162839', '#50677c');
         for (let index = 0; index < 3; index++) {
             const y = 111 + index * 34;
             line(ctx, [[404, y + 17], [464, y + 17]], '#657d8e', 2);
-            label(ctx, ['PAGES', 'PREVIEWS', 'BYTES'][index], 434, y - 8, '#91b4ce', 7);
+            label(ctx, ['Pages', 'Previews', 'Bytes'][index], 434, y - 8, '#91b4ce', 7);
             for (let sheet = 0; sheet < 4; sheet++) {
                 rounded(ctx, 412 + sheet * 10, y - 2, 7, 15, 1, ['#a2cfb3', '#78a6c5', '#ba9563'][index], '#385367');
             }
         }
         ctx.setLineDash([3, 6]); line(ctx, [[70, 223], [395, 223]], '#467183', 1); ctx.setLineDash([]);
-        label(ctx, 'L A R I C S   /   F L E E T   D I S P A T C H', 18, 21, '#7698b4', 7, 'left');
+        label(ctx, 'LARICS Fleet dispatch', 18, 21, '#7698b4', 9, 'left');
         for (const [x, y] of [[112, 41], [359, 33], [298, 119], [79, 82]]) {
             line(ctx, [[x - 3, y], [x + 3, y]], '#354f69', 0.8);
             line(ctx, [[x, y - 3], [x, y + 3]], '#354f69', 0.8);
@@ -992,19 +1243,20 @@ class RobotStagePainter {
         const panic = frame.mode === 'outage';
         ellipse(ctx, 457, 20, 3, 3, panic ? '#ff9a7d' : frame.mode === 'quiet' ? '#b5a7df' : '#70e7d3');
         label(ctx, frame.missingPage === null ? 'viewport supplied' : 'waiting for p.' + frame.missingPage, 454, 36, panic ? '#ffbaa0' : '#96afc5', 7, 'right');
-        label(ctx, frame.queuedCargo.length + ' queued · ' + frame.pending + ' preparing', 20, 240, '#8aa8be', 7, 'left');
+        label(ctx, frame.queuedCargo.length + ' queued; ' + frame.pending + ' preparing', 20, 240, '#8aa8be', 7, 'left');
         label(ctx, frame.stats.deliveredCargo + ' arrivals', 458, 240, '#8aa8be', 7, 'right');
         for (const prop of frame.props) { this.paintProp(ctx, prop, time, frame); }
         if (frame.mode === 'quiet') { this.paintQuiet(ctx, frame); }
         for (const actor of frame.actors) {
+            if (actor.outside) { continue; }
             if (actor.partner === null || actor.job !== 'help') { continue; }
-            const other = frame.actors.find(candidate => candidate.id === actor.partner);
+            const other = frame.actors.find(candidate => !candidate.outside && candidate.id === actor.partner);
             if (!other) { continue; }
             ctx.setLineDash([2, 3]);
             line(ctx, [[actor.x, actor.y + 10], [other.x, other.y - 10]], '#6cddcc', 1.2);
             ctx.setLineDash([]);
         }
-        const ordered = [...frame.actors].sort((a, b) => a.y - b.y);
+        const ordered = frame.actors.filter(actor => !actor.outside).sort((a, b) => a.y - b.y);
         for (const actor of ordered) { this.paintActor(ctx, actor, frame, time, reduced); }
         if (!reduced) {
             for (const particle of frame.particles) {
@@ -1021,109 +1273,7 @@ class RobotStagePainter {
     }
 
     private paintActor(ctx: Paint, actor: RobotFrame['actors'][number], frame: RobotFrame, time: number, reduced: boolean): void {
-        const spec = vehicleOf(actor);
-        const moving = Math.hypot(actor.vx, actor.vy);
-        const panicking = frame.mode === 'outage' && (actor.needsHelp || actor.activity === 'yield' || actor.activity === 'replan' || actor.activity === 'balance');
-        const scale = spec.air ? 0.83 : 0.86;
-        const quiet = reduced || frame.mode === 'quiet' && actor.job !== 'delivery' && actor.job !== 'help' && moving < 2;
-        const bob = spec.air && !quiet ? Math.sin(time * (1.9 + actor.temperament) + actor.phase) * 1.2 : 0;
-        const bank = spec.air && !quiet ? clamp(actor.vx / 450 + actor.vy / 350, -0.2, 0.2) : 0;
-        ellipse(ctx, actor.x, spec.air ? 222 - (222 - actor.y) * 0.07 : actor.y + 17,
-            spec.air ? 15 : 22, spec.air ? 3 : 4, spec.air ? '#05111c35' : '#06132080');
-        ctx.save(); ctx.translate(actor.x, actor.y + bob); ctx.rotate(bank);
-        ctx.scale(scale, scale);
-        const gait = quiet ? actor.phase : actor.distance / 11;
-        if (actor.vehicle === 'walker' || actor.vehicle === 'hexapod') {
-            const feet = actor.vehicle === 'walker' ? [-17, -10, 11, 18] : [-19, -11, -3, 5, 13, 21];
-            feet.forEach((hip, index) => {
-                const phase = gait + (index % 2) * Math.PI;
-                const stride = moving > 2 && !quiet ? Math.sin(phase) * 7 : 0;
-                const lift = moving > 2 && !quiet ? Math.max(0, Math.cos(phase)) * 6 : 0;
-                const foot = { x: hip + stride + (index % 2 ? 4 : -4), y: 23 - lift };
-                const knee = { x: hip + 6 * (index % 2 ? 1 : -1) + stride * 0.4, y: 10 };
-                line(ctx, [[hip, 2], [knee.x, knee.y], [foot.x, foot.y]], LAB_INK, 5);
-                line(ctx, [[hip, 2], [knee.x, knee.y], [foot.x, foot.y]], index % 2 ? spec.color : '#677c95', 2.7);
-                ellipse(ctx, knee.x, knee.y, 2.1, 2.1, '#d4d9e6');
-                rounded(ctx, foot.x - 3, foot.y - 1, 7, 3, 1, '#20303e', '');
-            });
-        }
-        ctx.drawImage(this.bodies.get(actor.vehicle)!, -64, -50, 128, 100);
-        if (!spec.air && actor.vehicle !== 'walker' && actor.vehicle !== 'hexapod') {
-            const wheels = actor.vehicle === 'rover' ? [-20, 0, 20] : [-17, 16];
-            for (const x of wheels) {
-                const angle = quiet ? 0 : actor.distance / 7;
-                line(ctx, [[x - Math.cos(angle) * 3.7, 14 - Math.sin(angle) * 3.7], [x + Math.cos(angle) * 3.7, 14 + Math.sin(angle) * 3.7]], '#d4e0e5', 1);
-            }
-        }
-        if (spec.air) {
-            const motors = ROTOR_LAYOUT[actor.vehicle]!;
-            motors.forEach(([x, y], index) => {
-                const phase = quiet ? index : time * (38 + actor.temperament * 5) + index;
-                ctx.save(); ctx.translate(x, y - 3); ctx.scale(1, 0.32);
-                ctx.rotate(phase);
-                ellipse(ctx, 0, 0, 13, 2, quiet ? '#8ba6b966' : '#c1e8ec80');
-                ellipse(ctx, 0, 0, 2, 13, quiet ? '#6f879966' : '#8ec6d280');
-                ctx.restore();
-            });
-        }
-        let faceX = 0, faceY = -5;
-        if (actor.vehicle === 'rover') { faceY = -11; }
-        if (actor.vehicle === 'mecanum') { faceX = 13; faceY = -6; }
-        if (actor.vehicle === 'forklift') { faceX = -1; faceY = -15; }
-        if (actor.vehicle === 'hexapod') { faceY = -8; }
-        if (actor.vehicle === 'walker') { faceX = 21; faceY = -11; }
-        const sleeping = actor.activity === 'sleep' || frame.mode === 'quiet' && actor.job !== 'delivery';
-        const blink = sleeping || !quiet && Math.sin(time * 1.4 + actor.phase) > 0.995;
-        for (const side of [-1, 1]) {
-            const ex = faceX + side * (actor.vehicle === 'walker' || actor.vehicle === 'mecanum' ? 2.6 : 4);
-            if (blink) { line(ctx, [[ex - 2, faceY], [ex + 2, faceY]], '#9adbcf', 1.2); }
-            else {
-                ellipse(ctx, ex, faceY, panicking ? 2.9 : 2, panicking ? 3.3 : 2.5, panicking ? '#fff4dc' : '#a2eddd');
-                ellipse(ctx, ex + actor.look * 0.8, faceY + (panicking ? 0.6 : 0), 0.8, 1.2, LAB_INK);
-            }
-        }
-        if (panicking) {
-            line(ctx, [[faceX - 6, faceY - 5], [faceX - 2, faceY - 6]], '#fff0c5', 1);
-            line(ctx, [[faceX + 2, faceY - 6], [faceX + 6, faceY - 4]], '#fff0c5', 1);
-            const sway = quiet ? 0 : Math.sin(time * 8 + actor.phase) * 1.5;
-            ctx.beginPath(); ctx.moveTo(faceX + 11, faceY - 7 + sway);
-            ctx.quadraticCurveTo(faceX + 17, faceY - 1 + sway, faceX + 12, faceY + 1 + sway);
-            ctx.quadraticCurveTo(faceX + 8, faceY - 1 + sway, faceX + 11, faceY - 7 + sway);
-            ctx.fillStyle = '#8addf5'; ctx.fill();
-        }
-        const gesturing = ['weld', 'assist', 'signal', 'calibrate', 'balance', 'read', 'celebrate'].includes(actor.activity);
-        if (actor.vehicle === 'mecanum' || actor.vehicle === 'rover') {
-            const reach = actor.carrying ? { x: 24, y: -20 }
-                : actor.activity === 'celebrate' ? { x: 8 + Math.sin(time * 5) * 12, y: -43 }
-                    : gesturing ? { x: 25, y: -16 + Math.sin(time * 3 + actor.phase) * 5 } : { x: -12, y: -28 };
-            drawArm(ctx, { x: -9, y: -10 }, reach, spec.color, actor.activity === 'load' ? 6 : 2.5);
-        }
-        if (actor.vehicle === 'heavyquad' && (gesturing || actor.carrying)) {
-            drawArm(ctx, { x: 0, y: 14 }, { x: actor.carrying ? 2 : 25, y: actor.carrying ? 37 : 30 }, spec.color, actor.carrying ? 2 : 5);
-        }
-        if (actor.vehicle === 'forklift') {
-            const lift = actor.carrying ? actor.activity === 'unload' ? 10 + actor.progress * 25 : 12
-                : actor.activity === 'lift' ? 8 + Math.sin(time * 2) * 12 : 0;
-            line(ctx, [[21, 12 - lift], [39, 12 - lift]], '#e6c37b', 3);
-            line(ctx, [[21, 16 - lift], [38, 16 - lift]], '#809aaa', 1);
-        }
-        if (actor.carrying && actor.cargo) {
-            if (spec.air) {
-                line(ctx, [[-7, 14], [-7, 33], [0, 38], [7, 33], [7, 14]], '#9cbdc6', 1);
-                parcel(ctx, 0, 36, actor.cargo, quiet ? 0 : -bank * 0.8 + Math.sin(time * 2 + actor.phase) * 0.07);
-            } else {
-                const lift = actor.vehicle === 'forklift' && actor.activity === 'unload' ? actor.progress * 24 : 0;
-                parcel(ctx, actor.vehicle === 'forklift' ? 33 : 19, -18 - lift, actor.cargo);
-            }
-        }
-        if (actor.needsHelp || actor.yieldTo !== null || actor.activity === 'replan') {
-            const text = actor.needsHelp ? 'SOS' : actor.yieldTo !== null ? 'after you?' : 'REPLAN';
-            const width = text.length * 4.2 + 8;
-            rounded(ctx, -width / 2, -45, width, 13, 4, '#ffebc9', '#bb8755');
-            label(ctx, text, 0, -36, '#62412d', 6);
-        }
-        label(ctx, spec.name, 0, spec.air ? -27 : 37, '#9fb7c9', 6);
-        ctx.restore();
+        paintRobotVehicle(ctx, actor, time, frame.mode, reduced, this.bodies.get(actor.vehicle));
     }
 
     private paintProp(ctx: Paint, prop: SceneProp, time: number, frame: RobotFrame): void {
@@ -1150,7 +1300,7 @@ class RobotStagePainter {
             label(ctx, prop.label!, 0, 26, '#dce3b4', 7); break;
         case 'rescue':
             ctx.setLineDash([4, 3]); ellipse(ctx, 0, 4, 29, 8, '#ff9b6a0d', '#ba8a67'); ctx.setLineDash([]);
-            label(ctx, 'RETRIEVAL ZONE', 0, 18, '#d0ab84', 6); break;
+            label(ctx, 'Retrieval zone', 0, 18, '#d0ab84', 6); break;
         case 'traffic':
             rounded(ctx, -7, -25, 14, 29, 3, '#182638', '#9bb0b6');
             ellipse(ctx, 0, -18, 3, 3, time % 4 < 2 ? '#ff9a7d' : '#49382d');
@@ -1220,7 +1370,7 @@ class RobotStagePainter {
         case 'waiting-sign':
             line(ctx, [[0, -2], [0, 25]], '#9a9b85', 2);
             rounded(ctx, -32, -23, 64, 24, 2, '#c5b68d', '#e4d5a8');
-            label(ctx, 'FETCHING…', 0, -8, '#5b503d', 7); break;
+            label(ctx, 'Fetching…', 0, -8, '#5b503d', 7); break;
         }
         ctx.restore();
     }
@@ -1232,7 +1382,7 @@ class RobotStagePainter {
             ellipse(ctx, 218, 208, 22, 6, '#d7ac69');
             ellipse(ctx, 218, 207, 18, 4, '#c56f58');
             for (const [x, y] of [[207, 206], [219, 205], [229, 208]]) { ellipse(ctx, x, y, 2, 1.5, '#a9bf72'); }
-            rounded(ctx, 180, 193, 10, 19, 1, '#d9d4bf', '#b7b29b'); label(ctx, 'FLOUR', 185, 205, '#7b7965', 4);
+            rounded(ctx, 180, 193, 10, 19, 1, '#d9d4bf', '#b7b29b'); label(ctx, 'Flour', 185, 205, '#7b7965', 4);
         }
         if (details.has(2)) {
             for (let index = 0; index < 3; index++) {
@@ -1279,10 +1429,19 @@ class RobotStagePainter {
 
 
 export interface RobotLab {
+    readonly dispatch: RobotDispatchPort;
     setActive(active: boolean): void;
     update(input: RobotTelemetry): void;
     snapshot(): RobotFrame & { renderer: { active: boolean; scheduled: boolean; reducedMotion: boolean; frames: number; meanDrawMs: number; maxDrawMs: number } };
     dispose(): void;
+}
+
+function telemetryKey(input: RobotTelemetry): string {
+    const event = input.performance?.events?.at(-1);
+    return JSON.stringify([
+        input.starved, input.visibleMissing, input.visible, input.pending, input.safetySeconds,
+        input.velocityPxPerMs, input.direction, input.previewPages, event?.sequence, event?.at, event?.type,
+    ]);
 }
 
 /** The diagnostics tick supplies data; animation frames reuse it without sampling the PDF. */
@@ -1304,6 +1463,8 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     const painter = new RobotStagePainter(canvas);
     const media = win.matchMedia('(prefers-reduced-motion: reduce)');
     let input: RobotTelemetry = {};
+    let inputKey = telemetryKey(input);
+    let inputPending = false;
     let active = false;
     let inView = true;
     let disposed = false;
@@ -1312,6 +1473,18 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     let frames = 0, totalDrawMs = 0, maxDrawMs = 0;
     let latest = model.snapshot();
 
+    function consumeInput(now: number): boolean {
+        if (!inputPending) { return false; }
+        inputPending = false;
+        const key = telemetryKey(input);
+        model.update(now, input);
+        const state = model.snapshot();
+        const changed = key !== inputKey || state.mode !== latest.mode || state.scene !== latest.scene
+            || state.caption !== latest.caption || state.actors.some((actor, index) => actor.notice !== latest.actors[index].notice);
+        inputKey = key;
+        return changed;
+    }
+
     function render(now: number): void {
         const started = win.performance.now();
         latest = media.matches ? model.snapshot() : model.step(now);
@@ -1319,8 +1492,8 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
         if (caption.textContent !== latest.caption) { caption.textContent = latest.caption; }
         const working = latest.actors.filter(actor => actor.job === 'delivery').length;
         const text = latest.mode === 'quiet'
-            ? 'Waiting tableau · the outage repertoire has finished'
-            : working + ' couriers · ' + latest.stats.yields + ' yields · ' + latest.stats.assists + ' assists · ' + latest.stats.replans + ' replans';
+            ? 'Waiting tableau; the outage repertoire has finished'
+            : working + ' couriers; ' + latest.stats.yields + ' yields; ' + latest.stats.assists + ' assists; ' + latest.stats.replans + ' replans';
         if (activity.textContent !== text) { activity.textContent = text; }
         stage.dataset.mode = latest.mode;
         stage.dataset.scene = latest.scene;
@@ -1347,15 +1520,16 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     }
 
     function wantsAnimation(): boolean {
-        return latest.mode !== 'quiet' || latest.particles.length > 0 || latest.actors.some(actor =>
-            actor.job === 'delivery' || actor.job === 'help' || Math.hypot(actor.vx, actor.vy) > 2);
+        return model.needsAnimation();
     }
 
     function schedule(): void {
         cancel();
         if (!active || disposed || doc.hidden || !inView) { return; }
-        render(win.performance.now());
-        lastDraw = win.performance.now();
+        const now = win.performance.now();
+        consumeInput(now);
+        render(now);
+        lastDraw = now;
         if (!media.matches && wantsAnimation()) { raf = win.requestAnimationFrame(loop); }
     }
 
@@ -1365,8 +1539,13 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     }
 
     function motionChanged(): void { schedule(); }
+    function inputChanged(): void { if (raf === undefined) { schedule(); } }
     doc.addEventListener('visibilitychange', visibility);
+    doc.addEventListener('pointerdown', inputChanged, { passive: true });
+    doc.addEventListener('keydown', inputChanged);
     media.addEventListener('change', motionChanged);
+    const sizeObserver = new win.ResizeObserver(() => schedule());
+    sizeObserver.observe(stage);
     const observer = new win.IntersectionObserver(entries => {
         const entry = entries[entries.length - 1];
         inView = !!entry?.isIntersecting;
@@ -1374,12 +1553,53 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     });
     observer.observe(stage);
 
+    function viewportPoint(point: Point): RobotDispatchPoint {
+        const rect = canvas.getBoundingClientRect();
+        const style = win.getComputedStyle(canvas);
+        let width = rect.width, height = rect.height;
+        if (style.objectFit === 'contain' || style.objectFit === 'cover') {
+            const scale = (style.objectFit === 'cover' ? Math.max : Math.min)(
+                rect.width / ROBOT_LIMITS.width, rect.height / ROBOT_LIMITS.height);
+            width = ROBOT_LIMITS.width * scale;
+            height = ROBOT_LIMITS.height * scale;
+        }
+        const positions = style.objectPosition.split(/\s+/);
+        const offset = (value: string | undefined, remaining: number) => value?.endsWith('%')
+            ? remaining * parseFloat(value) / 100 : value && Number.isFinite(parseFloat(value)) ? parseFloat(value) : remaining / 2;
+        return {
+            x: rect.left + offset(positions[0], rect.width - width) + point.x / ROBOT_LIMITS.width * width,
+            y: rect.top + offset(positions[1], rect.height - height) + point.y / ROBOT_LIMITS.height * height,
+            scale: Math.min(width / ROBOT_LIMITS.width, height / ROBOT_LIMITS.height),
+        };
+    }
+
     const api: RobotLab = {
+        dispatch: {
+            reserve(vehicle) {
+                if (!active || disposed || doc.hidden || !inView) { return; }
+                const point = model.reserveVehicle(vehicle, win.performance.now());
+                if (!point) { return; }
+                schedule();
+                return viewportPoint(point);
+            },
+            destination(vehicle) {
+                if (!active || disposed || doc.hidden || !inView) { return; }
+                const point = model.reservedPosition(vehicle);
+                return point ? viewportPoint(point) : undefined;
+            },
+            release(vehicle) {
+                model.returnVehicle(vehicle, win.performance.now());
+                if (!disposed && active && !doc.hidden && inView) { schedule(); }
+                else { latest = model.snapshot(); }
+            },
+        },
         setActive(value): void {
             if (disposed || active === value) { return; }
             active = value;
             if (active) {
                 model.open(win.performance.now(), input);
+                inputKey = telemetryKey(input);
+                inputPending = false;
                 schedule();
             } else {
                 cancel();
@@ -1387,10 +1607,12 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
         },
         update(value): void {
             input = value;
+            inputPending = true;
             if (!active || disposed || doc.hidden || !inView) { return; }
-            model.update(win.performance.now(), value);
-            if (media.matches) { render(win.performance.now()); }
-            else if (raf === undefined) { schedule(); }
+            const now = win.performance.now();
+            const changed = consumeInput(now);
+            if (media.matches) { if (changed) { render(now); } }
+            else if (raf === undefined && (changed || wantsAnimation())) { schedule(); }
         },
         snapshot() {
             return {
@@ -1407,7 +1629,10 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
             active = false;
             cancel();
             observer.disconnect();
+            sizeObserver.disconnect();
             doc.removeEventListener('visibilitychange', visibility);
+            doc.removeEventListener('pointerdown', inputChanged);
+            doc.removeEventListener('keydown', inputChanged);
             media.removeEventListener('change', motionChanged);
             painter.dispose();
             stage.replaceChildren();

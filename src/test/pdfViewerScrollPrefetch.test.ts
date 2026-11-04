@@ -27,8 +27,14 @@ interface Dynamics {
 describe('shared PDF scroll prefetch policy', function () {
     this.timeout(30 * 1000);
     let dir: string | undefined;
-    // eslint-disable-next-line @typescript-eslint/naming-convention -- names of the module's public exports
-    let policy: { ScrollPrefetchDynamics: new () => Dynamics; PREFETCH_LIMITS: Readonly<Record<string, number>> };
+    let policy: {
+        // eslint-disable-next-line @typescript-eslint/naming-convention -- name of the module's public export
+        ScrollPrefetchDynamics: new () => Dynamics;
+        // eslint-disable-next-line @typescript-eslint/naming-convention -- name of the module's public export
+        PREFETCH_LIMITS: Readonly<Record<string, number>>;
+        pdfCachePolicy: (device?: Record<string, unknown>) => { name: string; rangeCacheBytes: number; pruneOffscreen: boolean; limits: Readonly<Record<string, number>> };
+        pdfDocumentCacheOptions: (device?: Record<string, unknown>) => { rangeCacheBytes: number; adaptiveImageDecoding: boolean; imageDecodeConcurrency: number };
+    };
 
     before(async () => {
         const { bundleOptions, viewerRoot } = await importModule(path.join(repo, 'scripts', 'build-pdf-viewer.mjs'));
@@ -205,5 +211,36 @@ describe('shared PDF scroll prefetch policy', function () {
         assert.ok(limits.maxPreparedPages >= limits.maxRenderedPages, 'preparation includes the native render window');
         assert.ok(limits.maxConcurrentPrepares <= limits.maxPreparedPages, 'concurrent preparation fits within the plan');
         assert.ok(limits.maxPreviewBytes >= limits.previewMaxDimension ** 2 * 4, 'the preview cache can retain one maximum-sized RGBA raster');
+    });
+
+    it('selects bounded mobile caches for phones and desktop-mode iPads', () => {
+        const desktop = policy.pdfCachePolicy({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', maxTouchPoints: 10 });
+        assert.strictEqual(desktop.name, 'desktop', 'a touchscreen laptop keeps the desktop policy');
+        assert.strictEqual(desktop.rangeCacheBytes, 128 * 1024 * 1024);
+        assert.strictEqual(desktop.pruneOffscreen, false);
+        assert.deepStrictEqual(policy.pdfDocumentCacheOptions({ userAgent: 'desktop' }), {
+            rangeCacheBytes: 128 * 1024 * 1024, adaptiveImageDecoding: false, imageDecodeConcurrency: 0,
+        });
+        for (const device of [
+            { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 27_2 like Mac OS X)', maxTouchPoints: 5 },
+            { userAgent: 'Mozilla/5.0 (Linux; Android 16)', maxTouchPoints: 5 },
+            { userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15)', maxTouchPoints: 5 },
+            { userAgent: 'future browser', userAgentData: { mobile: true } },
+        ]) {
+            const mobile = policy.pdfCachePolicy(device);
+            assert.strictEqual(mobile.name, 'mobile');
+            assert.strictEqual(mobile.rangeCacheBytes, 32 * 1024 * 1024);
+            assert.strictEqual(mobile.pruneOffscreen, true);
+            assert.deepStrictEqual(policy.pdfDocumentCacheOptions(device), {
+                rangeCacheBytes: 32 * 1024 * 1024, adaptiveImageDecoding: true, imageDecodeConcurrency: 1,
+            });
+            assert.ok(Object.isFrozen(mobile) && Object.isFrozen(mobile.limits));
+            for (const name of ['maxPreparedPages', 'maxConcurrentPrepares', 'maxRenderedPages', 'maxCanvasBytes', 'maxPreviewBytes', 'previewMaxDimension', 'trailPreviewMaxDimension']) {
+                assert.ok(mobile.limits[name] < desktop.limits[name], name + ' shrinks on mobile');
+            }
+            assert.strictEqual(mobile.limits.maxPreviewPages, 128, 'small trail rasters retain a useful revisit history');
+            assert.strictEqual(mobile.limits.trailPreviewMaxDimension, 192);
+        }
+        assert.strictEqual(policy.pdfCachePolicy({ userAgent: 'Mozilla/5.0 (Macintosh)', maxTouchPoints: 0 }).name, 'desktop');
     });
 });

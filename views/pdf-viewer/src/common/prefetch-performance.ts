@@ -1,4 +1,4 @@
-import { installPrefetchRobots, type RobotLab } from './prefetch-robots';
+import { installPrefetchRobots, type RobotDispatchPort, type RobotLab } from './prefetch-robots';
 
 /** Bounded measurements shared by both PDF viewers and their fetch bridge. */
 export const PERFORMANCE_LIMITS = Object.freeze({
@@ -20,6 +20,15 @@ export interface PerformanceEvent {
     data: EventData;
 }
 interface FetchSample { at: number; start: number; bytes: number }
+
+export interface DiskCacheSnapshot {
+    storedBytes: number;
+    totalBytes: number;
+    diskBytes: number;
+    budgetBytes: number;
+    filling: boolean;
+    complete: boolean;
+}
 
 /** Fixed storage also bounds diagnostics when a viewer stays open for days. */
 class Ring<T> {
@@ -65,6 +74,7 @@ export class PdfPerformance {
     private fetchLastDurationMs = 0;
     private firstFetchAt = Infinity;
     private startedAt = 0;
+    private diskCache?: DiskCacheSnapshot;
 
     constructor(private readonly now: () => number = () => performance.now()) {
         this.startedAt = now();
@@ -74,6 +84,14 @@ export class PdfPerformance {
 
     /** Constant-time admission signal; reading this does not copy diagnostic history. */
     get oldestFetchMs(): number { return this.ageOfOldestFetch(this.now()); }
+
+    /** Keep one numeric host-cache report; URLs, document text and build identifiers stay out. */
+    setDiskCache(value?: DiskCacheSnapshot): void {
+        if (!value) { this.diskCache = undefined; return; }
+        const { storedBytes, totalBytes, diskBytes, budgetBytes, filling, complete } = value;
+        if (![storedBytes, totalBytes, diskBytes, budgetBytes].every(bytes => Number.isSafeInteger(bytes) && bytes >= 0)) { return; }
+        this.diskCache = { storedBytes, totalBytes, diskBytes, budgetBytes, filling: !!filling, complete: !!complete };
+    }
 
     private ageOfOldestFetch(at: number): number {
         const first = this.activeFetches.values().next();
@@ -172,6 +190,7 @@ export class PdfPerformance {
             fetchWindowMs: windowMs,
             fetchLastDurationMs: this.fetchLastDurationMs,
             fetchAverageDurationMs: this.fetchCount ? this.fetchDurationMs / this.fetchCount : 0,
+            diskCache: this.diskCache ? { ...this.diskCache } : undefined,
         };
     }
 
@@ -182,11 +201,22 @@ export class PdfPerformance {
         this.eventCount = this.fetchBytes = this.fetchCount = this.fetchDurationMs = this.fetchLastDurationMs = 0;
         this.firstFetchAt = Infinity;
         this.startedAt = this.now();
+        this.diskCache = undefined;
         this.notifyFetchChange();
     }
 }
 
 export const pdfPerformance = new PdfPerformance();
+
+export interface DecodedImageSnapshot {
+    pageBytes: number;
+    sharedBytes: number;
+    dataBytes: number;
+    bitmapBytes: number;
+    images: number;
+    supported: boolean;
+    truncated: boolean;
+}
 
 export interface PrefetchDiagnosticSample {
     direction: number;
@@ -205,9 +235,13 @@ export interface PrefetchDiagnosticSample {
     previewPages: number;
     previewBytes: number;
     canvasBytes: number;
+    cachePolicy?: string;
+    rangeCache?: Record<string, number>;
+    decodedImages?: DecodedImageSnapshot;
     starved?: boolean;
     visibleMissing?: readonly number[];
     fetchBackpressure?: boolean;
+    memoryBackpressure?: boolean;
     performance?: ReturnType<PdfPerformance['snapshot']>;
 }
 
@@ -218,17 +252,35 @@ interface TraceSample {
     delay: number;
 }
 
+interface DiagnosticsOptions {
+    toolbar?: HTMLElement;
+    toolbarBefore?: HTMLElement;
+    measurementsMenu?: HTMLElement;
+    onOpen?: () => void;
+    enabled?: boolean;
+    robots?: {
+        readonly enabled: boolean;
+        setEnabled(enabled: boolean): void;
+        setDispatchOrigin?(port: RobotDispatchPort | undefined): void;
+    };
+}
+
+const ROBOT_ICON = `<svg class="robot-icon" viewBox="0 0 28 28" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3v4M7 11H4v10h20V11h-3M9 7h10v14H9zM11 24h6"/><path d="M12 12v2m4-2v2m-4 4h4"/></g><circle cx="14" cy="3" r="1.5" fill="currentColor"/></svg>`;
+const MEASUREMENTS_ICON = `<svg class="robot-icon" viewBox="0 0 28 28" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5v18h19M8 18l5-8 5 5 6-9"/><circle cx="13" cy="10" r="1.5"/><circle cx="18" cy="15" r="1.5"/></g></svg>`;
+
 /**
- * Ctrl+Alt+Shift+R opens the motion lab. The normal viewer creates neither dashboard DOM nor
- * a sampling timer. Closing it or hiding the document stops its timer.
+ * Document deliveries and the optional motion lab have independent controls. The lab remains
+ * closed until requested, so an enabled document effect adds no measurement sampling timer.
  */
-export function installPrefetchDiagnostics(container: HTMLElement, sample: () => PrefetchDiagnosticSample) {
+export function installPrefetchDiagnostics(container: HTMLElement, sample: () => PrefetchDiagnosticSample, options: DiagnosticsOptions = {}) {
     const doc = container.ownerDocument;
     const win = doc?.defaultView;
     let host: HTMLDivElement | undefined;
     let root: ShadowRoot | undefined;
     let timer: number | undefined;
     let robots: RobotLab | undefined;
+    let button: HTMLButtonElement | undefined;
+    let measurementsButton: HTMLButtonElement | undefined;
     let shown = false;
     let disposed = false;
     let previousFocus: Element | null = null;
@@ -282,10 +334,20 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
         field('target', `${format(state.preloadPx)} px`);
         field('buffer', seconds(state.bufferSeconds));
         field('margin', seconds(state.safetySeconds, true));
-        field('cache', `${state.previewPages} previews · ${format(state.previewBytes / (1024 * 1024), 1)} MiB preview · ${format(state.canvasBytes / (1024 * 1024), 1)} MiB canvas`);
-        field('work', `${state.pending.length} preparing · ${state.prepared.length} preview targets · ${state.renderAhead.length} render targets · ${state.failed.length} failed`);
-        field('total', `${format(metrics.fetchBytes / (1024 * 1024), 1)} MiB received · ${format(metrics.fetchCount)} fetches`);
-        field('transport', `${metrics.pendingFetchCount} fetches in flight · oldest ${format(metrics.oldestFetchMs)} ms${state.fetchBackpressure ? ' · cold-page admission paused' : ''}`);
+        field('cache', `${state.previewPages} previews; ${format(state.previewBytes / (1024 * 1024), 1)} MiB preview; ${format(state.canvasBytes / (1024 * 1024), 1)} MiB canvas`);
+        const bytes = state.rangeCache;
+        field('byte-cache', bytes ? `${state.cachePolicy ?? 'reader'}; ${format(bytes.residentBytes / (1024 * 1024), 1)} / ${format(bytes.maxBytes / (1024 * 1024))} MiB ranges; ${format(bytes.evictedBytes / (1024 * 1024), 1)} MiB evicted` : '');
+        const decoded = state.decodedImages;
+        field('decoded-images', !decoded ? '' : !decoded.supported ? 'Decoded image accounting unavailable'
+            : `Decoded images${decoded.truncated ? ' (partial scan)' : ''}: ${format(decoded.pageBytes / (1024 * 1024), 1)} MiB page; ${format(decoded.sharedBytes / (1024 * 1024), 1)} MiB shared${decoded.bitmapBytes ? ' (RGBA bitmap estimate)' : ''}`);
+        const imageStats = bytes && bytes.imageDecodeConcurrency > 0 ? bytes : undefined;
+        field('image-work', imageStats ? `Image decoding: ${format(imageStats.imageDecodeActive)} / ${format(imageStats.imageDecodeConcurrency)} active; ${format(imageStats.imageDecodeQueued)} queued; peak ${format(imageStats.imageDecodePeakActive)} active. ${format(imageStats.imageDecodeCompletedNative)} native; ${format(imageStats.imageDecodeCompletedFallback)} fallback.` : '');
+        field('image-pixels', imageStats && imageStats.imageDecodeOriginalPixels > 0 ? `Decoded pixels, cumulative: ${format(imageStats.imageDecodeOutputPixels / 1e6, 1)} MP output / ${format(imageStats.imageDecodeOriginalPixels / 1e6, 1)} MP original.` : '');
+        const disk = metrics.diskCache;
+        field('disk-cache', disk ? `Disk: ${format(disk.storedBytes / (1024 * 1024), 1)} / ${format(disk.totalBytes / (1024 * 1024), 1)} MiB of this build. ${disk.complete ? 'Complete' : disk.filling ? 'Filling' : 'Paused'}. All builds: ${format(disk.diskBytes / (1024 * 1024), 1)} / ${format(disk.budgetBytes / (1024 * 1024))} MiB.` : '');
+        field('work', `${state.pending.length} preparing; ${state.prepared.length} preview targets; ${state.renderAhead.length} render targets; ${state.failed.length} failed`);
+        field('total', `${format(metrics.fetchBytes / (1024 * 1024), 1)} MiB received; ${format(metrics.fetchCount)} fetches`);
+        field('transport', `${metrics.pendingFetchCount} fetches in flight; oldest ${format(metrics.oldestFetchMs)} ms${state.fetchBackpressure ? '; cold-page admission paused' : ''}${state.memoryBackpressure ? '; waiting for byte-cache cleanup' : ''}`);
         const margin = state.safetySeconds;
         fields.get('margin')!.style.color = margin !== null && margin < 0 ? '#ffb68c' : '#66e5cf';
         const status = fields.get('status')!;
@@ -308,6 +370,7 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
     }
 
     function stopTimer(): void {
+        options.robots?.setDispatchOrigin?.(undefined);
         robots?.setActive(false);
         if (timer !== undefined) {
             win!.clearInterval(timer);
@@ -320,13 +383,14 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
         if (shown && !doc.hidden && win) {
             tick();
             robots?.setActive(true);
+            options.robots?.setDispatchOrigin?.(robots?.dispatch);
             timer = win.setInterval(tick, PERFORMANCE_LIMITS.refreshMs);
         }
     }
 
     async function copySnapshot(): Promise<void> {
         const { performance: measured, ...viewer } = sample();
-        const text = JSON.stringify({ viewer, performance: measured ?? pdfPerformance.snapshot(), robots: robots?.snapshot() }, null, 2);
+        const text = JSON.stringify({ viewer, performance: measured ?? pdfPerformance.snapshot(), labRobots: robots?.snapshot() }, null, 2);
         try {
             if (win?.navigator.clipboard?.writeText) {
                 await win.navigator.clipboard.writeText(text);
@@ -354,24 +418,24 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
         root = host.attachShadow({ mode: 'open' });
         root.innerHTML = `
 <style>
-:host { all:initial; position:fixed; right:14px; bottom:14px; z-index:2147483647; display:block; color:#e8f0fa; font:12px/1.4 system-ui,sans-serif; color-scheme:dark; }
+:host { all:initial; position:fixed; right:max(14px,env(safe-area-inset-right)); bottom:max(14px,env(safe-area-inset-bottom)); z-index:2147483647; display:block; color:#e8f0fa; font:12px/1.4 system-ui,sans-serif; color-scheme:dark; }
 :host([hidden]) { display:none !important; }
 * { box-sizing:border-box; }
-section { width:456px; max-width:calc(100vw - 28px); max-height:calc(100vh - 28px); overflow:auto; padding:14px; border:1px solid #43566b; border-radius:12px; background:#101c2b; box-shadow:0 8px 36px #0007; }
+section { width:456px; max-width:calc(100vw - 28px); max-height:calc(100vh - 70px); max-height:calc(100dvh - 70px); overflow:auto; overscroll-behavior:contain; padding:14px; border:1px solid #43566b; border-radius:12px; background:#101c2b; box-shadow:0 8px 36px #0007; }
 header { display:flex; align-items:center; gap:9px; }
-.robot { flex:none; width:25px; height:25px; color:#66e5cf; }
-h2 { flex:1; margin:0; font-size:14px; font-weight:650; letter-spacing:.02em; }
+.robot-icon { flex:none; width:25px; height:25px; color:#66e5cf; }
+h2 { flex:1; margin:0; font-size:14px; font-weight:600; }
 button { border:1px solid #4b6178; border-radius:5px; color:inherit; background:#203248; padding:5px 8px; cursor:pointer; font:inherit; }
 button:hover { background:#30485f; } button:focus-visible { outline:2px solid #66e5cf; outline-offset:2px; }
-.close { padding:0 6px; font-size:19px; }
+.close { min-width:28px; min-height:28px; padding:0 6px; font-size:19px; }
 .meta { display:flex; justify-content:space-between; align-items:center; gap:6px; margin-top:9px; font-size:10px; color:#b2c0cf; }
 .status { color:#66e5cf; font-size:11px; } .status[data-state="idle"] { color:#b2c0cf; } .status[data-state="late"] { color:#ffb68c; }
 .robot-stage { margin-top:11px; border:1px solid #345069; border-radius:8px; overflow:hidden; background:#0b1424; contain:layout paint; pointer-events:none; }
 .robot-canvas { display:block; width:100%; aspect-ratio:480 / 250; }
 .robot-caption { min-height:32px; padding:7px 10px 1px; color:#d0e2f0; font-size:11px; line-height:1.4; }
-.robot-activity { padding:3px 10px 8px; color:#849eb5; font:9px/1.3 ui-monospace,monospace; }
+.robot-activity { padding:3px 10px 8px; color:#849eb5; font-size:10px; line-height:1.3; font-variant-numeric:tabular-nums; }
 dl { display:grid; grid-template-columns:1fr 1fr; gap:9px 14px; margin:13px 0; }
-dt { color:#b2c0cf; font-size:10px; } dd { margin:1px 0 0; font:600 15px/1.3 ui-monospace,monospace; white-space:nowrap; }
+dt { color:#b2c0cf; font-size:10px; } dd { margin:1px 0 0; font:500 15px/1.3 system-ui,sans-serif; font-variant-numeric:tabular-nums; white-space:nowrap; }
 .margin { color:#66e5cf; } p { margin:5px 0; } .explanation,.storage,.foot { color:#b2c0cf; font-size:10px; }
 .graph { border-top:1px solid #304359; margin-top:10px; padding-top:7px; }
 .legend { display:flex; justify-content:space-between; gap:5px; color:#b2c0cf; font-size:10px; }
@@ -380,17 +444,36 @@ svg.chart { display:block; width:100%; height:62px; overflow:visible; }
 .velocity { stroke:#acb8ff; } .buffer { stroke:#66e5cf; } .delay { stroke:#ffba7a; } .green { color:#66e5cf; } .orange { color:#ffba7a; }
 details { margin-top:9px; border-top:1px solid #304359; padding-top:7px; }
 summary { cursor:pointer; font-size:10px; color:#b2c0cf; }
+.measurements > summary { padding:4px 0; font-size:12px; color:#d0e2f0; }
 pre { font:9px/1.5 ui-monospace,monospace; margin:6px 0 0; max-height:78px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
 footer { display:flex; align-items:center; gap:8px; margin-top:10px; }
 footer span { font-size:10px; color:#b2c0cf; }
+@media (max-width:700px), (pointer:coarse) {
+    :host { right:max(8px,env(safe-area-inset-right)); bottom:max(8px,env(safe-area-inset-bottom)); }
+    section { width:340px; max-width:calc(100vw - 16px); max-height:calc(100vh - 100px); max-height:calc(100dvh - 100px); padding:6px 8px; }
+    section:has(.measurements[open]) { max-height:calc(100vh - 100px); max-height:calc(100dvh - 100px); }
+    h2 { font-size:13px; }
+    .close { min-width:44px; min-height:44px; }
+    .meta { margin-top:3px; }
+    .robot-stage { margin-top:6px; }
+    .robot-caption { min-height:0; padding:5px 8px; font-size:10px; }
+    .robot-activity { display:none; }
+    section:not(:has(.measurements[open])) .meta,
+    section:not(:has(.measurements[open])) .robot-caption { display:none; }
+    section:not(:has(.measurements[open])) .robot-canvas { height:86px; aspect-ratio:auto; object-fit:contain; }
+    section:not(:has(.measurements[open])) .measurements { margin-top:4px; padding-top:0; }
+    .measurements > summary { min-height:44px; padding:12px 0; }
+    .copy { min-height:44px; }
+}
 </style>
 <section role="region" aria-label="PDF motion diagnostics">
 <header>
-<svg class="robot" viewBox="0 0 28 28" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3v4M7 11H4v10h20V11h-3M9 7h10v14H9zM11 24h6"/><path d="M12 12v2m4-2v2m-4 4h4"/></g><circle cx="14" cy="3" r="1.5" fill="currentColor"/></svg>
-<h2>LARICS motion lab</h2><button class="close" type="button" aria-label="Close motion diagnostics">×</button>
+${ROBOT_ICON}
+<h2>LARICS Motion Lab</h2><button class="close" type="button" aria-label="Close motion diagnostics">×</button>
 </header>
-<div class="meta"><span class="status" data-field="status">Motion stopped</span><span>Ctrl+Alt+Shift+R</span></div>
+<div class="meta"><span class="status" data-field="status">Motion stopped</span></div>
 <div class="robot-stage" data-robot-stage></div>
+<details class="measurements"><summary>Motion and buffer measurements</summary>
 <dl>
 <div><dt>Velocity v̂</dt><dd data-field="velocity"></dd></div>
 <div><dt>Acceleration â</dt><dd data-field="acceleration"></dd></div>
@@ -402,16 +485,18 @@ footer span { font-size:10px; color:#b2c0cf; }
 <div><dt>Time margin</dt><dd class="margin" data-field="margin"></dd></div>
 </dl>
 <p class="explanation">Buffered time = ready distance / speed.<br>Time margin = buffered time − measured load delay.</p>
-<p class="storage" data-field="cache"></p><p class="storage" data-field="work"></p><p class="storage" data-field="transport"></p><p class="storage" data-field="total"></p>
+<p class="storage" data-field="cache"></p><p class="storage" data-field="byte-cache"></p><p class="storage" data-field="decoded-images"></p><p class="storage" data-field="image-work"></p><p class="storage" data-field="image-pixels"></p><p class="storage" data-field="disk-cache"></p><p class="storage" data-field="work"></p><p class="storage" data-field="transport"></p><p class="storage" data-field="total"></p>
 <div class="graph">
-<div class="legend"><span>Velocity · last 10 s</span><span data-field="speed-scale"></span></div>
+<div class="legend"><span>Velocity; last 10 s</span><span data-field="speed-scale"></span></div>
 <svg class="chart" viewBox="0 0 312 62" role="img" aria-label="Estimated scrolling velocity over the last ten seconds"><path class="axis" d="M4 31H308"/><path class="curve velocity" data-trace="velocity"/></svg>
-<div class="legend"><span><span class="green">Buffered time</span> · <span class="orange">load delay</span></span><span data-field="time-scale"></span></div>
+<div class="legend"><span><span class="green">Buffered time</span>; <span class="orange">load delay</span></span><span data-field="time-scale"></span></div>
 <svg class="chart" viewBox="0 0 312 62" role="img" aria-label="Buffered time and measured loading delay over the last ten seconds"><path class="axis" d="M4 58H308"/><path class="curve buffer" data-trace="buffer"/><path class="curve delay" data-trace="delay"/></svg>
 </div>
-<details><summary>Event buffer · <span data-field="event-count"></span></summary><pre data-field="events"></pre></details>
+<details><summary>Event buffer; <span data-field="event-count"></span></summary><pre data-field="events"></pre></details>
 <footer><button type="button" class="copy">Copy measurements</button><span role="status" data-field="copy-status"></span></footer>
+</details>
 </section>`;
+        root.querySelector<HTMLDetailsElement>('.measurements')!.open = !!win?.matchMedia('(min-width:701px) and (pointer:fine)').matches;
         for (const element of root.querySelectorAll<HTMLElement>('[data-field]')) {
             fields.set(element.dataset.field!, element);
         }
@@ -421,28 +506,45 @@ footer span { font-size:10px; color:#b2c0cf; }
         robots = installPrefetchRobots(root.querySelector<HTMLElement>('[data-robot-stage]')!);
     }
 
-    function toggle(): void {
+    function setEnabled(enabled: boolean): void {
         if (disposed || !win || !doc.createElement) { return; }
-        shown = !shown;
+        if (shown === enabled) { return; }
+        shown = enabled;
+        measurementsButton?.setAttribute('aria-expanded', String(shown));
         if (shown) {
             previousFocus = doc.activeElement;
             if (!host) { createPanel(); }
             host!.hidden = false;
             startTimer();
+            options.onOpen?.();
+            if (options.measurementsMenu) { root!.querySelector<HTMLButtonElement>('.close')?.focus({ preventScroll: true }); }
         } else {
+            const restoreFocus = doc.activeElement === host;
             stopTimer();
             host!.hidden = true;
             history.length = 0;
-            if (doc.activeElement === host) { (previousFocus as HTMLElement | null)?.focus?.({ preventScroll: true }); }
+            if (restoreFocus) {
+                const focus = measurementsButton?.getClientRects().length ? measurementsButton
+                    : doc.getElementById('toolbarMoreToggle') ?? doc.getElementById('secondaryToolbarToggleButton') ?? previousFocus as HTMLElement | null;
+                focus?.focus?.({ preventScroll: true });
+            }
         }
     }
 
+    function toggle(): void { setEnabled(!shown); }
+
+    function setRobotsEnabled(enabled: boolean): void {
+        if (disposed) { return; }
+        options.robots?.setEnabled(enabled);
+        const active = options.robots?.enabled ?? false;
+        button?.setAttribute('aria-pressed', String(active));
+        if (button) { button.title = active ? 'Turn off document robots' : 'Turn on document robots'; }
+    }
+
+    function toggleRobots(): void { setRobotsEnabled(!options.robots?.enabled); }
+
     function keydown(event: KeyboardEvent): void {
-        if (!event.repeat && !event.isComposing && event.ctrlKey && event.altKey && event.shiftKey && !event.metaKey && (event.code === 'KeyR' || event.key.toLowerCase() === 'r')) {
-            event.preventDefault();
-            event.stopPropagation();
-            toggle();
-        } else if (shown && event.key === 'Escape' && event.composedPath().includes(host!)) {
+        if (shown && event.key === 'Escape' && event.composedPath().includes(host!)) {
             event.preventDefault();
             toggle();
         }
@@ -459,8 +561,40 @@ footer span { font-size:10px; color:#b2c0cf; }
 
     doc?.addEventListener?.('keydown', keydown, true);
     doc?.addEventListener?.('visibilitychange', visibility);
+    if (options.toolbar) {
+        button = doc.createElement('button');
+        button.id = 'pdf-prefetch-toggle';
+        button.type = 'button';
+        button.className = 'pdf-prefetch-toggle toolbarButton';
+        button.title = options.robots?.enabled ? 'Turn off document robots' : 'Turn on document robots';
+        button.setAttribute('aria-label', 'Document robots');
+        button.setAttribute('aria-controls', container.id || 'viewerContainer');
+        button.setAttribute('aria-pressed', String(options.robots?.enabled ?? false));
+        button.innerHTML = ROBOT_ICON;
+        button.addEventListener('click', toggleRobots);
+        if (options.toolbarBefore) { options.toolbar.insertBefore(button, options.toolbarBefore); }
+        else { options.toolbar.append(button); }
+
+        measurementsButton = doc.createElement('button');
+        measurementsButton.id = 'pdf-prefetch-measurements';
+        measurementsButton.type = 'button';
+        measurementsButton.className = 'pdf-prefetch-toggle toolbarButton' + (options.measurementsMenu ? ' labeled' : '');
+        measurementsButton.title = 'Open LARICS Motion Lab';
+        measurementsButton.setAttribute('aria-label', 'LARICS Motion Lab');
+        measurementsButton.setAttribute('aria-controls', 'pdf-prefetch-diagnostics');
+        measurementsButton.setAttribute('aria-expanded', 'false');
+        measurementsButton.innerHTML = MEASUREMENTS_ICON + (options.measurementsMenu ? '<span>LARICS Motion Lab</span>' : '');
+        measurementsButton.addEventListener('click', toggle);
+        (options.measurementsMenu ?? options.toolbar).append(measurementsButton);
+    }
+    if (options.enabled === true) { setEnabled(true); }
     return {
         toggle,
+        setEnabled,
+        get enabled() { return shown; },
+        setRobotsEnabled,
+        get robotsEnabled() { return options.robots?.enabled ?? false; },
+        labSnapshot: () => robots?.snapshot(),
         dispose(): void {
             if (disposed) { return; }
             disposed = true;
@@ -470,6 +604,13 @@ footer span { font-size:10px; color:#b2c0cf; }
             robots?.dispose();
             robots = undefined;
             host?.remove();
+            button?.removeEventListener('click', toggleRobots);
+            button?.remove();
+            button = undefined;
+            measurementsButton?.removeEventListener('click', toggle);
+            measurementsButton?.remove();
+            measurementsButton = undefined;
+            shown = false;
             host = root = undefined;
             fields.clear();
             history.length = 0;

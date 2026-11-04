@@ -63,7 +63,294 @@
      this.current.patternStroke = false;
    }
    setStrokeTransparent() {
-@@ -13005,6 +13029,13 @@
+@@ -9712,7 +9736,8 @@
+ class PDFDataTransportStream {
+   constructor(pdfDataRangeTransport, {
+     disableRange = false,
+-    disableStream = false
++    disableStream = false,
++    rangeCacheBytes = 0
+   }) {
+     assert(pdfDataRangeTransport, 'PDFDataTransportStream - missing required "pdfDataRangeTransport" argument.');
+     const {
+@@ -9729,6 +9754,7 @@
+       this._queuedChunks.push(buffer);
+     }
+     this._pdfDataRangeTransport = pdfDataRangeTransport;
++    this._allowRangeRefetch = rangeCacheBytes > 0;
+     this._isStreamingSupported = !disableStream;
+     this._isRangeSupported = !disableRange;
+     this._contentLength = length;
+@@ -9810,7 +9836,7 @@
+     return new PDFDataTransportStreamReader(this, queuedChunks, this._progressiveDone, this._contentDispositionFilename);
+   }
+   getRangeReader(begin, end) {
+-    if (end <= this._progressiveDataLength) {
++    if (!this._allowRangeRefetch && end <= this._progressiveDataLength) {
+       return null;
+     }
+     const reader = new PDFDataTransportStreamRangeReader(this, begin, end);
+@@ -10201,6 +10227,39 @@
+   warn(`getArrayBuffer - unexpected data format: ${val}`);
+   return new Uint8Array(val).buffer;
+ }
++// Refetching an evicted range must not retain every completed native reader.
++function trackRangeReader(readers, reader) {
++  readers.push(reader);
++  let closed = false;
++  const forget = () => {
++    if (!closed) {
++      closed = true;
++      const index = readers.indexOf(reader);
++      if (index >= 0) {
++        readers.splice(index, 1);
++      }
++    }
++  };
++  const read = reader.read.bind(reader);
++  reader.read = async () => {
++    try {
++      const result = await read();
++      if (result.done) {
++        forget();
++      }
++      return result;
++    } catch (reason) {
++      forget();
++      throw reason;
++    }
++  };
++  const cancel = reader.cancel.bind(reader);
++  reader.cancel = reason => {
++    forget();
++    return cancel(reason);
++  };
++  return reader;
++}
+ class PDFFetchStream {
+   _responseOrigin = null;
+   constructor(source) {
+@@ -10219,12 +10278,11 @@
+     return this._fullRequestReader;
+   }
+   getRangeReader(begin, end) {
+-    if (end <= this._progressiveDataLength) {
++    if (!this.source.rangeCacheBytes && end <= this._progressiveDataLength) {
+       return null;
+     }
+     const reader = new PDFFetchStreamRangeReader(this, begin, end);
+-    this._rangeRequestReaders.push(reader);
+-    return reader;
++    return trackRangeReader(this._rangeRequestReaders, reader);
+   }
+   cancelAllRequests(reason) {
+     this._fullRequestReader?.cancel(reason);
+@@ -10814,12 +10872,11 @@
+     return this._fullRequestReader;
+   }
+   getRangeReader(start, end) {
+-    if (end <= this._progressiveDataLength) {
++    if (!this.source.rangeCacheBytes && end <= this._progressiveDataLength) {
+       return null;
+     }
+     const rangeReader = new PDFNodeStreamFsRangeReader(this, start, end);
+-    this._rangeRequestReaders.push(rangeReader);
+-    return rangeReader;
++    return trackRangeReader(this._rangeRequestReaders, rangeReader);
+   }
+   cancelAllRequests(reason) {
+     this._fullRequestReader?.cancel(reason);
+@@ -11464,6 +11521,7 @@
+   const password = src.password ?? null;
+   const rangeTransport = src.range instanceof PDFDataRangeTransport ? src.range : null;
+   const rangeChunkSize = Number.isInteger(src.rangeChunkSize) && src.rangeChunkSize > 0 ? src.rangeChunkSize : DEFAULT_RANGE_CHUNK_SIZE;
++  const rangeCacheBytes = Number.isSafeInteger(src.rangeCacheBytes) && src.rangeCacheBytes > 0 ? src.rangeCacheBytes : 0;
+   let worker = src.worker instanceof PDFWorker ? src.worker : null;
+   const verbosity = src.verbosity;
+   const docBaseUrl = typeof src.docBaseUrl === "string" && !isDataScheme(src.docBaseUrl) ? src.docBaseUrl : null;
+@@ -11481,6 +11539,9 @@
+   const isOffscreenCanvasSupported = typeof src.isOffscreenCanvasSupported === "boolean" ? src.isOffscreenCanvasSupported : !isNodeJS;
+   const isImageDecoderSupported = typeof src.isImageDecoderSupported === "boolean" ? src.isImageDecoderSupported : !isNodeJS && (util_FeatureTest.platform.isFirefox || !globalThis.chrome);
+   const canvasMaxAreaInBytes = Number.isInteger(src.canvasMaxAreaInBytes) ? src.canvasMaxAreaInBytes : -1;
++  const adaptiveImageDecoding = src.adaptiveImageDecoding === true;
++  const imageDecodeConcurrency = Number.isInteger(src.imageDecodeConcurrency) && src.imageDecodeConcurrency >= 0
++    ? Math.min(8, src.imageDecodeConcurrency) : adaptiveImageDecoding ? 1 : 0;
+   const disableFontFace = typeof src.disableFontFace === "boolean" ? src.disableFontFace : isNodeJS;
+   const fontExtraProperties = src.fontExtraProperties === true;
+   const enableXfa = src.enableXfa === true;
+@@ -11533,6 +11594,7 @@
+     password,
+     disableAutoFetch,
+     rangeChunkSize,
++    rangeCacheBytes,
+     length,
+     docBaseUrl,
+     enableXfa,
+@@ -11544,6 +11606,8 @@
+       isOffscreenCanvasSupported,
+       isImageDecoderSupported,
+       canvasMaxAreaInBytes,
++      adaptiveImageDecoding,
++      imageDecodeConcurrency,
+       fontExtraProperties,
+       useSystemFonts,
+       useWasm,
+@@ -11555,6 +11619,7 @@
+     }
+   };
+   const transportParams = {
++    adaptiveImageDecoding,
+     ownerDocument,
+     pdfBug,
+     styleElement,
+@@ -11575,7 +11640,8 @@
+     if (rangeTransport) {
+       networkStream = new PDFDataTransportStream(rangeTransport, {
+         disableRange,
+-        disableStream
++        disableStream,
++        rangeCacheBytes
+       });
+     } else if (!data) {
+       if (!url) {
+@@ -11600,6 +11666,7 @@
+         httpHeaders,
+         withCredentials,
+         rangeChunkSize,
++        rangeCacheBytes,
+         disableRange,
+         disableStream
+       });
+@@ -11834,6 +11901,12 @@
+   getData() {
+     return this._transport.getData();
+   }
++  getRangeCacheStats() {
++    return this._transport.getRangeCacheStats();
++  }
++  trimRangeCache() {
++    return this._transport.trimRangeCache();
++  }
+   saveDocument() {
+     return this._transport.saveDocument();
+   }
+@@ -11865,6 +11938,27 @@
+     return this._transport.getCalculationOrderIds();
+   }
+ }
++function getImageDecodeHints(viewport, transform = null, imageDecodeScale = 0, imageDecodeMaxDimension = 0) {
++  const matrix = viewport?.transform || [viewport?.scale || 1, 0, 0, viewport?.scale || 1, 0, 0];
++  const output = transform ? Util.transform(transform, matrix) : matrix;
++  const stretch = values => {
++    const [a, b, c, d] = values;
++    const sum = a * a + b * b + c * c + d * d;
++    const determinant = a * d - b * c;
++    return Math.sqrt((sum + Math.sqrt(Math.max(0, sum * sum - 4 * determinant * determinant))) / 2);
++  };
++  const scale = imageDecodeScale > 0 ? imageDecodeScale : stretch(output);
++  const bound = imageDecodeMaxDimension > 0 ? imageDecodeMaxDimension
++    : Math.max(viewport.width, viewport.height) * (transform ? stretch(transform) : 1);
++  if (!(scale > 0 && bound > 0 && Number.isFinite(scale) && Number.isFinite(bound))) {
++    return null;
++  }
++  return {
++    imageDecodeScale: Math.pow(2, Math.ceil(Math.log2(scale) * 4 - 1e-9) / 4),
++    imageDecodeMaxDimension: Math.max(32, Math.ceil(bound / 32) * 32),
++  };
++}
++
+ class PDFPageProxy {
+   #pendingCleanup = false;
+   constructor(pageIndex, pageInfo, transport, pdfBug = false) {
+@@ -11930,6 +12024,9 @@
+   async getXfa() {
+     return this._transport._htmlForXfa?.children[this._pageIndex] || null;
+   }
++  getImageDecodeHints({ viewport, transform = null, imageDecodeScale = 0, imageDecodeMaxDimension = 0 }) {
++    return getImageDecodeHints(viewport, transform, imageDecodeScale, imageDecodeMaxDimension);
++  }
+   render({
+     canvasContext,
+     viewport,
+@@ -11941,10 +12038,28 @@
+     annotationCanvasMap = null,
+     pageColors = null,
+     printAnnotationStorage = null,
+-    isEditing = false
++    isEditing = false,
++    imageDecodeScale = 0,
++    imageDecodeMaxDimension = 0
+   }) {
+     this._stats?.time("Overall");
+     const intentArgs = this._transport.getRenderingIntent(intent, annotationMode, printAnnotationStorage, isEditing);
++    if (this._transport._params.adaptiveImageDecoding && intent === "display") {
++      const hints = getImageDecodeHints(viewport, transform, imageDecodeScale, imageDecodeMaxDimension);
++      if (hints) {
++        const baseKey = intentArgs.cacheKey;
++        let compatible;
++        for (const [key, state] of this._intentStates) {
++          if (state.imageDecodeBaseKey === baseKey && state.imageDecodeScale >= hints.imageDecodeScale
++              && state.imageDecodeMaxDimension >= hints.imageDecodeMaxDimension
++              && (!compatible || state.imageDecodeScale < compatible[1].imageDecodeScale)) {
++            compatible = [key, state];
++          }
++        }
++        Object.assign(intentArgs, hints, { imageDecodeBaseKey: baseKey });
++        intentArgs.cacheKey = compatible?.[0] || `${baseKey}_image_${hints.imageDecodeScale}_${hints.imageDecodeMaxDimension}`;
++      }
++    }
+     const {
+       renderingIntent,
+       cacheKey
+@@ -11953,7 +12068,11 @@
+     optionalContentConfigPromise ||= this._transport.getOptionalContentConfig(renderingIntent);
+     let intentState = this._intentStates.get(cacheKey);
+     if (!intentState) {
+-      intentState = Object.create(null);
++      intentState = Object.assign(Object.create(null), {
++        imageDecodeScale: intentArgs.imageDecodeScale,
++        imageDecodeMaxDimension: intentArgs.imageDecodeMaxDimension,
++        imageDecodeBaseKey: intentArgs.imageDecodeBaseKey,
++      });
+       this._intentStates.set(cacheKey, intentState);
+     }
+     if (intentState.streamReaderCancelTimeout) {
+@@ -12189,7 +12308,9 @@
+     renderingIntent,
+     cacheKey,
+     annotationStorageSerializable,
+-    modifiedIds
++    modifiedIds,
++    imageDecodeScale = 0,
++    imageDecodeMaxDimension = 0
+   }) {
+     const {
+       map,
+@@ -12200,7 +12321,9 @@
+       intent: renderingIntent,
+       cacheKey,
+       annotationStorage: map,
+-      modifiedIds
++      modifiedIds,
++      imageDecodeScale,
++      imageDecodeMaxDimension
+     }, transfer);
+     const reader = readableStream.getReader();
+     const intentState = this._intentStates.get(cacheKey);
+@@ -12901,6 +13024,12 @@
+   getData() {
+     return this.messageHandler.sendWithPromise("GetData", null);
+   }
++  getRangeCacheStats() {
++    return this.messageHandler.sendWithPromise("GetRangeCacheStats", null);
++  }
++  trimRangeCache() {
++    return this.messageHandler.sendWithPromise("TrimRangeCache", null);
++  }
+   saveDocument() {
+     if (this.annotationStorage.size <= 0) {
+       warn("saveDocument called while `annotationStorage` is empty, " + "please use the getData-method instead.");
+@@ -13005,6 +13134,13 @@
      });
    }
    getStructTree(pageIndex) {
@@ -77,3 +364,1007 @@
      return this.messageHandler.sendWithPromise("GetStructTree", {
        pageIndex
      });
+--- a/build/pdf.worker.mjs
++++ b/build/pdf.worker.mjs
+@@ -2898,11 +2898,190 @@
+     return [this];
+   }
+ }
++// Slipstream: optional chunk storage. Returned byte views retain their own ArrayBuffer
++// after eviction; every later stream read checks current residency before using an offset.
++class SparseChunkedStream extends ChunkedStream {
++  constructor(length, chunkSize, manager, maxBytes) {
++    super(0, chunkSize, manager);
++    this.end = length;
++    this.numChunks = Math.ceil(length / chunkSize);
++    this._rangeCache = {
++      length,
++      maxBytes,
++      chunks: new Map(),
++      residentBytes: 0,
++      peakBytes: 0,
++      evictedBytes: 0,
++      lastTouched: -1
++    };
++  }
++  _touchChunk(chunk) {
++    const cache = this._rangeCache;
++    const entry = cache.chunks.get(chunk);
++    if (entry && cache.lastTouched !== chunk) {
++      cache.chunks.delete(chunk);
++      cache.chunks.set(chunk, entry);
++      cache.lastTouched = chunk;
++    }
++    return entry;
++  }
++  _writeBytes(begin, data) {
++    const cache = this._rangeCache;
++    const source = data instanceof Uint8Array ? data : new Uint8Array(data);
++    let offset = 0;
++    while (offset < source.byteLength) {
++      const position = begin + offset;
++      const chunk = Math.floor(position / this.chunkSize);
++      const within = position % this.chunkSize;
++      const size = Math.min(this.chunkSize, cache.length - chunk * this.chunkSize);
++      let entry = cache.chunks.get(chunk);
++      if (!entry) {
++        if (within !== 0) {
++          throw new Error("A progressive PDF chunk lost its unfinished prefix.");
++        }
++        entry = { bytes: new Uint8Array(size), valid: 0 };
++        cache.chunks.set(chunk, entry);
++        cache.residentBytes += size;
++        cache.peakBytes = Math.max(cache.peakBytes, cache.residentBytes);
++      }
++      const take = Math.min(size - within, source.byteLength - offset);
++      entry.bytes.set(source.subarray(offset, offset + take), within);
++      entry.valid = Math.max(entry.valid, within + take);
++      if (entry.valid === size) {
++        this._loadedChunks.add(chunk);
++      }
++      this._touchChunk(chunk);
++      offset += take;
++    }
++  }
++  onReceiveData(begin, data) {
++    const end = begin + data.byteLength;
++    if (begin < 0 || begin % this.chunkSize !== 0 || end > this._rangeCache.length
++        || end % this.chunkSize !== 0 && end !== this._rangeCache.length) {
++      throw new Error("Invalid sparse PDF byte range.");
++    }
++    this._writeBytes(begin, data);
++  }
++  onReceiveProgressiveData(data) {
++    const begin = this.progressiveDataLength;
++    if (begin + data.byteLength > this._rangeCache.length) {
++      throw new Error("Progressive PDF data exceeds its declared length.");
++    }
++    this._writeBytes(begin, data);
++    this.progressiveDataLength += data.byteLength;
++  }
++  ensureByte(pos) {
++    const chunk = Math.floor(pos / this.chunkSize);
++    const entry = this._touchChunk(chunk);
++    if (!entry || pos % this.chunkSize >= entry.valid) {
++      throw new MissingDataException(pos, pos + 1);
++    }
++  }
++  ensureRange(begin, end) {
++    if (begin >= end) {
++      return;
++    }
++    const first = Math.floor(begin / this.chunkSize);
++    const last = Math.ceil(end / this.chunkSize);
++    for (let chunk = first; chunk < last; chunk++) {
++      const entry = this._touchChunk(chunk);
++      const needed = Math.min(end - chunk * this.chunkSize, this.chunkSize);
++      if (!entry || entry.valid < needed) {
++        throw new MissingDataException(begin, end);
++      }
++    }
++  }
++  getByte() {
++    if (this.pos >= this.end) {
++      return -1;
++    }
++    this.ensureByte(this.pos);
++    const chunk = Math.floor(this.pos / this.chunkSize);
++    return this._rangeCache.chunks.get(chunk).bytes[this.pos++ % this.chunkSize];
++  }
++  _readRange(begin, end) {
++    if (begin >= end) {
++      return new Uint8Array(0);
++    }
++    this.ensureRange(begin, end);
++    const first = Math.floor(begin / this.chunkSize);
++    if (Math.floor((end - 1) / this.chunkSize) === first) {
++      return this._rangeCache.chunks.get(first).bytes.subarray(begin % this.chunkSize, end - first * this.chunkSize);
++    }
++    const bytes = new Uint8Array(end - begin);
++    let position = begin;
++    while (position < end) {
++      const chunk = Math.floor(position / this.chunkSize);
++      const entry = this._rangeCache.chunks.get(chunk);
++      const within = position % this.chunkSize;
++      const take = Math.min(entry.valid - within, end - position);
++      bytes.set(entry.bytes.subarray(within, within + take), position - begin);
++      position += take;
++    }
++    return bytes;
++  }
++  getBytes(length) {
++    const begin = this.pos;
++    const end = length ? Math.min(begin + length, this.end) : this.end;
++    const bytes = this._readRange(begin, end);
++    if (length) {
++      this.pos = end;
++    }
++    return bytes;
++  }
++  getByteRange(begin, end) {
++    return this._readRange(Math.max(0, begin), Math.min(end, this.end));
++  }
++  makeSubStream(start, length, dict = null) {
++    if (length) {
++      this.ensureRange(start, start + length);
++    } else {
++      this.ensureByte(start);
++    }
++    return super.makeSubStream(start, length, dict);
++  }
++  trimRangeCache() {
++    const cache = this._rangeCache;
++    for (const [chunk, entry] of cache.chunks) {
++      if (cache.residentBytes <= cache.maxBytes) {
++        break;
++      }
++      // The next progressive response appends to this unfinished chunk.
++      if (entry.valid !== entry.bytes.length) {
++        continue;
++      }
++      cache.chunks.delete(chunk);
++      this._loadedChunks.delete(chunk);
++      cache.residentBytes -= entry.bytes.length;
++      cache.evictedBytes += entry.bytes.length;
++    }
++    cache.lastTouched = -1;
++    return this.getRangeCacheStats();
++  }
++  getRangeCacheStats() {
++    const cache = this._rangeCache;
++    return {
++      length: cache.length,
++      residentBytes: cache.residentBytes,
++      residentChunks: cache.chunks.size,
++      totalChunks: this.numChunks,
++      evictedBytes: cache.evictedBytes,
++      maxBytes: cache.maxBytes,
++      peakBytes: cache.peakBytes
++    };
++  }
++}
++
+ class ChunkedStreamManager {
+   constructor(pdfNetworkStream, args) {
+     this.length = args.length;
+     this.chunkSize = args.rangeChunkSize;
+-    this.stream = new ChunkedStream(this.length, this.chunkSize, this);
++    this.stream = args.rangeCacheBytes > 0
++      ? new SparseChunkedStream(this.length, this.chunkSize, this, args.rangeCacheBytes)
++      : new ChunkedStream(this.length, this.chunkSize, this);
++    this._rangeCacheHolds = 0;
++    this._activeRangeRequests = 0;
++    this._rangeCacheTrimTimer = null;
+     this.pdfNetworkStream = pdfNetworkStream;
+     this.disableAutoFetch = args.disableAutoFetch;
+     this.msgHandler = args.msgHandler;
+@@ -2914,8 +3093,77 @@
+     this.aborted = false;
+     this._loadedStreamCapability = Promise.withResolvers();
+   }
++  holdRangeCache() {
++    if (!(this.stream instanceof SparseChunkedStream)) {
++      return () => {};
++    }
++    this._rangeCacheHolds++;
++    let released = false;
++    return () => {
++      if (released) {
++        return;
++      }
++      released = true;
++      this._rangeCacheHolds--;
++      this.scheduleRangeCacheTrim();
++    };
++  }
++  scheduleRangeCacheTrim() {
++    if (!(this.stream instanceof SparseChunkedStream) || this.aborted || this._rangeCacheTrimTimer !== null) {
++      return;
++    }
++    // A later event-loop turn lets request continuations acquire their operation holds.
++    // This is one coalesced scheduling event, not a timer that polls for an idle worker.
++    this._rangeCacheTrimTimer = setTimeout(() => {
++      this._rangeCacheTrimTimer = null;
++      this.trimRangeCache();
++    }, 0);
++  }
++  getRangeCacheStats() {
++    const stats = this.stream.getRangeCacheStats?.();
++    return stats ? {
++      ...stats,
++      activeOperations: this._rangeCacheHolds,
++      pendingRequests: this._activeRangeRequests
++    } : null;
++  }
++  trimRangeCache() {
++    if (!this.aborted && !this._rangeCacheHolds && !this._activeRangeRequests
++        && this._promisesByRequest.size === 0 && this._requestsByChunk.size === 0) {
++      this.stream.trimRangeCache?.();
++    }
++    return this.getRangeCacheStats();
++  }
++  _finishRangeRequest(requestId) {
++    const chunks = this._chunksNeededByRequest.get(requestId);
++    if (chunks) {
++      for (const chunk of chunks) {
++        const remaining = this._requestsByChunk.get(chunk)?.filter(id => id !== requestId);
++        if (remaining?.length) {
++          this._requestsByChunk.set(chunk, remaining);
++        } else {
++          this._requestsByChunk.delete(chunk);
++        }
++      }
++    }
++    this._chunksNeededByRequest.delete(requestId);
++    this._promisesByRequest.delete(requestId);
++    this.scheduleRangeCacheTrim();
++  }
++  _rejectChunkRequests(beginChunk, endChunk, reason) {
++    const ids = new Set();
++    for (let chunk = beginChunk; chunk < endChunk; chunk++) {
++      for (const id of this._requestsByChunk.get(chunk) || []) {
++        ids.add(id);
++      }
++    }
++    for (const id of ids) {
++      this._promisesByRequest.get(id)?.reject(reason);
++    }
++  }
+   sendRequest(begin, end) {
+     const rangeReader = this.pdfNetworkStream.getRangeReader(begin, end);
++    this._activeRangeRequests++;
+     if (!rangeReader.isStreamingSupported) {
+       rangeReader.onProgress = this.onProgress.bind(this);
+     }
+@@ -2954,16 +3202,23 @@
+         chunk: data,
+         begin
+       });
++    }).finally(() => {
++      this._activeRangeRequests--;
++      this.pdfNetworkStream.removeRangeReader?.(rangeReader);
++      this.scheduleRangeCacheTrim();
+     });
+   }
+   requestAllChunks(noFetch = false) {
+-    if (!noFetch) {
+-      const missingChunks = this.stream.getMissingChunks();
+-      this._requestChunks(missingChunks);
+-    }
+-    return this._loadedStreamCapability.promise;
++    if (noFetch) {
++      return this._loadedStreamCapability.promise;
++    }
++    // A previous complete load may since have been pruned. Refill its current holes.
++    return this._requestChunks(this.stream.getMissingChunks()).then(() => this.stream);
+   }
+   _requestChunks(chunks) {
++    if (this.aborted && this.stream instanceof SparseChunkedStream) {
++      return Promise.reject(new AbortException("PDF byte transport is closed."));
++    }
+     const requestId = this.currRequestId++;
+     const chunksNeeded = new Set();
+     this._chunksNeededByRequest.set(requestId, chunksNeeded);
+@@ -2973,6 +3228,7 @@
+       }
+     }
+     if (chunksNeeded.size === 0) {
++      this._chunksNeededByRequest.delete(requestId);
+       return Promise.resolve();
+     }
+     const capability = Promise.withResolvers();
+@@ -2992,15 +3248,17 @@
+       for (const groupedChunk of groupedChunksToRequest) {
+         const begin = groupedChunk.beginChunk * this.chunkSize;
+         const end = Math.min(groupedChunk.endChunk * this.chunkSize, this.length);
+-        this.sendRequest(begin, end).catch(capability.reject);
++        this.sendRequest(begin, end).catch(reason => {
++          this._rejectChunkRequests(groupedChunk.beginChunk, groupedChunk.endChunk, reason);
++        });
+       }
+     }
+     return capability.promise.catch(reason => {
+-      if (this.aborted) {
++      if (this.aborted && !(this.stream instanceof SparseChunkedStream)) {
+         return;
+       }
+       throw reason;
+-    });
++    }).finally(() => this._finishRangeRequest(requestId));
+   }
+   getStream() {
+     return this.stream;
+@@ -3118,6 +3376,7 @@
+       loaded: this.stream.numChunksLoaded * this.chunkSize,
+       total: this.length
+     });
++    this.scheduleRangeCacheTrim();
+   }
+   onError(err) {
+     this._loadedStreamCapability.reject(err);
+@@ -3130,10 +3389,15 @@
+   }
+   abort(reason) {
+     this.aborted = true;
++    clearTimeout(this._rangeCacheTrimTimer);
++    this._rangeCacheTrimTimer = null;
+     this.pdfNetworkStream?.cancelAllRequests(reason);
+     for (const capability of this._promisesByRequest.values()) {
+       capability.reject(reason);
+     }
++    this._promisesByRequest.clear();
++    this._chunksNeededByRequest.clear();
++    this._requestsByChunk.clear();
+   }
+ }
+
+@@ -3248,6 +3512,95 @@
+ ;// ./src/core/image_resizer.js
+
+
++
++// Mobile display images follow their rendered placement rather than their print resolution.
++function imageDecodeSize(width, height, resolution) {
++  if (!resolution || !(width > 0 && height > 0)) {
++    return { width, height };
++  }
++  const { scale, maxDimension, transform } = resolution;
++  let ratio;
++  if (scale > 0 && transform?.length === 6 && transform.slice(0, 4).every(Number.isFinite)) {
++    const x = Math.hypot(transform[0], transform[1]) * scale;
++    const y = Math.hypot(transform[2], transform[3]) * scale;
++    if (x > 0 && y > 0) {
++      ratio = Math.max(x / width, y / height);
++    }
++  }
++  if (!(ratio > 0 && Number.isFinite(ratio))) {
++    ratio = maxDimension > 0 ? maxDimension / Math.max(width, height) : 1;
++  }
++  // Round upward so nearby placements share a variant without dropping requested detail.
++  const longest = Math.max(width, height);
++  const target = Math.min(longest, Math.max(1, Math.ceil(longest * Math.min(1, ratio) / 32) * 32));
++  const factor = target / longest;
++  return { width: Math.max(1, Math.ceil(width * factor)), height: Math.max(1, Math.ceil(height * factor)) };
++}
++
++class ImageDecodeQueue {
++  constructor(limit = 1) {
++    this.limit = Number.isInteger(limit) && limit > 0 ? limit : Infinity;
++    this.pending = [];
++    this.active = 0;
++    this.peakActive = 0;
++    this.completedNative = 0;
++    this.completedFallback = 0;
++    this.originalPixels = 0;
++    this.outputPixels = 0;
++    this.reason = null;
++  }
++  run(operation) {
++    if (this.reason) {
++      return Promise.reject(this.reason);
++    }
++    return new Promise((resolve, reject) => {
++      this.pending.push({ operation, resolve, reject });
++      this.pump();
++    });
++  }
++  pump() {
++    while (!this.reason && this.active < this.limit && this.pending.length) {
++      const job = this.pending.shift();
++      this.active++;
++      this.peakActive = Math.max(this.peakActive, this.active);
++      Promise.resolve().then(() => {
++        if (this.reason) { throw this.reason; }
++        return job.operation();
++      }).then(result => {
++        if (this.reason) {
++          result?.bitmap?.close();
++          throw this.reason;
++        }
++        job.resolve(result);
++      }, job.reject).catch(job.reject).finally(() => {
++        this.active--;
++        this.pump();
++      });
++    }
++  }
++  record(native, originalPixels, outputPixels) {
++    if (native) { this.completedNative++; }
++    else { this.completedFallback++; }
++    this.originalPixels += originalPixels;
++    this.outputPixels += outputPixels;
++  }
++  abort(reason) {
++    this.reason ||= reason || new AbortException("Image decoding terminated");
++    for (const job of this.pending.splice(0)) { job.reject(this.reason); }
++  }
++  stats() {
++    return {
++      imageDecodeConcurrency: Number.isFinite(this.limit) ? this.limit : 0,
++      imageDecodeActive: this.active,
++      imageDecodeQueued: this.pending.length,
++      imageDecodePeakActive: this.peakActive,
++      imageDecodeCompletedNative: this.completedNative,
++      imageDecodeCompletedFallback: this.completedFallback,
++      imageDecodeOriginalPixels: this.originalPixels,
++      imageDecodeOutputPixels: this.outputPixels,
++    };
++  }
++}
+
+ const MIN_IMAGE_DIM = 2048;
+ const MAX_IMAGE_DIM = 65537;
+@@ -5190,36 +5543,66 @@
+   get canAsyncDecodeImageFromBuffer() {
+     return this.stream.isAsync;
+   }
+-  async getTransferableImage() {
+-    if (!(await JpegStream.canUseImageDecoder)) {
++  async decodeScaledImage(width, height) {
++    // A new JPEG decoder avoids reusing DecodeStream.buffer from an earlier resolution.
++    const bytes = this.canAsyncDecodeImageFromBuffer && (await this.stream.asyncGetBytes()) || this.bytes;
++    const image = new JpegImage(this.jpegOptions);
++    image.parse(this.#skipUselessBytes(bytes));
++    return image.getData({ width, height, forceRGBA: true, isSourcePDF: true });
++  }
++  async getTransferableImage(options = null) {
++    const useDecoder = await JpegStream.canUseImageDecoder;
++    const useBitmap = options?.nativeBitmap && typeof createImageBitmap === "function";
++    if (!useDecoder && !useBitmap) {
+       return null;
+     }
+     const jpegOptions = this.jpegOptions;
+     if (jpegOptions.decodeTransform) {
+       return null;
+     }
+-    let decoder;
++    let decoder, bitmap;
+     try {
+       const bytes = this.canAsyncDecodeImageFromBuffer && (await this.stream.asyncGetBytes()) || this.bytes;
+       if (!bytes) {
+         return null;
+       }
+       let data = this.#skipUselessBytes(bytes);
+-      const useImageDecoder = JpegImage.canUseImageDecoder(data, jpegOptions.colorTransform);
+-      if (!useImageDecoder) {
++      const supported = JpegImage.canUseImageDecoder(data, jpegOptions.colorTransform);
++      if (!supported) {
+         return null;
+       }
+-      if (useImageDecoder.exifStart) {
++      if (supported.exifStart) {
+         data = data.slice();
+-        data.fill(0x00, useImageDecoder.exifStart, useImageDecoder.exifEnd);
+-      }
+-      decoder = new ImageDecoder({
+-        data,
+-        type: "image/jpeg",
+-        preferAnimation: false
+-      });
+-      return (await decoder.decode()).image;
++        data.fill(0x00, supported.exifStart, supported.exifEnd);
++      }
++      const bitmapOptions = options && {
++        resizeWidth: options.width, resizeHeight: options.height, resizeQuality: "high",
++        imageOrientation: "none", colorSpaceConversion: "none", premultiplyAlpha: "premultiply",
++      };
++      if (useDecoder) {
++        decoder = new ImageDecoder({
++          data, type: "image/jpeg", preferAnimation: false,
++          ...(options && { desiredWidth: options.width, desiredHeight: options.height }),
++        });
++        bitmap = (await decoder.decode()).image;
++        if (!options) { return bitmap; }
++        const width = bitmap.displayWidth ?? bitmap.width;
++        const height = bitmap.displayHeight ?? bitmap.height;
++        if (width === options.width && height === options.height) { return bitmap; }
++        if (!useBitmap) { bitmap.close(); return null; }
++        const resized = await createImageBitmap(bitmap, bitmapOptions);
++        bitmap.close();
++        bitmap = resized;
++      } else {
++        bitmap = await createImageBitmap(new Blob([data], { type: "image/jpeg" }), bitmapOptions);
++      }
++      if (bitmap.width !== options.width || bitmap.height !== options.height) {
++        bitmap.close();
++        return null;
++      }
++      return bitmap;
+     } catch (reason) {
++      bitmap?.close();
+       warn(`getTransferableImage - failed: "${reason}".`);
+       return null;
+     } finally {
+@@ -30437,7 +30820,20 @@
+       buffer[i + 2] = (buffer[i + 2] - matteB) * k + matteB;
+     }
+   }
+-  async createImageData(forceRGBA = false, isOffscreenCanvasSupported = false) {
++  async createImageData(forceRGBA = false, isOffscreenCanvasSupported = false, resolution = null) {
++    if (resolution && !forceRGBA && this.image instanceof JpegStream && this.colorSpace.name === "DeviceRGB"
++        && !this.smask && !this.mask && !this.needsDecode) {
++      const { width, height } = imageDecodeSize(this.width, this.height, resolution);
++      const bitmap = await this.image.getTransferableImage({ width, height, nativeBitmap: true });
++      if (bitmap) {
++        return { data: null, width, height, bitmap, interpolate: this.interpolate, _nativeDecode: true };
++      }
++      const data = await this.image.decodeScaledImage(width, height);
++      if (isOffscreenCanvasSupported) {
++        return this.createBitmap(ImageKind.RGBA_32BPP, width, height, data);
++      }
++      return { data, width, height, kind: ImageKind.RGBA_32BPP, interpolate: this.interpolate };
++    }
+     const drawWidth = this.drawWidth;
+     const drawHeight = this.drawHeight;
+     const imgData = {
+@@ -30866,6 +31262,7 @@
+     this.options = options || DefaultPartialEvaluatorOptions;
+     this.type3FontRefs = null;
+     this._regionalImageCache = new RegionalImageCache();
++    this._adaptiveImageCache = new Map();
+     this._fetchBuiltInCMapBound = this.fetchBuiltInCMap.bind(this);
+   }
+   get _pdfFunctionFactory() {
+@@ -31026,6 +31423,10 @@
+   async buildFormXObject(resources, xobj, smask, operatorList, task, initialState, localColorSpaceCache) {
+     const dict = xobj.dict;
+     const matrix = lookupMatrix(dict.getArray("Matrix"), null);
++    if (this.options.imageDecodeMaxDimension && matrix) {
++      initialState = (initialState || new EvalState()).clone();
++      initialState.ctm = Util.transform(initialState.ctm, matrix);
++    }
+     const bbox = lookupNormalRect(dict.getArray("BBox"), null);
+     let optionalContent, groupOptions;
+     if (dict.has("OC")) {
+@@ -31090,7 +31491,8 @@
+     operatorList,
+     cacheKey,
+     localImageCache,
+-    localColorSpaceCache
++    localColorSpaceCache,
++    imageTransform = null
+   }) {
+     const dict = image.dict;
+     const imageRef = dict.objId;
+@@ -31098,6 +31500,18 @@
+     const h = dict.get("H", "Height");
+     if (!(w && typeof w === "number") || !(h && typeof h === "number")) {
+       warn("Image dimensions are missing, or not numbers.");
++      return;
++    }
++    const resolution = this.options.imageDecodeMaxDimension && !this.parsingType3Font ? {
++      scale: this.options.imageDecodeScale,
++      maxDimension: this.options.imageDecodeMaxDimension,
++      transform: imageTransform,
++    } : null;
++    const imageSize = resolution && imageDecodeSize(w, h, resolution);
++    const adaptiveKey = imageRef && imageSize ? `${imageRef}_${imageSize.width}_${imageSize.height}` : null;
++    const cachedAdaptive = adaptiveKey && this._adaptiveImageCache.get(adaptiveKey);
++    if (cachedAdaptive) {
++      addLocallyCachedImageOps(operatorList, cachedAdaptive);
+       return;
+     }
+     const maxImageSize = this.options.maxImageSize;
+@@ -31229,7 +31643,7 @@
+     if (this.parsingType3Font) {
+       objId = `${this.idFactory.getDocId()}_type3_${objId}`;
+     } else if (cacheKey && imageRef) {
+-      cacheGlobally = this.globalImageCache.shouldCache(imageRef, this.pageIndex);
++      cacheGlobally = !this.options.imageDecodeMaxDimension && this.globalImageCache.shouldCache(imageRef, this.pageIndex);
+       if (cacheGlobally) {
+         assert(!isInline, "Cannot cache an inline image globally.");
+         objId = `${this.idFactory.getDocId()}_${objId}`;
+@@ -31270,16 +31684,21 @@
+         }
+       }
+     }
+-    PDFImage.buildImage({
+-      xref: this.xref,
+-      res: resources,
+-      image,
+-      isInline,
+-      pdfFunctionFactory: this._pdfFunctionFactory,
+-      globalColorSpaceCache: this.globalColorSpaceCache,
+-      localColorSpaceCache
+-    }).then(async imageObj => {
+-      imgData = await imageObj.createImageData(false, this.options.isOffscreenCanvasSupported);
++    // Image decoding continues after the operator-list WorkerTask can finish.
++    const releaseImageRangeCache = this.xref.pdfManager.streamManager?.holdRangeCache();
++    const imageQueue = this.xref.pdfManager.imageDecodeQueue;
++    const decodeImage = async () => {
++      const imageObj = await PDFImage.buildImage({
++        xref: this.xref, res: resources, image, isInline,
++        pdfFunctionFactory: this._pdfFunctionFactory,
++        globalColorSpaceCache: this.globalColorSpaceCache, localColorSpaceCache,
++      });
++      return imageObj.createImageData(false, this.options.isOffscreenCanvasSupported, resolution);
++    };
++    (imageQueue ? imageQueue.run(decodeImage) : decodeImage()).then(result => {
++      imgData = result;
++      imageQueue?.record(!!imgData._nativeDecode, w * h, imgData.width * imgData.height);
++      delete imgData._nativeDecode;
+       imgData.dataLen = imgData.bitmap ? imgData.width * imgData.height * 4 : imgData.data.length;
+       imgData.ref = imageRef;
+       if (cacheGlobally) {
+@@ -31287,12 +31706,13 @@
+       }
+       return this._sendImgData(objId, imgData, cacheGlobally);
+     }).catch(reason => {
++      if (imageQueue?.reason || reason instanceof AbortException) { return; }
+       warn(`Unable to decode image "${objId}": "${reason}".`);
+       if (imageRef) {
+         this.globalImageCache.addDecodeFailed(imageRef);
+       }
+       return this._sendImgData(objId, null, cacheGlobally);
+-    });
++    }).finally(() => releaseImageRangeCache?.());
+     if (cacheKey) {
+       const cacheData = {
+         objId,
+@@ -31302,7 +31722,8 @@
+         hasMask
+       };
+       localImageCache.set(cacheKey, imageRef, cacheData);
+-      if (imageRef) {
++      if (adaptiveKey) { this._adaptiveImageCache.set(adaptiveKey, cacheData); }
++      if (imageRef && !this.options.imageDecodeMaxDimension) {
+         this._regionalImageCache.set(null, imageRef, cacheData);
+         if (cacheGlobally) {
+           this.globalImageCache.setData(imageRef, {
+@@ -31385,7 +31806,8 @@
+       xref: this.xref,
+       dictArray: [patternDict.get("Resources"), resources]
+     });
+-    return this.getOperatorList({
++    const evaluator = this.options.imageDecodeMaxDimension ? this.clone({ imageDecodeScale: 0 }) : this;
++    return evaluator.getOperatorList({
+       stream: pattern,
+       task,
+       resources: patternResources,
+@@ -31964,7 +32386,7 @@
+           case OPS.paintXObject:
+             isValidName = args[0] instanceof Name;
+             name = args[0].name;
+-            if (isValidName) {
++            if (isValidName && !self.options.imageDecodeMaxDimension) {
+               const localImage = localImageCache.getByName(name);
+               if (localImage) {
+                 addLocallyCachedImageOps(operatorList, localImage);
+@@ -31978,13 +32400,13 @@
+               }
+               let xobj = xobjs.getRaw(name);
+               if (xobj instanceof Ref) {
+-                const localImage = localImageCache.getByRef(xobj) || self._regionalImageCache.getByRef(xobj);
++                const localImage = self.options.imageDecodeMaxDimension ? null : localImageCache.getByRef(xobj) || self._regionalImageCache.getByRef(xobj);
+                 if (localImage) {
+                   addLocallyCachedImageOps(operatorList, localImage);
+                   resolveXObject();
+                   return;
+                 }
+-                const globalImage = self.globalImageCache.getData(xobj, self.pageIndex);
++                const globalImage = self.options.imageDecodeMaxDimension ? null : self.globalImageCache.getData(xobj, self.pageIndex);
+                 if (globalImage) {
+                   operatorList.addDependency(globalImage.objId);
+                   operatorList.addImageOps(globalImage.fn, globalImage.args, globalImage.optionalContent, globalImage.hasMask);
+@@ -32016,7 +32438,8 @@
+                   operatorList,
+                   cacheKey: name,
+                   localImageCache,
+-                  localColorSpaceCache
++                  localColorSpaceCache,
++                  imageTransform: stateManager.state.ctm.slice()
+                 }).then(resolveXObject, rejectXObject);
+                 return;
+               } else if (type.name === "PS") {
+@@ -32045,7 +32468,7 @@
+             return;
+           case OPS.endInlineImage:
+             const cacheKey = args[0].cacheKey;
+-            if (cacheKey) {
++            if (cacheKey && !self.options.imageDecodeMaxDimension) {
+               const localImage = localImageCache.getByName(cacheKey);
+               if (localImage) {
+                 addLocallyCachedImageOps(operatorList, localImage);
+@@ -32060,7 +32483,8 @@
+               operatorList,
+               cacheKey,
+               localImageCache,
+-              localColorSpaceCache
++              localColorSpaceCache,
++              imageTransform: stateManager.state.ctm.slice()
+             }));
+             return;
+           case OPS.showText:
+@@ -33035,7 +33459,7 @@
+                   resolveXObject();
+                   return;
+                 }
+-                const globalImage = self.globalImageCache.getData(xobj, self.pageIndex);
++                const globalImage = self.options.imageDecodeMaxDimension ? null : self.globalImageCache.getData(xobj, self.pageIndex);
+                 if (globalImage) {
+                   resolveXObject();
+                   return;
+@@ -33731,7 +34155,7 @@
+       hash.update(`${firstChar}-${lastChar}`);
+       if (toUnicode instanceof BaseStream) {
+         const stream = toUnicode.str || toUnicode;
+-        const uint8array = stream.buffer ? new Uint8Array(stream.buffer.buffer, 0, stream.bufferLength) : new Uint8Array(stream.bytes.buffer, stream.start, stream.end - stream.start);
++        const uint8array = stream.buffer ? new Uint8Array(stream.buffer.buffer, 0, stream.bufferLength) : stream.getByteRange(stream.start, stream.end);
+         hash.update(uint8array);
+       } else if (toUnicode instanceof Name) {
+         hash.update(toUnicode.name);
+@@ -54680,7 +55104,9 @@
+     intent,
+     cacheKey,
+     annotationStorage = null,
+-    modifiedIds = null
++    modifiedIds = null,
++    imageDecodeScale = 0,
++    imageDecodeMaxDimension = 0
+   }) {
+     const contentStreamPromise = this.getContentStream();
+     const resourcesPromise = this.loadResources(["ColorSpace", "ExtGState", "Font", "Pattern", "Properties", "Shading", "XObject"]);
+@@ -54695,7 +55121,8 @@
+       globalColorSpaceCache: this.globalColorSpaceCache,
+       globalImageCache: this.globalImageCache,
+       systemFontCache: this.systemFontCache,
+-      options: this.evaluatorOptions
++      options: imageDecodeMaxDimension > 0
++        ? { ...this.evaluatorOptions, imageDecodeScale, imageDecodeMaxDimension } : this.evaluatorOptions
+     });
+     const newAnnotsByPage = !this.xfaFactory ? getNewAnnotationsMap(annotationStorage) : null;
+     const newAnnots = newAnnotsByPage?.get(this.pageIndex);
+@@ -55824,6 +56251,8 @@
+     evaluatorOptions.isOffscreenCanvasSupported &&= FeatureTest.isOffscreenCanvasSupported;
+     evaluatorOptions.isImageDecoderSupported &&= FeatureTest.isImageDecoderSupported;
+     this.evaluatorOptions = Object.freeze(evaluatorOptions);
++    this.imageDecodeQueue = evaluatorOptions.adaptiveImageDecoding || evaluatorOptions.imageDecodeConcurrency > 0
++      ? new ImageDecodeQueue(evaluatorOptions.imageDecodeConcurrency) : null;
+     ImageResizer.setOptions(evaluatorOptions);
+     JpegStream.setOptions(evaluatorOptions);
+     const options = {
+@@ -55912,7 +56341,7 @@
+   requestLoadedStream(noFetch = false) {
+     return this._loadedStreamPromise;
+   }
+-  terminate(reason) {}
++  terminate(reason) { this.imageDecodeQueue?.abort(reason); }
+ }
+ class NetworkPdfManager extends BasePdfManager {
+   constructor(args) {
+@@ -55921,11 +56350,28 @@
+       msgHandler: args.handler,
+       length: args.length,
+       disableAutoFetch: args.disableAutoFetch,
+-      rangeChunkSize: args.rangeChunkSize
++      rangeChunkSize: args.rangeChunkSize,
++      rangeCacheBytes: args.rangeCacheBytes
+     });
+     this.pdfDocument = new PDFDocument(this, this.streamManager.getStream());
+   }
++  async getPage(pageIndex) {
++    const release = this.streamManager.holdRangeCache();
++    try {
++      return await super.getPage(pageIndex);
++    } finally {
++      release();
++    }
++  }
+   async ensure(obj, prop, args) {
++    const release = this.streamManager.holdRangeCache();
++    try {
++      return await this._ensure(obj, prop, args);
++    } finally {
++      release();
++    }
++  }
++  async _ensure(obj, prop, args) {
+     try {
+       const value = obj[prop];
+       if (typeof value === "function") {
+@@ -55937,7 +56383,7 @@
+         throw ex;
+       }
+       await this.requestRange(ex.begin, ex.end);
+-      return this.ensure(obj, prop, args);
++      return this._ensure(obj, prop, args);
+     }
+   }
+   requestRange(begin, end) {
+@@ -55952,6 +56398,7 @@
+     });
+   }
+   terminate(reason) {
++    this.imageDecodeQueue?.abort(reason);
+     this.streamManager.abort(reason);
+   }
+ }
+@@ -56785,6 +57232,12 @@
+     this._rangeRequestReaders.push(reader);
+     return reader;
+   }
++  removeRangeReader(reader) {
++    const index = this._rangeRequestReaders.indexOf(reader);
++    if (index >= 0) {
++      this._rangeRequestReaders.splice(index, 1);
++    }
++  }
+   cancelAllRequests(reason) {
+     this._fullRequestReader?.cancel(reason);
+     for (const reader of this._rangeRequestReaders.slice(0)) {
+@@ -56948,6 +57401,22 @@
+     }
+     const workerHandlerName = docId + "_worker";
+     let handler = new MessageHandler(workerHandlerName, docId, port);
++    const registerHandler = handler.on.bind(handler);
++    handler.on = (name, callback) => registerHandler(name, function (data, sink) {
++      const release = name === "GetRangeCacheStats" || name === "TrimRangeCache"
++        ? null : pdfManager?.streamManager?.holdRangeCache();
++      try {
++        const result = callback.call(this, data, sink);
++        if (result?.then) {
++          return Promise.resolve(result).finally(() => release?.());
++        }
++        release?.();
++        return result;
++      } catch (reason) {
++        release?.();
++        throw reason;
++      }
++    });
+     function ensureNotTerminated() {
+       if (terminated) {
+         throw new Error("Worker was terminated");
+@@ -56955,36 +57424,44 @@
+     }
+     function startWorkerTask(task) {
+       WorkerTasks.add(task);
++      task._releaseRangeCache = pdfManager?.streamManager?.holdRangeCache();
+     }
+     function finishWorkerTask(task) {
+       task.finish();
+       WorkerTasks.delete(task);
++      task._releaseRangeCache?.();
+     }
+     async function loadDocument(recoveryMode) {
+-      await pdfManager.ensureDoc("checkHeader");
+-      await pdfManager.ensureDoc("parseStartXRef");
+-      await pdfManager.ensureDoc("parse", [recoveryMode]);
+-      await pdfManager.ensureDoc("checkFirstPage", [recoveryMode]);
+-      await pdfManager.ensureDoc("checkLastPage", [recoveryMode]);
+-      const isPureXfa = await pdfManager.ensureDoc("isPureXfa");
+-      if (isPureXfa) {
+-        const task = new WorkerTask("loadXfaFonts");
+-        startWorkerTask(task);
+-        await Promise.all([pdfManager.loadXfaFonts(handler, task).catch(reason => {}).then(() => finishWorkerTask(task)), pdfManager.loadXfaImages()]);
+-      }
+-      const [numPages, fingerprints] = await Promise.all([pdfManager.ensureDoc("numPages"), pdfManager.ensureDoc("fingerprints")]);
+-      const htmlForXfa = isPureXfa ? await pdfManager.ensureDoc("htmlForXfa") : null;
+-      return {
+-        numPages,
+-        fingerprints,
+-        htmlForXfa
+-      };
++      const release = pdfManager.streamManager?.holdRangeCache();
++      try {
++        await pdfManager.ensureDoc("checkHeader");
++        await pdfManager.ensureDoc("parseStartXRef");
++        await pdfManager.ensureDoc("parse", [recoveryMode]);
++        await pdfManager.ensureDoc("checkFirstPage", [recoveryMode]);
++        await pdfManager.ensureDoc("checkLastPage", [recoveryMode]);
++        const isPureXfa = await pdfManager.ensureDoc("isPureXfa");
++        if (isPureXfa) {
++          const task = new WorkerTask("loadXfaFonts");
++          startWorkerTask(task);
++          await Promise.all([pdfManager.loadXfaFonts(handler, task).catch(reason => {}).then(() => finishWorkerTask(task)), pdfManager.loadXfaImages()]);
++        }
++        const [numPages, fingerprints] = await Promise.all([pdfManager.ensureDoc("numPages"), pdfManager.ensureDoc("fingerprints")]);
++        const htmlForXfa = isPureXfa ? await pdfManager.ensureDoc("htmlForXfa") : null;
++        return {
++          numPages,
++          fingerprints,
++          htmlForXfa
++        };
++      } finally {
++        release?.();
++      }
+     }
+     async function getPdfManager({
+       data,
+       password,
+       disableAutoFetch,
+       rangeChunkSize,
++      rangeCacheBytes,
+       length,
+       docBaseUrl,
+       enableXfa,
+@@ -57000,7 +57477,8 @@
+         handler,
+         length,
+         password,
+-        rangeChunkSize
++        rangeChunkSize,
++        rangeCacheBytes
+       };
+       if (data) {
+         pdfManagerArgs.source = data;
+@@ -57127,7 +57605,7 @@
+         pdfManager = newPdfManager;
+         pdfManager.requestLoadedStream(true).then(stream => {
+           handler.send("DataLoaded", {
+-            length: stream.bytes.byteLength
++            length: stream.end
+           });
+         });
+       }).then(pdfManagerReady, onFailure);
+@@ -57196,8 +57674,16 @@
+     handler.on("GetMarkInfo", function (data) {
+       return pdfManager.ensureCatalog("markInfo");
+     });
++    handler.on("GetRangeCacheStats", function () {
++      const stats = pdfManager.streamManager?.getRangeCacheStats() ?? null;
++      return pdfManager.imageDecodeQueue ? { ...stats, ...pdfManager.imageDecodeQueue.stats() } : stats;
++    });
++    handler.on("TrimRangeCache", function () {
++      const stats = pdfManager.streamManager?.trimRangeCache() ?? null;
++      return pdfManager.imageDecodeQueue ? { ...stats, ...pdfManager.imageDecodeQueue.stats() } : stats;
++    });
+     handler.on("GetData", function (data) {
+-      return pdfManager.requestLoadedStream().then(stream => stream.bytes);
++      return pdfManager.requestLoadedStream().then(stream => stream.getByteRange(0, stream.end));
+     });
+     handler.on("GetAnnotations", function ({
+       pageIndex,
+@@ -57301,10 +57787,10 @@
+       if (isPureXfa) {
+         xfaData = refs[0];
+         if (!xfaData) {
+-          return stream.bytes;
++          return stream.getByteRange(0, stream.end);
+         }
+       } else if (changes.size === 0) {
+-        return stream.bytes;
++        return stream.getByteRange(0, stream.end);
+       }
+       const needAppearances = acroFormRef && acroForm instanceof Dict && changes.values().some(ref => ref.needAppearances);
+       const xfa = acroForm instanceof Dict && acroForm.get("XFA") || null;
+@@ -57346,7 +57832,7 @@
+         };
+       }
+       return incrementalUpdate({
+-        originalData: stream.bytes,
++        originalData: stream.getByteRange(0, stream.end),
+         xrefInfo: newXrefInfo,
+         changes,
+         xref,
+@@ -57375,7 +57861,9 @@
+           intent: data.intent,
+           cacheKey: data.cacheKey,
+           annotationStorage: data.annotationStorage,
+-          modifiedIds: data.modifiedIds
++          modifiedIds: data.modifiedIds,
++          imageDecodeScale: data.imageDecodeScale,
++          imageDecodeMaxDimension: data.imageDecodeMaxDimension
+         }).then(function (operatorListInfo) {
+           finishWorkerTask(task);
+           if (start) {
