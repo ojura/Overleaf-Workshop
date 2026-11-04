@@ -117,7 +117,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     const isReady = (id: number) => pageView(id)?.renderingState === FINISHED || previews.has(id);
     const hidden = () => owner.visibilityState === 'hidden';
     const nativeTarget = (id: number) => nativePages.includes(id) || renderAhead.includes(id);
-    const retainResources = (id: number) => policy.pruneOffscreen
+    const retainResources = (id: number) => policy.releaseRenderedResources
         ? nativeTarget(id) && pageView(id)?.renderingState !== FINISHED : prepared.includes(id);
 
     function clearRobotPending(): void {
@@ -358,7 +358,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         if (page._intentStates?.size !== 0) {
             const view = pageView(id);
             const native = view?.pdfPage === page;
-            if (policy.pruneOffscreen && native && view.renderingState === FINISHED && !jobs.has(id)) {
+            if (policy.releaseRenderedResources && native && view.renderingState === FINISHED && !jobs.has(id)) {
                 // PDF.js defers this until every render task and operator list is finished.
                 // The completed native canvas and our saved raster remain available.
                 page.cleanup();
@@ -707,7 +707,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             if (entry.native && pageView(id)?.pdfPage !== entry.page) { warm.delete(id); continue; }
             const view = pageView(id);
             if (retainResources(id) || jobs.has(id)
-                || cached.has(view) && !(policy.pruneOffscreen && view.renderingState === FINISHED)) { continue; }
+                || cached.has(view) && !(policy.releaseRenderedResources && view.renderingState === FINISHED)) { continue; }
             entry.page.cleanup();
             warm.delete(id);
         }
@@ -746,7 +746,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             job.page = page;
             if (!prepared.includes(id)) { return; }
             if (pageView(id)?.renderingState === FINISHED
-                || policy.pruneOffscreen && previews.has(id) && !nativeTarget(id)) { return; }
+                || policy.releaseRenderedResources && previews.has(id) && !nativeTarget(id)) { return; }
             if (!visible.includes(id) && visibleUncovered()) { return; }
             if (!resourcesWarm(id) && (fetchBackpressure() || memoryAdmissionBlocked())) { return; }
             const rotation = ((page.rotate || 0) + (viewer.pagesRotation || 0)) % 360;
@@ -783,7 +783,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         } finally {
             if (job.canvas) { job.canvas.width = job.canvas.height = 0; }
             if (job.page && doc === document && !retainResources(id)
-                && (policy.pruneOffscreen || !(viewer.getCachedPageViews?.() ?? new Set()).has(pageView(id)))) {
+                && (policy.releaseRenderedResources || !(viewer.getCachedPageViews?.() ?? new Set()).has(pageView(id)))) {
                 job.page.cleanup();
                 warm.delete(id);
             }
@@ -817,7 +817,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             const view = pageView(id);
             if (view?.renderingState === FINISHED || jobs.has(id) || failed.has(id) || declinedPreviews.has(id)
                 || view?.renderingState === RUNNING || view?.renderingState === PAUSED
-                || previews.has(id) && (resourcesWarm(id) || policy.pruneOffscreen && !nativeTarget(id))) { continue; }
+                || previews.has(id) && (resourcesWarm(id) || policy.releaseRenderedResources && !nativeTarget(id))) { continue; }
             // render() begins worker-side operator/image processing before onContinue. Keep
             // that CPU and fetch capacity for an uncovered viewport; covered motion can fill
             // the speculative horizon continuously while native resolution catches up.

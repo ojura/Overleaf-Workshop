@@ -219,8 +219,12 @@ describe('shared PDF scroll prefetch policy', function () {
         assert.strictEqual(desktop.rangeCacheBytes, 128 * 1024 * 1024);
         assert.strictEqual(desktop.pruneOffscreen, false);
         assert.deepStrictEqual(policy.pdfDocumentCacheOptions({ userAgent: 'desktop' }), {
-            rangeCacheBytes: 128 * 1024 * 1024, adaptiveImageDecoding: false, imageDecodeConcurrency: 0,
+            rangeCacheBytes: 128 * 1024 * 1024, adaptiveImageDecoding: true, imageDecodeConcurrency: 2,
         });
+        assert.deepStrictEqual([
+            desktop.limits.maxConcurrentPrepares, desktop.limits.maxPreparedPages, desktop.limits.maxRenderedPages,
+            desktop.limits.maxCanvasBytes, desktop.limits.maxPreviewBytes,
+        ], [3, 16, 8, 192 * 1024 * 1024, 64 * 1024 * 1024], 'image decoding keeps the desktop preparation and raster budgets');
         for (const device of [
             { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 27_2 like Mac OS X)', maxTouchPoints: 5 },
             { userAgent: 'Mozilla/5.0 (Linux; Android 16)', maxTouchPoints: 5 },

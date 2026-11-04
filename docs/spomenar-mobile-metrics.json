@@ -89,7 +89,7 @@
     "oldStageRendererScheduled": true
   },
   "adaptive": {
-    "description": "Display-size JPEG decoding, one active image job, document effects enabled and optional lab closed.",
+    "description": "Display-size JPEG decoding, one active image job, gap-triggered document effects enabled and optional lab closed.",
     "passes": [
       {
         "pass": 1,
@@ -417,6 +417,103 @@
         "supported": true,
         "truncated": false
       }
+    }
+  },
+  "firstVisibleFollowup": {
+    "commit": "16a72ff",
+    "admissionPolicy": "One delivery on the first useful visible encounter, including an already finished native canvas or cached preview.",
+    "method": {
+      "passes": 1,
+      "fromPage": 60,
+      "furthestPage": 90,
+      "returnPage": 65,
+      "forwardDurationMs": 3011,
+      "forwardUpdates": 183,
+      "reverseDurationMs": 2501,
+      "reverseUpdates": 151,
+      "movingSampleIntervalMs": 100,
+      "nativeRecording": "CPU only",
+      "optionalLabOpen": false,
+      "trustedInputInterrupted": false,
+      "scriptErrors": []
+    },
+    "moving": {
+      "samples": 55,
+      "missingSamples": 41,
+      "completedFetches": 200,
+      "fetchBytes": 102105088,
+      "maxPendingFetches": 14
+    },
+    "fleet": {
+      "maxAllowedActors": 4,
+      "maxAllowedCargoBytes": 524288,
+      "maxAllowedSpriteBytes": 204800,
+      "peakActors": 4,
+      "peakCargoBytes": 239616,
+      "peakSpriteBytes": 204800,
+      "peakRetainedBytes": 444416,
+      "newEpisodes": 15,
+      "offscreenCancelledEpisodes": 15,
+      "completedFragmentsDuringMotion": 0,
+      "paintCounterIncrements": 60,
+      "observedDomUpdateBatches": 52,
+      "rejected": 0,
+      "skipped": 0
+    },
+    "warmNativeAdmission": {
+      "page": 61,
+      "finishedBeforeMotion": true,
+      "kind": "page",
+      "actors": 2
+    },
+    "setupScreenshot": {
+      "page": 60,
+      "visible": [
+        60,
+        61
+      ],
+      "actors": 3,
+      "cargoBytes": 94464,
+      "spriteBytes": 153600,
+      "retainedBytes": 248064,
+      "presentation": "compact",
+      "headerClear": true,
+      "sourceKind": "preview",
+      "completedFragmentsBeforeMotion": 3
+    },
+    "recovery": {
+      "visibleReadyMs": 0,
+      "pdfAndFleetIdleMs": 304
+    },
+    "immediateIdle": {
+      "durationMs": 8067,
+      "snapshotCount": 21,
+      "cpuSamplesAfterFirstSecond": 14,
+      "meanCpuPercent": 1.6642857853855406,
+      "maxCpuPercent": 6.900000095367432,
+      "frameCounts": [
+        121
+      ],
+      "eventCounts": [
+        311
+      ],
+      "fetchCounts": [
+        224
+      ],
+      "activeActors": 0,
+      "retainedBytes": 0,
+      "scheduled": false,
+      "pendingFetches": 0
+    },
+    "restored": {
+      "page": 65,
+      "scale": 0.44362745098039214,
+      "scaleValue": "page-width",
+      "top": 30592,
+      "left": 0,
+      "robotsEnabled": true,
+      "diagnosticsEnabled": false,
+      "passiveCaptureRearmed": true
     }
   }
 }

@@ -21,9 +21,9 @@ The numeric record is [spomenar-mobile-metrics.json](spomenar-mobile-metrics.jso
 
 Safari's compatibility user-agent text contains an older iOS token. The OS version above comes from the device service, and the Safari version comes from its Version token.
 
-The phone loaded the real served PDF through byte ranges. The final controlled recording observed 487 requests with status 206, no failed requests, and no native memory-pressure events. The server validation separately checked exact head and tail byte counts and stable validators.
+The phone loaded the real served PDF through byte ranges. The adaptive-decoder comparison recording observed 487 requests with status 206, no failed requests, and no native memory-pressure events. The server validation separately checked exact head and tail byte counts and stable validators.
 
-## Controlled comparison
+## Controlled decoder comparison
 
 Each pass positioned the reader at physical PDF page 60, scrolled linearly to page 90 over 3,000 ms, and reversed to page 65 over 2,500 ms. The second pass used the caches left by the first. The scroll driver used the phone's animation frames, producing 181 or 182 forward updates and 151 reverse updates. Positioning and recovery were excluded from the moving-sample counts.
 
@@ -31,7 +31,7 @@ The browser snapshot was sampled about every 200 ms. A **gap sample** means that
 
 Web Inspector recorded memory categories and CPU approximately every 500 ms. Host monotonic timestamps were aligned to `performance.now()`; the adaptive run's calibration round trip was 8.3 ms. The final runner used one inspector connection for evaluation, memory, CPU and network recording. No forced garbage collection or explicit PDF cleanup occurred during these comparisons or their natural idle observations. The driver stops on trusted touch; none occurred during either controlled pass.
 
-The baseline below already included the sparse range cache and graduated preview cache. It predates adaptive JPEG sizing and serialized image decoding. The adaptive candidate also included document-mounted robot deliveries, with those effects enabled and the optional lab closed.
+The baseline below already included the sparse range cache and graduated preview cache. It predates adaptive JPEG sizing and serialized image decoding. The adaptive candidate also included document-mounted robot deliveries, with those effects enabled and the optional lab closed. These deliveries used gap-triggered admission; the later first-visible policy is measured separately below.
 
 | Measurement | Baseline | Adaptive candidate |
 | --- | ---: | ---: |
@@ -88,7 +88,7 @@ The book's photo collages make that sizing important. Server-side source inspect
 
 ## Idle work and CPU
 
-During the final natural idle observation, document effects were enabled and the optional lab was closed. The following remained constant for the entire 20-second recording:
+During the adaptive candidate's natural idle observation, document effects were enabled and the optional lab was closed. The following remained constant for the entire 20-second recording:
 
 - Event count 727 and fetch count 504.
 - Document robot frame count 14.
@@ -116,6 +116,35 @@ Two cold-page visual checks demonstrated the requested delivery behavior:
 The first closed-lab screenshot exposed a presentation defect: a courier and cargo could cross the header while entering from the top. The final viewer-bounds correction was checked on the same phone after deployment. With four active couriers, the live viewer rectangle was x=0, y=106, width=402, height=548, and the fixed transit layer computed `clip-path: inset(106px 0px 0px)`. The screenshot showed a clear header with visible couriers and cargo below it. This presentation change leaves the decoder and controlled memory comparison above unchanged.
 
 The optional lab continued processing its finite telemetry cargo after the document couriers returned. Its stage paint averaged 1.15 ms, with a 3 ms maximum in that physical observation. The default-idle CPU measurement above was taken with the lab closed and the document fleet fully empty.
+
+## First-visible delivery follow-up
+
+Commit `16a72ff` changed document-effect admission to give each page one delivery on its first useful visible encounter, including already cached pixels. The earlier decoder comparison above used gap-triggered admission. Phones retained the compact profile: four actors, 512 KiB of cargo and 204,800 bytes of sprite backing.
+
+One further pass used the same physical iPhone, with robots enabled and the optional lab closed. It moved from page 60 to 90 in 3,011 ms over 183 animation-frame updates, then reversed to page 65 in 2,501 ms over 151 updates. Moving snapshots were taken about every 100 ms; native recording captured CPU only. No trusted input interrupted the driver.
+
+Page 61 had a finished native canvas before motion began. On its first entry it received two couriers carrying those existing pixels. This directly exercised the new warm-page admission. The page-60 setup screenshot showed three compact couriers carrying real preview fragments, with a clear header and 248,064 retained bytes. Those three fragments completed before the moving pass.
+
+| Measurement during the moving pass | Observed value |
+| --- | ---: |
+| Peak active couriers | 4 |
+| Peak retained cargo | 239,616 bytes |
+| Peak sprite backing | 204,800 bytes |
+| Peak combined robot backing | 444,416 bytes |
+| New page episodes | 15 |
+| Episodes cancelled after leaving the visible region | 15 |
+| Completed fragments during rapid motion | 0 |
+| Paint-counter increments | 60 |
+| Observed DOM update batches | 52 |
+| Rejected or skipped episodes | 0 |
+
+The couriers left with their pages during this rapid traversal, so every moving episode was cancelled before deposit. The fixed actor cap remained saturated at four in several samples, then capacity was released as pages left view. The stopped reading page was ready at the first sample; PDF work and the fleet were both idle after 304 ms.
+
+The moving samples contained 41 gaps out of 55. The pass completed 200 range fetches totaling 102,105,088 bytes, with at most 14 pending fetches in the samples. This follow-up used one pass and 100 ms sampling; the earlier decoder comparison used two passes and 200 ms sampling.
+
+Over the following 8,067 ms, the frame count remained 121, event count 311 and fetch count 224. Active couriers, retained robot bytes and pending fetches stayed at zero, with `scheduled: false`. CPU after the first idle second averaged 1.664%, with a 6.9% maximum across fourteen samples. This window began immediately after recovery; the earlier 0.229% observation followed the separately documented 86.27-second settling interval.
+
+The check restored page 65 at page-width scale, scroll top 30,592 and left 0, with robots enabled and the lab closed. The CPU recorder detached, temporary observers and driver listeners were removed, and passive trusted-input capture was rearmed.
 
 ## Higher-zoom photo check
 

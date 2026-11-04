@@ -8,6 +8,8 @@ The first visit fits the page to the reading column. PDF.js remembers the page, 
 
 The SVG robot button in the header controls deliveries on the document and starts on. On a page's first substantial visible encounter, the robots carry fragments of its rendered pixels into place, including pages already prepared by prefetch. A thin page strip at the edge waits for a useful view, and later visits or zoom changes do not repeat that page's performance. Large desktop reading areas use six to twelve larger couriers; phones, tablets and narrow panes keep a compact four-courier limit. Both presentations release their cargo and stop animation when the delivery ends.
 
+Larger fragments sometimes travel with a pair or trio sharing one payload. Aerial-ground teams can rendezvous, hand the fragment to a ground carrier and finish the delivery together. These episodes share the same actor and memory limits as solo couriers, with a single copied fragment for the whole team.
+
 A separate measurement button opens the optional LARICS Motion Lab. Its fleet can be summoned while pages are ready, and it becomes the departure point for document deliveries while open. The lab starts closed. Search and outline remain in the PDF.js toolbar and sidebar. Download sends the same-origin PDF URL directly to the browser's download manager, so it does not assemble the full book in a JavaScript buffer first.
 
 The header and viewer fill the available viewport. PDF.js's page container owns scrolling, while the header keeps touch targets at least 44 pixels wide and high. The viewport permits browser zoom and accounts for device safe areas.
@@ -55,7 +57,7 @@ The production source is `/spomenar/book.pdf`. It must serve the PDF directly an
 
 PDF.js automatic streaming and automatic whole-document fetching are disabled. The shared predictor can still request nearby pages and their resources. Received bytes use the shared sparse worker cache, with a 32 MiB idle target on phones and tablets and 128 MiB on desktop. Old chunks can be evicted and fetched again. Fetch start, received bytes, elapsed time, and completion feed the same `PdfPerformance` collector used by the extension, so network backpressure and the robot delivery activity reflect actual requests.
 
-Mobile image decoding follows the displayed page and zoom, with one image job admitted at a time. Plain RGB JPEGs can decode directly into resized native bitmaps. A later zoom requests more detail. This avoids retaining the book's original print-resolution photo pixels merely to draw a phone-sized page. The same shared policy and patched worker are used by both extension engines.
+Image decoding follows the displayed page and zoom on every device, with one image job on mobile and two on desktop. Plain RGB JPEGs can decode directly into resized native bitmaps. A later zoom requests more detail, while printing uses original resolution. Finished native canvases and distant retained previews release their decoded image tiers without starting another idle decode. Desktop keeps its larger native-canvas cache. The same shared policy and patched worker are used by both extension engines.
 
 The website's scripts, PDF.js worker, fonts, locales, and WASM files come from the same origin. It uses external scripts, system fonts, and `isEvalSupported: false`. PDF.js needs WASM execution, worker/blob sources, data/blob images and fonts, and dynamically applied styles. The deployment's CSP must allow those resources.
 

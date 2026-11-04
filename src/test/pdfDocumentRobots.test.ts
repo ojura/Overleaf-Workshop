@@ -45,7 +45,10 @@ class Element {
     setAttribute(name: string, value: string) { this.attributes.set(name, value); }
 }
 class Canvas extends Element {
-    width = 0;
+    private pixelWidth = 0;
+    zeroWrites = 0;
+    get width() { return this.pixelWidth; }
+    set width(value: number) { if (value === 0) { this.zeroWrites++; } this.pixelWidth = value; }
     height = 0;
     readonly copies: any[][] = [];
     readonly contextOptions: any[] = [];
@@ -202,6 +205,28 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         return result;
     }
 
+    function cooperative(mode?: string, helpers = 2, useLab = false) {
+        const f = fixture({ maxActors: helpers });
+        f.desktop();
+        if (useLab) { f.api.setDispatchOrigin(f.openLab().lab.dispatch); }
+        for (let id = 1; id <= 12; id++) {
+            const page = f.page(id);
+            page.pageElement.rect = { left: 40, top: 60, width: 465, height: 661 };
+            f.api.setVisiblePages([id]);
+            f.api.offer(page);
+            const payload = f.api.snapshot().pages[0]?.payloads?.find((candidate: any) => candidate.helpers.length === helpers
+                && (!mode || candidate.mode === mode));
+            if (payload) { return { f, page, payload }; }
+            f.finish();
+        }
+        assert.fail('a varied delivery sequence includes a real shared payload for ' + helpers + ' helpers' + (mode ? ' in ' + mode : ''));
+    }
+
+    function point(canvas: Canvas) {
+        const match = canvas.style.transform.match(/translate\(([-\d.]+)px,([-\d.]+)px\)/)!;
+        return { x: Number(match[1]) + parseFloat(canvas.style.width) / 2, y: Number(match[2]) + parseFloat(canvas.style.height) / 2 };
+    }
+
     it('copies real bounded fragments into a transparent viewport transit layer and finishes without idle frames', () => {
         const f = fixture();
         const page = f.page();
@@ -210,9 +235,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const began = f.api.snapshot();
         assert.ok(began.activeActors >= 2 && began.activeActors <= began.maxActors);
         const copies = f.owned.flatMap(canvas => canvas.copies).filter(args => args.length === 9);
-        assert.strictEqual(copies.length, began.activeActors, 'each courier carries actual pixels copied from the ready canvas');
+        assert.strictEqual(copies.length, began.activePayloads, 'each payload copies its ready pixels once, including shared cargo');
         assert.ok(copies.every(args => args[0] === page.canvas && args[3] < page.canvas.width && args[4] < page.canvas.height));
-        assert.ok(f.owned.every(canvas => Math.max(canvas.width, canvas.height) <= module.DOCUMENT_ROBOT_LIMITS.fragmentDimension));
+        assert.ok(f.owned.every(canvas => Math.max(canvas.width, canvas.height) <= module.DOCUMENT_ROBOT_LIMITS.fragmentDimension * module.DOCUMENT_ROBOT_LIMITS.cooperative.rasterScale));
         const transit = f.document.body.children.find((child: Element) => child.className === 'pdfDocumentRobotTransit')!;
         assert.strictEqual(transit.style.position, 'fixed');
         assert.strictEqual(transit.style.zIndex, '2147483647', 'departing actors stay visible above the optional lab');
@@ -227,12 +252,195 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         }
         f.finish();
         const ended = f.api.snapshot();
-        assert.strictEqual(ended.deliveredFragments, began.activeActors);
+        assert.strictEqual(ended.deliveredFragments, began.activePayloads);
         assert.strictEqual(ended.activeEpisodes + ended.activeActors + ended.retainedBytes, 0);
         assert.strictEqual(ended.scheduled, false);
         assert.strictEqual(f.callbacks.size, 0);
         assert.strictEqual(transit.parentNode, null);
         assert.deepStrictEqual([page.canvas.width, page.canvas.height], [4320, 6480]);
+    });
+
+    it('copies one substantial real fragment for a cooperative pair and a cooperative trio', () => {
+        for (const helpers of [2, 3]) {
+            const { f, page, payload } = cooperative('formation', helpers);
+            const state = f.api.snapshot();
+            const actors = state.pages[0].actors.filter((actor: any) => actor.payloadId === payload.id);
+            assert.strictEqual(actors.length, helpers);
+            assert.strictEqual(new Set(actors.map((actor: any) => actor.vehicle)).size, helpers);
+            const cargo = f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.dataset.payload === String(payload.id));
+            assert.strictEqual(cargo.length, 1, 'helpers share one retained raster');
+            assert.strictEqual(cargo[0].copies.filter(args => args.length === 9).length, 1);
+            assert.strictEqual(cargo[0].copies[0][0], page.canvas);
+            assert.ok(payload.target.width * 465 > 220 && payload.target.height * 661 > 160, 'a team receives a visibly larger content fragment');
+            assert.strictEqual(state.activePayloads, 1);
+            assert.strictEqual(state.cargoBytes, cargo[0].width * cargo[0].height * 4);
+            page.canvas.width = page.canvas.height = 0;
+            f.frame();
+            assert.ok(cargo[0].width > 0, 'helpers do not depend on a retained source canvas');
+        }
+    });
+
+    it('keeps cooperative helpers in formation and deposits their shared fragment exactly once', () => {
+        const { f, payload } = cooperative('formation');
+        const baseline = f.api.snapshot().deliveredFragments;
+        let current: any;
+        for (let step = 0; step < 120; step++) {
+            f.frame();
+            current = f.api.snapshot().pages[0]?.payloads.find((candidate: any) => candidate.id === payload.id);
+            if (current?.progress >= 0.4) { break; }
+        }
+        assert.strictEqual(current.stage, 'carry');
+        const sprites = payload.helpers.map((id: number) => f.owned.find(canvas => canvas.dataset.courier === String(id) && canvas.className === 'pdfDocumentRobotVehicle')) as Canvas[];
+        const before = sprites.map(point);
+        f.frame();
+        const after = sprites.map(point);
+        assert.ok(Math.abs((before[1].x - before[0].x) - (after[1].x - after[0].x)) < 0.05);
+        assert.ok(Math.abs((before[1].y - before[0].y) - (after[1].y - after[0].y)) < 0.05);
+        for (let step = 0; step < 120; step++) {
+            f.frame();
+            const actors = f.api.snapshot().pages[0]?.actors.filter((actor: any) => actor.payloadId === payload.id);
+            if (actors?.some((actor: any) => actor.deposited)) {
+                assert.ok(actors.every((actor: any) => actor.deposited), 'the common payload controls every helper deposit');
+                break;
+            }
+        }
+        assert.strictEqual(f.api.snapshot().deliveredFragments, baseline + 1);
+        const cargo = f.owned.find(canvas => canvas.dataset.payload === String(payload.id))!;
+        f.finish();
+        assert.strictEqual(cargo.zeroWrites, 1, 'shared cargo is released once after deposit');
+        assert.strictEqual(f.api.snapshot().deliveredFragments, baseline + 1);
+        assert.strictEqual(f.callbacks.size, 0);
+    });
+
+    it('coordinates an aerial-to-ground handoff before the ground carrier transports the shared payload', () => {
+        const { f, payload } = cooperative('handoff');
+        const actors = f.api.snapshot().pages[0].actors;
+        assert.ok(actors.some((actor: any) => actor.role === 'aerial'));
+        assert.ok(actors.some((actor: any) => actor.role === 'ground'));
+        let current: any;
+        for (let step = 0; step < 120; step++) {
+            f.frame();
+            current = f.api.snapshot().pages[0]?.payloads.find((candidate: any) => candidate.id === payload.id);
+            if (current?.stage === 'handoff') { break; }
+        }
+        assert.strictEqual(current.stage, 'handoff');
+        assert.strictEqual(current.handedOff, false);
+        assert.strictEqual(current.carrier, 'aerial');
+        const ground = actors.find((actor: any) => actor.role === 'ground');
+        const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.dataset.courier === String(ground.id))!;
+        const rendezvous = point(sprite);
+        f.frame();
+        assert.deepStrictEqual(point(sprite), rendezvous, 'the ground vehicle waits while the aerial helper lowers the parcel');
+        for (let step = 0; step < 120; step++) {
+            f.frame();
+            current = f.api.snapshot().pages[0]?.payloads.find((candidate: any) => candidate.id === payload.id);
+            if (current?.stage === 'carry') { break; }
+        }
+        assert.strictEqual(current.handedOff, true);
+        assert.strictEqual(current.carrier, 'ground');
+        assert.strictEqual(current.deposited, false);
+        f.finish();
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes, 0);
+    });
+
+    it('releases cooperative cargo once and returns every borrowed helper on each lifecycle ending', () => {
+        for (const ending of ['finish', 'offscreen', 'reset', 'hide', 'disable', 'dispose']) {
+            const { f, payload } = cooperative('formation', 2, true);
+            const cargo = f.owned.find(canvas => canvas.dataset.payload === String(payload.id))!;
+            const pending = [...f.callbacks.values()];
+            const outside = f.lab.snapshot().actors.filter((actor: any) => actor.outside);
+            assert.strictEqual(outside.length, 2);
+            if (ending === 'finish') { f.finish(); }
+            else if (ending === 'offscreen') { f.api.setVisiblePages([]); }
+            else if (ending === 'hide') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+            else if (ending === 'disable') { f.api.setEnabled(false); }
+            else { f.api[ending](); }
+            for (const callback of pending) { callback(f.now + 10000); }
+            assert.strictEqual(cargo.zeroWrites, 1, ending + ' releases the shared bitmap exactly once');
+            assert.ok(f.lab.snapshot().actors.every((actor: any) => !actor.outside));
+            assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes, 0);
+            assert.strictEqual(f.callbacks.size, 0);
+        }
+    });
+
+    it('mixes solo and cooperative deliveries within the existing mobile and desktop resource caps', () => {
+        const modes = new Set<string>();
+        for (const device of ['mobile', 'desktop']) {
+            const f = fixture({ device });
+            f.desktop(3);
+            for (let id = 1; id <= 15; id++) {
+                const page = f.page(id);
+                page.pageElement.rect = { left: 40, top: 60, width: 465, height: 661 };
+                f.api.setVisiblePages([id]); f.api.offer(page);
+                const state = f.api.snapshot();
+                for (const payload of state.pages[0]?.payloads ?? []) { modes.add(payload.mode); }
+                assert.ok(state.activeActors <= state.maxActors && state.cargoBytes <= state.maxCargoBytes && state.spriteBytes <= state.maxSpriteBytes);
+                assert.strictEqual(state.retainedBytes, f.owned.reduce((bytes, canvas) => bytes + canvas.width * canvas.height * 4, 0));
+                f.finish();
+            }
+        }
+        assert.deepStrictEqual([...modes].sort(), ['formation', 'handoff', 'solo']);
+    });
+
+    it('falls back to solo fragments when a larger cooperative raster cannot fit the existing byte cap', () => {
+        const shared = cooperative('formation');
+        const larger = shared.f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.dataset.payload === String(shared.payload.id))!;
+        assert.ok(larger.width * larger.height * 4 > 180000, 'the control scene needs more bytes than the constrained cache allows');
+        const f = fixture({ device: 'mobile', maxActors: 3, maxCargoBytes: 180000 });
+        f.desktop();
+        for (let id = 1; id <= 12; id++) {
+            const page = f.page(id);
+            page.pageElement.rect = { left: 40, top: 60, width: 465, height: 661 };
+            f.api.setVisiblePages([id]);
+            assert.strictEqual(f.api.offer(page), 'started');
+            const state = f.api.snapshot();
+            assert.ok(state.pages[0].payloads.every((payload: any) => payload.mode === 'solo' && payload.helpers.length === 1));
+            assert.ok(state.cargoBytes <= 180000);
+            assert.strictEqual(state.cargoBytes, f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotCargo')
+                .reduce((bytes, canvas) => bytes + canvas.width * canvas.height * 4, 0));
+            f.finish();
+            assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+        }
+        assert.ok(f.owned.flatMap(canvas => canvas.copies).filter(args => args.length === 9)
+            .every(args => args[7] <= module.DOCUMENT_ROBOT_LIMITS.fragmentDimension), 'over-budget team rasters are rejected before copying');
+    });
+
+    it('rolls back a partially reserved cooperative crew without leaking its shared raster or lab actor', () => {
+        const f = fixture({ maxActors: 3 });
+        f.desktop();
+        const held = new Set<string>();
+        let availableVehicle: string | undefined, reservations = 0, releases = 0;
+        const origin = { x: 550, y: 80, scale: 0.4 };
+        f.api.setDispatchOrigin({
+            reserve(vehicle: string) {
+                availableVehicle ??= vehicle;
+                if (vehicle !== availableVehicle || held.has(vehicle)) { return; }
+                held.add(vehicle); reservations++; return origin;
+            },
+            destination: (vehicle: string) => held.has(vehicle) ? origin : undefined,
+            release(vehicle: string) { assert.ok(held.delete(vehicle), 'each borrowed helper is returned once'); releases++; },
+        });
+        let rolledBack = 0;
+        for (let id = 1; id <= 12; id++) {
+            const page = f.page(id);
+            page.pageElement.rect = { left: 40, top: 60, width: 465, height: 661 };
+            f.api.setVisiblePages([id]); f.api.offer(page);
+            const state = f.api.snapshot();
+            if (state.pages[0]?.payloads) {
+                assert.ok(state.pages[0].payloads.every((payload: any) => payload.mode === 'solo' && payload.helpers.length === 1));
+            }
+            assert.strictEqual(held.size, state.activeActors);
+            f.finish();
+            assert.strictEqual(held.size, 0);
+            assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+        }
+        for (const canvas of f.owned) {
+            if (canvas.copies.some(args => args.length === 9 && args[7] > module.DOCUMENT_ROBOT_LIMITS.desktop.fragmentDimension)) {
+                rolledBack++; assert.strictEqual(canvas.zeroWrites, 1, 'a failed team releases its one copied raster once');
+            }
+        }
+        assert.ok(rolledBack > 0, 'the test exercises a cooperative allocation before a later helper reservation fails');
+        assert.strictEqual(reservations, releases);
     });
 
     it('clips couriers and cargo below the toolbar and follows the visible viewer during an active lab departure', () => {

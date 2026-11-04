@@ -37,6 +37,8 @@ export interface PdfCachePolicy {
     readonly limits: Readonly<{ [Key in keyof typeof PREFETCH_LIMITS]: number }>;
     readonly rangeCacheBytes: number;
     readonly pruneOffscreen: boolean;
+    /** Keep completed pixels without retaining their operator lists and decoded images. */
+    readonly releaseRenderedResources: boolean;
     readonly adaptiveImageDecoding: boolean;
     readonly imageDecodeConcurrency: number;
 }
@@ -49,11 +51,11 @@ export interface ReaderDevice {
 
 const DESKTOP_POLICY: PdfCachePolicy = Object.freeze({
     name: 'desktop', limits: PREFETCH_LIMITS, rangeCacheBytes: 128 * 1024 * 1024, pruneOffscreen: false,
-    adaptiveImageDecoding: false, imageDecodeConcurrency: 0,
+    releaseRenderedResources: true, adaptiveImageDecoding: true, imageDecodeConcurrency: 2,
 });
 const MOBILE_POLICY: PdfCachePolicy = Object.freeze({
     name: 'mobile', limits: MOBILE_PREFETCH_LIMITS, rangeCacheBytes: 32 * 1024 * 1024, pruneOffscreen: true,
-    adaptiveImageDecoding: true, imageDecodeConcurrency: 1,
+    releaseRenderedResources: true, adaptiveImageDecoding: true, imageDecodeConcurrency: 1,
 });
 
 /** iPad's desktop UA still reports several touch points; a Windows touch laptop stays desktop. */

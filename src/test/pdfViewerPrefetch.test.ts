@@ -902,15 +902,18 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         }
     });
 
-    for (const nativeFirst of [true, false]) {
-        it('releases finished mobile native resources after ' + (nativeFirst ? 'its auxiliary render finishes' : 'native rendering follows auxiliary completion'), async () => {
-            const f = fixture({ mobile: true });
+    for (const [mobile, nativeFirst] of [[false, true], [false, false], [true, true], [true, false]]) {
+        it('releases finished ' + (mobile ? 'mobile' : 'desktop') + ' native resolution tiers after ' + (nativeFirst ? 'its auxiliary render finishes' : 'native rendering follows auxiliary completion'), async () => {
+            const f = fixture({ mobile });
             await f.frame();
             const preparation = f.pdf.activeRenders.find(render => render.id === 21)!;
             const view = f.pages[20];
             view.pdfPage = preparation.page;
             view.renderingState = 1;
+            preparation.page._intentStates.set('display-low-density', {});
+            preparation.page._intentStates.set('display-high-density', {});
             preparation.page.objs.set('photo', { width: 100, height: 100, data: new Uint8Array(40_000) });
+            preparation.page.objs.set('photo-low-density', { width: 50, height: 50, data: new Uint8Array(10_000) });
             if (nativeFirst) {
                 f.finishNative(view.id);
                 assert.ok(preparation.page._intentStates.size > 0, 'the auxiliary render still needs the shared resources');
@@ -925,7 +928,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
                 f.finishNative(view.id);
             }
             const canvas = view.canvas;
-            assert.strictEqual(preparation.page._intentStates.size, 0, 'finished pixels no longer retain original photo bitmaps');
+            assert.strictEqual(preparation.page._intentStates.size, 0, 'finished pixels release every retained display-density tier');
             assert.strictEqual(preparation.page.objs.size, 0);
             await f.frame();
             assert.strictEqual(view.canvas, canvas);
@@ -941,51 +944,105 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         });
     }
 
-    it('defers finished mobile page cleanup while another PDF.js render still uses its resources', async () => {
-        const f = fixture({ mobile: true, startPage: 1, pages: 1 });
+    for (const mobile of [false, true]) {
+        it('defers finished ' + (mobile ? 'mobile' : 'desktop') + ' page cleanup while another PDF.js render still uses its resources', async () => {
+            const f = fixture({ mobile, startPage: 1, pages: 1 });
+            await f.frame();
+            const page = f.pdf.page(1);
+            const canvas = f.pages[0].canvas;
+            const otherRender = page.render({ viewport: page.getViewport({ scale: 1, rotation: 0 }) });
+            page.objs.set('photo', { width: 100, height: 100, data: new Uint8Array(40_000) });
+            const cleanups = page.cleanupCalls;
+            f.eventBus.emit('pagerendered', { pageNumber: 1, error: null, cssTransform: false });
+            assert.ok(page.cleanupCalls > cleanups, 'the completed native page requests safe deferred cleanup');
+            assert.ok(page.objs.size > 0, 'an additional active PDF.js render keeps its images until completion');
+            otherRender.finish();
+            await promisesSettled();
+            assert.strictEqual(page.objs.size, 0);
+            assert.strictEqual(page._intentStates.size, 0);
+            assert.strictEqual(f.pages[0].canvas, canvas);
+            await f.frame();
+            assert.strictEqual(f.pdf.renders.length, 1, 'finished native pixels do not restart preparation');
+        });
+    }
+
+    for (const mobile of [false, true]) {
+        it('prepares ' + (mobile ? 'mobile' : 'desktop') + ' images for native pixel density and invalidates warm admission on larger zoom', async () => {
+            const f = fixture({ mobile });
+            f.owner.defaultView.devicePixelRatio = 2;
+            const view: any = f.pages[20];
+            view.viewport = { width: 800, height: 1000, scale: 1 };
+            await f.frame();
+            const first = f.pdf.activeRenders.find(render => render.id === 21)!;
+            assert.strictEqual(first.parameters.imageDecodeScale, 2, 'a small preview prepares the native display density');
+            assert.strictEqual(first.parameters.imageDecodeMaxDimension, 2000);
+            first.task.finish();
+            await promisesSettled();
+            view.viewport = { width: 1600, height: 2000, scale: 2 };
+            const transfers = Array.from({ length: f.controller.snapshot().cacheLimits.maxPendingFetches }, () => fetches.begin());
+            f.scrollBy(1000);
+            f.eventBus.emit('scalechanging');
+            await promisesSettled();
+            await f.frame();
+            assert.ok(first.page._intentStates.size > 0, 'old display resources still exist during the zoom transition');
+            assert.strictEqual(f.queue.renderView(view), false, 'the old lower-resolution intent cannot bypass cold-work pressure');
+            for (const transfer of transfers) { fetches.end(transfer); }
+            await f.frame();
+            const last = f.pdf.renders.filter(render => render.id === 21).at(-1)!;
+            assert.notStrictEqual(last, first);
+            assert.strictEqual(last.parameters.imageDecodeScale, 4);
+            assert.strictEqual(last.parameters.imageDecodeMaxDimension, 4000);
+        });
+    }
+
+    it('releases desktop raster-only resolution tiers without idle rewarming beyond the native window', async () => {
+        const f = fixture();
+        f.container.clientHeight = 2000;
         await f.frame();
-        const page = f.pdf.page(1);
-        const canvas = f.pages[0].canvas;
-        const otherRender = page.render({ viewport: page.getViewport({ scale: 1, rotation: 0 }) });
-        page.objs.set('photo', { width: 100, height: 100, data: new Uint8Array(40_000) });
-        const cleanups = page.cleanupCalls;
-        f.eventBus.emit('pagerendered', { pageNumber: 1, error: null, cssTransform: false });
-        assert.ok(page.cleanupCalls > cleanups, 'the completed native page requests safe deferred cleanup');
-        assert.ok(page.objs.size > 0, 'an additional active PDF.js render keeps its images until completion');
-        otherRender.finish();
-        await promisesSettled();
-        assert.strictEqual(page.objs.size, 0);
-        assert.strictEqual(page._intentStates.size, 0);
-        assert.strictEqual(f.pages[0].canvas, canvas);
+        const state = f.controller.snapshot();
+        const farId = state.prepared.find((id: number) => !state.visible.includes(id) && !state.renderAhead.includes(id));
+        assert.ok(farId, 'the preparation plan extends beyond the finite native window');
+        for (let step = 0; step < 8; step++) {
+            for (const render of [...f.pdf.activeRenders]) {
+                render.page._intentStates.set('display-previous-density', {});
+                render.page.objs.set('old-photo', { width: 80, height: 60, data: new Uint8Array(19_200) });
+                render.task.finish();
+            }
+            await promisesSettled();
+            await f.frame();
+        }
+        const first = f.pdf.renders.find(render => render.id === farId)!;
+        assert.ok(first);
+        const raster: Canvas = first.parameters.canvasContext.canvas;
+        assert.ok(raster.width > 0, 'the completed preview is retained');
+        assert.strictEqual(first.page._intentStates.size, 0, 'a raster-only prepared page releases all decoded tiers');
+        assert.strictEqual(first.page.objs.size, 0);
+        assert.strictEqual(f.pdf.renders.filter(render => render.id === farId).length, 1);
+        const renders = f.pdf.renders.length;
+        for (let step = 0; step < 4; step++) { f.eventBus.emit('updateviewarea'); await f.frame(30_000); }
+        assert.strictEqual(f.pdf.renders.length, renders, 'retained previews do not restart work after resource cleanup');
+        assert.strictEqual(f.callbacks.size, 0);
+        assert.strictEqual(timers.size, 0);
+        f.scrollBy((farId - 20) * 1000);
         await f.frame();
-        assert.strictEqual(f.pdf.renders.length, 1, 'finished native pixels do not restart preparation');
+        assert.strictEqual(raster.parentNode, f.pages[farId - 1].div, 'the existing pixels cover native resource preparation');
+        assert.strictEqual(f.pdf.renders.filter(render => render.id === farId).length, 2);
     });
 
-    it('prepares mobile images for native pixel density and invalidates warm admission on larger zoom', async () => {
-        const f = fixture({ mobile: true });
-        f.owner.defaultView.devicePixelRatio = 2;
-        const view: any = f.pages[20];
-        view.viewport = { width: 800, height: 1000, scale: 1 };
+    it('preserves desktop offscreen canvases while releasing their decoded resolution tiers', async () => {
+        const f = fixture();
         await f.frame();
-        const first = f.pdf.activeRenders.find(render => render.id === 21)!;
-        assert.strictEqual(first.parameters.imageDecodeScale, 2, 'a small preview prepares the native display density');
-        assert.strictEqual(first.parameters.imageDecodeMaxDimension, 2000);
-        first.task.finish();
-        await promisesSettled();
-        view.viewport = { width: 1600, height: 2000, scale: 2 };
-        const transfers = Array.from({ length: 6 }, () => fetches.begin());
-        f.scrollBy(1000);
-        f.eventBus.emit('scalechanging');
-        await promisesSettled();
+        const page = f.pdf.page(17);
+        page._intentStates.set('display-old-density', {});
+        page.objs.set('photo', { width: 80, height: 60, data: new Uint8Array(19_200) });
+        f.finishNative(17);
+        const canvas = f.pages[16].canvas;
         await f.frame();
-        assert.ok(first.page._intentStates.size > 0, 'old display resources still exist during the zoom transition');
-        assert.strictEqual(f.queue.renderView(view), false, 'the old lower-resolution intent cannot bypass cold-work pressure');
-        for (const transfer of transfers) { fetches.end(transfer); }
-        await f.frame();
-        const last = f.pdf.renders.filter(render => render.id === 21).at(-1)!;
-        assert.notStrictEqual(last, first);
-        assert.strictEqual(last.parameters.imageDecodeScale, 4);
-        assert.strictEqual(last.parameters.imageDecodeMaxDimension, 4000);
+        assert.ok(canvas && canvas.width > 0);
+        assert.strictEqual(f.pages[16].canvas, canvas, 'desktop canvas retention remains independent of decoded cleanup');
+        assert.strictEqual(f.pages[16].destroyCalls, 0);
+        assert.strictEqual(page._intentStates.size, 0);
+        assert.strictEqual(page.objs.size, 0);
     });
 
     it('accounts decoded image allocations once, classifying shared storage before page storage', async () => {
@@ -1636,7 +1693,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.ok(f.pdf.renders.length > 0, 'preview preparation overlaps the remaining five aged transfers');
     });
 
-    it('allows running, paused and completed-resource native rendering under fetch pressure', async () => {
+    it('allows active desktop native work under fetch pressure but readmits a cleaned redraw as cold', async () => {
         const f = fixture();
         const visible = f.pages[19];
         visible.renderingState = 1;
@@ -1652,8 +1709,8 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.strictEqual(f.choose(), null, 'the unfinished page has not yet established resource readiness');
         f.finishNative(visible.id);
         visible.renderingState = 0;
-        assert.strictEqual(f.choose(), visible, 'a completed native render certifies warm resources for a redraw');
-        assert.strictEqual(f.queue.renderView(visible), true);
+        assert.strictEqual(f.choose(), null, 'a completed canvas releases its decoded resources before a later redraw');
+        assert.strictEqual(f.queue.renderView(visible), false);
     });
 
     it('allows a completed preview to supply warm resources while pending fetches block cold pages', async () => {
@@ -1701,9 +1758,11 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         f.scrollBy(-5000);
         await f.frame();
         assert.ok(!f.controller.snapshot().renderAhead.includes(oldId));
+        oldView.renderingState = 1;
         assert.strictEqual(f.queue.renderView(oldView), false);
         assert.strictEqual(f.nativeRenders.length, 0, 'a resolved native getPage must not revive obsolete render work');
         const current = f.pages[f.visible().first.id - 1];
+        current.renderingState = 1;
         assert.strictEqual(f.queue.renderView(current), true);
         assert.deepStrictEqual(f.nativeRenders, [current]);
         const thumbnail = { id: current.id, renderingId: 'thumbnail' + current.id };
@@ -1716,9 +1775,11 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         const old = f.pages[19];
         f.replaceDocument();
         await f.frame();
+        old.renderingState = 1;
         assert.strictEqual(f.queue.renderView(old), false);
         assert.strictEqual(f.nativeRenders.length, 0, 'the old view has the same page number but belongs to the old document');
         const current = f.pages[19];
+        current.renderingState = 1;
         assert.strictEqual(f.queue.renderView(current), true);
         assert.deepStrictEqual(f.nativeRenders, [current]);
     });
