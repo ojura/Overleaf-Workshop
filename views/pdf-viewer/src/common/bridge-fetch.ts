@@ -5,8 +5,9 @@
  * other URL, e.g. pdf.js's own resources, goes to the webview's fetch as before.
  */
 import type { HostMessage, ViewerMessage } from './protocol';
+import { pdfPerformance } from './prefetch-performance';
 
-interface Pending { resolve: (response: Response) => void, reject: (error: unknown) => void }
+interface Pending { resolve: (response: Response) => void, reject: (error: unknown) => void, started: number, cleanup: () => void }
 
 const NULL_BODY = new Set([101, 204, 205, 304]);
 
@@ -25,11 +26,14 @@ export function installBridgeFetch(post: (message: ViewerMessage) => void, bridg
         const waiting = pending.get(message.id);
         if (!waiting) { return; }
         pending.delete(message.id);
+        waiting.cleanup();
         if (message.type === 'fetchResponse') {
+            pdfPerformance.fetch(message.body?.byteLength ?? 0, performance.now() - waiting.started);
             waiting.resolve(new Response(NULL_BODY.has(message.status) ? null : message.body, {
                 status: message.status, statusText: message.statusText, headers: message.headers,
             }));
         } else {
+            pdfPerformance.event('fetch-error');
             waiting.reject(new TypeError(message.message)); // as fetch rejects on network errors
         }
     });
@@ -44,14 +48,29 @@ export function installBridgeFetch(post: (message: ViewerMessage) => void, bridg
             const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
             const aborted = () => signal?.reason ?? new DOMException('The request was aborted.', 'AbortError');
             if (signal?.aborted) { reject(aborted()); return; }
-            pending.set(id, { resolve, reject });
-            signal?.addEventListener('abort', () => {
-                if (pending.delete(id)) {
+            const endFetch = pdfPerformance.beginFetch();
+            const onAbort = () => {
+                const waiting = pending.get(id);
+                if (waiting && pending.delete(id)) {
+                    waiting.cleanup();
+                    pdfPerformance.event('fetch-abort');
                     post({ type: 'fetchAbort', page, id });
                     reject(aborted());
                 }
-            }, { once: true });
-            post({ type: 'fetch', page, id, url: url.href, method: init?.method ?? 'GET', headers });
+            };
+            const cleanup = () => {
+                signal?.removeEventListener('abort', onAbort);
+                endFetch();
+            };
+            pending.set(id, { resolve, reject, started: performance.now(), cleanup });
+            signal?.addEventListener('abort', onAbort, { once: true });
+            try {
+                post({ type: 'fetch', page, id, url: url.href, method: init?.method ?? 'GET', headers });
+            } catch (error) {
+                pending.delete(id);
+                cleanup();
+                reject(error);
+            }
         });
     };
 }

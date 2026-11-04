@@ -6,6 +6,7 @@ import type { Position, SyncBox } from '../common/protocol';
 import { documentShown, showBuildState, showLoadError } from '../common/banner';
 import { goToCode, listenForDoubleClick, showHighlights } from '../common/synctex';
 import { applyTheme, themesFrom, type Theme } from '../common/theme';
+import { installPdfPrefetch } from '../common/pdf-prefetch';
 import { Documents } from './documents';
 import { Outline } from './outline';
 import { Toolbar } from './toolbar';
@@ -24,6 +25,7 @@ const SIDEBAR_OUTLINE = 2;
 
 const container = document.getElementById('viewerContainer') as HTMLDivElement;
 const wrapper = new PDFJSWrapper(container);
+const prefetch = installPdfPrefetch(wrapper.viewer);
 
 /** the zoom, kept per document; Overleaf's default is the page width (pdf-js-viewer.tsx:34-37) */
 let scale = 'page-width';
@@ -205,7 +207,8 @@ listenForWheelZoom(wrapper, (value) => {
 });
 listenForDoubleClick(wrapper.eventBus, (event, canvas, page) => wrapper.clickPosition(event, canvas, page));
 
-(window as any).overleafViewer = { wrapper, documents };
+(window as any).overleafViewer = { wrapper, documents, prefetch };
+(window as any).pdfPrefetch = prefetch;
 
 const init = await ready();
 const saved = savedState();

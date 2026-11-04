@@ -39,4 +39,5 @@ export function applyTheme(viewer: any, theme: Theme) {
     viewer.viewer?.style.setProperty('--page-bg-color', isPlain(theme) ? 'white' : theme.bgColor);
     // draws the pages again, which reads the theme anew
     viewer.refresh?.();
+    viewer.eventBus?.dispatch('prefetchthemechanged', { source: viewer });
 }

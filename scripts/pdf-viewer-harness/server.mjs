@@ -63,7 +63,11 @@ const liveOutput = liveResponse && (() => {
     if (liveResponse.compileGroup) { query.set('compileGroup', liveResponse.compileGroup); }
     if (liveResponse.clsiServerId) { query.set('clsiserverid', liveResponse.clsiServerId); }
     query.set('enable_pdf_caching', 'true');
-    return { url: `${liveResponse.pdfDownloadDomain}${file.url}?${query}`, downloadDomain: liveResponse.pdfDownloadDomain, projectId: arg('live-project'), file };
+    return {
+        url: `${liveResponse.pdfDownloadDomain}${file.url}?${query}`,
+        downloadDomain: liveResponse.pdfDownloadDomain, projectId: arg('live-project'), file,
+        clsiCacheShard: liveResponse.clsiCacheShard,
+    };
 })();
 // the provider passes the size of the build in view; here the largest build's stands in for it
 const bridge = liveOutput

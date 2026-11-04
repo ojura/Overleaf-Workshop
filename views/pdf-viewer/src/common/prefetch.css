@@ -1,0 +1,5 @@
+/* Keep the complete preview visible while PDF.js paints its replacement incrementally.
+   Text and annotation layers keep their native hit testing and stacking. */
+.page:has(> .pdfPrefetchPreview) > .canvasWrapper {
+    visibility: hidden;
+}

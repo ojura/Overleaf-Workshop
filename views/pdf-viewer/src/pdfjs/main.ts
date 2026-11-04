@@ -25,6 +25,7 @@ import { goToCode, listenForDoubleClick, showHighlights } from '../common/syncte
 import { applyTheme, themesFrom } from '../common/theme';
 import type { Theme } from '../common/theme';
 import { createWorkerPort } from '../common/worker';
+import { installPdfPrefetch } from '../common/pdf-prefetch';
 import { documentParams, PDFJS } from '../shims/pdf-js';
 import '../common/icons.css';
 import './viewer.css';
@@ -442,6 +443,9 @@ async function start() {
 
     await initialized;
     const a = app();
+    const prefetch = installPdfPrefetch(a.pdfViewer);
+    (window as any).pdfjsViewer.prefetch = prefetch;
+    (window as any).pdfPrefetch = prefetch;
     // pdf.js's pages have a transparent 9 px border. PDFJSWrapper's currentPosition measures from
     // the page's outer edge, and scrollPageIntoView places PDF points inside the border, so a
     // position would come back 9 px off after each new build. Overleaf's viewer draws pages without

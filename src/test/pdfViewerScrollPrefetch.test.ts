@@ -1,0 +1,209 @@
+import * as assert from 'assert';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+
+// tsc emits CommonJS; the viewer bundle is an ES module.
+const importModule = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
+const repo = path.resolve(__dirname, '..', '..');
+
+interface Snapshot {
+    velocityPxPerMs: number;
+    accelerationPxPerMs2: number;
+    pageLatencyMs: number;
+    preloadPx: number;
+    direction: -1 | 0 | 1;
+}
+interface Dynamics {
+    input(delta: number, now: number): void;
+    page(milliseconds: number): void;
+    stop(): void;
+    reset(): void;
+    preload(viewport: number): number;
+    readonly direction: -1 | 0 | 1;
+    snapshot(viewport: number): Snapshot;
+}
+
+describe('shared PDF scroll prefetch policy', function () {
+    this.timeout(30 * 1000);
+    let dir: string | undefined;
+    // eslint-disable-next-line @typescript-eslint/naming-convention -- names of the module's public exports
+    let policy: { ScrollPrefetchDynamics: new () => Dynamics; PREFETCH_LIMITS: Readonly<Record<string, number>> };
+
+    before(async () => {
+        const { bundleOptions, viewerRoot } = await importModule(path.join(repo, 'scripts', 'build-pdf-viewer.mjs'));
+        const esbuild = await importModule('esbuild');
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-scroll-prefetch-'));
+        const outfile = path.join(dir, 'scroll-prefetch.mjs');
+        try {
+            await esbuild.build({
+                ...bundleOptions,
+                entryPoints: [path.join(viewerRoot, 'src', 'common', 'scroll-prefetch.ts')],
+                outfile,
+            });
+        } finally {
+            await esbuild.stop();
+        }
+        policy = await importModule(outfile);
+    });
+
+    after(() => {
+        if (dir) { fs.rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it('keeps two viewports ready at rest with a useful minimum on short panes', () => {
+        const motion = new policy.ScrollPrefetchDynamics();
+        assert.strictEqual(motion.preload(700), 1400);
+        assert.strictEqual(motion.preload(100), 480);
+        assert.deepStrictEqual(motion.snapshot(700), {
+            velocityPxPerMs: 0, accelerationPxPerMs2: 0, pageLatencyMs: 32, preloadPx: 1400, direction: 0,
+        });
+        for (const viewport of [0, -1, NaN, Infinity, -Infinity]) {
+            assert.strictEqual(motion.preload(viewport), 0);
+        }
+    });
+
+    it('expands ahead immediately for fast gestures and caps speculative distance', () => {
+        const motion = new policy.ScrollPrefetchDynamics();
+        const idle = motion.preload(700);
+        motion.input(100, 1000);
+        const slow = motion.preload(700);
+        assert.ok(slow > idle);
+        motion.input(400, 1016);
+        const fast = motion.preload(700);
+        assert.ok(fast > slow);
+        motion.page(800);
+        assert.ok(motion.preload(700) >= fast);
+        assert.strictEqual(motion.preload(700), 8400);
+        assert.strictEqual(motion.preload(2000), 12000);
+        assert.strictEqual(motion.preload(9000), 18000, 'a large viewport retains its two-viewport baseline');
+        motion.input(2, 5000);
+        assert.ok(motion.preload(700) < fast, 'a new slow gesture discards the previous peak speed');
+    });
+
+    it('keeps recent peak speed through short pauses and resets it after the gesture gap', () => {
+        const motion = new policy.ScrollPrefetchDynamics();
+        motion.input(320, 1000);
+        assert.strictEqual(motion.snapshot(700).velocityPxPerMs, 10);
+        motion.input(16, 1016);
+        assert.strictEqual(motion.snapshot(700).velocityPxPerMs, 7.5);
+        motion.input(16, 1032);
+        assert.strictEqual(motion.snapshot(700).velocityPxPerMs, 5.63);
+        motion.input(16, 1282);
+        assert.ok(motion.snapshot(700).velocityPxPerMs > 4, '250ms still belongs to this gesture');
+        motion.input(16, 1533);
+        assert.strictEqual(motion.snapshot(700).velocityPxPerMs, 0.5, '251ms starts a new gesture');
+        assert.strictEqual(motion.snapshot(700).accelerationPxPerMs2, 0);
+    });
+
+    it('bounds the sample interval when input events arrive within one frame', () => {
+        const motion = new policy.ScrollPrefetchDynamics();
+        motion.input(320, 1000);
+        motion.input(320, 1001);
+        assert.strictEqual(motion.snapshot(700).velocityPxPerMs, 20);
+        motion.input(320, 1001);
+        assert.strictEqual(motion.snapshot(700).velocityPxPerMs, 20);
+        assert.ok(Number.isFinite(motion.snapshot(700).accelerationPxPerMs2));
+    });
+
+    it('changes direction immediately without carrying acceleration through a reversal', () => {
+        const motion = new policy.ScrollPrefetchDynamics();
+        motion.input(400, 1000);
+        motion.input(800, 1016);
+        assert.ok(motion.snapshot(700).accelerationPxPerMs2 > 0);
+        motion.input(-16, 1032);
+        assert.strictEqual(motion.direction, -1);
+        assert.strictEqual(motion.snapshot(700).direction, -1);
+        assert.strictEqual(motion.snapshot(700).velocityPxPerMs, 37.5, 'the conservative speed lead survives a reversal');
+        assert.strictEqual(motion.snapshot(700).accelerationPxPerMs2, 0);
+        motion.input(-32, 1048);
+        assert.ok(motion.snapshot(700).accelerationPxPerMs2 < 0, 'acceleration follows signed motion');
+        motion.input(-16, 1064);
+        assert.ok(motion.snapshot(700).accelerationPxPerMs2 > 0, 'slowing upward motion has positive acceleration');
+    });
+
+    it('smooths signed acceleration and resets its sample after an idle gap', () => {
+        const motion = new policy.ScrollPrefetchDynamics();
+        motion.input(32, 1000);
+        assert.strictEqual(motion.snapshot(700).accelerationPxPerMs2, 0);
+        motion.input(64, 1016);
+        const accelerating = motion.snapshot(700).accelerationPxPerMs2;
+        assert.ok(accelerating > 0 && accelerating < 3 / 16);
+        motion.input(64, 1032);
+        assert.ok(motion.snapshot(700).accelerationPxPerMs2 > 0);
+        assert.ok(motion.snapshot(700).accelerationPxPerMs2 < accelerating);
+        motion.input(64, 1300);
+        assert.strictEqual(motion.snapshot(700).accelerationPxPerMs2, 0);
+    });
+
+    it('learns a slow preparation immediately and reduces that latency gradually', () => {
+        const motion = new policy.ScrollPrefetchDynamics();
+        motion.input(40, 1000);
+        const initial = motion.preload(700);
+        motion.page(200);
+        const slowRead = motion.preload(700);
+        assert.ok(slowRead > initial);
+        assert.strictEqual(motion.snapshot(700).pageLatencyMs, 200);
+        motion.page(20);
+        assert.strictEqual(motion.snapshot(700).pageLatencyMs, 160);
+        assert.ok(motion.preload(700) > initial);
+        assert.ok(motion.preload(700) < slowRead);
+    });
+
+    it('bounds the contribution of extremely slow reads independently from viewport size', () => {
+        const motion = new policy.ScrollPrefetchDynamics();
+        motion.input(2, 1000);
+        motion.page(5000);
+        const lead = motion.preload(700);
+        assert.ok(lead < 8400);
+        motion.page(60_000);
+        assert.strictEqual(motion.preload(700), lead);
+        assert.strictEqual(motion.snapshot(700).pageLatencyMs, 60_000);
+    });
+
+    it('ignores invalid measurements and never infers motion from completed page work', () => {
+        const motion = new policy.ScrollPrefetchDynamics();
+        motion.page(24);
+        motion.page(30);
+        const before = motion.snapshot(700);
+        for (const [delta, now] of [[NaN, 1], [Infinity, 1], [-Infinity, 1], [0, 1], [10, NaN], [10, Infinity]]) {
+            motion.input(delta, now);
+        }
+        for (const latency of [NaN, Infinity, -Infinity, -1]) { motion.page(latency); }
+        assert.deepStrictEqual(motion.snapshot(700), before);
+        assert.strictEqual(before.velocityPxPerMs, 0);
+        assert.strictEqual(before.accelerationPxPerMs2, 0);
+        assert.strictEqual(before.direction, 0);
+        assert.strictEqual(before.preloadPx, 1400);
+    });
+
+    it('stops motion while preserving latency, then resets all learning for a new document', () => {
+        const motion = new policy.ScrollPrefetchDynamics();
+        motion.page(400);
+        motion.input(80, 1000);
+        motion.input(160, 1016);
+        motion.stop();
+        assert.deepStrictEqual(motion.snapshot(700), {
+            velocityPxPerMs: 0, accelerationPxPerMs2: 0, pageLatencyMs: 400, preloadPx: 1400, direction: 0,
+        });
+        motion.input(40, 1020);
+        const fresh = new policy.ScrollPrefetchDynamics();
+        fresh.input(40, 1020);
+        assert.ok(motion.preload(700) > fresh.preload(700), 'stopping keeps the learned preparation cost');
+        assert.strictEqual(motion.snapshot(700).accelerationPxPerMs2, 0);
+        motion.reset();
+        assert.deepStrictEqual(motion.snapshot(700), new policy.ScrollPrefetchDynamics().snapshot(700));
+    });
+
+    it('exports immutable finite budgets that fit the native cache and a preview raster', () => {
+        const limits = policy.PREFETCH_LIMITS;
+        assert.ok(Object.isFrozen(limits));
+        for (const [name, value] of Object.entries(limits)) {
+            assert.ok(Number.isSafeInteger(value) && value > 0, `${name} must be a positive finite integer`);
+        }
+        assert.ok(limits.maxRenderedPages < 10, 'render targets must fit below PDF.js\'s ten-view buffer');
+        assert.ok(limits.maxPreparedPages >= limits.maxRenderedPages, 'preparation includes the native render window');
+        assert.ok(limits.maxConcurrentPrepares <= limits.maxPreparedPages, 'concurrent preparation fits within the plan');
+        assert.ok(limits.maxPreviewBytes >= limits.previewMaxDimension ** 2 * 4, 'the preview cache can retain one maximum-sized RGBA raster');
+    });
+});
