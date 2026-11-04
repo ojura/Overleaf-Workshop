@@ -33,7 +33,10 @@
     "cacheReset": false,
     "forcedGarbageCollection": false,
     "newBrowserOrTab": false,
-    "inputGuard": "Trusted user input or document replacement stops scripted changes; restore only while the captured document remains current."
+    "inputGuard": "Trusted user input or document replacement stops scripted changes; restore only while the captured document remains current.",
+    "callbackRateDefinition": "Interval count divided by elapsed time from the first to the last callback in the selected window.",
+    "percentileDefinition": "Sorted interval at index floor((count - 1) * percentile).",
+    "scrollDistanceDefinition": "Sum of absolute differences between successive recorded scroll-event positions within the profile window."
   },
   "baseline": {
     "revision": "9af6bee",
@@ -689,11 +692,805 @@
       "robot-scroll-heavy-auto-baseline9af-1-summary.json": "2bc0791394e33bd8a573fc8c88ed9bba900961de00509bec13ba6f8d905427f9",
       "robot-scroll-heavy-auto-baseline9af-1-hotspots.json": "d6f25412e6b7f4111b07cf7a47781ae18300f55338bd7acd8bbe92e5f12bcbd0",
       "robot-scroll-heavy-auto-baseline9af-1-cpu.cpuprofile": "5cdd60e42bc7f2b1d474b058b95eb4034651b72475b42feaf830ec6c884158bc"
+    },
+    "documentBytes": 1608612206
+  },
+  "matchedPostInstall": {
+    "status": "Completed",
+    "revision": "36d99a2",
+    "startedAtUtc": "2026-11-04T19:44:25.273Z",
+    "finishedAtUtc": "2026-11-04T19:44:44.932Z",
+    "engine": "pdfjs",
+    "documentPageCount": 460,
+    "documentBytes": 1608358464,
+    "viewportCssPx": {
+      "width": 1246,
+      "height": 1427
+    },
+    "initialState": {
+      "page": 93,
+      "scale": 0.9,
+      "scaleValue": "0.9",
+      "rotation": 0,
+      "scrollMode": 0,
+      "spreadMode": 1,
+      "top": 39153,
+      "left": 0,
+      "robots": true,
+      "lab": false,
+      "pages": 460,
+      "engine": "pdfjs"
+    },
+    "duplex": {
+      "page": 93,
+      "spreadMode": 1,
+      "members": [
+        93,
+        94
+      ],
+      "scale": 0.9,
+      "scaleValue": "0.9"
+    },
+    "initialConditions": {
+      "existingSession": true,
+      "readerReloadedForInstalledRevision": true,
+      "cacheCleared": false,
+      "visibleMissing": [],
+      "pendingPreparation": [
+        99,
+        100,
+        103
+      ],
+      "completedDeliveryBytesBefore": 485199069,
+      "completedResponsesBefore": 418,
+      "sidecarSourceState": "missing",
+      "sidecarAssetRequests": 0
+    },
+    "scenario": {
+      "commands": [
+        {
+          "ordinal": 0,
+          "elapsedFromFirstCommandMs": 0.0,
+          "scrollTopBeforePx": 39560,
+          "requestedDistancePx": 5708,
+          "behavior": "smooth"
+        },
+        {
+          "ordinal": 1,
+          "elapsedFromFirstCommandMs": 1526.7999999523163,
+          "scrollTopBeforePx": 45268,
+          "requestedDistancePx": 5708,
+          "behavior": "smooth"
+        },
+        {
+          "ordinal": 2,
+          "elapsedFromFirstCommandMs": 3051.199999988079,
+          "scrollTopBeforePx": 50976,
+          "requestedDistancePx": 5708,
+          "behavior": "smooth"
+        },
+        {
+          "ordinal": 3,
+          "elapsedFromFirstCommandMs": 4333.0,
+          "scrollTopBeforePx": 56684,
+          "requestedDistancePx": 5708,
+          "behavior": "smooth"
+        },
+        {
+          "ordinal": 4,
+          "elapsedFromFirstCommandMs": 5614.099999964237,
+          "scrollTopBeforePx": 62391,
+          "requestedDistancePx": -5708,
+          "behavior": "smooth"
+        },
+        {
+          "ordinal": 5,
+          "elapsedFromFirstCommandMs": 7155.399999976158,
+          "scrollTopBeforePx": 56683,
+          "requestedDistancePx": -5708,
+          "behavior": "smooth"
+        },
+        {
+          "ordinal": 6,
+          "elapsedFromFirstCommandMs": 8447.599999964237,
+          "scrollTopBeforePx": 50975,
+          "requestedDistancePx": -5708,
+          "behavior": "smooth"
+        },
+        {
+          "ordinal": 7,
+          "elapsedFromFirstCommandMs": 9992.5,
+          "scrollTopBeforePx": 45267,
+          "requestedDistancePx": -5708,
+          "behavior": "smooth"
+        }
+      ],
+      "actualScrollDistancePx": 45661,
+      "scrollEventCount": 560,
+      "physicalPageRange": [
+        93,
+        147
+      ]
+    },
+    "activeScroll": {
+      "windowMs": 11392.5,
+      "frames": 642,
+      "averageFps": 56.33629516351599,
+      "intervalMs": {
+        "count": 641,
+        "p50": 17.400000000023283,
+        "p90": 20.599999999976717,
+        "p95": 22.5,
+        "p99": 35.09999999997672,
+        "max": 51.59999999997672,
+        "over25": 14,
+        "over50": 1
+      }
+    },
+    "wholeProfile": {
+      "windowMs": 18146.80000001192,
+      "frames": 1043,
+      "averageFps": 57.44813403829515,
+      "intervalMs": {
+        "count": 1042,
+        "p50": 16.70000000001164,
+        "p90": 19.400000000023283,
+        "p95": 21.300000000046566,
+        "p99": 32.70000000001164,
+        "max": 51.59999999997672,
+        "over25": 14,
+        "over50": 1
+      }
+    },
+    "longTasks": {
+      "count": 1,
+      "totalMs": 52,
+      "durationMs": {
+        "count": 1,
+        "p50": 52,
+        "p90": 52,
+        "p95": 52,
+        "p99": 52,
+        "max": 52,
+        "over25": 1,
+        "over50": 1
+      }
+    },
+    "documentFleet": {
+      "startFrames": 240,
+      "endFrames": 507,
+      "paintDelta": 267,
+      "peakActors": 12,
+      "episodesDelta": 47,
+      "cancelledDelta": 47,
+      "initialActors": 0,
+      "finalActors": 0,
+      "wholeProfileRafCallbacks": 1043,
+      "activeSampleWindow": {
+        "paintDelta": 261,
+        "elapsedMs": 11266.0,
+        "paintsPerSecond": 23.167051304810936
+      },
+      "largestCoarsePaintBin": {
+        "elapsedFromFirstCommandMs": 2543.599999964237,
+        "durationMs": 252.5999999642372,
+        "paints": 8,
+        "paintsPerSecond": 31.67062549933741,
+        "actors": 2
+      },
+      "intendedAnimationCapHz": 30,
+      "actualPaintTiming": {
+        "totalDuringProfileMs": 93.39999967813492,
+        "meanDuringProfileMs": 0.3498127328769098,
+        "counters": {
+          "paintTotalMs": {
+            "before": 116.39999961853027,
+            "after": 209.7999992966652
+          },
+          "paintLastMs": {
+            "before": 0.699999988079071,
+            "after": 0
+          },
+          "paintMaxMs": {
+            "before": 8.200000047683716,
+            "after": 8.200000047683716
+          }
+        }
+      },
+      "idleTail": {
+        "samples": 17,
+        "durationMs": 4329.899999976158,
+        "unchangedPaintCount": 507,
+        "activeActors": 0,
+        "cargoBytes": 0,
+        "scheduled": false
+      }
+    },
+    "readiness": {
+      "samples": 72,
+      "samplesMissing": 39,
+      "visibleSlots": 350,
+      "missingSlots": 132,
+      "readySlots": 218,
+      "readySlotFraction": 0.6228571428571428
+    },
+    "completedViewerDelivery": {
+      "bytes": 841361908,
+      "responses": 740,
+      "includesCachedResponses": true
+    },
+    "cdpPerformanceDeltas": {
+      "workbench": {
+        "taskDurationSeconds": 3.565759,
+        "scriptDurationSeconds": 1.94692,
+        "layoutDurationSeconds": 0,
+        "styleRecalculationSeconds": 0,
+        "layoutCount": 0,
+        "styleRecalculationCount": 0,
+        "jsHeapUsedBytes": -295608,
+        "jsHeapTotalBytes": -1048576,
+        "domNodeCount": 0,
+        "documentCount": 0
+      },
+      "pdf": {
+        "taskDurationSeconds": 7.3288839999999995,
+        "scriptDurationSeconds": 1.989788,
+        "layoutDurationSeconds": 0.227089,
+        "styleRecalculationSeconds": 0.305653,
+        "layoutCount": 975,
+        "styleRecalculationCount": 1132,
+        "jsHeapUsedBytes": 2155212,
+        "jsHeapTotalBytes": 8650752,
+        "domNodeCount": 5100,
+        "documentCount": 1
+      }
+    },
+    "cpu": {
+      "samplingIntervalUs": 10000,
+      "selfHotspots": [
+        {
+          "name": "(idle)",
+          "file": "(runtime)",
+          "line": 0,
+          "sampledMs": 10807.471
+        },
+        {
+          "name": "(program)",
+          "file": "(runtime)",
+          "line": 0,
+          "sampledMs": 2428.685
+        },
+        {
+          "name": "(garbage collector)",
+          "file": "(runtime)",
+          "line": 0,
+          "sampledMs": 737.641
+        },
+        {
+          "name": "HostMessaging.channel.port1.onmessage",
+          "file": "(runtime)",
+          "line": 337,
+          "sampledMs": 362.62
+        },
+        {
+          "name": "fillText",
+          "file": "(runtime)",
+          "line": 0,
+          "sampledMs": 273.063
+        },
+        {
+          "name": "backFillObjectContext",
+          "file": "pdfjs.mjs",
+          "line": 366,
+          "sampledMs": 262.03
+        },
+        {
+          "name": "drawImage",
+          "file": "(runtime)",
+          "line": 0,
+          "sampledMs": 232.429
+        },
+        {
+          "name": "",
+          "file": "pdfjs.mjs",
+          "line": 1015,
+          "sampledMs": 201.576
+        },
+        {
+          "name": "getVisibleElements",
+          "file": "viewer.mjs",
+          "line": 340,
+          "sampledMs": 141.012
+        },
+        {
+          "name": "getBoundingClientRect",
+          "file": "(runtime)",
+          "line": 0,
+          "sampledMs": 118.594
+        },
+        {
+          "name": "",
+          "file": "pdfjs.mjs",
+          "line": 1663,
+          "sampledMs": 110.92
+        },
+        {
+          "name": "getVisibleElements",
+          "file": "viewer.mjs",
+          "line": 340,
+          "sampledMs": 103.023
+        },
+        {
+          "name": "getVisibleElements",
+          "file": "viewer.mjs",
+          "line": 340,
+          "sampledMs": 100.847
+        },
+        {
+          "name": "getImageData",
+          "file": "(runtime)",
+          "line": 0,
+          "sampledMs": 91.756
+        },
+        {
+          "name": "drawImage",
+          "file": "(runtime)",
+          "line": 0,
+          "sampledMs": 90.906
+        },
+        {
+          "name": "getImageData",
+          "file": "(runtime)",
+          "line": 0,
+          "sampledMs": 70.801
+        },
+        {
+          "name": "#onMessage",
+          "file": "pdf.mjs",
+          "line": 5746,
+          "sampledMs": 60.535
+        },
+        {
+          "name": "isElementBottomAfterViewTop",
+          "file": "viewer.mjs",
+          "line": 351,
+          "sampledMs": 60.49
+        },
+        {
+          "name": "setItem",
+          "file": "(runtime)",
+          "line": 0,
+          "sampledMs": 51.768
+        },
+        {
+          "name": "postMessage",
+          "file": "(runtime)",
+          "line": 0,
+          "sampledMs": 50.185
+        }
+      ],
+      "focusedFunctions": [
+        {
+          "name": "refresh",
+          "file": "pdfjs.mjs",
+          "line": 8119,
+          "selfMs": 0.0,
+          "inclusiveMs": 904.024
+        },
+        {
+          "name": "HostMessaging.channel.port1.onmessage",
+          "file": "(runtime)",
+          "line": 337,
+          "selfMs": 362.62,
+          "inclusiveMs": 422.884
+        },
+        {
+          "name": "backFillObjectContext",
+          "file": "pdfjs.mjs",
+          "line": 366,
+          "selfMs": 262.03,
+          "inclusiveMs": 262.03
+        },
+        {
+          "name": "copyRendered",
+          "file": "pdfjs.mjs",
+          "line": 7657,
+          "selfMs": 3.498,
+          "inclusiveMs": 256.263
+        },
+        {
+          "name": "plan",
+          "file": "pdfjs.mjs",
+          "line": 7848,
+          "selfMs": 35.231,
+          "inclusiveMs": 165.929
+        },
+        {
+          "name": "updateRobotPages",
+          "file": "pdfjs.mjs",
+          "line": 7219,
+          "selfMs": 0.0,
+          "inclusiveMs": 130.698
+        },
+        {
+          "name": "#onMessage",
+          "file": "pdf.mjs",
+          "line": 5746,
+          "selfMs": 60.535,
+          "inclusiveMs": 98.296
+        },
+        {
+          "name": "setVisibleWork",
+          "file": "pdfjs.mjs",
+          "line": 5771,
+          "selfMs": 40.349,
+          "inclusiveMs": 92.742
+        },
+        {
+          "name": "paint",
+          "file": "pdfjs.mjs",
+          "line": 6139,
+          "selfMs": 20.144,
+          "inclusiveMs": 90.526
+        },
+        {
+          "name": "updateRobotPages",
+          "file": "pdfjs.mjs",
+          "line": 7219,
+          "selfMs": 10.087,
+          "inclusiveMs": 60.459
+        },
+        {
+          "name": "paintInlineImageXObject",
+          "file": "pdf.mjs",
+          "line": 9196,
+          "selfMs": 1.501,
+          "inclusiveMs": 41.635
+        },
+        {
+          "name": "paintImageXObject",
+          "file": "pdf.mjs",
+          "line": 9138,
+          "selfMs": 0.0,
+          "inclusiveMs": 41.635
+        },
+        {
+          "name": "updateRobotPages",
+          "file": "pdfjs.mjs",
+          "line": 7219,
+          "selfMs": 40.48,
+          "inclusiveMs": 40.48
+        },
+        {
+          "name": "createBridgeResponse",
+          "file": "pdfjs.mjs",
+          "line": 206,
+          "selfMs": 10.07,
+          "inclusiveMs": 40.187
+        },
+        {
+          "name": "readPdfResponse",
+          "file": "pdfjs.mjs",
+          "line": 227,
+          "selfMs": 20.213,
+          "inclusiveMs": 30.165
+        },
+        {
+          "name": "readPdfResponse",
+          "file": "pdfjs.mjs",
+          "line": 227,
+          "selfMs": 20.152,
+          "inclusiveMs": 30.135
+        },
+        {
+          "name": "paintAdvance",
+          "file": "pdfjs.mjs",
+          "line": 5673,
+          "selfMs": 30.11,
+          "inclusiveMs": 30.11
+        },
+        {
+          "name": "setVisibleWork",
+          "file": "pdfjs.mjs",
+          "line": 5771,
+          "selfMs": 10.069,
+          "inclusiveMs": 20.197
+        },
+        {
+          "name": "paintRobotVehicle",
+          "file": "pdfjs.mjs",
+          "line": 3086,
+          "selfMs": 0.0,
+          "inclusiveMs": 20.181
+        },
+        {
+          "name": "drawVehicle",
+          "file": "pdfjs.mjs",
+          "line": 5316,
+          "selfMs": 0.0,
+          "inclusiveMs": 20.181
+        },
+        {
+          "name": "paintRobotVehicle",
+          "file": "pdfjs.mjs",
+          "line": 3086,
+          "selfMs": 0.0,
+          "inclusiveMs": 20.153
+        },
+        {
+          "name": "drawVehicle",
+          "file": "pdfjs.mjs",
+          "line": 5316,
+          "selfMs": 0.0,
+          "inclusiveMs": 20.153
+        },
+        {
+          "name": "geometry",
+          "file": "pdfjs.mjs",
+          "line": 5199,
+          "selfMs": 0.0,
+          "inclusiveMs": 20.115
+        },
+        {
+          "name": "advanceGeometry",
+          "file": "pdfjs.mjs",
+          "line": 5614,
+          "selfMs": 0.0,
+          "inclusiveMs": 20.115
+        },
+        {
+          "name": "snapshot",
+          "file": "pdfjs.mjs",
+          "line": 8202,
+          "selfMs": 0.0,
+          "inclusiveMs": 20.071
+        },
+        {
+          "name": "Response",
+          "file": "(runtime)",
+          "line": 0,
+          "selfMs": 20.042,
+          "inclusiveMs": 20.042
+        },
+        {
+          "name": "geometry",
+          "file": "pdfjs.mjs",
+          "line": 5199,
+          "selfMs": 0.0,
+          "inclusiveMs": 10.128
+        },
+        {
+          "name": "advanceGeometry",
+          "file": "pdfjs.mjs",
+          "line": 5614,
+          "selfMs": 0.0,
+          "inclusiveMs": 10.128
+        },
+        {
+          "name": "snapshot",
+          "file": "pdfjs.mjs",
+          "line": 3993,
+          "selfMs": 10.082,
+          "inclusiveMs": 10.082
+        },
+        {
+          "name": "copyRendered",
+          "file": "pdfjs.mjs",
+          "line": 7657,
+          "selfMs": 0.0,
+          "inclusiveMs": 10.075
+        },
+        {
+          "name": "snapshot",
+          "file": "pdfjs.mjs",
+          "line": 6515,
+          "selfMs": 0.0,
+          "inclusiveMs": 9.989
+        },
+        {
+          "name": "HostMessaging.channel.port1.onmessage",
+          "file": "(runtime)",
+          "line": 337,
+          "selfMs": 5.571,
+          "inclusiveMs": 5.571
+        }
+      ],
+      "keyCallerChains": [
+        {
+          "selfMs": 737.641,
+          "chainLeafFirst": [
+            {
+              "name": "(garbage collector)",
+              "file": "(runtime)",
+              "line": 0
+            },
+            {
+              "name": "(root)",
+              "file": "(runtime)",
+              "line": 0
+            }
+          ]
+        },
+        {
+          "selfMs": 362.62,
+          "chainLeafFirst": [
+            {
+              "name": "HostMessaging.channel.port1.onmessage",
+              "file": "(runtime)",
+              "line": 337
+            },
+            {
+              "name": "(root)",
+              "file": "(runtime)",
+              "line": 0
+            }
+          ]
+        },
+        {
+          "selfMs": 273.063,
+          "chainLeafFirst": [
+            {
+              "name": "fillText",
+              "file": "(runtime)",
+              "line": 0
+            },
+            {
+              "name": "showText",
+              "file": "pdf.mjs",
+              "line": 8601
+            },
+            {
+              "name": "executeOperatorList",
+              "file": "pdf.mjs",
+              "line": 7872
+            },
+            {
+              "name": "_next",
+              "file": "pdf.mjs",
+              "line": 13414
+            },
+            {
+              "name": "",
+              "file": "pdf.mjs",
+              "line": 13406
+            },
+            {
+              "name": "(root)",
+              "file": "(runtime)",
+              "line": 0
+            }
+          ]
+        },
+        {
+          "selfMs": 262.03,
+          "chainLeafFirst": [
+            {
+              "name": "backFillObjectContext",
+              "file": "pdfjs.mjs",
+              "line": 366
+            },
+            {
+              "name": "",
+              "file": "pdfjs.mjs",
+              "line": 959
+            },
+            {
+              "name": "(root)",
+              "file": "(runtime)",
+              "line": 0
+            }
+          ]
+        },
+        {
+          "selfMs": 232.429,
+          "chainLeafFirst": [
+            {
+              "name": "drawImage",
+              "file": "(runtime)",
+              "line": 0
+            },
+            {
+              "name": "copyRendered",
+              "file": "pdfjs.mjs",
+              "line": 7657
+            },
+            {
+              "name": "",
+              "file": "pdfjs.mjs",
+              "line": 8272
+            },
+            {
+              "name": "dispatch",
+              "file": "viewer.mjs",
+              "line": 1356
+            },
+            {
+              "name": "a.eventBus.dispatch",
+              "file": "pdfjs.mjs",
+              "line": 8821
+            },
+            {
+              "name": "dispatchPageRendered",
+              "file": "viewer.mjs",
+              "line": 9692
+            },
+            {
+              "name": "",
+              "file": "viewer.mjs",
+              "line": 11385
+            },
+            {
+              "name": "_drawCanvas",
+              "file": "viewer.mjs",
+              "line": 9646
+            },
+            {
+              "name": "(root)",
+              "file": "(runtime)",
+              "line": 0
+            }
+          ]
+        }
+      ]
+    },
+    "scrollExtents": {
+      "before": {
+        "scrollWidth": 1246,
+        "scrollHeight": 197800
+      },
+      "after": {
+        "scrollWidth": 1246,
+        "scrollHeight": 197800
+      }
+    },
+    "restoration": {
+      "result": {
+        "current": true,
+        "changed": true,
+        "interrupted": false,
+        "restored": true,
+        "page": 93,
+        "scale": 0.9,
+        "scaleValue": "0.9",
+        "rotation": 0,
+        "scrollMode": 0,
+        "spreadMode": 1,
+        "top": 39153,
+        "left": 0,
+        "robots": true,
+        "lab": false
+      },
+      "verifiedSample": {
+        "page": 93,
+        "top": 39153,
+        "left": 0,
+        "scale": 0.9,
+        "spreadMode": 1
+      },
+      "comparedStateFields": [
+        "page",
+        "scale",
+        "spreadMode",
+        "top",
+        "left"
+      ],
+      "exactComparedStateMatch": true,
+      "trustedInputInterrupted": false,
+      "documentStillCurrent": true,
+      "renderingLeaseReleased": true,
+      "observersRemoved": true,
+      "rafCancelled": true,
+      "cpuAndPerformanceSessionsDetached": true
+    },
+    "rawArtifactSha256": {
+      "robot-scroll-heavy-pdfjs-matched36d99a2-1.json": "2a43b8f7a4f361112ecfaf16dcf2273bf2e9e7deb8284c2f38e13dec24edff9b",
+      "robot-scroll-heavy-pdfjs-matched36d99a2-1-summary.json": "44064730356a790a5074fae8a5cdb136bc34ef0af1eea4b04a86caf8af967a32",
+      "robot-scroll-heavy-pdfjs-matched36d99a2-1-hotspots.json": "62db1ab89a6508f759c0f362429045d9a92873425e9055e8002c3907bd837481",
+      "robot-scroll-heavy-pdfjs-matched36d99a2-1-cpu.cpuprofile": "2945ccd9d6bb3b82131e22df991fa28986c33c29e1ef77efb1192d343c7e1248"
     }
   },
-  "matchedPostInstall": null,
   "plannedMatchedPostInstall": {
-    "status": "Held for explicit installed-candidate release",
+    "status": "Completed at revision 36d99a2 before desktop sidecar export/generation",
     "startPhysicalPage": 93,
     "scale": 0.9,
     "spreadMode": 1,
@@ -702,5 +1499,106 @@
     "cacheReset": false,
     "newSidecarGenerationBeforeMeasurement": false,
     "stateHandling": "Capture and restore the latest actual user state, not the baseline saved position; stop on trusted user input or document replacement."
+  },
+  "comparison": {
+    "geometryAndInput": {
+      "sameStartPage": true,
+      "sameScale": true,
+      "sameDuplexMode": true,
+      "sameViewport": true,
+      "sameEightNativeCommands": true,
+      "sameFourViewportDistancePerCommand": true,
+      "sameObservedScrollDistance": true,
+      "cacheReset": false
+    },
+    "representation": {
+      "changedBetweenRuns": true,
+      "baselineDocumentBytes": 1608612206,
+      "matchedDocumentBytes": 1608358464,
+      "byteLengthDifference": -253742,
+      "documentStableWithinMatchedRun": true,
+      "lengthSource": "Range-cache length recorded in each actual profile",
+      "baselinePhysicalPageRange": [
+        93,
+        145
+      ],
+      "matchedPhysicalPageRange": [
+        93,
+        147
+      ]
+    },
+    "conditions": "The installed reader was reloaded and the live book had been rebuilt. Both runs used the same motion and viewport, without cache clearing or sidecar assets. Delivered bytes, response counts and page work differed.",
+    "activeScroll": {
+      "baselineCallbacksPerSecond": 55.540396616522074,
+      "matchedCallbacksPerSecond": 56.33629516351599,
+      "baselineP95Ms": 26.40000000037253,
+      "matchedP95Ms": 22.5,
+      "baselineIntervalsOver25Ms": 34,
+      "matchedIntervalsOver25Ms": 14,
+      "baselineIntervalsOver50Ms": 2,
+      "matchedIntervalsOver50Ms": 1
+    },
+    "completedViewerDelivery": {
+      "baselineBytes": 1184886977,
+      "matchedBytes": 841361908,
+      "bytesPercentChange": -28.99222252149033,
+      "baselineResponses": 850,
+      "matchedResponses": 740
+    },
+    "sampledCpuSelfMs": {
+      "baseline": {
+        "arrayBuffer": 1457.417,
+        "Response": 604.187,
+        "createBridgeResponse": 0.0,
+        "readPdfResponse": 0.0,
+        "(garbage collector)": 783.933,
+        "HostMessaging.channel.port1.onmessage": 373.113,
+        "backFillObjectContext": 312.711
+      },
+      "matched": {
+        "arrayBuffer": 0.0,
+        "Response": 20.042,
+        "createBridgeResponse": 10.07,
+        "readPdfResponse": 40.365,
+        "(garbage collector)": 737.641,
+        "HostMessaging.channel.port1.onmessage": 368.191,
+        "backFillObjectContext": 262.03
+      }
+    },
+    "normalizedCpu": {
+      "denominator": "One GiB of completed viewer delivery, including cached responses",
+      "baselineDeliveredGiB": 1.1035119900479913,
+      "matchedDeliveredGiB": 0.7835793383419514,
+      "baselineSelfMsPerGiB": {
+        "arrayBuffer": 1320.707897280407,
+        "Response": 547.5128548206569,
+        "createBridgeResponse": 0.0,
+        "readPdfResponse": 0.0,
+        "(garbage collector)": 710.3982621574479,
+        "HostMessaging.channel.port1.onmessage": 338.11413320826125,
+        "backFillObjectContext": 283.3779812273724
+      },
+      "matchedSelfMsPerGiB": {
+        "arrayBuffer": 0.0,
+        "Response": 25.577499328158318,
+        "createBridgeResponse": 12.851283216972071,
+        "readPdfResponse": 51.513609439233136,
+        "(garbage collector)": 941.3737242751237,
+        "HostMessaging.channel.port1.onmessage": 469.8834974121314,
+        "backFillObjectContext": 334.40136458224345
+      },
+      "baselinePdfTaskSecondsPerGiB": 8.416464962556576,
+      "matchedPdfTaskSecondsPerGiB": 9.35308480122494
+    },
+    "documentFleet": {
+      "baselineWholePaints": 575,
+      "matchedWholePaints": 267,
+      "baselineActivePaintsPerSecond": 50.586770981507826,
+      "matchedActivePaintsPerSecond": 23.167051304810936,
+      "baselineLargestCoarseBinPaints": 25,
+      "matchedLargestCoarseBinPaints": 8,
+      "matchedActualMeanPaintMs": 0.3498127328769098,
+      "coarseBinInterpretation": "Eight paints in a roughly 253 ms bin is consistent with the 30 Hz gate and endpoint counting; the baseline recorded 25 paints in a similar bin."
+    }
   }
 }
