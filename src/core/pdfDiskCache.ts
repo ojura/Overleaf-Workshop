@@ -10,10 +10,12 @@ export const PDF_DISK_POLICY = {
     quietMs: 1500,
     paceMs: 250,
     memoryManifests: 128,
+    ownerCheckMs: 1000,
 } as const;
 
 const HASH = /^[a-f0-9]{64}$/;
 const FILE = /^(?:[a-f0-9]{64}|(?:build|object)-[a-f0-9]{64}\.json)$/;
+const DATA_TEMP = /^(?:[a-f0-9]{64}|(?:build|object)-[a-f0-9]{64}\.json)\..+\.tmp$/;
 const digest = (bytes: Uint8Array | string) => createHash('sha256').update(bytes).digest('hex');
 const alive = (signal?: AbortSignal) => !signal?.aborted;
 async function processStart(pid: number): Promise<string> {
@@ -36,13 +38,15 @@ type Segment = Part | { start: number, end: number, inline: Uint8Array };
 interface BuildManifest { version: 1, key: string, size: number, validator?: Validator, parts: Part[] }
 interface ObjectManifest { version: 1, hash: string, size: number, parts: Part[] }
 interface Layout { key: string, size: number, pieces: Piece[], output: PdfOutput }
-interface Entry { size: number, used: number }
+interface Entry { size: number, used: number, identity: string }
 export interface PdfFillRequest { output: PdfOutput, url: string, start: number, end: number, validator?: Validator, signal: AbortSignal }
 export interface PdfDiskOptions {
     fetchRange?: (request: PdfFillRequest) => Promise<BridgeResponse>;
     now?: () => number;
     setTimer?: (callback: () => void, ms: number) => unknown;
     clearTimer?: (timer: unknown) => void;
+    setWaitTimer?: (callback: () => void, ms: number) => unknown;
+    clearWaitTimer?: (timer: unknown) => void;
 }
 export interface PdfCacheViewer {
     setOutput(output: PdfOutput | undefined): void;
@@ -57,32 +61,46 @@ interface Viewer {
     order: number;
     stopped: boolean;
 }
+interface Mutation {
+    action?: () => Promise<boolean>;
+    signal?: AbortSignal;
+    finish(value: boolean): void;
+    cancel(): void;
+}
 
 /**
  * Actual received bytes live in SHA-256 files. A build is only a small map of byte intervals:
  * it never reserves or truncates a file to the advertised PDF size. Existing pdf-pieces files
  * use this same directory and budget. Completed objects get reusable maps of their small blobs.
  *
- * One extension host owns the writer lock. Other hosts can read the cache, but do not fill or
- * admit bytes while that owner is alive. Atomic file publication and serialized admission keep
- * concurrent panels, temporary writes, and older build generations inside the same budget.
+ * A short writer lease covers one admission transaction. Reads never acquire it. A separate
+ * per-transfer lease serializes background network requests across hosts. Atomic publication
+ * and fresh accounting inside every admission keep all generations within the same budget.
  */
 export class PdfDiskCache {
     private readonly entries = new Map<string, Entry>();
     private readonly builds = new Map<string, BuildManifest>();
     private readonly objects = new Map<string, ObjectManifest | undefined>();
     private readonly verified = new Set<string>();
+    private readonly suspect = new Set<string>();
     private readonly layouts = new WeakMap<PdfOutput, Layout>();
     private readonly viewers = new Set<Viewer>();
     private readonly changes = new Set<() => void>();
     private readonly now: () => number;
     private readonly setTimer: (callback: () => void, ms: number) => unknown;
     private readonly clearTimer: (timer: unknown) => void;
+    private readonly setWaitTimer: (callback: () => void, ms: number) => unknown;
+    private readonly clearWaitTimer: (timer: unknown) => void;
     private ready?: Promise<void>;
     private watcher?: fs.FSWatcher;
     private dirty = true;
-    private observedOwner = '';
     private serial: Promise<unknown> = Promise.resolve();
+    private mutations: Promise<unknown> = Promise.resolve();
+    private readonly mutationQueue: Mutation[] = [];
+    private mutationRunning = false;
+    private activeMutation?: Mutation;
+    private readonly waiters = new Map<string, Set<() => void>>();
+    private waitTimer?: unknown;
     private bytes = 0;
     private reserved = 0;
     private owner?: string;
@@ -98,60 +116,154 @@ export class PdfDiskCache {
         this.now = options.now ?? Date.now;
         this.setTimer = options.setTimer ?? ((callback, ms) => { const timer = setTimeout(callback, ms); timer.unref(); return timer; });
         this.clearTimer = options.clearTimer ?? (timer => clearTimeout(timer as NodeJS.Timeout));
+        this.setWaitTimer = options.setWaitTimer ?? ((callback, ms) => { const timer = setTimeout(callback, ms); timer.unref(); return timer; });
+        this.clearWaitTimer = options.clearWaitTimer ?? (timer => clearTimeout(timer as NodeJS.Timeout));
     }
 
     private async initialize() {
         if (this.closed || !this.maxBytes && !await fs.promises.stat(this.dir).catch(() => undefined)) { return; }
         await fs.promises.mkdir(this.dir, { recursive: true });
-        this.watcher = fs.watch(this.dir, { persistent: false }, () => {
-            if (this.owner || this.closed) { return; }
+        if (this.closed) { return; }
+        this.watcher = fs.watch(this.dir, { persistent: false }, (event, filename) => {
+            if (this.closed) { return; }
+            const name = filename?.toString();
+            if (!name || name === '.writer' || name === '.background') { this.wakeWaiters(name); }
+            // Immutable data is published/evicted by rename. LRU touches and lock traffic do
+            // not invalidate a reader's fast path or restart a completed background viewer.
+            if (this.owner || name && (event !== 'rename' || !FILE.test(name))) { return; }
             this.dirty = true;
             for (const viewer of this.viewers) { viewer.stopped = false; }
             this.changed();
             this.schedule(PDF_DISK_POLICY.quietMs);
         });
-        this.watcher.on('error', () => { this.dirty = true; });
+        this.watcher.on('error', () => { this.dirty = true; this.wakeWaiters(); });
         await this.refresh();
     }
 
-    private async acquireWriter() {
-        const lock = path.join(this.dir, '.writer');
-        for (let attempt = 0; attempt < 2; attempt++) {
-            const token = process.pid + ':' + await processStart(process.pid) + ':' + randomUUID();
-            const candidate = path.join(this.dir, '.writer-' + randomUUID() + '.tmp');
+    private async tryLease(name: '.writer' | '.background'): Promise<string | undefined> {
+        const lock = path.join(this.dir, name);
+        const token = process.pid + ':' + await processStart(process.pid) + ':' + randomUUID();
+        const candidate = path.join(this.dir, '.lock-' + name.slice(1) + '-' + randomUUID());
+        try {
             await fs.promises.writeFile(candidate, token, { flag: 'wx' });
+            for (let attempt = 0; attempt < 2; attempt++) {
+                try { await fs.promises.link(candidate, lock); return token; }
+                catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') { throw error; }
+                    const previous = await fs.promises.readFile(lock, 'utf8').catch(() => '');
+                    if (!previous) { continue; }
+                    if (await ownerAlive(previous) || !await this.reap(lock, previous, candidate)) { return; }
+                }
+            }
+        } finally { await fs.promises.unlink(candidate).catch(() => {}); }
+    }
+
+    private async releaseLease(name: '.writer' | '.background', token: string) {
+        const lock = path.join(this.dir, name);
+        if (await fs.promises.readFile(lock, 'utf8').catch(() => '') === token) {
+            await fs.promises.unlink(lock).catch(() => {});
+        }
+    }
+
+    private wakeWaiters(name?: string) {
+        const groups = name ? [this.waiters.get(name)] : [...this.waiters.values()];
+        for (const group of groups) { for (const wake of [...(group ?? [])]) { wake(); } }
+    }
+
+    private waitForLease(name: string, signal?: AbortSignal) {
+        let finish!: () => void;
+        const promise = new Promise<void>(resolve => {
+            let done = false;
+            finish = () => {
+                if (done) { return; }
+                done = true;
+                const group = this.waiters.get(name);
+                group?.delete(finish);
+                if (!group?.size) { this.waiters.delete(name); }
+                signal?.removeEventListener('abort', finish);
+                if (!this.waiters.size && this.waitTimer !== undefined) {
+                    this.clearWaitTimer(this.waitTimer); this.waitTimer = undefined;
+                }
+                resolve();
+            };
+            const group = this.waiters.get(name) ?? new Set<() => void>();
+            group.add(finish); this.waiters.set(name, group);
+            signal?.addEventListener('abort', finish, { once: true });
+            if (this.closed || !alive(signal)) { finish(); return; }
+            if (this.waitTimer === undefined) {
+                this.waitTimer = this.setWaitTimer(() => {
+                    this.waitTimer = undefined;
+                    this.wakeWaiters();
+                }, PDF_DISK_POLICY.ownerCheckMs);
+            }
+        });
+        return { promise, cancel: () => finish() };
+    }
+
+    private async backgroundLease(signal: AbortSignal): Promise<string | undefined> {
+        while (!this.closed && alive(signal)) {
+            const waiting = this.waitForLease('.background', signal);
             try {
-                await fs.promises.link(candidate, lock);
-                this.owner = token;
-                break;
-            } catch (error) {
-                if ((error as NodeJS.ErrnoException).code !== 'EEXIST') { throw error; }
-                const previous = await fs.promises.readFile(lock, 'utf8').catch(() => '');
-                if (await ownerAlive(previous) || !await this.reap(lock, previous, candidate)) { break; }
-            } finally {
-                await fs.promises.unlink(candidate).catch(() => {});
+                const token = await this.tryLease('.background');
+                if (token) { return token; }
+                await waiting.promise;
+            } finally { waiting.cancel(); }
+        }
+    }
+
+    private async refresh(force = false) {
+        if (this.closed) { return; }
+        if (!force && !this.dirty) { return; }
+        this.dirty = false;
+        const previous = new Map(this.entries);
+        this.entries.clear(); this.bytes = 0; this.builds.clear(); this.objects.clear();
+        for (const name of await fs.promises.readdir(this.dir)) {
+            if (FILE.test(name)) {
+                const stat = await fs.promises.stat(path.join(this.dir, name)).catch(() => undefined);
+                if (stat?.isFile()) {
+                    const identity = stat.dev + ':' + stat.ino;
+                    if (previous.get(name)?.identity !== identity) { this.verified.delete(name); this.suspect.delete(name); }
+                    this.entries.set(name, { size: stat.size, used: stat.mtimeMs, identity }); this.bytes += stat.size;
+                }
+            }
+        }
+        for (const hash of this.verified) { if (!this.entries.has(hash)) { this.verified.delete(hash); } }
+        for (const name of this.suspect) { if (!this.entries.has(name)) { this.suspect.delete(name); } }
+    }
+
+    private async cleanOrphans() {
+        for (const name of await fs.promises.readdir(this.dir)) {
+            const file = path.join(this.dir, name);
+            if (DATA_TEMP.test(name)) { await fs.promises.unlink(file).catch(() => {}); }
+            else if (/^\.lock-(?:writer|background)-[a-f0-9-]+$|^\.writer-.*\.tmp$|^\.reap-[a-f0-9]{64}-\d+$/.test(name)) {
+                const token = await fs.promises.readFile(file, 'utf8').catch(() => '');
+                if (token && !await ownerAlive(token)) { await fs.promises.unlink(file).catch(() => {}); }
             }
         }
     }
 
-    private async refresh() {
-        if (this.closed) { return; }
-        const token = await fs.promises.readFile(path.join(this.dir, '.writer'), 'utf8').catch(() => '');
-        if (!this.dirty && token === this.observedOwner) { return; }
-        this.dirty = false;
-        if (!this.owner && (!token || !await ownerAlive(token))) { await this.acquireWriter(); }
-        this.observedOwner = await fs.promises.readFile(path.join(this.dir, '.writer'), 'utf8').catch(() => '');
-        this.entries.clear(); this.bytes = 0; this.builds.clear(); this.objects.clear();
-        for (const name of await fs.promises.readdir(this.dir)) {
-            if (this.owner && (name.endsWith('.tmp') || /^\.reap-[a-f0-9]{64}-\d+$/.test(name))) {
-                await fs.promises.unlink(path.join(this.dir, name)).catch(() => {});
-            } else if (FILE.test(name)) {
-                const stat = await fs.promises.stat(path.join(this.dir, name)).catch(() => undefined);
-                if (stat?.isFile()) { this.entries.set(name, { size: stat.size, used: stat.mtimeMs }); this.bytes += stat.size; }
+    private async repairSuspects() {
+        for (const name of [...this.suspect]) {
+            if (HASH.test(name)) { await this.verify(name); }
+            else {
+                const parsed = await this.json(name);
+                const build = name.startsWith('build-');
+                const key = name.slice(build ? 6 : 7, -5);
+                let valid = parsed?.version === 1 && (build ? parsed.key : parsed.hash) === key
+                    && Number.isSafeInteger(parsed.size) && parsed.size > 0 && this.validParts(parsed.parts, parsed.size)
+                    && (!parsed.validator || this.validValidator(parsed.validator));
+                if (valid && !build) {
+                    const plan = this.plan(parsed.parts, 0, parsed.size);
+                    const check = createHash('sha256');
+                    valid = !!plan;
+                    try { for await (const bytes of this.readPlan(plan ?? [])) { check.update(bytes); } }
+                    catch { valid = false; }
+                    valid = valid && check.digest('hex') === key;
+                }
+                if (!valid) { await this.remove(name); }
             }
+            this.suspect.delete(name);
         }
-        for (const hash of this.verified) { if (!this.entries.has(hash)) { this.verified.delete(hash); } }
-        if (this.owner) { await this.room(0, new Set()); }
     }
 
     private async reap(lock: string, previous: string, candidate: string): Promise<boolean> {
@@ -177,20 +289,89 @@ export class PdfDiskCache {
 
     private run<T>(action: () => Promise<T>): Promise<T> {
         const task = this.serial.then(async () => {
-            this.ready ??= this.initialize().catch(async () => {
-                // Cache storage is optional: an inaccessible disk must not break PDF fetching.
-                const lock = path.join(this.dir, '.writer');
-                if (this.owner && await fs.promises.readFile(lock, 'utf8').catch(() => '') === this.owner) {
-                    await fs.promises.unlink(lock).catch(() => {});
-                }
-                this.owner = undefined;
-            });
+            this.ready ??= this.initialize().catch(() => {});
             await this.ready;
             if (!this.owner) { await this.refresh().catch(() => {}); }
             return action();
         });
         this.serial = task.catch(() => {});
         return task;
+    }
+
+    private mutate(action: () => Promise<boolean>, signal?: AbortSignal): Promise<boolean> {
+        return new Promise<boolean>(resolve => {
+            let settled = false;
+            const entry: Mutation = {
+                action, signal,
+                finish: value => {
+                    if (settled) { return; }
+                    settled = true; entry.action = undefined;
+                    signal?.removeEventListener('abort', entry.cancel);
+                    resolve(value);
+                },
+                cancel: () => {
+                    entry.action = undefined;
+                    const index = this.mutationQueue.indexOf(entry);
+                    if (index >= 0) { this.mutationQueue.splice(index, 1); }
+                    entry.finish(false);
+                },
+            };
+            if (this.closed || !alive(signal)) { entry.cancel(); return; }
+            signal?.addEventListener('abort', entry.cancel, { once: true });
+            this.mutationQueue.push(entry);
+            this.pumpMutations();
+        });
+    }
+
+    private pumpMutations() {
+        if (this.mutationRunning) { return; }
+        this.mutationRunning = true;
+        this.mutations = (async () => {
+            while (this.mutationQueue.length) {
+                const entry = this.mutationQueue.shift()!;
+                this.activeMutation = entry;
+                try { entry.finish(await this.performMutation(entry)); }
+                catch { entry.finish(false); }
+                finally { this.activeMutation = undefined; }
+            }
+        })().finally(() => {
+            this.mutationRunning = false;
+            if (this.mutationQueue.length) { this.pumpMutations(); }
+        });
+    }
+
+    private async performMutation(entry: Mutation): Promise<boolean> {
+        const signal = entry.signal;
+        await this.run(async () => {});
+        while (!this.closed && alive(signal) && entry.action) {
+            if (!this.maxBytes && !await fs.promises.stat(this.dir).catch(() => undefined)) { return false; }
+            const waiting = this.waitForLease('.writer', signal);
+            try {
+                // Waiting stays outside the local read queue. Only a nonblocking lease
+                // attempt and its successful mutation occupy the queue.
+                const result = await this.run(async () => {
+                    if (this.closed || !alive(signal) || !entry.action) { return { done: true, value: false }; }
+                    const token = await this.tryLease('.writer');
+                    if (!token) { return { done: false, value: false }; }
+                    waiting.cancel();
+                    this.owner = token;
+                    try {
+                        await this.cleanOrphans();
+                        await this.refresh(true);
+                        await this.repairSuspects();
+                        await this.room(0, new Set());
+                        const action = entry.action;
+                        return { done: true, value: !!action && !this.closed && alive(signal) && await action() };
+                    } finally {
+                        this.owner = undefined;
+                        await this.releaseLease('.writer', token);
+                    }
+                });
+                if (result.done) { return result.value; }
+                await waiting.promise;
+            } finally { waiting.cancel(); }
+        }
+        return false;
     }
 
     private layout(output: PdfOutput): Layout {
@@ -271,15 +452,16 @@ export class PdfDiskCache {
     }
 
     private async remove(name: string) {
-        if (!this.owner) { return; }
+        if (name.startsWith('object-')) { this.objects.delete(name.slice(7, -5)); }
+        if (name.startsWith('build-')) { this.builds.delete(name.slice(6, -5)); }
+        if (!this.owner) { this.suspect.add(name); this.verified.delete(name); return; }
         await fs.promises.unlink(path.join(this.dir, name)).catch(error => {
             if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { throw error; }
         });
         this.bytes -= this.entries.get(name)?.size ?? 0;
         this.entries.delete(name);
         this.verified.delete(name);
-        if (name.startsWith('object-')) { this.objects.delete(name.slice(7, -5)); }
-        if (name.startsWith('build-')) { this.builds.delete(name.slice(6, -5)); }
+        this.suspect.delete(name);
     }
 
     private async room(extra: number, protect: Set<string>): Promise<boolean> {
@@ -304,7 +486,8 @@ export class PdfDiskCache {
             await fs.promises.writeFile(temp, content, { flag: 'wx' });
             if (!alive(signal) || this.closed) { return false; }
             await fs.promises.rename(temp, path.join(this.dir, name));
-            this.entries.set(name, { size: content.length, used: this.now() });
+            const stat = await fs.promises.stat(path.join(this.dir, name));
+            this.entries.set(name, { size: content.length, used: this.now(), identity: stat.dev + ':' + stat.ino });
             this.bytes += content.length;
             this.changed();
             return true;
@@ -323,20 +506,21 @@ export class PdfDiskCache {
     }
 
     private async verify(hash: string): Promise<boolean> {
-        if (!this.entries.has(hash)) { return false; }
+        if (!this.entries.has(hash) || this.suspect.has(hash) && !this.owner) { return false; }
         if (this.verified.has(hash)) { return true; }
         const check = createHash('sha256');
         try {
             for await (const bytes of fs.createReadStream(path.join(this.dir, hash), { highWaterMark: PDF_DISK_POLICY.chunkBytes })) { check.update(bytes); }
-            if (check.digest('hex') === hash) { this.verified.add(hash); return true; }
+            if (check.digest('hex') === hash) { this.verified.add(hash); this.suspect.delete(hash); return true; }
         } catch {}
         await this.remove(hash);
         return false;
     }
 
     private async object(hash: string): Promise<ObjectManifest | undefined> {
-        if (this.objects.has(hash)) { return this.objects.get(hash); }
         const name = 'object-' + hash + '.json';
+        if (this.suspect.has(name)) { return undefined; }
+        if (this.objects.has(hash)) { return this.objects.get(hash); }
         const parsed = await this.json(name);
         const valid = parsed?.version === 1 && parsed.hash === hash && Number.isSafeInteger(parsed.size) && parsed.size > 0 &&
             this.validParts(parsed.parts, parsed.size);
@@ -347,16 +531,16 @@ export class PdfDiskCache {
     }
 
     private async segments(layout: Layout, manifest: BuildManifest): Promise<Segment[]> {
-        const parts: Segment[] = manifest.parts.filter(p => (this.entries.get(p.hash)?.size ?? -1) >= p.offset + p.end - p.start);
+        const parts: Segment[] = manifest.parts.filter(p => !this.suspect.has(p.hash) && (this.entries.get(p.hash)?.size ?? -1) >= p.offset + p.end - p.start);
         for (const piece of layout.pieces) {
             if (piece.prefix.length) { parts.push({ start: piece.start - piece.prefix.length, end: piece.start, inline: piece.prefix }); }
-            if (this.entries.get(piece.hash)?.size === piece.end - piece.start) {
+            if (!this.suspect.has(piece.hash) && this.entries.get(piece.hash)?.size === piece.end - piece.start) {
                 parts.push({ start: piece.start, end: piece.end, hash: piece.hash, offset: 0 });
             } else {
                 const object = await this.object(piece.hash);
                 if (object?.size === piece.end - piece.start) {
                     for (const p of object.parts) {
-                        if ((this.entries.get(p.hash)?.size ?? -1) >= p.offset + p.end - p.start) {
+                        if (!this.suspect.has(p.hash) && (this.entries.get(p.hash)?.size ?? -1) >= p.offset + p.end - p.start) {
                             parts.push({ ...p, start: piece.start + p.start, end: piece.start + p.end });
                         }
                     }
@@ -435,8 +619,8 @@ export class PdfDiskCache {
         });
     }
 
-    put(hash: string, content: Uint8Array): Promise<boolean> {
-        return this.run(() => this.blob(hash, content));
+    put(hash: string, content: Uint8Array, signal?: AbortSignal): Promise<boolean> {
+        return this.mutate(() => this.blob(hash, content, new Set(), signal), signal);
     }
 
     readRange(output: PdfOutput, start: number, end: number): Promise<{ body: Uint8Array, validator?: Validator } | undefined> {
@@ -465,7 +649,7 @@ export class PdfDiskCache {
 
     /** Only exact 206 ranges with a stable validator enter the build's persistent byte map. */
     storeRange(output: PdfOutput, start: number, end: number, response: BridgeResponse, signal?: AbortSignal): Promise<boolean> {
-        return this.run(async () => {
+        return this.mutate(async () => {
             const layout = this.layout(output);
             const headers = new Map(response.headers.map(([name, value]) => [name.toLowerCase(), value]));
             const validator = this.validator(response.headers);
@@ -513,13 +697,14 @@ export class PdfDiskCache {
                 if (await this.write(name, Buffer.from(JSON.stringify(object)), protect, signal)) { this.remember(this.objects, piece.hash, object); }
             }
             return alive(signal);
-        });
+        }, signal);
     }
 
-    private gap(output: PdfOutput): Promise<{ start: number, end: number, validator?: Validator } | undefined> {
+    private gap(output: PdfOutput, fresh = false): Promise<{ start: number, end: number, validator?: Validator } | undefined> {
         return this.run(async () => {
+            if (fresh) { await this.refresh(true); }
             const layout = this.layout(output);
-            if (!this.owner || this.closed || layout.size > this.maxBytes) { return undefined; }
+            if (this.closed || layout.size > this.maxBytes) { return undefined; }
             const manifest = await this.manifest(layout);
             const parts = await this.segments(layout, manifest);
             let cursor = 0;
@@ -599,8 +784,13 @@ export class PdfDiskCache {
         this.changed();
         const current = () => !job.controller.signal.aborted && this.viewers.has(viewer) &&
             viewer.generation === job.generation && viewer.output === output && this.eligible() === viewer;
+        let transfer: string | undefined;
         try {
-            const gap = await this.gap(output);
+            if (!await this.gap(output)) { if (current()) { viewer.stopped = true; } return; }
+            if (!current()) { return; }
+            transfer = await this.backgroundLease(job.controller.signal);
+            if (!transfer || !current()) { return; }
+            const gap = await this.gap(output, true);
             if (!current()) { return; }
             if (!gap) { viewer.stopped = true; return; }
             const response = await this.options.fetchRange!({ ...gap, output, url: output.url, signal: job.controller.signal });
@@ -610,6 +800,7 @@ export class PdfDiskCache {
         } catch {
             if (current()) { viewer.stopped = true; }
         } finally {
+            if (transfer) { await this.releaseLease('.background', transfer); }
             if (this.filling === job) { this.filling = undefined; }
             this.changed();
             this.schedule(job.controller.signal.aborted ? PDF_DISK_POLICY.quietMs : PDF_DISK_POLICY.paceMs);
@@ -669,7 +860,11 @@ export class PdfDiskCache {
     }
 
     /** Useful for deterministic lifecycle tests and extension shutdown; no polling is involved. */
-    async settled() { await this.fillTask; await this.serial; }
+    async settled() {
+        await this.fillTask;
+        while (this.mutationRunning) { await this.mutations; }
+        await this.serial;
+    }
 
     onChange(listener: () => void): () => void {
         this.changes.add(listener);
@@ -681,17 +876,14 @@ export class PdfDiskCache {
     async dispose() {
         this.closed = true;
         this.pause();
+        this.activeMutation?.cancel();
+        for (const entry of [...this.mutationQueue]) { entry.cancel(); }
+        this.wakeWaiters();
         this.viewers.clear();
         this.changes.clear();
         this.watcher?.close();
         await this.fillTask;
+        await this.mutations;
         await this.serial;
-        if (!this.ready) { return; }
-        await this.run(async () => {
-            if (!this.owner) { return; }
-            const lock = path.join(this.dir, '.writer');
-            if (await fs.promises.readFile(lock, 'utf8').catch(() => '') === this.owner) { await fs.promises.unlink(lock).catch(() => {}); }
-            this.owner = undefined;
-        });
     }
 }

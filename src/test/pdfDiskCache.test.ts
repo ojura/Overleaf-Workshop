@@ -49,8 +49,14 @@ class Timers {
 }
 
 function diskBytes(dir: string): number {
-    return fs.readdirSync(dir).filter(name => /^[a-f0-9]{64}$|^(build|object)-[a-f0-9]{64}\.json$|^[a-f0-9]{64}\..*\.tmp$/.test(name))
+    return fs.readdirSync(dir).filter(name => /^(?:[a-f0-9]{64}|(?:build|object)-[a-f0-9]{64}\.json)(?:\..*\.tmp)?$/.test(name))
         .reduce((sum, name) => sum + fs.statSync(path.join(dir, name)).size, 0);
+}
+
+const turn = () => new Promise<void>(resolve => setImmediate(resolve));
+function liveToken() {
+    const stat = fs.readFileSync('/proc/' + process.pid + '/stat', 'utf8');
+    return process.pid + ':' + stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] + ':test-owner';
 }
 
 describe('the shared persistent PDF disk budget', () => {
@@ -169,7 +175,7 @@ describe('the shared persistent PDF disk budget', () => {
         assert.ok(snapshot.files < 30, 'older unpinned data was evicted');
     });
 
-    it('allows only one writer across cache instances and removes interrupted temporary files on restart', async () => {
+    it('releases each admission and cleans interrupted data without removing live lock candidates', async () => {
         const bytes = content(400);
         const first = make();
         assert.strictEqual(await first.put(hash(bytes), bytes), true);
@@ -177,17 +183,279 @@ describe('the shared persistent PDF disk budget', () => {
         assert.strictEqual((await second.snapshot()).writer, false);
         assert.deepStrictEqual(await second.get(hash(bytes)), bytes);
         const different = content(400, 5);
-        assert.strictEqual(await second.put(hash(different), different), false);
+        assert.strictEqual(await second.put(hash(different), different), true);
         await second.dispose();
-        assert.strictEqual((await first.snapshot()).writer, true);
+        assert.strictEqual((await first.snapshot()).writer, false);
+        assert.strictEqual(fs.existsSync(path.join(dir, '.writer')), false);
         await first.dispose();
         fs.writeFileSync(path.join(dir, hash(different) + '.crashed.tmp'), different);
         fs.writeFileSync(path.join(dir, 'build-' + 'a'.repeat(64) + '.json'), '{"version":');
+        const liveCandidate = path.join(dir, '.lock-writer-' + 'a'.repeat(36));
+        const deadCandidate = path.join(dir, '.lock-background-' + 'b'.repeat(36));
+        fs.writeFileSync(liveCandidate, liveToken());
+        fs.writeFileSync(deadCandidate, process.pid + ':0:dead-candidate');
         const restarted = make();
-        assert.strictEqual((await restarted.snapshot()).writer, true);
+        assert.strictEqual((await restarted.snapshot()).writer, false);
+        assert.strictEqual(fs.readdirSync(dir).some(name => name.endsWith('.tmp')), true, 'snapshot performs no cleanup mutation');
+        assert.strictEqual(await restarted.put(hash(different), different), true);
         assert.strictEqual(fs.readdirSync(dir).some(name => name.endsWith('.tmp')), false);
+        assert.strictEqual(fs.existsSync(liveCandidate), true);
+        assert.strictEqual(fs.existsSync(deadCandidate), false);
         assert.deepStrictEqual(await restarted.get(hash(bytes)), bytes);
         assert.ok((await restarted.snapshot()).bytes <= 4 * 1024 * 1024);
+    });
+
+    it('lets a restarted book accumulate while a live completed tiny document remains open', async () => {
+        const tinyBytes = content(80), tiny = output(tinyBytes.length, 'tiny');
+        const oldBookHost = make();
+        assert.strictEqual(await oldBookHost.storeRange(tiny, 0, tinyBytes.length, response(tinyBytes, 0, tinyBytes.length)), true);
+        const tinyHost = make();
+        const tinyViewer = tinyHost.createViewer();
+        tinyViewer.setOutput(tiny); tinyViewer.setActivity(true, true);
+        assert.strictEqual((await tinyHost.snapshot(tiny)).complete, true);
+        await oldBookHost.dispose();
+        await tinyHost.snapshot(tiny);
+        const timers = new Timers(), bytes = content(2000), book = output(bytes.length, 'book-restarted');
+        let requests = 0;
+        const bookHost = make(4 * 1024 * 1024, { setTimer: timers.set, clearTimer: timers.clear,
+            fetchRange: async request => { requests++; return response(bytes, request.start, request.end); } });
+        const viewer = bookHost.createViewer();
+        viewer.setOutput(book); viewer.setActivity(true, true);
+        assert.strictEqual(timers.fire(), true);
+        await bookHost.settled();
+        assert.strictEqual(requests, 1, 'a completed live window cannot monopolize admission');
+        assert.strictEqual((await bookHost.snapshot(book)).complete, true);
+        assert.strictEqual((await tinyHost.snapshot(tiny)).complete, true);
+    });
+
+    it('merges cross-host range updates and reserves one shared budget for simultaneous admissions', async () => {
+        const budget = 4096, bytes = content(300), book = output(bytes.length);
+        const a = make(budget), b = make(budget);
+        await Promise.all([a.snapshot(book), b.snapshot(book)]);
+        let peak = 0;
+        const original = fs.promises.writeFile;
+        fs.promises.writeFile = (async (...args: Parameters<typeof original>) => {
+            const result = await original(...args);
+            // Data writes hold the admission lease; lock candidates do not. Sampling a
+            // candidate can race another host's rename and throw into its acquisition.
+            if (/^(?:[a-f0-9]{64}|(?:build|object)-[a-f0-9]{64}\.json)\..+\.tmp$/.test(path.basename(String(args[0])))) {
+                peak = Math.max(peak, diskBytes(dir));
+            }
+            return result;
+        }) as typeof original;
+        cleanups.push(() => { fs.promises.writeFile = original; });
+        assert.deepStrictEqual(await Promise.all([
+            a.storeRange(book, 0, 150, response(bytes, 0, 150)),
+            b.storeRange(book, 150, 300, response(bytes, 150, 300)),
+        ]), [true, true]);
+        assert.deepStrictEqual((await a.readRange(book, 0, 300))?.body, bytes, 'fresh manifests preserve both disjoint commits');
+        const writes = Array.from({ length: 20 }, (_, index) => {
+            const body = content(400, index + 1);
+            return (index % 2 ? a : b).put(hash(body), body);
+        });
+        assert.ok((await Promise.all(writes)).every(Boolean));
+        assert.ok(peak <= budget, 'temporary blobs and replacement maps stay inside the same total budget');
+        const states = await Promise.all([a.snapshot(), b.snapshot()]);
+        assert.ok(states.every(state => state.bytes === diskBytes(dir) && state.reserved === 0));
+    });
+
+    it('keeps cached reads available while a foreign writer blocks an abortable admission', async () => {
+        for (const ending of ['abort', 'dispose']) {
+            const bytes = content(200), existing = content(70, 3);
+            fs.writeFileSync(path.join(dir, hash(existing)), existing);
+            fs.writeFileSync(path.join(dir, '.writer'), liveToken());
+            const waitTimers = new Timers(), attempted = deferred<void>();
+            const cache = make(4096, { setWaitTimer: waitTimers.set, clearWaitTimer: waitTimers.clear });
+            const original = fs.promises.readFile;
+            fs.promises.readFile = (async (...args: Parameters<typeof original>) => {
+                const result = await original(...args);
+                if (String(args[0]) === path.join(dir, '.writer')) { attempted.resolve(); }
+                return result;
+            }) as typeof original;
+            const controller = new AbortController();
+            let settled = false;
+            const pending = cache.put(hash(bytes), bytes, controller.signal).then(value => { settled = true; return value; });
+            try {
+                await attempted.promise;
+                assert.deepStrictEqual(await cache.get(hash(existing)), existing, 'foreign contention does not park the local read queue');
+                assert.strictEqual(settled, false, 'a busy writer waits for release instead of dropping received bytes');
+                assert.strictEqual(waitTimers.tasks.size, 1, 'one active watchdog serves the waiting cache');
+                if (ending === 'abort') { controller.abort(); } else { await cache.dispose(); }
+                assert.strictEqual(await pending, false);
+                assert.strictEqual(waitTimers.tasks.size, 0);
+                fs.unlinkSync(path.join(dir, '.writer'));
+                await turn();
+                assert.strictEqual(fs.existsSync(path.join(dir, hash(bytes))), false, 'cancelled work cannot publish on a later release');
+            } finally {
+                controller.abort();
+                fs.promises.readFile = original;
+                await cache.dispose();
+                fs.rmSync(path.join(dir, '.writer'), { force: true });
+            }
+        }
+    });
+
+    it('cancels a queued local admission promptly while the earlier write remains blocked', async () => {
+        fs.writeFileSync(path.join(dir, '.writer'), liveToken());
+        const attempted = deferred<void>(), cache = make(4096);
+        const original = fs.promises.readFile;
+        fs.promises.readFile = (async (...args: Parameters<typeof original>) => {
+            const result = await original(...args);
+            if (String(args[0]) === path.join(dir, '.writer')) { attempted.resolve(); }
+            return result;
+        }) as typeof original;
+        const a = new AbortController(), b = new AbortController();
+        const firstBytes = content(200), secondBytes = content(300, 7);
+        let firstSettled = false, secondSettled = false;
+        const first = cache.put(hash(firstBytes), firstBytes, a.signal).then(value => { firstSettled = true; return value; });
+        let second: Promise<boolean> | undefined;
+        try {
+            await attempted.promise;
+            await cache.snapshot();
+            second = cache.put(hash(secondBytes), secondBytes, b.signal).then(value => { secondSettled = true; return value; });
+            b.abort();
+            await turn();
+            assert.strictEqual(secondSettled, true, 'a cancelled queued caller does not wait behind another host\'s lock');
+            assert.strictEqual(await second, false);
+            assert.strictEqual(firstSettled, false, 'the earlier live request remains serialized and waiting');
+            a.abort();
+            assert.strictEqual(await first, false);
+            fs.unlinkSync(path.join(dir, '.writer'));
+            await cache.settled();
+            assert.strictEqual(fs.existsSync(path.join(dir, hash(secondBytes))), false);
+        } finally {
+            a.abort(); b.abort(); fs.promises.readFile = original;
+            fs.rmSync(path.join(dir, '.writer'), { force: true });
+            await Promise.all([first, second]);
+        }
+    });
+
+    it('performs no writer acquisition or watchdog polling for idle cache reads and snapshots', async () => {
+        const bytes = content(200), seed = make();
+        assert.strictEqual(await seed.put(hash(bytes), bytes), true);
+        await seed.dispose();
+        const timers = new Timers(), waitTimers = new Timers();
+        const cache = make(4096, { setTimer: timers.set, clearTimer: timers.clear,
+            setWaitTimer: waitTimers.set, clearWaitTimer: waitTimers.clear });
+        const original = fs.promises.link;
+        const originalReadDir = fs.promises.readdir;
+        let claims = 0;
+        let scans = 0;
+        fs.promises.link = (async (source: fs.PathLike, target: fs.PathLike) => {
+            if (['.writer', '.background'].includes(path.basename(String(target)))) { claims++; }
+            return original(source, target);
+        }) as typeof original;
+        fs.promises.readdir = (async (...args: Parameters<typeof originalReadDir>) => {
+            scans++; return originalReadDir(...args);
+        }) as typeof originalReadDir;
+        cleanups.push(() => { fs.promises.link = original; fs.promises.readdir = originalReadDir; });
+        for (let i = 0; i < 5; i++) {
+            assert.deepStrictEqual(await cache.get(hash(bytes)), bytes);
+            assert.strictEqual((await cache.snapshot()).writer, false);
+            await turn();
+        }
+        assert.strictEqual(claims, 0);
+        assert.strictEqual(scans, 1, 'LRU timestamp updates do not rescan immutable cached data');
+        assert.strictEqual(timers.tasks.size + waitTimers.tasks.size, 0);
+        assert.strictEqual(fs.existsSync(path.join(dir, '.writer')), false);
+    });
+
+    it('recovers when an owner dies after a writer waiter is registered and stops its watchdog', async () => {
+        const helper = path.join(dir, 'dying-owner.cjs');
+        fs.writeFileSync(helper, [
+            "const fs = require('fs'); const path = require('path');",
+            "const stat = fs.readFileSync('/proc/' + process.pid + '/stat', 'utf8');",
+            "const start = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];",
+            "fs.writeFileSync(path.join(process.argv[2], '.writer'), process.pid + ':' + start + ':test-owner');",
+            "process.send('ready'); process.on('message', () => {});",
+        ].join('\n'));
+        const child = fork(helper, [dir], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+        const closed = new Promise<void>(resolve => child.once('exit', () => resolve()));
+        const waitTimers = new Timers(), attempted = deferred<void>();
+        const original = fs.promises.readFile;
+        const cache = make(4096, { setWaitTimer: waitTimers.set, clearWaitTimer: waitTimers.clear });
+        try {
+            await new Promise<void>(resolve => child.once('message', () => resolve()));
+            fs.promises.readFile = (async (...args: Parameters<typeof original>) => {
+                const result = await original(...args);
+                if (String(args[0]) === path.join(dir, '.writer')) { attempted.resolve(); }
+                return result;
+            }) as typeof original;
+            const bytes = content(300);
+            let settled = false;
+            const pending = cache.put(hash(bytes), bytes).then(value => { settled = true; return value; });
+            await attempted.promise;
+            await cache.snapshot();
+            assert.strictEqual(settled, false);
+            assert.strictEqual(waitTimers.tasks.size, 1);
+            child.kill('SIGKILL');
+            await closed;
+            assert.strictEqual(waitTimers.fire(), true, 'process death has no directory unlink event');
+            assert.strictEqual(await pending, true);
+            assert.strictEqual(waitTimers.tasks.size, 0);
+            assert.deepStrictEqual(await cache.get(hash(bytes)), bytes);
+        } finally {
+            fs.promises.readFile = original;
+            child.kill('SIGKILL');
+            await closed;
+            await cache.dispose();
+        }
+    });
+
+    it('holds one global background transfer while leaving foreground admission free', async () => {
+        const aTimers = new Timers(), bTimers = new Timers();
+        const started = deferred<PdfFillRequest>(), reply = deferred<BridgeResponse>();
+        cleanups.push(() => reply.resolve({ id: 0, status: 499, statusText: 'Cancelled', headers: [], body: new Uint8Array() }));
+        const bytes = content(2000), book = output(bytes.length);
+        let bRequests = 0;
+        const a = make(4 * 1024 * 1024, { setTimer: aTimers.set, clearTimer: aTimers.clear,
+            fetchRange: request => { started.resolve(request); return reply.promise; } });
+        const b = make(4 * 1024 * 1024, { setTimer: bTimers.set, clearTimer: bTimers.clear,
+            fetchRange: async request => { bRequests++; return response(bytes, request.start, request.end); } });
+        const av = a.createViewer(), bv = b.createViewer();
+        av.setOutput(book); av.setActivity(true, true);
+        assert.strictEqual(aTimers.fire(), true);
+        const request = await started.promise;
+        assert.strictEqual(fs.existsSync(path.join(dir, '.writer')), false, 'network never holds the admission mutex');
+        bv.setOutput(book); bv.setActivity(true, true);
+        assert.strictEqual(bTimers.fire(), true);
+        await b.snapshot(); await turn();
+        assert.strictEqual(bRequests, 0);
+        const foreground = content(90, 7);
+        assert.strictEqual(await b.put(hash(foreground), foreground), true);
+        const end = a.beginForeground();
+        assert.strictEqual(request.signal.aborted, true);
+        await turn();
+        assert.strictEqual(bRequests, 0, 'an abort-ignoring transport retains the global slot until settlement');
+        reply.resolve(response(bytes, request.start, request.end));
+        await Promise.all([a.settled(), b.settled()]);
+        assert.strictEqual(bRequests, 1);
+        assert.strictEqual((await b.snapshot(book)).complete, true);
+        end(); av.dispose(); bv.dispose();
+    });
+
+    it('rechecks a waiting host\'s gap after another host completes the global background transfer', async () => {
+        const aTimers = new Timers(), bTimers = new Timers();
+        const started = deferred<PdfFillRequest>(), reply = deferred<BridgeResponse>();
+        cleanups.push(() => reply.resolve({ id: 0, status: 499, statusText: 'Cancelled', headers: [], body: new Uint8Array() }));
+        const bytes = content(2000), book = output(bytes.length);
+        let duplicateRequests = 0;
+        const a = make(4 * 1024 * 1024, { setTimer: aTimers.set, clearTimer: aTimers.clear,
+            fetchRange: request => { started.resolve(request); return reply.promise; } });
+        const b = make(4 * 1024 * 1024, { setTimer: bTimers.set, clearTimer: bTimers.clear,
+            fetchRange: async request => { duplicateRequests++; return response(bytes, request.start, request.end); } });
+        const av = a.createViewer(), bv = b.createViewer();
+        av.setOutput(book); av.setActivity(true, true);
+        assert.strictEqual(aTimers.fire(), true);
+        const request = await started.promise;
+        bv.setOutput(book); bv.setActivity(true, true);
+        assert.strictEqual(bTimers.fire(), true);
+        await b.snapshot(); await turn();
+        reply.resolve(response(bytes, request.start, request.end));
+        await Promise.all([a.settled(), b.settled()]);
+        assert.strictEqual(duplicateRequests, 0, 'winning the lease rechecks bytes published while this host waited');
+        assert.strictEqual((await b.snapshot(book)).complete, true);
+        assert.strictEqual(fs.existsSync(path.join(dir, '.background')), false);
     });
 
     it('reuses fully verified object shards in a new build without storing its object ID in the content hash', async () => {
@@ -312,7 +580,7 @@ describe('the shared persistent PDF disk budget', () => {
         } finally { bridge.dispose(); }
     });
 
-it('refreshes a readonly window and takes over filling after the writer closes', async () => {
+    it('refreshes another window and permits filling while both hosts remain open', async () => {
         const bytes = content(2000);
         const book = output(bytes.length);
         const first = make();
@@ -334,14 +602,10 @@ it('refreshes a readonly window and takes over filling after the writer closes',
         viewer.setOutput(book); viewer.setActivity(true, true);
         assert.strictEqual(timers.fire(), true);
         await second.settled();
-        assert.strictEqual(requests, 0);
-        await first.dispose();
-        assert.strictEqual((await second.snapshot()).writer, true, 'owner exit permits a later window to acquire the writer');
-        viewer.setActivity(true, false); viewer.setActivity(true, true);
-        assert.strictEqual(timers.fire(), true);
-        await second.settled();
         assert.strictEqual(requests, 1);
         assert.strictEqual((await second.snapshot(book)).complete, true);
+        assert.strictEqual((await first.snapshot(book)).complete, true);
+        assert.strictEqual((await second.snapshot()).writer, false);
         viewer.dispose();
     });
 
@@ -358,6 +622,77 @@ it('refreshes a readonly window and takes over filling after the writer closes',
         assert.ok(state.memoryManifests <= PDF_DISK_POLICY.memoryManifests * 2);
         assert.strictEqual(state.files, 1, 'unreceived generations create no persisted manifests');
         assert.strictEqual(state.bytes, bytes.length);
+    });
+
+    it('excludes a corrupt range on read and repairs valid incoming bytes under fresh ownership', async () => {
+        const bytes = content(400), book = output(bytes.length), seed = make();
+        assert.strictEqual(await seed.storeRange(book, 0, bytes.length, response(bytes, 0, bytes.length)), true);
+        fs.writeFileSync(path.join(dir, hash(bytes)), content(bytes.length, 9));
+        const reader = make();
+        assert.strictEqual(await reader.readRange(book, 0, bytes.length), undefined);
+        assert.strictEqual((await reader.snapshot(book)).covered, 0, 'known corrupt bytes cannot suppress incoming range repair');
+        assert.strictEqual(await reader.storeRange(book, 0, bytes.length, response(bytes, 0, bytes.length)), true);
+        assert.deepStrictEqual((await reader.readRange(book, 0, bytes.length))?.body, bytes);
+
+        fs.writeFileSync(path.join(dir, hash(bytes)), content(bytes.length, 5));
+        const delayedReader = make(), repairingHost = make();
+        assert.strictEqual(await delayedReader.readRange(book, 0, bytes.length), undefined);
+        assert.strictEqual(await repairingHost.put(hash(bytes), bytes), true);
+        const other = content(70, 3);
+        assert.strictEqual(await delayedReader.put(hash(other), other), true);
+        assert.deepStrictEqual((await delayedReader.readRange(book, 0, bytes.length))?.body, bytes,
+            'a delayed suspicion cannot delete another host\'s verified repair');
+    });
+
+    it('excludes a rejected aggregate object map from ranges and revalidates it before cleanup', async () => {
+        const bytes = content(PDF_DISK_POLICY.chunkBytes * 2 + 71), pieceHash = hash(bytes);
+        const book = output(bytes.length, 'source', [{ start: 0, end: bytes.length, hash: pieceHash }]);
+        const seed = make();
+        assert.strictEqual(await seed.storeRange(book, 0, bytes.length, response(bytes, 0, bytes.length)), true);
+        const objectFile = path.join(dir, 'object-' + pieceHash + '.json');
+        const corrupted = JSON.parse(fs.readFileSync(objectFile, 'utf8'));
+        corrupted.parts[0].hash = corrupted.parts[1].hash;
+        fs.writeFileSync(objectFile, JSON.stringify(corrupted));
+        const reader = make();
+        assert.strictEqual(await reader.get(pieceHash), undefined, 'valid component hashes cannot certify an incorrect combined object');
+        const moved = output(bytes.length + 50, 'moved', [{ start: 50, end: bytes.length + 50, hash: pieceHash }]);
+        assert.strictEqual(await reader.readRange(moved, 50, 150), undefined, 'a rejected cached map cannot serve range bytes');
+        assert.strictEqual((await reader.snapshot(moved)).covered, 0);
+        const other = content(100, 3);
+        assert.strictEqual(await reader.put(hash(other), other), true);
+        assert.strictEqual(fs.existsSync(objectFile), false, 'structurally valid metadata still needs its aggregate hash checked');
+        assert.strictEqual(await reader.readRange(moved, 50, 150), undefined);
+    });
+
+    it('aborts queued content-piece admission when its foreground bridge request is cancelled', async () => {
+        const bytes = content(300), attempted = deferred<void>();
+        const server = http.createServer((_request, reply) => { reply.writeHead(200); reply.end(bytes); });
+        await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+        const domain = 'http://127.0.0.1:' + (server.address() as AddressInfo).port;
+        const book = output(bytes.length); book.downloadDomain = domain; book.url = domain + book.file.url;
+        fs.writeFileSync(path.join(dir, '.writer'), liveToken());
+        const cache = make(), bridge = new PdfFetchBridge(outputsOf(domain, book.projectId), cache, { output: book });
+        const original = fs.promises.readFile;
+        fs.promises.readFile = (async (...args: Parameters<typeof original>) => {
+            const result = await original(...args);
+            if (String(args[0]) === path.join(dir, '.writer')) { attempted.resolve(); }
+            return result;
+        }) as typeof original;
+        const pending = bridge.handle({ id: 42, url: domain + '/project/project-a/user/user-a/content/build/' + hash(bytes) });
+        const rejected = assert.rejects(pending, /aborted/i);
+        try {
+            await attempted.promise;
+            bridge.abort(42);
+            fs.unlinkSync(path.join(dir, '.writer'));
+            await rejected;
+            assert.strictEqual(fs.existsSync(path.join(dir, hash(bytes))), false, 'an aborted piece never publishes after a later lock release');
+        } finally {
+            bridge.dispose(); fs.promises.readFile = original;
+            fs.rmSync(path.join(dir, '.writer'), { force: true });
+            await pending.catch(() => {});
+            server.closeAllConnections();
+            await new Promise<void>(resolve => server.close(() => resolve()));
+        }
     });
 
     it('retains an old foreground response during replacement but does not reuse bytes for a changed output query', async () => {
@@ -406,31 +741,40 @@ it('refreshes a readonly window and takes over filling after the writer closes',
         }
     });
 
-    it('allows only one process to reap a dead writer even when the second unlink arrives after new ownership', async () => {
-        // A live PID with a different kernel start tick also represents a stale, reused PID.
+    it('serializes two processes recovering a stale writer without unlinking the new transaction owner', async function () {
+        this.timeout(10000);
         fs.writeFileSync(path.join(dir, '.writer'), process.pid + ':0:previous-process');
         const helper = path.join(dir, 'writer-race.cjs');
         fs.writeFileSync(helper, [
-            "const fs = require('fs');",
-            "const { PdfDiskCache } = require(process.argv[2]);",
-            "const directory = process.argv[3];",
-            "let go, remove, close;",
-            "const started = new Promise(r => go = r), permission = new Promise(r => remove = r), shutdown = new Promise(r => close = r);",
-            "process.on('message', m => { if(m === 'go') go(); if(m === 'unlink') remove(); if(m === 'close') { remove(); close(); } });",
-            "const unlink = fs.promises.unlink.bind(fs.promises); let gate = true;",
-            "fs.promises.unlink = async file => { if(gate && file === directory + '/.writer') { process.send({phase:'unlink'}); await permission; } return unlink(file); };",
-            "(async () => { process.send({phase:'ready'}); await started;",
-            "const cache = new PdfDiskCache(directory, 4096);",
-            "const state = await cache.snapshot(); gate = false;",
-            "process.send({phase:'result',writer:state.writer}); await shutdown; await cache.dispose(); process.disconnect();",
-            "})().catch(e => { process.send({phase:'failure',message:e.message}); process.exitCode=1; process.disconnect(); });",
+            "const fs = require('fs'), path = require('path'), crypto = require('crypto');",
+            "const { PdfDiskCache } = require(process.argv[2]); const directory = process.argv[3];",
+            "let go, read, remove, commit, close, holding=false, gateRead=true, gateUnlink=true;",
+            "const started=new Promise(r=>go=r), readGate=new Promise(r=>read=r), unlinkGate=new Promise(r=>remove=r), commitGate=new Promise(r=>commit=r), shutdown=new Promise(r=>close=r);",
+            "process.on('message',m=>{ if(m==='go')go(); if(m==='read')read(); if(m==='unlink')remove(); if(m==='commit')commit(); if(m==='status')process.send({phase:'status',holding}); if(m==='close'){read();remove();commit();close();} });",
+            "const readFile=fs.promises.readFile.bind(fs.promises);",
+            "fs.promises.readFile=async(...args)=>{const value=await readFile(...args); if(gateRead && args[0]===directory+'/.writer' && String(value).endsWith('previous-process')){gateRead=false;process.send({phase:'read-old'});await readGate;} return value;};",
+            "const link=fs.promises.link.bind(fs.promises);",
+            "fs.promises.link=async(source,target)=>{const value=await link(source,target);if(target===directory+'/.writer')gateUnlink=false;return value;};",
+            "const unlink=fs.promises.unlink.bind(fs.promises);",
+            "fs.promises.unlink=async file=>{if(gateUnlink && file===directory+'/.writer'){process.send({phase:'unlink'});await unlinkGate;const value=await unlink(file);process.send({phase:'unlink-done'});return value;}return unlink(file);};",
+            "const writeFile=fs.promises.writeFile.bind(fs.promises);",
+            "fs.promises.writeFile=async(...args)=>{const value=await writeFile(...args);if(/^[a-f0-9]{64}\\..*\\.tmp$/.test(path.basename(String(args[0])))){holding=true;process.send({phase:'holding'});await commitGate;holding=false;}return value;};",
+            "(async()=>{process.send({phase:'ready'});await started;const cache=new PdfDiskCache(directory,4096);",
+            "const bytes=Buffer.from('piece-'+process.pid), hash=crypto.createHash('sha256').update(bytes).digest('hex');",
+            "const stored=await cache.put(hash,bytes);process.send({phase:'result',stored});await shutdown;await cache.dispose();process.disconnect();",
+            "})().catch(e=>{process.send({phase:'failure',message:e.message});process.exitCode=1;process.disconnect();});",
         ].join('\n'));
         const children: ChildProcess[] = [];
         const events: Array<{ child: ChildProcess, message: any }> = [];
+        const delayed = new Set<ChildProcess>();
         let wake = deferred<void>();
         const next = async () => {
             while (!events.length) { const waiting = wake; await waiting.promise; }
-            return events.shift()!;
+            const event = events.shift()!;
+            if (event.message.phase === 'failure') { throw new Error(event.message.message); }
+            if (event.message.phase === 'unlink') { delayed.add(event.child); }
+            if (event.message.phase === 'unlink-done') { delayed.delete(event.child); }
+            return event;
         };
         const exits: Promise<void>[] = [];
         for (let i = 0; i < 2; i++) {
@@ -445,23 +789,69 @@ it('refreshes a readonly window and takes over filling after the writer closes',
         try {
             for (let i = 0; i < 2; i++) { assert.strictEqual((await next()).message.phase, 'ready'); }
             children.forEach(child => child.send('go'));
-            const first = await next();
-            const second = await next();
-            assert.ok([first.message.phase, second.message.phase].every(p => p === 'unlink' || p === 'result'));
-            const waiting = [first, second].filter(e => e.message.phase === 'unlink');
-            const results = [first, second].filter(e => e.message.phase === 'result');
-            assert.ok(waiting.length > 0, 'the stale writer was recognized');
-            // Hold the second stale unlink until the first process has published its new lock.
-            for (const event of waiting) {
-                event.child.send('unlink');
-                const result = await next();
-                assert.strictEqual(result.message.phase, 'result');
-                results.push(result);
+            for (let i = 0; i < 2; i++) { assert.strictEqual((await next()).message.phase, 'read-old'); }
+            children.forEach(child => child.send('read'));
+            const removal = await next();
+            assert.strictEqual(removal.message.phase, 'unlink');
+            removal.child.send('unlink');
+            let first: { child: ChildProcess, message: any };
+            do { first = await next(); } while (first.message.phase !== 'holding');
+            for (const child of [...delayed].filter(candidate => candidate !== first.child)) {
+                child.send('unlink');
+                let event;
+                do { event = await next(); } while (event.child !== child || event.message.phase !== 'unlink-done');
             }
-            assert.strictEqual(results.filter(e => e.message.writer).length, 1, 'exactly one process owns admission after stale recovery');
+            assert.strictEqual(Number(fs.readFileSync(path.join(dir, '.writer'), 'utf8').split(':')[0]), first.child.pid,
+                'a delayed stale recovery cannot remove the new transaction owner');
+            const second = children.find(child => child !== first.child)!;
+            second.send('status');
+            let status;
+            do { status = await next(); } while (status.child !== second || status.message.phase !== 'status');
+            assert.strictEqual(status.message.holding, false, 'the other process cannot enter the critical section');
+            first.child.send('commit');
+            const results: boolean[] = [];
+            while (results.length < 2) {
+                const event = await next();
+                if (event.message.phase === 'holding') { event.child.send('commit'); }
+                if (event.message.phase === 'unlink') { event.child.send('unlink'); }
+                if (event.message.phase === 'result') { results.push(event.message.stored); }
+            }
+            assert.deepStrictEqual(results, [true, true]);
+            assert.strictEqual(fs.existsSync(path.join(dir, '.writer')), false);
+            assert.strictEqual(fs.readdirSync(dir).filter(name => /^[a-f0-9]{64}$/.test(name)).length, 2);
         } finally {
             children.forEach(child => { if (child.connected) { child.send('close'); } });
             await Promise.all(exits);
+        }
+    });
+
+    it('does not create a watcher when disposal races a delayed storage initialization', async () => {
+        const cache = make(), entered = deferred<void>(), release = deferred<void>();
+        const nativeFs = require('fs') as typeof fs;
+        const originalMkdir = fs.promises.mkdir, originalWatch = nativeFs.watch;
+        const open = new Set<fs.FSWatcher>();
+        fs.promises.mkdir = (async (...args: Parameters<typeof originalMkdir>) => {
+            const result = await originalMkdir(...args);
+            if (String(args[0]) === dir) { entered.resolve(); await release.promise; }
+            return result;
+        }) as typeof originalMkdir;
+        nativeFs.watch = ((...args: Parameters<typeof originalWatch>) => {
+            const watcher = originalWatch(...args), close = watcher.close.bind(watcher);
+            open.add(watcher);
+            watcher.close = () => { open.delete(watcher); close(); };
+            return watcher;
+        }) as typeof originalWatch;
+        try {
+            const loading = cache.snapshot();
+            await entered.promise;
+            const closing = cache.dispose();
+            release.resolve();
+            await Promise.all([loading, closing]);
+            assert.strictEqual(open.size, 0, 'shutdown cannot miss a watcher created after its initial close');
+        } finally {
+            release.resolve();
+            fs.promises.mkdir = originalMkdir; nativeFs.watch = originalWatch;
+            for (const watcher of open) { watcher.close(); }
         }
     });
 
@@ -473,7 +863,9 @@ it('refreshes a readonly window and takes over filling after the writer closes',
         fs.writeFileSync(path.join(dir, hash(bytes)), content(bytes.length, 1));
         const restarted = make();
         assert.strictEqual(await restarted.get(hash(bytes)), undefined);
-        assert.strictEqual((await restarted.snapshot()).bytes, 0);
+        assert.strictEqual((await restarted.snapshot()).bytes, bytes.length, 'read detection retains physical-byte accounting until a mutation repairs it');
+        assert.strictEqual(await restarted.put(hash(bytes), bytes), true);
+        assert.deepStrictEqual(await restarted.get(hash(bytes)), bytes);
         const offDir = path.join(dir, 'disabled');
         const off = new PdfDiskCache(offDir, 0); caches.push(off);
         assert.strictEqual(await off.put(hash(bytes), bytes), false);
@@ -482,7 +874,8 @@ it('refreshes a readonly window and takes over filling after the writer closes',
         await restarted.dispose();
         fs.writeFileSync(path.join(dir, hash(bytes)), bytes);
         const disabledExisting = make(0);
-        assert.strictEqual((await disabledExisting.snapshot()).bytes, 0, 'zero budget removes old cached files once this host owns admission');
+        assert.strictEqual(await disabledExisting.put(hash(bytes), bytes), false);
+        assert.strictEqual((await disabledExisting.snapshot()).bytes, 0, 'zero-budget admission removes previous files without creating new data');
         assert.strictEqual(fs.existsSync(path.join(dir, hash(bytes))), false);
     });
 });

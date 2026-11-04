@@ -214,7 +214,7 @@ export class PdfFetchBridge {
             const body = await boundedBody(response, limit);
             current();
             const result: BridgeResponse = { id: request.id, status: response.status, statusText: response.statusText, headers: [...response.headers.entries()], body };
-            if (piece && this.cache && response.status === 200) { await this.cache.put(piece, body).catch(() => false); }
+            if (piece && this.cache && response.status === 200) { await this.cache.put(piece, body, controller.signal).catch(() => false); }
             if (ranges?.length === 1 && output && this.cache) {
                 await this.cache.storeRange(output, ranges[0].start, ranges[0].end, result, controller.signal).catch(() => false);
             }
