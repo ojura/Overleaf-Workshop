@@ -6,10 +6,14 @@ import * as path from 'path';
 const importModule = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
 const repo = path.resolve(__dirname, '..', '..');
 
+type Listener = NonNullable<Parameters<EventTarget['addEventListener']>[1]>;
+type AddOptions = Parameters<EventTarget['addEventListener']>[2];
+type RemoveOptions = Parameters<EventTarget['removeEventListener']>[2];
+
 class Surface extends EventTarget {
-    readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
-    readonly registrations: AddEventListenerOptions[] = [];
-    override addEventListener(name: string, listener: EventListenerOrEventListenerObject | null, options?: AddEventListenerOptions | boolean) {
+    readonly listeners = new Map<string, Set<Listener>>();
+    readonly registrations: Exclude<AddOptions, boolean | undefined>[] = [];
+    override addEventListener(name: string, listener: Listener | null, options?: AddOptions) {
         if (!listener) { return; }
         const config = typeof options === 'boolean' ? { capture: options } : options ?? {};
         const key = name + ':' + !!config.capture;
@@ -17,11 +21,11 @@ class Surface extends EventTarget {
         this.listeners.get(key)!.add(listener); this.registrations.push(config);
         super.addEventListener(name, listener, options);
     }
-    override removeEventListener(name: string, listener: EventListenerOrEventListenerObject | null, options?: EventListenerOptions | boolean) {
+    override removeEventListener(name: string, listener: Listener | null, options?: RemoveOptions) {
         if (listener) {
             this.listeners.get(name + ':' + !!(typeof options === 'boolean' ? options : options?.capture))?.delete(listener);
+            super.removeEventListener(name, listener, options);
         }
-        super.removeEventListener(name, listener, options);
     }
     get listenerCount() { return [...this.listeners.values()].reduce((total, listeners) => total + listeners.size, 0); }
 }
