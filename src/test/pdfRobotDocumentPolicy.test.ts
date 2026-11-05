@@ -31,6 +31,30 @@ describe('Document robot CSS footprint policy', function () {
     const crops = (regions = photos, size = page(), visible = full, kind = 'desktop'): any[] =>
         api.selectRobotImageCrops(regions, size, visible, api.robotDocumentMetrics(size, kind));
 
+    it('plans exclusive logical regions while allowing touching edges and unchanged semantic units', () => {
+        const owned = Object.freeze({ x: 0.1, y: 0.2, width: 0.3, height: 0.2 });
+        const touching = Object.freeze({ x: 0.4, y: 0.2, width: 0.2, height: 0.2, imageId: 'same-source' });
+        assert.strictEqual(api.planRobotDocumentRegion(touching, [owned]), touching);
+        for (const candidate of [owned, { ...owned, x: 0.2 }, { ...touching, x: 0.4 - 1e-10 }]) {
+            assert.strictEqual(api.planRobotDocumentRegion(candidate, [owned]), undefined, 'positive logical overlap is already owned');
+        }
+        for (const candidate of [{ ...owned, x: -0.01 }, { ...owned, width: NaN }, { ...owned, height: 0 }, { ...owned, y: 0.9 }]) {
+            assert.strictEqual(api.planRobotDocumentRegion(candidate, []), undefined);
+        }
+        const turned = rotate(touching);
+        assert.strictEqual(api.planRobotDocumentRegion(turned, [rotate(owned)]), turned);
+        assert.deepStrictEqual(owned, { x: 0.1, y: 0.2, width: 0.3, height: 0.2 });
+    });
+
+    it('preserves separate placements of the same source image before route assignment', () => {
+        const first = { id: 'reused-image', x: 0.1, y: 0.1, width: 0.18, height: 0.12 };
+        const second = { ...first, x: 0.65 };
+        const selected = crops([first, second, { ...first, id: 'placement-alias' }]);
+        assert.strictEqual(selected.length, 2);
+        assert.deepStrictEqual(selected.map(value => value.x).sort(), [first.x, second.x]);
+        assert.deepStrictEqual(crops([second, first]), crops([first, second]), 'manifest order does not choose a placement');
+    });
+
     it('uses bounded square-root document growth with neutral quarter-turns', () => {
         for (const zoom of [0.5, 1, 1.5, 2, 3, 4]) {
             const size = page(zoom), value = api.robotDocumentMetrics(size, 'desktop');
@@ -121,8 +145,9 @@ describe('Document robot CSS footprint policy', function () {
     it('does not form collages from overlapping or partly clipped placements', () => {
         const first = { id: 'a', x: 0.1, y: 0.1, width: 0.2, height: 0.15 };
         const overlap = crops([first, { ...first, id: 'b', x: 0.15 }]);
-        assert.strictEqual(overlap.length, 2);
+        assert.strictEqual(overlap.length, 1, 'overlapping alternatives produce one preferred logical unit');
         assert.ok(overlap.every(value => value.kind === 'image'));
+        assert.deepStrictEqual([overlap[0].width, overlap[0].height], [first.width, first.height]);
         const clipped = crops([first, { ...first, id: 'b', x: 0.306 }], page(), { x: 0.2, y: 0, width: 0.8, height: 1 });
         assert.strictEqual(clipped.length, 2);
         assert.ok(clipped.every(value => value.kind === 'image'));

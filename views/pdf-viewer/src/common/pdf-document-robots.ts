@@ -9,7 +9,8 @@ import type { PdfDocumentColumnTransition } from './pdf-document-column';
 import { MOTION_LAB_CHOREOGRAPHY, motionLabColumnElapsed, motionLabEase } from './motion-lab-choreography';
 import { canCarryRobot } from './robot-rescue';
 import { robotScreenMetrics, robotCaptionMetrics, ROBOT_CAPTION_STYLE } from './robot-screen-scale';
-import { robotDocumentMetrics, selectRobotImageCrops, type RobotDocumentSize, type RobotImageCrop } from './robot-document-policy';
+import { robotDocumentMetrics, selectRobotImageCrops, planRobotDocumentRegion,
+    type RobotDocumentSize, type RobotImageCrop } from './robot-document-policy';
 import { RobotTraffic } from './robot-traffic';
 import { installRobotInteraction, type RobotInteractionPoint } from './robot-interaction';
 import { createPdfRasterProjection, resizePdfRasterProjection, projectPdfRasterCrop, pdfRasterCropSize, pdfRasterToCrop,
@@ -1353,12 +1354,13 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 if (!area || area.width * (area.right - area.left) < policy.minimumWidth
                     || area.height * (area.bottom - area.top) < policy.minimumHeight) { continue; }
                 const pagePolicy = pagePresentation(policy, area);
-                const crops = selectCrops(value.canvas, area, pagePolicy, value.imageRegions, value.rasterProjection)
-                    .slice(0, policy.kind === 'desktop' ? DOCUMENT_ROBOT_LIMITS.replacement.fragmentsPerDesktopPage : 1);
+                const crops = selectCrops(value.canvas, area, pagePolicy, value.imageRegions, value.rasterProjection);
+                const limit = policy.kind === 'desktop' ? DOCUMENT_ROBOT_LIMITS.replacement.fragmentsPerDesktopPage : 1;
                 for (const crop of crops) {
-                    if (actorCount() >= policy.maxActors) { break; }
+                    const admitted = scene.pieces.filter(piece => piece.page === value.pageNumber).map(piece => piece.payload);
+                    if (admitted.length >= limit || actorCount() >= policy.maxActors) { break; }
                     const ground = area.bottom >= 0.98 && crop.y + crop.height / 2 >= 0.6 && !used.has('forklift');
-                    const payload = makeDelivery(value.canvas, crop, area, scene.pieces.length, 'solo', 1, used, pagePolicy, [], ground,
+                    const payload = makeDelivery(value.canvas, crop, area, scene.pieces.length, 'solo', 1, used, pagePolicy, [], admitted, ground,
                         value.rasterProjection);
                     if (!payload) { continue; }
                     payload.duration = DOCUMENT_ROBOT_LIMITS.replacement.durationMs;
@@ -2619,8 +2621,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     }
 
     function makeDelivery(source: HTMLCanvasElement, crop: Crop, area: Geometry, index: number, mode: DeliveryMode,
-        helpers: number, used: ReadonlySet<RobotVehicle>, policy: Presentation, staged: AdvanceActor[], ground = false,
+        helpers: number, used: ReadonlySet<RobotVehicle>, policy: Presentation, staged: AdvanceActor[], admitted: readonly Payload[], ground = false,
         projection?: PdfRasterProjection, preferredGround?: RobotVehicle): Payload | undefined {
+        if (!planRobotDocumentRegion(crop, admitted.map(payload => payload.crop))) { return; }
         const payload = makePayload(source, crop, area, index, mode, policy, ground, projection);
         if (!payload) { return; }
         for (let helper = 0; helper < helpers; helper++) {
@@ -2720,7 +2723,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 .sort((a, b) => b.y + b.height - a.y - a.height || b.score - a.score)[0] : undefined;
         const remaining = [...crops];
         if (lower) {
-            const ground = makeDelivery(value.canvas, lower, area, 0, 'solo', 1, used, policy, staged, true, value.rasterProjection);
+            const ground = makeDelivery(value.canvas, lower, area, 0, 'solo', 1, used, policy, staged, payloads, true, value.rasterProjection);
             if (ground) {
                 payloads.push(ground); assigned++; used.add('forklift');
                 remaining.splice(remaining.indexOf(lower), 1);
@@ -2739,7 +2742,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             && (largeImage || stagedGround || turningLugv || enlarged.width >= first.width * 1.4 && enlarged.height >= first.height * 1.4)) {
             const helpers = !stagedGround && !turningLugv && choice === 'trio' ? Math.min(3, count - assigned) : 2;
             const shared = makeDelivery(value.canvas, enlarged, area, payloads.length,
-                turningLugv || stagedGround || choice === 'airlift' ? 'airlift' : choice === 'handoff' ? 'handoff' : 'formation', helpers, used, policy, staged,
+                turningLugv || stagedGround || choice === 'airlift' ? 'airlift' : choice === 'handoff' ? 'handoff' : 'formation', helpers, used, policy, staged, payloads,
                 false, value.rasterProjection, turningLugv ? 'lugv' : undefined);
             if (shared) {
                 payloads.push(shared); assigned += shared.helpers.length;
@@ -2748,7 +2751,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             }
         }
         for (let index = sharedCrop ? 1 : 0; index < remaining.length && assigned < count; index++) {
-            const payload = makeDelivery(value.canvas, remaining[index], area, payloads.length, 'solo', 1, used, policy, staged,
+            const payload = makeDelivery(value.canvas, remaining[index], area, payloads.length, 'solo', 1, used, policy, staged, payloads,
                 false, value.rasterProjection);
             if (payload) {
                 payloads.push(payload); assigned++;

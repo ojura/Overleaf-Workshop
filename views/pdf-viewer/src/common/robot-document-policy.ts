@@ -52,6 +52,27 @@ function intersection(a: RobotDocumentRect, b: RobotDocumentRect): RobotDocument
         height: Math.max(0, Math.min(a.y + a.height, b.y + b.height) - y) };
 }
 
+/** Page-space arithmetic can differ by a few ULPs at a shared portion edge. */
+const PAGE_EDGE_EPSILON = Number.EPSILON * 8;
+
+/**
+ * A payload claims its exact logical region before allocating pixels or a crew.
+ * Claims come from admitted payloads, not raster rounding or padded arrival covers.
+ * The returned semantic unit is unchanged; failed construction owns no region.
+ */
+export function planRobotDocumentRegion<T extends RobotDocumentRect>(candidate: T,
+    admitted: readonly RobotDocumentRect[]): T | undefined {
+    if (!validSize(candidate) || ![candidate.x, candidate.y].every(Number.isFinite)
+        || candidate.x < -PAGE_EDGE_EPSILON || candidate.y < -PAGE_EDGE_EPSILON
+        || candidate.x + candidate.width > 1 + PAGE_EDGE_EPSILON
+        || candidate.y + candidate.height > 1 + PAGE_EDGE_EPSILON) { return; }
+    for (const owned of admitted) {
+        const overlap = intersection(candidate, owned);
+        if (overlap.width > PAGE_EDGE_EPSILON && overlap.height > PAGE_EDGE_EPSILON) { return; }
+    }
+    return candidate;
+}
+
 function bounds(regions: readonly RobotDocumentRect[]): RobotDocumentRect {
     const x = Math.min(...regions.map(value => value.x)), y = Math.min(...regions.map(value => value.y));
     return { x, y, width: Math.max(...regions.map(value => value.x + value.width)) - x,
@@ -109,19 +130,20 @@ export function selectRobotImageCrops(regions: readonly RobotImageRegion[], page
         || metrics.cargoEdge <= 0) { return []; }
     const clip = intersection(visible, { x: 0, y: 0, width: 1, height: 1 });
     if (!clip.width || !clip.height) { return []; }
-    const ids = new Set<string>(), rectangles = new Set<string>();
+    const rectangles = new Set<string>();
     const images: RobotImageRegion[] = [];
     for (const value of regions.slice(0, ROBOT_DOCUMENT_POLICY.maxRegions)) {
-        if (!value.id || ids.has(value.id) || !validSize(value) || ![value.x, value.y].every(Number.isFinite)) { continue; }
+        if (!value.id || !validSize(value) || ![value.x, value.y].every(Number.isFinite)) { continue; }
         const rect = value.x >= 0 && value.y >= 0 && value.x + value.width <= 1 && value.y + value.height <= 1
             ? { x: value.x, y: value.y, width: value.width, height: value.height }
             : intersection(value, { x: 0, y: 0, width: 1, height: 1 });
         if (!rect.width || !rect.height) { continue; }
         const key = [rect.x, rect.y, rect.width, rect.height].join(':');
         if (rectangles.has(key)) { continue; }
-        ids.add(value.id); rectangles.add(key); images.push({ ...rect, id: value.id });
+        rectangles.add(key); images.push({ ...rect, id: value.id });
     }
-    images.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    images.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+        || a.x - b.x || a.y - b.y || a.width - b.width || a.height - b.height);
     const roots = images.map((_, index) => index);
     const root = (index: number): number => {
         while (roots[index] !== index) { roots[index] = roots[roots[index]]; index = roots[index]; }
@@ -186,6 +208,13 @@ export function selectRobotImageCrops(regions: readonly RobotImageRegion[], page
     const distance = (value: RobotDocumentRect) => Math.hypot(
         (value.x + value.width / 2 - clip.x - clip.width / 2) * page.width,
         (value.y + value.height / 2 - clip.y - clip.height / 2) * page.height);
-    return candidates.sort((a, b) => b.score - a.score || distance(a) - distance(b)
-        || (a.imageId < b.imageId ? -1 : a.imageId > b.imageId ? 1 : 0)).slice(0, ROBOT_DOCUMENT_POLICY.maxCrops);
+    const selected: RobotImageCrop[] = [];
+    // Content priority chooses the whole image/collage/portion before a route can
+    // prefer a smaller overlapping lower placement. Crew choice cannot split it.
+    for (const candidate of candidates.sort((a, b) => b.score - a.score || distance(a) - distance(b)
+        || (a.imageId < b.imageId ? -1 : a.imageId > b.imageId ? 1 : 0))) {
+        if (planRobotDocumentRegion(candidate, selected)) { selected.push(candidate); }
+        if (selected.length >= ROBOT_DOCUMENT_POLICY.maxCrops) { break; }
+    }
+    return selected;
 }

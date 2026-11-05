@@ -298,6 +298,36 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
 
     const sceneNodes = (node: Element): Element[] => [node, ...node.children.flatMap(sceneNodes)];
     const captions = (f: Fixture) => sceneNodes(f.container).filter(node => node.className === 'pdfDocumentRobotCaption');
+    const exclusiveRegions = (payloads: any[], context: string) => {
+        for (let first = 0; first < payloads.length; first++) {
+            for (const second of payloads.slice(first + 1)) {
+                const a = payloads[first].target, b = second.target;
+                const width = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+                const height = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+                assert.ok(width <= 1e-12 || height <= 1e-12,
+                    context + ' has two owners: ' + JSON.stringify([a, b]));
+            }
+        }
+    };
+    function textStripFixture(options: Record<string, unknown> = {}): Fixture {
+        let f: Fixture;
+        f = fixture({ ...options, createCanvas: () => {
+            const canvas = new Canvas(f.document); f.owned.push(canvas);
+            canvas.context.getImageData = (_x: number, _y: number, width: number, height: number) => {
+                const data = new Uint8ClampedArray(width * height * 4).fill(255);
+                for (let y = 2; y < height; y++) {
+                    if (y % 5 >= 3) { continue; }
+                    for (let x = 2; x < width; x++) {
+                        const at = (y * width + x) * 4, ink = x < width / 3 ? 0 : 180;
+                        data[at] = data[at + 1] = data[at + 2] = ink;
+                    }
+                }
+                return { data };
+            };
+            return canvas;
+        } });
+        return f;
+    }
     const nearMissOptions = () => {
         const draws = [0.99, 0.1, 0.5, 0];
         return { seed: 16, encounterRandom: () => draws.shift() ?? 0.99 };
@@ -3850,6 +3880,147 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.finish();
         assert.ok(lab.snapshot().actors.every((actor: any) => !actor.outside));
         assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+    });
+
+    it('assigns exclusive fallback jobs in a 600 by 240 visible text strip before copying pixels', () => {
+        let multiple = false;
+        for (const seed of [1, 13]) {
+            const f = textStripFixture({ seed }); f.desktop(1, 1200, 900);
+            const page = f.page();
+            page.pageElement.rect = { left: 40, top: 660, width: 600, height: 900 };
+            f.api.setVisiblePages([1]);
+            assert.strictEqual(f.api.offer(page), 'started');
+            const payloads = f.api.snapshot().pages[0].payloads;
+            multiple ||= payloads.length > 1;
+            exclusiveRegions(payloads, '600 by 240 strip, seed ' + seed);
+            const copies = f.owned.flatMap(canvas => canvas.copies.filter(args => args.length === 9 && args[0] === page.canvas));
+            assert.strictEqual(copies.length, payloads.length, 'rejected overlap allocates no duplicate raster');
+            f.finish();
+            assert.strictEqual(f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+        }
+        assert.ok(multiple, 'separate available text regions still receive separate jobs');
+    });
+
+    it('claims cooperative enlargement against ground and solo jobs before allocating another crop', () => {
+        const f = fixture({ maxActors: 8 }); f.desktop(1, 1280, 1000);
+        let shared = false, distinct = false;
+        for (let id = 1; id <= 12; id++) {
+            const page = f.page(id);
+            page.pageElement.rect = id % 2 ? { left: 40, top: -600, width: 1000, height: 1000 }
+                : { left: 40, top: 300, width: 1000, height: 1600 };
+            f.api.setVisiblePages([id]); assert.strictEqual(f.api.offer(page), 'started');
+            const payloads = f.api.snapshot().pages[0].payloads;
+            shared ||= payloads.some((payload: any) => payload.helpers.length > 1);
+            distinct ||= payloads.length > 1;
+            exclusiveRegions(payloads, 'enlarged/shared page ' + id);
+            const copies = f.owned.flatMap(canvas => canvas.copies.filter(args => args.length === 9 && args[0] === page.canvas));
+            assert.strictEqual(copies.length, payloads.length, 'one copied raster belongs to each job regardless of its helper count');
+            assert.strictEqual(page.pageElement.children.filter(node => node.className === 'pdfDocumentRobotArrival').length, payloads.length);
+            f.finish();
+        }
+        assert.ok(shared && distinct, 'cooperative jobs and distinct work remain available');
+    });
+
+    it('selects whole-photo and collage work before a smaller overlapping lower route', () => {
+        const whole = { id: 'whole-photo', x: 0.1, y: 0.45, width: 0.5, height: 0.3 };
+        const collage = [{ id: 'left-photo', x: 0.1, y: 0.55, width: 0.2, height: 0.18 },
+            { id: 'right-photo', x: 0.306, y: 0.55, width: 0.2, height: 0.18 }];
+        for (const [kind, regions, target] of [
+            ['image', [whole, { id: 'lower-inset', x: 0.35, y: 0.65, width: 0.12, height: 0.12 }],
+                { x: whole.x, y: whole.y, width: whole.width, height: whole.height }],
+            ['collage', [...collage, { id: 'lower-inset', x: 0.2, y: 0.68, width: 0.08, height: 0.08 }],
+                { x: 0.1, y: 0.55, width: 0.406, height: 0.18 }],
+        ] as const) {
+            const f = fixture({ maxActors: 6 }); f.desktop(1, 1200, 1100);
+            const page = f.page(); page.pageElement.rect = { left: 40, top: 60, width: 640, height: 900 };
+            f.api.setVisiblePages([1]); assert.strictEqual(f.api.offer({ ...page, imageRegions: regions }), 'started');
+            const payloads = f.api.snapshot().pages[0].payloads;
+            const job = payloads.find((payload: any) => payload.cropKind === kind && payload.imageId !== 'lower-inset');
+            assert.ok(job, 'route choice retains the preferred ' + kind + ' unit');
+            for (const key of ['x', 'y', 'width', 'height'] as const) { assert.ok(Math.abs(job.target[key] - target[key]) < 1e-12); }
+            assert.ok(payloads.every((payload: any) => payload.imageId !== 'lower-inset'), 'a smaller lower proposal cannot claim the semantic unit first');
+            exclusiveRegions(payloads, kind); f.finish();
+        }
+    });
+
+    it('keeps separate same-image placements and exclusive jobs through zoom, DPR and refinement', () => {
+        const first = { id: 'reused-photo', x: 0.1, y: 0.1, width: 0.18, height: 0.12 };
+        const second = { ...first, x: 0.65 };
+        for (const zoom of [0.5, 1, 1.5, 2, 3, 4]) {
+            for (const dpr of [1, 1.2, 2, 3]) {
+                const width = 640 * zoom, height = 900 * zoom;
+                const f = fixture({ maxActors: 6 }); f.desktop(dpr, Math.max(1200, width + 80), Math.max(1100, height + 100));
+                const page = f.page(); page.pageElement.rect = { left: 40, top: 60, width, height };
+                page.canvas.width = 160; page.canvas.height = 225;
+                const delivery = { ...page, kind: 'preview' as const, imageRegions: [first, second,
+                    { ...first, id: 'overlapping-layer', width: first.width - 0.02, x: first.x + 0.02 }] };
+                f.api.setVisiblePages([1]); assert.strictEqual(f.api.offer(delivery), 'started');
+                const before = f.api.snapshot().pages[0].payloads;
+                assert.strictEqual(before.length, 2, 'separate placements remain distinct jobs at ' + zoom + '/' + dpr);
+                assert.deepStrictEqual(before.map((job: any) => job.target.x).sort(), [first.x, second.x]);
+                exclusiveRegions(before, zoom + '/' + dpr);
+                const source = new Canvas(f.document); source.width = 640; source.height = 900;
+                assert.strictEqual(f.api.refine({ ...delivery, canvas: source, kind: 'page' }), 2);
+                const after = f.api.snapshot().pages[0].payloads;
+                for (let index = 0; index < before.length; index++) {
+                    for (const key of ['id', 'imageId', 'target', 'helpers', 'deadline']) { assert.deepStrictEqual(after[index][key], before[index][key]); }
+                }
+                assert.strictEqual(f.api.offer(delivery), 'skipped');
+                f.finish();
+                assert.strictEqual(f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+            }
+        }
+    });
+
+    it('leaves a failed region proposal available after canvas or helper reservation rollback', () => {
+        for (const failure of ['copy', 'helper']) {
+            let f: Fixture, failCopy = failure === 'copy';
+            f = fixture({ maxActors: 3, createCanvas: () => {
+                const canvas = new Canvas(f.document); f.owned.push(canvas);
+                canvas.beforeCopy = args => {
+                    if (failCopy && args.length === 9) { failCopy = false; throw new Error('first region copy failed'); }
+                };
+                return canvas;
+            } });
+            f.desktop(1, 1200, 1100);
+            const held = new Set<string>(); let allowed: string | undefined, borrowed = 0, released = 0;
+            if (failure === 'helper') {
+                const origin = { x: 550, y: 80, scale: 0.4 };
+                f.api.setDispatchOrigin({ reserve(vehicle: string) {
+                    allowed ??= vehicle;
+                    if (vehicle !== allowed || held.has(vehicle)) { return; }
+                    held.add(vehicle); borrowed++; return origin;
+                }, destination: () => origin, release(vehicle: string) { assert.ok(held.delete(vehicle)); released++; } });
+            }
+            const page = f.page(); page.pageElement.rect = { left: 40, top: 60, width: 640, height: 900 };
+            const image = { id: 'single-job', x: 0.2, y: 0.2, width: 0.3, height: 0.2 };
+            f.api.setVisiblePages([1]); assert.strictEqual(f.api.offer({ ...page, imageRegions: [image] }), 'started');
+            const jobs = f.api.snapshot().pages[0].payloads;
+            assert.strictEqual(jobs.length, 1); assert.strictEqual(jobs[0].mode, 'solo');
+            assert.deepStrictEqual(jobs[0].target, { x: image.x, y: image.y, width: image.width, height: image.height });
+            assert.ok(f.owned.some(canvas => canvas.zeroWrites === 1), 'failed construction releases its temporary owner');
+            if (failure === 'helper') { assert.ok(borrowed >= 2 && released >= 1, 'the failed crew returned its real lease before ordinary admission'); }
+            f.finish(); assert.strictEqual(held.size + f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+            assert.strictEqual(borrowed, released);
+        }
+    });
+
+    it('keeps retiring region jobs exclusive per page without claiming the incoming document', () => {
+        const f = textStripFixture({ maxActors: 8 }); f.desktop(1, 1280, 1000);
+        const pages = [f.page(1), f.page(2)];
+        pages.forEach((page, index) => { page.pageElement.rect = { left: 40 + index * 610, top: 760, width: 600, height: 900 }; });
+        f.api.retireDocument(pages, 'old-edition');
+        const retiring = f.api.snapshot().replacement.payloads;
+        for (const page of pages) {
+            const jobs = retiring.filter((job: any) => job.page === page.pageNumber);
+            assert.ok(jobs.length > 1, 'each old page receives distinct available work');
+            exclusiveRegions(jobs, 'retirement page ' + page.pageNumber);
+        }
+        f.api.setVisiblePages([1]); assert.strictEqual(f.api.offer(pages[0]), 'started', 'old edition claims cannot suppress incoming pixels');
+        exclusiveRegions(f.api.snapshot().pages[0].payloads, 'incoming document');
+        f.api.reset();
+        assert.strictEqual(f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+        assert.strictEqual(f.api.snapshot().replacement, undefined);
     });
 
     it('admits each sampled source rectangle once in a useful thin visible page slice', () => {
