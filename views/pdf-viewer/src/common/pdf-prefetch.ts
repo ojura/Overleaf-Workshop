@@ -562,6 +562,20 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
                 && pdfPerformance.oldestFetchMs >= limits.fetchBackpressureMs;
     }
 
+    function canStartColdPage(id: number): boolean {
+        if (fetchBackpressure() || memoryAdmissionBlocked()) { return false; }
+        if (policy.name === 'mobile' && dynamics.direction !== 0 && !layoutPending
+            && previewCompatible() && visible.includes(id)) {
+            const view = pageView(id), preview = previews.get(id)?.canvas;
+            // showPreviews runs before native selection and pump. Only a preview already
+            // placed on this visible page can defer its cold PDF decoding during motion.
+            // Cached but detached pixels leave native fallback available. The existing
+            // gesture settle or layout reset wakes refinement without another timer.
+            if (preview && preview.width > 0 && preview.height > 0 && preview.parentNode === view?.div) { return false; }
+        }
+        return true;
+    }
+
     function canRender(view: any) {
         // Resuming an admitted render or using fully prepared resources adds no cold page.
         // A cancelled RenderTask can leave its worker's image requests running, so the
@@ -569,7 +583,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         const job = jobs.get(view?.id);
         return view?.renderingState === RUNNING || view?.renderingState === PAUSED
             || resourcesWarm(view?.id) || !!job?.task && !job.cancelled
-            || jobs.size < limits.maxConcurrentPrepares && !fetchBackpressure() && !memoryAdmissionBlocked();
+            || jobs.size < limits.maxConcurrentPrepares && canStartColdPage(view?.id);
     }
 
     function resourcesWarm(id: number): boolean {
@@ -1040,7 +1054,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             if (pageView(id)?.renderingState === FINISHED
                 || policy.releaseRenderedResources && previews.has(id) && !nativeTarget(id)) { return; }
             if (!visible.includes(id) && visibleUncovered()) { return; }
-            if (!resourcesWarm(id) && (fetchBackpressure() || memoryAdmissionBlocked())) { return; }
+            if (!resourcesWarm(id) && !canStartColdPage(id)) { return; }
             const rotation = ((page.rotate || 0) + (viewer.pagesRotation || 0)) % 360;
             const natural = page.getViewport({ scale: 1, rotation });
             const scale = Math.min(1, limits.previewMaxDimension / Math.max(natural.width, natural.height));
@@ -1116,7 +1130,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             // that CPU and fetch capacity for an uncovered viewport; covered motion can fill
             // the speculative horizon continuously while native resolution catches up.
             if (!visible.includes(id) && visibleUncovered()) { continue; }
-            if (!resourcesWarm(id) && (fetchBackpressure() || memoryAdmissionBlocked())) { continue; }
+            if (!resourcesWarm(id) && !canStartColdPage(id)) { continue; }
             if (jobs.size >= limits.maxConcurrentPrepares) { break; }
             void prepare(id);
         }

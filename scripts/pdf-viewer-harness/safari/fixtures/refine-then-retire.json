@@ -1,0 +1,42 @@
+{
+  "page": 99,
+  "payloadId": 8,
+  "before": {
+    "id": 8,
+    "imageId": "p99-i2",
+    "deadline": 214456.79165914818,
+    "target": {
+      "x": 0.1755328669326745,
+      "y": 0.27815740598630473,
+      "width": 0.315806107087826,
+      "height": 0.12505938486751272
+    },
+    "helpers": [
+      17
+    ],
+    "rasterWidth": 171,
+    "rasterHeight": 97,
+    "refinements": 1,
+    "refinementPending": false,
+    "arrivalCovered": true
+  },
+  "after": {
+    "id": 8,
+    "imageId": "p99-i2",
+    "deadline": 214456.79165914818,
+    "target": {
+      "x": 0.1755328669326745,
+      "y": 0.27815740598630473,
+      "width": 0.315806107087826,
+      "height": 0.12505938486751272
+    },
+    "helpers": [
+      17
+    ],
+    "rasterWidth": 0,
+    "rasterHeight": 0,
+    "refinements": 2,
+    "refinementPending": false,
+    "arrivalCovered": false
+  }
+}

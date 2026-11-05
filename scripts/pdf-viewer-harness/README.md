@@ -5,6 +5,15 @@ the Overleaf viewer. The scripts in this folder and in `probes/` run a viewer pa
 Chrome, against a local server that stands in for Overleaf and for VS Code. The scripts in `ide/`
 drive the viewers in a test instance of Antigravity on a virtual display.
 
+`safari/` preserves the physical iPhone Safari suite used on 4 and 5 November 2026. Its
+[runbook](../../docs/safari-validation.md) covers the retained Inspector connection, source
+verification, short delivery and reversal scenarios, real gesture observation, and 600 seconds
+of continuous motion with native memory, CPU and network recording. Runtime receipts and
+pairing material stay in an explicitly supplied folder outside the checkout.
+
+Run its device-free regression checks with `npm run test:safari:offline`, or run the combined
+PDF checks with `npm run test:pdf-viewer`. Live commands remain inert without `--execute`.
+
 ## What the headless harness runs
 
 `server.mjs` plays three parts:

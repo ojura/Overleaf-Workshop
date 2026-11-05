@@ -907,6 +907,8 @@
     "lint": "eslint src --ext ts",
     "test": "node ./out/test/runTest.js",
     "test:unit": "tsc -p ./ && mocha \"out/test/**/*.test.js\"",
+    "test:pdf-viewer": "tsc -p ./ && mocha \"out/test/pdf*.test.js\" && npm run test:safari:offline",
+    "test:safari:offline": "node --test scripts/pdf-viewer-harness/safari/*.test.mjs && python3 -B -m unittest discover -s scripts/pdf-viewer-harness/safari -p 'test_*.py'",
     "test:api": "tsc -p ./ && node --test out/test/base.test.js",
     "prepare": "husky install"
   },

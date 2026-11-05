@@ -28,9 +28,13 @@ The [pinned PDF.js patch](../views/pdf-viewer/vendor/pdfjs-5.1.91-dist.patch) ad
 
 The worker budget is its idle residency target. One active PDF stream can exceed it temporarily, so the shared controller also stops new cold-page work while the byte cache is over budget. A completed preparation keeps its admission slot until the worker has answered a trim request. Running and fully prepared native pages can continue. A 250 ms memory check runs only while work or memory pressure remains; it operates even with Motion Lab closed, and stops when the document is hidden or disposed. This lets ongoing work finish and gives the worker a chance to release bytes during continuous scrolling.
 
+An image acquires its range hold only after the decode queue admits it. The hold covers image construction, asynchronous decoding and missing-range retries, then releases before the worker trims between queue slots. Queued images can refetch evicted source bytes when admitted. This prevents a long image queue from holding the complete range cache above its idle target.
+
 Preparation uses small `pdfPage.render()` calls with the display intent shared by native rendering. At most three cold pages on desktop, or two on mobile, are admitted across speculative previews and the auxiliary renders that track native resource preparation. A new cold native render starts only after its small auxiliary render is running. That auxiliary render holds its slot until preparation actually completes. Completed native renders and previews mark resources warm; PDF.js clearing the same page proxy's rendering-intent map revokes that status.
 
 Native visible pages and holes in spread layouts retain their rendering priority. An uncovered visible page blocks further offscreen admission. When scrolling makes an already-started preview obsolete, it becomes `retiring` and finishes while holding its slot. This prevents repeated canvas cancellation from launching unbounded worker decoding. Obsolete `getPage` requests whose render has not started are discarded. Document replacement, layout changes, hidden documents, and disposal still cancel work; completion checks reject stale results.
+
+During mobile motion, a visible page whose compatible nonempty preview is attached to the current page waits for the existing gesture-settle event before starting cold native preparation. Warm and already-running work continues. Missing, detached or invalid previews retain immediate native fallback. This keeps fast traversal from decoding each passing page after the preview already supplies its displayed pixels.
 
 Full-resolution lookahead stays within two viewports. Counting visible pages and spread holes in that window avoids repeatedly evicting and redrawing pages through PDF.js's default ten-view buffer. Rotation, theme, and optional-content changes invalidate saved previews; zoom can reuse and resize them. Disposing the controller removes listeners and restores the queue methods.
 
@@ -58,7 +62,7 @@ The worker composes each image's placement matrix, including nested Form matrice
 
 Plain, unmasked DeviceRGB JPEGs decode directly to their required bitmap dimensions through the browser's native decoder. Orientation, color conversion and alpha premultiplication options are explicit, and the existing PDF.js JPEG compatibility checks and EXIF removal remain in use. A decoder that returns the wrong dimensions has its bitmap closed. If the native path is unavailable, a fresh JPEG decoder produces scaled pixels; reusing the same compressed stream at a later zoom therefore cannot reuse an earlier small output buffer. Other image semantics keep the existing PDF.js decoding path.
 
-Queued and active image jobs retain their required PDF ranges until completion. Document termination rejects waiting jobs and closes late native bitmaps. Image statistics travel with the existing range-cache statistics request, so the feature adds no separate polling loop.
+Active image jobs validate their encoded source and mask ranges before construction, then retain those ranges until decoding completes. Incremental decoders therefore start with resident bytes even after their queued sources were evicted. Document termination rejects waiting jobs and closes late native bitmaps. Image statistics travel with the existing range-cache statistics request, so the feature adds no separate polling loop.
 
 ### Transfer admission
 
@@ -263,6 +267,8 @@ An actual finite shift can summon one available Navines to the relevant document
 The time margin extrapolates the present speed and recent loading cost. Abrupt jumps and changes in page complexity change those estimates.
 
 ## Verification
+
+`npm run test:pdf-viewer` combines the PDF unit suites with the maintained Safari lifecycle and recorder fixtures. The [Safari validation runbook](safari-validation.md) preserves the physical device setup and full workload from 4 and 5 November 2026, including source identity, native recording, exact restoration and interrupted-result recovery.
 
 From the checkout:
 

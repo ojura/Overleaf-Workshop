@@ -1,0 +1,45 @@
+{
+  "project": "WebKit",
+  "checkedOn": "2026-11-05",
+  "formatting": "JSON indentation normalized; semantic comparison recorded below",
+  "files": [
+    {
+      "file": "Runtime.json",
+      "url": "https://raw.githubusercontent.com/WebKit/WebKit/a08d46521cd6f2af2121d9ef8f50cdf98197f23b/Source/JavaScriptCore/inspector/protocol/Runtime.json",
+      "revision": "a08d46521cd6f2af2121d9ef8f50cdf98197f23b",
+      "semanticMatch": true,
+      "snapshotSha256": "fa780aa01039f5d7ab02f18d045b6531c01c1009b1c306e50b74e01c7cb12234",
+      "upstreamSha256": "5e0758337714ba89c3e1168d8c82bb800466ae752412c998e5b8eadcedd5ec1f"
+    },
+    {
+      "file": "Network.json",
+      "url": "https://raw.githubusercontent.com/WebKit/WebKit/a08d46521cd6f2af2121d9ef8f50cdf98197f23b/Source/JavaScriptCore/inspector/protocol/Network.json",
+      "revision": "a08d46521cd6f2af2121d9ef8f50cdf98197f23b",
+      "semanticMatch": true,
+      "snapshotSha256": "6540f58815414527612ec27a0097fc644836380cb965e4520c1c74563db101d9",
+      "upstreamSha256": "99d52095b3368c60e7b2ef79e7c0aaa36de17a8ab6c93e65a643a584db6b4588"
+    },
+    {
+      "file": "Memory.json",
+      "url": "https://raw.githubusercontent.com/WebKit/WebKit/a08d46521cd6f2af2121d9ef8f50cdf98197f23b/Source/JavaScriptCore/inspector/protocol/Memory.json",
+      "revision": "a08d46521cd6f2af2121d9ef8f50cdf98197f23b",
+      "semanticMatch": true,
+      "snapshotSha256": "eed9b530e1f30b54f6b05ab82a60c5d9a1300674598811367a8bda04e171ceab",
+      "upstreamSha256": "b0c0e363d021d2e675b5b2197beca04217eb8e4784bc8ade28009ee0fc2b2146"
+    },
+    {
+      "file": "CPUProfiler.json",
+      "url": "https://raw.githubusercontent.com/WebKit/WebKit/a08d46521cd6f2af2121d9ef8f50cdf98197f23b/Source/JavaScriptCore/inspector/protocol/CPUProfiler.json",
+      "revision": "a08d46521cd6f2af2121d9ef8f50cdf98197f23b",
+      "semanticMatch": true,
+      "snapshotSha256": "ed857e8a4ff4243886b931b2b0624be6686dec24f1ecaa1f09c0ff37f34fe2b6",
+      "upstreamSha256": "ed857e8a4ff4243886b931b2b0624be6686dec24f1ecaa1f09c0ff37f34fe2b6"
+    }
+  ],
+  "componentLicense": {
+    "file": "COPYING.LIB",
+    "url": "https://raw.githubusercontent.com/WebKit/WebKit/a08d46521cd6f2af2121d9ef8f50cdf98197f23b/Source/JavaScriptCore/COPYING.LIB",
+    "sha256": "5094ecb9c9dcd0eadc34f3c11511d9b5535063032bc150164ecd1a5d5a445547"
+  },
+  "licensingPolicy": "https://webkit.org/licensing-webkit/"
+}

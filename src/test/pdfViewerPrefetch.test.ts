@@ -833,6 +833,130 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         return { f, source, loaders, bind, metadata, publish };
     }
 
+    function coveredMobileMotion(options: FixtureOptions = {}) {
+        const h = previewFixture({ mobile: true, pages: 1, startPage: 1, initialNative: false, ...options });
+        const loader = h.bind();
+        const preview = h.publish(loader, 1).canvas;
+        h.f.container.emit('wheel', { deltaY: 600, deltaMode: 0 });
+        return { ...h, preview };
+    }
+
+    function endGesture(f: Fixture) {
+        const timer = [...timers].find(([, value]) => value.delay === 250);
+        assert.ok(timer, 'the existing gesture settle event is scheduled');
+        timers.delete(timer[0]);
+        f.time += timer[1].delay;
+        timer[1].callback();
+    }
+
+    it('defers covered mobile cold work through both native selection and preparation until the existing gesture settles', async () => {
+        const h = coveredMobileMotion(), f = h.f, view = f.pages[0];
+        await f.frame();
+        assert.strictEqual(h.preview.parentNode, view.div, 'useful preview pixels are attached before admission');
+        assert.strictEqual(f.pdf.requests.length, 0, 'pump does not start a cold page underneath displayed pixels during motion');
+        assert.strictEqual(f.choose(), null, 'native priority respects the same cold-page admission');
+        assert.strictEqual(f.queue.renderView(view), false, 'a previously selected native page cannot bypass the fence');
+        for (let i = 0; i < 3; i++) { f.eventBus.emit('updateviewarea'); await f.frame(); }
+        assert.strictEqual(f.pdf.requests.length, 0);
+        assert.strictEqual(f.callbacks.size, 0, 'covered motion does not create an animation loop');
+        assert.deepStrictEqual([...timers.values()].map(timer => timer.delay), [250], 'only the existing gesture timer remains');
+        endGesture(f);
+        assert.strictEqual(f.callbacks.size, 1, 'settling requests one existing refresh');
+        await f.frame();
+        assert.deepStrictEqual(f.pdf.requests.map(request => request.id), [1]);
+        assert.strictEqual(f.pdf.activeRenders.length, 1);
+        await f.frame();
+        assert.strictEqual(f.pdf.requests.length, 1, 'native selection and pump share one preparation');
+        f.pdf.activeRenders[0].task.finish(); await promisesSettled(); f.finishNative(1);
+        await f.frame(); await f.frame();
+        assert.strictEqual(f.callbacks.size, 0);
+        assert.strictEqual(timers.size, 0, 'completed refinement has no admission polling');
+    });
+
+    it('rechecks covered mobile motion after a late getPage without starting or retaining a cold render', async () => {
+        const h = previewFixture({ mobile: true, pages: 1, startPage: 1, initialNative: false, autoPages: false }), f = h.f;
+        const loader = h.bind(); await f.frame();
+        assert.strictEqual(f.pdf.requests.length, 1);
+        const preview = h.publish(loader, 1).canvas;
+        assert.strictEqual(preview.parentNode, f.pages[0].div);
+        f.container.emit('wheel', { deltaY: 600, deltaMode: 0 });
+        f.pdf.requests[0].result.resolve(f.pdf.page(1)); await promisesSettled(); await f.frame();
+        assert.strictEqual(f.pdf.renders.length, 0, 'late page metadata cannot start obsolete cold decoding');
+        assert.deepStrictEqual(f.controller.snapshot().pending, [], 'the unstarted job releases its admission slot');
+        assert.strictEqual(f.choose(), null);
+        endGesture(f); await f.frame();
+        assert.strictEqual(f.pdf.requests.length, 2, 'the current settled page gets one fresh attempt');
+        f.pdf.answerAll(); await promisesSettled();
+        assert.strictEqual(f.pdf.activeRenders.length, 1);
+    });
+
+    for (const ending of ['reverse', 'zoom'] as const) {
+        it('refines the covered mobile page after ' + ending + ' without a stale motion hold', async () => {
+            const { f } = coveredMobileMotion(); await f.frame();
+            assert.strictEqual(f.pdf.requests.length, 0);
+            if (ending === 'reverse') {
+                f.container.emit('wheel', { deltaY: -600, deltaMode: 0 }); await f.frame();
+                assert.strictEqual(f.pdf.requests.length, 0, 'reversal retains useful pixels while motion continues');
+                endGesture(f);
+            } else {
+                f.pages[0].viewport = { ...f.pages[0].viewport, width: 1200, height: 1500, scale: 1.5 };
+                f.eventBus.emit('scalechanging');
+            }
+            await f.frame();
+            assert.strictEqual(f.pdf.activeRenders.length, 1);
+            assert.strictEqual(f.pdf.requests.length, 1);
+            if (ending === 'zoom') {
+                assert.ok(f.pdf.activeRenders[0].parameters.imageDecodeScale >= 1.5, 'refinement uses the new native geometry');
+            }
+        });
+    }
+
+    it('preserves warm, running and already-finished native pixels during covered mobile motion', async () => {
+        const h = previewFixture({ mobile: true, pages: 1, startPage: 1, initialNative: false }), f = h.f;
+        const loader = h.bind(); await f.frame();
+        const task = f.pdf.activeRenders[0].task;
+        h.publish(loader, 1); f.container.emit('wheel', { deltaY: 600, deltaMode: 0 });
+        assert.strictEqual(f.queue.renderView(f.pages[0]), true, 'an already-admitted preparation is allowed to finish');
+        task.finish(); await promisesSettled();
+        assert.strictEqual(f.choose(), f.pages[0], 'warm decoded resources keep native priority');
+        for (const state of [1, 2]) {
+            f.pages[0].renderingState = state;
+            assert.strictEqual(f.queue.renderView(f.pages[0]), true);
+        }
+        f.finishNative(1);
+        const canvas = f.pages[0].canvas; await f.frame();
+        assert.strictEqual(f.pages[0].canvas, canvas);
+        assert.ok(canvas!.width > 0 && canvas!.height > 0);
+        assert.strictEqual(f.pdf.requests.length, 1);
+        assert.strictEqual(task.cancellationCalls, 0, 'motion does not cancel useful in-flight native work');
+    });
+
+    for (const coverage of ['missing', 'unusable-geometry', 'empty-backing'] as const) {
+        it('starts mobile native fallback during motion when preview coverage is ' + coverage, async () => {
+            const h = previewFixture({ mobile: true, pages: 1, startPage: 1, initialNative: false }), f = h.f;
+            if (coverage !== 'missing') {
+                const preview = h.publish(h.bind(), 1).canvas;
+                if (coverage === 'unusable-geometry') { f.pages[0].viewport = { ...f.pages[0].viewport, width: 0 }; }
+                else { preview.width = 0; }
+            }
+            f.container.emit('wheel', { deltaY: 600, deltaMode: 0 }); await f.frame();
+            assert.strictEqual(f.pdf.activeRenders.length, 1, 'a cached allocation without usable pixels cannot block fallback');
+            assert.strictEqual(f.choose(), f.pages[0]);
+            assert.strictEqual(f.queue.renderView(f.pages[0]), true);
+        });
+    }
+
+    it('keeps a detached cached preview from blocking native selection and leaves desktop admission unchanged', async () => {
+        const h = coveredMobileMotion(), f = h.f; await f.frame();
+        assert.strictEqual(f.pdf.requests.length, 0);
+        h.preview.remove();
+        assert.strictEqual(f.choose(), f.pages[0], 'a reset page with detached pixels retains native fallback');
+        f.queue.renderView(f.pages[0]); await promisesSettled();
+        assert.strictEqual(f.pdf.activeRenders.length, 1);
+        const desktop = coveredMobileMotion({ mobile: false }).f; await desktop.frame();
+        assert.strictEqual(desktop.pdf.activeRenders.length, 1);
+    });
+
     function measuredNative(f: Fixture, displayed = () => true) {
         const view = f.pages[0], canvas = new Canvas();
         view.div.clientWidth = 330; view.div.clientHeight = 470;
@@ -1629,6 +1753,10 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         f.scrollBy((farId - 20) * 1000);
         await f.frame();
         assert.strictEqual(raster.parentNode, f.pages[farId - 1].div, 'the retained raster immediately covers the returning page');
+        assert.strictEqual(f.pdf.renders.filter(render => render.id === farId).length, 1, 'covered motion keeps its decoded resources released');
+        endGesture(f);
+        for (const render of [...f.pdf.activeRenders]) { render.task.finish(); }
+        await promisesSettled(); await f.frame();
         assert.strictEqual(f.pdf.renders.filter(render => render.id === farId).length, 2, 'a native target receives exactly one new completion fence');
     });
 

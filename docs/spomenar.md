@@ -84,6 +84,8 @@ The supplied standards document shows the negative mark on dark backgrounds and 
 
 ## Verification
 
+The [Safari validation runbook](safari-validation.md) defines the physical iPhone checks, short delivery and reversal scenarios, manual gestures, and the complete 600-second endurance run. `npm run test:safari:offline` checks that harness without contacting a device; `npm run test:pdf-viewer` includes it with the PDF regression suites.
+
 The focused suite covers exact ranges, cancelling whole-file responses, invalid headers and body lengths, changed documents, cancellation accounting, validators, same-origin configuration, shared links, and the exported viewer controls and relative assets.
 
 ```sh

@@ -1,0 +1,954 @@
+{
+  "version": 1,
+  "date": "2026-11-05",
+  "description": "Observed partial physical Safari endurance baselines. Native counters cover each recording; detailed event arrays retain bounded tails. Run 5 includes its recovered browser result.",
+  "device": {
+    "productType": "iPhone17,1",
+    "osVersion": "27.2",
+    "pymobiledevice3Version": "11.20.2"
+  },
+  "release": {
+    "commit": "6f2345ee52fd1b9a935011bc6e60217e0854e675",
+    "entry": {
+      "url": "https://cloud.larics.fer.hr/spomenar/assets/spomenar.mjs",
+      "sha256": "64989688247ed487e343e142a7e85e5ac3654f763f2864180609802a1fadb29f",
+      "bytes": 254505
+    },
+    "document": {
+      "sha256": "6abb3d0b13d2970bca0f613287a6ea5d30280be14435b5c681b8ca8bd61d24d0",
+      "bytes": 1608358464,
+      "pages": 460
+    }
+  },
+  "units": {
+    "bytes": "Bytes; MiB conversions use 1048576.",
+    "cpu": "Native process percent; values can exceed 100 when multiple cores work.",
+    "nativeTime": "Timestamps reported by native tracking within that recording.",
+    "frames": "Actual animation-frame intervals during commanded motion.",
+    "peakScope": "Client peaks are sampled during this attempt; native peaks are accumulated by its recorder."
+  },
+  "runs": [
+    {
+      "id": "iphone-sustained-6f2345e-1",
+      "status": "partial",
+      "stopCause": "recorder-used-inconsistent-completion-decoded-counter",
+      "plannedMotionMs": 600000,
+      "observedMotionMs": 12907,
+      "observedDwellMs": 0,
+      "wrapperElapsedSeconds": 21.41034242702881,
+      "client": {
+        "sampleCount": 33,
+        "frames": {
+          "frames": 772,
+          "gaps": 771,
+          "sumMs": 12883,
+          "maxMs": 46,
+          "boundsMs": [
+            20,
+            34,
+            50,
+            100,
+            250,
+            1000
+          ],
+          "buckets": [
+            746,
+            23,
+            2,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "coverage": {
+          "pageObservations": 67,
+          "missing": 0,
+          "noDisplayedRaster": 0,
+          "noUsefulPixels": 0,
+          "detachedNative": 1,
+          "detachedCovered": 1
+        },
+        "sampledPeaks": {
+          "previewBytes": 8316928,
+          "canvasBytes": 20095344,
+          "pendingFetches": 8,
+          "activeActors": 4,
+          "cargoBytes": 389120,
+          "spriteBytes": 204800,
+          "retainedBytes": 593920,
+          "covers": 4,
+          "refinements": 1
+        },
+        "sampledRawPeaks": {
+          "residentBytes": 55810624,
+          "activeOperations": 12,
+          "pendingRequests": 11,
+          "imageDecodeActive": 1,
+          "imageDecodeQueued": 11
+        },
+        "sampledDecodedImagePeaks": {
+          "pageBytes": 4235392,
+          "sharedBytes": 0,
+          "dataBytes": 0,
+          "bitmapBytes": 4235392,
+          "images": 10
+        },
+        "counterDelta": {
+          "fetchCount": 366,
+          "fetchBytes": 121999615,
+          "sourceRequests": 103,
+          "sourceCompleted": 88,
+          "robotFrames": 380,
+          "robotPaintMs": 284,
+          "delivered": 0,
+          "robotRefinements": 8
+        },
+        "newEpisodes": 47,
+        "newCancelledEpisodes": 47,
+        "rawResidentBytesAtEnd": 33528384,
+        "cacheLimits": {
+          "gestureGapMs": 250,
+          "maxPreparedPages": 6,
+          "maxConcurrentPrepares": 2,
+          "maxPendingFetches": 6,
+          "slowPendingFetches": 3,
+          "fetchBackpressureMs": 1500,
+          "maxRenderedPages": 3,
+          "maxCanvasBytes": 50331648,
+          "previewMaxDimension": 512,
+          "trailPreviewMaxDimension": 192,
+          "maxPreviewBytes": 8388608,
+          "maxPreviewPages": 128
+        }
+      },
+      "native": {
+        "memory": {
+          "samples": 40,
+          "first": {
+            "timestampSeconds": 0.09731558331986889,
+            "totalBytes": 249333504,
+            "categoryBytes": {
+              "javascript": 110238279,
+              "jit": 5996544,
+              "images": 0,
+              "layers": 0,
+              "page": 123743417,
+              "other": 9355264
+            }
+          },
+          "last": {
+            "timestampSeconds": 19.761632083333097,
+            "totalBytes": 495825408,
+            "categoryBytes": {
+              "javascript": 60596600,
+              "jit": 11714560,
+              "images": 0,
+              "layers": 0,
+              "page": 410325128,
+              "other": 13189120
+            }
+          },
+          "peakBytes": 570233856,
+          "categoriesAtPeakBytes": {
+            "javascript": 137238723,
+            "jit": 11567104,
+            "images": 0,
+            "layers": 0,
+            "page": 407026493,
+            "other": 14401536
+          },
+          "categoryPeaksBytes": {
+            "javascript": 158094402,
+            "jit": 11730944,
+            "images": 6356992,
+            "layers": 0,
+            "page": 457053062,
+            "other": 30244864
+          },
+          "maxNativeGapMs": 505.08712499868125,
+          "pressure": []
+        },
+        "cpu": {
+          "samples": 40,
+          "spanSeconds": 19.66431650001323,
+          "weightedCpuSeconds": 10.330881826320484,
+          "weightedMeanPercent": 52.53618566561179,
+          "peakPercent": 112.4000015258789,
+          "maxNativeGapMs": 505.08712499868125
+        },
+        "network": {
+          "requests": 375,
+          "completed": 371,
+          "cancelled": 4,
+          "peakPending": 16,
+          "pendingAtEnd": 0,
+          "advertisedBodyBytes": 122726303,
+          "decodedDataEventBytes": 122726303,
+          "encodedDataEventBytes": 122861906,
+          "completionDecodedBytes": 123774879,
+          "completionReceivedBytes": 122861906,
+          "pdf": {
+            "requests": 267,
+            "completed": 267,
+            "advertisedBodyBytes": 119406592,
+            "decodedDataBytes": 119406592,
+            "encodedDataBytes": 119538181,
+            "metrics.responseBodyDecodedSize": 120455168,
+            "rangeResponsesChecked": 267,
+            "rangeBodiesChecked": null,
+            "decodedMetricDiscrepancies": null,
+            "rangeFailures": 1
+          },
+          "preview": {
+            "requests": 104,
+            "completed": 100,
+            "decodedDataBytes": 3200901,
+            "canceled": 4
+          },
+          "unattributedDataEvents": 205
+        },
+        "rawTailLimits": {
+          "memory": 512,
+          "cpu": 512,
+          "pressure": 32,
+          "requests": 1024,
+          "errors": 64
+        },
+        "rawTailDropped": {
+          "memory": 0,
+          "cpu": 0,
+          "pressure": 0,
+          "requests": 0,
+          "errors": 0
+        }
+      },
+      "inconsistentResponse": {
+        "range": "bytes=114819072-115867647",
+        "contentRange": "bytes 114819072-115867647/1608358464",
+        "contentLength": 1048576,
+        "decodedDataEventBytes": 1048576,
+        "completionDecodedBytes": 2097152,
+        "encodedDataEventBytes": 1049728,
+        "completionReceivedBytes": 1049728
+      },
+      "restoration": {
+        "exact": true,
+        "focusRestored": true,
+        "observersRemoved": true,
+        "probeDisposed": true,
+        "detached": true,
+        "idle": {
+          "durationMs": 1502,
+          "framesAdded": 0,
+          "quiet": true,
+          "pendingAtEnd": 0,
+          "pendingFetchesAtEnd": 0
+        }
+      }
+    },
+    {
+      "id": "iphone-sustained-6f2345e-5",
+      "status": "partial",
+      "stopCause": "document-hidden-followed-by-native-memory-pressure-and-inspection-suspension",
+      "plannedMotionMs": 600000,
+      "lastAcknowledgedMotionMs": 275223,
+      "lastAcknowledgedDwellMs": 5002,
+      "lastAcknowledgedElapsedMs": 280544,
+      "wrapperElapsedSeconds": 300.67899401905015,
+      "lastAcknowledgedClient": {
+        "phase": "stage-6",
+        "stageIndex": 5,
+        "page": 455,
+        "samples": 556,
+        "failure": null,
+        "interruption": null,
+        "leaseRemainingMs": 20000,
+        "screenWakeLock": {
+          "state": "denied",
+          "granted": false,
+          "errorName": "NotAllowedError"
+        }
+      },
+      "clientTerminalResult": {
+        "state": "interrupted",
+        "interruption": "hidden",
+        "elapsedMs": 592652,
+        "interruptedAtElapsedMs": 283929,
+        "restorationMs": 308722,
+        "sampleCount": 566,
+        "sampleCostMs": 327,
+        "maxSampleCostMs": 7,
+        "frames": {
+          "frames": 16481,
+          "gaps": 16465,
+          "sumMs": 277819,
+          "maxMs": 311,
+          "boundsMs": [
+            20,
+            34,
+            50,
+            100,
+            250,
+            1000
+          ],
+          "buckets": [
+            15828,
+            509,
+            77,
+            48,
+            2,
+            1,
+            0
+          ]
+        },
+        "coverage": {
+          "pageObservations": 1044,
+          "missing": 10,
+          "noDisplayedRaster": 12,
+          "noUsefulPixels": 12,
+          "detachedNative": 69,
+          "detachedCovered": 69
+        },
+        "stageCoverage": {
+          "pageObservations": 1032,
+          "missing": 4,
+          "noDisplayedRaster": 4,
+          "noUsefulPixels": 4,
+          "detachedNative": 69,
+          "detachedCovered": 69
+        },
+        "sampledPeaks": {
+          "previewBytes": 8388608,
+          "canvasBytes": 62672568,
+          "pendingFetches": 29,
+          "activeActors": 4,
+          "cargoBytes": 413440,
+          "spriteBytes": 204800,
+          "retainedBytes": 618240,
+          "covers": 4,
+          "refinements": 1
+        },
+        "sampledRawPeaks": {
+          "residentBytes": 211655232,
+          "activeOperations": 42,
+          "pendingRequests": 35,
+          "imageDecodeActive": 1,
+          "imageDecodeQueued": 41
+        },
+        "sampledDecodedImagePeaks": {
+          "pageBytes": 64056880,
+          "sharedBytes": 0,
+          "dataBytes": 0,
+          "bitmapBytes": 64056880,
+          "images": 28
+        },
+        "counterDelta": {
+          "fetchCount": 7489,
+          "fetchBytes": 4811803995,
+          "sourceRequests": 2705,
+          "sourceCompleted": 2357,
+          "robotFrames": 1995,
+          "robotPaintMs": 1453,
+          "delivered": 0,
+          "robotRefinements": 48
+        },
+        "decodeCounterDelta": {
+          "imageDecodeCompletedNative": 3730,
+          "imageDecodeCompletedFallback": 93,
+          "imageDecodeOriginalPixels": 14958989019,
+          "imageDecodeOutputPixels": 1283452350
+        },
+        "newEpisodes": 377,
+        "newCancelledEpisodes": 377,
+        "stages": [
+          {
+            "number": 1,
+            "zoom": "page-width",
+            "startElapsedMs": 106,
+            "endElapsedMs": 51176,
+            "motionMs": 50026,
+            "dwellMs": 1001,
+            "frames": {
+              "frames": 2989,
+              "gaps": 2987,
+              "sumMs": 50004,
+              "maxMs": 64,
+              "boundsMs": [
+                20,
+                34,
+                50,
+                100,
+                250,
+                1000
+              ],
+              "buckets": [
+                2913,
+                60,
+                9,
+                5,
+                0,
+                0,
+                0
+              ]
+            },
+            "coverage": {
+              "pageObservations": 204,
+              "missing": 0,
+              "noDisplayedRaster": 0,
+              "noUsefulPixels": 0,
+              "detachedNative": 10,
+              "detachedCovered": 10
+            },
+            "peaks": {
+              "previewBytes": 8388608,
+              "canvasBytes": 20095344,
+              "pendingFetches": 25,
+              "activeActors": 4,
+              "cargoBytes": 389120,
+              "spriteBytes": 204800,
+              "retainedBytes": 593920,
+              "covers": 4,
+              "refinements": 1
+            },
+            "counterDelta": {
+              "fetchCount": 1413,
+              "fetchBytes": 770433958,
+              "sourceRequests": 367,
+              "sourceCompleted": 337,
+              "robotFrames": 667,
+              "robotPaintMs": 449,
+              "delivered": 0,
+              "robotRefinements": 14
+            }
+          },
+          {
+            "number": 2,
+            "zoom": 0.5,
+            "startElapsedMs": 51176,
+            "endElapsedMs": 102209,
+            "motionMs": 50017,
+            "dwellMs": 1000,
+            "frames": {
+              "frames": 2984,
+              "gaps": 2982,
+              "sumMs": 49983,
+              "maxMs": 73,
+              "boundsMs": [
+                20,
+                34,
+                50,
+                100,
+                250,
+                1000
+              ],
+              "buckets": [
+                2876,
+                93,
+                9,
+                4,
+                0,
+                0,
+                0
+              ]
+            },
+            "coverage": {
+              "pageObservations": 209,
+              "missing": 3,
+              "noDisplayedRaster": 3,
+              "noUsefulPixels": 3,
+              "detachedNative": 10,
+              "detachedCovered": 10
+            },
+            "peaks": {
+              "previewBytes": 8387328,
+              "canvasBytes": 16924032,
+              "pendingFetches": 26,
+              "activeActors": 4,
+              "cargoBytes": 398080,
+              "spriteBytes": 204800,
+              "retainedBytes": 602880,
+              "covers": 4,
+              "refinements": 0
+            },
+            "counterDelta": {
+              "fetchCount": 1678,
+              "fetchBytes": 987693139,
+              "sourceRequests": 880,
+              "sourceCompleted": 830,
+              "robotFrames": 930,
+              "robotPaintMs": 631,
+              "delivered": 0,
+              "robotRefinements": 32
+            }
+          },
+          {
+            "number": 3,
+            "zoom": 0.8,
+            "startElapsedMs": 102210,
+            "endElapsedMs": 153251,
+            "motionMs": 50009,
+            "dwellMs": 1000,
+            "frames": {
+              "frames": 2981,
+              "gaps": 2977,
+              "sumMs": 49942,
+              "maxMs": 78,
+              "boundsMs": [
+                20,
+                34,
+                50,
+                100,
+                250,
+                1000
+              ],
+              "buckets": [
+                2907,
+                49,
+                13,
+                8,
+                0,
+                0,
+                0
+              ]
+            },
+            "coverage": {
+              "pageObservations": 167,
+              "missing": 0,
+              "noDisplayedRaster": 0,
+              "noUsefulPixels": 0,
+              "detachedNative": 14,
+              "detachedCovered": 14
+            },
+            "peaks": {
+              "previewBytes": 8388608,
+              "canvasBytes": 43379280,
+              "pendingFetches": 28,
+              "activeActors": 0,
+              "cargoBytes": 0,
+              "spriteBytes": 0,
+              "retainedBytes": 0,
+              "covers": 0,
+              "refinements": 0
+            },
+            "counterDelta": {
+              "fetchCount": 1323,
+              "fetchBytes": 1126665785,
+              "sourceRequests": 277,
+              "sourceCompleted": 214,
+              "robotFrames": 0,
+              "robotPaintMs": 0,
+              "delivered": 0,
+              "robotRefinements": 0
+            }
+          },
+          {
+            "number": 4,
+            "zoom": 1.6,
+            "startElapsedMs": 153251,
+            "endElapsedMs": 204293,
+            "motionMs": 50008,
+            "dwellMs": 1000,
+            "frames": {
+              "frames": 2970,
+              "gaps": 2966,
+              "sumMs": 49944,
+              "maxMs": 98,
+              "boundsMs": [
+                20,
+                34,
+                50,
+                100,
+                250,
+                1000
+              ],
+              "buckets": [
+                2902,
+                37,
+                14,
+                13,
+                0,
+                0,
+                0
+              ]
+            },
+            "coverage": {
+              "pageObservations": 130,
+              "missing": 0,
+              "noDisplayedRaster": 0,
+              "noUsefulPixels": 0,
+              "detachedNative": 19,
+              "detachedCovered": 19
+            },
+            "peaks": {
+              "previewBytes": 8296704,
+              "canvasBytes": 62672568,
+              "pendingFetches": 29,
+              "activeActors": 0,
+              "cargoBytes": 0,
+              "spriteBytes": 0,
+              "retainedBytes": 0,
+              "covers": 0,
+              "refinements": 0
+            },
+            "counterDelta": {
+              "fetchCount": 892,
+              "fetchBytes": 1041961392,
+              "sourceRequests": 71,
+              "sourceCompleted": 56,
+              "robotFrames": 0,
+              "robotPaintMs": 0,
+              "delivered": 0,
+              "robotRefinements": 0
+            }
+          },
+          {
+            "number": 5,
+            "zoom": "page-width",
+            "startElapsedMs": 204293,
+            "endElapsedMs": 255319,
+            "motionMs": 50008,
+            "dwellMs": 1001,
+            "frames": {
+              "frames": 2976,
+              "gaps": 2974,
+              "sumMs": 49975,
+              "maxMs": 84,
+              "boundsMs": [
+                20,
+                34,
+                50,
+                100,
+                250,
+                1000
+              ],
+              "buckets": [
+                2801,
+                150,
+                19,
+                4,
+                0,
+                0,
+                0
+              ]
+            },
+            "coverage": {
+              "pageObservations": 204,
+              "missing": 0,
+              "noDisplayedRaster": 0,
+              "noUsefulPixels": 0,
+              "detachedNative": 8,
+              "detachedCovered": 8
+            },
+            "peaks": {
+              "previewBytes": 8388096,
+              "canvasBytes": 20095344,
+              "pendingFetches": 22,
+              "activeActors": 4,
+              "cargoBytes": 413440,
+              "spriteBytes": 204800,
+              "retainedBytes": 618240,
+              "covers": 4,
+              "refinements": 0
+            },
+            "counterDelta": {
+              "fetchCount": 1614,
+              "fetchBytes": 649570628,
+              "sourceRequests": 811,
+              "sourceCompleted": 697,
+              "robotFrames": 220,
+              "robotPaintMs": 218,
+              "delivered": 0,
+              "robotRefinements": 0
+            }
+          },
+          {
+            "number": 6,
+            "zoom": 0.5,
+            "startElapsedMs": 255320,
+            "endElapsedMs": 283929,
+            "motionMs": 28540,
+            "dwellMs": 0,
+            "frames": {
+              "frames": 1581,
+              "gaps": 1579,
+              "sumMs": 27971,
+              "maxMs": 311,
+              "boundsMs": [
+                20,
+                34,
+                50,
+                100,
+                250,
+                1000
+              ],
+              "buckets": [
+                1429,
+                120,
+                13,
+                14,
+                2,
+                1,
+                0
+              ]
+            },
+            "coverage": {
+              "pageObservations": 118,
+              "missing": 1,
+              "noDisplayedRaster": 1,
+              "noUsefulPixels": 1,
+              "detachedNative": 8,
+              "detachedCovered": 8
+            },
+            "peaks": {
+              "previewBytes": 8386560,
+              "canvasBytes": 16924032,
+              "pendingFetches": 9,
+              "activeActors": 4,
+              "cargoBytes": 389120,
+              "spriteBytes": 204800,
+              "retainedBytes": 593920,
+              "covers": 4,
+              "refinements": 0
+            },
+            "counterDelta": {
+              "fetchCount": 558,
+              "fetchBytes": 235142176,
+              "sourceRequests": 290,
+              "sourceCompleted": 213,
+              "robotFrames": 178,
+              "robotPaintMs": 155,
+              "delivered": 0,
+              "robotRefinements": 2
+            }
+          }
+        ]
+      },
+      "native": {
+        "memory": {
+          "samples": 568,
+          "first": {
+            "timestampSeconds": 0.09411591666867025,
+            "totalBytes": 225243648,
+            "categoryBytes": {
+              "javascript": 51246273,
+              "jit": 1900544,
+              "images": 0,
+              "layers": 0,
+              "page": 161955135,
+              "other": 10141696
+            }
+          },
+          "last": {
+            "timestampSeconds": 285.520460791653,
+            "totalBytes": 876604416,
+            "categoryBytes": {
+              "javascript": 58781162,
+              "jit": 2326528,
+              "images": 0,
+              "layers": 0,
+              "page": 804683286,
+              "other": 10813440
+            }
+          },
+          "peakBytes": 1449668608,
+          "categoriesAtPeakBytes": {
+            "javascript": 111935677,
+            "jit": 13877248,
+            "images": 31571968,
+            "layers": 0,
+            "page": 1279438659,
+            "other": 12845056
+          },
+          "categoryPeaksBytes": {
+            "javascript": 494105139,
+            "jit": 14581760,
+            "images": 93208576,
+            "layers": 0,
+            "page": 1279438659,
+            "other": 140115968
+          },
+          "maxNativeGapMs": 509.10687501891516,
+          "pressure": [
+            {
+              "timestampSeconds": 284.4693145833444,
+              "severity": "critical"
+            }
+          ]
+        },
+        "cpu": {
+          "samples": 568,
+          "spanSeconds": 285.42634487498435,
+          "weightedCpuSeconds": 263.0189220634072,
+          "weightedMeanPercent": 92.1494903277441,
+          "peakPercent": 147.90000915527344,
+          "maxNativeGapMs": 509.10687501891516
+        },
+        "network": {
+          "requests": 7584,
+          "completed": 7508,
+          "cancelled": 76,
+          "peakPending": 36,
+          "pendingAtEnd": 0,
+          "advertisedBodyBytes": 4812525851,
+          "decodedDataEventBytes": 4812425933,
+          "encodedDataEventBytes": 4817739471,
+          "completionDecodedBytes": 4814498661,
+          "completionReceivedBytes": 4817706667,
+          "pdf": {
+            "requests": 4858,
+            "completed": 4858,
+            "advertisedBodyBytes": 4737343616,
+            "decodedDataBytes": 4737343616,
+            "encodedDataBytes": 4742556389,
+            "metrics.responseBodyDecodedSize": 4739440768,
+            "rangeResponsesChecked": 4858,
+            "rangeBodiesChecked": 4858,
+            "decodedMetricDiscrepancies": 2,
+            "rangeFailures": 0
+          },
+          "preview": {
+            "requests": 2706,
+            "completed": 2630,
+            "decodedDataBytes": 75068257,
+            "canceled": 76
+          },
+          "unattributedDataEvents": 3733
+        },
+        "rawTailLimits": {
+          "memory": 512,
+          "cpu": 512,
+          "pressure": 32,
+          "requests": 1024,
+          "errors": 64
+        },
+        "rawTailDropped": {
+          "memory": 56,
+          "cpu": 56,
+          "pressure": 0,
+          "requests": 6560,
+          "errors": 0
+        }
+      },
+      "rpc": {
+        "count": 88,
+        "traceErrors": 0,
+        "failed": [
+          {
+            "sequence": 82,
+            "method": "Runtime.evaluate",
+            "startSecondsFromRecorderReady": 285.566500848949,
+            "elapsedMs": 3000.5336470603943,
+            "outcome": "cancelled"
+          },
+          {
+            "sequence": 83,
+            "method": "Runtime.evaluate",
+            "startSecondsFromRecorderReady": 288.567086863935,
+            "elapsedMs": 3001.0224860310555,
+            "outcome": "cancelled"
+          },
+          {
+            "sequence": 84,
+            "method": "Memory.stopTracking",
+            "startSecondsFromRecorderReady": 291.5681522299647,
+            "elapsedMs": 2000.0364400148392,
+            "outcome": "cancelled"
+          },
+          {
+            "sequence": 85,
+            "method": "Memory.disable",
+            "startSecondsFromRecorderReady": 293.5682257299423,
+            "elapsedMs": 2000.4263480305672,
+            "outcome": "cancelled"
+          },
+          {
+            "sequence": 86,
+            "method": "CPUProfiler.stopTracking",
+            "startSecondsFromRecorderReady": 295.5686771559715,
+            "elapsedMs": 2001.0158550143242,
+            "outcome": "cancelled"
+          },
+          {
+            "sequence": 87,
+            "method": "Network.disable",
+            "startSecondsFromRecorderReady": 297.56972094601394,
+            "elapsedMs": 2000.4660009741783,
+            "outcome": "cancelled"
+          },
+          {
+            "sequence": 88,
+            "method": "Runtime.releaseObjectGroup",
+            "startSecondsFromRecorderReady": 299.5790985800028,
+            "elapsedMs": 1000.3962829709053,
+            "outcome": "cancelled"
+          }
+        ],
+        "criticalPressureToFirstFailedRpcMs": 792.909815967083
+      },
+      "recovery": {
+        "state": "terminal-report-collected",
+        "sameDocumentAndProbeSurvived": true,
+        "recordingContinuity": false,
+        "probeDisposed": true,
+        "wrapperStatus": "failed",
+        "cleanupErrors": [
+          "Memory.disable: Memory.disable protocol error: -32000"
+        ]
+      },
+      "restoration": {
+        "exact": true,
+        "focusRestored": true,
+        "observersRemoved": true,
+        "frontendErrors": [],
+        "frontendCleanupErrors": [],
+        "savedReading": {
+          "page": 46,
+          "scaleValue": "page-width",
+          "scale": 0.544199415511788,
+          "rotation": 0,
+          "scrollMode": 0,
+          "spreadMode": 0,
+          "sidebar": 0,
+          "top": 23685,
+          "left": 0,
+          "robots": true,
+          "lab": false
+        },
+        "restoredReading": {
+          "page": 46,
+          "scaleValue": "page-width",
+          "scale": 0.544199415511788,
+          "rotation": 0,
+          "scrollMode": 0,
+          "spreadMode": 0,
+          "sidebar": 0,
+          "top": 23685,
+          "left": 0,
+          "robots": true,
+          "lab": false
+        },
+        "idle": {
+          "durationMs": 308282,
+          "framesAdded": 0,
+          "quiet": true,
+          "pendingAtEnd": 0,
+          "pendingFetchesAtEnd": 0
+        },
+        "awakeIntervalVerified": false,
+        "renderedViewportAtFinalSample": false,
+        "missingPagesAtFinalSample": [
+          46,
+          47
+        ],
+        "rawResidentBytesAtFinalSample": 55679552,
+        "workerOperationsAtFinalSample": 3,
+        "activeDecodesAtFinalSample": 1,
+        "queuedDecodesAtFinalSample": 2,
+        "observation": "The nominal 1500 ms idle timer resumed after 308282 ms of suspension. Coordinate/focus and fleet cleanup were verified; the final sample still had missing pages 46 and 47."
+      },
+      "observedMotionMs": 278608,
+      "observedDwellMs": 5002
+    }
+  ]
+}

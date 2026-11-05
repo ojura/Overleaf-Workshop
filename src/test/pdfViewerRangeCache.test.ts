@@ -21,7 +21,7 @@ describe('PDF.js sparse range cache', function () {
         // Execute the actual patched classes and both proxy layers, with private classes
         // exported only from this temporary test copy of the pinned distribution.
         fs.writeFileSync(path.join(dir, 'pdf.worker.mjs'), fs.readFileSync(path.join(pdfjsRelease, 'build/pdf.worker.mjs'), 'utf8')
-            + '\nexport { SparseChunkedStream, ChunkedStreamManager, NetworkPdfManager, MissingDataException, PDFImage, PartialEvaluator, Dict, Name, Stream };\n');
+            + '\nexport { SparseChunkedStream, ChunkedStreamManager, NetworkPdfManager, MissingDataException, PDFImage, PartialEvaluator, Dict, Name, Stream, GlobalColorSpaceCache, LocalColorSpaceCache };\n');
         fs.writeFileSync(path.join(dir, 'pdf.mjs'), fs.readFileSync(path.join(pdfjsRelease, 'build/pdf.mjs'), 'utf8')
             + '\nexport { PDFDataTransportStream, PDFFetchStream, PDFNodeStream };\n');
         for (const name of ['DOMMatrix', 'pdfjsLib', 'pdfjsWorker']) { saved.set(name, Object.getOwnPropertyDescriptor(globalThis, name)); }
@@ -222,6 +222,53 @@ describe('PDF.js sparse range cache', function () {
         assert.strictEqual(source.requests.length, count, 'an aborted ensure cannot restart network requests');
     });
 
+    it('retries a missing sparse range thrown after an asynchronous decode boundary', async () => {
+        const { cache, source, stream } = manager(bytes(32));
+        const pdfManager = Object.create(worker.NetworkPdfManager.prototype);
+        pdfManager.streamManager = cache;
+        const target = { async read() { await Promise.resolve(); return stream.getByteRange(4, 20); } };
+        try {
+            const result = await pdfManager.ensure(target, 'read', []);
+            assert.deepStrictEqual(Array.from(result), Array.from(bytes(32).slice(4, 20)));
+            assert.deepStrictEqual(source.requests, [{ begin: 4, end: 20 }]);
+            assert.strictEqual(cache.getRangeCacheStats().activeOperations, 0);
+            assert.ok(cache.trimRangeCache().residentBytes <= 8);
+        } finally { cache.abort(new Error('test complete')); }
+    });
+
+    it('restarts a queued JPEG 2000 header when sparse data is missing after its size marker', async () => {
+        const data = new Uint8Array(44);
+        data.set([0xff, 0x4f, 0xff, 0x51]);
+        const header = new DataView(data.buffer);
+        header.setUint32(8, 128);
+        header.setUint32(12, 96);
+        header.setUint16(40, 3);
+        const { cache, source, stream } = manager(data);
+        const pdfManager = Object.create(worker.NetworkPdfManager.prototype);
+        pdfManager.streamManager = cache;
+        const dict = new worker.Dict();
+        dict.set('Filter', worker.Name.get('JPXDecode'));
+        dict.set('Width', 128); dict.set('Height', 96);
+        dict.set('ColorSpace', worker.Name.get('DeviceRGB'));
+        const image = { stream, dict };
+        const target = { async read() {
+            return worker.PDFImage.buildImage({
+                image, xref: { fetchIfRef: (value: any) => value }, res: worker.Dict.empty,
+                globalColorSpaceCache: new worker.GlobalColorSpaceCache(),
+                localColorSpaceCache: new worker.LocalColorSpaceCache(),
+            });
+        } };
+        try {
+            await cache.requestRange(0, 4);
+            const decoded = await pdfManager.ensure(target, 'read', []);
+            assert.deepStrictEqual([decoded.width, decoded.height, decoded.numComps, decoded.bpc], [128, 96, 3, 8]);
+            assert.ok(source.requests.length > 2, 'the size fields are read across separately refetched chunks');
+            assert.strictEqual(stream.pos, stream.start, 'every parse outcome returns the encoded stream to its start');
+            assert.strictEqual(cache.getRangeCacheStats().activeOperations, 0);
+            assert.ok(cache.trimRangeCache().residentBytes <= 8);
+        } finally { cache.abort(new Error('test complete')); }
+    });
+
     it('reloads all missing bytes after an earlier complete load has been pruned', async () => {
         const { cache, source, stream } = manager(bytes(20));
         try {
@@ -344,33 +391,54 @@ describe('PDF.js sparse range cache', function () {
         assert.strictEqual(sparse.bytes.byteLength, 0);
     });
 
-    function fixture(withImage = false) {
+    function lzwLiterals(pixels: string) {
+        const codes: number[] = [];
+        // Clear before the nine-bit dictionary grows; literal codes independently encode the fixture.
+        for (let start = 0; start < pixels.length; start += 200) {
+            codes.push(256);
+            for (let i = start; i < Math.min(start + 200, pixels.length); i++) { codes.push(pixels.charCodeAt(i)); }
+        }
+        codes.push(257);
+        const encoded = Buffer.alloc(Math.ceil(codes.length * 9 / 8));
+        let bit = 0;
+        for (const code of codes) {
+            for (let shift = 8; shift >= 0; shift--, bit++) { encoded[bit >> 3] |= (code >> shift & 1) << (7 - (bit & 7)); }
+        }
+        return encoded.toString('latin1');
+    }
+
+    function fixture(withImage = false, imageCount = 1, lzw = false) {
         const objects: string[] = [];
         const pages = 4;
         objects[1] = '<< /Type /Catalog /Pages 2 0 R >>';
         objects[2] = '<< /Type /Pages /Kids [' + Array.from({ length: pages }, (_, i) => (3 + i * 2) + ' 0 R').join(' ') + '] /Count ' + pages + ' >>';
         for (let i = 0; i < pages; i++) {
             const page = 3 + i * 2;
-            const resources = withImage ? ' /XObject << /Image 11 0 R >> ' : '';
+            const images = Array.from({ length: imageCount }, (_, index) => index);
+            const resources = withImage ? ' /XObject << ' + images.map(index => '/Image' + index + ' ' + (11 + index) + ' 0 R').join(' ') + ' >> ' : '';
             objects[page] = '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Resources <<' + resources + '>> /Contents ' + (page + 1) + ' 0 R >>';
-            const content = '% ' + 'padding '.repeat(12288) + '\nq 0 0 1 rg 20 20 50 50 re f Q\n' + (withImage ? 'q 128 0 0 128 0 0 cm /Image Do Q\n' : '');
+            const content = '% ' + 'padding '.repeat(lzw ? 32 : 12288) + '\nq 0 0 1 rg 20 20 50 50 re f Q\n' + (withImage ? images.map(index => 'q 128 0 0 128 0 0 cm /Image' + index + ' Do Q\n').join('') : '');
             objects[page + 1] = '<< /Length ' + Buffer.byteLength(content) + ' >>\nstream\n' + content + 'endstream';
         }
         if (withImage) {
-            const pixels = 'abc'.repeat(128 * 128);
-            objects[11] = '<< /Type /XObject /Subtype /Image /Width 128 /Height 128 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length ' + pixels.length + ' >>\nstream\n' + pixels + '\nendstream';
+            for (let index = 0; index < imageCount; index++) {
+                const pixels = String.fromCharCode(97 + index).repeat(128 * 128 * 3);
+                const encoded = lzw ? lzwLiterals(pixels) : pixels;
+                objects[11 + index] = '<< /Type /XObject /Subtype /Image /Width 128 /Height 128 /ColorSpace /DeviceRGB /BitsPerComponent 8'
+                    + (lzw ? ' /Filter /LZWDecode' : '') + ' /Length ' + encoded.length + ' >>\nstream\n' + encoded + '\nendstream';
+            }
         }
         let text = '%PDF-1.7\n';
         const offsets = [0];
         for (let i = 1; i < objects.length; i++) {
-            offsets[i] = Buffer.byteLength(text);
+            offsets[i] = Buffer.byteLength(text, 'latin1');
             text += i + ' 0 obj\n' + objects[i] + '\nendobj\n';
         }
-        const xref = Buffer.byteLength(text);
+        const xref = Buffer.byteLength(text, 'latin1');
         text += 'xref\n0 ' + objects.length + '\n0000000000 65535 f \n';
         for (let i = 1; i < objects.length; i++) { text += String(offsets[i]).padStart(10, '0') + ' 00000 n \n'; }
         text += 'trailer\n<< /Size ' + objects.length + ' /Root 1 0 R >>\nstartxref\n' + xref + '\n%%EOF\n';
-        return new Uint8Array(Buffer.from(text));
+        return new Uint8Array(Buffer.from(text, 'latin1'));
     }
 
     it('round-trips stats/trim through the real document and worker proxies and materializes only explicit getData', async () => {
@@ -457,6 +525,143 @@ describe('PDF.js sparse range cache', function () {
         } finally {
             releaseImage();
             worker.PDFImage.prototype.createImageData = createImageData;
+            await task.destroy();
+        }
+    });
+
+    it('pins only the active image and refetches evicted queued images between decode slots', async () => {
+        const data = fixture(true, 3);
+        const chunk = 16384;
+        const transport = new pdfjs.PDFDataRangeTransport(data.length, data.slice(0, chunk), true);
+        const requests: Array<{ begin: number; end: number }> = [];
+        transport.requestDataRange = (begin: number, end: number) => {
+            requests.push({ begin, end });
+            queueMicrotask(() => transport.onDataRange(begin, data.slice(begin, end)));
+        };
+        const gate = () => {
+            let resolve!: () => void;
+            const promise = new Promise<void>(finish => { resolve = finish; });
+            return { promise, resolve };
+        };
+        const started = Array.from({ length: 3 }, gate);
+        const finished = Array.from({ length: 3 }, gate);
+        const seen = new WeakMap<object, number>();
+        let next = 0;
+        const createImageData = worker.PDFImage.prototype.createImageData;
+        worker.PDFImage.prototype.createImageData = async function (...args: any[]) {
+            let index = seen.get(this.image);
+            if (index === undefined) { index = next++; seen.set(this.image, index); }
+            assert.ok(index < 3, 'missing-range retries reuse their original image stream');
+            started[index].resolve();
+            await finished[index].promise;
+            return createImageData.apply(this, args);
+        };
+        const task = pdfjs.getDocument({
+            range: transport, rangeChunkSize: chunk, rangeCacheBytes: chunk * 2,
+            imageDecodeConcurrency: 1, disableAutoFetch: true, disableStream: true,
+            isEvalSupported: false, isOffscreenCanvasSupported: false, useSystemFonts: true,
+        });
+        try {
+            const document = await task.promise;
+            const page = await document.getPage(1);
+            const operations = await page.getOperatorList();
+            await started[0].promise;
+            const before = await document.getRangeCacheStats();
+            assert.strictEqual(before.imageDecodeActive, 1);
+            assert.strictEqual(before.imageDecodeQueued, 2);
+            assert.strictEqual(before.activeOperations, 1, 'waiting image jobs do not pin all sparse ranges');
+            const initialRequests = requests.length;
+            const ids = operations.fnArray.flatMap((fn: number, index: number) => fn === pdfjs.OPS.paintImageXObject ? [operations.argsArray[index][0]] : []);
+            const decoded = Promise.all(ids.map((id: string) => new Promise<any>(resolve => page.objs.get(id, resolve))));
+            finished[0].resolve();
+            await started[1].promise;
+            const between = await document.getRangeCacheStats();
+            assert.ok(between.evictedBytes > before.evictedBytes, 'completed work lets the idle budget trim before the next decode');
+            assert.strictEqual(between.activeOperations, 1);
+            finished[1].resolve();
+            await started[2].promise;
+            finished[2].resolve();
+            const images = await decoded;
+            assert.deepStrictEqual(images.map(image => image?.data[0]), [97, 98, 99], 'all queued images retain their actual pixels after eviction');
+            assert.ok(requests.length > initialRequests, 'an evicted queued stream is requested again when admitted');
+            const after = await document.trimRangeCache();
+            assert.strictEqual(after.activeOperations, 0);
+            assert.ok(after.residentBytes <= after.maxBytes);
+            assert.strictEqual(after.imageDecodePeakActive, 1);
+        } finally {
+            for (const item of finished) { item.resolve(); }
+            worker.PDFImage.prototype.createImageData = createImageData;
+            await task.destroy();
+        }
+    });
+
+    it('decodes every LZW pixel after an evicted middle chunk is refetched in its queue slot', async () => {
+        const data = fixture(true, 3, true);
+        const chunk = 16384;
+        const transport = new pdfjs.PDFDataRangeTransport(data.length, data.slice(0, chunk), true);
+        const requests: Array<{ begin: number; end: number }> = [];
+        transport.requestDataRange = (begin: number, end: number) => {
+            requests.push({ begin, end });
+            queueMicrotask(() => transport.onDataRange(begin, data.slice(begin, end)));
+        };
+        let releaseFirst!: () => void;
+        let firstStarted!: () => void;
+        const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+        const started = new Promise<void>(resolve => { firstStarted = resolve; });
+        let first = true;
+        const createImageData = worker.PDFImage.prototype.createImageData;
+        worker.PDFImage.prototype.createImageData = async function (...args: any[]) {
+            if (first) { first = false; firstStarted(); await firstGate; }
+            return createImageData.apply(this, args);
+        };
+        const missing: number[] = [];
+        const buildImage = worker.PDFImage.buildImage;
+        worker.PDFImage.buildImage = async function (options: any) {
+            for (const base of options.image.getBaseStreams() || []) {
+                const middle = Math.floor((base.start + base.end) / 2 / chunk);
+                if (!base.hasChunk(middle)) {
+                    missing.push(middle * chunk);
+                    assert.strictEqual(options.xref.pdfManager.imageDecodeQueue.active, 1);
+                    assert.strictEqual(options.xref.pdfManager.streamManager.getRangeCacheStats().activeOperations, 1);
+                }
+            }
+            return buildImage.call(this, options);
+        };
+        const task = pdfjs.getDocument({
+            range: transport, rangeChunkSize: chunk, rangeCacheBytes: chunk * 2,
+            imageDecodeConcurrency: 1, disableAutoFetch: true, disableStream: true,
+            isEvalSupported: false, isOffscreenCanvasSupported: false, useSystemFonts: true,
+        });
+        try {
+            const document = await task.promise;
+            const page = await document.getPage(1);
+            const operations = await page.getOperatorList();
+            await started;
+            const before = await document.getRangeCacheStats();
+            assert.strictEqual(before.imageDecodeActive, 1);
+            assert.strictEqual(before.imageDecodeQueued, 2);
+            assert.strictEqual(before.activeOperations, 1);
+            const initialRequests = requests.length;
+            const ids = operations.fnArray.flatMap((fn: number, index: number) => fn === pdfjs.OPS.paintImageXObject ? [operations.argsArray[index][0]] : []);
+            assert.strictEqual(ids.length, 3);
+            const decoded = Promise.all(ids.map((id: string) => new Promise<any>(resolve => page.objs.get(id, resolve))));
+            releaseFirst();
+            const images = await decoded;
+            assert.ok(missing.length, 'a queued LZW image enters its active slot with an evicted middle chunk');
+            assert.ok(missing.some(begin => requests.slice(initialRequests).some(range => range.begin <= begin && range.end >= begin + chunk)), 'the missing middle chunk is requested again');
+            for (const [index, image] of images.entries()) {
+                assert.ok(image, 'the incremental decoder must produce an image');
+                assert.deepStrictEqual([image.width, image.height, image.data.length], [128, 128, 128 * 128 * 3]);
+                assert.ok(image.data.every((value: number) => value === 97 + index), 'every image byte survives the refetch, including bytes beyond the missing chunk');
+            }
+            const after = await document.trimRangeCache();
+            assert.strictEqual(after.activeOperations, 0);
+            assert.strictEqual(after.imageDecodePeakActive, 1);
+            assert.ok(after.residentBytes <= after.maxBytes);
+        } finally {
+            releaseFirst();
+            worker.PDFImage.prototype.createImageData = createImageData;
+            worker.PDFImage.buildImage = buildImage;
             await task.destroy();
         }
     });

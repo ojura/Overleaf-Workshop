@@ -26,6 +26,11 @@ window) are in CLAUDE.local.md, which git leaves out.
     modules against a stand-in for 'vscode' through one loader, src/test/standIn.ts, which leaves
     require.cache as it found it, so the tests run from any compiled folder and in any order.
   - `npx eslint src --ext ts`
+- PDF changes also run `npm run test:pdf-viewer`. This includes the maintained Safari lifecycle
+  and recorder fixtures. [docs/safari-validation.md](docs/safari-validation.md) preserves the
+  physical iPhone setup, both short scenarios, real gesture observation and the full 600-second
+  workload. Use that runbook for mobile validation and keep the device owner attached through
+  result review. A shorter or interrupted capture does not satisfy its endurance gate.
 - A new test fails on the code before the fix and passes with it; report both runs. Tests wait for
   the events or awaited calls they need, not for sleeps or polling with a time limit, and close
   everything they open on every path.

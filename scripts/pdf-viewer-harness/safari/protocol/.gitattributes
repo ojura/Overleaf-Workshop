@@ -1,0 +1,2 @@
+# Keep the upstream license's original whitespace and recorded byte identity.
+COPYING.LIB whitespace=-blank-at-eol
