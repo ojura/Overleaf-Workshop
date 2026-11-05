@@ -6,7 +6,7 @@ The tools in `scripts/pdf-viewer-harness/safari/` exercise the published reader 
 
 The observed device was an iPhone17,1 running iOS 27.2. The host used Python with `pymobiledevice3` 11.20.2, pinned in [requirements-live.txt](../scripts/pdf-viewer-harness/safari/requirements-live.txt). The installed library matched the official wheel's Python source; no local Inspector patch was required. Use an existing isolated Python environment or install that requirement in one dedicated to the live tools. Offline fixtures use Python's standard library and Node, without attaching to a device.
 
-Keep the pairing record and device selection in an external JSON file with `udid` and `pair_record`. Copy [document.example.json](../scripts/pdf-viewer-harness/safari/document.example.json) to an external file and update its `pageUrl`, `entryUrl`, `pdfUrl`, PDF SHA-256, byte length and page count for the exact publication. All three URLs must share the origin, and the reader URL ends in `/`. Generated receipts, screenshots and raw recordings belong in an output directory outside the repository. The maintained fixture contains public document identity and selected numeric observations only.
+Keep the pairing record and device selection in an external JSON file with `udid` and `pair_record`. Copy [document.example.json](../scripts/pdf-viewer-harness/safari/document.example.json) to an external file and update its `pageUrl`, `entryUrl`, `pdfUrl`, PDF SHA-256, byte length and page count for the exact publication. All three URLs must share the origin, and the reader URL ends in `/`. Generated receipts, screenshots and raw recordings belong in an output directory outside the repository. The maintained fixtures contain public document identity and selected numeric observations only.
 
 Open the existing Spomenar tab on the phone, keep Safari in the foreground and leave the reader untouched during the agreed workload. A paired USB connection does not establish that the desired page is inspectable or foreground. The runner checks the exact origin and page path, requires one matching tab, and uses its existing Web Inspector target. It does not create a tab, browser profile, automation bridge or debug port.
 
@@ -53,7 +53,7 @@ The expected entry can instead be supplied as `--entry-sha <64 lowercase hex>` w
 
 | Scenario | Run options | Purpose |
 | --- | --- | --- |
-| `sustained` | `--seconds 600 --start-mode tap` | Twelve stages, 600 seconds of motion, 12 seconds of dwell, then exact awake restoration. |
+| `sustained` | `--scenario sustained --seconds 600 --start-mode tap` | Example extended budget: twelve stages over a selected 600 seconds of motion, 12 seconds of dwell, then exact awake restoration. |
 | `traverse` | `--scenario traverse --start-mode immediate` | Two 60→90→65 passes with 11 seconds of actual motion, bounded settling, eight seconds of robots-on idle and four seconds off. |
 | `short` | `--scenario short` | Actual photo delivery, screenshot, refinement/retirement and finite Motion Lab drag/resize/dock checks. |
 | `manual` | `--scenario manual --seconds 120` | Passive observations while the user performs actual pinch, fling, selection, rotation and toolbar/lab actions. |
@@ -104,9 +104,9 @@ For manual participation, start the passive scenario and perform a natural fling
 
 The targeted visual probe and the endurance workload serve different checks. Endurance repeatedly visits pages and zoom levels; the first-encounter ledger deliberately prevents the same delivery from replaying at every visit. A fast traverse can cancel a delivery when its page leaves the viewport. Count actual refinements and deposits, and use a deliberate first visible encounter when inspecting the crop or a caption.
 
-### Endurance sequence
+### Extended workload sequence
 
-The requested workload contains 600 seconds of scroll motion and one second of dwell after each stage, plus bounded setup and restoration. Each leg uses actual animation frames. Zoom changes use the viewer's normal scale state.
+The command example selects 600 seconds of motion. Choose `--seconds` from 60 to 600 for the question being investigated; ten minutes is a selected extended budget, not a universal validation requirement. The table shows this 600-second example. Leg durations scale with the selected motion budget, while the twelve one-second dwells and bounded setup/restoration remain separate. Each leg uses actual animation frames. Zoom changes use the viewer's normal scale state. A successful run must complete its requested budget and all planned stages; an interruption retains its actual duration and remains partial.
 
 | Stage | Zoom | Start page | Destination and motion seconds |
 | --- | --- | --- | --- |
@@ -163,4 +163,56 @@ Attempt 5 completed five stages and part of stage 6. Its recovered report record
 
 The recovered browser intervals average 59.27 per second across 278.608 seconds of motion. Stages 1 through 5 average 59.39 to 59.74; the interrupted sixth stage averages 56.45 with a 311 ms maximum gap. Four of the 1,032 stage page observations lacked useful displayed pixels. All 69 observations of a detached native canvas had a displayed preview. Actual sampled raw bytes peaked at 211,655,232 B with as many as 42 active worker operations and 41 queued image decodes. Decoded page bitmaps peaked at 64,056,880 B, and native canvases at 62,672,568 B during 160% zoom. Preview retention remained within eight MiB and the fleet within four actors, 413,440 B of cargo and 204,800 B of sprites. The two revisited zoom stages performed zero robot paints while native memory and image work remained substantial.
 
-The original document and probe survived. Their recovered terminal report verifies exact page 46, page-width scale, scrollTop 23685, sidebar, robot/lab settings and focus, plus observer removal and empty fleet ownership. The probe was then disposed through the retained owner. Its nominal 1.5-second idle wait took 308.282 seconds during suspension, and its final sample still had missing pages 46 and 47. That report verifies coordinate restoration and released fleet resources; the maintained success check additionally requires a visible rendered viewport and a continuously observed animation-frame interval. The recovery wrapper recorded `Memory.disable` protocol error `-32000`; frontend cleanup reported no error. Neither partial attempt completed the requested ten-minute workload.
+The original document and probe survived. Their recovered terminal report verifies exact page 46, page-width scale, scrollTop 23685, sidebar, robot/lab settings and focus, plus observer removal and empty fleet ownership. The probe was then disposed through the retained owner. Its nominal 1.5-second idle wait took 308.282 seconds during suspension, and its final sample still had missing pages 46 and 47. That report verifies coordinate restoration and released fleet resources; the maintained success check additionally requires a visible rendered viewport and a continuously observed animation-frame interval. The recovery wrapper recorded `Memory.disable` protocol error `-32000`; frontend cleanup reported no error. Both attempts ended before their selected 600-second motion budget.
+
+### Maintained release b8920d6
+
+The [maintained-run fixture](../scripts/pdf-viewer-harness/safari/fixtures/endurance-2026-11-05-b8920d6.json) records release `b8920d66259dd9f359ff624e3c9928559f63087e` against the same public book. Executed entry source matched SHA-256 `cf2ab2b5f7826973a40749044ea11bfb9a174dfbd15d91628e777e2694d98f0b` and 254,643 bytes. The separately checked public worker matched SHA-256 `b2ca936cf9c6fc937b57df713181b703ee1e4debe25d424f7ee42f780cadc8b9` and 1,890,669 bytes.
+
+A real tap obtained the wake lock in 14 ms. The run completed seven stages and 8.602 seconds of stage 8, totaling 358.707 seconds of motion and 7.013 seconds of dwell from its selected 600-second budget. It stopped with `wake-lock-released`. The terminal result was collected on the same retained target, with 111 RPCs and no RPC, recorder or cleanup errors.
+
+All 1,329 visible page observations had useful displayed pixels. All 47 observations of a detached native canvas had a displayed preview. The 21,279 measured motion intervals averaged 59.44 per second, with a 136 ms maximum; 173 intervals exceeded 34 ms and 47 exceeded 50 ms. The final hidden samples were excluded from visible coverage. The frame and native summaries by stage are:
+
+| Stage | Zoom | Motion | Frame intervals/s | Native peak | Native weighted CPU |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Page width | 50.018 s | 59.83 | 769.49 MB | 75.39% |
+| 2 | 50% | 50.019 s | 59.68 | 971.40 MB | 95.05% |
+| 3 | 80% | 50.009 s | 59.64 | 1,114.89 MB | 87.33% |
+| 4 | 160% | 50.009 s | 59.55 | 1,257.73 MB | 95.60% |
+| 5 | Page width | 50.011 s | 59.35 | 1,288.05 MB | 105.93% |
+| 6 | 50% | 50.022 s | 58.47 | 1,452.04 MB | 105.85% |
+| 7 | 80% | 50.017 s | 59.49 | 1,602.11 MB | 91.65% |
+| 8, partial | 160% | 8.602 s | 59.78 | 1,403.19 MB | 106.23% |
+
+Native counters cover 776 memory/CPU samples and 390.280 seconds, including the tap wait and cleanup. Weighted CPU over that full interval was 88.35%, peaking at 164.10%. Native memory peaked at 1,602,112,512 B and ended at 1,016,332,288 B. At the peak, 1,312,638,675 B belonged to `page` and 223,413,549 B to JavaScript. Inspector's [`page` category sums bmalloc and LibcMalloc allocations](https://github.com/WebKit/WebKit/blob/a08d46521cd6f2af2121d9ef8f50cdf98197f23b/Source/WebCore/inspector/agents/InspectorMemoryAgent.cpp#L150-L153), so it includes more than the application's counted caches. Native stages 1 through 5 were preserved as during-run numeric summaries before their raw rows rolled out of the bounded tail; their provenance is recorded in the fixture.
+
+Sampled raw residency peaked at 122,788,416 B, with at most seven active worker operations; the worker's peak counter grew from 6,265,408 B to 160,930,368 B during the run. The decode queue reached 54 waiting jobs, and decoder concurrency remained one. Decoded page bitmaps peaked at 134,824,952 B and native canvases at 43,379,280 B. Retained previews stayed within eight MiB, and sampled fleet resources within four actors, 413,440 B of cargo and 204,800 B of sprites. Stages 3, 4, 7 and 8 performed zero robot paints. The saved browser sample nearest the native peak had no fleet resources and 87,136,832 B of raw residency across five active operations.
+
+All 6,293 completed PDF bodies passed exact range checks, transferring 6,815,310,336 body bytes. Preview responses contributed 99,754,498 body bytes, 1.44% of the observed total. Seven completion decoded-byte summaries disagreed with complete data events; those differences stayed separate from body validation. All 122 cancellations were preview requests. The browser counted 74 refinements but no completed deposits during this repeated traverse; the short photo scenario remains the place to inspect a complete delivery and readable caption.
+
+The actual visibility transition lies within a 510 ms sampled bracket that contains the wake-lock release. The critical notification followed the recorded release by approximately half a second under host/client clock association. Native timestamps show memory falling from 1,358,671,104 B to 1,021,263,872 B, with the lower-memory sample 270.774 ms before that notification; host delivery reversed the latter two events. At the pinned official WebKit revision, [`prepareToSuspend` can call a critical synchronous memory release](https://github.com/WebKit/WebKit/blob/a08d46521cd6f2af2121d9ef8f50cdf98197f23b/Source/WebKit/WebProcess/WebProcess.cpp#L1902-L1963), and [`MemoryRelease.cpp` reports `didHandleMemoryPressure` after the release work](https://github.com/WebKit/WebKit/blob/a08d46521cd6f2af2121d9ef8f50cdf98197f23b/Source/WebCore/page/MemoryRelease.cpp#L193-L225). This ordering fits suspension cleanup; the phone-side trigger remains unobserved in the recorder.
+
+The last three visible samples already had zero worker operations, pending range requests, active/queued decodes, decoded page bytes and fleet resources, with raw residency at 33,528,384 B. Cleanup restored page 46, page-width scale, scrollTop 23685, sidebar, robot/lab settings and focus exactly; preview requests also drained. Observers and the probe were removed while the inspector owner stayed attached. The final document was hidden, pages 46/47 were undisplayed, and observed awake idle was zero. The receipt remains interrupted with exact coordinate restoration.
+
+Comparing the same first five workload stages gives the following prefix measurements. Both runs began at page 46 with the same page-width scale and 20,095,344 B of native canvases. The new start was colder: 6,265,408 B of raw data and five previews, versus 33,528,384 B and 38 previews in the earlier attempt.
+
+| First five stages | 6f2345e | b8920d6 |
+| --- | --- | --- |
+| Motion | 250.068 s | 250.066 s |
+| Frame intervals/s | 59.580 | 59.610 |
+| Maximum frame gap | 98 ms | 76 ms |
+| Intervals over 50 ms | 34 | 24 |
+| Observations without useful pixels | 3 / 914 | 0 / 920 |
+| Tracked fetch-byte increase | 4,576,324,902 B | 4,806,014,278 B |
+
+The newer prefix fetched 5.02% more bytes. These values come from the browser's first/last fetch counters for the five stages, including PDF and preview traffic. Whole-run native peaks above cover different motion durations, 278.608 and 358.707 seconds, and remain separate from this 250-second prefix comparison.
+
+### Completed two-pass traverse
+
+The [traverse fixture](../scripts/pdf-viewer-harness/safari/fixtures/traverse-2026-11-05-b8920d6.json) records the next operation on the same retained b8920d6 document and inspector connection after Safari returned to the foreground. It kept the existing caches and encounter ledger. Both 60→90→65 passes completed, with 11.036 seconds of motion against the selected 11-second route. All 130 visible page observations had useful displayed pixels, including all four detached-native observations. Motion intervals averaged 59.51 per second, with a 49 ms maximum gap.
+
+The robots-on interval lasted 8.001 seconds and the robots-off interval 4.004 seconds; each recorded zero additional robot paints and quiet fleet state. Exact reader, panel and focus restoration passed. The final viewport was visible and displayed, with no missing pages, followed by 1,500 ms of continuously observed awake idle, a 28 ms maximum frame gap and zero added effect frames. Observers and the probe were removed, the owner stayed attached, and all 46 RPCs completed without validation, protocol or cleanup errors.
+
+The native recorder collected 60 memory/CPU samples with no dropped rows or pressure event. Memory began at 471,825,920 B, peaked at 935,495,808 B and ended at 749,767,040 B. Weighted CPU was 42.92% across the full 29.739-second recording. Current raw residency peaked at 54,368,832 B with at most three active operations; the 160,930,368 B worker lifetime peak was unchanged from the preceding run. Preview retention stayed within eight MiB, native canvases within 20,095,344 B, and decoded page bitmaps within 4,734,208 B. The already-seen pages admitted no new robot episodes or cargo.
+
+All 520 PDF bodies passed exact checks, totaling 301,544,576 body bytes, with no missing body evidence or completion-summary discrepancy. Five preview requests were canceled and all requests drained. Three scheduled workload screenshots clustered in robots-off idle at approximately 20.1, 20.5 and 20.9 seconds because the short route inherited unsorted capture thresholds. That interval's 106 ms maximum includes capture cost; motion and final awake-idle figures above are separate. A fourth screenshot recorded the finished restored state.

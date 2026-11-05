@@ -619,13 +619,14 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
-    async def run_case(self, *, seconds=6, end_work=None, stop_initially=False, **options):
+    async def run_case(self, *, seconds=6, end_work=None, stop_initially=False,
+                       wire_type=FakeWire, probe_options=None, **options):
         clock = Clock()
         recorder = runner.Recorder(clock.now, document=DOCUMENT, limits={'memory': 4, 'cpu': 4})
         stop = asyncio.Event()
         if stop_initially:
             stop.set()
-        wire = FakeWire(clock, recorder, stop, duration=seconds, **options)
+        wire = wire_type(clock, recorder, stop, duration=seconds, **options)
         budget = runner.Budget(seconds, clock.now)
         if end_work is not None:
             budget.ends.update(work=clock.at + end_work, restore=clock.at + end_work + 8,
@@ -643,9 +644,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(status['finished'])
             pictures.append((index, clock.at))
             wire.calls.append(('screenshot-' + str(index), clock.at))
-            return {'index': index}
+            return {'index': index, 'phase': status.get('phase')}
         result = await runner.run_recorded(wire, recorder, JS, 'owned', seconds, budget, stop,
-                                           checkpoint, screenshot, clock.sleep)
+                                           checkpoint, screenshot, clock.sleep, options=probe_options)
         return result, wire, recorder, checkpoints, pictures, clock
 
     async def test_one_recording_spans_workload_restoration_and_terminal_capture(self):
@@ -664,6 +665,58 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                      'Memory.enable', 'Memory.startTracking', 'Memory.stopTracking', 'Memory.disable']:
             self.assertEqual(wire.commands.count(name), 1, name)
         self.assertFalse(wire.enabled)
+
+    async def test_traverse_captures_motion_and_restored_idle_without_delayed_duplicates(self):
+        for tap_wait, heartbeat, phases in ((0, 5, ['stage-1', 'stage-2']),
+                                            (30, 5, ['stage-1', 'stage-2']),
+                                            (0, 10, ['stage-2'])):
+            with self.subTest(tap_wait=tap_wait, heartbeat=heartbeat):
+                class TraverseWire(FakeWire):
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self.duration = tap_wait + 11 + 8 + 4
+
+                    def status(self):
+                        value = super().status()
+                        motion = value['elapsedMs'] / 1000 - tap_wait
+                        value['scrollMs'] = max(0, min(motion, 11)) * 1000
+                        if motion < 0:
+                            value.update(state='armed', phase='armed')
+                        elif motion < 5.5:
+                            value['phase'] = 'stage-1'
+                        elif motion < 11:
+                            value['phase'] = 'stage-2'
+                        elif motion < 19:
+                            value['phase'] = 'robots-on-idle'
+                        elif motion < 23:
+                            value['phase'] = 'robots-off-idle'
+                        elif value['finished']:
+                            value['phase'] = 'finished'
+                        return value
+
+                    async def evaluate(self, source, timeout=3):
+                        value = await super().evaluate(source, timeout)
+                        if 'expectedStages' in value:
+                            value.update(scenario='traverse', expectedStages=2, dwellMs=0,
+                                stages=[{'endedAt': 1}, {'endedAt': 2}],
+                                naturalIdle=[{'robots': enabled, 'quiet': True, 'framesAdded': 0,
+                                              'durationMs': duration}
+                                             for enabled, duration in ((True, 8000), (False, 4000))])
+                        return value
+
+                with mock.patch.object(runner, 'HEARTBEAT_SECONDS', heartbeat):
+                    result, wire, _, _, pictures, _ = await self.run_case(
+                        seconds=11, wire_type=TraverseWire,
+                        probe_options={'scenario': 'traverse', 'startMode': 'tap' if tap_wait else 'immediate'})
+                self.assertEqual(result['status'], 'passed')
+                self.assertEqual([shot['phase'] for shot in result['screenshots']], phases + ['finished'])
+                indices = [index for index, _ in pictures]
+                self.assertEqual(len(indices), len(set(indices)), 'a missed threshold must not repeat a capture')
+                self.assertEqual(indices[-1], 4)
+                self.assertTrue(all(0 < at - wire.started - tap_wait < 11
+                                    for index, at in pictures if index != 4))
+                self.assertTrue(wire.disposed)
+                self.assertFalse(wire.enabled)
 
     async def test_lost_initial_acknowledgement_uses_the_same_token_without_restarting(self):
         result, wire, *_ = await self.run_case(lose_initial=True)

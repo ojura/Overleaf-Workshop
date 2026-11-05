@@ -1,0 +1,490 @@
+{
+  "version": 1,
+  "date": "2026-11-05",
+  "description": "Completed historical two-pass traverse on the retained b8920d6 Safari document, followed by robots-on/off idle and exact awake restoration.",
+  "device": {
+    "productType": "iPhone17,1",
+    "osVersion": "27.2",
+    "pymobiledevice3Version": "11.20.2"
+  },
+  "release": {
+    "commit": "b8920d66259dd9f359ff624e3c9928559f63087e",
+    "entry": {
+      "url": "https://cloud.larics.fer.hr/spomenar/assets/spomenar.mjs",
+      "sha256": "cf2ab2b5f7826973a40749044ea11bfb9a174dfbd15d91628e777e2694d98f0b",
+      "bytes": 254643,
+      "evidence": "executed native script source"
+    },
+    "worker": {
+      "evidence": "fresh-public-artifact",
+      "url": "https://cloud.larics.fer.hr/spomenar/assets/pdfjs/build/pdf.worker.mjs",
+      "bytes": 1890669,
+      "sha256": "b2ca936cf9c6fc937b57df713181b703ee1e4debe25d424f7ee42f780cadc8b9",
+      "matched": true
+    },
+    "document": {
+      "pageUrl": "https://cloud.larics.fer.hr/spomenar/",
+      "entryUrl": "https://cloud.larics.fer.hr/spomenar/assets/spomenar.mjs",
+      "pdfUrl": "https://cloud.larics.fer.hr/spomenar-versions/6abb3d0b13d2970bca0f613287a6ea5d30280be14435b5c681b8ca8bd61d24d0/book.pdf",
+      "sha256": "6abb3d0b13d2970bca0f613287a6ea5d30280be14435b5c681b8ca8bd61d24d0",
+      "bytes": 1608358464,
+      "pages": 460
+    }
+  },
+  "units": {
+    "bytes": "exact byte counts",
+    "cpu": "weighted by native timestamp intervals across the full recording",
+    "frames": "interval rate is gaps / sumMs * 1000; measurements reset for each motion leg and exclude intervals between motion legs",
+    "peakScope": "current sampled values describe this traverse; worker lifetime maxima carried from the preceding run are labeled separately"
+  },
+  "sourceReceipts": [
+    "iphone-traverse-b8920d6-1-result.json",
+    "iphone-traverse-b8920d6-1-recording.json"
+  ],
+  "run": {
+    "scenario": "traverse",
+    "startMode": "immediate",
+    "state": "completed",
+    "hostStatus": "passed",
+    "requestedScrollMs": 11000,
+    "expectedStages": 2,
+    "scrollMs": 11036,
+    "dwellMs": 0,
+    "preparationMs": 105,
+    "setupMs": 59,
+    "restorationMs": 1919,
+    "elapsedSeconds": 30.5941308879992,
+    "initialConditions": {
+      "retainedDocument": true,
+      "readingState": {
+        "page": 46,
+        "scaleValue": "page-width",
+        "scale": 0.544199415511788,
+        "rotation": 0,
+        "scrollMode": 0,
+        "spreadMode": 0,
+        "sidebar": 0,
+        "top": 23685,
+        "left": 0,
+        "robots": true,
+        "lab": false
+      },
+      "rawResidentBytes": 33528384,
+      "previewBytes": 8174592,
+      "canvasBytes": 20095344,
+      "handledEpisodes": 426
+    },
+    "wakeLock": {
+      "state": "released",
+      "granted": true,
+      "released": true,
+      "supported": true,
+      "releaseReason": "terminal-cleanup"
+    },
+    "browser": {
+      "sampleCount": 65,
+      "retainedSamples": 65,
+      "sampleCostMs": 76,
+      "maxSampleCostMs": 3,
+      "coverage": {
+        "pageObservations": 130,
+        "missing": 0,
+        "noDisplayedRaster": 0,
+        "noUsefulPixels": 0,
+        "detachedNative": 4,
+        "detachedCovered": 4
+      },
+      "frames": {
+        "frames": 657,
+        "gaps": 653,
+        "sumMs": 10973,
+        "maxMs": 49,
+        "boundsMs": [
+          20,
+          34,
+          50,
+          100,
+          250,
+          1000
+        ],
+        "buckets": [
+          612,
+          30,
+          11,
+          0,
+          0,
+          0,
+          0
+        ],
+        "intervalsPerSecond": 59.509706
+      },
+      "sampledPeaks": {
+        "previewBytes": 8388608,
+        "canvasBytes": 20095344,
+        "pendingFetches": 14,
+        "activeActors": 0,
+        "cargoBytes": 0,
+        "spriteBytes": 0,
+        "retainedBytes": 0,
+        "covers": 0,
+        "refinements": 0
+      },
+      "sampledRawPeaks": {
+        "residentBytes": 54368832,
+        "activeOperations": 3,
+        "pendingRequests": 12,
+        "imageDecodeActive": 1,
+        "imageDecodeQueued": 19
+      },
+      "sampledDecodedPeaks": {
+        "pageBytes": 4734208,
+        "sharedBytes": 0,
+        "dataBytes": 0,
+        "bitmapBytes": 4734208,
+        "images": 13
+      },
+      "sourceRejected": 0,
+      "counterDelta": {
+        "fetchCount": 693,
+        "fetchBytes": 307666768,
+        "sourceRequests": 178,
+        "sourceCompleted": 173,
+        "robotFrames": 3,
+        "robotPaintMs": 5,
+        "delivered": 0,
+        "robotRefinements": 0
+      },
+      "newEpisodes": 0,
+      "workerLifetimePeak": {
+        "initialBytes": 160930368,
+        "finalBytes": 160930368,
+        "increasedDuringRun": false
+      },
+      "stages": [
+        {
+          "stage": 1,
+          "startPage": 60,
+          "destinations": [
+            90,
+            65
+          ],
+          "scrollMs": 5520,
+          "settleMs": 1,
+          "settled": true,
+          "coverage": {
+            "pageObservations": 24,
+            "missing": 0,
+            "noDisplayedRaster": 0,
+            "noUsefulPixels": 0,
+            "detachedNative": 3,
+            "detachedCovered": 3
+          },
+          "frames": {
+            "frames": 329,
+            "gaps": 327,
+            "sumMs": 5488,
+            "maxMs": 49,
+            "boundsMs": [
+              20,
+              34,
+              50,
+              100,
+              250,
+              1000
+            ],
+            "buckets": [
+              303,
+              18,
+              6,
+              0,
+              0,
+              0,
+              0
+            ],
+            "intervalsPerSecond": 59.584548
+          }
+        },
+        {
+          "stage": 2,
+          "startPage": 60,
+          "destinations": [
+            90,
+            65
+          ],
+          "scrollMs": 5516,
+          "settleMs": 0,
+          "settled": true,
+          "coverage": {
+            "pageObservations": 24,
+            "missing": 0,
+            "noDisplayedRaster": 0,
+            "noUsefulPixels": 0,
+            "detachedNative": 1,
+            "detachedCovered": 1
+          },
+          "frames": {
+            "frames": 328,
+            "gaps": 326,
+            "sumMs": 5485,
+            "maxMs": 47,
+            "boundsMs": [
+              20,
+              34,
+              50,
+              100,
+              250,
+              1000
+            ],
+            "buckets": [
+              309,
+              12,
+              5,
+              0,
+              0,
+              0,
+              0
+            ],
+            "intervalsPerSecond": 59.434822
+          }
+        }
+      ],
+      "naturalIdle": [
+        {
+          "robotsEnabled": true,
+          "durationMs": 8001,
+          "framesAdded": 0,
+          "quiet": true,
+          "frames": {
+            "frames": 478,
+            "gaps": 477,
+            "sumMs": 7984,
+            "maxMs": 42,
+            "boundsMs": [
+              20,
+              34,
+              50,
+              100,
+              250,
+              1000
+            ],
+            "buckets": [
+              472,
+              3,
+              2,
+              0,
+              0,
+              0,
+              0
+            ],
+            "intervalsPerSecond": 59.744489
+          }
+        },
+        {
+          "robotsEnabled": false,
+          "durationMs": 4004,
+          "framesAdded": 0,
+          "quiet": true,
+          "frames": {
+            "frames": 225,
+            "gaps": 224,
+            "sumMs": 3988,
+            "maxMs": 106,
+            "boundsMs": [
+              20,
+              34,
+              50,
+              100,
+              250,
+              1000
+            ],
+            "buckets": [
+              218,
+              2,
+              1,
+              1,
+              2,
+              0,
+              0
+            ],
+            "intervalsPerSecond": 56.168506
+          }
+        }
+      ]
+    },
+    "native": {
+      "recordingCoverage": {
+        "initializationThroughTerminalResult": true,
+        "memorySamples": 60,
+        "cpuSamples": 60,
+        "complete": true
+      },
+      "rawCounts": {
+        "requests": 702,
+        "memory": 60,
+        "cpu": 60
+      },
+      "rawDropped": {
+        "memory": 0,
+        "cpu": 0,
+        "pressure": 0,
+        "requests": 0,
+        "errors": 0
+      },
+      "pressureEvents": 0,
+      "memory": {
+        "samples": 60,
+        "firstBytes": 471825920,
+        "peakBytes": 935495808,
+        "lastBytes": 749767040,
+        "peakCategories": {
+          "javascript": 136037279,
+          "jit": 8323072,
+          "images": 5177344,
+          "layers": 0,
+          "page": 772670689,
+          "other": 13287424
+        },
+        "lastCategories": {
+          "javascript": 122865094,
+          "jit": 8830976,
+          "images": 0,
+          "layers": 0,
+          "page": 605438906,
+          "other": 12632064
+        },
+        "maxNativeGapMs": 505.2153749857098
+      },
+      "cpu": {
+        "samples": 60,
+        "peakPercent": 126.40000915527344,
+        "weightedCpuSeconds": 12.763073521680612,
+        "sampleSpanSeconds": 29.738739624997834,
+        "weightedMeanPercent": 42.91733167787719,
+        "lastPercent": 0.10000000149011612
+      },
+      "network": {
+        "requests": 702,
+        "completed": 697,
+        "canceled": 5,
+        "peakPending": 30,
+        "pendingAtEnd": 0,
+        "pdf": {
+          "requests": 520,
+          "completed": 520,
+          "advertisedBodyBytes": 301544576,
+          "decodedDataBytes": 301544576,
+          "encodedDataBytes": 301876109,
+          "rangeResponsesChecked": 520,
+          "rangeBodiesChecked": 520,
+          "bodyErrors": 0,
+          "unobservedCompletedBodies": 0,
+          "decodedMetricDiscrepancies": 0
+        },
+        "preview": {
+          "requests": 179,
+          "completed": 174,
+          "canceled": 5,
+          "decodedDataBytes": 6730070,
+          "encodedDataBytes": 6738170
+        },
+        "recorderErrors": 0
+      },
+      "rpc": {
+        "targetUnchanged": true,
+        "targetChanges": 0,
+        "count": 46,
+        "traceErrors": 0,
+        "errors": 0
+      }
+    },
+    "restoration": {
+      "exact": true,
+      "focusRestored": true,
+      "readerMatchesSaved": true,
+      "panelMatchesSaved": true,
+      "readingState": {
+        "page": 46,
+        "scaleValue": "page-width",
+        "scale": 0.544199415511788,
+        "rotation": 0,
+        "scrollMode": 0,
+        "spreadMode": 0,
+        "sidebar": 0,
+        "top": 23685,
+        "left": 0,
+        "robots": true,
+        "lab": false
+      },
+      "viewport": {
+        "visible": true,
+        "focused": true,
+        "displayed": true,
+        "missingPages": []
+      },
+      "idle": {
+        "durationMs": 1919,
+        "observedMs": 1500,
+        "maxGapMs": 28,
+        "framesAdded": 0,
+        "awake": true,
+        "quiet": true,
+        "pendingAtEnd": 0,
+        "pendingFetchesAtEnd": 0
+      },
+      "rawResidentBytes": 33528384,
+      "activeOperations": 0,
+      "pendingRequests": 0,
+      "activeDecodes": 0,
+      "queuedDecodes": 0,
+      "previewSource": {
+        "pending": 0,
+        "decoding": 0,
+        "queuedDecodes": 0
+      },
+      "fleet": {
+        "activeActors": 0,
+        "cargoBytes": 0,
+        "spriteBytes": 0,
+        "retainedBytes": 0,
+        "activeArrivalCovers": 0,
+        "activeRefinements": 0,
+        "scheduled": false
+      },
+      "observersRemoved": true,
+      "probeDisposed": true,
+      "ownerAttached": true,
+      "retainedByOwner": true,
+      "clientErrors": 0,
+      "clientCleanupErrors": 0,
+      "hostCleanupErrors": 0,
+      "validationFailures": []
+    },
+    "screenshots": [
+      {
+        "phase": "robots-off-idle",
+        "sinceRecordingReadyMs": 20070.096,
+        "durationMs": 158.332
+      },
+      {
+        "phase": "robots-off-idle",
+        "sinceRecordingReadyMs": 20490.738,
+        "durationMs": 157.848
+      },
+      {
+        "phase": "robots-off-idle",
+        "sinceRecordingReadyMs": 20917.865,
+        "durationMs": 169.715
+      },
+      {
+        "phase": "finished",
+        "sinceRecordingReadyMs": 30113.085,
+        "durationMs": 132.113
+      }
+    ]
+  },
+  "interpretation": {
+    "comparison": "The same document and its caches/encounter ledger were retained after the extended run. This is a separate short coverage/reversal/idle result.",
+    "screenshots": "The inherited unsorted screenshot thresholds placed all three scheduled workload captures in robots-off idle at approximately 20.1, 20.5 and 20.9 seconds. Its 106 ms maximum frame gap includes those captures; motion max was 49 ms and final awake idle max was 28 ms. A fourth screenshot recorded the finished restored state.",
+    "workerPeak": "The 160930368-byte worker peak was unchanged from the preceding run; observed current raw residency peaked at 54368832 bytes during this traverse."
+  }
+}

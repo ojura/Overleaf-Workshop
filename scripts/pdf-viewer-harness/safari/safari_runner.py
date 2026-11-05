@@ -661,8 +661,11 @@ async def run_recorded(wire, recorder, source, token, seconds, budget, stop_even
     stop_attempts = 0
     next_heartbeat = budget.now()
     next_checkpoint = budget.now()
-    shots = deque([20, seconds / 3, seconds * 2 / 3]) if screenshot else deque()
-    started = None
+    shot_times = [seconds / 3, seconds * 2 / 3]
+    if receipt['scenario'] != 'traverse' and seconds > 20:
+        shot_times.append(20)
+    shots = deque(sorted(set(shot_times))) if screenshot else deque()
+    shot_index = 0
 
     async def control(method, owned_token, owned_budget, phase='work', argument=None):
         return await api_call(wire, method, owned_token, owned_budget, phase, argument, api=probe_api)
@@ -745,9 +748,8 @@ async def run_recorded(wire, recorder, source, token, seconds, budget, stop_even
             latest = await control('status', token, budget, 'work')
         if not isinstance(latest, dict) or latest.get('token') != token:
             raise RuntimeError('Initialization did not acknowledge the owned token')
-        started = budget.now()
-        receipt['initializationAcknowledgedHostMs'] = started * 1000
-        next_heartbeat = started
+        next_heartbeat = budget.now()
+        receipt['initializationAcknowledgedHostMs'] = next_heartbeat * 1000
         await publish(True)
         while True:
             now = budget.now()
@@ -770,13 +772,23 @@ async def run_recorded(wire, recorder, source, token, seconds, budget, stop_even
                 await publish(True)
                 if latest.get('finished'):
                     continue
-            if shots and started is not None and now - started >= shots[0] and not stop_sent:
-                shots.popleft()
-                try:
-                    picture = await screenshot(len(receipt['screenshots']) + 1, latest)
-                    receipt['screenshots'].append(picture)
-                except Exception as error:
-                    receipt.setdefault('screenshotErrors', []).append(str(error))
+                # Use reported motion, so tap waiting and traverse's natural idle
+                # cannot consume workload captures. The restored capture follows
+                # the separately measured awake idle interval in collect_terminal.
+                progress_ms = latest.get('elapsedMs' if manual else 'scrollMs')
+                capture_active = latest.get('state') == ('observing' if manual else 'running')
+                if (shots and not stop_sent and capture_active and number(progress_ms)
+                        and shots[0] <= progress_ms / 1000 < seconds):
+                    # One fresh heartbeat may cross multiple thresholds; capture
+                    # once rather than replaying missed shots against one frame.
+                    while shots and shots[0] <= progress_ms / 1000:
+                        shots.popleft()
+                    shot_index += 1
+                    try:
+                        picture = await screenshot(shot_index, latest)
+                        receipt['screenshots'].append(picture)
+                    except Exception as error:
+                        receipt.setdefault('screenshotErrors', []).append(str(error))
             await sleep(min(0.25, max(0, next_heartbeat - budget.now()), budget.remaining(phase)))
         value = receipt['result']
         exact = value.get('restorationExact') is True and value.get('restored') is True
