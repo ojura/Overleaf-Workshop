@@ -165,6 +165,7 @@ export interface SavedState {
     scrollMode?: number;
     spreadMode?: number;
     sidebarView?: number;
+    motionLabMeasurementsOpen?: boolean;
     [other: string]: unknown;
 }
 
