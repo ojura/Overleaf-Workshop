@@ -276,10 +276,12 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             && cached.nativeProjection === projection && cached.transform === transform) { return cached.page; }
         const clip = { x: 0, y: 0, width: view.div.clientWidth, height: view.div.clientHeight };
         if (!(clip.width > 0 && clip.height > 0 && viewport.width > 0 && viewport.height > 0)) { return; }
-        let page: PdfPageProjection;
+        let page: PdfPageProjection = { content: { x: 0, y: 0, width: viewport.width, height: viewport.height }, clip };
         if (canvas && projection) {
             const box = view.div.getBoundingClientRect(), raster = canvas.getBoundingClientRect();
-            if (!(raster.width > 0 && raster.height > 0)) { return; }
+            // PDF.js can announce a main draw before attaching its backing. Keep the
+            // ready preview, but leave this geometry uncached until the canvas is laid out.
+            if (!(raster.width > 0 && raster.height > 0)) { return page; }
             // Absolute children start at the padding edge. Store local geometry so scrolling
             // and the shared document-column translation do not require another DOM read.
             page = pdfPageFromRaster(projection, {
@@ -287,8 +289,6 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
                 y: raster.top - box.top - view.div.clientTop,
                 width: raster.width, height: raster.height,
             }, clip);
-        } else {
-            page = { content: { x: 0, y: 0, width: viewport.width, height: viewport.height }, clip };
         }
         pageProjections.set(view, { hasCanvas: !!canvas, viewport, nativeProjection: projection, transform, page });
         return page;

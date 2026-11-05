@@ -815,7 +815,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         return { f, source, loaders, bind, metadata, publish };
     }
 
-    function measuredNative(f: Fixture) {
+    function measuredNative(f: Fixture, displayed = () => true) {
         const view = f.pages[0], canvas = new Canvas();
         view.div.clientWidth = 330; view.div.clientHeight = 470;
         view.viewport = { width: 332.59866666666665, height: 472.4406666666667, scale: 0.5, rotation: 0 };
@@ -823,6 +823,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         view.pdfPage = f.pdf.page(1);
         canvas.width = 396; canvas.height = 564;
         canvas.getBoundingClientRect = () => {
+            if (!displayed()) { return { x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
             const box = view.div.getBoundingClientRect(), left = box.left + view.div.clientLeft, top = box.top + view.div.clientTop;
             return { x: left, y: top, left, top, right: left + view.div.clientWidth, bottom: top + view.div.clientHeight,
                 width: view.div.clientWidth, height: view.div.clientHeight };
@@ -866,6 +867,36 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         near(refined.rasterProjection!.pageToRaster[0], 399.1184, 'native source retains clipped horizontal coverage');
         near(refined.rasterProjection!.pageToRaster[3], 566.9288, 'native source retains clipped vertical coverage');
         assert.deepStrictEqual(refined.pageProjection, delivered.pageProjection, 'atlas-to-native refinement keeps the same photo targets');
+    });
+
+    it('keeps ready preview pixels while a captured native canvas has no display box and measures its attachment', async () => {
+        const robots = new DocumentRobots();
+        const h = previewFixture({ pages: 1, startPage: 1, width: 332.59866666666665, height: 472.4406666666667,
+            initialNative: false, autoPages: false }, robots), f = h.f;
+        const loader = h.bind(); await f.frame();
+        const preview = h.publish(loader, 1, 541, 768).canvas;
+        assert.strictEqual(preview.parentNode, f.pages[0].div);
+        let displayed = false, measurements = 0;
+        const { view, canvas } = measuredNative(f, () => { measurements++; return displayed; });
+        assert.strictEqual(preview.parentNode, view.div, 'native draw preparation cannot remove already useful preview pixels');
+        const matrix = previewMatrix(preview);
+        near(matrix[0] * 330, view.viewport.width, 'provisional horizontal logical extent');
+        near(matrix[3] * 470, view.viewport.height, 'provisional vertical logical extent');
+        assert.deepStrictEqual(f.controller.snapshot().visibleMissing, []);
+        const beforeAttachment = measurements;
+        displayed = true;
+        f.eventBus.emit('updateviewarea'); await f.frame();
+        assert.ok(measurements > beforeAttachment, 'the same native canvas is measured after attachment without a viewport or layout change');
+        assert.strictEqual(preview.parentNode, view.div, 'the preview stays until the native draw finishes');
+        const afterAttachment = measurements;
+        f.eventBus.emit('updateviewarea'); await f.frame();
+        assert.strictEqual(measurements, afterAttachment, 'real attached geometry can then be cached');
+        view.renderingState = 3;
+        f.eventBus.emit('pagerendered', { pageNumber: 1, source: view, error: null, cssTransform: false });
+        assert.strictEqual(robots.refinements.at(-1)!.canvas, canvas);
+        await f.frame();
+        assert.strictEqual(preview.parentNode, null, 'finished native pixels replace the preview normally');
+        assert.ok(preview.width > 0, 'native completion keeps the reusable preview raster');
     });
 
     it('preserves independent preview ceil padding without compressing its logical page', async () => {
