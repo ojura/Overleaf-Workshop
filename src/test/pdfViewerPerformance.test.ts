@@ -324,6 +324,8 @@ describe('PDF prefetch performance measurements', function () {
         const remove = (name: string, listener: unknown) => { listeners.get(name)?.delete(listener); };
         const canvases: Node[] = [], observers: Array<{ disconnected: boolean }> = [];
         const layouts: any[] = [];
+        const layoutInvalidations: number[] = [];
+        let invalidations = 0;
         const timers = new Map<number, () => void>(), frames = new Map<number, (time: number) => void>();
         let scheduleId = 0;
         const document: any = { hidden: true, addEventListener: add, removeEventListener: remove };
@@ -395,7 +397,7 @@ describe('PDF prefetch performance measurements', function () {
         const container = new Node(), transit = new Node(); transit.id = 'document-transit';
         document.body.append(container); container.append(transit);
         const diagnostics = performanceModule.installPrefetchDiagnostics(container, () => { assert.fail('a hidden document does not sample'); },
-            { onPanelLayout: (layout: any) => layouts.push(layout) });
+            { onPanelLayout: (layout: any) => { layouts.push(layout); layoutInvalidations.push(invalidations); } });
         try {
             diagnostics.setEnabled(true);
             const host = [...container.children, ...document.body.children].find(node => node.id === 'pdf-prefetch-diagnostics')!;
@@ -406,15 +408,26 @@ describe('PDF prefetch performance measurements', function () {
             assert.ok(Number(layer[1]) < 2147483647, 'the real courier may paint above the lab during departure and return');
             assert.deepStrictEqual(layouts.map(layout => [layout.visible, layout.reason]), [[true, 'open']]);
             assert.ok(host.shadow.innerHTML.includes('class="panel-drag" tabindex="0"'), 'the title has keyboard movement access');
+            const lab = (host.shadow.querySelector('[data-robot-stage]') as any).robotLab;
+            lab.invalidateGeometry = () => { invalidations++; };
             host.shadow.querySelector('[data-panel-dock="left"]').emit('click');
             assert.strictEqual(layouts.at(-1).dock, 'left');
             assert.strictEqual(layouts.at(-1).reason, 'dock');
             assert.strictEqual(layouts.at(-1).rect.x, 8);
+            assert.strictEqual(invalidations, 1, 'a panel layout invalidates the lab before downstream courier movement');
+            assert.strictEqual(layoutInvalidations.at(-1), 1);
+            host.shadow.querySelector('.panel-content').emit('scroll');
+            host.shadow.querySelector('.measurements').emit('toggle');
+            assert.strictEqual(invalidations, 3, 'internal scrolling and compact-details changes invalidate the same snapshot');
+            const content = host.shadow.querySelector('.panel-content'), measurements = host.shadow.querySelector('.measurements');
             diagnostics.setEnabled(false);
             assert.strictEqual(host.hidden, true);
             assert.strictEqual(layouts.at(-1).visible, false);
             diagnostics.setEnabled(true);
             assert.strictEqual(document.body.children.filter((node: Node) => node.id === host.id).length, 1);
+            diagnostics.dispose();
+            assert.strictEqual(content.handlers.get('scroll')?.size, 0);
+            assert.strictEqual(measurements.handlers.get('toggle')?.size, 0);
         } finally { diagnostics.dispose(); }
         assert.deepStrictEqual(container.children, [transit]);
         assert.deepStrictEqual(document.body.children, [container]);

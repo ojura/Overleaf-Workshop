@@ -589,6 +589,42 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.deepStrictEqual([page.canvas.width, page.canvas.height], [4320, 6480]);
     });
 
+    it('defers column completion geometry to the queued paint and returns from the final edge', () => {
+        let offset = 0, transit: Element | undefined;
+        const f = fixture({ maxActors: 1, documentOffset: () => offset,
+            registerDocumentLayer: (layer: Element) => { transit = layer; return () => {}; } }); f.desktop();
+        const page = f.page(99); page.pageElement.rect.left = 250;
+        f.api.setVisiblePages([99]);
+        const motion = { id: 1, fromX: 0, toX: -120, startedAt: f.now, durationMs: 400,
+            reason: 'dock', dock: 'right', bounds: { x: 250, y: 60, width: 400, height: 600 } };
+        f.api.setColumnTransition(motion);
+        offset = -70; transit!.style.translate = '-70px'; page.pageElement.rect.left = 180;
+        f.tick(160);
+        const before = f.api.snapshot(), actor = before.columnPull;
+        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.actor))!;
+        const reads = () => sceneNodes(f.document.body).reduce((total, element) => total + element.layoutReads, 0);
+        const previousReads = reads();
+
+        // The column finishes its style write before the renderer's next frame.
+        f.now = motion.startedAt + motion.durationMs;
+        offset = -120; transit!.style.translate = '-120px'; page.pageElement.rect.left = 130;
+        f.api.setColumnTransition(undefined);
+        assert.strictEqual(reads(), previousReads, 'completion does not read layout after the column style write');
+        assert.strictEqual(f.api.snapshot().frames, before.frames, 'completion only marks the existing frame dirty');
+        assert.strictEqual(f.callbacks.size, 1, 'the finite return shares the already queued frame');
+
+        f.tick(0);
+        const current = f.api.snapshot();
+        const hand = module.ROBOT_FORKLIFT_ATTACHMENT.pull.right;
+        const handX = point(sprite).x + hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * current.spriteScale;
+        assert.ok(Math.abs(handX - 130) < 0.05, 'the return starts at the final translated edge, not the preceding paint');
+        assert.strictEqual(current.columnPull.phase, 'return');
+        assert.strictEqual(current.columnPull.deadline, actor.deadline, 'deferring paint preserves the original finish deadline');
+        f.finish();
+        assert.strictEqual(f.api.snapshot().columnPull, undefined);
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+    });
+
     it('preempts the document pull for ready cargo and cancels it on hard lifecycle boundaries', () => {
         for (const ending of ['ready', 'offscreen', 'hide', 'reduce', 'disable', 'reset', 'replacement', 'dispose', 'cancel']) {
             const f = fixture({ maxActors: 1 }); f.desktop();

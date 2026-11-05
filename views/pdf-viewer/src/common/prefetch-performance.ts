@@ -289,6 +289,8 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
     let timer: number | undefined;
     let robots: RobotLab | undefined;
     let panel: ReturnType<typeof installMotionLabPanel> | undefined;
+    let panelContent: HTMLElement | undefined;
+    let panelDetails: HTMLDetailsElement | undefined;
     let button: HTMLButtonElement | undefined;
     let measurementsButton: HTMLButtonElement | undefined;
     let shown = false;
@@ -299,8 +301,10 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
 
     function field(name: string, text: string): void {
         const element = fields.get(name);
-        if (element) { element.textContent = text; }
+        if (element && element.textContent !== text) { element.textContent = text; }
     }
+
+    function panelGeometryChanged(): void { robots?.invalidateGeometry(); }
 
     function format(value: number, digits = 0): string {
         return Number.isFinite(value) ? value.toLocaleString(undefined, { maximumFractionDigits: digits }) : '?';
@@ -365,7 +369,12 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
         const status = fields.get('status')!;
         const starved = !!state.starved || !!state.visibleMissing?.length;
         status.dataset.state = starved ? 'late' : margin === null ? 'idle' : margin >= 0 ? 'ready' : 'late';
-        status.textContent = starved ? 'Waiting for visible pages' : margin === null ? 'Motion stopped' : margin >= 0 ? 'Buffered ahead' : 'Preparing to catch up';
+        const statusText = starved ? 'Waiting for visible pages' : margin === null ? 'Motion stopped' : margin >= 0 ? 'Buffered ahead' : 'Preparing to catch up';
+        if (status.textContent !== statusText) {
+            status.textContent = statusText;
+            // This line is above the canvas and can wrap without resizing the canvas itself.
+            panelGeometryChanged();
+        }
 
         const speedMax = Math.max(1, ...history.map(point => Math.abs(point.velocity)));
         const timeMax = Math.max(0.1, ...history.flatMap(point => [point.delay, point.buffer ?? 0]));
@@ -532,6 +541,10 @@ ${ROBOT_ICON}
         root.querySelector('.copy')!.addEventListener('click', () => { void copySnapshot(); });
         (doc.body ?? doc.documentElement).append(host);
         robots = installPrefetchRobots(root.querySelector<HTMLElement>('[data-robot-stage]')!);
+        panelContent = root.querySelector<HTMLElement>('.panel-content')!;
+        panelDetails = root.querySelector<HTMLDetailsElement>('.measurements')!;
+        panelContent.addEventListener('scroll', panelGeometryChanged, { passive: true });
+        panelDetails.addEventListener('toggle', panelGeometryChanged);
         panel = installMotionLabPanel(host, {
             surface: root.querySelector<HTMLElement>('section')!,
             dragHandle: root.querySelector<HTMLElement>('.panel-drag')!,
@@ -541,7 +554,11 @@ ${ROBOT_ICON}
                 right: root.querySelector<HTMLButtonElement>('[data-panel-dock="right"]')!,
                 float: root.querySelector<HTMLButtonElement>('[data-panel-dock="float"]')!,
             },
-            onLayout: options.onPanelLayout,
+            onLayout: layout => {
+                // A layout consumer can synchronously reserve or return a courier.
+                panelGeometryChanged();
+                options.onPanelLayout?.(layout);
+            },
         });
     }
 
@@ -643,6 +660,9 @@ ${ROBOT_ICON}
             if (disposed) { return; }
             disposed = true;
             stopTimer();
+            panelContent?.removeEventListener('scroll', panelGeometryChanged);
+            panelDetails?.removeEventListener('toggle', panelGeometryChanged);
+            panelContent = panelDetails = undefined;
             panel?.dispose();
             panel = undefined;
             doc?.removeEventListener?.('keydown', keydown, true);

@@ -923,8 +923,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             if (now() + 0.01 < end) { clearColumnPull(); cancelFrameIfEmpty(); notifyCapacity(); }
             else {
                 columnPull.returnAt ??= end;
-                columnPull.returnFrom ??= { ...columnPull.point };
-                requestPaint();
+                // The column just wrote its final translation. Read geometry in the queued paint.
+                dirty = true;
+                schedule();
             }
             return;
         }

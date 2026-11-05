@@ -269,3 +269,11 @@ node scripts/pdf-viewer-harness/probes/prefetch.mjs --headless yes --latency 60 
 See [harness requirements](../scripts/pdf-viewer-harness/README.md#requirements). The probe uses an owned browser and test server, writes `prefetch-results.json` and `prefetch-dashboard.png` under `$PDF_VIEWER_HARNESS_WORK` or `/tmp/pdf-viewer-harness`, then closes its browser and server.
 
 The probe reports visible-content missing time as the fraction of sampled elapsed time when at least one visible page has neither a finished native render nor an attached preview. Samples are weighted by frame duration. Compare runs with the same document identity, cache state, viewport, motion pattern and network conditions; record transferred bytes alongside frame and paint timings.
+
+### Activating an installed viewer
+
+`./scripts/install-local-build.sh` installs the checkout's frontend bundles into the matching local extension. To activate them in an existing Antigravity reader, capture the document identity, page, zoom, rotation, spread and scroll modes, exact scroll offsets, sidebar, Motion Lab state, editor group, split widths and focus. Close the clean PDF editor and use `View: Reopen Closed Editor`. If it reopens in the left group, use `View: Move Editor into Right Group`; if the original expanded split changed, use `View: Expand Editor Group`. Expand Editor Group returns the other group to its minimum width. Restore the captured reading and panel state, with trusted user input taking priority.
+
+Prefer this editor recreation over `Developer: Reload Webviews` for live updates. The reload command iterates registered overlays and their underlying elements, so one invocation can send the same content twice. The observed reload left the replacement content without service-worker control and its extension-resource requests failed. Normal close and reopen recovered controlled resources and loaded the installed bundle.
+
+Let the new webview complete its bootstrap before attaching debugger-based verification. Check its service-worker controller, expected PDF identity and `window.pdfPrefetch`. Compare the executed entry module with the installed bundle to confirm new frontend code; host-generated HTML metadata can still describe the existing extension-host process. Recreating the editor keeps that host process running.

@@ -1277,6 +1277,8 @@ function robotCanvasGeometry(canvas: HTMLCanvasElement) {
         width, height, fit: Math.min(width / ROBOT_LIMITS.width, height / ROBOT_LIMITS.height), bodyScale: screen.cssScale };
 }
 
+type RobotCanvasGeometry = ReturnType<typeof robotCanvasGeometry>;
+
 class RobotStagePainter {
     private readonly context: Paint;
     private readonly background: HTMLCanvasElement;
@@ -1335,9 +1337,8 @@ class RobotStagePainter {
         }
     }
 
-    draw(frame: RobotFrame, reduced = false): void {
+    draw(frame: RobotFrame, geometry: RobotCanvasGeometry, reduced = false): void {
         const ctx = this.context;
-        const geometry = robotCanvasGeometry(this.canvas);
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.drawImage(this.background, 0, 0);
         ctx.setTransform(this.ratio, 0, 0, this.ratio, 0, 0);
@@ -1382,7 +1383,7 @@ class RobotStagePainter {
         paintRobotVehicle(ctx, { ...actor, labels: false }, time, frame.mode, reduced, this.bodies.get(actor.vehicle));
     }
 
-    private paintLabels(ctx: Paint, actors: RobotFrame['actors'], at: number, geometry: ReturnType<typeof robotCanvasGeometry>): void {
+    private paintLabels(ctx: Paint, actors: RobotFrame['actors'], at: number, geometry: RobotCanvasGeometry): void {
         const metrics = robotCaptionMetrics({ devicePixelRatio: this.canvas.ownerDocument.defaultView!.devicePixelRatio,
             displayScale: geometry.fit });
         const geometryKey = [geometry.width, geometry.height, geometry.bodyScale, metrics.localFontSize, metrics.localLineHeight].join(',');
@@ -1566,6 +1567,8 @@ class RobotStagePainter {
 
 export interface RobotLab {
     readonly dispatch: RobotDispatchPort;
+    /** Mark panel position or fitting changes before a caller can dispatch another courier. */
+    invalidateGeometry(): void;
     setActive(active: boolean): void;
     update(input: RobotTelemetry): void;
     snapshot(): RobotFrame & { renderer: { active: boolean; scheduled: boolean; reducedMotion: boolean; frames: number; meanDrawMs: number; maxDrawMs: number } };
@@ -1593,6 +1596,12 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     canvas.className = 'robot-canvas';
     caption.className = 'robot-caption';
     activity.className = 'robot-activity';
+    const captionMetrics = robotCaptionMetrics();
+    Object.assign(caption.style, { padding: captionMetrics.paddingY + 'px ' + captionMetrics.paddingX + 'px',
+        fontSize: captionMetrics.fontSize + 'px', lineHeight: captionMetrics.lineHeight + 'px',
+        fontWeight: '400', color: ROBOT_LAB_CAPTION_STYLE.color,
+        background: ROBOT_LAB_CAPTION_STYLE.background, border: '0',
+        borderRadius: '3px', whiteSpace: 'normal', overflowWrap: 'anywhere', opacity: '1' });
     stage.append(canvas, caption, activity);
     stage.setAttribute('aria-hidden', 'true');
     stage.style.pointerEvents = 'none';
@@ -1608,6 +1617,42 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     let lastDraw = -Infinity;
     let frames = 0, totalDrawMs = 0, maxDrawMs = 0;
     let latest = model.snapshot();
+    let geometry: RobotCanvasGeometry | undefined;
+    let geometryDpr = NaN;
+    let density: MediaQueryList | undefined;
+
+    function invalidateGeometry(): void { geometry = undefined; }
+
+    function currentGeometry(): RobotCanvasGeometry | undefined {
+        if (stage.isConnected === false || canvas.isConnected === false) { geometry = undefined; return; }
+        // Stable motion changes canvas pixels, not its CSS box. Paint and every returning
+        // courier share the same fit and viewport origin until an actual layout event.
+        if (!geometry || geometryDpr !== win.devicePixelRatio) {
+            const measured = robotCanvasGeometry(canvas);
+            if (![measured.left, measured.top, measured.width, measured.height, measured.fit].every(Number.isFinite)
+                || measured.width <= 0 || measured.height <= 0 || measured.fit <= 0) {
+                geometry = undefined;
+                return;
+            }
+            geometry = measured;
+            geometryDpr = win.devicePixelRatio;
+        }
+        return geometry;
+    }
+
+    function geometryChanged(): void {
+        if (disposed) { return; }
+        invalidateGeometry();
+        schedule();
+    }
+
+    function densityChanged(): void {
+        density?.removeEventListener('change', densityChanged);
+        if (disposed) { return; }
+        density = win.matchMedia('(resolution: ' + win.devicePixelRatio + 'dppx)');
+        density.addEventListener('change', densityChanged);
+        geometryChanged();
+    }
 
     function consumeInput(now: number): boolean {
         if (!inputPending) { return false; }
@@ -1621,28 +1666,27 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
         return changed;
     }
 
-    function render(now: number): void {
+    function render(now: number): boolean {
         const started = win.performance.now();
         latest = media.matches ? model.snapshot() : model.step(now);
-        painter.draw(latest, media.matches);
-        const metrics = robotCaptionMetrics({ devicePixelRatio: win.devicePixelRatio });
-        Object.assign(caption.style, { padding: metrics.paddingY + 'px ' + metrics.paddingX + 'px',
-            fontSize: metrics.fontSize + 'px', lineHeight: metrics.lineHeight + 'px',
-            fontWeight: '400', color: ROBOT_LAB_CAPTION_STYLE.color,
-            background: ROBOT_LAB_CAPTION_STYLE.background, border: '0',
-            borderRadius: '3px', whiteSpace: 'normal', overflowWrap: 'anywhere', opacity: '1' });
-        if (caption.textContent !== latest.caption) { caption.textContent = latest.caption; }
+        if (caption.textContent !== latest.caption) { caption.textContent = latest.caption; invalidateGeometry(); }
         const working = latest.actors.filter(actor => actor.job === 'delivery').length;
         const text = latest.mode === 'quiet'
             ? 'Waiting tableau; the outage repertoire has finished'
             : working + ' couriers; ' + latest.stats.yields + ' yields; ' + latest.stats.assists + ' assists; ' + latest.stats.replans + ' replans';
-        if (activity.textContent !== text) { activity.textContent = text; }
-        stage.dataset.mode = latest.mode;
-        stage.dataset.scene = latest.scene;
+        if (activity.textContent !== text) { activity.textContent = text; invalidateGeometry(); }
+        if (stage.dataset.mode !== latest.mode) { stage.dataset.mode = latest.mode; }
+        if (stage.dataset.scene !== latest.scene) { stage.dataset.scene = latest.scene; }
+        // Complete real text changes before measuring, including synchronous reserve().
+        // Rewriting constant caption styles every paint would dirty the next layout read.
+        const measured = currentGeometry();
+        if (!measured) { return false; }
+        painter.draw(latest, measured, media.matches);
         const elapsed = win.performance.now() - started;
         totalDrawMs += elapsed;
         maxDrawMs = Math.max(maxDrawMs, elapsed);
         frames++;
+        return true;
     }
 
     function cancel(): void {
@@ -1656,7 +1700,7 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
         const elapsed = now - lastDraw;
         if (!Number.isFinite(lastDraw) || elapsed >= interval) {
             lastDraw = Number.isFinite(lastDraw) ? now - elapsed % interval : now;
-            render(now);
+            if (!render(now)) { return; }
         }
         if (wantsAnimation()) { raf = win.requestAnimationFrame(loop); }
     }
@@ -1670,12 +1714,13 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
         if (!active || disposed || doc.hidden || !inView) { return; }
         const now = win.performance.now();
         consumeInput(now);
-        render(now);
+        if (!render(now)) { return; }
         lastDraw = now;
         if (!media.matches && wantsAnimation()) { raf = win.requestAnimationFrame(loop); }
     }
 
     function visibility(): void {
+        invalidateGeometry();
         if (doc.hidden) { cancel(); }
         else { schedule(); }
     }
@@ -1686,17 +1731,25 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     doc.addEventListener('pointerdown', inputChanged, { passive: true });
     doc.addEventListener('keydown', inputChanged);
     media.addEventListener('change', motionChanged);
-    const sizeObserver = new win.ResizeObserver(() => schedule());
+    win.addEventListener('resize', geometryChanged);
+    win.visualViewport?.addEventListener('resize', geometryChanged);
+    win.visualViewport?.addEventListener('scroll', geometryChanged);
+    densityChanged();
+    const sizeObserver = new win.ResizeObserver(geometryChanged);
     sizeObserver.observe(stage);
+    sizeObserver.observe(canvas);
     const observer = new win.IntersectionObserver(entries => {
+        if (disposed) { return; }
         const entry = entries[entries.length - 1];
         inView = !!entry?.isIntersecting;
+        invalidateGeometry();
         if (inView) { schedule(); } else { cancel(); }
     });
     observer.observe(stage);
 
-    function viewportPoint(point: Point): RobotDispatchPoint {
-        const geometry = robotCanvasGeometry(canvas);
+    function viewportPoint(point: Point): RobotDispatchPoint | undefined {
+        const geometry = currentGeometry();
+        if (!geometry) { return; }
         return {
             x: geometry.left + point.x / ROBOT_LIMITS.width * geometry.width,
             y: geometry.top + point.y / ROBOT_LIMITS.height * geometry.height,
@@ -1705,13 +1758,16 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     }
 
     const api: RobotLab = {
+        invalidateGeometry() { if (!disposed) { invalidateGeometry(); } },
         dispatch: {
             reserve(vehicle) {
-                if (!active || disposed || doc.hidden || !inView) { return; }
+                if (!active || disposed || doc.hidden || !inView || !currentGeometry()) { return; }
                 const point = model.reserveVehicle(vehicle, win.performance.now());
                 if (!point) { return; }
                 schedule();
-                return viewportPoint(point);
+                const origin = viewportPoint(point);
+                if (!origin) { model.returnVehicle(vehicle, win.performance.now()); latest = model.snapshot(); }
+                return origin;
             },
             destination(vehicle) {
                 if (!active || disposed || doc.hidden || !inView) { return; }
@@ -1727,6 +1783,7 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
         setActive(value): void {
             if (disposed || active === value) { return; }
             active = value;
+            invalidateGeometry();
             if (active) {
                 model.open(win.performance.now(), input);
                 inputKey = telemetryKey(input);
@@ -1765,6 +1822,11 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
             doc.removeEventListener('pointerdown', inputChanged);
             doc.removeEventListener('keydown', inputChanged);
             media.removeEventListener('change', motionChanged);
+            density?.removeEventListener('change', densityChanged);
+            win.removeEventListener('resize', geometryChanged);
+            win.visualViewport?.removeEventListener('resize', geometryChanged);
+            win.visualViewport?.removeEventListener('scroll', geometryChanged);
+            geometry = undefined;
             painter.dispose();
             stage.replaceChildren();
             delete (stage as HTMLElement & { robotLab?: RobotLab }).robotLab;

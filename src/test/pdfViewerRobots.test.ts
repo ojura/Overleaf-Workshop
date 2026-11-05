@@ -23,10 +23,15 @@ class RobotElement {
     className = '';
     textContent = '';
     readonly dataset: Record<string, string> = {};
-    readonly style: Record<string, string> = {};
+    styleWrites = 0;
+    readonly style = new Proxy({} as Record<string, string>, {
+        set: (target, key: string, value: string) => { this.styleWrites++; target[key] = value; return true; },
+    });
     readonly children: RobotElement[] = [];
     readonly attributes = new Map<string, string>();
     rect = { left: 0, top: 0, width: 480, height: 250 };
+    rectReads = 0;
+    isConnected = true;
     readonly texts: Array<{ text: string; x: number; y: number; font: string; color: string }> = [];
     readonly context = new Proxy({ fillText: (text: string, x: number, y: number) => {
         this.texts.push({ text, x, y, font: this.context.font, color: this.context.fillStyle });
@@ -40,7 +45,7 @@ class RobotElement {
     });
     constructor(readonly ownerDocument: any) {}
     getContext() { return this.context; }
-    getBoundingClientRect() { return { ...this.rect }; }
+    getBoundingClientRect() { this.rectReads++; return { ...this.rect }; }
     append(...elements: RobotElement[]) { this.children.push(...elements); }
     replaceChildren(...elements: RobotElement[]) { this.children.splice(0, this.children.length, ...elements); }
     setAttribute(name: string, value: string) { this.attributes.set(name, value); }
@@ -50,10 +55,14 @@ class RobotRuntime {
     now = 0;
     readonly callbacks = new Map<number, (at: number) => void>();
     readonly canvases: RobotElement[] = [];
-    readonly observers: Array<{ kind: string, callback: (entries: any[]) => void, disconnected: boolean }> = [];
+    readonly observers: Array<{ kind: string, callback: (entries: any[]) => void, disconnected: boolean, targets: unknown[] }> = [];
     readonly window = new RobotEvents() as RobotEvents & Record<string, any>;
     readonly document = new RobotEvents() as RobotEvents & Record<string, any>;
     readonly media = new RobotEvents() as RobotEvents & { matches: boolean };
+    readonly queries = new Map<string, RobotEvents & { matches: boolean }>();
+    readonly visualViewport = new RobotEvents();
+    readonly canvasStyle = { objectFit: 'contain', objectPosition: '50% 50%' };
+    styleReads = 0;
     readonly stage: RobotElement;
     readonly lab: any;
     private frameId = 0;
@@ -62,28 +71,33 @@ class RobotRuntime {
         const runtime = this;
         Object.assign(this.window, {
             devicePixelRatio: 1,
-            getComputedStyle: () => ({ objectFit: 'contain', objectPosition: '50% 50%' }),
+            visualViewport: this.visualViewport,
+            getComputedStyle: () => { this.styleReads++; return this.canvasStyle; },
             performance: { now: () => this.now },
             crypto: { getRandomValues: (values: Uint32Array) => { values[0] = seed; return values; } },
-            matchMedia: () => this.media,
+            matchMedia: (query: string) => {
+                if (query === '(prefers-reduced-motion: reduce)') { return this.media; }
+                if (!this.queries.has(query)) { this.queries.set(query, Object.assign(new RobotEvents(), { matches: true })); }
+                return this.queries.get(query)!;
+            },
             requestAnimationFrame: (callback: (at: number) => void) => { this.callbacks.set(++this.frameId, callback); return this.frameId; },
             cancelAnimationFrame: (id: number) => this.callbacks.delete(id),
             ['IntersectionObserver']: class {
                 readonly state;
                 constructor(callback: (entries: any[]) => void) {
-                    this.state = { kind: 'intersection', callback, disconnected: false };
+                    this.state = { kind: 'intersection', callback, disconnected: false, targets: [] as unknown[] };
                     runtime.observers.push(this.state);
                 }
-                observe() {}
+                observe(target: unknown) { this.state.targets.push(target); }
                 disconnect() { this.state.disconnected = true; }
             },
             ['ResizeObserver']: class {
                 readonly state;
                 constructor(callback: (entries: any[]) => void) {
-                    this.state = { kind: 'resize', callback, disconnected: false };
+                    this.state = { kind: 'resize', callback, disconnected: false, targets: [] as unknown[] };
                     runtime.observers.push(this.state);
                 }
-                observe() {}
+                observe(target: unknown) { this.state.targets.push(target); }
                 disconnect() { this.state.disconnected = true; }
             },
         });
@@ -113,7 +127,8 @@ class RobotRuntime {
     dispose() {
         this.lab.dispose();
         assert.strictEqual(this.callbacks.size, 0);
-        assert.strictEqual(this.document.count + this.media.count + this.window.count, 0);
+        assert.strictEqual(this.document.count + this.media.count + this.window.count + this.visualViewport.count
+            + [...this.queries.values()].reduce((sum, query) => sum + query.count, 0), 0);
         assert.ok(this.observers.every(observer => observer.disconnected));
         assert.ok(this.canvases.every(canvas => canvas.width * canvas.height === 0));
     }
@@ -173,6 +188,121 @@ describe('the procedural PDF robot fleet', function () {
                 runtime.lab.update({ ...ready, visible: [12], pending: [] });
             }
             assert.strictEqual(runtime.lab.snapshot().renderer.frames, frames, 'identical quarter-second diagnostics do not repaint a settled canvas');
+            assert.strictEqual(runtime.callbacks.size, 0);
+        } finally { runtime.dispose(); }
+    });
+
+    it('shares one stable geometry read across lab paints and multiple courier destinations', () => {
+        const runtime = new RobotRuntime(robots);
+        try {
+            runtime.lab.update(ready); runtime.lab.setActive(true);
+            const canvas = runtime.stage.children.find(node => node.className === 'robot-canvas')!;
+            assert.ok(runtime.lab.dispatch.reserve('quad'));
+            assert.ok(runtime.lab.dispatch.reserve('mecanum'));
+            const frames = runtime.lab.snapshot().renderer.frames;
+            for (let index = 0; index < 30; index++) {
+                runtime.document.emit('pointerdown');
+                assert.ok(runtime.lab.dispatch.destination('quad'));
+                assert.ok(runtime.lab.dispatch.destination('mecanum'));
+            }
+            assert.strictEqual(runtime.lab.snapshot().renderer.frames, frames + 30);
+            assert.strictEqual(canvas.rectReads, 1, 'unchanged paint and dispatch consumers share the measured canvas');
+            assert.strictEqual(runtime.styleReads, 1, 'object fitting is not recomputed from DOM styles per actor');
+            assert.strictEqual(runtime.callbacks.size, 0, 'geometry reuse does not start an idle frame loop');
+        } finally { runtime.dispose(); }
+    });
+
+    it('keeps static caption styles out of repeated lab paints', () => {
+        const runtime = new RobotRuntime(robots);
+        try {
+            runtime.lab.update(ready); runtime.lab.setActive(true);
+            const caption = runtime.stage.children.find(node => node.className === 'robot-caption')!;
+            const writes = caption.styleWrites;
+            assert.ok(writes > 0);
+            for (let index = 0; index < 30; index++) { runtime.document.emit('pointerdown'); }
+            assert.strictEqual(caption.styleWrites, writes, 'stable styling must not invalidate layout before the next geometry read');
+        } finally { runtime.dispose(); }
+    });
+
+    it('invalidates shared geometry for real size, viewport, density and lifecycle changes without polling', () => {
+        const runtime = new RobotRuntime(robots);
+        try {
+            runtime.lab.update(ready); runtime.lab.setActive(true);
+            const canvas = runtime.stage.children.find(node => node.className === 'robot-canvas')!;
+            runtime.lab.dispatch.reserve('quad');
+            const point = () => runtime.lab.dispatch.destination('quad');
+            const first = point();
+            const checkReadOnce = (previous: number) => {
+                const result = point();
+                assert.deepStrictEqual(point(), result);
+                assert.strictEqual(canvas.rectReads, previous + 1);
+                assert.strictEqual(runtime.callbacks.size, 0);
+                return result;
+            };
+            let reads = canvas.rectReads;
+            canvas.rect.left += 70; canvas.rect.top -= 40;
+            runtime.lab.invalidateGeometry();
+            assert.strictEqual(canvas.rectReads, reads, 'a panel move invalidates lazily');
+            let moved = checkReadOnce(reads);
+            assert.strictEqual(moved.x - first.x, 70); assert.strictEqual(moved.y - first.y, -40);
+
+            reads = canvas.rectReads;
+            canvas.rect.width = 300; canvas.rect.height = 86;
+            runtime.canvasStyle.objectPosition = '25% 75%';
+            const resize = runtime.observers.find(observer => observer.kind === 'resize' && observer.targets.includes(canvas))!;
+            assert.ok(resize, 'the actual canvas is observed even if the surrounding stage keeps its dimensions');
+            resize.callback([{ target: canvas }]);
+            moved = checkReadOnce(reads);
+            const actor = runtime.lab.snapshot().actors.find((candidate: any) => candidate.vehicle === 'quad');
+            assert.ok(Math.abs(moved.x - (canvas.rect.left + (300 - 480 * 86 / 250) / 4 + actor.x * 86 / 250)) < 1e-8);
+            assert.ok(Math.abs(moved.y - (canvas.rect.top + actor.y * 86 / 250)) < 1e-8);
+
+            for (const [target, event] of [[runtime.window, 'resize'], [runtime.visualViewport, 'resize'], [runtime.visualViewport, 'scroll']] as const) {
+                reads = canvas.rectReads; canvas.rect.left += 5;
+                target.emit(event); checkReadOnce(reads);
+            }
+            reads = canvas.rectReads;
+            const oldScale = point().scale;
+            const oldDensity = runtime.queries.get('(resolution: 1dppx)')!;
+            assert.ok(oldDensity);
+            runtime.window.devicePixelRatio = 4; oldDensity.emit('change');
+            assert.strictEqual(checkReadOnce(reads).scale, oldScale / 2);
+            assert.strictEqual(oldDensity.count, 0, 'the obsolete density query is released');
+            assert.strictEqual(runtime.queries.get('(resolution: 4dppx)')!.count, 1);
+
+            reads = canvas.rectReads; runtime.document.hidden = true; runtime.document.emit('visibilitychange');
+            canvas.rect.top += 20;
+            assert.strictEqual(point(), undefined);
+            assert.strictEqual(canvas.rectReads, reads);
+            runtime.document.hidden = false; runtime.document.emit('visibilitychange'); checkReadOnce(reads);
+            reads = canvas.rectReads; runtime.lab.setActive(false); canvas.rect.left += 20;
+            runtime.lab.setActive(true); checkReadOnce(reads);
+            const callbacks = runtime.observers.map(observer => observer.callback);
+            runtime.lab.dispose();
+            reads = canvas.rectReads;
+            for (const callback of callbacks) { callback([{ isIntersecting: true, target: canvas }]); }
+            oldDensity.emit('change'); runtime.lab.invalidateGeometry();
+            assert.strictEqual(canvas.rectReads, reads, 'late observer delivery cannot measure a disposed stage');
+            assert.strictEqual(runtime.callbacks.size, 0);
+        } finally { runtime.dispose(); }
+    });
+
+    it('does not cache an unusable canvas or reserve a courier from a disconnected stage', () => {
+        const runtime = new RobotRuntime(robots);
+        try {
+            const canvas = runtime.stage.children.find(node => node.className === 'robot-canvas')!;
+            canvas.rect.width = canvas.rect.height = 0;
+            runtime.lab.update(ready); runtime.lab.setActive(true);
+            assert.strictEqual(runtime.lab.dispatch.reserve('quad'), undefined, 'zero-size placement is not a dispatch origin');
+            assert.strictEqual(runtime.callbacks.size, 0);
+            canvas.rect = { left: 70, top: 40, width: 480, height: 250 };
+            assert.ok(runtime.lab.dispatch.reserve('quad'), 'the first real placement is measured even before a resize observer arrives');
+            const placed = runtime.lab.dispatch.destination('quad');
+            canvas.isConnected = false;
+            assert.strictEqual(runtime.lab.dispatch.destination('quad'), undefined);
+            assert.strictEqual(runtime.lab.dispatch.reserve('mecanum'), undefined);
+            canvas.rect.left += 30; canvas.isConnected = true;
+            assert.strictEqual(runtime.lab.dispatch.destination('quad').x, placed.x + 30, 'reconnection cannot reuse the old viewport position');
             assert.strictEqual(runtime.callbacks.size, 0);
         } finally { runtime.dispose(); }
     });
