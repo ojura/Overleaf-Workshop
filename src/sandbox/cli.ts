@@ -160,8 +160,9 @@ replica-status  Shows whether the window is connected to Overleaf, how it watche
 Exit status of both: 0 in sync (replica-status: the window answered); 3 a file could not
 be synced, has conflict markers, or waits for a deletion to be confirmed, listed; 4 an IDE
 window does not keep the folder in sync (the IDE is not running, or it has not opened the
-folder as a replica); 5 the window did not answer in time; 1 the tool failed; 2 wrong
-arguments.
+folder as a replica); 5 the window did not answer in time; 1 the tool failed, also when it
+cannot reach the window that keeps the folder in sync, e.g. as the socket's path is too
+long for the system (the message says why); 2 wrong arguments.
 
 replica-land    Lands <commit> of the replica's git repository in the project, then compiles
                 the project. The commit must descend from the checked-out commit, which
@@ -201,8 +202,9 @@ replica-land    Lands <commit> of the replica's git repository in the project, t
 --main <file>   the main document; by default the project's
 --no-compile    land and check, without the compile
 Exit status: 0 landed and compiled without errors; 3 landed, but the compile or a check
-failed; 1 stopped before the push, or the push failed (the message says why); 4 and 5 as
-for replica-sync; 2 wrong arguments.
+failed; 1 stopped before the push, also when the tool cannot reach the window that keeps
+the folder in sync, or the push failed (the message says why); 4 and 5 as for
+replica-sync; 2 wrong arguments.
 
 replica-connect Connects a development history with the replica's repository, for a history
                 that started from a copy of the project's files. It fetches --ref (default
