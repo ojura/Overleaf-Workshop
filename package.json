@@ -906,7 +906,7 @@
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "node ./out/test/runTest.js",
-    "test:unit": "tsc -p ./ && mocha \"out/test/**/*.test.js\"",
+    "test:unit": "tsc -p ./ && { mocha --ignore out/test/base.test.js \"out/test/**/*.test.js\"; mocha_status=$?; node --test out/test/base.test.js \"scripts/**/*.test.mjs\"; node_test_status=$?; exit $((mocha_status || node_test_status)); }",
     "test:pdf-viewer": "tsc -p ./ && mocha \"out/test/pdf*.test.js\" && npm run test:safari:offline",
     "test:safari:offline": "node --test scripts/pdf-viewer-harness/safari/*.test.mjs && python3 -B -m unittest discover -s scripts/pdf-viewer-harness/safari -p 'test_*.py'",
     "test:api": "tsc -p ./ && node --test out/test/base.test.js",

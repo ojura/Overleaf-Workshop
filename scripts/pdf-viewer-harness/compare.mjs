@@ -1,47 +1,92 @@
-// Runs both viewers through drive.mjs and prints a side-by-side table.
-//   node compare.mjs [--ext <views/pdf-viewer dir>] [--overleaf DIR] [--pdfjs DIR] [--port 8785]
-//                    [--engines overleaf,pdfjs] [--runs frame:40,frame:150,plain:40] [--out DIR]
+// Runs both viewers through drive.mjs and prints a side-by-side table: drive.mjs's measurements, and
+// each check that a run reported, by its name, with n/a for a run that did not report it (a check
+// of one viewer only).
+//   node compare.mjs [--ext <views/pdf-viewer dir>] [--overleaf DIR] [--pdfjs DIR] [--port N]
+//                    [--engines pdfjs,overleaf] [--runs frame:40,frame:150,plain:40] [--out DIR]
 // --ext defaults to the checkout's views/pdf-viewer; --overleaf and --pdfjs take one viewer from
 // another folder, for example another checkout's. By default each viewer runs as VS Code shows it
 // (frame) at 40 and 150 ms per request, and as a plain page at 40 ms. The results go to --out, by
 // default compare/ in the work folder (common.mjs): <engine>-<mode>-<latency>.json and .log for
-// each run, and table.md.
+// each run, and table.md. Exit status 0 when every run passed all its checks, 1 when a run failed
+// a check, failed itself or did not write a result; a run that a signal ended stops the comparison, with
+// that run's status.
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { arg, defaultExt, here, work } from './common.mjs';
+import { EXIT_CODES } from '../lib/cleanup.mjs';
+import { scriptOptions } from '../lib/options.mjs';
+import { defaultExt, here, work } from './common.mjs';
+import { ENGINES } from './viewers.mjs';
 
-const ext = arg('ext', defaultExt);
-const exts = { overleaf: arg('overleaf', ext), pdfjs: arg('pdfjs', ext) };
-const engines = (arg('engines', 'overleaf,pdfjs')).split(',');
-const port = Number(arg('port', '8785'));
-const runs = (arg('runs', 'frame:40,frame:150,plain:40')).split(',').map(r => {
-    const [mode, latency] = r.split(':');
-    return { framed: mode === 'frame', latency: Number(latency) };
+// --<engine> DIR for each viewer, as --pdfjs and --overleaf
+const options = scriptOptions({ ext: 'value', ...Object.fromEntries(ENGINES.map(engine => [engine, 'value'])), engines: 'value', port: 'number', runs: 'value', out: 'value' });
+
+/**
+ * The last resort for a drive that never ends: drive.mjs ends on its own, also when the viewer
+ * hangs, since each of its waits has a limit; a run takes about a minute.
+ */
+const RUN_LIMIT_MS = 600000;
+
+const ext = options.get('ext', defaultExt);
+const exts = Object.fromEntries(ENGINES.map(engine => [engine, options.get(engine, ext)]));
+const engines = options.get('engines', ENGINES.join(',')).split(',');
+const unknown = engines.filter(engine => !ENGINES.includes(engine));
+if (unknown.length) {
+    console.error(`--engines takes ${ENGINES.join(', ')}, not ${unknown.join(', ')}`);
+    process.exit(64);
+}
+const port = options.get('port');
+const runs = (options.get('runs', 'frame:40,frame:150,plain:40')).split(',').map(r => {
+    const parts = r.split(':');
+    const [mode, text] = parts;
+    const latency = Number(text);
+    if (parts.length !== 2 || !['frame', 'plain'].includes(mode) || !text.trim() || !Number.isFinite(latency) || latency < 0) {
+        console.error(`--runs takes frame:LATENCY or plain:LATENCY with a finite nonnegative latency, not ${JSON.stringify(r)}`);
+        process.exit(64);
+    }
+    return { framed: mode === 'frame', latency };
 });
-const outDir = path.resolve(arg('out', path.join(work, 'compare')));
+const outDir = path.resolve(options.get('out', path.join(work, 'compare')));
 fs.mkdirSync(outDir, { recursive: true });
 
 const all = {};
+/** the runs that failed, with why */
+const failures = [];
 for (const engine of engines) {
     for (const run of runs) {
         const name = `${engine}-${run.framed ? 'frame' : 'plain'}-${run.latency}`;
         const json = path.join(outDir, `${name}.json`);
         fs.rmSync(json, { force: true });
         const args = [path.join(here, 'drive.mjs'), '--ext', path.resolve(exts[engine]), '--engine', engine, '--latency', String(run.latency),
-            '--port', String(port), '--json', json, '--shots', path.join(outDir, `shots-${name}`)];
+            ...(port ? ['--port', String(port)] : []), '--json', json, '--shots', path.join(outDir, `shots-${name}`)];
         if (run.framed) { args.push('--frame'); }
         console.log(`running ${name} ...`);
-        const result = spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 600000 });
+        // at the limit drive.mjs gets SIGTERM, ends as on Ctrl+C (scripts/lib/cleanup.mjs) and stops its Chrome
+        const result = spawnSync(process.execPath, args, { encoding: 'utf8', timeout: RUN_LIMIT_MS });
         fs.writeFileSync(path.join(outDir, `${name}.log`), `${result.stdout}\n${result.stderr}`);
         all[name] = fs.existsSync(json) ? JSON.parse(fs.readFileSync(json, 'utf8')) : { error: result.stderr || 'drive.mjs did not write a result' };
+        if (result.error?.code === 'ETIMEDOUT') {
+            failures.push(`${name}: still running after ${RUN_LIMIT_MS / 1000} s, ended with SIGTERM`);
+        } else if (Object.values(EXIT_CODES).includes(result.status)) {
+            console.log(`${name} ended by a signal (exit status ${result.status}); the comparison stops`);
+            process.exit(result.status);
+        } else if (result.error) {
+            failures.push(`${name}: could not run drive.mjs: ${result.error.message}`);
+        } else if (result.status !== 0) {
+            failures.push(`${name}: drive.mjs exited with ${result.signal ?? `status ${result.status}`}`);
+        } else if (all[name].error) {
+            failures.push(`${name}: ${all[name].error}`);
+        }
     }
 }
 
 const cell = (r, f) => {
     try { const v = f(r); return v === undefined ? 'n/a' : String(v); } catch { return 'n/a'; }
 };
-const check = (r, name) => {
+const names = Object.keys(all);
+/** the checks that the runs reported, by name, in the order in which they first appear */
+const checkNames = [...new Set(names.flatMap(n => (all[n].results ?? []).map(c => c.name)))];
+const checkCell = (r, name) => {
     const c = r.results?.find(x => x.name === name);
     return c ? (c.ok ? 'yes' : 'NO') : 'n/a';
 };
@@ -52,18 +97,11 @@ const rows = [
     ['reload: swap (ms)', r => r.metrics.reloadSwapMs],
     ['reload: page 60 drawn (ms)', r => r.metrics.reloadRenderedMs],
     ['reload: MB through the bridge / from the server', r => `${r.metrics.reloadBridgeMB} / ${r.metrics.reloadServerMB}`],
-    ['reload: old pages stay during the load', r => check(r, 'reload: the old pages stay while the new build loads')],
-    ['reload: same page and offset on screen', r => check(r, 'reload: same page, same offset on screen')],
-    ['find: asks before downloading', r => check(r, 'find: the viewer asks before a search downloads the PDF')],
-    ['Ctrl+P reaches VS Code', r => check(r, 'Ctrl+P (Quick Open) reaches VS Code')],
-    ['Ctrl+Shift+P reaches VS Code', r => check(r, 'Ctrl+Shift+P (Command Palette) reaches VS Code')],
-    ['Ctrl+= zooms only the PDF', r => check(r, 'Ctrl+= stays with the viewer (VS Code would zoom its window too)')],
-    ['Ctrl+S does not download the PDF', r => check(r, 'Ctrl+S does not download the PDF through the bridge')],
     ['find: MB downloaded in 10 s', r => r.metrics.find10sBridgeMB],
+    ...checkNames.map(name => [name, r => checkCell(r, name)]),
     ['checks passed', r => `${r.results.filter(x => x.ok).length}/${r.results.length}`],
     ['console errors and warnings', r => r.problems.length],
 ];
-const names = Object.keys(all);
 let table = `| | ${names.join(' | ')} |\n|---|${names.map(() => '---').join('|')}|\n`;
 for (const [label, f] of rows) {
     table += `| ${label} | ${names.map(n => all[n].error ? 'error' : cell(all[n], f)).join(' | ')} |\n`;
@@ -76,3 +114,7 @@ for (const n of names) {
         console.log(`${n}: ${all[n].error ?? failed.map(f => `${f.name} (${f.detail})`).join('; ')}`);
     }
 }
+if (failures.length) {
+    console.log(`\n${failures.length} of ${names.length} runs failed:\n${failures.map(f => `  ${f}`).join('\n')}`);
+}
+process.exitCode = failures.length ? 1 : 0;

@@ -22,9 +22,12 @@ window) are in CLAUDE.local.md, which git leaves out.
   the PDF viewers and the chat view.
 - Build, test and lint:
   - `node node_modules/typescript/bin/tsc -p ./`
-  - `node node_modules/.bin/mocha "out/test/**/*.test.js"`. The test files load the extension's
-    modules against a stand-in for 'vscode' through one loader, src/test/standIn.ts, which leaves
-    require.cache as it found it, so the tests run from any compiled folder and in any order.
+  - `npm run test:unit`: it builds out/ as above, runs the tests in out/test with mocha, and with
+    `node --test` base.test.js, which is written for node:test, and the scripts' tests
+    (scripts/**/*.test.mjs); it fails when either runner fails.
+    The test files load the extension's modules against a stand-in for 'vscode' through one loader,
+    src/test/standIn.ts, which leaves require.cache as it found it, so the tests run from any
+    compiled folder and in any order.
   - `npx eslint src --ext ts`
 - PDF changes also run `npm run test:pdf-viewer`. This includes the maintained Safari lifecycle
   and recorder fixtures. [docs/safari-validation.md](docs/safari-validation.md) preserves the
@@ -56,6 +59,9 @@ window) are in CLAUDE.local.md, which git leaves out.
 - Experiments never write into a shared project or into a live local replica. Use a private copy
   of the project (`node out/sandbox/cli.js init`) and a test instance of the IDE
   (scripts/hidden-ide.sh).
+- A test instance in project mode holds a lock on its project, and a second start for the same
+  project refuses, naming the instance that holds the lock. That instance can be another agent's:
+  stop it only if you started it.
 - Never print a secret's value: a session cookie, a CSRF token, or an API, git or messaging token.
   That rules out shell tracing (`set -x`, `bash -x`) in a command that expands one, dumps of an
   environment with its values (`env`, `printenv`, `/proc/<pid>/environ`), echoes through

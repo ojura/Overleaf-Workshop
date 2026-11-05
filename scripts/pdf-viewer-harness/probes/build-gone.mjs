@@ -3,19 +3,24 @@
 // outputs, without a line about it; a build gone from the cache as well shows the 'gone' line and
 // tells the host once, naming the build; the host's build states show as lines, with Recompile
 // only where nothing more happens on its own; the host's next build removes the line.
-// Every wait is for an event in the page: a change of its DOM (a MutationObserver) or a message to
-// the host (the stub's log). Each has a limit of 60 s, the last resort for a page that never gets there.
-//   node probes/build-gone.mjs [--ext DIR] [--engine pdfjs|overleaf] [--port 8900]
-import { arg, book, openHarness } from '../common.mjs';
+// Every wait is for an event in the page: a change of its DOM (whenTruthy in scripts/lib/devtools.mjs)
+// or a message to the host (the stub's log). Each has a limit of 60 s, the last resort for a page
+// that never gets there.
+//   node probes/build-gone.mjs [--ext DIR] [--engine pdfjs|overleaf] [--port N]
+import { whenTruthy } from '../../lib/devtools.mjs';
+import { scriptOptions } from '../../lib/options.mjs';
+import { book, checker, openHarness } from '../common.mjs';
+import { BANNER, DEFAULT_ENGINE, ENGINES, SHOWN_BUILD } from '../viewers.mjs';
 
-const engine = arg('engine', 'pdfjs');
-const h = await openHarness({ name: `gone-${engine}`, port: Number(arg('port', '8900')), ext: arg('ext'), bookDir: book('book-20', 20, 64), latency: 10 });
+const options = scriptOptions({ engine: ENGINES, ext: 'value', port: 'number' });
+
+/** The last resort for each wait of the probe. */
+const LIMIT_MS = 60000;
+const engine = options.get('engine', DEFAULT_ENGINE);
+const h = await openHarness({ name: `gone-${engine}`, port: options.get('port'), ext: options.get('ext'), bookDir: book('book-20', 20, 64), latency: 10 });
 const { page, origin } = h;
-const results = [];
-const check = (name, ok, detail = '') => {
-    results.push(Boolean(ok));
-    console.log(`${ok ? 'PASS' : 'FAIL'}  ${engine}: ${name}${detail ? `  (${detail})` : ''}`);
-};
+const { check: checkOne, summary } = checker();
+const check = (name, ok, detail) => checkOne(`${engine}: ${name}`, ok, detail);
 const stats = async () => (await fetch(`${origin}/stats`)).json();
 async function gone(build, from) {
     const res = await fetch(`${origin}/gone?build=${build}&from=${from}`, { method: 'POST' });
@@ -24,43 +29,29 @@ async function gone(build, from) {
 const builds = await (await fetch(`${origin}/builds`)).json();
 const id = { a: builds.a.file.build, b: builds.b.file.build };
 
-/** Installed in each page: a promise that settles when `test()` holds, checked now and at each change of the DOM. */
-const helpers = `window.__until = (test, what) => new Promise((resolve, reject) => {
-    let timer;
-    const observer = new MutationObserver(() => { settle(); });
-    const settle = () => {
-        const value = test();
-        if (!value) { return false; }
-        observer.disconnect();
-        clearTimeout(timer);
-        resolve(value);
-        return true;
-    };
-    if (settle()) { return; }
-    observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
-    timer = setTimeout(() => { observer.disconnect(); reject(new Error('the page did not show ' + what + ' within 60 s')); }, 60000);
-});
-window.__first = (type) => Promise.race([
-    harness.first(type),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('the page did not post ' + type + ' within 60 s')), 60000)),
-]);
-true`;
-const banner = `document.getElementById('viewer-banner')`;
-const until = (test, what) => page.evaluate(`window.__until(() => ${test}, ${JSON.stringify(what)})`);
-const shown = (build) => until(`document.documentElement.dataset.shownBuild === ${JSON.stringify(build)}`, `build ${build}`);
-const line = (state) => until(`${banner}?.dataset.state === ${JSON.stringify(state)}`, `the line '${state}'`);
-const noLine = () => until(`!${banner} && 'none'`, 'no line');
-const first = (type) => page.evaluate(`window.__first(${JSON.stringify(type)})`);
-const hasRecompile = () => page.evaluate(`[...(${banner}?.querySelectorAll('button') ?? [])].some(b => b.textContent === 'Recompile')`);
+/** The value of `test`, an expression for the page, once it is truthy; fails naming `what` after LIMIT_MS. */
+const until = async (test, what) => {
+    const value = await page.evaluate(whenTruthy(test, LIMIT_MS));
+    if (!value) { throw new Error(`the page did not show ${what} within ${LIMIT_MS / 1000} s`); }
+    return value;
+};
+const shown = (build) => until(`${SHOWN_BUILD} === ${JSON.stringify(build)}`, `build ${build}`);
+const line = (state) => until(`(${BANNER})?.dataset.state === ${JSON.stringify(state)}`, `the line '${state}'`);
+const noLine = () => until(`!${BANNER} && 'none'`, 'no line');
+/** The stub's first event of `type`: logged already, or the next one; fails after LIMIT_MS. */
+const first = (type) => page.evaluate(`Promise.race([
+    harness.first(${JSON.stringify(type)}),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('the page did not post ' + ${JSON.stringify(type)} + ' within ${LIMIT_MS / 1000} s')), ${LIMIT_MS})),
+])`);
+const hasRecompile = () => page.evaluate(`[...((${BANNER})?.querySelectorAll('button') ?? [])].some(b => b.textContent === 'Recompile')`);
 
 let loaded;
 page.on('Page.loadEventFired', () => { loaded?.(); loaded = undefined; });
-/** Open the viewer page on a document of its own, with the helpers installed. */
+/** Open the viewer page on a document of its own, and wait for its load event. */
 async function open(doc) {
     const fired = new Promise(resolve => { loaded = resolve; });
     await page.send('Page.navigate', { url: `${origin}/page?engine=${engine}&doc=${doc}` });
     await fired;
-    await page.evaluate(helpers);
 }
 
 const problems = [];
@@ -72,7 +63,7 @@ try {
     await shown(id.a);
     const s = await stats();
     check('a build deleted from the compile server is shown from Overleaf\'s cache', s.cacheRequests > 0, `${s.cacheRequests} requests to the cache`);
-    check('without a line about it', !(await page.evaluate(`Boolean(${banner})`)));
+    check('without a line about it', !(await page.evaluate(`Boolean(${BANNER})`)));
     check('without telling the host that the build is gone', (await page.evaluate(`harness.messages('buildGone').length`)) === 0);
     const shownA = await page.evaluate(`harness.messages('buildShown').map(m => m.build)`);
     check('and the page tells the host which build it shows', shownA.includes(id.a), JSON.stringify(shownA));
@@ -94,12 +85,12 @@ try {
     check('the host compiling shows its line, without Recompile', !(await hasRecompile()));
     await page.evaluate(`harness.buildState('unchecked', 'fetch failed'); true`);
     await line('unchecked');
-    check('a failed check over a PDF shows quietly, without Recompile', !(await hasRecompile()) && await page.evaluate(`${banner}.classList.contains('under-way')`));
+    check('a failed check over a PDF shows quietly, without Recompile', !(await hasRecompile()) && await page.evaluate(`${BANNER}.classList.contains('under-way')`));
     await page.evaluate(`harness.buildState('compile-failed', 'Overleaf\\'s status is "failure"'); true`);
     await line('compile-failed');
-    const text = await page.evaluate(`${banner}.textContent`);
+    const text = await page.evaluate(`${BANNER}.textContent`);
     check('a failed compile shows why, and offers Recompile', text.includes('Overleaf\'s status is "failure"') && await hasRecompile(), text.slice(0, 90));
-    await page.evaluate(`[...${banner}.querySelectorAll('button')].find(b => b.textContent === 'Recompile').click(); true`);
+    await page.evaluate(`[...${BANNER}.querySelectorAll('button')].find(b => b.textContent === 'Recompile').click(); true`);
     await first('recompile');
     check('Recompile asks the host to compile', true);
 
@@ -118,6 +109,6 @@ try {
     check('run', false, String(error?.message ?? error));
 } finally {
     console.log(`${engine}: exceptions in the page:`, problems.length ? problems : 'none');
+    summary();
     await h.close();
-    process.exitCode = results.length && results.every(Boolean) ? 0 : 1;
 }
