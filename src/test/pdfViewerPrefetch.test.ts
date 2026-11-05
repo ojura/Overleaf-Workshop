@@ -610,7 +610,8 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.deepStrictEqual(f.column.layers, [layer]);
         unregister(); assert.strictEqual(f.column.releases, 1);
         const panel = { visible: true, dock: 'right', rect: { x: 650, y: 40, width: 350, height: 500 }, reason: 'dock' };
-        (f.container as any).diagnosticsOptions.onPanelLayout(panel);
+        assert.strictEqual((f.container as any).diagnosticsOptions.onPanelLayout(panel), undefined,
+            'a stationary column does not delay panel docking');
         assert.deepStrictEqual(f.column.panels, [panel]);
         f.controller.prepareReplacement('next-edition'); f.eventBus.emit('pagesdestroy');
         assert.strictEqual(fleet.replacement, 'next-edition');
@@ -618,6 +619,12 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         f.columnSettings.onTransition(motion);
         assert.strictEqual(fleet.replacement, undefined, 'a fresh docking scene cancels the captured retirement first');
         assert.strictEqual(fleet.columnMotions.at(-1), motion);
+        f.column.transition = motion;
+        assert.deepStrictEqual((f.container as any).diagnosticsOptions.onPanelLayout(panel),
+            { readyAt: motion.startedAt + motion.durationMs }, 'docking follows the owned column scene deadline');
+        f.column.transition = undefined;
+        assert.strictEqual((f.container as any).diagnosticsOptions.onPanelLayout(panel), undefined,
+            'a finished or cancelled column leaves no stale docking delay');
         f.columnSettings.onTransition(undefined);
         assert.strictEqual(fleet.columnMotions.at(-1), undefined);
         f.container.emit('pointerdown', { isTrusted: false });

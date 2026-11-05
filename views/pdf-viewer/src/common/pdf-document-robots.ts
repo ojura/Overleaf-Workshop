@@ -5,6 +5,7 @@ import { LabelPlacementSolver, LABEL_PLACEMENT_LIMITS, type LabelPlacement, type
 import { ASAP_CLEANER_ARTWORK_SIZE, paintAsapCleaner } from './robot-cleaner-artwork';
 import { computeCargoRoute, needsCargoAirlift, clampGroundRoutePoint, GROUND_ROUTE_MAX_SLOPE, CARGO_ROUTE_POLICY, type CargoRouteState } from './robot-cargo-routes';
 import type { PdfDocumentColumnTransition } from './pdf-document-column';
+import { MOTION_LAB_CHOREOGRAPHY, motionLabColumnElapsed, motionLabEase } from './motion-lab-choreography';
 import { canCarryRobot } from './robot-rescue';
 import { robotScreenMetrics, robotCaptionMetrics, ROBOT_CAPTION_STYLE } from './robot-screen-scale';
 import { RobotTraffic } from './robot-traffic';
@@ -222,6 +223,9 @@ interface ColumnPull {
     layer: HTMLDivElement;
     start: Point & { scale: number };
     point: Point & { scale: number };
+    offsetX: number;
+    startOpacity: number;
+    opacity: number;
     laneY: number;
     side: -1 | 1;
     phase: 'approach' | 'pull' | 'return';
@@ -992,36 +996,44 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             return;
         }
         if (columnPull?.motion.id === motion.id) { return; }
-        clearColumnPull();
         const area = motion.bounds;
         if (disposed || !enabled || hidden() || media.matches || !area
             || ![motion.fromX, motion.toX, motion.startedAt, motion.durationMs, area.x, area.y, area.width, area.height].every(Number.isFinite)
-            || motion.durationMs <= 0 || motion.durationMs > 2000 || area.width <= 0 || area.height <= 0
-            || Math.abs(motion.toX - motion.fromX) < 0.5) { return; }
+            || motion.durationMs <= 0 || motion.durationMs > MOTION_LAB_CHOREOGRAPHY.columnDurationMs || area.width <= 0 || area.height <= 0
+            || Math.abs(motion.toX - motion.fromX) < 0.5) { clearColumnPull(); return; }
         clearRetiring(); releaseCleaner();
         const viewport = viewportBounds(), policy = presentation(viewport);
-        if (actorCount() >= policy.maxActors || allActors().some(actor => actor.vehicle === 'forklift')) { return; }
+        const previous = columnPull;
+        if (actorCount() - Number(!!previous) >= policy.maxActors
+            || allActors().some(actor => actor !== previous?.body && actor.vehicle === 'forklift')) { clearColumnPull(); return; }
         const side: -1 | 1 = motion.toX < motion.fromX ? 1 : -1;
         const pull = ROBOT_FORKLIFT_ATTACHMENT.pull[side === 1 ? 'right' : 'left'];
         const top = Math.max(area.y, viewport.top), bottom = Math.min(area.y + area.height, viewport.bottom);
-        const body = makeBody(new Set(allActors().map(actor => actor.vehicle)), policy, vehicle => vehicle === 'forklift',
+        const body = previous?.body ?? makeBody(new Set(allActors().map(actor => actor.vehicle)), policy, vehicle => vehicle === 'forklift',
             (_vehicle, origin) => !origin || origin.y + pull.y * ROBOT_FORKLIFT_ATTACHMENT.scale * policy.spriteScale >= top
                 && origin.y + pull.y * ROBOT_FORKLIFT_ATTACHMENT.scale * policy.spriteScale <= bottom);
         if (!body) { return; }
-        let layer: HTMLDivElement | undefined;
+        let layer = previous?.layer;
         try {
             syncSceneOrigin();
-            const laneY = body.origin?.y ?? clamp(area.y + area.height * 0.8, top + 80, Math.max(top + 80, bottom - 35));
-            const edgeX = area.x + (side === 1 ? 0 : area.width) + documentOffset();
+            const offsetX = documentOffset();
+            // The compositor can advance between actor paints. Continue from the
+            // displayed point while keeping this actor's sprite and Lab reservation.
+            const displayed = previous && { ...previous.point, x: previous.point.x + offsetX - previous.offsetX };
+            const laneY = displayed?.y ?? body.origin?.y ?? clamp(area.y + area.height * 0.8, top + 80, Math.max(top + 80, bottom - 35));
+            const edgeX = area.x + (side === 1 ? 0 : area.width) + offsetX;
             const targetX = edgeX - pull.x * ROBOT_FORKLIFT_ATTACHMENT.scale * policy.spriteScale;
-            const start = body.origin ? { ...body.origin, scale: body.origin.scale ?? policy.spriteScale }
-                : { x: targetX - side * 110, y: laneY, scale: policy.spriteScale };
-            layer = doc.createElement('div');
-            layer.className = 'pdfDocumentRobotColumnPull'; layer.setAttribute('aria-hidden', 'true');
-            Object.assign(layer.style, { position: 'absolute', inset: '0', pointerEvents: 'none' });
-            layer.append(body.sprite); container.append(transit); transit.append(layer);
+            const start = displayed ?? (body.origin ? { ...body.origin, scale: body.origin.scale ?? policy.spriteScale }
+                : { x: targetX - side * 110, y: laneY, scale: policy.spriteScale });
+            const opacity = previous?.opacity ?? (body.origin ? 1 : 0);
+            if (!layer) {
+                layer = doc.createElement('div');
+                layer.className = 'pdfDocumentRobotColumnPull'; layer.setAttribute('aria-hidden', 'true');
+                Object.assign(layer.style, { position: 'absolute', inset: '0', pointerEvents: 'none' });
+                layer.append(body.sprite); container.append(transit); transit.append(layer);
+            }
             columnPull = { motion: { ...motion, bounds: { ...area } }, body, layer, start,
-                point: { ...start }, laneY, side, phase: 'approach' };
+                point: { ...start }, offsetX, startOpacity: opacity, opacity, laneY, side, phase: 'approach' };
             activePresentation = policy.kind;
             requestPaint();
         } catch {
@@ -1041,14 +1053,16 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             clearColumnPull(); return;
         }
         const pull = ROBOT_FORKLIFT_ATTACHMENT.pull[side === 1 ? 'right' : 'left'];
-        const edgeX = motion.bounds!.x + (side === 1 ? 0 : motion.bounds!.width) + documentOffset();
+        const offsetX = documentOffset();
+        const edgeX = motion.bounds!.x + (side === 1 ? 0 : motion.bounds!.width) + offsetX;
         const target = { x: edgeX - pull.x * ROBOT_FORKLIFT_ATTACHMENT.scale * policy.spriteScale, y: active.laneY };
         const progress = clamp((at - motion.startedAt) / motion.durationMs, 0, 1);
-        const approach = ease(clamp(progress / 0.2, 0, 1));
+        const elapsed = motionLabColumnElapsed(at - motion.startedAt, motion.durationMs);
+        const approach = motionLabEase(elapsed / MOTION_LAB_CHOREOGRAPHY.approachMs);
         let point = straight(active.start, target, approach);
         let scale = active.start.scale + (policy.spriteScale - active.start.scale) * approach;
-        let opacity = body.origin ? 1 : Math.min(1, progress * 15);
-        active.phase = progress < 0.2 ? 'approach' : 'pull';
+        let opacity = active.startOpacity + (1 - active.startOpacity) * Math.min(1, progress * 15);
+        active.phase = elapsed < MOTION_LAB_CHOREOGRAPHY.approachMs ? 'approach' : 'pull';
         if (at >= end || active.returnAt !== undefined) {
             active.returnAt ??= end;
             active.returnFrom ??= { ...target, scale: policy.spriteScale };
@@ -1061,7 +1075,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             scale = active.returnFrom.scale + ((destination.scale ?? policy.spriteScale) - active.returnFrom.scale) * amount;
             opacity = destination === dock ? 1 : 1 - amount;
         }
-        active.point = { ...point, scale };
+        active.point = { ...point, scale }; active.offsetX = offsetX; active.opacity = opacity;
         placements.push({ body, point, scale, opacity, tilt: 0, activity: active.phase === 'pull' ? 'assist' : 'navigate',
             carrying: false, progress: Math.round(progress * 12) / 12, look: side, phase: 'parked', fixed: true,
             remainingMs: end + DOCUMENT_ROBOT_LIMITS.advance.returnMs - at, pages: [...visible],

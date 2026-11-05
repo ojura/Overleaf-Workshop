@@ -249,7 +249,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         try {
             await esbuild.build({ ...bundleOptions, entryPoints: [path.join(viewerRoot, 'src/common/pdf-document-robots.ts')], outfile: path.join(directory, 'document.mjs') });
             await esbuild.build({ ...bundleOptions, entryPoints: [path.join(viewerRoot, 'src/common/prefetch-robots.ts')], outfile: path.join(directory, 'artwork.mjs') });
-            module = { ...await importModule(path.join(directory, 'document.mjs')), ...await importModule(path.join(directory, 'artwork.mjs')) };
+            await esbuild.build({ ...bundleOptions, entryPoints: [path.join(viewerRoot, 'src/common/motion-lab-choreography.ts')], outfile: path.join(directory, 'choreography.mjs') });
+            module = { ...await importModule(path.join(directory, 'document.mjs')), ...await importModule(path.join(directory, 'artwork.mjs')),
+                ...await importModule(path.join(directory, 'choreography.mjs')) };
         } finally { await esbuild.stop(); }
     });
     afterEach(() => { for (const fixture of fixtures.splice(0)) { fixture.dispose(); } });
@@ -713,6 +715,98 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.finish();
         assert.strictEqual(f.api.snapshot().columnPull, undefined);
         assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+    });
+
+    it('approaches for the shared interval and remains attached through the leisurely haul and settle', () => {
+        const timing = module.MOTION_LAB_CHOREOGRAPHY;
+        for (const toX of [-120, 120]) {
+            let offset = 0, transit: Element | undefined;
+            const f = fixture({ maxActors: 1, documentOffset: () => offset,
+                registerDocumentLayer: (layer: Element) => { transit = layer; return () => {}; } }); f.desktop();
+            const page = f.page(99); page.pageElement.rect.left = 250; f.api.setVisiblePages([99]);
+            const motion = { id: 1, fromX: 0, toX, startedAt: f.now, durationMs: timing.columnDurationMs,
+                reason: 'dock', dock: toX < 0 ? 'right' : 'left', bounds: { x: 250, y: 60, width: 400, height: 600 } };
+            f.api.setColumnTransition(motion);
+            const initial = f.api.snapshot(), actor = initial.columnPull;
+            assert.ok(actor, 'the renderer admits the complete shared column duration');
+            const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.actor))!;
+            const start = point(sprite), hand = module.ROBOT_FORKLIFT_ATTACHMENT.pull[toX < 0 ? 'right' : 'left'];
+            const edge = toX < 0 ? 250 : 650;
+            const attachment = hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * initial.spriteScale;
+            let previous = 0;
+            for (const elapsed of [250, 450, timing.approachMs, 900, 1400,
+                timing.approachMs + timing.haulMs, timing.columnDurationMs - 50, timing.columnDurationMs]) {
+                offset = toX * module.motionLabColumnProgress(elapsed);
+                transit!.style.translate = offset + 'px'; page.pageElement.rect.left = 250 + offset;
+                f.tick(elapsed - previous); previous = elapsed;
+                const state = f.api.snapshot();
+                assert.strictEqual(state.columnPull.actor, actor.actor);
+                assert.strictEqual(state.columnPull.deadline, actor.deadline);
+                const current = point(sprite);
+                if (elapsed < timing.approachMs) {
+                    assert.strictEqual(Math.abs(offset), 0, 'the page waits for contact');
+                    assert.strictEqual(state.columnPull.phase, 'approach');
+                    const amount = module.motionLabEase(elapsed / timing.approachMs);
+                    assert.ok(Math.abs(current.x - (start.x + (edge - attachment - start.x) * amount)) < 0.05,
+                        'approach consumes the same smooth phase as the scene timeline');
+                } else {
+                    assert.strictEqual(state.columnPull.phase, elapsed < timing.columnDurationMs ? 'pull' : 'return');
+                    assert.ok(Math.abs(current.x + attachment - edge - offset) < 0.05,
+                        'the manipulator stays on the actual page edge through haul and stationary settle');
+                }
+                assert.strictEqual(state.activeActors, 1);
+                assert.strictEqual(state.cargoBytes + state.activePayloads, 0);
+            }
+            f.api.setColumnTransition(undefined); f.finish();
+            assert.strictEqual(f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+            assert.strictEqual(sprite.zeroWrites, 1);
+            assert.strictEqual(f.owned.flatMap(canvas => canvas.copies).length, 0);
+        }
+    });
+
+    it('retargets the same column actor from its displayed pose without releasing its reservation', () => {
+        for (const elapsed of [40, 200, 450]) {
+            let offset = 0, transit: Element | undefined, reserved = 0, released = 0;
+            const f = fixture({ maxActors: 1, documentOffset: () => offset,
+                registerDocumentLayer: (layer: Element) => { transit = layer; return () => {}; } }); f.desktop();
+            const page = f.page(99); page.pageElement.rect.left = 250; f.api.setVisiblePages([99]);
+            const borrowed = elapsed !== 450;
+            const dock = { x: 100, y: 300, scale: 1 };
+            if (borrowed) { f.api.setDispatchOrigin({ reserve: () => { reserved++; return dock; },
+                destination: () => dock, release: () => { released++; } }); }
+            const motion = { id: 1, fromX: 0, toX: -120, startedAt: f.now, durationMs: 400,
+                reason: 'dock', dock: 'right', bounds: { x: 250, y: 60, width: 400, height: 600 } };
+            f.api.setColumnTransition(motion);
+            const actor = f.api.snapshot().columnPull.actor;
+            const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor))!;
+            offset = -120 * module.motionLabColumnProgress(elapsed, motion.durationMs);
+            transit!.style.translate = offset + 'px'; page.pageElement.rect.left = 250 + offset;
+            f.tick(elapsed);
+            // The shared compositor can move after the actor's last 30 Hz paint.
+            offset -= 17; transit!.style.translate = offset + 'px'; page.pageElement.rect.left = 250 + offset;
+            const displayed = point(sprite), opacity = Number(sprite.style.opacity);
+            f.now += 1;
+            const next = { ...motion, id: 2, fromX: offset, toX: offset - 70, startedAt: f.now };
+            f.api.setColumnTransition(next);
+            assert.strictEqual(f.api.snapshot().columnPull.actor, actor, 'retarget keeps one actor and one sprite');
+            assert.strictEqual(reserved, Number(borrowed));
+            assert.strictEqual(released, 0);
+            assert.deepStrictEqual(point(sprite), displayed, 'retarget starts at the current displayed pose');
+            assert.strictEqual(Number(sprite.style.opacity), opacity, 'retarget preserves current visibility');
+            f.tick(34);
+            const hand = module.ROBOT_FORKLIFT_ATTACHMENT.pull.right;
+            const target = 250 + offset - hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * f.api.snapshot().spriteScale;
+            const amount = module.motionLabEase(module.motionLabColumnElapsed(34, next.durationMs)
+                / module.MOTION_LAB_CHOREOGRAPHY.approachMs);
+            assert.ok(Math.abs(point(sprite).x - (displayed.x + (target - displayed.x) * amount)) < 0.05,
+                'the new approach includes compositor movement since the prior paint');
+            offset = next.toX; transit!.style.translate = offset + 'px'; page.pageElement.rect.left = 250 + offset;
+            f.tick(next.durationMs - 34); f.api.setColumnTransition(undefined); f.finish();
+            assert.strictEqual(reserved, Number(borrowed));
+            assert.strictEqual(released, Number(borrowed));
+            assert.strictEqual(sprite.zeroWrites, 1);
+            assert.strictEqual(f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+        }
     });
 
     it('preempts the document pull for ready cargo and cancels it on hard lifecycle boundaries', () => {

@@ -20,10 +20,13 @@ class Wire:
         self.calls, self.domains = [], set()
         self.fail_finish = self.stop_active = False
         self.owner, self.token, self.aborts = False, None, 0
+        self.finish_seconds = 1
+        self.async_abort_required = self.lose_finish_ack = False
+        self.invocations = []
 
     async def prepare_initializer(self, source):
         self.calls.append('prepare-' + source)
-        return source
+        return 'abort' if 'p.abort(' in source else source
 
     async def command(self, method, **params):
         self.calls.append(method)
@@ -35,16 +38,31 @@ class Wire:
         elif method == 'Runtime.callFunctionOn':
             self.assert_recording()
             options = params['arguments'][0]['value']
+            self.invocations.append(copy.deepcopy(params))
             if params['objectId'] == 'active':
                 self.owner, self.token = True, options['token']
                 if self.stop_active:
                     self.stop.set()
                     await asyncio.Future()
                 value = {'token': self.token, 'active': {'page': 99}, 'errors': []}
+            elif params['objectId'] == 'abort':
+                if params.get('awaitPromise') is not True:
+                    raise AssertionError('Asynchronous panel recovery must be awaited')
+                if not self.owner:
+                    return {'result': {'type': 'object', 'value': {'missing': True}}}
+                self.aborts += 1
+                self.owner = False
+                return {'result': {'type': 'object', 'value': {'ok': True, 'result': {
+                    'token': self.token, 'interrupted': True, 'observersRemoved': True}}}}
             else:
                 if self.fail_finish:
                     raise RuntimeError('finish failed before restoration')
+                if self.finish_seconds > params['timeout']:
+                    raise TimeoutError('Finite panel choreography exceeded the finish RPC cap')
+                self.clock.at += self.finish_seconds - 1
                 self.owner = False
+                if self.lose_finish_ack:
+                    raise TimeoutError('The finish acted but its acknowledgement was lost')
                 value = {'token': self.token, 'active': {'page': 99}, 'panel': {'trials': [{}] * 5},
                     'restorationExact': True, 'focusRestored': True, 'observersRemoved': True, 'errors': [],
                     'restoredViewport': {'visible': True, 'focused': False, 'displayed': True, 'missingPages': []},
@@ -64,6 +82,8 @@ class Wire:
 
     async def evaluate(self, source, **kwargs):
         if 'p.abort(' in source:
+            if self.async_abort_required:
+                raise RuntimeError('Synchronous evaluate cannot await panel restoration')
             self.aborts += 1
             self.owner = False
             return {'ok': True, 'result': {'token': self.token, 'interrupted': True, 'observersRemoved': True}}
@@ -108,8 +128,37 @@ class ShortTests(unittest.IsolatedAsyncioTestCase):
     async def test_host_stop_cancels_the_pending_reply_then_restores_without_reinvocation(self):
         result, wire, _ = await self.run_case(stop_active=True)
         self.assertEqual(result['status'], 'interrupted')
-        self.assertEqual(wire.calls.count('Runtime.callFunctionOn'), 1)
+        self.assertEqual(sum(value['objectId'] == 'active' for value in wire.invocations), 1)
         self.assertEqual(wire.aborts, 1)
+        self.assertFalse(wire.domains or wire.owner)
+
+    async def test_finite_panel_choreography_has_a_shared_browser_and_host_budget(self):
+        result, wire, _ = await self.run_case(finish_seconds=40)
+        self.assertEqual(result['status'], 'passed')
+        active, finish = [value for value in wire.invocations if value['objectId'] != 'abort']
+        limits = active['arguments'][0]['value']['budget']
+        self.assertEqual(limits['activeMs'], active['timeout'] * 1000)
+        self.assertEqual(limits['finishMs'], finish['timeout'] * 1000)
+        self.assertEqual(limits['workMs'], limits['activeMs'] + limits['captureMs'] + limits['finishMs'])
+        self.assertGreaterEqual(limits['restoreMs'], 15000)
+        self.assertFalse(wire.domains or wire.owner)
+
+    async def test_failed_finish_awaits_panel_abort_with_recording_still_active(self):
+        result, wire, _ = await self.run_case(fail_finish=True, async_abort_required=True)
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(wire.aborts, 1)
+        self.assertEqual(result['cleanupErrors'], [])
+        self.assertTrue(result['probeRemoved'])
+        self.assertEqual(sum(value['objectId'] == 'abort' for value in wire.invocations), 1)
+        self.assertFalse(wire.domains or wire.owner)
+
+    async def test_lost_finish_ack_does_not_repeat_an_acted_operation(self):
+        result, wire, _ = await self.run_case(lose_finish_ack=True)
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['error']['type'], 'TimeoutError')
+        self.assertEqual(sum(value['objectId'] == 'active' for value in wire.invocations), 1)
+        self.assertEqual(sum(value['objectId'] == 'finish' for value in wire.invocations), 1)
+        self.assertTrue(result['probeRemoved'])
         self.assertFalse(wire.domains or wire.owner)
 
     async def test_manual_uses_the_same_recorder_with_its_own_passive_api_and_duration(self):

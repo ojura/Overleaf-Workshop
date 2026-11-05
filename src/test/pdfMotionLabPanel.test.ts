@@ -84,7 +84,7 @@ describe('Motion Lab panel geometry and controls', function () {
         }
     });
 
-    function fixture(onLayout?: (layout: any) => void) {
+    function fixture(onLayout?: (layout: any) => { readyAt: number } | void, motion = false) {
         class Events {
             readonly listeners = new Map<string, Set<(event: any) => void>>();
             addEventListener(name: string, listener: (event: any) => void) {
@@ -103,9 +103,17 @@ describe('Motion Lab panel geometry and controls', function () {
             observe() { this.disconnected = false; }
             disconnect() { this.disconnected = true; }
         }
+        let now = 0, nextFrame = 0;
+        const frames = new Map<number, (at: number) => void>();
+        const media = Object.assign(new Events(), { matches: !motion });
         const win: any = Object.assign(new Events(), {
             innerWidth: 1000, innerHeight: 800, visualViewport: visual,
-            requestAnimationFrame() { assert.fail('panel controls must not schedule animation frames'); },
+            performance: { now: () => now }, matchMedia: () => media,
+            requestAnimationFrame(callback: (at: number) => void) {
+                assert.ok(motion, 'reduced-motion controls must not schedule animation frames');
+                const id = ++nextFrame; frames.set(id, callback); return id;
+            },
+            cancelAnimationFrame(id: number) { frames.delete(id); },
             setInterval() { assert.fail('panel controls must not poll'); },
             setTimeout() { assert.fail('panel controls must not schedule delayed work'); },
         });
@@ -132,13 +140,20 @@ describe('Motion Lab panel geometry and controls', function () {
         let measured: typeof initial | undefined;
         const host = new Node(), surface = new Node(), drag = new Node(), resize = new Node();
         const buttons = { left: new Node(), right: new Node(), float: new Node() };
-        const layouts: any[] = [];
+        const layouts: any[] = [], painted: any[] = [];
         const panel = api.installMotionLabPanel(host, { surface, dragHandle: drag, resizeHandle: resize, dockButtons: buttons,
-            onLayout(layout: any) { layouts.push(layout); onLayout?.(layout); } });
+            onLayout(layout: any) { layouts.push(layout); return onLayout?.(layout); },
+            onGeometryChange() { painted.push(surface.getBoundingClientRect()); } });
         const pointer = (x: number, y: number, id = 1) => ({ button: 0, isPrimary: true, pointerId: id, clientX: x, clientY: y,
             preventDefault() {}, stopPropagation() {} });
         const key = (value: string, shiftKey = false) => ({ key: value, shiftKey, preventDefault() {}, stopPropagation() {} });
-        return { host, surface, drag, resize, buttons, visual, win, document, observers, layouts, panel, pointer, key,
+        return { host, surface, drag, resize, buttons, visual, win, document, observers, layouts, painted, panel, pointer, key,
+            frames, media,
+            advance(at: number) {
+                now = at;
+                const pending = [...frames.values()]; frames.clear();
+                for (const callback of pending) { callback(at); }
+            },
             measure(rect?: typeof initial) { measured = rect; } };
     }
 
@@ -338,5 +353,122 @@ describe('Motion Lab panel geometry and controls', function () {
         assert.strictEqual(f.layouts.at(-1).visible, false);
         assert.strictEqual(f.document.count(), 0);
         assert.strictEqual(f.win.count(), 0);
+    });
+
+    it('holds one docking destination while the column clears, then paints a finite glide without resize feedback', () => {
+        const f = fixture(layout => layout.reason === 'dock' ? { readyAt: 2500 } : undefined, true);
+        try {
+            f.panel.setVisible(true);
+            f.panel.setDock('left');
+            const target = { x: 18, y: 28, width: 340, height: 684 };
+            assert.deepStrictEqual(f.layouts.at(-1).rect, target);
+            assert.deepStrictEqual(f.panel.snapshot().rect, initial, 'the displayed panel waits for the column');
+            assert.strictEqual(f.host.dataset.panelMoving, 'true');
+            assert.strictEqual(f.frames.size, 1);
+            f.advance(500); f.advance(2500);
+            assert.deepStrictEqual(f.panel.snapshot().rect, initial);
+            f.advance(3100);
+            assert.deepStrictEqual(f.panel.snapshot().rect, { x: 159, y: 114, width: 340, height: 492 });
+            const count = f.layouts.length;
+            f.observers[0].callback();
+            assert.strictEqual(f.layouts.length, count, 'an intermediate measured size cannot overwrite the destination');
+            assert.deepStrictEqual(f.layouts.at(-1).rect, target);
+            assert.ok(f.painted.some(rect => rect.x === 159), 'courier geometry is invalidated for the actual painted position');
+            f.advance(3700);
+            assert.deepStrictEqual(f.panel.snapshot().rect, target);
+            assert.strictEqual(f.host.dataset.panelMoving, undefined);
+            assert.strictEqual(f.frames.size, 0);
+            f.advance(10_000);
+            assert.strictEqual(f.layouts.length, count, 'animation frames do not replan the column');
+        } finally { f.panel.dispose(); }
+    });
+
+    it('retargets and hands a moving panel to the pointer at its displayed rectangle', () => {
+        const f = fixture(undefined, true);
+        try {
+            f.panel.setVisible(true); f.panel.setDock('left'); f.advance(600);
+            const first = f.panel.snapshot().rect, stale = [...f.frames.values()][0];
+            f.panel.setDock('right');
+            assert.deepStrictEqual(f.panel.snapshot().rect, first, 'retargeting has no visual jump');
+            stale(10_000);
+            assert.deepStrictEqual(f.panel.snapshot().rect, first, 'the old frame cannot move its successor');
+            f.advance(1200);
+            const displayed = f.panel.snapshot().rect;
+            f.drag.emit('pointerdown', f.pointer(displayed.x + 40, displayed.y + 20));
+            assert.deepStrictEqual(f.panel.snapshot().rect, displayed, 'taking the title keeps its grabbed point');
+            assert.strictEqual(f.panel.snapshot().dock, 'float');
+            assert.strictEqual(f.frames.size, 0);
+            assert.strictEqual(f.host.dataset.panelMoving, undefined);
+            f.win.emit('pointermove', f.pointer(displayed.x + 60, displayed.y + 30));
+            assert.deepStrictEqual(f.panel.snapshot().rect, { ...displayed, x: displayed.x + 20, y: displayed.y + 10 });
+            f.win.emit('pointerup', f.pointer(displayed.x + 60, displayed.y + 30));
+            assert.strictEqual(f.frames.size, 0);
+        } finally { f.panel.dispose(); }
+    });
+
+    it('keeps the right resize edge anchored and keyboard movement immediate during docking', () => {
+        const f = fixture(undefined, true);
+        try {
+            f.panel.setVisible(true); f.panel.setDock('right'); f.advance(600);
+            const displayed = f.panel.snapshot().rect;
+            const point = { x: displayed.x, y: displayed.y + displayed.height };
+            f.resize.emit('pointerdown', f.pointer(point.x, point.y));
+            assert.deepStrictEqual(f.panel.snapshot().rect, displayed);
+            assert.strictEqual(f.host.dataset.dock, 'right', 'the captured resize handle stays on the inner edge');
+            f.win.emit('pointermove', f.pointer(point.x - 30, point.y));
+            assert.deepStrictEqual(f.panel.snapshot().rect, { ...displayed, x: displayed.x - 30, width: displayed.width + 30 });
+            f.win.emit('pointerup', f.pointer(point.x - 30, point.y));
+            assert.strictEqual(f.host.dataset.dock, 'float');
+            assert.strictEqual(f.frames.size, 0);
+            f.panel.setDock('left'); f.advance(1200);
+            const moving = f.panel.snapshot().rect, stale = [...f.frames.values()][0];
+            f.drag.emit('keydown', f.key('ArrowRight', true));
+            assert.deepStrictEqual(f.panel.snapshot().rect, { ...moving, x: moving.x + 40 });
+            assert.strictEqual(f.frames.size, 0);
+            const controlled = f.panel.snapshot();
+            stale(10_000);
+            assert.deepStrictEqual(f.panel.snapshot(), controlled);
+        } finally { f.panel.dispose(); }
+    });
+
+    it('cancels every docking frame on lifecycle changes and ignores callbacks owned by the old scene', () => {
+        for (const stop of ['close', 'hidden', 'viewport', 'reduced', 'dispose'] as const) {
+            const f = fixture(undefined, true);
+            try {
+                f.panel.setVisible(true); f.panel.setDock('left'); f.advance(300);
+                const stale = [...f.frames.values()][0];
+                if (stop === 'close') { f.panel.setVisible(false); }
+                else if (stop === 'hidden') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+                else if (stop === 'viewport') { f.visual.width = 280; f.visual.emit('resize'); }
+                else if (stop === 'reduced') { f.media.matches = true; f.media.emit('change'); }
+                else { f.panel.dispose(); }
+                const settled = f.panel.snapshot();
+                assert.strictEqual(f.frames.size, 0, stop);
+                assert.strictEqual(f.host.dataset.panelMoving, undefined, stop);
+                stale(10_000);
+                assert.deepStrictEqual(f.panel.snapshot(), settled, stop);
+                assert.strictEqual(f.frames.size, 0, stop);
+            } finally { f.panel.dispose(); }
+        }
+    });
+
+    it('does not schedule a superseded docking scene after a layout consumer closes or retargets it', () => {
+        let f: ReturnType<typeof fixture>, retarget = false;
+        f = fixture(layout => {
+            if (layout.reason !== 'dock') { return; }
+            if (!retarget) { f.panel.setVisible(false); }
+            else if (layout.dock === 'left') { f.panel.setDock('right'); }
+        }, true);
+        try {
+            f.panel.setVisible(true); f.panel.setDock('left');
+            assert.strictEqual(f.frames.size, 0);
+            retarget = true;
+            f.panel.setDock('float'); f.panel.setVisible(true); f.panel.setDock('left');
+            assert.strictEqual(f.panel.snapshot().dock, 'right');
+            assert.strictEqual(f.frames.size, 1);
+            f.advance(1200);
+            assert.strictEqual(f.panel.snapshot().rect.x, 562);
+            assert.strictEqual(f.frames.size, 0);
+        } finally { f.panel.dispose(); }
     });
 });

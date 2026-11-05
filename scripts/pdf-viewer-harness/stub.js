@@ -67,7 +67,7 @@
                     break;
                 }
                 const meta = JSON.parse(res.headers.get('x-bridge'));
-                const body = await res.arrayBuffer();
+                const body = new Uint8Array(await res.arrayBuffer());
                 // the answer names the page that asked, as the extension host's does
                 deliver({ type: 'fetchResponse', ...meta, page: message.page, body });
                 break;

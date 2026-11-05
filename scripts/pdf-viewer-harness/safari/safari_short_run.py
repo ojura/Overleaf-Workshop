@@ -9,6 +9,12 @@ import safari_runner as core
 from safari_settings import load_browser_source
 
 SIDECAR_API = '__spomenarSidecarProbe'
+# Nine finite panel/column settles can take about 33.3 seconds, followed by
+# the existing delivery/reader settling and awake proof. These are failure
+# limits, not delays: the browser finishes each action from observed state.
+SHORT_BUDGET_MS = {'activeMs': 35000, 'captureMs': 5000, 'finishMs': 60000, 'restoreMs': 15000,
+                   'settleMs': 6000, 'awakeMs': 4000}
+SHORT_BUDGET_MS['workMs'] = sum(SHORT_BUDGET_MS[key] for key in ('activeMs', 'captureMs', 'finishMs'))
 
 
 async def run_manual(wire, recorder, settings, seconds, budget, stop_event, checkpoint):
@@ -18,23 +24,27 @@ async def run_manual(wire, recorder, settings, seconds, budget, stop_event, chec
         probe_api='__spomenarManualProbe', manual=True)
 
 
-async def invoke(wire, source, options, budget, stop_event, cap):
-    handle = await core.bounded(wire.prepare_initializer(source), budget, 'work',
+async def invoke(wire, source, options, budget, stop_event, cap, *, phase='work'):
+    handle = await core.bounded(wire.prepare_initializer(source), budget, phase,
                                 core.INITIALIZER_PREPARE_SECONDS, 'prepare inert short observation')
-    if stop_event.is_set():
+    if stop_event is not None and stop_event.is_set():
         raise RuntimeError('Host stop arrived before the short observation invocation')
     operation = asyncio.create_task(core.bounded(wire.command('Runtime.callFunctionOn', timeout=cap,
         objectId=handle, functionDeclaration='function (options) { return this(options); }',
         arguments=[{'value': options}], returnByValue=True, awaitPromise=True, emulateUserGesture=False),
-        budget, 'work', cap, 'short observation Runtime.callFunctionOn'))
-    stopped = asyncio.create_task(stop_event.wait())
+        budget, phase, cap, 'short observation Runtime.callFunctionOn'))
+    stopped = asyncio.create_task(stop_event.wait()) if stop_event is not None else None
     try:
+        if stopped is None:
+            return wire.value(await operation, 'short observation')
         done, _ = await asyncio.wait((operation, stopped), return_when=asyncio.FIRST_COMPLETED)
         if operation not in done:
             raise RuntimeError('Host stop requested during the short observation')
         return wire.value(await operation, 'short observation')
     finally:
         for task in (operation, stopped):
+            if task is None:
+                continue
             if not task.done():
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -44,7 +54,7 @@ async def invoke(wire, source, options, budget, stop_event, cap):
 async def run_short(wire, recorder, settings, budget, stop_event, checkpoint):
     token = secrets.token_hex(12)
     receipt = {'status': 'running', 'scenario': 'short', 'token': token,
-               'cleanupErrors': [], 'screenshots': []}
+               'budgetMs': dict(SHORT_BUDGET_MS), 'cleanupErrors': [], 'screenshots': []}
     domains = []
     attempted = False
 
@@ -70,10 +80,10 @@ async def run_short(wire, recorder, settings, budget, stop_event, checkpoint):
         return {'file': filename.name, 'bytes': len(data)}
 
     async def abort():
-        expression = '(() => { const p=window[' + json.dumps(SIDECAR_API) + '];if(!p)return {missing:true};' + \
-            'if(p.token!==' + json.dumps(token) + ')return {wrongOwner:true};return p.abort(' + \
-            json.dumps(token) + ',"host-cleanup");})()'
-        value = await core.bounded(wire.evaluate(expression), budget, 'restore', label='short owner abort')
+        source = '(options => { const p=window[' + json.dumps(SIDECAR_API) + '];if(!p)return {missing:true};' + \
+            'if(p.token!==options.token)return {wrongOwner:true};return p.abort(options.token,"host-cleanup");})'
+        value = await invoke(wire, source, {'token': token}, budget, None,
+                             SHORT_BUDGET_MS['restoreMs'] / 1000, phase='restore')
         if value.get('wrongOwner') or value.get('ok') is False:
             raise RuntimeError('The short observation token changed')
         if value.get('result'):
@@ -95,16 +105,18 @@ async def run_short(wire, recorder, settings, budget, stop_event, checkpoint):
         attempted = True
         receipt['initializationAttemptedHostMs'] = budget.now() * 1000
         value = await invoke(wire, load_browser_source('sidecar-active.js'),
-            {'token': token, 'document': settings.document.browser()}, budget, stop_event, 35)
+            {'token': token, 'document': settings.document.browser(), 'budget': dict(SHORT_BUDGET_MS)},
+            budget, stop_event, SHORT_BUDGET_MS['activeMs'] / 1000)
         if not isinstance(value, dict) or value.get('token') != token:
             raise RuntimeError('Short observation did not acknowledge its token')
         receipt['active'] = value
         persist()
         if value.get('failure') or value.get('interrupted'):
             raise RuntimeError('Short observation stopped before its delivery sample')
-        receipt['screenshots'].append(await snapshot())
+        receipt['screenshots'].append(await core.bounded(snapshot(), budget, 'work',
+            SHORT_BUDGET_MS['captureMs'] / 1000, 'short delivery capture'))
         value = await invoke(wire, load_browser_source('sidecar-finish.js'), {'token': token},
-                             budget, stop_event, 25)
+                             budget, stop_event, SHORT_BUDGET_MS['finishMs'] / 1000)
         if not isinstance(value, dict) or value.get('token') != token:
             raise RuntimeError('Short finish did not acknowledge its token')
         receipt['result'] = value

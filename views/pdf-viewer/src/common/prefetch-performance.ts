@@ -1,5 +1,5 @@
 import { installPrefetchRobots, type RobotDispatchPort, type RobotLab } from './prefetch-robots';
-import { installMotionLabPanel, type MotionLabPanelLayout } from './motion-lab-panel';
+import { installMotionLabPanel, type MotionLabPanelLayout, type MotionLabPanelPreparation } from './motion-lab-panel';
 
 /** Bounded measurements shared by both PDF viewers and their fetch bridge. */
 export const PERFORMANCE_LIMITS = Object.freeze({
@@ -265,7 +265,7 @@ interface DiagnosticsOptions {
     toolbarBefore?: HTMLElement;
     measurementsMenu?: HTMLElement;
     onOpen?: () => void;
-    onPanelLayout?: (layout: MotionLabPanelLayout) => void;
+    onPanelLayout?: (layout: MotionLabPanelLayout) => MotionLabPanelPreparation | void;
     enabled?: boolean;
     robots?: {
         readonly enabled: boolean;
@@ -554,11 +554,8 @@ ${ROBOT_ICON}
                 right: root.querySelector<HTMLButtonElement>('[data-panel-dock="right"]')!,
                 float: root.querySelector<HTMLButtonElement>('[data-panel-dock="float"]')!,
             },
-            onLayout: layout => {
-                // A layout consumer can synchronously reserve or return a courier.
-                panelGeometryChanged();
-                options.onPanelLayout?.(layout);
-            },
+            onGeometryChange: panelGeometryChanged,
+            onLayout: layout => options.onPanelLayout?.(layout),
         });
     }
 

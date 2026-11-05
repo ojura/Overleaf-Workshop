@@ -2,10 +2,13 @@
   // @include payload-observation.mjs
   if (window.__spomenarSidecarProbe || window.__spomenarSustainedProbe) throw new Error('A phone observation is already active');
   const token = options?.token, expected = options?.document, targets = options?.pages ?? [99, 100];
+  const budget = options?.budget;
   if (typeof token !== 'string' || token.length < 16 || token.length > 128 || !expected
       || !/^[a-f0-9]{64}$/.test(expected.sha256) || !Number.isSafeInteger(expected.bytes) || expected.bytes <= 0
       || !Number.isInteger(expected.pages) || !Array.isArray(targets) || targets.length !== 2
-      || new Set(targets).size !== 2 || targets.some(page => !Number.isInteger(page) || page < 1 || page > expected.pages)) {
+      || new Set(targets).size !== 2 || targets.some(page => !Number.isInteger(page) || page < 1 || page > expected.pages)
+      || !budget || ['activeMs', 'captureMs', 'finishMs', 'workMs', 'restoreMs', 'settleMs', 'awakeMs'].some(key => !Number.isSafeInteger(budget[key]) || budget[key] <= 0)
+      || budget.workMs !== budget.activeMs + budget.captureMs + budget.finishMs) {
     throw new Error('Invalid sidecar observation options');
   }
   const pageUrl = new URL(expected.pageUrl), pdfUrl = new URL(expected.pdfUrl), here = new URL(location.href);
@@ -26,7 +29,7 @@
     sidebar: app.pdfSidebar?.visibleView, top: container.scrollTop, left: container.scrollLeft,
     robots: prefetch.robotsEnabled, lab: prefetch.diagnosticsEnabled });
   const saved = readState();
-  const result = { token, expected, startedAt: performance.now(), saved, focused: document.hasFocus(), samples: [], events: [], entries: [], errors: [],
+  const result = { token, expected, budget: { ...budget }, startedAt: performance.now(), saved, focused: document.hasFocus(), samples: [], events: [], entries: [], errors: [],
     refinements: [], retirements: [], interrupted: false, initialGeometry: { scrollWidth: container.scrollWidth,
       scrollHeight: container.scrollHeight, clientWidth: container.clientWidth, clientHeight: container.clientHeight } };
   const eventSequences = new Set(), payloadObservations = new PayloadObservations(), request = new AbortController();
@@ -46,7 +49,7 @@
       columnX: Number.parseFloat(getComputedStyle(container).getPropertyValue('--pdf-document-column-x')) || 0 };
   };
   result.savedPanel = panelState();
-  let timer, disposed = false, changed = false, panelRestore;
+  let timer, disposed = false, changed = false, closing = false, panelRestore, restoreInFlight, closeInFlight;
   const current = () => app.pdfDocument === pdfDocument && viewer.pdfDocument === pdfDocument
     && new URL(app.url, location.href).href === pdfUrl.href;
   const stop = event => {
@@ -68,34 +71,40 @@
     window.removeEventListener('error', error); window.removeEventListener('unhandledrejection', error);
     result.observersRemoved = true;
   };
-  const guard = () => {
+  const guard = (allowClosing = false) => {
     if (!current()) { result.interrupted = true; result.interruption = 'document changed'; dispose(); }
-    if (result.interrupted || disposed) throw new Error(result.interruption || 'Observation closed');
+    if (result.interrupted || disposed || closing && !allowClosing) throw new Error(result.interruption || 'Observation closed');
   };
   const restore = () => {
-    if (result.interrupted || !current()) return false;
-    if (!changed) { result.readingState = readState(); return true; }
-    let panelError;
-    try { panelRestore?.(); } catch (error) { panelError = error; }
-    if (viewer.pagesRotation !== saved.rotation) viewer.pagesRotation = saved.rotation;
-    if (viewer.scrollMode !== saved.scrollMode) viewer.scrollMode = saved.scrollMode;
-    if (viewer.spreadMode !== saved.spreadMode) viewer.spreadMode = saved.spreadMode;
-    if (viewer.currentScaleValue !== saved.scaleValue) viewer.currentScaleValue = saved.scaleValue;
-    if (app.pdfSidebar?.visibleView !== saved.sidebar) app.pdfSidebar?.switchView(saved.sidebar);
-    if (viewer.currentPageNumber !== saved.page || Math.abs(container.scrollTop - saved.top) > 0.5
-        || Math.abs(container.scrollLeft - saved.left) > 0.5) {
-      viewer.scrollPageIntoView({ pageNumber: saved.page });
-      container.scrollTop = saved.top; container.scrollLeft = saved.left;
-    }
-    if (prefetch.robotsEnabled !== saved.robots) prefetch.setRobotsEnabled(saved.robots);
-    if (prefetch.diagnosticsEnabled !== saved.lab) prefetch.setDiagnosticsEnabled(saved.lab);
-    if (focus?.isConnected && deepFocus() !== focus) {
-      if (focus === document.body) deepFocus()?.blur?.(); else focus.focus?.({ preventScroll: true });
-    }
-    result.focusRestored = deepFocus() === focus;
-    result.restored = true; result.readingState = readState();
-    if (panelError) throw panelError;
-    return true;
+    if (restoreInFlight) return restoreInFlight;
+    restoreInFlight = Promise.resolve().then(async () => {
+      if (result.interrupted || disposed || !current()) return false;
+      if (!changed) { result.readingState = readState(); return true; }
+      let panelError;
+      try { await panelRestore?.({ guard: () => guard(true), deadline: performance.now() + budget.restoreMs }); }
+      catch (error) { panelError = error; }
+      if (result.interrupted || disposed || !current()) return false;
+      if (viewer.pagesRotation !== saved.rotation) viewer.pagesRotation = saved.rotation;
+      if (viewer.scrollMode !== saved.scrollMode) viewer.scrollMode = saved.scrollMode;
+      if (viewer.spreadMode !== saved.spreadMode) viewer.spreadMode = saved.spreadMode;
+      if (viewer.currentScaleValue !== saved.scaleValue) viewer.currentScaleValue = saved.scaleValue;
+      if (app.pdfSidebar?.visibleView !== saved.sidebar) app.pdfSidebar?.switchView(saved.sidebar);
+      if (viewer.currentPageNumber !== saved.page || Math.abs(container.scrollTop - saved.top) > 0.5
+          || Math.abs(container.scrollLeft - saved.left) > 0.5) {
+        viewer.scrollPageIntoView({ pageNumber: saved.page });
+        container.scrollTop = saved.top; container.scrollLeft = saved.left;
+      }
+      if (prefetch.robotsEnabled !== saved.robots) prefetch.setRobotsEnabled(saved.robots);
+      if (prefetch.diagnosticsEnabled !== saved.lab) prefetch.setDiagnosticsEnabled(saved.lab);
+      if (focus?.isConnected && deepFocus() !== focus) {
+        if (focus === document.body) deepFocus()?.blur?.(); else focus.focus?.({ preventScroll: true });
+      }
+      result.focusRestored = deepFocus() === focus;
+      result.restored = true; result.readingState = readState();
+      if (panelError) throw panelError;
+      return true;
+    }).finally(() => { restoreInFlight = undefined; });
+    return restoreInFlight;
   };
   for (const type of types) document.addEventListener(type, stop, { capture: true, passive: true });
   window.addEventListener('orientationchange', stop, { passive: true });
@@ -152,21 +161,27 @@
     }
     result.samples.push(next); if (result.samples.length > 256) result.samples.shift(); return next;
   };
-  const probe = { token, result, sample, dispose, restore, readState, panel, panelState, guard, sleep,
+  const probe = { token, result, budget, sample, dispose, restore, readState, panel, panelState, guard, sleep,
+    get closing() { return closing; },
     abort(supplied, reason = 'host-stop') {
       if (supplied !== token) return { ok: false };
-      try { restore(); } catch (error) { result.cleanupError = String(error.message || error); }
-      finally { result.interrupted = true; result.interruption ??= String(reason).slice(0, 160); dispose();
-        if (window.__spomenarSidecarProbe === probe) delete window.__spomenarSidecarProbe; }
-      return { ok: true, result };
+      if (closeInFlight) return closeInFlight;
+      closing = true; clearTimeout(timer); request.abort();
+      closeInFlight = Promise.resolve().then(async () => {
+        try { await restore(); } catch (error) { result.cleanupError = String(error.message || error); }
+        finally { result.interrupted = true; result.interruption ??= String(reason).slice(0, 160); dispose();
+          if (window.__spomenarSidecarProbe === probe) delete window.__spomenarSidecarProbe; }
+        return { ok: true, result };
+      });
+      return closeInFlight;
     },
     setPanelRestore(callback) { panelRestore = callback; } };
   window.__spomenarSidecarProbe = probe;
   timer = setTimeout(() => {
     result.watchdog = true;
-    try { restore(); } catch (error) { result.cleanupError = String(error.message || error); }
-    finally { dispose(); if (window.__spomenarSidecarProbe === probe) delete window.__spomenarSidecarProbe; }
-  }, 60000);
+    result.failure ??= 'Short observation work deadline expired';
+    void probe.abort(token, 'watchdog');
+  }, budget.workMs);
   async function json(url, cap) {
     const response = await fetch(url, { cache: 'no-cache', credentials: 'same-origin', signal: request.signal });
     if (!response.ok || response.redirected || !response.body) {
@@ -248,8 +263,8 @@
     }
     result.noContentAwarePayloadObserved = !result.interrupted;
   } catch (error) {
-    if (!result.interrupted) result.failure = String(error.message || error);
-    try { restore(); } catch (cleanup) { result.cleanupError = String(cleanup.message || cleanup); }
+    if (!result.interrupted && !closing) result.failure = String(error.message || error);
+    try { await restore(); } catch (cleanup) { result.cleanupError = String(cleanup.message || cleanup); }
     dispose(); if (window.__spomenarSidecarProbe === probe) delete window.__spomenarSidecarProbe;
   }
   return result;

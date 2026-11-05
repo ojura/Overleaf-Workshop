@@ -1335,7 +1335,12 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         toolbarBefore: options.diagnosticsToolbarBefore,
         measurementsMenu: options.diagnosticsMenu,
         onOpen: options.onDiagnosticsOpen,
-        onPanelLayout: layout => { if (!disposed) { documentColumn?.setPanel(layout); } },
+        onPanelLayout: layout => {
+            if (disposed) { return; }
+            documentColumn?.setPanel(layout);
+            const motion = documentColumn?.transition;
+            return motion ? { readyAt: motion.startedAt + motion.durationMs } : undefined;
+        },
         enabled: options.diagnosticsEnabled,
         robots: {
             get enabled() { return documentRobots?.enabled ?? false; },

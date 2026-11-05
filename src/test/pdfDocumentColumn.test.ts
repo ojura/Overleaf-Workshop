@@ -38,6 +38,7 @@ class Style {
 
 class Element {
     readonly style = new Style();
+    readonly dataset: Record<string, string | undefined> = {};
     parent?: Element;
     isConnected = true;
     clientLeft = 0;
@@ -64,7 +65,7 @@ class Element {
     }
 }
 
-describe('PDF document column beside a docked Motion Lab', function () {
+describe('PDF document column beside Motion Lab', function () {
     this.timeout(30_000);
     let dir: string;
     let plan: (viewport: Rect, pages: Rect[], panel?: Panel, appliedX?: number) => { offsetX: number; bounds?: Rect };
@@ -158,11 +159,65 @@ describe('PDF document column beside a docked Motion Lab', function () {
         }
     });
 
-    it('leaves a column still when the dock fits in its existing blank margin or floats', () => {
+    it('leaves a column still when the panel fits in its existing blank margin or is outside the visible pages', () => {
         assert.strictEqual(plan(viewport, [page], panel('right', { rect: { x: 950, y: 0, width: 250, height: 800 } })).offsetX, 0);
-        assert.strictEqual(plan(viewport, [page], panel('float')).offsetX, 0);
+        assert.strictEqual(plan(viewport, [page], panel('float', { rect: { x: 950, y: 0, width: 250, height: 800 } })).offsetX, 0);
         assert.strictEqual(plan(viewport, [page], panel('right', { visible: false })).offsetX, 0);
         assert.strictEqual(plan(viewport, [page], panel('right', { rect: { x: 800, y: 900, width: 400, height: 100 } })).offsetX, 0);
+    });
+
+    it('clears a floating panel to either side only when the complete page and gap fit', () => {
+        assert.strictEqual(plan(viewport, [page], panel('float')).offsetX, -116);
+        assert.strictEqual(plan(viewport, [page], panel('float', { rect: { x: 0, y: 0, width: 400, height: 800 } })).offsetX, 116);
+        for (const [rect, expected] of [
+            [{ x: 616, y: 0, width: 584, height: 800 }, -300],
+            [{ x: 615.99, y: 0, width: 584, height: 800 }, 0],
+            [{ x: 0, y: 0, width: 584, height: 800 }, 300],
+            [{ x: 0, y: 0, width: 584.01, height: 800 }, 0],
+            [{ x: 500, y: 0, width: 200, height: 800 }, 0],
+        ] as const) {
+            assert.strictEqual(plan(viewport, [page], panel('float', { rect })).offsetX, expected);
+        }
+    });
+
+    it('keeps the complete visible spread together when selecting a floating-panel side', () => {
+        const spread = [{ ...page, x: 200, width: 390 }, { ...page, x: 610, width: 390 }];
+        assert.strictEqual(plan(viewport, spread, panel('float', { rect: { x: 900, y: 0, width: 300, height: 800 } })).offsetX, -116);
+        assert.strictEqual(plan(viewport, spread, panel('float')).offsetX, 0,
+            'space for either individual page does not suffice for the spread');
+    });
+
+    it('chooses the nearest feasible floating placement from the applied offset and keeps its side during drag', () => {
+        const narrow = { ...page, x: 400, width: 400 };
+        const floating = panel('float', { rect: { x: 500, y: 0, width: 200, height: 800 } });
+        assert.strictEqual(plan(viewport, [narrow], floating).offsetX, -316, 'an initial tie has a stable left choice');
+        for (const applied of [-316, -60, 60, 316]) {
+            const expected = applied < 0 ? -316 : 316;
+            assert.strictEqual(plan(viewport, [{ ...narrow, x: narrow.x + applied }], floating, applied).offsetX, expected);
+        }
+        let applied = 316;
+        for (const x of [499.9, 500, 500.1, 500, 499.9, 500.1]) {
+            applied = plan(viewport, [{ ...narrow, x: narrow.x + applied }],
+                panel('float', { rect: { ...floating.rect, x } }), applied).offsetX;
+            assert.ok(applied >= 316 && applied <= 316.1, 'a cleared right side must not oscillate across the panel');
+            assert.ok(narrow.x + applied >= x + floating.rect.width + 16 - 1e-9);
+            assert.ok(narrow.x + narrow.width + applied <= viewport.width);
+        }
+    });
+
+    it('recenters when the unshifted page fully clears the floating panel', () => {
+        for (const applied of [-116, 116]) {
+            for (const x of [0, 950]) {
+                assert.strictEqual(plan(viewport, [{ ...page, x: page.x + applied }],
+                    panel('float', { rect: { x, y: 0, width: 250, height: 800 } }), applied).offsetX, 0);
+            }
+        }
+        const clippedView = { ...viewport, x: 200, width: 1000 };
+        const clippedOffsets = [[150, 900], [650, 220]].map(([pageX, panelX]) =>
+            plan(clippedView, [{ ...page, x: pageX }],
+                panel('float', { rect: { x: panelX, y: 0, width: 280, height: 800 } })).offsetX);
+        assert.deepStrictEqual(clippedOffsets, [0, 0],
+            'an already-clear float must not reposition a horizontally clipped base page');
     });
 
     it('measures the visible spread and excludes pages outside the viewport', () => {
@@ -181,8 +236,8 @@ describe('PDF document column beside a docked Motion Lab', function () {
         assert.strictEqual(plan(viewport, [{ ...page, width: NaN }], panel()).offsetX, 0);
     });
 
-    it('does no geometry or computed-style work while the unshifted lab is absent, closed or floating', () => {
-        for (const state of [undefined, panel('right', { visible: false }), panel('float')]) {
+    it('does no geometry or computed-style work while the unshifted lab is absent or closed', () => {
+        for (const state of [undefined, panel('right', { visible: false })]) {
             const f = fixture();
             let reads = 0;
             const rect = f.container.getBoundingClientRect.bind(f.container);
@@ -206,6 +261,145 @@ describe('PDF document column beside a docked Motion Lab', function () {
                 assert.strictEqual(f.observers[0].watched.size, 0);
                 assert.strictEqual(f.container.style.values.size, 0);
                 assert.strictEqual(f.pages[0].style.values.size, 0);
+            } finally { f.api.dispose(); }
+        }
+    });
+
+    it('observes floating-panel geometry and updates a cleared column during drag, resize and page changes', () => {
+        const f = fixture();
+        try {
+            f.api.setPanel(panel('float')); f.frame(policy.durationMs);
+            assert.strictEqual(f.api.offsetX, -116);
+            assert.ok(f.observers[0].watched.has(f.container));
+            assert.ok(f.observers[0].watched.has(f.pages[0]));
+            f.api.setPanel(panel('float', { reason: 'drag', rect: { x: 850, y: 0, width: 350, height: 800 } }));
+            assert.strictEqual(f.api.offsetX, -116, 'a still-feasible placement stays put while the panel moves away');
+            assert.strictEqual(f.frames.size, 0);
+            f.api.setPanel(panel('float', { reason: 'drag', rect: { x: 750, y: 0, width: 450, height: 800 } }));
+            assert.strictEqual(f.api.offsetX, -166);
+            f.api.setPanel(panel('float', { reason: 'drag', rect: { x: 950, y: 0, width: 250, height: 800 } }));
+            assert.strictEqual(f.api.offsetX, 0, 'dragging into the original blank margin restores centering');
+            f.api.setPanel(panel('float', { reason: 'drag', rect: { x: 750, y: 0, width: 450, height: 800 } }));
+            assert.strictEqual(f.api.offsetX, -166);
+            const previous = f.pages[0], next = f.makePage({ ...page, x: 350 });
+            f.pages.splice(0, 1, next); f.api.update(false);
+            assert.strictEqual(f.api.offsetX, -216);
+            assert.strictEqual(previous.style.getPropertyValue('translate'), '');
+            assert.ok(f.observers[0].watched.has(next));
+            next.box.width = 800; f.observers[0].trigger();
+            assert.strictEqual(f.api.offsetX, 0, 'a wider page must not be clipped to clear the float');
+            next.box.width = 600; f.observers[0].trigger();
+            assert.strictEqual(f.api.offsetX, -216);
+            next.box.y = -1100; f.api.update(false);
+            assert.strictEqual(f.api.offsetX, 0, 'vertical scrolling out of the panel overlap restores the column');
+            assert.strictEqual(f.frames.size, 0);
+            assert.deepStrictEqual([f.container.scrollLeft, f.container.scrollTop], [17, 83]);
+        } finally { f.api.dispose(); }
+        assert.strictEqual(f.observers[0].watched.size, 0);
+        assert.strictEqual(f.document.count + f.window.count + f.visual.count + f.media.count, 0);
+    });
+
+    it('rechecks floating full-fit placement after the visual viewport changes and closes through one finite return', () => {
+        const f = fixture();
+        try {
+            f.api.setPanel(panel('float')); f.frame(policy.durationMs);
+            f.visual.offsetLeft = 200; f.visual.width = 800; f.visual.emit('resize');
+            assert.strictEqual(f.api.offsetX, 0, 'the remaining left side is narrower than the full page plus gap');
+            f.visual.offsetLeft = 0; f.visual.width = 1400; f.visual.emit('scroll');
+            assert.strictEqual(f.api.offsetX, -116);
+            f.api.setPanel(panel('float', { visible: false, reason: 'close' }));
+            assert.strictEqual(f.frames.size, 1);
+            assert.strictEqual(f.container.dataset.pdfColumnMoving, 'true');
+            f.frame(policy.durationMs * 2);
+            assert.strictEqual(f.api.offsetX, 0);
+            assert.strictEqual(f.frames.size, 0);
+            assert.strictEqual(f.container.dataset.pdfColumnMoving, undefined);
+            assert.strictEqual(f.observers[0].watched.size, 0);
+            assert.strictEqual(f.pages[0].style.getPropertyValue('translate'), '');
+            assert.strictEqual(f.transit.style.getPropertyValue('translate'), '');
+        } finally { f.api.dispose(); }
+    });
+
+    it('keeps the full approach, haul and settle sequence observable without extending its deadline', () => {
+        const f = fixture();
+        try {
+            f.api.setPanel(panel('float'));
+            assert.strictEqual(policy.durationMs, 2500);
+            assert.strictEqual(f.container.dataset.pdfColumnMoving, 'true');
+            f.frame(499); assert.strictEqual(f.api.offsetX, 0);
+            f.frame(500); assert.strictEqual(f.api.offsetX, 0);
+            f.frame(1400); assert.strictEqual(f.api.offsetX, -58);
+            f.frame(2300); assert.strictEqual(f.api.offsetX, -116);
+            assert.ok(f.api.transition, 'arrival of the page still leaves the finite settle phase');
+            assert.strictEqual(f.container.dataset.pdfColumnMoving, 'true');
+            f.frame(2499); assert.ok(f.api.transition);
+            f.frame(2500);
+            assert.strictEqual(f.api.transition, undefined);
+            assert.strictEqual(f.container.dataset.pdfColumnMoving, undefined);
+            assert.strictEqual(f.frames.size, 0);
+        } finally { f.api.dispose(); }
+    });
+
+    it('publishes animated retargets directly and rejects old callbacks without ending the successor', () => {
+        const f = fixture();
+        try {
+            const retargetAt = policy.durationMs / 2;
+            f.api.setPanel(panel()); f.frame(retargetAt);
+            const previous = f.api.transition!, stale = [...f.frames.values()][0], from = f.api.offsetX;
+            f.api.setPanel(panel('left', { reason: 'dock' }));
+            const next = f.api.transition!;
+            assert.ok(next.id > previous.id);
+            assert.deepStrictEqual(f.transitions, [previous, next], 'retargeting must not signal an intermediate actor release');
+            assert.strictEqual(next.fromX, from);
+            stale(10000);
+            assert.strictEqual(f.api.transition, next);
+            assert.strictEqual(f.api.offsetX, from);
+            assert.strictEqual(f.container.dataset.pdfColumnMoving, 'true');
+            f.frame(retargetAt + policy.durationMs);
+            assert.deepStrictEqual(f.transitions, [previous, next, undefined]);
+            assert.strictEqual(f.container.dataset.pdfColumnMoving, undefined);
+            assert.strictEqual(f.frames.size, 0);
+        } finally { f.api.dispose(); }
+    });
+
+    it('keeps the selected floating side on a tied retarget before the first frame', () => {
+        const f = fixture();
+        try {
+            f.pages[0].box.x = 400; f.pages[0].box.width = 400;
+            f.api.setPanel(panel('float', { rect: { x: 490, y: 0, width: 200, height: 800 } }));
+            assert.strictEqual(f.api.offsetX, 0);
+            assert.strictEqual(f.api.transition?.toX, 306);
+            f.api.setPanel(panel('float', { reason: 'dock', rect: { x: 500, y: 0, width: 200, height: 800 } }));
+            assert.strictEqual(f.api.offsetX, 0);
+            assert.strictEqual(f.api.transition?.toX, 316);
+            f.api.update(false);
+            assert.strictEqual(f.api.transition?.toX, 316, 'routine measurement preserves the approach direction too');
+            assert.ok(f.transitions.every(value => value));
+            f.frame(policy.durationMs);
+            assert.strictEqual(f.api.offsetX, 316);
+            assert.strictEqual(f.frames.size, 0);
+        } finally { f.api.dispose(); }
+    });
+
+    it('ends an animated retarget exactly once on immediate layout, reduced motion, hide or disposal', () => {
+        for (const boundary of ['layout', 'reduced', 'hidden', 'dispose']) {
+            const f = fixture();
+            try {
+                f.container.dataset.pdfColumnMoving = 'existing';
+                f.api.setPanel(panel()); f.frame(policy.durationMs / 2);
+                f.api.setPanel(panel('left', { reason: 'dock' }));
+                const stale = [...f.frames.values()][0];
+                if (boundary === 'layout') { f.pages[0].box.x += 50; f.api.update(); }
+                else if (boundary === 'reduced') { f.media.matches = true; f.media.emit('change'); }
+                else if (boundary === 'hidden') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+                else { f.api.dispose(); }
+                const offset = f.api.offsetX;
+                stale(10000);
+                assert.strictEqual(f.api.offsetX, offset);
+                assert.strictEqual(f.api.transition, undefined);
+                assert.strictEqual(f.frames.size, 0);
+                assert.strictEqual(f.container.dataset.pdfColumnMoving, 'existing');
+                assert.strictEqual(f.transitions.filter(value => !value).length, 1, boundary);
             } finally { f.api.dispose(); }
         }
     });
@@ -302,10 +496,10 @@ describe('PDF document column beside a docked Motion Lab', function () {
             assert.strictEqual(f.transitions.length, 1);
             f.frame(policy.durationMs / 2);
             assert.ok(f.api.offsetX < 0 && f.api.offsetX > -116);
-            assert.strictEqual(f.pages[0].getBoundingClientRect().left - page.x, f.api.offsetX);
+            assert.ok(Math.abs(f.pages[0].getBoundingClientRect().left - page.x - f.api.offsetX) < 1e-9);
             assert.strictEqual(f.transit.getBoundingClientRect().left, f.api.offsetX);
             const origin = f.container.box.x + f.container.clientLeft - f.container.scrollLeft + f.api.offsetX;
-            assert.strictEqual(f.pages[0].getBoundingClientRect().left - origin, page.x + f.container.scrollLeft,
+            assert.ok(Math.abs(f.pages[0].getBoundingClientRect().left - origin - page.x - f.container.scrollLeft) < 1e-9,
                 'subtracting the shared scene origin applies column motion exactly once');
             assert.strictEqual(f.pages[0].style.getPropertyValue('transform'), 'rotate(0.1deg)');
             assert.deepStrictEqual([f.container.scrollLeft, f.container.scrollTop], [17, 83]);
@@ -458,23 +652,27 @@ describe('PDF document column beside a docked Motion Lab', function () {
     });
 
     it('applies reduced motion immediately and finishes an active move when hidden', () => {
-        const reduced = fixture(true);
-        try {
-            reduced.api.setPanel(panel());
-            assert.strictEqual(reduced.api.offsetX, -116);
-            assert.strictEqual(reduced.frames.size, 0);
-            assert.strictEqual(reduced.transitions.length, 0);
-        } finally { reduced.api.dispose(); }
-        for (const boundary of ['hidden', 'reduced']) {
-            const f = fixture();
+        for (const dock of ['right', 'float'] as const) {
+            const reduced = fixture(true);
             try {
-                f.api.setPanel(panel()); f.frame(100);
-                if (boundary === 'hidden') { f.document.hidden = true; f.document.emit('visibilitychange'); }
-                else { f.media.matches = true; f.media.emit('change'); }
-                assert.strictEqual(f.api.offsetX, -116);
-                assert.strictEqual(f.frames.size, 0);
-                assert.strictEqual(f.api.transition, undefined);
-            } finally { f.api.dispose(); }
+                reduced.api.setPanel(panel(dock));
+                assert.strictEqual(reduced.api.offsetX, -116);
+                assert.strictEqual(reduced.frames.size, 0);
+                assert.strictEqual(reduced.transitions.length, 0);
+                assert.strictEqual(reduced.container.dataset.pdfColumnMoving, undefined);
+            } finally { reduced.api.dispose(); }
+            for (const boundary of ['hidden', 'reduced']) {
+                const f = fixture();
+                try {
+                    f.api.setPanel(panel(dock)); f.frame(100);
+                    if (boundary === 'hidden') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+                    else { f.media.matches = true; f.media.emit('change'); }
+                    assert.strictEqual(f.api.offsetX, -116);
+                    assert.strictEqual(f.frames.size, 0);
+                    assert.strictEqual(f.api.transition, undefined);
+                    assert.strictEqual(f.container.dataset.pdfColumnMoving, undefined);
+                } finally { f.api.dispose(); }
+            }
         }
     });
 

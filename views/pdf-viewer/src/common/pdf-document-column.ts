@@ -1,4 +1,5 @@
 import type { MotionLabPanelLayout, MotionLabPanelRect } from './motion-lab-panel';
+import { MOTION_LAB_CHOREOGRAPHY, motionLabColumnProgress } from './motion-lab-choreography';
 
 /** Client-viewport CSS pixels. The helper leaves document scale and scroll offsets unchanged. */
 export type PdfDocumentColumnRect = MotionLabPanelRect;
@@ -6,7 +7,7 @@ export type PdfDocumentColumnPanel = MotionLabPanelLayout;
 
 export const PDF_DOCUMENT_COLUMN_POLICY = Object.freeze({
     gapPx: 16,
-    durationMs: 400,
+    durationMs: MOTION_LAB_CHOREOGRAPHY.columnDurationMs,
     // Ignore subpixel overlap noise instead of perpetually retargeting a resting column.
     minimumShiftPx: 0.5,
     offsetProperty: '--pdf-document-column-x',
@@ -22,9 +23,9 @@ const valid = (rect: PdfDocumentColumnRect) => [rect.x, rect.y, rect.width, rect
 const intersects = (a: PdfDocumentColumnRect, b: PdfDocumentColumnRect) => a.x < b.x + b.width
     && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
 
-/** Page rectangles already include appliedX; remove it before measuring existing blank space. */
+/** Remove the actual applied shift; preferredX preserves the selected side before its first frame. */
 export function planPdfDocumentColumn(viewport: PdfDocumentColumnRect, pages: readonly PdfDocumentColumnRect[],
-    panel: PdfDocumentColumnPanel | undefined, appliedX = 0): PdfDocumentColumnPlan {
+    panel: PdfDocumentColumnPanel | undefined, appliedX = 0, preferredX = appliedX): PdfDocumentColumnPlan {
     if (!valid(viewport) || !Number.isFinite(appliedX)) { return { offsetX: 0 }; }
     const visible = pages.filter(page => valid(page) && intersects(page, viewport));
     if (!visible.length) { return { offsetX: 0 }; }
@@ -33,11 +34,26 @@ export function planPdfDocumentColumn(viewport: PdfDocumentColumnRect, pages: re
     const top = Math.min(...visible.map(page => page.y));
     const bottom = Math.max(...visible.map(page => page.y + page.height));
     const bounds = { x: left, y: top, width: right - left, height: bottom - top };
-    if (bounds.width >= viewport.width || !panel?.visible || panel.dock === 'float' || !valid(panel.rect)
+    if (bounds.width >= viewport.width || !panel?.visible || !valid(panel.rect)
         || !intersects(panel.rect, viewport) || panel.rect.y >= bottom || panel.rect.y + panel.rect.height <= top) {
         return { offsetX: 0, bounds };
     }
     const gap = PDF_DOCUMENT_COLUMN_POLICY.gapPx;
+    if (panel.dock === 'float') {
+        if (right + gap <= panel.rect.x || left >= panel.rect.x + panel.rect.width + gap) { return { offsetX: 0, bounds }; }
+        const minimum = viewport.x - left, maximum = viewport.x + viewport.width - right;
+        const leftMaximum = Math.min(maximum, panel.rect.x - gap - right);
+        const rightMinimum = Math.max(minimum, panel.rect.x + panel.rect.width + gap - left);
+        // Each interval fits the complete page or spread. Staying nearest the applied
+        // position avoids crossing the panel while the original column still overlaps it.
+        const leftShift = minimum <= leftMaximum ? Math.max(minimum, Math.min(leftMaximum, appliedX)) : undefined;
+        const rightShift = rightMinimum <= maximum ? Math.max(rightMinimum, Math.min(maximum, appliedX)) : undefined;
+        if (leftShift === undefined) { return { offsetX: rightShift ?? 0, bounds }; }
+        if (rightShift === undefined) { return { offsetX: leftShift, bounds }; }
+        const leftDistance = Math.abs(leftShift - appliedX), rightDistance = Math.abs(rightShift - appliedX);
+        const tied = Math.abs(leftDistance - rightDistance) < PDF_DOCUMENT_COLUMN_POLICY.minimumShiftPx;
+        return { offsetX: (tied ? preferredX <= 0 : leftDistance < rightDistance) ? leftShift : rightShift, bounds };
+    }
     const shift = panel.dock === 'right'
         ? -Math.min(Math.max(0, left - viewport.x), Math.max(0, right + gap - panel.rect.x))
         : Math.min(Math.max(0, viewport.x + viewport.width - right), Math.max(0, panel.rect.x + panel.rect.width + gap - left));
@@ -111,6 +127,7 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
     let previousViewport: PdfDocumentColumnRect | undefined, previousBounds: PdfDocumentColumnRect | undefined;
     let widePages: readonly HTMLElement[] | undefined;
     let transition: Readonly<PdfDocumentColumnTransition> | undefined;
+    let savedMoving: string | undefined;
     let frame: { id: number } | undefined;
     let disposed = false;
     const observer = typeof win.ResizeObserver === 'function' ? new win.ResizeObserver(() => update()) : undefined;
@@ -161,7 +178,7 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
     }
 
     function observe(pages: readonly HTMLElement[]): void {
-        const next = new Set<Element>(panel?.visible && panel.dock !== 'float' ? [container, ...pages] : []);
+        const next = new Set<Element>(panel?.visible ? [container, ...pages] : []);
         for (const root of observed) { if (!next.has(root)) { observer?.unobserve(root); observed.delete(root); } }
         for (const root of next) { if (!observed.has(root)) { observer?.observe(root); observed.add(root); } }
     }
@@ -181,7 +198,12 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
         const previous = transition;
         transition = undefined;
         if (!offsetX) { restoreStyles(); }
-        if (previous) { notify(); }
+        if (previous) {
+            if (savedMoving === undefined) { delete container.dataset.pdfColumnMoving; }
+            else { container.dataset.pdfColumnMoving = savedMoving; }
+            savedMoving = undefined;
+            notify();
+        }
     }
 
     function schedule(): void {
@@ -191,10 +213,10 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
         pending.id = requestFrame(at => {
             if (frame !== pending || disposed || !transition) { return; }
             frame = undefined;
-            const progress = Math.max(0, Math.min(1, (at - transition.startedAt) / transition.durationMs));
-            const eased = 1 - Math.pow(1 - progress, 3);
+            const elapsed = at - transition.startedAt;
+            const eased = motionLabColumnProgress(elapsed, transition.durationMs);
             apply(transition.fromX + (transition.toX - transition.fromX) * eased);
-            if (progress >= 1) { apply(transition.toX); end(); }
+            if (elapsed >= transition.durationMs) { apply(transition.toX); end(); }
             else { schedule(); }
         });
     }
@@ -202,7 +224,7 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
     function measure(animate = false, layoutChanged = true): void {
         if (disposed) { return; }
         if (layoutChanged) { widePages = undefined; }
-        if ((!panel?.visible || panel.dock === 'float') && offsetX === 0 && !transition
+        if (!panel?.visible && offsetX === 0 && !transition
             && !savedOffset && !styled.size && !observed.size) { return; }
         const pages = [...new Set(options.pages())].filter(page => page.isConnected !== false);
         if (offsetX === 0 && !transition && !savedOffset && widePages?.length === pages.length
@@ -218,7 +240,7 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
             const box = page.getBoundingClientRect();
             return { x: box.left, y: box.top, width: box.width, height: box.height };
         });
-        const plan = planPdfDocumentColumn(view, pageRects, panel, offsetX);
+        const plan = planPdfDocumentColumn(view, pageRects, panel, offsetX, transition?.toX ?? offsetX);
         // Scrolling cannot expose a usable side margin when every current page is
         // viewport-wide. Page, size, viewport and explicit layout changes remeasure.
         const wide = observer && view.width > 0 && pageRects.length > 0
@@ -230,18 +252,23 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
             if (!plan.offsetX) { apply(0); restoreStyles(); if (wide) { widePages = pages; } }
             return;
         }
-        end();
-        if (disposed) { return; }
-        if (plan.offsetX || offsetX) { styleRoots(next); }
         if (!animate || media.matches || doc.hidden || plan.offsetX === offsetX) {
+            end();
+            if (disposed) { return; }
+            if (plan.offsetX || offsetX) { styleRoots(next); }
             apply(plan.offsetX); end();
             if (!disposed && offsetX === 0 && wide) { widePages = pages; }
             return;
         }
+        // An animated retarget keeps the actor reservation until the successor ends.
+        if (frame) { cancelFrame(frame.id); frame = undefined; }
+        if (plan.offsetX || offsetX) { styleRoots(next); }
+        if (!transition) { savedMoving = container.dataset.pdfColumnMoving; }
         transition = Object.freeze({ id: ++serial, fromX: offsetX, toX: plan.offsetX,
             startedAt: now(), durationMs: PDF_DOCUMENT_COLUMN_POLICY.durationMs,
             reason: panel?.reason ?? 'viewport', dock: panel?.dock ?? 'float',
             bounds: plan.bounds && Object.freeze({ ...plan.bounds }) });
+        container.dataset.pdfColumnMoving = 'true';
         notify();
         schedule();
     }
