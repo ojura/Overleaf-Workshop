@@ -24,7 +24,7 @@ export interface PdfRasterCrop {
     readonly logical: PdfProjectionRect;
     /** Exact fractional source rectangle, in backing pixels. */
     readonly source: PdfProjectionRect;
-    /** Integer read rectangle: floor both starts, ceil both ends, clipped to the backing. */
+    /** Integer rectangle: outward-rounded endpoints plus the optional pixel margin, clipped to the backing. */
     readonly pixels: PdfProjectionRect;
     /** Logical footprint of pixels, including the outward sample's fractional edge coverage. */
     readonly sampled: PdfProjectionRect;
@@ -127,14 +127,18 @@ function integralEdge(value: number): number {
     return Math.abs(value - nearest) <= 8 * Number.EPSILON * Math.max(1, Math.abs(value)) ? nearest : value;
 }
 
-export function projectPdfRasterCrop(projection: PdfRasterProjection, logicalRect: PdfProjectionRect): PdfRasterCrop | undefined {
+/** The optional backing-pixel margin changes only pixels/sample footprint, never the exact photo or source. */
+export function projectPdfRasterCrop(projection: PdfRasterProjection, logicalRect: PdfProjectionRect,
+    pixelMargin = 0): PdfRasterCrop | undefined {
+    if (!Number.isSafeInteger(pixelMargin) || pixelMargin < 0) { throw new RangeError('Invalid PDF raster margin'); }
     const requested = intersection(logicalRect, UNIT_PAGE);
     if (!requested) { return undefined; }
     const source = intersection(bounds(projection.pageToRaster, requested), { x: 0, y: 0, width: projection.width, height: projection.height });
     if (!source) { return undefined; }
-    const x = Math.max(0, Math.floor(integralEdge(source.x))), y = Math.max(0, Math.floor(integralEdge(source.y)));
-    const right = Math.min(projection.width, Math.ceil(integralEdge(source.x + source.width)));
-    const bottom = Math.min(projection.height, Math.ceil(integralEdge(source.y + source.height)));
+    const x = Math.max(0, Math.floor(integralEdge(source.x)) - pixelMargin);
+    const y = Math.max(0, Math.floor(integralEdge(source.y)) - pixelMargin);
+    const right = Math.min(projection.width, Math.ceil(integralEdge(source.x + source.width)) + pixelMargin);
+    const bottom = Math.min(projection.height, Math.ceil(integralEdge(source.y + source.height)) + pixelMargin);
     const pixels = { x, y, width: right - x, height: bottom - y };
     if (!validRect(pixels)) { return undefined; }
     const toPage = inverse(projection.pageToRaster);

@@ -15,7 +15,7 @@ interface Projection {
     resizePdfRasterProjection(raster: Raster, width: number, height: number): Raster;
     rotatePdfRasterProjection(raster: Raster, degrees: number): Raster;
     reorientPdfRasterProjection(raster: Raster, degrees: number): Raster;
-    projectPdfRasterCrop(raster: Raster, logical: Rect): Crop | undefined;
+    projectPdfRasterCrop(raster: Raster, logical: Rect, pixelMargin?: number): Crop | undefined;
     pdfRasterCropSize(raster: Raster, logical: Rect): { width: number; height: number };
     pdfRasterToCrop(raster: Raster, logical: Rect, width: number, height: number): Matrix;
     projectPdfPageRect(page: Page, logical: Rect): Rect;
@@ -111,6 +111,62 @@ describe('PDF raster and logical page projection', function () {
         assert.deepStrictEqual(crop.pixels, { x: 3, y: 1, width: 1, height: 2 });
         const fractional = api.projectPdfRasterCrop(api.createPdfRasterProjection(10, 10), { x: 0.3, y: 0.1, width: 0.10000001, height: 0.2 })!;
         assert.strictEqual(fractional.pixels.width, 2, 'a real fractional edge still requires the next sample');
+    });
+
+    it('includes the measured outside atlas texel without changing the exact photo or ordinary cargo read', () => {
+        const raster = api.createPdfRasterProjection(360, 512);
+        for (const y of [0.14090420630897255, 0.689918490716582]) {
+            const photo = { x: 0.1755328669326745, y, width: 0.315806107087826, height: 0.1250593633356536 };
+            const cargo = api.projectPdfRasterCrop(raster, photo)!;
+            const cover = api.projectPdfRasterCrop(raster, photo, 1)!;
+            assert.strictEqual(cargo.pixels.x + cargo.pixels.width, 177);
+            assert.strictEqual(cover.pixels.x + cover.pixels.width, 178,
+                'atlas column 177 contains the dark fringe visible at phone screen column 595');
+            assert.strictEqual(cover.pixels.x, 62);
+            assert.strictEqual(cover.pixels.y, cargo.pixels.y - 1);
+            assert.strictEqual(cover.pixels.height, cargo.pixels.height + 2);
+            rectClose(cover.logical, cargo.logical); rectClose(cover.source, cargo.source);
+            assert.deepStrictEqual(api.projectPdfRasterCrop(raster, photo), cargo,
+                'the optional cover footprint does not alter an ordinary source read');
+        }
+    });
+
+    it('maps the source-texel margin through lower and higher tiers and retained quarter-turns', () => {
+        const photo = { x: 0.1755328669326745, y: 0.689918490716582,
+            width: 0.315806107087826, height: 0.1250593633356536 };
+        for (const [width, height] of [[135, 192], [360, 512], [541, 768], [1081, 1536]]) {
+            const original = api.createPdfRasterProjection(width, height);
+            for (const degrees of [0, 90, 180, 270]) {
+                const target = degrees === 90 ? { x: 1 - photo.y - photo.height, y: photo.x, width: photo.height, height: photo.width }
+                    : degrees === 180 ? { x: 1 - photo.x - photo.width, y: 1 - photo.y - photo.height, width: photo.width, height: photo.height }
+                        : degrees === 270 ? { x: photo.y, y: 1 - photo.x - photo.width, width: photo.height, height: photo.width } : photo;
+                const raster = api.reorientPdfRasterProjection(original, degrees);
+                const cargo = api.projectPdfRasterCrop(raster, target)!, cover = api.projectPdfRasterCrop(raster, target, 1)!;
+                rectClose(cover.source, cargo.source); rectClose(cover.logical, cargo.logical);
+                const horizontal = 1 / (degrees % 180 ? height : width), vertical = 1 / (degrees % 180 ? width : height);
+                close(cargo.sampled.x - cover.sampled.x, horizontal);
+                close(cargo.sampled.y - cover.sampled.y, vertical);
+                close(cover.sampled.width - cargo.sampled.width, horizontal * 2);
+                close(cover.sampled.height - cargo.sampled.height, vertical * 2);
+            }
+        }
+    });
+
+    it('clips a margin to available backing pixels before mapping native leading-edge coverage', () => {
+        const original = api.createPdfRasterProjection(100, 200, 100.5, 200.75);
+        const raster = api.reorientPdfRasterProjection(original, 90);
+        const target = { x: 0.004, y: 0, width: 0.2, height: 0.2 };
+        const cargo = api.projectPdfRasterCrop(raster, target)!, cover = api.projectPdfRasterCrop(raster, target, 1)!;
+        assert.strictEqual(cover.pixels.x, 0);
+        assert.strictEqual(cover.pixels.y + cover.pixels.height, 200);
+        assert.strictEqual(cover.pixels.width, cargo.pixels.width + 1);
+        rectClose(cover.logical, cargo.logical); rectClose(cover.source, cargo.source);
+        const displayed = { x: 0, y: 0, width: 200, height: 100 };
+        const page = api.pdfPageFromRaster(raster, displayed, displayed);
+        const mask = api.clipPdfPageRect(page, api.projectPdfPageRect(page, cover.sampled))!;
+        assert.ok(mask.x >= 0 && mask.y >= 0 && mask.x + mask.width <= 200 && mask.y + mask.height <= 100);
+        assert.strictEqual(api.projectPdfRasterCrop(original, { x: 0.999, y: 0.999, width: 0.001, height: 0.001 }, 1), undefined,
+            'a margin cannot create photo coverage where the native backing has no pixels');
     });
 
     it('keeps an edge-clipped native crop at its actual footprint instead of stretching it to the target', () => {

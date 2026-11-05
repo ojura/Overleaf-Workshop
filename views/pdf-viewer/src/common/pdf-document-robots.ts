@@ -1047,12 +1047,14 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const dpr = Math.max(1, win.devicePixelRatio || 1);
         const raster = displayed ?? createPdfRasterProjection(Math.max(1, Math.ceil(page.content.width * dpr)),
             Math.max(1, Math.ceil(page.content.height * dpr)), page.content.width * dpr, page.content.height * dpr);
-        const sampled = projectPdfRasterCrop(raster, payload.crop)?.sampled;
+        // A magnified preview can carry filtered or encoded photo colour in the first outside source texel.
+        // Extend only the cover footprint on the displayed raster's grid, including retained rotation.
+        const sampled = projectPdfRasterCrop(raster, payload.crop, 1)?.sampled;
         const bounds = sampled && projectPdfPageRect(page, sampled);
         const density = Number.isFinite(win.devicePixelRatio) && win.devicePixelRatio > 0 ? win.devicePixelRatio : 1;
         const viewportScale = win.visualViewport?.scale ?? 1;
         const guard = 1 / (density * (Number.isFinite(viewportScale) && viewportScale > 0 ? viewportScale : 1));
-        // A fractional CSS edge can leave one composited display pixel visible beyond the sampled raster footprint.
+        // A fractional CSS edge can leave one composited display pixel visible beyond that source-pixel margin.
         // Cover that pixel at the current pinch scale, without changing cargo sampling or the logical photo target.
         const mask = bounds && clipPdfPageRect(page, { x: bounds.x - guard, y: bounds.y - guard,
             width: bounds.width + guard * 2, height: bounds.height + guard * 2 });
