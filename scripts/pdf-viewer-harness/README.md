@@ -68,6 +68,12 @@ request and as a plain page at 40 ms, and writes a table of the results.
 | `toolbar-shots.mjs` | the toolbar at pane widths from 1400 to 220 px, with the pdfjs viewer's find bar and tools menu, and what reaches past the edge |
 | `live.mjs` | a real build from a saved compile response (see below) |
 
+What the scripts know about the two viewer pages is in `viewers.mjs`, for the headless scripts and
+the IDE scripts alike: where a page keeps its viewer object, when a page counts as drawn, the ids
+of the buttons and toolbars, the SyncTeX highlight, and the functions that run in a page to show a
+page, to switch the color theme and wait until pdf.js reports the page drawn again, and to read a
+page's pixels with those that count as an image's.
+
 ## Requirements
 
 - Node 22.4 or later, for the global `fetch` and `WebSocket`.
@@ -75,7 +81,8 @@ request and as a plain page at 40 ms, and writes a table of the results.
 - `python3`, which writes the test books.
 - The checkout's dev dependencies (`npm install`), for esbuild.
 - The viewer pages: `npm run build-pdf-viewer` writes `views/pdf-viewer/dist/`, and
-  `npm run download-pdfjs` writes `views/pdf-viewer/vendor/pdfjs-5.1.91/` with the patch applied.
+  `npm run download-pdfjs` writes pdf.js's release, the version that package.json pins as
+  `pdfjs-dist`, to `views/pdf-viewer/vendor/pdfjs-<version>/` with the patch applied.
 
 ## Running
 
@@ -88,18 +95,24 @@ node scripts/pdf-viewer-harness/probes/theme-colors.mjs --engine overleaf
 ```
 
 Every script takes `--ext DIR` for another `views/pdf-viewer` folder, such as another checkout's,
-and `--port N` for the server. Scripts on different ports can run at the same time. The usage of
-each script is in its first comment.
+and `--port N` for the server, which otherwise takes a port that is free when the script starts,
+so that scripts can run at the same time, also two runs of one script. The usage of each script is
+in its first comment.
 
 Each script starts its own server and Chrome, with a new Chrome profile and an empty piece cache,
-and stops both when it ends, also after Ctrl+C or a timeout. Chrome picks a free DevTools port
+and stops both when it ends, also after Ctrl+C or a timeout. When a SIGKILL ends the script, the
+kernel kills the server and Chrome, which run under `setpriv --pdeathsig KILL`; their profile and
+piece cache then stay in the work folder. Chrome picks a free DevTools port
 itself and writes it into its profile, and the script connects through what Chrome wrote there
 (`scripts/lib/devtools.mjs`), so it drives only the Chrome it started. Chrome's own messages go to
 the script's stderr, after `chrome: `. Generated files go to the work
 folder, `$PDF_VIEWER_HARNESS_WORK` or by default `pdf-viewer-harness` in the system's temporary
 folder:
 
-- `book/` (120 pages, two builds of 126 MB each) and `book-theme/` (one page), written on first use;
+- `book/` (120 pages, two builds of 126 MB each) and `book-theme/` (one page), written on first use,
+  each with `book.json`, which its writer writes last: the number of pages, a text that every page
+  holds, and the outline's chapters (`make_book.py`) or the boxes of the things on the page
+  (`theme_book.py`), which the scripts check against;
 - `shots/`, the screenshots, and `compare/`, the results of `compare.mjs`;
 - the Chrome profiles and piece caches of the scripts that are running.
 
@@ -124,16 +137,17 @@ repository.
 
 The scripts in `ide/` drive the viewers in Antigravity itself, in the window of an instance that
 `scripts/hidden-ide.sh` started on a virtual display, and only there. They read the instance's
-`instance.json` in the folder that `--instance` names, or else in `$HIDDEN_IDE_HOME` (there is no
-default), connect to the DevTools endpoint that the instance's start recorded there, and
+`instance.json` in the folder that `--instance` names, or else in `$HIDDEN_IDE_HOME` (they require
+one of the two), connect to the DevTools endpoint that the instance's start recorded there, and
 go on only when the instance's IDE answers as itself (`scripts/lib/test-instance.mjs`). The
 settings they change are the instance's own (`profile/User/settings.json`), and they restore them
 when they end.
 
 An instance opens either a folder of PDFs, without a login (`--folder`), or the local replica of an
-Overleaf project meant for tests (`--project`), whose `output.pdf` the viewer loads in ranges:
+Overleaf project meant for tests (`--project`); the viewer loads that project's `output.pdf` in ranges:
 
 ```sh
+export HIDDEN_IDE_HOME=<a folder of your own> HIDDEN_IDE_BINARY=<the Antigravity binary>
 scripts/hidden-ide.sh start --folder /tmp/pdf-viewer-harness/book-theme
 node scripts/pdf-viewer-harness/ide/drive-local-pdf.mjs --pdf /tmp/pdf-viewer-harness/book-theme/build-a.pdf --pages 1 --theme-book
 scripts/hidden-ide.sh stop

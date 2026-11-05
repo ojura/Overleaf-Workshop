@@ -108,9 +108,25 @@ function fixture({ storage = new Map(), origin = 1 } = {}) {
 
 const rect = (x, y, width, height) => ({ x, y, width, height, left: x, top: y, right: x + width, bottom: y + height,
   toJSON() { return { x, y, width, height, left: x, top: y, right: x + width, bottom: y + height }; } });
-function panelFixture(f, { dock = 'float', bounds = rect(180, 80, 320, 240), viewportWidth = 800, viewportHeight = 700 } = {}) {
-  let current = bounds, currentDock = dock, animation, column, columnX = 0, pointer;
-  const actions = [], overlaps = [], details = { open: false }, handles = new Map(), controls = new Map();
+function panelFixture(f, { dock = 'float', bounds = rect(180, 80, 320, 240), viewportWidth = 800, viewportHeight = 700,
+  measurements = false, contentSizing = false, toggleDelay = 0 } = {}) {
+  let current = bounds, currentDock = dock, animation, column, columnX = 0, pointer, measurementsOpen = measurements;
+  const actions = [], overlaps = [], details = new Events();
+  Object.defineProperty(details, 'open', {
+    get() { return measurementsOpen; },
+    set(value) {
+      if (measurementsOpen === value) return;
+      measurementsOpen = value;
+      f.window.setTimeout(() => details.emit('toggle'), toggleDelay);
+    },
+  });
+  details.addEventListener('toggle', () => {
+    if (!contentSizing) return;
+    animation = { from: current, to: rect(current.x, current.y, current.width, details.open ? 420 : 260), at: f.now };
+    host.dataset.panelMoving = 'true'; moveColumn(details.open ? 40 : 0);
+    actions.push({ kind: 'measurements', value: details.open, at: f.now });
+  });
+  const handles = new Map(), controls = new Map();
   const host = Object.assign(f.element('pdf-prefetch-diagnostics'), { hidden: false, dataset: { dock } });
   const floating = rect(100, 70, 240, 220);
   const root = { activeElement: null };
@@ -190,8 +206,10 @@ function panelFixture(f, { dock = 'float', bounds = rect(180, 80, 320, 240), vie
       if (now >= animation.at + 3700) { animation = undefined; delete host.dataset.panelMoving; }
     }
   });
-  return { host, root, handles, actions, overlaps, selectDock,
-    configure(value, bounds) { currentDock = value; host.dataset.dock = value; current = bounds; },
+  return { host, root, handles, actions, overlaps, selectDock, details,
+    configure(value, bounds, open = measurementsOpen) {
+      currentDock = value; host.dataset.dock = value; current = bounds; measurementsOpen = open;
+    },
     snapshot: () => ({ dock: currentDock, rect: current.toJSON(), measurements: details.open }) };
 }
 
@@ -456,6 +474,26 @@ test('matching panel coordinates during the stationary approach do not bypass re
   assert.equal(panel.host.dataset.panelMoving, undefined);
   assert.equal(f.viewer.container.dataset.pdfColumnMoving, undefined);
   assert.deepEqual(panel.snapshot(), JSON.parse(JSON.stringify(saved.panel)));
+});
+
+test('saved disclosure waits for queued toggle and content motion before restoring anchored geometry', async t => {
+  for (const measurements of [false, true]) {
+    const f = fixture(); t.after(() => f.dispose());
+    const panel = panelFixture(f, { measurements, contentSizing: true, toggleDelay: 80, bounds: rect(180, 80, 320, 220) });
+    f.install(); await f.ready(); const saved = f.api().capture(true);
+    panel.configure('float', rect(100, 70, 360, measurements ? 260 : 420), !measurements);
+    const restored = await f.drive(f.api().restore(saved));
+    assert.equal(restored.exact, true);
+    assert.deepEqual(panel.snapshot(), JSON.parse(JSON.stringify(saved.panel)));
+    assert.deepEqual(panel.overlaps, []);
+    const disclosure = panel.actions.find(action => action.kind === 'measurements');
+    const gestures = panel.actions.filter(action => action.kind === 'drag' || action.kind === 'resize');
+    assert.equal(disclosure.value, measurements);
+    assert.ok(gestures.length > 0);
+    assert.ok(gestures.every(action => action.at >= disclosure.at + 3700), 'content motion must finish before geometry gestures');
+    assert.equal(new Set(gestures.map(action => action.at)).size, 1, 'anchored geometry shares one column settle');
+    assert.equal(panel.details.count, 1, 'the temporary toggle listener is removed');
+  }
 });
 
 test('viewport-clamped floating restoration moves before growing and corrects position after shrinking', async t => {

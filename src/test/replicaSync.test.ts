@@ -567,6 +567,144 @@ describe('ReplicaSync', () => {
             }
         });
 
+        /** A failure guard: a tool must answer while the test still holds the lock. */
+        async function toolAnswer(request: Promise<SyncSummary>): Promise<SyncSummary> {
+            let timer: NodeJS.Timeout | undefined;
+            try {
+                return await Promise.race([request, new Promise<never>((_resolve, reject) => {
+                    timer = setTimeout(() => reject(new Error('the tool waited without a bound while the lock remained held')), 1000);
+                })]);
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+
+        it('answers a tool\'s request that records with the lock\'s text when the lock comes in the middle of its step and stays', async () => {
+            const saved = ReplicaSync.toolLockWaitMs;
+            ReplicaSync.toolLockWaitMs = 0;
+            const t = await locked();
+            let request: Promise<SyncSummary> | undefined;
+            try {
+                // a store that records, as the git store's commit of Overleaf's state
+                let records = 0;
+                t.store.record = async () => { records += 1; return {}; };
+                t.local.set('/a.tex', 'an edit\n');
+                lockDuringRead(t);
+                request = t.sync.flush(true, { record: true, by: 'tool' });
+                const summary = await toolAnswer(request);
+                assert.ok(String(summary.waitingFor).includes('/replica/.git/index.lock'), summary.waitingFor);
+                assert.strictEqual(t.remote.docs.get('/a.tex'), text, 'Overleaf keeps its text');
+                assert.strictEqual(records, 0, 'the record waits too');
+            } finally {
+                t.store.release();
+                await request?.catch(() => {});
+                await t.sync.stop();
+                ReplicaSync.toolLockWaitMs = saved;
+            }
+        });
+
+        it('lets the checks of one tool\'s request wait for the lock up to toolLockWaitMs together: the record waits only for what the write\'s check left', async () => {
+            const saved = ReplicaSync.toolLockWaitMs;
+            ReplicaSync.toolLockWaitMs = 50;
+            const t = await locked();
+            let request: Promise<SyncSummary> | undefined;
+            try {
+                t.store.record = async () => ({});
+                t.local.set('/a.tex', 'an edit\n');
+                lockDuringRead(t);
+                // how long each check of the request waits for the lock (the sync's own wait)
+                const sync = t.sync as any;
+                const goesWithin = sync.indexLockGoesWithin.bind(sync);
+                const waits: number[] = [];
+                sync.indexLockGoesWithin = (file: string, ms: number) => { waits.push(ms); return goesWithin(file, ms); };
+                request = t.sync.flush(true, { record: true, by: 'tool' });
+                const summary = await toolAnswer(request);
+                assert.ok(String(summary.waitingFor).includes('/replica/.git/index.lock'), summary.waitingFor);
+                assert.strictEqual(waits.length, 2, 'the write\'s check and the record\'s');
+                assert.ok(waits[1] < waits[0], `the record waits for what is left: ${JSON.stringify(waits)}`);
+            } finally {
+                t.store.release();
+                await request?.catch(() => {});
+                await t.sync.stop();
+                ReplicaSync.toolLockWaitMs = saved;
+            }
+        });
+
+        it('keeps the tool deadline when collected deletions are applied and meet a second lock', async () => {
+            const savedLimit = ReplicaSync.toolLockWaitMs;
+            const savedNow = Date.now;
+            const t = await locked();
+            const sync = t.sync as any;
+            const goesWithin = sync.indexLockGoesWithin;
+            let clock = savedNow();
+            let request: Promise<SyncSummary> | undefined;
+            const waits: number[] = [];
+            try {
+                ReplicaSync.toolLockWaitMs = 50;
+                Date.now = () => clock;
+                sync.indexLockGoesWithin = async (_file: string, ms: number) => {
+                    waits.push(ms);
+                    if (waits.length === 1) { clock += 40; t.store.release(); return true; }
+                    return false;
+                };
+                t.local.files.delete('/a.tex');
+                const read = t.remote.readDoc.bind(t.remote);
+                let reads = 0;
+                t.remote.readDoc = async (path: string) => {
+                    if (++reads === 2) { t.store.lock = '/replica/.git/index.lock'; }
+                    return read(path);
+                };
+                request = t.sync.flush(true, { by: 'tool' });
+                const summary = await toolAnswer(request);
+                assert.deepStrictEqual(waits, [50, 10], 'the deletion uses the remainder of the initial wait');
+                assert.match(summary.waitingFor ?? '', /index\.lock/);
+                assert.strictEqual(t.remote.docs.get('/a.tex'), text, 'the deletion waits for Git');
+            } finally {
+                Date.now = savedNow;
+                sync.indexLockGoesWithin = goesWithin;
+                t.store.release();
+                await request?.catch(() => {});
+                await t.sync.stop();
+                ReplicaSync.toolLockWaitMs = savedLimit;
+            }
+        });
+
+        it('reports the lock when it first appears at the final recording of a tool flush', async () => {
+            const saved = ReplicaSync.toolLockWaitMs;
+            const t = await locked();
+            let request: Promise<SyncSummary> | undefined;
+            let records = 0;
+            try {
+                ReplicaSync.toolLockWaitMs = 0;
+                t.store.release();
+                t.store.record = async () => { records += 1; return {}; };
+                t.remote.settled = async () => { t.store.lock = '/replica/.git/index.lock'; };
+                request = t.sync.flush(true, { record: true, by: 'tool' });
+                const summary = await toolAnswer(request);
+                assert.match(summary.waitingFor ?? '', /index\.lock/, 'the caller must not report a completed sync');
+                assert.strictEqual(records, 0, 'the state was not recorded while Git held the lock');
+            } finally {
+                t.remote.settled = async () => {};
+                t.store.release();
+                await request?.catch(() => {});
+                await t.sync.stop();
+                ReplicaSync.toolLockWaitMs = saved;
+            }
+        });
+
+        it('reports a store that deferred recording instead of claiming a completed tool flush', async () => {
+            const t = await locked();
+            try {
+                t.store.release();
+                t.store.record = async () => ({ waiting: true });
+                const summary = await t.sync.flush(true, { record: true, by: 'tool' });
+                assert.strictEqual(summary.waitingFor, "Overleaf's state is waiting to be recorded");
+            } finally {
+                t.store.release();
+                await t.sync.stop();
+            }
+        });
+
         it('does not ask the window about the commit that a checkout leaves when a tool\'s request meets the checkout\'s lock in the middle of its step', async () => {
             const t = await locked();
             let asked = 0;
@@ -637,6 +775,57 @@ describe('ReplicaSync', () => {
             assert.deepStrictEqual(t.local.files.get('/a.png')!.content, png2);
             assert.strictEqual(t.remote.count('readFile'), 1, 'the reconcile that ran again took the file that it had read');
             assert.ok(t.ui.logs.some(line => line.includes('reads both sides again')), 'it ran again');
+        });
+
+        /** A synced project with /fig/a.png and /main.tex, its sync, and a store without git's lock. */
+        async function withFigure() {
+            const t = setup();
+            const store = new LockedStore();
+            store.lock = undefined;
+            t.remote.files.set('/fig/a.png', png);
+            t.remote.docs.set('/main.tex', text);
+            const sync = new ReplicaSync(t.remote, t.local, store, t.ui, (p: string) => p.endsWith('.aux'));
+            await sync.syncAll();
+            return { ...t, store, sync };
+        }
+
+        it('leaves the empty local folder of a file deleted on Overleaf in place when git takes its lock right after the file\'s removal', async () => {
+            const t = await withFigure();
+            try {
+                const emptied: string[] = [];
+                t.local.removeFolderIfEmpty = async (...folders: string[]) => { emptied.push(...folders); };
+                const remove = t.local.remove.bind(t.local);
+                t.local.remove = async (path: string) => { await remove(path); t.store.lock = '/replica/.git/index.lock'; };
+                t.remote.files.delete('/fig/a.png');
+                await t.sync.remoteChanged('/fig/a.png', true);
+                assert.strictEqual(t.local.files.has('/fig/a.png'), false, 'the file is deleted locally, as on Overleaf');
+                assert.deepStrictEqual(emptied, [], 'the empty folder stays while git holds its lock');
+                assert.ok(t.ui.logs.some(line => line.startsWith('/fig: the empty folder stays in the local folder')), t.ui.logs.join('\n'));
+            } finally {
+                t.store.release();
+                await t.sync.stop();
+            }
+        });
+
+        it('leaves the empty folder of a file deleted locally in place on Overleaf when git takes its lock right after the removal there', async () => {
+            const saved = ReplicaSync.localDeleteDelayMs;
+            ReplicaSync.localDeleteDelayMs = 0;
+            const t = await withFigure();
+            try {
+                const emptied: string[] = [];
+                t.remote.removeFolderIfEmpty = async (...folders: string[]) => { emptied.push(...folders); };
+                const remove = t.remote.remove.bind(t.remote);
+                t.remote.remove = async (path: string) => { await remove(path); t.store.lock = '/replica/.git/index.lock'; };
+                t.local.files.delete('/fig/a.png');
+                await t.sync.localChanged('/fig/a.png');
+                assert.strictEqual(t.remote.files.has('/fig/a.png'), false, 'the file is deleted on Overleaf, as locally');
+                assert.deepStrictEqual(emptied, [], 'the empty folder stays on Overleaf while git holds its lock');
+                assert.ok(t.ui.logs.some(line => line.startsWith('/fig: the empty folder stays on Overleaf')), t.ui.logs.join('\n'));
+            } finally {
+                t.store.release();
+                await t.sync.stop();
+                ReplicaSync.localDeleteDelayMs = saved;
+            }
         });
 
         it('keeps what git writes into a file during the upload of its merge, at the merged text\'s local write', async () => {
@@ -745,6 +934,31 @@ describe('ReplicaSync', () => {
             t.store.op = undefined;
             await t.sync.syncAll();
             assert.deepStrictEqual(t.docs.map(p => t.local.text(p)), t.docs.map(p => `${p} v2, edited on Overleaf\n`));
+        });
+
+        it('stops starting reconciles once the full sync finds git in the middle of an operation, and leaves them to the full sync after it', async () => {
+            const n = 4 * ReplicaSync.scanConcurrency;
+            const t = await synced(n);
+            const readDoc = t.remote.readDoc.bind(t.remote);
+            try {
+                for (const p of t.docs) { t.remote.docs.set(p, `${p} v2, edited on Overleaf\n`); }
+                // a merge starts in the folder while the full sync reads the first document
+                let reads = 0;
+                t.remote.readDoc = async (path: string) => { reads += 1; t.store.op = 'a merge'; return readDoc(path); };
+                const during = await t.sync.syncAll();
+                assert.strictEqual(during.waitingFor, 'git is in the middle of a merge in the folder');
+                assert.ok(reads <= ReplicaSync.scanConcurrency, `${reads} of the ${n} documents read during the merge`);
+                assert.strictEqual(during.notChecked, n - ReplicaSync.scanConcurrency, 'the reconciles not started');
+                // the merge ends; the full sync after it takes the documents in
+                t.remote.readDoc = readDoc;
+                t.store.op = undefined;
+                await t.sync.syncAll();
+                assert.deepStrictEqual(t.docs.map(p => t.local.text(p)), t.docs.map(p => `${p} v2, edited on Overleaf\n`));
+            } finally {
+                t.remote.readDoc = readDoc;
+                t.store.op = undefined;
+                await t.sync.stop();
+            }
         });
 
         it('leaves the uploads it has not made yet to the full sync after the operation', async () => {

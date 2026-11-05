@@ -1,5 +1,5 @@
 import { pdfCachePolicy, pdfSidecarDecodeOptions, ScrollPrefetchDynamics, type PdfCachePolicy } from './scroll-prefetch';
-import { installPrefetchDiagnostics, pdfPerformance, type DecodedImageSnapshot } from './prefetch-performance';
+import { installPrefetchDiagnostics, pdfPerformance, type DecodedImageSnapshot, type MotionLabMeasurementsPreference } from './prefetch-performance';
 import { PdfPreviewCache } from './pdf-preview-cache';
 import { installPdfDocumentRobots, type DocumentRobotDelivery, type DocumentRobotWorkGroup } from './pdf-document-robots';
 import { createPdfPreviewSourceLoader, rotatePdfPreviewImageRegions, type PdfPreviewSource } from './pdf-preview-source';
@@ -26,6 +26,7 @@ interface Options {
     diagnosticsToolbar?: HTMLElement;
     diagnosticsToolbarBefore?: HTMLElement;
     diagnosticsMenu?: HTMLElement;
+    measurementsPreference?: MotionLabMeasurementsPreference;
     onDiagnosticsOpen?: () => void;
     diagnosticsEnabled?: boolean;
     robotsEnabled?: boolean;
@@ -1348,6 +1349,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         toolbar: options.diagnosticsToolbar,
         toolbarBefore: options.diagnosticsToolbarBefore,
         measurementsMenu: options.diagnosticsMenu,
+        measurementsPreference: options.measurementsPreference,
         onOpen: options.onDiagnosticsOpen,
         onPanelLayout: layout => {
             if (disposed) { return; }

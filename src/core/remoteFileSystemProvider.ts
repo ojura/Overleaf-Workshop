@@ -307,7 +307,10 @@ export class VirtualFileSystem extends vscode.Disposable {
     private handlersRegistered: boolean = false;
     /** this window's last compile on Overleaf, whatever its status */
     lastCompile?: CompileRecord;
-    /** whether Overleaf has this window's compile request and has not answered it yet (compile) */
+    /**
+     * Whether this window's compile request has left for Overleaf without an answer yet.
+     * Its compile server may not have the request yet (CompileManager.stopCompile).
+     */
     waitingForCompile = false;
     /** the build in use, which may be another client's (src/core/projectBuilds.ts) */
     readonly builds: ProjectBuilds;
@@ -1916,8 +1919,8 @@ export class VirtualFileSystem extends vscode.Disposable {
      * Answers true for a build, false for a compile without one, undefined when nothing changed
      * since the last compile, and 'stopped' when `stop` was aborted before the request was sent:
      * then the request is not sent, nor the clearing of the output when the stop came before it,
-     * and the project counts as changed as before. While Overleaf has the request and has not
-     * answered it, waitingForCompile is true.
+     * and the project counts as changed as before. From the request's leaving until Overleaf's
+     * answer, waitingForCompile is true.
      */
     async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string, fromScratch:boolean=false, stop?: AbortSignal): Promise<boolean | 'stopped' | undefined> {
         if (force || fromScratch || (this.root && this.isDirty)) {

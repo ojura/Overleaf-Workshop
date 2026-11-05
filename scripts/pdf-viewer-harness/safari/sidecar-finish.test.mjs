@@ -11,9 +11,11 @@ const box = (x, y, width, height) => ({ x, y, left: x, top: y, width, height,
   right: x + width, bottom: y + height, toJSON() { return { ...this, toJSON: undefined }; } });
 
 function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 0, pageLeft = 300, pageWidth = 300,
-  stallDock, insufficientFloat = false, interruptDuringRestore = false, recoverFloatFrom } = {}) {
+  stallDock, insufficientFloat = false, interruptDuringRestore = false, recoverFloatFrom,
+  measurements = false, recoveryMeasurements, contentSizing = false, toggleDelay = 0 } = {}) {
   let now = 0, serial = 0, columnX = 0, animation, column, pointer, callback, restoring;
   let closed = false, interrupted = false, stalled = false, recovery = false, recoveryPositioned = false;
+  let measurementsOpen = measurements, recoveryDisclosureChanged = false;
   const timers = new Map(), overlaps = [], history = [];
   const readerRight = readerLeft + 1000;
   const originalFloat = box(floatX, 80, floatWidth, 220);
@@ -21,7 +23,26 @@ function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 
   const destination = value => value === 'float' ? clone(floating)
     : box(value === 'left' ? readerLeft : readerRight - floating.width, 20, floating.width, 660);
   let rect = destination(dock);
-  const original = clone(rect), details = { open: false }, host = { dataset: { dock } };
+  const original = clone(rect), host = { dataset: { dock } };
+  const toggleListeners = new Set();
+  const details = {
+    addEventListener(name, callback) { if (name === 'toggle') toggleListeners.add(callback); },
+    removeEventListener(name, callback) { if (name === 'toggle') toggleListeners.delete(callback); },
+    get open() { return measurementsOpen; },
+    set open(value) {
+      if (measurementsOpen === value) return;
+      measurementsOpen = value;
+      timeout(() => {
+        if (contentSizing) {
+          const to = box(rect.x, rect.y, rect.width, measurementsOpen ? 420 : 260);
+          animation = { at: now, from: clone(rect), to };
+          host.dataset.panelMoving = 'true'; moveColumn(plan(currentDock, to));
+          history.push({ action: 'measurements', value: measurementsOpen, at: now, intendedEnd: now + 3700, recovery });
+        }
+        for (const listener of [...toggleListeners]) listener({ type: 'toggle' });
+      }, toggleDelay);
+    },
+  };
   const saved = { page: 46, scaleValue: 'page-width', scale: 0.5, rotation: 0, scrollMode: 0,
     spreadMode: 0, sidebar: 0, top: 23685, left: 0, robots: true, lab: false };
   const reading = { ...saved, page: 99, top: 50000 };
@@ -127,6 +148,9 @@ function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 
           animation = column = undefined; delete host.dataset.panelMoving; delete container.dataset.pdfColumnMoving;
           history.push({ action: 'recovery-position', at: now, recovery });
         }
+        if (callback && recoveryMeasurements !== undefined && !recoveryDisclosureChanged) {
+          recoveryDisclosureChanged = true; measurementsOpen = recoveryMeasurements;
+        }
         if (interruptDuringRestore) timeout(() => { interrupted = result.interrupted = true; reading.page = 311; }, 32);
         await callback?.({ guard: () => guard(true), deadline: now + budget.restoreMs });
         if (result.interrupted) return false;
@@ -143,7 +167,7 @@ function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 
     setTimeout: timeout, clearTimeout: id => timers.delete(id),
     requestAnimationFrame: fn => timeout(() => fn(now), 16), cancelAnimationFrame: id => timers.delete(id) };
   const finish = vm.runInNewContext(source, context);
-  return { result, history, overlaps, original, originalFloat, panelState, reading, timers, probe,
+  return { result, history, overlaps, original, originalFloat, panelState, reading, timers, probe, toggleListeners,
     async run() {
       let done = false, failure;
       finish({ token: result.token }).then(() => { done = true; }, error => { done = true; failure = error; });
@@ -246,5 +270,26 @@ test('viewport-clamped floating recovery handles growth-leftward and shrink-righ
     assert.equal(new Set(gestures.map(event => event.at)).size, 1);
     assert.equal(h.reading.page, result.saved.page);
     assert.equal(h.timers.size, 0);
+  }
+});
+
+test('sidecar recovery awaits queued toggle and content motion before saved geometry', async () => {
+  for (const measurements of [false, true]) {
+    const h = fixture({ floatX: 140, floatWidth: 320, measurements, recoveryMeasurements: !measurements,
+      contentSizing: true, toggleDelay: 80, recoverFloatFrom: [100, 70, 360, measurements ? 260 : 420], stallDock: 'right' });
+    const result = await h.run();
+    assert.match(result.failure, /did not settle/i);
+    assert.equal(result.cleanupError, undefined);
+    assert.equal(h.panelState().measurements, measurements);
+    for (const key of ['x', 'y', 'width', 'height']) assert.ok(Math.abs(h.panelState().rect[key] - h.original[key]) <= 1, key);
+    const disclosure = h.history.find(event => event.action === 'measurements');
+    const gestures = h.history.filter(event => event.recovery && ['drag', 'resize'].includes(event.action));
+    assert.equal(disclosure.value, measurements);
+    assert.ok(gestures.length > 0);
+    assert.ok(gestures.every(event => event.at >= disclosure.intendedEnd), 'content motion must finish before geometry gestures');
+    assert.equal(h.overlaps.filter(event => event.recovery).length, 0);
+    assert.equal(h.reading.page, result.saved.page);
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.toggleListeners.size, 0, 'the temporary toggle listener is removed');
   }
 });

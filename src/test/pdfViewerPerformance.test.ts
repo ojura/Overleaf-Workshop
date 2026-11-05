@@ -11,6 +11,7 @@ describe('PDF prefetch performance measurements', function () {
     this.timeout(30 * 1000);
     let dir: string;
     let performanceModule: any;
+    let contentModule: any;
 
     before(async () => {
         const { bundleOptions, viewerRoot } = await importModule(path.join(repo, 'scripts', 'build-pdf-viewer.mjs'));
@@ -23,6 +24,26 @@ describe('PDF prefetch performance measurements', function () {
                 outfile: path.join(dir, 'performance.mjs'),
             });
             performanceModule = await importModule(path.join(dir, 'performance.mjs'));
+            await esbuild.build({
+                ...bundleOptions,
+                entryPoints: [path.join(viewerRoot, 'src', 'common', 'prefetch-performance.ts')],
+                outfile: path.join(dir, 'content.mjs'),
+                plugins: [{ name: 'diagnostic-content-boundary', setup(build: any) {
+                    build.onResolve({ filter: /^\.\/(prefetch-robots|motion-lab-panel)$/ }, (args: any) =>
+                        ({ path: args.path, namespace: 'diagnostic-content-boundary' }));
+                    build.onLoad({ filter: /.*/, namespace: 'diagnostic-content-boundary' }, (args: any) => ({
+                        contents: args.path.endsWith('prefetch-robots')
+                            ? 'export function installPrefetchRobots() { return globalThis.__motionDiagnosticsHarness.lab; }'
+                            : 'export { MOTION_LAB_RESIZE_HANDLES } from '
+                                + JSON.stringify(path.join(viewerRoot, 'src', 'common', 'motion-lab-panel.ts')) + ';'
+                                + 'export function installMotionLabPanel(host, options) {'
+                                + ' return globalThis.__motionDiagnosticsHarness.installPanel(host, options); }',
+                        loader: 'js',
+                        resolveDir: repo,
+                    }));
+                } }],
+            });
+            contentModule = await importModule(path.join(dir, 'content.mjs'));
         } finally {
             await esbuild.stop();
         }
@@ -30,6 +51,300 @@ describe('PDF prefetch performance measurements', function () {
 
     after(() => {
         if (dir) { fs.rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    function contentFixture(options: { storage?: Map<string, string>; storageFails?: boolean;
+        preference?: { whenReady?(): Promise<void>; read(): boolean | undefined; write(open: boolean): void | Promise<void> };
+        visible?: boolean; onOpen?: () => void } = {}) {
+        const listeners = new Map<string, Set<() => void>>();
+        const timers = new Map<number, () => void>();
+        const storage = options.storage ?? new Map<string, string>();
+        const reads: string[] = [], writes: Array<[string, string]> = [];
+        const refreshes: any[] = [], heights: Array<number | undefined> = [];
+        const observers: Observer[] = [];
+        const document: any = { hidden: !options.visible, activeElement: null,
+            addEventListener(name: string, listener: () => void) {
+                if (!listeners.has(name)) { listeners.set(name, new Set()); } listeners.get(name)!.add(listener);
+            },
+            removeEventListener(name: string, listener: () => void) { listeners.get(name)?.delete(listener); },
+        };
+        let panelOptions: any, host: ElementNode, rectangleReads = 0, invalidations = 0;
+        let currentWidth = 456, forcedHeight = 700, extraHeight = 0, failMeasurement = false;
+        class ElementNode {
+            ownerDocument = document;
+            id = ''; hidden = false; open = false; scrollTop = 0; scrollLeft = 0; textContent = '';
+            style: Record<string, string> = {};
+            dataset: Record<string, string> = {};
+            attributes = new Map<string, string>();
+            handlers = new Map<string, Set<() => void>>();
+            children: ElementNode[] = [];
+            shadow: any;
+            constructor(readonly selector = '') {}
+            append(...children: ElementNode[]) { this.children.push(...children); }
+            remove() {}
+            setAttribute(name: string, value: string) { this.attributes.set(name, value); }
+            getAttribute(name: string) { return this.attributes.get(name) ?? null; }
+            addEventListener(name: string, callback: () => void) {
+                if (!this.handlers.has(name)) { this.handlers.set(name, new Set()); } this.handlers.get(name)!.add(callback);
+            }
+            removeEventListener(name: string, callback: () => void) { this.handlers.get(name)?.delete(callback); }
+            emit(name: string) { for (const callback of [...this.handlers.get(name) ?? []]) { callback(); } }
+            getBoundingClientRect() {
+                rectangleReads++;
+                const section = host.shadow.querySelector('section');
+                const width = section.style.width?.endsWith('px') ? parseFloat(section.style.width) : currentWidth;
+                const content = host.shadow.querySelector('.panel-content');
+                const measurements = host.shadow.querySelector('.measurements');
+                let top = 100, height = forcedHeight;
+                if (this.selector === '.panel-content-flow') {
+                    if (failMeasurement) { throw new Error('detached layout'); }
+                    // The actual flow remains intrinsic when its scroll viewport is shorter or taller.
+                    top += 15 + 28 + 9 + (width < 360 ? 72 : 36) - content.scrollTop;
+                    height = (measurements.open ? 620 : 240) + (width < 400 ? 60 : 0) + extraHeight + 0.25;
+                }
+                return { x: 500, y: top, left: 500, top, right: 500 + width, bottom: top + height, width, height };
+            }
+            attachShadow() {
+                const nodes = new Map<string, ElementNode>();
+                const lookup = (selector: string) => {
+                    if (!nodes.has(selector)) { nodes.set(selector, new ElementNode(selector)); }
+                    return nodes.get(selector)!;
+                };
+                const fields = ['margin', 'status'].map(name => {
+                    const node = lookup('[data-field="' + name + '"]'); node.dataset.field = name; return node;
+                });
+                return this.shadow = { innerHTML: '', querySelector: lookup, querySelectorAll: () => fields };
+            }
+        }
+        class Observer {
+            targets = new Set<ElementNode>();
+            disconnected = false;
+            constructor(readonly callback: (entries: any[]) => void) { observers.push(this); }
+            observe(target: ElementNode) { this.targets.add(target); this.disconnected = false; }
+            disconnect() { this.targets.clear(); this.disconnected = true; }
+            fire() { this.callback([...this.targets].map(target => ({ target,
+                contentRect: { width: currentWidth, height: extraHeight + 240 } }))); }
+        }
+        const panel = {
+            setVisible(visible: boolean) { if (visible) { heights.push(panelOptions.measureContentHeight?.(currentWidth)); } },
+            refreshContent(value?: any) { refreshes.push(value); panelOptions.onGeometryChange();
+                heights.push(panelOptions.measureContentHeight?.(currentWidth)); },
+            dispose() {},
+        };
+        (globalThis as any).__motionDiagnosticsHarness = {
+            lab: { invalidateGeometry() { invalidations++; }, setActive() {}, update() {}, dispose() {}, snapshot: () => ({}) },
+            installPanel(createdHost: ElementNode, value: any) { host = createdHost; panelOptions = value; return panel; },
+        };
+        document.body = new ElementNode();
+        document.createElement = () => new ElementNode();
+        document.defaultView = {
+            matchMedia: () => ({ matches: true }),
+            getComputedStyle: (element: ElementNode) => ({
+                paddingBottom: element.selector === 'section' ? '14px' : '0px',
+                borderBottomWidth: element.selector === 'section' ? '1px' : '0px',
+            }),
+            get localStorage() {
+                if (options.storageFails) { throw new Error('Storage is disabled'); }
+                return { getItem(key: string) { reads.push(key); return storage.get(key) ?? null; },
+                    setItem(key: string, value: string) { writes.push([key, value]); storage.set(key, value); } };
+            },
+            setInterval(callback: () => void) { const id = timers.size + 1; timers.set(id, callback); return id; },
+            clearInterval(id: number) { timers.delete(id); },
+        };
+        document.defaultView['ResizeObserver'] = Observer;
+        const diagnostics = contentModule.installPrefetchDiagnostics(new ElementNode(), () => ({
+            direction: 0, velocityPxPerMs: 0, accelerationPxPerMs2: 0, pageLatencyMs: 0,
+            preloadPx: 0, readyDistancePx: 0, safetySeconds: null, bufferSeconds: null,
+            visible: [], renderAhead: [], prepared: [], pending: [], failed: [],
+            previewPages: 0, previewBytes: 0, canvasBytes: 0,
+        }), { measurementsPreference: options.preference, onOpen: options.onOpen });
+        return { diagnostics, storage, reads, writes, refreshes, heights, observers, timers,
+            get host() { return host; }, get panelOptions() { return panelOptions; },
+            get rectangleReads() { return rectangleReads; }, get invalidations() { return invalidations; },
+            node: (selector: string) => host.shadow.querySelector(selector) as ElementNode,
+            setWidth(value: number) { currentWidth = value; }, setForcedHeight(value: number) { forcedHeight = value; },
+            setHidden(value: boolean) { document.hidden = value; for (const listener of listeners.get('visibilitychange') ?? []) { listener(); } },
+            grow(value: number) { extraHeight = value; }, failMeasurement(value: boolean) { failMeasurement = value; },
+            dispose() { diagnostics.dispose(); delete (globalThis as any).__motionDiagnosticsHarness; },
+        };
+    }
+
+    it('defaults the native measurements disclosure to collapsed and persists only subsequent changes', () => {
+        const fixture = contentFixture();
+        let key = '';
+        try {
+            assert.deepStrictEqual(fixture.reads, [], 'closed diagnostics do not access storage');
+            fixture.diagnostics.setEnabled(true);
+            const details = fixture.node('.measurements');
+            assert.strictEqual(details.open, false, 'desktop creation also defaults collapsed');
+            assert.strictEqual(fixture.heights[0], 344, 'the preference is applied before the first content measurement');
+            assert.strictEqual(fixture.reads.length, 1); key = fixture.reads[0];
+            details.emit('toggle');
+            assert.deepStrictEqual(fixture.writes, [], 'initialization is not a preference change');
+            details.open = true; details.emit('toggle');
+            assert.deepStrictEqual(fixture.writes, [[key, 'true']]);
+            assert.deepStrictEqual(fixture.refreshes, [{ fit: true }]);
+            assert.strictEqual(fixture.heights.at(-1), 724);
+            assert.match(fixture.host.shadow.innerHTML, /<details class="measurements"><summary>/,
+                'the disclosure keeps native details and summary semantics');
+            assert.match(fixture.host.shadow.innerHTML, /Expand/);
+            assert.match(fixture.host.shadow.innerHTML, /Collapse/);
+        } finally { fixture.dispose(); }
+        const recreated = contentFixture({ storage: fixture.storage });
+        try {
+            recreated.diagnostics.setEnabled(true);
+            const details = recreated.node('.measurements');
+            assert.strictEqual(details.open, true);
+            assert.strictEqual(recreated.heights[0], 724);
+            details.emit('toggle');
+            assert.deepStrictEqual(recreated.writes, []);
+            details.open = false; details.emit('toggle');
+            assert.deepStrictEqual(recreated.writes, [[key, 'false']]);
+            assert.deepStrictEqual(recreated.refreshes, [{ fit: false }], 'closing does not request growth to fit');
+            assert.strictEqual(recreated.heights.at(-1), 344);
+        } finally { recreated.dispose(); }
+    });
+
+    it('reads an injected preference lazily and keeps disclosure controls usable when storage fails', async () => {
+        let saved: boolean | undefined;
+        let reads = 0;
+        const writes: boolean[] = [];
+        const fixture = contentFixture({ storageFails: true, preference: {
+            read() { reads++; return saved; }, write(value) { writes.push(value); },
+        } });
+        try {
+            assert.strictEqual(reads, 0);
+            saved = true;
+            fixture.diagnostics.setEnabled(true);
+            assert.strictEqual(reads, 1);
+            assert.strictEqual(fixture.node('.measurements').open, true);
+            fixture.node('.measurements').emit('toggle');
+            assert.deepStrictEqual(writes, []);
+            fixture.node('.measurements').open = false; fixture.node('.measurements').emit('toggle');
+            assert.deepStrictEqual(writes, [false]);
+            assert.deepStrictEqual(fixture.reads, []);
+        } finally { fixture.dispose(); }
+        for (const preference of [undefined, { read(): boolean { throw new Error('read unavailable'); },
+            write() { throw new Error('write unavailable'); } }, { read: () => false,
+            write: () => Promise.reject(new Error('asynchronous write unavailable')) }]) {
+            const denied = contentFixture({ storageFails: true, preference });
+            try {
+                assert.doesNotThrow(() => denied.diagnostics.setEnabled(true));
+                const details = denied.node('.measurements');
+                assert.strictEqual(details.open, false);
+                details.open = true;
+                assert.doesNotThrow(() => details.emit('toggle'));
+                assert.deepStrictEqual(denied.refreshes, [{ fit: true }]);
+                await new Promise<void>(resolve => setImmediate(resolve));
+            } finally { denied.dispose(); }
+        }
+    });
+
+    it('waits for late host preferences before first measurement and fences cancelled open requests', async () => {
+        for (const cancel of [undefined, 'close', 'dispose'] as const) {
+            let ready!: () => void, opened!: () => void, saved: boolean | undefined;
+            let reads = 0;
+            const waiting = new Promise<void>(resolve => { ready = resolve; });
+            const visible = new Promise<void>(resolve => { opened = resolve; });
+            const fixture = contentFixture({ preference: {
+                whenReady: () => waiting,
+                read() { reads++; return saved; },
+                write() { assert.fail('initial saved state must not be written back'); },
+            }, onOpen: opened });
+            try {
+                fixture.diagnostics.setEnabled(true);
+                await Promise.resolve();
+                assert.strictEqual(fixture.host, undefined, 'no collapsed panel flashes before saved state arrives');
+                assert.strictEqual(reads, 0);
+                fixture.setHidden(false);
+                assert.strictEqual(fixture.timers.size, 0, 'visibility cannot start sampling before the pending panel exists');
+                if (cancel === 'close') { fixture.diagnostics.setEnabled(false); }
+                if (cancel === 'dispose') { fixture.diagnostics.dispose(); }
+                saved = true; ready();
+                if (!cancel) {
+                    await visible;
+                    assert.strictEqual(fixture.node('.measurements').open, true);
+                    assert.strictEqual(fixture.heights[0], 724);
+                    assert.strictEqual(reads, 1);
+                } else {
+                    await new Promise<void>(resolve => setImmediate(resolve));
+                    assert.strictEqual(fixture.host, undefined);
+                    assert.strictEqual(fixture.diagnostics.enabled, false);
+                    assert.strictEqual(reads, 0);
+                    assert.strictEqual(fixture.timers.size, 0);
+                }
+            } finally { fixture.dispose(); }
+        }
+        let opened!: () => void;
+        const visible = new Promise<void>(resolve => { opened = resolve; });
+        const failed = contentFixture({ preference: {
+            whenReady: () => Promise.reject(new Error('host unavailable')),
+            read() { assert.fail('failed readiness uses the chosen collapsed default'); },
+            write() { assert.fail('fallback must not overwrite the unavailable saved state'); },
+        }, onOpen: opened });
+        try {
+            failed.diagnostics.setEnabled(true);
+            await visible;
+            assert.strictEqual(failed.node('.measurements').open, false);
+            assert.strictEqual(failed.heights[0], 344);
+        } finally { failed.dispose(); }
+    });
+
+    it('measures natural height at the proposed width without forced-height or scroll feedback', () => {
+        const fixture = contentFixture();
+        try {
+            fixture.diagnostics.setEnabled(true);
+            const surface = fixture.node('section'), content = fixture.node('.panel-content');
+            Object.assign(surface.style, { width: '100%', maxWidth: 'none', height: '100%' });
+            content.style.overflow = 'auto'; content.scrollTop = 73; content.scrollLeft = 9;
+            const styles = { ...surface.style }, contentStyles = { ...content.style };
+            const measure = fixture.panelOptions.measureContentHeight;
+            assert.strictEqual(typeof measure, 'function');
+            assert.strictEqual(measure(456), 344);
+            assert.strictEqual(measure(300), 440, 'narrow positioning controls and content wrap naturally');
+            fixture.setForcedHeight(180);
+            assert.strictEqual(measure(456), 344, 'short scroll viewport cannot cap intrinsic content');
+            fixture.setForcedHeight(900);
+            assert.strictEqual(measure(456), 344, 'a tall forced window cannot manufacture useful content');
+            assert.deepStrictEqual(surface.style, styles);
+            assert.deepStrictEqual(content.style, contentStyles);
+            assert.strictEqual(content.scrollTop, 73); assert.strictEqual(content.scrollLeft, 9);
+            fixture.failMeasurement(true);
+            assert.strictEqual(measure(300), undefined, 'detached/unavailable layout leaves the controller usable');
+            assert.deepStrictEqual(surface.style, styles);
+            assert.deepStrictEqual(content.style, contentStyles);
+            assert.strictEqual(content.scrollTop, 73); assert.strictEqual(content.scrollLeft, 9);
+        } finally { fixture.dispose(); }
+    });
+
+    it('refreshes from intrinsic changes rather than metric ticks and fences closed/disposed observers', () => {
+        const fixture = contentFixture({ visible: true });
+        try {
+            fixture.diagnostics.setEnabled(true);
+            assert.strictEqual(fixture.observers.length, 1);
+            const observer = fixture.observers[0];
+            assert.deepStrictEqual([...observer.targets].map(target => target.selector).sort(),
+                ['.panel-content-flow', '.panel-position', 'header'].sort());
+            const beforeTickReads = fixture.rectangleReads;
+            for (let index = 0; index < 5; index++) { for (const callback of fixture.timers.values()) { callback(); } }
+            assert.strictEqual(fixture.rectangleReads, beforeTickReads, 'sampling does not read content geometry');
+            fixture.grow(40); observer.fire();
+            assert.deepStrictEqual(fixture.refreshes, [undefined]);
+            assert.strictEqual(fixture.heights.at(-1), 384);
+            const refreshCount = fixture.refreshes.length;
+            fixture.diagnostics.setEnabled(false);
+            assert.ok(observer.disconnected);
+            observer.fire();
+            assert.strictEqual(fixture.refreshes.length, refreshCount);
+            fixture.diagnostics.setEnabled(true);
+            assert.ok(!observer.disconnected);
+            fixture.dispose();
+            observer.fire();
+            assert.strictEqual(fixture.refreshes.length, refreshCount);
+            assert.ok(observer.disconnected);
+            assert.strictEqual(fixture.timers.size, 0);
+            assert.strictEqual(fixture.node('.measurements').handlers.get('toggle')?.size, 0);
+        } finally { fixture.dispose(); }
     });
 
     it('keeps the newest bounded event history in chronological order', () => {
@@ -460,8 +775,11 @@ describe('PDF prefetch performance measurements', function () {
             assert.strictEqual(invalidations, 1, 'a panel layout invalidates the lab before downstream courier movement');
             assert.strictEqual(layoutInvalidations.at(-1), 1);
             host.shadow.querySelector('.panel-content').emit('scroll');
+            document.hidden = false;
+            host.shadow.querySelector('.measurements').open = true;
             host.shadow.querySelector('.measurements').emit('toggle');
             assert.strictEqual(invalidations, 3, 'internal scrolling and compact-details changes invalidate the same snapshot');
+            document.hidden = true;
             const content = host.shadow.querySelector('.panel-content'), measurements = host.shadow.querySelector('.measurements');
             host.shadow.querySelector('[data-panel-dock="float"]').emit('click');
             document.hidden = false;
