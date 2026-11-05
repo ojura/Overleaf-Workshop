@@ -4,7 +4,7 @@ The published reader at https://cloud.larics.fer.hr/spomenar/ uses the full pinn
 
 ## Reading
 
-The first visit fits the page to the reading column. PDF.js remembers the page, zoom, and scroll position by the document's fingerprint. A link containing a PDF-open hash, such as `#page=60&zoom=125,0,320`, opens that view. The header's share button uses PDF.js's current page, zoom, and coordinates; it opens the system share sheet when available and otherwise offers a copyable link.
+The first desktop visit opens at 150%. Phones and tablets fit the page to the reading column. PDF.js remembers the page, zoom, and scroll position by the document's fingerprint. A link containing a PDF-open hash, such as `#page=60&zoom=125,0,320`, opens that view. The header's share button uses PDF.js's current page, zoom, and coordinates; it opens the system share sheet when available and otherwise offers a copyable link.
 
 The SVG robot button in the header controls deliveries on the document and starts on. On a page's first substantial visible encounter, the robots carry fragments of its rendered pixels into place, including pages already prepared by prefetch. A thin page strip at the edge waits for a useful view, and later visits or zoom changes do not repeat that page's performance. Large desktop reading areas use six to twelve larger couriers; phones, tablets and narrow panes keep a compact four-courier limit. Both presentations release their cargo and stop animation when the delivery ends.
 

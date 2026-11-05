@@ -267,6 +267,9 @@ interface CaptionGroup {
     pages: ReadonlySet<number>;
     lines: ReadonlyMap<number, string>;
     until: number;
+    readMs: number;
+    shownAt?: number;
+    detached: boolean;
     measurementKey: string;
     width: number;
     height: number;
@@ -361,6 +364,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     let paintTotalMs = 0, paintMaxMs = 0, paintLastMs = 0;
     let sceneOrigin: Point = { x: 0, y: 0 };
     let stats = counters();
+    const pendingDeposits: number[][] = [];
     let dispatchOrigin: RobotDispatchPort | undefined;
     let activePresentation: Presentation['kind'] | undefined;
     let capacityBlocked = false;
@@ -604,8 +608,31 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (!episodes.size && !advance.size && !retiring && !columnPull) { transit.remove(); }
     }
 
-    function clearActorCaption(id: number): void {
-        if (captionGroup?.actors.includes(id)) { clearCaption(); }
+    function expireCaption(group: CaptionGroup): void {
+        if (captionTimer !== undefined) { win.clearTimeout(captionTimer); }
+        // The one timeout owns only a DOM bubble, never animation, a canvas or a robot lease.
+        captionTimer = win.setTimeout(() => {
+            if (captionGroup !== group) { return; }
+            captionTimer = undefined; clearCaption();
+        }, Math.max(0, group.until - now()));
+    }
+
+    function detachCaption(): void {
+        const group = captionGroup;
+        if (!group) { return; }
+        if (group.shownAt === undefined) { clearCaption(); return; }
+        group.detached = true;
+        for (const leader of group.leaders) { leader.remove(); }
+        group.leaders = [];
+        if (group.placement) { group.placement = { ...group.placement, leaders: [] }; }
+    }
+
+    function detachActorCaption(id: number): void {
+        if (captionGroup?.actors.includes(id)) { detachCaption(); }
+    }
+
+    function clearOwnedCaption(actors: readonly RobotBody[]): void {
+        if (captionGroup && actors.some(actor => captionGroup!.actors.includes(actor.id))) { clearCaption(); }
     }
 
     function sourceRectangle(source: HTMLCanvasElement, crop: Crop, supplied?: PdfRasterProjection) {
@@ -915,7 +942,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             vehicle => accepts(vehicle) && (payload.mode !== 'airlift' || payload.helpers.length > 0 || vehicle === 'lugv'), acceptsOrigin);
         if (!body) { return; }
         try {
-            encounters.forget(body.id); clearActorCaption(body.id);
+            encounters.forget(body.id); detachActorCaption(body.id);
             if (waiting) { body.launch = { ...waiting.point }; }
             const target = { x: payload.crop.x + payload.crop.width / 2, y: payload.crop.y + payload.crop.height / 2 };
             const actor: Courier = Object.assign(body, { payload, slot: payload.helpers.length,
@@ -929,12 +956,12 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         } catch { releaseActor(body); return; }
     }
 
-    function releaseActor(actor: RobotBody, completed = false): void {
+    function releaseActor(actor: RobotBody): void {
         encounters.forget(actor.id);
         hitBoxes.delete(actor.id);
         if (hovered?.id === actor.id) { hovered = undefined; }
         if (greeting?.id === actor.id) { greeting = undefined; }
-        if (!completed) { clearActorCaption(actor.id); }
+        detachActorCaption(actor.id);
         release(actor.sprite);
         spriteBytes -= actor.spriteBytes;
         capacityFreed = true;
@@ -1076,12 +1103,24 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         capacityFreed = true;
     }
 
+    function depositPayload(payload: Payload): void {
+        if (payload.deposited || !payload.canvas) { return; }
+        payload.deposited = true;
+        stats.deliveredFragments++;
+        // Refinement or visibility refresh can reach the deadline before the queued paint.
+        // Retain only numeric helper IDs for that paint's cue, never their leases or rasters.
+        if (pendingDeposits.length < DOCUMENT_ROBOT_LIMITS.desktop.maxActors) {
+            pendingDeposits.push(payload.helpers.map(actor => actor.id));
+        }
+        releasePayload(payload);
+    }
+
     function retireUncovered(payload: Payload, pageElement: HTMLElement | undefined): void {
-        // Native pixels can arrive after deposit is due but before its queued paint.
-        // Retire ownership before refinement can allocate a crop that would be released immediately.
-        if (payload.canvas && (now() >= payload.started + payload.delay + payload.duration * DEPOSIT_START
-            || !payload.cover?.isConnected || payload.cover.parentNode !== pageElement)) {
+        if (!payload.canvas) { return; }
+        if (!payload.cover?.isConnected || payload.cover.parentNode !== pageElement) {
             releasePayload(payload);
+        } else if (now() >= payload.started + payload.delay + payload.duration * DEPOSIT_START) {
+            depositPayload(payload);
         }
     }
 
@@ -1093,15 +1132,15 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const cover = payload.cover;
             if (!payload.canvas || !cover) { continue; }
             if (!pageElement.isConnected || payload.deposited
-                || now() >= payload.started + payload.delay + payload.duration * DEPOSIT_START
                 || cover.parentNode && cover.parentNode !== pageElement) { releasePayload(payload); continue; }
+            if (now() >= payload.started + payload.delay + payload.duration * DEPOSIT_START) { depositPayload(payload); continue; }
             try { if (cover.parentNode !== pageElement) { pageElement.append(cover); } }
             catch { releasePayload(payload); }
         }
     }
 
-    function dropPayload(payload: Payload, completed = false): void {
-        for (const actor of payload.helpers) { releaseActor(actor, completed); }
+    function dropPayload(payload: Payload): void {
+        for (const actor of payload.helpers) { releaseActor(actor); }
         payload.helpers.length = 0;
         releasePayload(payload);
         payload.sling?.remove(); payload.sling = undefined;
@@ -1111,6 +1150,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const scene = retiring;
         if (!scene) { return; }
         retiring = undefined;
+        clearOwnedCaption(scene.pieces.flatMap(piece => piece.payload.helpers));
         for (const piece of scene.pieces) { dropPayload(piece.payload); }
         scene.pieces.length = 0;
         scene.layer.remove();
@@ -1118,9 +1158,12 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         options.onReplacementComplete?.(scene.identity);
     }
 
-    function dropRetiringPiece(scene: RetiringScene, index: number, completed = false): void {
+    function dropRetiringPiece(scene: RetiringScene, index: number, cancelled = true): void {
         const [piece] = scene.pieces.splice(index, 1);
-        if (piece) { dropPayload(piece.payload, completed); }
+        if (piece) {
+            if (cancelled) { clearOwnedCaption(piece.payload.helpers); }
+            dropPayload(piece.payload);
+        }
         if (!scene.pieces.length && retiring === scene) { clearRetiring(); }
     }
 
@@ -1183,6 +1226,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     }
 
     function dropEpisode(episode: Episode, cancelled: boolean): void {
+        if (cancelled && captionGroup?.pages.has(episode.page)) { clearCaption(); }
         for (const payload of episode.payloads) { dropPayload(payload); }
         episode.payloads.length = 0;
         episode.layer.remove();
@@ -1201,6 +1245,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         releaseCleaner();
         encounters.clear();
         traffic.reset();
+        pendingDeposits.length = 0;
         hovered = undefined; greeting = undefined; hitBoxes.clear();
         interaction?.setEnabled(false);
         interaction?.setEnabled(enabled && !hidden() && !media.matches);
@@ -1225,8 +1270,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
 
     const pendingWorkPages = (work: AdvanceWork) => work.pages.filter(page => page.state === 'waiting' || page.state === 'preparing');
 
-    function dropAdvance(work: AdvanceWork, completed = false): void {
-        for (const actor of work.actors) { releaseActor(actor.body, completed); }
+    function dropAdvance(work: AdvanceWork): void {
+        for (const actor of work.actors) { releaseActor(actor.body); }
         work.actors.length = 0;
         work.layer.remove();
         advance.delete(work.key);
@@ -1273,7 +1318,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (work.phase !== 'returning') {
             work.phase = 'returning'; work.returnAt = now();
             for (const actor of work.actors) {
-                encounters.forget(actor.body.id); clearActorCaption(actor.body.id);
+                encounters.forget(actor.body.id); detachActorCaption(actor.body.id);
                 actor.start = { ...actor.point };
             }
             work.label.style.opacity = '0';
@@ -1284,13 +1329,14 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         area: ReturnType<typeof advanceGeometry>, destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, placements: BodyPlacement[]): void {
         work.labelAnchor = undefined;
         if (!area) {
+            if (captionGroup && work.pages.some(page => captionGroup!.pages.has(page.pageNumber))) { clearCaption(); }
             for (const actor of work.actors) { releaseActor(actor.body); }
             work.actors.length = 0; work.phase = 'parked'; work.label.style.opacity = '0';
             return;
         }
         const timing = DOCUMENT_ROBOT_LIMITS.advance;
         const elapsed = at - work.started;
-        if (work.phase === 'returning' && at - work.returnAt! >= timing.returnMs) { dropAdvance(work, true); return; }
+        if (work.phase === 'returning' && at - work.returnAt! >= timing.returnMs) { dropAdvance(work); return; }
         if (work.phase !== 'returning') {
             if (!work.actors.length || media.matches) { work.phase = 'parked'; }
             else if (work.gestureAt !== undefined) {
@@ -1633,16 +1679,17 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                     : straight(from, departureTarget, returnProgress);
             }
         }
+        const photoLoaded = !!payload.canvas;
         const carrying = payload.mode === 'airlift' && air ? !!path.route?.groundCarried
-            : !payload.deposited && !(payload.mode === 'handoff' && (air ? payload.handedOff : !payload.handedOff));
-        const lifting = payload.ground && progress >= DOCUMENT_ROBOT_LIMITS.forklift.liftStart;
+            : photoLoaded && !(payload.mode === 'handoff' && (air ? payload.handedOff : !payload.handedOff));
+        const lifting = photoLoaded && payload.ground && progress >= DOCUMENT_ROBOT_LIMITS.forklift.liftStart;
         const liftProgress = lifting ? Math.round(clamp((progress - DOCUMENT_ROBOT_LIMITS.forklift.liftStart)
             / (DEPOSIT_START - DOCUMENT_ROBOT_LIMITS.forklift.liftStart), 0, 1) * 12) / 12 : 0;
         const activity = payload.mode === 'airlift' && path.route && path.route.phase !== 'arrived'
             ? !air ? path.route.phase === 'recruit' || path.route.phase === 'rendezvous' ? 'signal'
                 : path.route.groundCarried ? 'park' : 'navigate'
                 : path.route.groundCarried ? 'assist' : path.route.phase === 'rendezvous' ? 'load' : 'navigate'
-            : actor.departing ? 'navigate' : payload.deposited || lifting ? 'unload'
+            : actor.departing || !photoLoaded && !payload.deposited ? 'navigate' : payload.deposited || lifting ? 'unload'
             : payload.mode === 'handoff' ? air ? payload.handedOff ? 'park' : 'deliver'
                 : payload.handedOff ? 'deliver' : progress >= RENDEZVOUS_END ? 'load' : 'navigate'
                 : payload.mode === 'formation' ? 'assist' : 'deliver';
@@ -1651,8 +1698,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             ? clamp((path.target.x - path.start.x) / area.width * 9, -8, 8) * (carrying ? 1 : -0.5) : 0;
         placements.push({ body: actor, point: robot, scale: spriteScale, opacity, tilt, activity, carrying,
             progress: lifting ? liftProgress : payload.deposited ? 1 : 0, look: payload.start.x < payload.crop.x + payload.crop.width / 2 ? 1 : -1,
-            phase: payload.mode === 'airlift' && actor.departing ? 'parked' : actor.departing ? 'return' : payload.deposited ? 'deposit' : 'cargo',
-            remainingMs: payload.deposited ? (1 - progress) * payload.duration
+            phase: payload.mode === 'airlift' && actor.departing ? 'parked' : actor.departing ? 'return'
+                : payload.deposited ? 'deposit' : photoLoaded ? 'cargo' : 'return',
+            remainingMs: !photoLoaded ? (1 - progress) * payload.duration
                 : Math.max(0, (payload.ground ? DOCUMENT_ROBOT_LIMITS.forklift.liftStart : DEPOSIT_START) - progress) * payload.duration,
             group: payload.id, pages: [pageNumber], payload,
             fixed: payload.deposited && !actor.departing || payload.ground && lifting || payload.stage === 'handoff' });
@@ -1660,7 +1708,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
 
     function paintPayload(payload: Payload, pageNumber: number, area: Geometry, at: number,
         destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, viewport: ReturnType<typeof viewportBounds>,
-        placements: BodyPlacement[], successfulDeposits: number[][], captionObstacles: SceneObstacle[]): boolean {
+        placements: BodyPlacement[], captionObstacles: SceneObstacle[]): boolean {
         const episode = episodes.get(pageNumber);
         if (area.projection) { paintArrival(payload, area.projection, episode?.displayRasterProjection); }
         retireUncovered(payload, episodes.get(pageNumber)?.element);
@@ -1677,11 +1725,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             : payload.ground && progress >= DOCUMENT_ROBOT_LIMITS.forklift.liftStart ? 'lift'
             : payload.mode === 'handoff' && progress >= HANDOFF_START && progress < HANDOFF_END ? 'handoff'
                 : payload.mode !== 'solo' && progress < (payload.mode === 'handoff' ? HANDOFF_START : RENDEZVOUS_END) ? 'rendezvous' : 'carry';
-        if (progress >= DEPOSIT_START && !payload.deposited) {
-            releasePayload(payload);
-            payload.deposited = true; stats.deliveredFragments++;
-            successfulDeposits.push(payload.helpers.map(actor => actor.id));
-        }
+        if (progress >= DEPOSIT_START) { depositPayload(payload); }
         if (progress >= RETURN_START) { releasePayload(payload); }
         else if (payload.cover) { payload.cover.style.opacity = '1'; }
         const path = payloadPath(payload, area, progress);
@@ -1758,7 +1802,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 if (elapsed < 0) { continue; }
                 const progress = payload.progress = clamp(elapsed / payload.duration, 0, 1);
                 if (progress >= 1 || actorCount() > policy.maxActors || !payload.helpers.every(actor => resizeSprite(actor, policy))) {
-                    dropRetiringPiece(scene, index, progress >= 1); continue;
+                    dropRetiringPiece(scene, index, progress < 1); continue;
                 }
                 // PDF.js resets scrollTop before restoring its initial view. Only this short
                 // retired scene stays in captured viewport coordinates; normal cargo is page-local.
@@ -1788,7 +1832,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 }
                 payload.stage = progress < timing.pickupEnd ? 'rendezvous' : progress >= RETURN_START ? 'return' : 'carry';
                 if (progress >= RETURN_START && !payload.deposited) {
-                    payload.deposited = true; stats.removedFragments++; releasePayload(payload);
+                    if (payload.canvas) { stats.removedFragments++; }
+                    payload.deposited = true; releasePayload(payload);
                 }
                 if (payload.canvas) {
                     const opacity = clamp(progress / 0.08, 0, 1);
@@ -1820,8 +1865,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                     }
                     placements.push({ body: actor, point: robot, scale,
                         opacity: Math.min(1, actor.origin ? 1 : progress / 0.08, returningToLab ? 1 : (1 - progress) / 0.12),
-                        tilt: 0, activity: progress < timing.pickupEnd ? 'load' : payload.deposited ? 'navigate' : 'deliver',
-                        carrying: progress >= timing.pickupEnd && !payload.deposited, progress: 0,
+                        tilt: 0, activity: !payload.canvas ? 'navigate' : progress < timing.pickupEnd ? 'load' : 'deliver',
+                        carrying: progress >= timing.pickupEnd && !!payload.canvas, progress: 0,
                         look: exit.x < target.x ? -1 : 1, phase: 'parked', fixed: true, remainingMs: (1 - progress) * payload.duration,
                         group: payload.id, pages: [piece.page] });
                 }
@@ -1886,25 +1931,36 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
 
     function paintCaption(placements: readonly BodyPlacement[], reactions: ReadonlyMap<number, RobotEncounterReaction>,
         viewport: ReturnType<typeof viewportBounds>, policy: Presentation, obstacles: readonly PlacementRect[]): void {
-        const selected = placements.find(value => reactions.get(value.body.id)?.caption);
+        const at = now();
+        if (captionGroup && at >= captionGroup.until) { clearCaption(); }
+        const { fontSize, lineHeight, paddingX, paddingY } = robotCaptionMetrics({ devicePixelRatio: win.devicePixelRatio });
+        const width = Math.min(policy.kind === 'desktop' ? 256 : 224, viewport.right - viewport.left - 20);
+        const measurementKey = [width, fontSize, lineHeight].join(',');
+        if (captionGroup?.shownAt !== undefined && captionGroup.measurementKey !== measurementKey) {
+            // A changed layout invalidates even a detached caption's last readable box.
+            clearCaption(); return;
+        }
+        const selected = placements.find(value => reactions.get(value.body.id)?.caption
+            && reactions.get(value.body.id)!.captionId === captionGroup?.id)
+            ?? placements.find(value => reactions.get(value.body.id)?.caption);
         const captionId = selected && reactions.get(selected.body.id)!.captionId;
+        if (captionGroup && captionId !== captionGroup.id) {
+            // An explicit greeting may replace a hover hint. Ordinary cues wait for the
+            // current readable text to expire; they do not queue or take its ownership.
+            if (captionId?.startsWith('greet:') && captionGroup.id.startsWith('hover:')) { clearCaption(); }
+            else { detachCaption(); return; }
+        }
+        if (captionGroup?.detached) { return; }
         const participating = captionId === undefined ? [] : placements.filter(value => reactions.get(value.body.id)?.captionId === captionId);
         const speakers = participating.filter(value => reactions.get(value.body.id)!.caption);
         if (!speakers.length) {
-            // Ordinary completion may leave a readable static bubble; its moving leaders end with the gesture.
-            for (const leader of captionGroup?.leaders ?? []) { leader.remove(); }
-            if (captionGroup) {
-                captionGroup.leaders = [];
-                if (captionGroup.placement) { captionGroup.placement = { ...captionGroup.placement, leaders: [] }; }
-            }
+            detachCaption();
             return;
         }
         const first = reactions.get(speakers[0].body.id)!;
-        if (first.captionUntil <= now()) { clearCaption(); return; }
+        if (first.captionUntil <= at) { detachCaption(); return; }
         const lines = speakers.map(value => ROBOT_VEHICLES.find(spec => spec.id === value.body.vehicle)!.name
             + ': ' + reactions.get(value.body.id)!.caption);
-        const { fontSize, lineHeight, paddingX, paddingY } = robotCaptionMetrics({ devicePixelRatio: win.devicePixelRatio });
-        const width = Math.min(policy.kind === 'desktop' ? 256 : 224, viewport.right - viewport.left - 20);
         if (width < 100) { clearCaption(); return; }
         if (captionGroup?.id !== first.captionId) {
             clearCaption();
@@ -1918,19 +1974,17 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const text = lines.join('\n');
             if (node.textContent !== text) { node.textContent = text; }
             const group: CaptionGroup = { id: first.captionId, node, until: first.captionUntil,
+                readMs: first.captionUntil - at, detached: false,
                 actors: participating.map(value => value.body.id), pages: new Set(participating.flatMap(value => [...value.pages])),
                 lines: new Map(speakers.map(value => [value.body.id, reactions.get(value.body.id)!.caption])),
                 measurementKey: '', width: 0, height: 0, leaders: [] };
             captionGroup = group;
             transit.append(node);
-            // This expiry only removes a static DOM bubble. It never schedules motion or retains a robot/canvas.
-            captionTimer = win.setTimeout(() => {
-                if (captionGroup !== group) { return; }
-                captionTimer = undefined; clearCaption();
-            }, Math.max(0, group.until - now()));
+            // An unseen cue has the source's original finite expiry. First visibility
+            // starts its readable interval once, without extending the actor's lifetime.
+            expireCaption(group);
         }
         const group = captionGroup!, caption = group.node;
-        const measurementKey = [width, fontSize, lineHeight].join(',');
         if (group.measurementKey !== measurementKey) {
             group.measurementKey = measurementKey;
             Object.assign(caption.style, { fontSize: fontSize + 'px', lineHeight: lineHeight + 'px',
@@ -1943,6 +1997,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         }
         const height = group.height;
         if (!(group.width > 0 && height > 0) || height > viewport.bottom - viewport.top - 16) {
+            if (group.shownAt !== undefined) { detachCaption(); return; }
             caption.style.opacity = '0';
             for (const leader of group.leaders) { leader.style.opacity = '0'; }
             return;
@@ -1964,11 +2019,19 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             labels: [{ id: group.id, anchor, width: group.width, height, radius: 20, clearance: 6, priority: 1,
                 leaderAnchors: anchors }], obstacles: [...bodies, ...obstacles],
         })[0];
-        if (!placement) { caption.style.opacity = '0'; return; }
-        group.placement = placement;
+        if (!placement) {
+            if (group.shownAt !== undefined) { detachCaption(); }
+            else { caption.style.opacity = '0'; }
+            return;
+        }
         // Parked hover owns one dirty paint, so immediate geometric admission decides
         // visibility. Animated exchanges keep the solver's finite transition state.
         const opacity = first.captionId.startsWith('hover:') ? placement.blocked ? 0 : 1 : placement.opacity;
+        if (group.shownAt !== undefined && (placement.blocked || opacity <= 0)) { detachCaption(); return; }
+        if (!placement.blocked && opacity > 0 && group.shownAt === undefined) {
+            group.shownAt = at; group.until = at + group.readMs; expireCaption(group);
+        }
+        group.placement = placement;
         Object.assign(caption.style, { left: placement.x + 'px', top: placement.y + 'px', opacity: opacity > 0 ? '1' : '0' });
         for (let index = 0; index < Math.max(group.leaders.length, placement.leaders.length); index++) {
             const line = placement.leaders[index];
@@ -2004,7 +2067,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const existing = reactions.get(focus.body.id);
             const isGreeting = !!greeting;
             const captionUntil = attention.started + (isGreeting ? ROBOT_INTERACTION_REACTIONS.captionMs : ROBOT_INTERACTION_REACTIONS.hoverMs);
-            const line = greeting?.line ?? (focus.carrying ? ROBOT_INTERACTION_REACTIONS.carrying
+            const line = greeting?.line ?? (focus.carrying && focus.payload?.canvas ? ROBOT_INTERACTION_REACTIONS.carrying
                 : focus.phase === 'return' ? ROBOT_INTERACTION_REACTIONS.returning
                     : focus.phase === 'parked' ? ROBOT_INTERACTION_REACTIONS.waiting : ROBOT_INTERACTION_REACTIONS.preparing);
             if (isGreeting) {
@@ -2072,7 +2135,6 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             for (const payload of episode.payloads) {
                 const motion = finalMotion.get(payload.id) ?? { x: 0, y: 0 };
                 const shown = visibility.get(payload.id) ?? 1;
-                if (shown < 1) { releasePayload(payload); }
                 const translate = motion.x.toFixed(3) + 'px ' + motion.y.toFixed(3) + 'px';
                 for (const element of [payload.canvas, payload.underlay?.canvas, payload.mast, payload.sling,
                     cleaner?.payload === payload ? cleaner.sprite : undefined]) {
@@ -2125,7 +2187,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         });
         if (!failed.size) {
             const captionActors = displayed.filter(value => captionGroup?.actors.includes(value.body.id));
-            if (captionActors.length && captionActors.every(value => (visibility.get(key(value)) ?? 1) <= 0.2)) { clearCaption(); }
+            if (captionActors.length && captionActors.every(value => (visibility.get(key(value)) ?? 1) <= 0.2)) { detachCaption(); }
             paintCaption(displayed.filter(value => value.opacity > 0.2), reactions, viewport, policy, displayedObstacles);
             paintWorkLabels(displayed, viewport, displayedObstacles); return;
         }
@@ -2198,7 +2260,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 if (at >= payload.started + payload.delay + payload.duration * RETURN_START) { payload.helpers.forEach(destination); }
             }
             if (columnPull && at >= columnPull.motion.startedAt + columnPull.motion.durationMs) { destination(columnPull.body); }
-            const placements: BodyPlacement[] = [], successfulDeposits: number[][] = [], captionObstacles: SceneObstacle[] = [];
+            const placements: BodyPlacement[] = [], captionObstacles: SceneObstacle[] = [];
             try { paintColumnPull(at, viewport, policy, destinations, placements); }
             catch { clearColumnPull(); stats.rejected++; }
             if (retiring) { paintRetiring(retiring, at, viewport, policy, destinations, placements, captionObstacles); }
@@ -2210,9 +2272,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                     const payload = episode.payloads[index];
                     try {
                         if (actorCount() <= policy.maxActors && payload.helpers.every(actor => resizeSprite(actor, policy))
-                            && paintPayload(payload, episode.page, area, at, destinations, viewport, placements, successfulDeposits, captionObstacles)) { continue; }
+                            && paintPayload(payload, episode.page, area, at, destinations, viewport, placements, captionObstacles)) { continue; }
                     } catch { stats.rejected++; }
-                    dropPayload(payload, payload.progress >= 1);
+                    dropPayload(payload);
                     episode.payloads.splice(index, 1);
                 }
                 if (!episode.payloads.length) { dropEpisode(episode, false); }
@@ -2226,7 +2288,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                     stats.rejected++;
                 }
             }
-            paintBodies(placements, successfulDeposits, at, viewport, policy, captionObstacles);
+            paintBodies(placements, pendingDeposits.splice(0), at, viewport, policy, captionObstacles);
             notifyCapacity();
         } finally {
             painting = false;
@@ -2461,7 +2523,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             if (id === undefined || !point) {
                 if (!hovered) { return; }
                 hovered = undefined;
-                if (captionGroup?.id.startsWith('hover:')) { clearCaption(); }
+                if (captionGroup?.id.startsWith('hover:')) { detachCaption(); }
             } else { hovered = { id, point, started: hovered?.id === id ? hovered.started : now() }; }
             requestPaint();
         },
@@ -2485,6 +2547,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             for (const episode of episodes.values()) {
                 for (const payload of episode.payloads) { releasePayload(payload); }
             }
+            requestPaint();
         },
         setVisibleWork,
         setColumnTransition,
@@ -2567,6 +2630,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                         deposited: actor.payload.deposited, departing: actor.departing, fromLab: !!actor.port,
                         locomotion: ROBOT_VEHICLES.find(spec => spec.id === actor.vehicle)!.air ? 'air' : 'ground',
                         carried: !!actor.carried || !!actor.reactionCarried, routePhase: actor.routePhase,
+                        carrying: actor.pose.carrying, activity: actor.pose.activity,
                         reaction: actor.pose.expression ?? null, malfunction: actor.pose.malfunction ?? null,
                         opacity: Number(actor.sprite.style.opacity) || 0,
                         caption: captionGroup?.lines.get(actor.id) ?? null })),

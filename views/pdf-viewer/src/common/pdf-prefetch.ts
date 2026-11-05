@@ -369,7 +369,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     }
 
     function readerInteraction(event: Event): void {
-        if (event.isTrusted) { cancelReplacement(); documentRobots?.cancelColumnMotion(); documentRobots?.revealArrivals(); }
+        if (event.isTrusted) { cancelReplacement(); documentRobots?.cancelColumnMotion(); }
     }
 
     function columnTransition(motion: Readonly<PdfDocumentColumnTransition> | undefined): void {

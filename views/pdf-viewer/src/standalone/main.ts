@@ -73,15 +73,17 @@ const viewerReady = new Promise<any>((resolve) => {
             imageResourcesPath: assets + 'web/images/',
         });
         // Keep PDF.js's view history, named destinations and back/forward handling. A first
-        // mobile visit fits the reading column and keeps the document's outline out of the way.
+        // desktop visit opens at 150%; mobile fits the column and keeps the outline out of the way.
         const initialView = app.setInitialView;
         app.setInitialView = function (hash: string | undefined, options: Record<string, unknown> = {}) {
+            const mobile = pdfCachePolicy().name === 'mobile';
+            const defaultZoom = mobile ? 'page-width' : 150;
             const explicitSidebar = new URLSearchParams(this.initialBookmark ?? '').has('pagemode');
-            const firstMobileView = pdfCachePolicy().name === 'mobile' && !hash && !explicitSidebar;
+            const firstMobileView = mobile && !hash && !explicitSidebar;
             // PDF.js supplies a hash for a saved view. Its stored sidebar choice takes priority.
             const initialOptions = firstMobileView ? { ...options, sidebarView: 0 } : options;
-            if (!this.pdfViewer.currentScaleValue) { this.pdfViewer.currentScaleValue = 'page-width'; }
-            return initialView.call(this, hash || 'zoom=page-width', initialOptions);
+            if (!this.pdfViewer.currentScaleValue) { this.pdfViewer.currentScaleValue = mobile ? defaultZoom : Number(defaultZoom) / 100; }
+            return initialView.call(this, hash || 'zoom=' + defaultZoom, initialOptions);
         };
         // A browser download streams to its download manager. PDF.js's default calls
         // getData(), which would first assemble the entire gigabyte book in JavaScript.

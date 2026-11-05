@@ -624,13 +624,31 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.strictEqual(fleet.revealedArrivals, 0);
         f.container.emit('pointerdown', { isTrusted: true, stoppedAtTarget: true });
         assert.ok(fleet.columnCancels > 0, 'trusted navigation can end the optional pull immediately');
-        assert.strictEqual(fleet.revealedArrivals, 1, 'trusted annotation input exposes pixels before its native target stops propagation');
+        assert.strictEqual(fleet.revealedArrivals, 0, 'trusted annotation input does not retire the active photo delivery');
         f.dispose();
         assert.strictEqual(f.column.disposed, true);
         const calls = fleet.columnMotions.length;
         f.columnSettings.onTransition(motion);
         assert.strictEqual(fleet.columnMotions.length, calls, 'late column completion cannot recreate scene work');
     });
+
+    for (const input of ['wheel', 'pointerdown', 'touchstart', 'keydown']) {
+        it('preserves active photo ownership on trusted ' + input + ' while cancelling replacement and column motion', async () => {
+            const fleet = new DocumentRobots();
+            const f = fixture({}, { robotsEnabled: true, createDocumentRobots: (_container: Element, options: any) => {
+                fleet.onReplacementComplete = options.onReplacementComplete; return fleet;
+            } });
+            await f.frame();
+            f.controller.prepareReplacement('next-edition'); f.eventBus.emit('pagesdestroy');
+            assert.strictEqual(fleet.replacement, 'next-edition');
+            const target = input === 'keydown' ? f.owner : f.container;
+            target.emit(input, { isTrusted: true, deltaY: 1, deltaX: 0, deltaMode: 0 });
+            assert.strictEqual(fleet.replacement, undefined);
+            assert.ok(fleet.columnCancels > 0);
+            assert.strictEqual(fleet.revealedArrivals, 0, 'ordinary input leaves the copied raster and destination cover owned by the delivery');
+            f.dispose();
+        });
+    }
 
     it('updates the translated page set after viewport changes without changing PDF scale or scroll', async () => {
         const f = fixture(); await f.frame();
