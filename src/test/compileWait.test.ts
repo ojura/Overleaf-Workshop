@@ -71,8 +71,9 @@ describe('CompileManager with a local replica', () => {
             getRootDocName: () => '/main.tex',
             getCompiler: () => ({ name: 'pdfLaTeX' }),
             _resolveUri: async () => ({ fileType: 'folder', fileId: 'root' }),
-            // nothing changed since the last compile: no log to read
-            compile: async (_force: boolean, _draft: boolean, _stop: boolean, _root: string, fromScratch?: boolean) => {
+            // A stopped compile sends nothing, as in VirtualFileSystem.compile. An unchanged one has no log to read.
+            compile: async (_force: boolean, _draft: boolean, _stopOnFirstError: boolean, _root: string, fromScratch?: boolean, stop?: AbortSignal) => {
+                if (stop?.aborted) { return 'stopped'; }
                 events.push(fromScratch ? 'compile from scratch' : 'compile');
                 return undefined;
             },
@@ -104,6 +105,33 @@ describe('CompileManager with a local replica', () => {
         await manager.compile(true, true);
         await ended;
         assert.deepStrictEqual(events.filter(e => e.startsWith('compile')), ['compile', 'compile from scratch']);
+    });
+
+    it('ends the upload wait at Stop while the independent upload can still finish', async () => {
+        let flushing!: () => void, release!: () => void;
+        const flushStarted = new Promise<void>(resolve => { flushing = resolve; });
+        const uploaded = new Promise<void>(resolve => { release = resolve; });
+        const { events, manager } = setup(() => { flushing(); return uploaded; });
+        const ended = compileEnd();
+        try {
+            assert.deepStrictEqual(await manager.compile(true), { kind: 'started' });
+            await flushStarted;
+            await manager.stopCompile();
+            // Drain the stop's promise continuations without resolving the upload or its timeout.
+            await new Promise<void>(resolve => setImmediate(resolve));
+            assert.strictEqual(manager.inCompiling, false, 'Stop must end the compile while the upload is still pending');
+            const { outcome } = await ended;
+            assert.strictEqual(outcome.result, 'failure');
+            assert.match(outcome.detail, /stopped before its request reached Overleaf/);
+            assert.deepStrictEqual(events, ['flush started']);
+            assert.deepStrictEqual(warnings, []);
+        } finally {
+            // A failed-before run must also settle its upload, event listener and 60-second timer.
+            release();
+            await ended;
+        }
+        await uploaded;
+        assert.deepStrictEqual(events, ['flush started', 'flush done'], 'Stop does not cancel the background upload');
     });
 
     it('compiles anyway when the uploads take too long, and says so', async () => {

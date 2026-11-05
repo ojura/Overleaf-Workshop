@@ -261,10 +261,18 @@ interface TraceSample {
     delay: number;
 }
 
+export interface MotionLabMeasurementsPreference {
+    /** Extension host state may arrive after the viewer controls become available. */
+    whenReady?(): Promise<void>;
+    read(): boolean | undefined;
+    write(open: boolean): void | Promise<void>;
+}
+
 interface DiagnosticsOptions {
     toolbar?: HTMLElement;
     toolbarBefore?: HTMLElement;
     measurementsMenu?: HTMLElement;
+    measurementsPreference?: MotionLabMeasurementsPreference;
     onOpen?: () => void;
     onPanelLayout?: (layout: MotionLabPanelLayout) => MotionLabPanelPreparation | void;
     enabled?: boolean;
@@ -277,6 +285,7 @@ interface DiagnosticsOptions {
 
 const ROBOT_ICON = `<svg class="robot-icon" viewBox="0 0 28 28" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3v4M7 11H4v10h20V11h-3M9 7h10v14H9zM11 24h6"/><path d="M12 12v2m4-2v2m-4 4h4"/></g><circle cx="14" cy="3" r="1.5" fill="currentColor"/></svg>`;
 const MEASUREMENTS_ICON = `<svg class="robot-icon" viewBox="0 0 28 28" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5v18h19M8 18l5-8 5 5 6-9"/><circle cx="13" cy="10" r="1.5"/><circle cx="18" cy="15" r="1.5"/></g></svg>`;
+const MEASUREMENTS_PREFERENCE_KEY = 'pdf-motion-lab-measurements-open';
 
 /**
  * Document deliveries and the optional motion lab have independent controls. The lab remains
@@ -291,11 +300,17 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
     let robots: RobotLab | undefined;
     let panel: ReturnType<typeof installMotionLabPanel> | undefined;
     let panelContent: HTMLElement | undefined;
+    let panelFlow: HTMLElement | undefined;
+    let panelSurface: HTMLElement | undefined;
     let panelDetails: HTMLDetailsElement | undefined;
+    let measurementsOpen = false;
+    let contentObserver: ResizeObserver | undefined;
+    let observingContent = false;
     let button: HTMLButtonElement | undefined;
     let measurementsButton: HTMLButtonElement | undefined;
     let shown = false;
     let disposed = false;
+    let pendingOpen: object | undefined;
     let previousFocus: Element | null = null;
     const history: TraceSample[] = [];
     const fields = new Map<string, HTMLElement>();
@@ -306,6 +321,73 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
     }
 
     function panelGeometryChanged(): void { robots?.invalidateGeometry(); }
+
+    function readMeasurementsPreference(): boolean {
+        try {
+            return options.measurementsPreference ? options.measurementsPreference.read() === true
+                : win?.localStorage.getItem(MEASUREMENTS_PREFERENCE_KEY) === 'true';
+        } catch { return false; }
+    }
+
+    function measurementsChanged(): void {
+        if (disposed || !panelDetails || panelDetails.open === measurementsOpen) { return; }
+        measurementsOpen = panelDetails.open;
+        try {
+            if (options.measurementsPreference) {
+                void Promise.resolve(options.measurementsPreference.write(measurementsOpen)).catch(() => {});
+            } else { win?.localStorage.setItem(MEASUREMENTS_PREFERENCE_KEY, String(measurementsOpen)); }
+        } catch { /* Disclosure and layout remain usable without persistent storage. */ }
+        // Opening should reveal the new content. Closing only caps the user's preferred height.
+        if (measurementsOpen) { panel?.refreshContent({ fit: true }); }
+        else { panel?.refreshContent({ fit: false }); }
+    }
+
+    function measureContentHeight(width: number): number | undefined {
+        const surface = panelSurface, content = panelContent, flow = panelFlow;
+        if (disposed || !surface || !content || !flow || !win || !Number.isFinite(width) || width <= 0) { return; }
+        const savedWidth = surface.style.width, savedMaxWidth = surface.style.maxWidth;
+        const savedOverflow = content.style.overflow, scrollTop = content.scrollTop, scrollLeft = content.scrollLeft;
+        try {
+            // Measure wrapping at the destination width without the previous viewport's scrollbar.
+            // The inner flow owns no height constraint, even when its scroller is shorter than it.
+            surface.style.width = width + 'px';
+            surface.style.maxWidth = 'none';
+            content.style.overflow = 'visible';
+            const bottom = flow.getBoundingClientRect().bottom, top = surface.getBoundingClientRect().top;
+            const surfaceStyle = win.getComputedStyle(surface), contentStyle = win.getComputedStyle(content);
+            const pixels = (value: string) => parseFloat(value) || 0;
+            const height = bottom - top + content.scrollTop
+                + pixels(contentStyle.paddingBottom) + pixels(contentStyle.borderBottomWidth)
+                + pixels(surfaceStyle.paddingBottom) + pixels(surfaceStyle.borderBottomWidth);
+            return Number.isFinite(height) && height > 0 ? Math.ceil(height) : undefined;
+        } catch { return undefined; }
+        finally {
+            surface.style.width = savedWidth;
+            surface.style.maxWidth = savedMaxWidth;
+            content.style.overflow = savedOverflow;
+            content.scrollTop = scrollTop;
+            content.scrollLeft = scrollLeft;
+        }
+    }
+
+    function watchContent(active: boolean): void {
+        if (active === observingContent) { return; }
+        if (!active) {
+            contentObserver?.disconnect();
+            observingContent = false;
+            return;
+        }
+        const observerType = (win as Window & typeof globalThis | null)?.ResizeObserver;
+        if (!observerType || !root || !panelFlow) { return; }
+        contentObserver ??= new observerType(() => {
+            if (observingContent && shown && !disposed && !doc.hidden) { panel?.refreshContent(); }
+        });
+        // Observe only intrinsic flow/chrome, never the controller's forced-height surface.
+        for (const element of [panelFlow, root.querySelector('header')!, root.querySelector('.panel-position')!]) {
+            contentObserver.observe(element);
+        }
+        observingContent = true;
+    }
 
     function format(value: number, digits = 0): string {
         return Number.isFinite(value) ? value.toLocaleString(undefined, { maximumFractionDigits: digits }) : '?';
@@ -402,7 +484,7 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
 
     function startTimer(): void {
         stopTimer();
-        if (shown && !doc.hidden && win) {
+        if (shown && root && !doc.hidden && win) {
             tick();
             robots?.setActive(true);
             options.robots?.setDispatchOrigin?.(robots?.dispatch);
@@ -434,7 +516,7 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
         }
     }
 
-    function createPanel(): void {
+    function createPanel(defaultMeasurements?: false): void {
         host = doc.createElement('div');
         host.id = 'pdf-prefetch-diagnostics';
         root = host.attachShadow({ mode: 'open' });
@@ -445,8 +527,9 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
 :host([hidden]) { display:none !important; }
 * { box-sizing:border-box; }
 section { position:relative; display:flex; flex-direction:column; width:456px; max-width:calc(100vw - 28px); max-height:calc(100vh - 70px); max-height:calc(100dvh - 70px); overflow:hidden; padding:14px; border:1px solid #43566b; border-radius:12px; background:#101c2b; box-shadow:0 8px 36px #0007; }
-header { display:flex; align-items:center; gap:9px; }
+header { display:flex; flex:none; align-items:center; gap:9px; }
 .panel-content { min-height:0; overflow:auto; overscroll-behavior:contain; }
+.panel-content-flow { display:flow-root; }
 .panel-drag { cursor:move; touch-action:none; user-select:none; border-radius:3px; }
 .panel-drag:focus-visible { outline:2px solid #66e5cf; outline-offset:3px; }
 .panel-position { flex:none; display:flex; flex-wrap:wrap; gap:5px; margin:7px 0 2px; }
@@ -488,7 +571,12 @@ svg.chart { display:block; width:100%; height:62px; overflow:visible; }
 .velocity { stroke:#acb8ff; } .buffer { stroke:#66e5cf; } .delay { stroke:#ffba7a; } .green { color:#66e5cf; } .orange { color:#ffba7a; }
 details { margin-top:9px; border-top:1px solid #304359; padding-top:7px; }
 summary { cursor:pointer; font-size:10px; color:#b2c0cf; }
-.measurements > summary { padding:4px 0; font-size:12px; color:#d0e2f0; }
+.measurements > summary { padding:5px 6px; border-radius:4px; font-size:12px; color:#d0e2f0; background:#66e5cf08; }
+.measurements > summary::marker { color:#93cbbb; }
+.measurements > summary:hover { background:#66e5cf10; }
+.measurements > summary:focus-visible { outline:1px solid #93cbbb; outline-offset:1px; }
+.measurements-hint { margin-left:6px; font-size:10px; color:#9fb4c7; }
+.measurements[open] .measurements-expand, .measurements:not([open]) .measurements-collapse { display:none; }
 pre { font:9px/1.5 ui-monospace,monospace; margin:6px 0 0; max-height:78px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
 footer { display:flex; align-items:center; gap:8px; margin-top:10px; }
 footer span { font-size:10px; color:#b2c0cf; }
@@ -506,7 +594,7 @@ footer span { font-size:10px; color:#b2c0cf; }
     section:not(:has(.measurements[open])) .robot-caption { display:none; }
     section:not(:has(.measurements[open])) .robot-canvas { height:86px; aspect-ratio:auto; object-fit:contain; }
     section:not(:has(.measurements[open])) .measurements { margin-top:4px; padding-top:0; }
-    .measurements > summary { min-height:44px; padding:12px 0; }
+    .measurements > summary { min-height:44px; padding:12px 6px; }
     .copy { min-height:44px; }
     .panel-position button { min-height:36px; }
 }
@@ -518,9 +606,10 @@ ${ROBOT_ICON}
 </header>
 <div class="panel-position" role="group" aria-label="Motion Lab position"><button type="button" data-panel-dock="left" aria-pressed="false">Dock left</button><button type="button" data-panel-dock="right" aria-pressed="false">Dock right</button><button type="button" data-panel-dock="float" aria-pressed="true">Float</button></div>
 <div class="panel-content">
+<div class="panel-content-flow">
 <div class="meta"><span class="status" data-field="status">Motion stopped</span></div>
 <div class="robot-stage" data-robot-stage></div>
-<details class="measurements"><summary>Motion and buffer measurements</summary>
+<details class="measurements"><summary>Motion and buffer measurements<span class="measurements-hint" aria-hidden="true"><span class="measurements-expand">Expand</span><span class="measurements-collapse">Collapse</span></span></summary>
 <dl>
 <div><dt>Velocity v̂</dt><dd data-field="velocity"></dd></div>
 <div><dt>Acceleration â</dt><dd data-field="acceleration"></dd></div>
@@ -544,9 +633,12 @@ ${ROBOT_ICON}
 <footer><button type="button" class="copy">Copy measurements</button><span role="status" data-field="copy-status"></span></footer>
 </details>
 </div>
+</div>
 </section>
 ${resizeDirections.map(direction => `<button type="button" class="panel-resize" data-panel-resize="${direction}" aria-label="${MOTION_LAB_RESIZE_HANDLES[direction]}" title="${MOTION_LAB_RESIZE_HANDLES[direction]}; drag or use arrow keys"></button>`).join('\n')}`;
-        root.querySelector<HTMLDetailsElement>('.measurements')!.open = !!win?.matchMedia('(min-width:701px) and (pointer:fine)').matches;
+        panelDetails = root.querySelector<HTMLDetailsElement>('.measurements')!;
+        measurementsOpen = defaultMeasurements ?? readMeasurementsPreference();
+        panelDetails.open = measurementsOpen;
         for (const element of root.querySelectorAll<HTMLElement>('[data-field]')) {
             fields.set(element.dataset.field!, element);
         }
@@ -555,11 +647,13 @@ ${resizeDirections.map(direction => `<button type="button" class="panel-resize" 
         (doc.body ?? doc.documentElement).append(host);
         robots = installPrefetchRobots(root.querySelector<HTMLElement>('[data-robot-stage]')!);
         panelContent = root.querySelector<HTMLElement>('.panel-content')!;
-        panelDetails = root.querySelector<HTMLDetailsElement>('.measurements')!;
+        panelFlow = root.querySelector<HTMLElement>('.panel-content-flow')!;
+        panelSurface = root.querySelector<HTMLElement>('section')!;
         panelContent.addEventListener('scroll', panelGeometryChanged, { passive: true });
-        panelDetails.addEventListener('toggle', panelGeometryChanged);
+        panelDetails.addEventListener('toggle', measurementsChanged);
         panel = installMotionLabPanel(host, {
-            surface: root.querySelector<HTMLElement>('section')!,
+            surface: panelSurface,
+            measureContentHeight,
             dragHandle: root.querySelector<HTMLElement>('.panel-drag')!,
             resizeHandles: Object.fromEntries(resizeDirections.map(direction =>
                 [direction, root!.querySelector<HTMLElement>('[data-panel-resize="' + direction + '"]')!])) as Record<MotionLabResizeDirection, HTMLElement>,
@@ -573,23 +667,41 @@ ${resizeDirections.map(direction => `<button type="button" class="panel-resize" 
         });
     }
 
+    function openPanel(defaultMeasurements?: false): void {
+        previousFocus = doc.activeElement;
+        if (!host) { createPanel(defaultMeasurements); }
+        host!.hidden = false;
+        panel?.setVisible(true);
+        if (disposed || !shown) { return; }
+        watchContent(!doc.hidden);
+        startTimer();
+        options.onOpen?.();
+        if (disposed || !shown) { return; }
+        if (options.measurementsMenu) { root!.querySelector<HTMLButtonElement>('.close')?.focus({ preventScroll: true }); }
+    }
+
     function setEnabled(enabled: boolean): void {
         if (disposed || !win || !doc.createElement) { return; }
         if (shown === enabled) { return; }
         shown = enabled;
         measurementsButton?.setAttribute('aria-expanded', String(shown));
         if (shown) {
-            previousFocus = doc.activeElement;
-            if (!host) { createPanel(); }
-            host!.hidden = false;
-            panel?.setVisible(true);
-            if (disposed || !shown) { return; }
-            startTimer();
-            options.onOpen?.();
-            if (disposed || !shown) { return; }
-            if (options.measurementsMenu) { root!.querySelector<HTMLButtonElement>('.close')?.focus({ preventScroll: true }); }
+            const preference = options.measurementsPreference;
+            if (!host && preference?.whenReady) {
+                const owned = {};
+                pendingOpen = owned;
+                const complete = (defaultMeasurements?: false) => {
+                    if (disposed || !shown || pendingOpen !== owned) { return; }
+                    pendingOpen = undefined;
+                    openPanel(defaultMeasurements);
+                };
+                void Promise.resolve().then(() => preference.whenReady!()).then(() => complete(), () => complete(false));
+            } else { openPanel(); }
         } else {
+            pendingOpen = undefined;
+            if (!host) { return; }
             const restoreFocus = doc.activeElement === host;
+            watchContent(false);
             stopTimer();
             panel?.setVisible(false);
             if (disposed || shown) { return; }
@@ -623,6 +735,7 @@ ${resizeDirections.map(direction => `<button type="button" class="panel-resize" 
     }
 
     function visibility(): void {
+        watchContent(shown && !doc.hidden);
         if (doc.hidden) {
             stopTimer();
             history.length = 0;
@@ -674,10 +787,13 @@ ${resizeDirections.map(direction => `<button type="button" class="panel-resize" 
         dispose(): void {
             if (disposed) { return; }
             disposed = true;
+            pendingOpen = undefined;
+            watchContent(false);
+            contentObserver = undefined;
             stopTimer();
             panelContent?.removeEventListener('scroll', panelGeometryChanged);
-            panelDetails?.removeEventListener('toggle', panelGeometryChanged);
-            panelContent = panelDetails = undefined;
+            panelDetails?.removeEventListener('toggle', measurementsChanged);
+            panelContent = panelDetails = panelFlow = panelSurface = undefined;
             panel?.dispose();
             panel = undefined;
             doc?.removeEventListener?.('keydown', keydown, true);

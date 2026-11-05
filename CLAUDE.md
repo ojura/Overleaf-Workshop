@@ -8,9 +8,18 @@ window) are in CLAUDE.local.md, which git leaves out.
 
 ## Changing the code
 
-- Work on each task in its own worktree (`git worktree add`), commit there, and land on the branch
-  with `git merge --ff-only <commit>` in the main checkout, which other sessions use at the same
-  time.
+- Before starting a task, inspect `git worktree list --porcelain` and the existing lane handoffs.
+  Git's registered worktrees are the central lane inventory. Continue an existing lane when it
+  already owns the task instead of creating an unregistered copy or a second competing checkout.
+- Work on each task in its own named-branch worktree (`git worktree add -b work/<task> <path>`),
+  commit there, and land on the branch with `git merge --ff-only <commit>` in the main checkout,
+  which other sessions use at the same time. Handoffs name the branch, worktree, owner, validation
+  result and remaining work in the transcript.
+- After landing, confirm the worktree's HEAD is an ancestor of main, its tracked and untracked
+  changes are clean, and no agent or process still uses it. Remove it with `git worktree remove`
+  as part of completing the lane. Preserve and reconcile unmerged commits or dirty work before
+  calling the workstream complete; do not force removal to hide unfinished work. Inspect the
+  registered worktree list again at handoff so abandoned lanes remain visible.
 - The command-line tools run from the main checkout's out/. After a landing, build out/ again
   while no tool runs.
 - Set up a new checkout with `npm ci --ignore-scripts`, then `npm run postinstall` and

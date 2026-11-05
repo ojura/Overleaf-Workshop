@@ -7,7 +7,7 @@ import { BaseSCM, CommitItem, SettingItem } from ".";
 import { FileRefEntity, FolderEntity, VirtualFileSystem, __OUTPUTS_ID, parseUri } from '../core/remoteFileSystemProvider';
 import {
     Deletions, describe, FolderChange, FolderChangedError, LocalStat, RemoteEntry, ReplicaLocal, ReplicaRemote, ReplicaSync,
-    ReplicaUI, SyncSummary,
+    ReplicaUI, SyncSummary, ToolRequest,
 } from './replicaSync';
 import { DEFAULT_IGNORE_PATTERNS, IgnoreMatcher, isReplicaOwnPath, REPLICA_CONFLICTS_FOLDER, REPLICA_SETTINGS_FILE, REPLICA_TEMPORARY_FOLDER } from './ignorePatterns';
 import * as localFs from './localFolderFs';
@@ -1011,14 +1011,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return {ok: false, error: vscode.l10n.t('This local replica has not started.')};
         }
         await this.ready;
+        // Preflight, upload and recording share one total wait for another program's Git lock.
+        const request: ToolRequest = {};
         const question = await this.questionComesFirst();
         if (question) {
-            const waiting = await sync.flush(false, {by: 'tool', question});
+            const waiting = await sync.flush(false, {by: 'tool', question, request});
             return {ok: false, error: `the replica is not in sync: ${this.syncProblems(waiting).join('; ')}`, summary: waiting};
         }
         await this.fullSync;
         const git = store.git;
-        const before = await sync.flush(true, {record: true, by: 'tool'});
+        const before = await sync.flush(true, {record: true, by: 'tool', request});
         const problems = this.syncProblems(before);
         if (problems.length) { return {ok: false, error: `the replica is not in sync: ${problems.join('; ')}`, summary: before}; }
         const [head, overleaf, target] = await Promise.all([git.commit('HEAD'), git.commit(OVERLEAF_REF), git.commit(commit)]);
@@ -1041,9 +1043,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const deleted = (await git.run(['diff', '--name-only', '--no-renames', '--diff-filter=D', '-z', head, target]))
                 .stdout.toString('utf8').split('\0').filter(Boolean).map(p => `/${p}`);
             await git.ownIndexWrite(() => git.run(['merge', '--ff-only', '--quiet', target]));
-            const summary = await sync.flush(true, {by: 'tool', approved: new Set(deleted)});
+            const summary = await sync.flush(true, {by: 'tool', approved: new Set(deleted), request});
             const failed = this.syncProblems(summary);
-            const recorded = await sync.recordNow({force: true});
+            const recorded = await sync.recordNow({force: true, by: 'tool', request});
             const after = await git.commit(OVERLEAF_REF);
             const held = after!==undefined && (after===target || await git.isAncestor(target, after));
             const ok = failed.length===0 && held && !recorded?.waiting;

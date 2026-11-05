@@ -142,6 +142,17 @@
       await nextFrame();
     }
   }
+  async function restoreMeasurements(details, open) {
+    let processed = false;
+    const toggled = () => { processed = true; };
+    details.addEventListener('toggle', toggled, { once: true });
+    try {
+      details.open = open;
+      // Native details queues toggle; unchanged geometry before that event is not settled.
+      while (!processed) { guard(true); await nextFrame(); }
+      guard(true);
+    } finally { details.removeEventListener('toggle', toggled); }
+  }
   function pageTextTarget(pageNumber) {
     if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > expected.pages) return;
     const view = viewer?.getPageView(pageNumber - 1), root = view?.div, target = view?.textLayer?.div;
@@ -295,6 +306,11 @@
     await twoFrames(); guard(true);
     if (saved.lab) {
       if (!panelState()) throw new Error('Motion Lab failed to reopen');
+      const details = panel()?.root.querySelector('.measurements');
+      if (details && details.open !== saved.panel.measurements) {
+        await restoreMeasurements(details, saved.panel.measurements);
+        await settleArrangement(); guard(true);
+      }
       if (panelState().dock !== saved.panel.dock) dock(saved.panel.dock);
       await settleArrangement(); guard(true);
       let current = panelState();
@@ -308,8 +324,6 @@
       if (saved.panel.dock === 'float') {
         current = panelState(); gesture('drag', saved.panel.rect.x - current.rect.x, saved.panel.rect.y - current.rect.y);
       }
-      const details = panel()?.root.querySelector('.measurements');
-      if (details) details.open = saved.panel.measurements;
     }
     await settleArrangement(); guard(true);
     let target = focusElement(saved.focus);

@@ -1141,6 +1141,54 @@ describe('local replica: git as the merge backend', function () {
             await t.sync.stop();
         });
 
+        it('does not rename a file on Overleaf while git is in the middle of an operation that started while the rename waited for a transfer', async () => {
+            // one transfer at a time, so that the rename waits for the transfer of another file
+            const concurrency = ReplicaSync.concurrency;
+            ReplicaSync.concurrency = 1;
+            const t = await synced({ '/a.png': png, '/other.tex': chapter }).finally(() => { ReplicaSync.concurrency = concurrency; });
+            const transfers = (t.sync as any).transfers;
+            const run = transfers.run;
+            const mergeHead = path.join(t.folder, '.git', 'MERGE_HEAD');
+            let letGo = () => {};
+            let download: Promise<void> | undefined;
+            let scan: Promise<unknown> | undefined;
+            try {
+                const id = t.remote.idOf('/a.png');
+                move(t, 'a.png', 'b.png');
+                // the download of other.tex holds the transfer until the test lets it go
+                t.remote.docs.set('/other.tex', edited);
+                t.remote.readGate = new Promise<void>(resolve => { letGo = resolve; });
+                const reading = new Promise<void>(resolve => { t.remote.onRead = () => resolve(); });
+                download = t.sync.remoteChanged('/other.tex', false);
+                await reading;
+                // the sync's transfers: the next one asked for is the rename's
+                let renameAsks!: () => void;
+                const renameAsked = new Promise<void>(resolve => { renameAsks = resolve; });
+                transfers.run = (task: () => Promise<unknown>) => { renameAsks(); return run.call(transfers, task); };
+                scan = t.sync.flush(true);
+                await renameAsked;
+                // a merge starts while the rename waits for the transfer
+                fs.writeFileSync(mergeHead, `${t.g('rev-parse', 'HEAD')}\n`);
+                t.remote.readGate = undefined;
+                letGo();
+                await Promise.all([download, scan]);
+                transfers.run = run;
+                assert.deepStrictEqual(t.remote.calls.filter(call => call.startsWith('rename')), [], 'nothing is renamed on Overleaf during the merge');
+                // the merge ends; the full sync after it renames the file
+                fs.rmSync(mergeHead);
+                await t.sync.syncAll();
+                assert.deepStrictEqual(t.remote.calls.filter(call => call.startsWith('rename')), ['rename /a.png /b.png']);
+                assert.strictEqual(t.remote.ids.get('/b.png'), id, 'the file keeps its id');
+            } finally {
+                transfers.run = run;
+                t.remote.readGate = undefined;
+                letGo();
+                fs.rmSync(mergeHead, { force: true });
+                await Promise.allSettled([download, scan]);
+                await t.sync.stop();
+            }
+        });
+
         it('moves the files of a folder that Overleaf moved, with a local change in one of them', async () => {
             const two = lines(i => `The second chapter, paragraph ${i}.`);
             const t = await world();

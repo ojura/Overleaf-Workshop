@@ -298,7 +298,7 @@ export class CompileManager {
         EventBus.fire('compileStartedEvent', { uri });
         try {
             const vfs = await this.vfsm.prefetch(uri);
-            await this.waitForLocalReplica(vfs);
+            await this.waitForLocalReplica(vfs, stop);
             // Compile the open document as the main document when it is one (isMainDocument),
             // else the project's main document. For a local replica `uri` is the project folder.
             const {fileType, fileId} = await vfs._resolveUri(uri);
@@ -374,13 +374,20 @@ export class CompileManager {
 
     /**
      * A local replica uploads its changes in the background. Wait for them, so the compile on
-     * Overleaf sees what was just saved, but compile anyway when they take too long.
+     * Overleaf sees what was just saved, but compile anyway when they take too long. Stop ends
+     * this wait; VirtualFileSystem.compile then sends no request. The uploads continue.
      */
-    private async waitForLocalReplica(vfs: VirtualFileSystem) {
+    private async waitForLocalReplica(vfs: VirtualFileSystem, stop: AbortSignal) {
         let timer: NodeJS.Timeout | undefined;
+        let onStop: (() => void) | undefined;
         const timeout = new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), CompileManager.uploadWaitMs); });
+        const stopped = new Promise<'stopped'>(resolve => {
+            onStop = () => resolve('stopped');
+            if (stop.aborted) { onStop(); }
+            else { stop.addEventListener('abort', onStop, { once: true }); }
+        });
         try {
-            const res = await Promise.race([LocalReplicaSCMProvider.flushAll(vfs).then(() => 'done' as const), timeout]);
+            const res = await Promise.race([LocalReplicaSCMProvider.flushAll(vfs).then(() => 'done' as const), timeout, stopped]);
             if (res==='timeout') {
                 vscode.window.showWarningMessage( vscode.l10n.t('Local changes are still being synced with Overleaf, so the PDF may not include all of them yet.') );
             }
@@ -388,6 +395,7 @@ export class CompileManager {
             vscode.window.showWarningMessage( vscode.l10n.t('Some local changes could not be uploaded to Overleaf, so the PDF may not include them: {error}', {error: errorMessage(error)}) );
         } finally {
             clearTimeout(timer);
+            if (onStop) { stop.removeEventListener('abort', onStop); }
         }
     }
 
@@ -415,17 +423,20 @@ export class CompileManager {
 
     /**
      * Stop compilation: stop the running compile, of whichever project it is. The compile keeps
-     * the stop: a compile whose request has not reached Overleaf yet, because it saves the
-     * editors, finds its project or waits for the local replica, sends nothing and ends as a
-     * failure that says so (VirtualFileSystem.compile). While Overleaf has the request, Overleaf
-     * is asked to stop it, and the compile's end says how it ended (run): Overleaf answers a
-     * stopped compile 'terminated', and a compile that the stop did not reach ends as it would
-     * have. Overleaf's stop is not sent before the request has reached Overleaf, since it stops
-     * the compile of the project and the user, whichever client started it (the compile server's
-     * CompileManager.js:410-421, getCompileName). Overleaf
-     * sends a stop to the compile server that it keeps for the project and the user
-     * (ClsiManager.mjs:396-421), which need not be the one that runs the compile; that one answers
-     * at once, and the compile goes on (the compile server's CompileManager.js:410-423).
+     * the stop. Before its request leaves, a stopped compile sends nothing and ends as a failure
+     * that says so (VirtualFileSystem.compile); Stop also ends the wait for replica uploads.
+     * Once the request has left (VirtualFileSystem.waitingForCompile), Overleaf is asked to stop
+     * it, and the compile's answer determines its outcome. Overleaf answers a stopped compile
+     * 'terminated'; a compile that the stop did not reach ends as it would have.
+     *
+     * Overleaf answers only when compilation ends, so this window cannot tell when the request
+     * reaches the compile server. Its web server first checks limits and flushes documents, and
+     * may retry the compile request (web CompileManager.mjs:30-114, ClsiManager.mjs:158-180).
+     * A stop during that interval can find no matching compile yet. The server's stop applies to
+     * the project and user, whichever client started it (CompileManager.js:410-421, getCompileName).
+     * Overleaf also sends the stop to the compile server it keeps for that project and user
+     * (ClsiManager.mjs:396-421), which may differ from the one running the compile. These gaps are
+     * why a sent Stop cannot itself determine the compile's final outcome.
      */
     async stopCompile() {
         const running = this.running;

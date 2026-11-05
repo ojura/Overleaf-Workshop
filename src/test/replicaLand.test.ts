@@ -75,7 +75,7 @@ describe('landing a commit through the replica\'s window (the land request)', fu
         const first = await requestReplica(folder, { op: 'sync' }, 10000);
         assert.strictEqual(first.ok, true, JSON.stringify(first));
         t.w.remoteWrites.length = 0;
-        return { ...t, requestReplica };
+        return { ...t, scm, requestReplica };
     }
 
     it('records Overleaf\'s state when a tool asks for a sync, and says so in the status', async () => {
@@ -105,6 +105,40 @@ describe('landing a commit through the replica\'s window (the land request)', fu
         assert.strictEqual(git(folder, 'rev-parse', OVERLEAF_REF), commit);
         assert.strictEqual(git(folder, 'rev-parse', 'HEAD'), commit);
         assert.strictEqual(git(folder, 'status', '--porcelain'), '');
+    });
+
+    it('shares one tool request from a landing preflight through its final recording', async () => {
+        const t = await start();
+        const head = git(folder, 'rev-parse', 'HEAD');
+        const commit = commitInClone(folder, clone, head, { 'main.tex': 'main v2\n' }, 'A bounded landing');
+        const sync = (t.scm as any).sync;
+        const flush = sync.flush;
+        const recordNow = sync.recordNow;
+        const requests: unknown[] = [];
+        const operations: string[] = [];
+        let toolFlush = 0;
+        sync.flush = async (scan: boolean, options: any = {}) => {
+            if (options.by !== 'tool') { return flush.call(sync, scan, options); }
+            requests.push(options.request);
+            operations.push('flush');
+            toolFlush += 1;
+            try { return await flush.call(sync, scan, options); } finally { toolFlush -= 1; }
+        };
+        sync.recordNow = (options: any = {}) => {
+            if (toolFlush || options.force) { requests.push(options.request); operations.push('record'); }
+            return recordNow.call(sync, options);
+        };
+        try {
+            const answer: any = await t.requestReplica(folder, { op: 'land', commit }, 10000);
+            assert.strictEqual(answer.ok, true, JSON.stringify(answer));
+            assert.strictEqual(t.w.remote.get('/main.tex'), 'main v2\n');
+            assert.deepStrictEqual(operations, ['flush', 'record', 'flush', 'record']);
+            assert.ok(requests[0] && typeof requests[0] === 'object', 'preflight owns a request');
+            assert.ok(requests.every(request => request === requests[0]), 'both flushes and records share the deadline owner');
+        } finally {
+            sync.flush = flush;
+            sync.recordNow = recordNow;
+        }
     });
 
     it('pushes a commit that renames and edits a document: Overleaf renames the document, then gets the edit', async () => {
