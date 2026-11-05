@@ -269,7 +269,8 @@ export function retryAfterMs(value: string | null, now: number = Date.now()): nu
  * ranges go to a temporary file next to `file`, which then takes `file`'s name, so a failed
  * download leaves `file` as it was. `onProgress` gets the bytes written so far after each range.
  * `wait` waits the time that an answer asks for before the range is asked again, until the
- * download stops (timers/promises' setTimeout).
+ * download stops (timers/promises' setTimeout). A Retry-After longer than the existing
+ * PdfFetchBridge.idleTimeoutMs server-wait budget fails immediately with the server's time.
  */
 export async function downloadInRanges(url: string, file: string, size: number, signal?: AbortSignal,
     { chunk = 8 * 1024 * 1024, parallel = 4, attempts = 3, onProgress = undefined as ((received: number) => void) | undefined,
@@ -311,6 +312,10 @@ export async function downloadInRanges(url: string, file: string, size: number, 
                 const passing = answer === undefined || answer.status >= 500 || (answer.status === 429 && answer.retryAfterMs !== undefined);
                 if (stop.signal.aborted || attempt >= attempts || !passing) { throw error; }
                 if (answer?.retryAfterMs !== undefined) {
+                    if (answer.retryAfterMs > PdfFetchBridge.idleTimeoutMs) {
+                        throw new DownloadError(`${answer.message}; the server asks to wait ${Math.ceil(answer.retryAfterMs / 1000)} s before it is asked again, `
+                            + `longer than the ${PdfFetchBridge.idleTimeoutMs / 1000} s that the window waits for a server`, answer.status, answer.retryAfterMs);
+                    }
                     // a stop during the wait ends the range with the answer's error
                     await wait(answer.retryAfterMs, stop.signal).catch(() => { throw error; });
                 }
