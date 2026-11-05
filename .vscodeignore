@@ -4,8 +4,13 @@ src/**
 out/test/**
 patches/**
 docs/**
+scripts/**
 .gitignore
 .yarnrc
+.mocharc.cjs
+CLAUDE.md
+CLAUDE.local.md
+.local-install/**
 **/tsconfig.json
 **/.eslintrc.json
 **/*.map
@@ -16,10 +21,12 @@ data/vendor/**
 !data/vendor/README.md
 !data/vendor/languages/**
 
-views/pdf-viewer/vendor/web/*.pdf
-views/pdf-viewer/vendor/web/cmaps
-views/pdf-viewer/vendor/web/locale
-views/pdf-viewer/vendor/web/standard_fonts
+# the PDF viewers' sources, which scripts/build-pdf-viewer.mjs builds into views/pdf-viewer/dist/,
+# the patch that download-pdfjs applies, and pdf.js's sample PDF; the viewers load the rest of the
+# pdf.js release at run time (src/core/pdfViewerPages.ts, views/pdf-viewer/src/pdfjs/index.html)
+views/pdf-viewer/src/**
+views/pdf-viewer/vendor/*.patch
+views/pdf-viewer/vendor/*/web/*.pdf
 
 views/chat-view/**
 !views/chat-view/dist/**

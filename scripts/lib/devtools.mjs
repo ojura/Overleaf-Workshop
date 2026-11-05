@@ -3,14 +3,34 @@
 // the port that the browser picks itself. Started with --remote-debugging-port=0, the browser
 // listens on a free port of 127.0.0.1 and writes the port and the path of its browser target into
 // the file DevToolsActivePort in its profile folder. The path holds an id that only that browser
-// accepts, so a connection to it reaches the browser of that profile and no other process that
-// listens on the machine. Pages and frames are reached through that connection
+// accepts, so a connection to it reaches the browser of that profile, and fails at any other
+// process that listens on that port. Pages and frames are reached through that connection
 // (Target.attachToTarget), not through ports of their own.
 import fs from 'node:fs';
 import path from 'node:path';
 
 /** The file in which a browser names its DevTools port and its browser target. */
 const ACTIVE_PORT_FILE = 'DevToolsActivePort';
+
+/**
+ * The last resort for an endpoint that accepts the TCP connection and never completes the
+ * WebSocket handshake, for example a process that took a recorded port after the browser ended.
+ */
+const HANDSHAKE_LIMIT_MS = 10000;
+
+/** The connections that are open, so that a signal can end every command that a script awaits (scripts/lib/cleanup.mjs). */
+const openConnections = new Set();
+/** why connect() refuses new connections: set when the script ends them all */
+let refusal;
+
+/** The number of open connections. */
+export const openConnectionCount = () => openConnections.size;
+
+/** Close every open connection, and refuse new ones: the commands that wait for answers fail with `reason`. */
+export function closeAllConnections(reason) {
+    refusal = reason;
+    for (const connection of [...openConnections]) { connection.close(reason); }
+}
 
 /**
  * The WebSocket URL of the browser that wrote `profile`'s DevToolsActivePort, or undefined while
@@ -46,7 +66,13 @@ export function waitForActivePort(profile, { ended, limitMs }) {
         let timer;
         const finish = (settle, value) => { clearTimeout(timer); watcher.close(); settle(value); };
         const look = () => {
-            const url = activePortUrl(profile);
+            let url;
+            try {
+                url = activePortUrl(profile);
+            } catch (error) {
+                finish(reject, error); // the file exists and cannot be read
+                return;
+            }
             if (url) { finish(resolve, url); }
         };
         timer = setTimeout(() => finish(reject, new Error(`the browser of ${profile} did not open DevTools within ${limitMs / 1000} s`)), limitMs);
@@ -67,16 +93,27 @@ export function waitForActivePort(profile, { ended, limitMs }) {
  * - attach(targetId) opens a session on one of the browser's targets (a page, a frame, a worker),
  *   with the same send and on for that target, and detach();
  * - discoverTargets() asks the browser for its target events (Target.targetCreated, ...), once;
- * - close() closes the connection, and `closed` resolves with the reason when it has closed.
- * A Node inspector's endpoint has no targets: use send and on alone there.
+ * - close(reason) closes the connection: the commands that wait for answers fail with `reason`,
+ *   or with the connection's close when the caller does not give one; `closed` resolves with the reason when the
+ *   connection has closed.
+ * A Node inspector's endpoint does not have targets: use send and on alone there.
  * A command that waits for its answer fails when the connection closes, and a session's command
  * also when its target detaches or crashes; the error names the command and the reason.
  */
-export async function connect(url) {
+export async function connect(url, { limitMs = HANDSHAKE_LIMIT_MS } = {}) {
+    if (refusal !== undefined) { throw new Error(`could not connect to ${url}: ${refusal}`); }
+    const handshakeMs = Math.min(limitMs, HANDSHAKE_LIMIT_MS);
+    if (handshakeMs <= 0) { throw new WaitLimitError(`${url}: no time remains for the WebSocket handshake`); }
     const ws = new WebSocket(url);
     await new Promise((resolve, reject) => {
-        const opened = () => { ws.removeEventListener('error', failed); resolve(); };
-        const failed = () => { ws.removeEventListener('open', opened); reject(new Error(`could not connect to ${url}`)); };
+        const timer = setTimeout(() => {
+            ws.removeEventListener('open', opened);
+            ws.removeEventListener('error', failed);
+            ws.close();
+            reject(new WaitLimitError(`${url} did not complete the WebSocket handshake within ${handshakeMs / 1000} s`));
+        }, handshakeMs);
+        const opened = () => { clearTimeout(timer); ws.removeEventListener('error', failed); resolve(); };
+        const failed = () => { clearTimeout(timer); ws.removeEventListener('open', opened); reject(new Error(`could not connect to ${url}`)); };
         ws.addEventListener('open', opened, { once: true });
         ws.addEventListener('error', failed, { once: true });
     });
@@ -136,8 +173,9 @@ export async function connect(url) {
         emit(message.sessionId, message.method, message.params);
     });
     ws.addEventListener('close', (event) => {
-        endReason = `the DevTools connection to ${url} closed (code ${event.code}${event.reason ? `, ${event.reason}` : ''})`;
+        endReason ??= `the DevTools connection to ${url} closed (code ${event.code}${event.reason ? `, ${event.reason}` : ''})`;
         failPending(() => true, endReason);
+        openConnections.delete(connection);
         reportClosed(endReason);
     });
 
@@ -184,10 +222,19 @@ export async function connect(url) {
             },
         };
     };
-    return {
-        url, send: (method, params) => send(method, params), on: (method, fn) => on(method, fn),
-        attach, discoverTargets, close: () => ws.close(), closed,
+    const close = (reason) => {
+        if (reason !== undefined && endReason === undefined) {
+            endReason = reason;
+            failPending(() => true, reason);
+        }
+        ws.close();
     };
+    const connection = {
+        url, send: (method, params) => send(method, params), on: (method, fn) => on(method, fn),
+        attach, discoverTargets, close, closed,
+    };
+    openConnections.add(connection);
+    return connection;
 }
 
 /**
@@ -218,3 +265,149 @@ export function waitForTarget(connection, matches, { what, limitMs }) {
             .catch((error) => finish(reject, error));
     });
 }
+
+/**
+ * The value of `expression` in a DevTools target: a session on a page or a frame, or a Node
+ * inspector's connection; with `contextId`, in that execution context. An exception in the target
+ * rejects with its description, as does a command that fails.
+ */
+export async function evaluate(target, expression, contextId) {
+    const r = await target.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, ...(contextId ? { contextId } : {}) });
+    if (r.exceptionDetails) {
+        throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
+    }
+    return r.result.value;
+}
+
+/** A wait that reached its limit before its condition held. */
+export class WaitLimitError extends Error {}
+
+/**
+ * `work`, or a WaitLimitError when it has not settled within `limitMs`, which is the last resort
+ * for a party that may never answer; `what` names the work in the error. At the limit the
+ * connection closes, which also ends the commands that `work` still awaits.
+ */
+export async function answerWithin(connection, what, limitMs, work) {
+    let timer;
+    const limit = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            const error = new WaitLimitError(`${what}: did not answer within ${limitMs / 1000} s`);
+            connection.close(error.message);
+            reject(error);
+        }, limitMs);
+    });
+    try {
+        return await Promise.race([work(), limit]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/**
+ * Wait until `probe()` resolves to a truthy value, and return { value, ms }. probe runs again
+ * `stepMs` after each falsy answer, and an error that it throws ends the wait with that error.
+ * `limitMs` is the last resort for a condition that never holds: a timer that ends the wait with a
+ * WaitLimitError naming `what`, also while a probe has not answered.
+ */
+export function waitUntil(probe, { what, limitMs, stepMs = 50 }) {
+    const start = Date.now();
+    return new Promise((resolve, reject) => {
+        let done = false;
+        let step;
+        const finish = (settle, value) => {
+            if (done) { return; }
+            done = true;
+            clearTimeout(limit);
+            clearTimeout(step);
+            settle(value);
+        };
+        const limit = setTimeout(() => finish(reject, new WaitLimitError(`${what} did not hold within ${limitMs / 1000} s`)), limitMs);
+        const check = () => {
+            Promise.resolve().then(probe).then((value) => {
+                if (done) { return; }
+                if (value) { finish(resolve, { value, ms: Date.now() - start }); } else { step = setTimeout(check, stepMs); }
+            }, (error) => finish(reject, error));
+        };
+        check();
+    });
+}
+
+/**
+ * Wait until `expression` is truthy in `target` (in `contextId` when given), as waitUntil does:
+ * an exception in the page ends the wait with that exception, and `limitMs` with a WaitLimitError.
+ */
+export function waitFor(target, expression, { what = expression, limitMs, stepMs, contextId } = {}) {
+    return waitUntil(() => evaluate(target, expression, contextId), { what, limitMs, stepMs });
+}
+
+/** For the .catch() of a wait when reaching its limit is a check's negative answer: undefined for a WaitLimitError, and any other error thrown again. */
+export function notWithinLimit(error) {
+    if (error instanceof WaitLimitError) { return undefined; }
+    throw error;
+}
+
+/** The modifier bits of Input.dispatchKeyEvent. */
+const MODIFIERS = { Alt: 1, Ctrl: 2, Meta: 4, Shift: 8 };
+/** The keys that pressKey takes besides letters and digits: [key, code, Windows virtual key code]. */
+const NAMED_KEYS = { Escape: ['Escape', 'Escape', 27], Enter: ['Enter', 'Enter', 13], '=': ['=', 'Equal', 187], '-': ['-', 'Minus', 189] };
+
+/**
+ * Press and release the key `combo` in the page of `session` (a session or a page with send()), as
+ * a keyboard sends it: "Ctrl+Shift+P", "Ctrl+=", "Escape". The modifiers come first, then a letter,
+ * a digit or a key of NAMED_KEYS; a letter is its capital when Shift is among the modifiers.
+ */
+export async function pressKey(session, combo) {
+    const parts = combo.split('+');
+    const name = parts.pop();
+    let modifiers = 0;
+    for (const part of parts) {
+        if (!(part in MODIFIERS)) { throw new Error(`pressKey: ${part} in ${combo} is not one of the modifiers ${Object.keys(MODIFIERS).join(', ')}`); }
+        modifiers |= MODIFIERS[part];
+    }
+    let key, code, keyCode;
+    if (/^[a-z]$/i.test(name)) {
+        const capital = name.toUpperCase();
+        [key, code, keyCode] = [modifiers & MODIFIERS.Shift ? capital : capital.toLowerCase(), `Key${capital}`, capital.charCodeAt(0)];
+    } else if (/^[0-9]$/.test(name)) {
+        [key, code, keyCode] = [name, `Digit${name}`, name.charCodeAt(0)];
+    } else if (name in NAMED_KEYS) {
+        [key, code, keyCode] = NAMED_KEYS[name];
+    } else {
+        throw new Error(`pressKey: ${name} in ${combo} is not a letter, a digit or one of ${Object.keys(NAMED_KEYS).join(' ')}`);
+    }
+    for (const type of ['rawKeyDown', 'keyUp']) {
+        await session.send('Input.dispatchKeyEvent', { type, modifiers, key, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode });
+    }
+}
+
+/** A left click at (x, y), in CSS pixels of the page of `session` (a session or a page with send()). */
+export async function clickAt(session, x, y) {
+    for (const type of ['mousePressed', 'mouseReleased']) {
+        await session.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
+    }
+}
+
+/**
+ * An expression for a page that settles with the value of the expression `condition` once it is
+ * truthy, and with undefined after `limitMs`. The page evaluates `condition` at once and again on
+ * each change of its DOM (a MutationObserver on the document, with attributes and text) and of
+ * its focus (focusin and focusout in the document, blur and focus of the window), which do not
+ * change the DOM.
+ */
+export const whenTruthy = (condition, limitMs) => `new Promise((resolve) => {
+    const value = () => (${condition});
+    const first = value();
+    if (first) { resolve(first); return; }
+    const look = () => { const now = value(); if (now) { done(now); } };
+    const observer = new MutationObserver(look);
+    const focusEvents = [[document, 'focusin'], [document, 'focusout'], [window, 'blur'], [window, 'focus']];
+    const done = (result) => {
+        observer.disconnect();
+        focusEvents.forEach(([target, type]) => target.removeEventListener(type, look, true));
+        clearTimeout(timer);
+        resolve(result);
+    };
+    observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true });
+    focusEvents.forEach(([target, type]) => target.addEventListener(type, look, true));
+    const timer = setTimeout(() => done(undefined), ${Number(limitMs)});
+})`;

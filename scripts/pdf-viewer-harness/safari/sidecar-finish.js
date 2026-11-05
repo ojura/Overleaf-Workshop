@@ -96,6 +96,23 @@
     check();
     throw new Error('Motion Lab ' + action + ' did not settle');
   }
+  async function restoreMeasurements(details, open, { check, deadline }) {
+    const end = Math.min(deadline, performance.now() + budget.settleMs);
+    let processed = false;
+    const toggled = () => { processed = true; };
+    details.addEventListener('toggle', toggled, { once: true });
+    try {
+      details.open = open;
+      // Wait for the queued native event before sampling the resulting content geometry.
+      while (!processed) {
+        check();
+        const remaining = end - performance.now();
+        if (remaining <= 0) throw new Error('Motion Lab disclosure did not settle');
+        await nextFrame(Math.max(1, Math.min(1000, remaining)));
+      }
+      check();
+    } finally { details.removeEventListener('toggle', toggled); }
+  }
   function verifyPanel(state, expected) {
     if (state.dock !== expected.dock || state.measurements !== expected.measurements
         || ['x', 'y', 'width', 'height'].some(key => !closeEnough(state.rect[key], expected.rect[key]))) {
@@ -142,6 +159,11 @@
       panelRestoring = Promise.resolve().then(async () => {
         check();
         if (!panel()) pdfPrefetch.setDiagnosticsEnabled(true);
+        const details = panel()?.root.querySelector('.measurements');
+        if (details && details.open !== original.measurements) {
+          await restoreMeasurements(details, original.measurements, { check, deadline });
+          await settlePanel('restore measurements', { check, deadline });
+        }
         if (floating) {
           if (panelState().dock !== 'float') { dock('float', check); await settlePanel('restore undock', { check, deadline }); }
           let current = panelState();
@@ -166,8 +188,6 @@
             pointGesture('resize', (original.rect.width - current.rect.width) * (original.dock === 'right' ? -1 : 1), 0, check);
           }
         }
-        const details = panel()?.root.querySelector('.measurements');
-        if (details) details.open = original.measurements;
         const restored = await settlePanel('restoration', { check, deadline });
         verifyPanel(restored, original);
         return restored;

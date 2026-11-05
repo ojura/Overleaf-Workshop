@@ -86,7 +86,8 @@ describe('Motion Lab panel geometry and controls', function () {
         }
     });
 
-    function fixture(onLayout?: (layout: any) => { readyAt: number; isReady?(): boolean } | void, motion = false) {
+    function fixture(onLayout?: (layout: any) => { readyAt: number; isReady?(): boolean } | void, motion = false,
+        measureContentHeight?: (width: number) => number | undefined) {
         class Events {
             readonly listeners = new Map<string, Set<(event: any) => void>>();
             addEventListener(name: string, listener: (event: any) => void) {
@@ -152,6 +153,7 @@ describe('Motion Lab panel geometry and controls', function () {
         const buttons = { left: new Node(), right: new Node(), float: new Node() };
         const layouts: any[] = [], painted: any[] = [];
         const panel = api.installMotionLabPanel(host, { surface, dragHandle: drag, resizeHandles: resizes, dockButtons: buttons,
+            measureContentHeight,
             onLayout(layout: any) { layouts.push(layout); return onLayout?.(layout); },
             onGeometryChange() { painted.push(surface.getBoundingClientRect()); } });
         const pointer = (x: number, y: number, id = 1) => ({ button: 0, isPrimary: true, pointerId: id, clientX: x, clientY: y,
@@ -166,6 +168,254 @@ describe('Motion Lab panel geometry and controls', function () {
             },
             measure(rect?: typeof initial) { measured = rect; } };
     }
+
+    it('caps floating and docked height to useful content while retaining passive size preference', () => {
+        const model = new api.MotionLabPanelGeometry(viewport, initial);
+        model.setContentHeight(120);
+        assert.deepStrictEqual(model.snapshot().rect, { ...initial, height: 120 });
+        for (const dock of ['left', 'right']) {
+            model.setDock(dock);
+            assert.deepStrictEqual(model.snapshot().rect, { x: dock === 'left' ? 8 : 652, y: 8, width: 340, height: 120 });
+        }
+        model.setDock('float');
+        model.setContentHeight(600);
+        assert.deepStrictEqual(model.snapshot().rect, initial, 'passive growth restores the remembered user height');
+        model.setViewport({ x: 31, y: 27, width: 180, height: 120 });
+        assert.strictEqual(model.snapshot().rect.height, 104);
+        model.setViewport(viewport);
+        assert.deepStrictEqual(model.snapshot().rect, initial);
+        for (const height of [0, -1, NaN, Infinity]) {
+            assert.throws(() => model.setContentHeight(height), /Motion Lab/);
+            assert.deepStrictEqual(model.snapshot().rect, initial);
+        }
+    });
+
+    it('fits the first disclosure expansion and later collapse without retaining a blank lower region', () => {
+        let natural = 120, measurements = 0;
+        const f = fixture(undefined, false, () => { measurements++; return natural; });
+        try {
+            f.panel.setVisible(true);
+            assert.deepStrictEqual(f.panel.snapshot().rect, { ...initial, height: 120 });
+            assert.strictEqual(f.observers.length, 0, 'intrinsic content observation replaces the forced-surface observer');
+            natural = 480;
+            f.panel.refreshContent({ fit: true });
+            assert.deepStrictEqual(f.panel.snapshot().rect, { ...initial, height: 480 });
+            f.resizes.s.emit('keydown', f.key('ArrowUp', true));
+            assert.strictEqual(f.panel.snapshot().rect.height, 440);
+            natural = 470;
+            f.panel.refreshContent();
+            assert.strictEqual(f.panel.snapshot().rect.height, 440, 'passive content changes preserve a deliberate smaller size');
+            for (let i = 0; i < 7; i++) { f.resizes.s.emit('keydown', f.key('ArrowUp', true)); }
+            natural = 300; f.panel.refreshContent({ fit: false });
+            assert.strictEqual(f.panel.snapshot().rect.height, 160, 'closing cannot enlarge a deliberately short expanded panel');
+            natural = 130;
+            f.panel.refreshContent({ fit: false });
+            assert.deepStrictEqual(f.panel.snapshot().rect, { ...initial, height: 130 });
+            const before = measurements, layouts = f.layouts.length;
+            f.drag.emit('keydown', f.key('ArrowRight'));
+            assert.strictEqual(measurements, before, 'moving the panel does not remeasure unchanged content');
+            f.panel.refreshContent();
+            assert.strictEqual(f.layouts.length, layouts + 1, 'the same content height does not emit another layout');
+            assert.strictEqual(f.frames.size, 0);
+        } finally { f.panel.dispose(); }
+    });
+
+    it('invalidates intrinsic geometry once even when the outer content height stays capped', () => {
+        let natural = 500, measurements = 0;
+        const notifiedAtLayout: number[] = [];
+        let f: ReturnType<typeof fixture>;
+        f = fixture(() => { notifiedAtLayout.push(f.painted.length); }, false,
+            () => { measurements++; return natural; });
+        try {
+            f.panel.setVisible(true);
+            const before = f.painted.length, layouts = f.layouts.length;
+            natural = 600; f.panel.refreshContent();
+            assert.strictEqual(f.painted.length, before + 1, 'the robot stage can move inside an unchanged capped rectangle');
+            assert.strictEqual(f.layouts.length, layouts);
+            natural = 240; f.panel.refreshContent();
+            assert.strictEqual(f.painted.length, before + 2, 'a changed outer rectangle uses the same one invalidation');
+            assert.strictEqual(notifiedAtLayout.at(-1), before + 2, 'the geometry invalidation precedes downstream layout');
+            assert.strictEqual(measurements, 3, 'opening and each explicit content change measure once');
+            assert.strictEqual(f.frames.size, 0);
+        } finally { f.panel.dispose(); }
+    });
+
+    it('retains a taller requested height through horizontal pointer resizing while content caps the displayed height', () => {
+        for (const direction of ['e', 'w'] as ResizeDirection[]) {
+            let natural = 300;
+            const f = fixture(undefined, false, () => natural);
+            try {
+                f.measure({ ...initial, height: 440 });
+                f.panel.setVisible(true); f.measure();
+                const before = f.panel.snapshot().rect;
+                assert.strictEqual(before.height, 300);
+                f.resizes[direction].emit('pointerdown', f.pointer(400, 300));
+                assert.deepStrictEqual(f.panel.snapshot().rect, before, 'zero-delta admission keeps the displayed pose');
+                const dx = direction === 'w' ? -40 : 40;
+                f.win.emit('pointermove', f.pointer(400 + dx, 300));
+                f.win.emit('pointerup', f.pointer(400 + dx, 300));
+                const resized = f.panel.snapshot().rect;
+                assert.strictEqual(resized.height, 300);
+                assert.strictEqual(resized.y, before.y);
+                assert.strictEqual(direction === 'w' ? resized.x + resized.width : resized.x,
+                    direction === 'w' ? before.x + before.width : before.x, 'the opposite horizontal edge stays fixed');
+                natural = 600; f.panel.refreshContent();
+                assert.deepStrictEqual(f.panel.snapshot().rect, { ...resized, height: 440 },
+                    'passive content growth restores the requested height rather than the temporary cap');
+                assert.strictEqual(f.frames.size, 0);
+            } finally { f.panel.dispose(); }
+        }
+    });
+
+    it('measures the proposed width before capping north and corner resizing at the anchored bottom', () => {
+        for (const direction of ['n', 'nw', 'ne'] as ResizeDirection[]) {
+            const widths: number[] = [];
+            const f = fixture(undefined, false, width => { widths.push(width); return width > 400 ? 210 : 350; });
+            try {
+                f.panel.setVisible(true);
+                const dx = direction === 'nw' ? -100 : direction === 'ne' ? 100 : 0;
+                f.resizes[direction].emit('pointerdown', f.pointer(400, 200));
+                f.win.emit('pointermove', f.pointer(400 + dx, 100));
+                const rect = f.panel.snapshot().rect, expectedHeight = direction === 'n' ? 350 : 210;
+                assert.strictEqual(rect.width, 340 + Math.abs(dx));
+                assert.strictEqual(rect.height, expectedHeight);
+                assert.strictEqual(rect.y + rect.height, initial.y + initial.height, direction + ' keeps its bottom anchor');
+                assert.strictEqual(widths.at(-1), rect.width, 'the cap belongs to the resized width');
+                if (direction !== 'n') {
+                    const sign = direction === 'nw' ? -1 : 1;
+                    f.win.emit('pointermove', f.pointer(400 + sign * 120, 90));
+                    const second = f.panel.snapshot().rect;
+                    assert.strictEqual(second.y + second.height, initial.y + initial.height, 'a changed ceiling cannot rebase the gesture');
+                    f.win.emit('pointermove', f.pointer(400 + sign * 20, 140));
+                    const reversed = f.panel.snapshot().rect;
+                    assert.strictEqual(reversed.width, 360);
+                    assert.strictEqual(reversed.height, 350);
+                    assert.strictEqual(reversed.y + reversed.height, initial.y + initial.height, 'width reversal retains the same bottom anchor');
+                }
+                f.win.emit('pointerup', f.pointer(400 + dx, 100));
+                assert.strictEqual(f.frames.size, 0);
+            } finally { f.panel.dispose(); }
+        }
+    });
+
+    it('releases a completed north pointer anchor before automatic disclosure collapse', () => {
+        for (const direction of ['n', 'nw', 'ne'] as ResizeDirection[]) {
+            let natural = 800;
+            const f = fixture(undefined, false, () => natural);
+            try {
+                f.panel.setVisible(true);
+                const dx = direction === 'nw' ? -40 : direction === 'ne' ? 40 : 0;
+                f.resizes[direction].emit('pointerdown', f.pointer(400, 200));
+                f.win.emit('pointermove', f.pointer(400 + dx, 120));
+                const resized = f.panel.snapshot().rect;
+                assert.strictEqual(resized.y + resized.height, initial.y + initial.height);
+                f.win.emit('pointerup', f.pointer(400 + dx, 120));
+                natural = 210; f.panel.refreshContent({ fit: false });
+                assert.deepStrictEqual(f.panel.snapshot().rect, { ...resized, height: 210 },
+                    'collapse preserves the completed panel top rather than the old resize anchor');
+                natural = 800; f.panel.refreshContent();
+                assert.deepStrictEqual(f.panel.snapshot().rect, resized, 'the requested height remains available');
+            } finally { f.panel.dispose(); }
+        }
+    });
+
+    it('releases each north keyboard resize anchor before automatic disclosure collapse', () => {
+        for (const direction of ['n', 'nw', 'ne'] as ResizeDirection[]) {
+            let natural = 800;
+            const f = fixture(undefined, false, () => natural);
+            try {
+                f.panel.setVisible(true);
+                f.resizes[direction].emit('keydown', f.key('ArrowUp', true));
+                const resized = f.panel.snapshot().rect;
+                assert.strictEqual(resized.y + resized.height, initial.y + initial.height);
+                natural = 210; f.panel.refreshContent({ fit: false });
+                assert.deepStrictEqual(f.panel.snapshot().rect, { ...resized, height: 210 });
+                natural = 800; f.panel.refreshContent();
+                assert.deepStrictEqual(f.panel.snapshot().rect, resized);
+                assert.strictEqual(f.frames.size, 0);
+            } finally { f.panel.dispose(); }
+        }
+    });
+
+    it('uses short content at both docks and grows it after viewport recovery without losing width', () => {
+        let natural = 190;
+        const f = fixture(undefined, false, width => natural + (width - 340) / 2);
+        try {
+            f.panel.setVisible(true);
+            for (const dock of ['left', 'right'] as const) {
+                f.panel.setDock(dock);
+                const before = f.panel.snapshot().rect;
+                assert.strictEqual(before.height, 190);
+                const handle = f.resizes[dock === 'left' ? 'e' : 'w'];
+                handle.emit('keydown', f.key(dock === 'left' ? 'ArrowRight' : 'ArrowLeft', true));
+                assert.strictEqual(f.panel.snapshot().dock, dock);
+                assert.strictEqual(f.panel.snapshot().rect.height, 210);
+                assert.strictEqual(f.panel.snapshot().rect.y, before.y);
+                f.panel.setDock('float');
+            }
+            f.panel.setDock('right');
+            natural = 900; f.panel.refreshContent({ fit: true });
+            assert.strictEqual(f.panel.snapshot().rect.height, 684);
+            f.visual.height = 200; f.visual.emit('resize');
+            assert.strictEqual(f.panel.snapshot().rect.height, 184);
+            f.visual.height = 700; f.visual.emit('resize');
+            assert.strictEqual(f.panel.snapshot().rect.height, 684);
+            assert.strictEqual(f.panel.snapshot().rect.width, 340);
+        } finally { f.panel.dispose(); }
+    });
+
+    it('defers passive content observations during a dock glide and rechecks once at completion', () => {
+        let measurements = 0;
+        const f = fixture(layout => layout.reason === 'dock' ? { readyAt: 2500 } : undefined, true,
+            () => { measurements++; return 420; });
+        try {
+            f.panel.setVisible(true); f.panel.setDock('left');
+            const before = measurements, layouts = f.layouts.length;
+            f.advance(500); f.panel.refreshContent();
+            f.advance(2500); f.panel.refreshContent();
+            f.advance(3100); f.panel.refreshContent();
+            assert.strictEqual(measurements, before, 'intermediate painted widths do not remeasure or replan the destination');
+            assert.strictEqual(f.layouts.length, layouts);
+            f.advance(3700);
+            assert.strictEqual(measurements, before + 1);
+            assert.strictEqual(f.panel.snapshot().rect.height, 420);
+            assert.strictEqual(f.layouts.length, layouts);
+            assert.strictEqual(f.frames.size, 0);
+            assert.strictEqual(f.host.dataset.panelMoving, undefined);
+        } finally { f.panel.dispose(); }
+    });
+
+    it('retargets a genuine disclosure change from the displayed pose and fences hidden content callbacks', () => {
+        let natural = 420, measurements = 0;
+        const f = fixture(layout => layout.reason !== 'open' ? { readyAt: 2500 } : undefined, true,
+            () => { measurements++; return natural; });
+        try {
+            f.panel.setVisible(true); f.panel.setDock('right'); f.advance(500);
+            const before = f.panel.snapshot().rect, stale = [...f.frames.values()][0];
+            natural = 140; f.panel.refreshContent({ fit: false });
+            assert.deepStrictEqual(f.panel.snapshot().rect, before, 'a disclosure retarget does not teleport the dock');
+            assert.strictEqual(f.layouts.at(-1).rect.height, 140);
+            stale(10000);
+            assert.deepStrictEqual(f.panel.snapshot().rect, before);
+            f.advance(2500); f.advance(3700);
+            assert.strictEqual(f.panel.snapshot().rect.height, 140);
+            assert.strictEqual(f.frames.size, 0);
+            f.document.hidden = true; f.document.emit('visibilitychange');
+            const hiddenReads = measurements;
+            natural = 500; f.panel.refreshContent({ fit: true });
+            assert.strictEqual(measurements, hiddenReads);
+            f.document.hidden = false; f.document.emit('visibilitychange');
+            assert.strictEqual(f.panel.snapshot().rect.height, 500);
+            f.panel.setVisible(false);
+            const closedReads = measurements;
+            f.panel.refreshContent();
+            assert.strictEqual(measurements, closedReads);
+        } finally { f.panel.dispose(); }
+        const disposedReads = measurements;
+        f.panel.refreshContent({ fit: true });
+        assert.strictEqual(measurements, disposedReads);
+        assert.strictEqual(f.frames.size, 0);
+    });
 
     it('resizes from all eight floating window handles with the opposite edges anchored', () => {
         for (const direction of directions) {

@@ -964,8 +964,9 @@ function ellipse(ctx: Paint, x: number, y: number, rx: number, ry: number, fill:
     ctx.fillStyle = fill; ctx.fill();
     if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 1.2; ctx.stroke(); }
 }
+const labelFont = (size: number) => '600 ' + size + 'px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
 function label(ctx: Paint, text: string, x: number, y: number, color = '#bfd1e4', size = 8, align: CanvasTextAlign = 'center'): void {
-    ctx.fillStyle = color; ctx.font = '600 ' + size + 'px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'; ctx.textAlign = align; ctx.fillText(text, x, y);
+    ctx.fillStyle = color; ctx.font = labelFont(size); ctx.textAlign = align; ctx.fillText(text, x, y);
 }
 function bodyArtwork(ctx: Paint, vehicle: typeof ROBOT_VEHICLES[number]): void {
     if (vehicle.id === 'ekokomvoz') { paintEkokomvoz(ctx, { phase: 0, direction: 1, working: false }); return; }
@@ -1256,7 +1257,15 @@ export function paintRobotVehicle(ctx: Paint, actor: RobotArtworkActor, time: nu
         rounded(ctx, -width / 2, -45, width, 13, 4, '#ffebc9', '#bb8755');
         label(ctx, text, 0, -36, '#62412d', 6);
     }
-    if (actor.labels !== false) { label(ctx, spec.name, 0, spec.air ? -27 : 37, '#9fb7c9', 6); }
+    if (actor.labels !== false) {
+        const y = spec.air ? -27 : 37, size = 6.5, padding = 3;
+        ctx.save();
+        ctx.font = labelFont(size);
+        const width = ctx.measureText(spec.name).width + padding * 2;
+        rounded(ctx, -width / 2, y - size - 1.5, width, size + 4, 3, '#16293be8', '#648198b3');
+        label(ctx, spec.name, 0, y, '#edf4fa', size);
+        ctx.restore();
+    }
     if (actor.malfunction === 'sparks') {
         for (let index = 0; index < ROBOT_RESCUE_POLICY.maxSparks; index++) {
             const angle = index * Math.PI * 2 / ROBOT_RESCUE_POLICY.maxSparks + (actor.gesturePhase ?? 0) * 0.3;

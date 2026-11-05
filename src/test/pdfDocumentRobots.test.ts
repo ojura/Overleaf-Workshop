@@ -92,6 +92,7 @@ class Canvas extends Element {
     beforeCopy?: (args: any[]) => void;
     readonly context = new Proxy({
         setTransform: (...values: number[]) => this.transforms.push(values),
+        measureText: (text: string) => ({ width: text.length * 6 }),
         drawImage: (...args: any[]) => {
             this.beforeCopy?.(args);
             if (this.failCopy && args.length === 9) { throw new Error('copy failed'); }
@@ -2304,6 +2305,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         let points: number[][] = [];
         const context = new Proxy({
             beginPath: () => { points = []; },
+            measureText: (text: string) => ({ width: text.length * 6 }),
             moveTo: (...point: number[]) => points.push(point),
             lineTo: (...point: number[]) => points.push(point),
             scale: (...scale: number[]) => scales.push(scale),

@@ -6,5 +6,6 @@ out
 
 **/vendor/**
 views/pdf-viewer/dist
+views/pdf-viewer/dist.*
 dist/spomenar
 scripts/pdf-viewer-harness/safari/__pycache__/

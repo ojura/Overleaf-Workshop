@@ -5,20 +5,117 @@
 // picked both ports itself, and only this IDE accepts the id in each path, so a connection to a
 // recorded endpoint reaches this instance's IDE or fails. Each connection also checks that the
 // process that answers is the IDE that start recorded (instance.json's pid).
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { connect, waitForActivePort, waitForTarget } from './devtools.mjs';
+import { answerWithin, connect, evaluate, waitForActivePort, waitForTarget, WaitLimitError } from './devtools.mjs';
+
+/** The last resort for an instance command or identity request that never answers. */
+export const ANSWER_LIMIT_MS = 15000;
+
+/** The time left for one startup operation; every stage uses the same startup deadline. */
+function remaining(deadline) {
+    const left = deadline - Date.now();
+    if (left <= 0) { throw new WaitLimitError('the instance did not finish starting within its startup deadline'); }
+    return left;
+}
 
 /**
- * The instance's folder: `explicit`, else HIDDEN_IDE_HOME. There is no default, so that two agents
- * never share an instance.
+ * The instance's folder: `explicit`, else HIDDEN_IDE_HOME. The scripts require one of them and do
+ * not fall back to a shared folder, so that two agents never share an instance.
  */
-export function instanceHome(explicit) {
+export function instanceHome(explicit, option) {
     const home = explicit ?? process.env.HIDDEN_IDE_HOME;
     if (!home) {
-        throw new Error('name the folder of the test instance with --instance DIR or HIDDEN_IDE_HOME; it has no default, so that two agents never share an instance');
+        throw new Error(`name the folder of the test instance with ${option ? `${option} DIR or ` : ''}HIDDEN_IDE_HOME; the scripts do not fall back to a shared folder, so that two agents never share an instance`);
     }
     return path.resolve(home);
+}
+
+/**
+ * Whether this user is the only user in the group `gid`: every other user has another primary group,
+ * and the group's list of members names only this user (getent, so that the system's user
+ * databases answer).
+ */
+function groupHoldsOnlyThisUser(gid) {
+    const group = spawnSync('getent', ['group', String(gid)], { encoding: 'utf8' });
+    if (group.status !== 0) { return false; }
+    const members = (group.stdout.trim().split(':')[3] ?? '').split(',').filter(Boolean);
+    if (members.some(member => member !== os.userInfo().username)) { return false; }
+    const users = spawnSync('getent', ['passwd'], { encoding: 'utf8' });
+    if (users.status !== 0) { return false; }
+    return users.stdout.split('\n').filter(Boolean).every((line) => {
+        const [, , uid, primary] = line.split(':');
+        return Number(primary) !== gid || Number(uid) === process.getuid();
+    });
+}
+
+/**
+ * Fail unless `home` can hold an instance: it holds the login copy and the record that stop acts
+ * on. It must be the folder itself (not a symbolic link), belong to this user and have mode 700,
+ * and the folders above it must pass checkFoldersAbove.
+ */
+export function checkInstanceFolder(home) {
+    const refuse = (reason) => { throw new Error(`refusing the instance's folder ${home}: ${reason}`); };
+    let stat;
+    try {
+        stat = fs.lstatSync(home);
+    } catch (error) {
+        if (error.code === 'ENOENT') { refuse('it does not exist'); }
+        throw error;
+    }
+    if (stat.isSymbolicLink()) { refuse('it is a symbolic link; name the folder itself'); }
+    if (!stat.isDirectory()) { refuse('it is not a folder'); }
+    if (stat.uid !== process.getuid()) { refuse('another user owns it'); }
+    if ((stat.mode & 0o777) !== 0o700) {
+        refuse(`its mode is ${(stat.mode & 0o777).toString(8)}; it must be 700, so that only this user can enter, read and write it`);
+    }
+    checkFoldersAbove(home);
+}
+
+/**
+ * Fail unless the folders above `home`, which need not exist yet, are closed to other users: each
+ * must belong to root or to this user, and other users must not be able to write it, except a
+ * folder with the sticky bit (as /tmp has), in which they cannot rename or remove what is not
+ * theirs. A folder that its group can write counts as closed to others when this user is the
+ * group's only user. The check walks the folders of the path as it is named and of the path with its
+ * symbolic links resolved, since a link in a folder that others can write could be replaced; a
+ * folder that does not exist yet is skipped, as mkdir makes it for this user with mode 700.
+ * What the check does not see: an ACL entry that lets another user write a folder. The check reads
+ * the mode bits, and with an ACL their group bits are the ACL's mask, so a folder whose group bits
+ * pass can hide such an entry (getfacl shows it).
+ */
+export function checkFoldersAbove(home) {
+    const refuse = (reason) => { throw new Error(`refusing the instance's folder ${home}: ${reason}`); };
+    const named = path.resolve(home);
+    let existing = path.dirname(named);
+    while (!fs.existsSync(existing)) { existing = path.dirname(existing); }
+    const chains = [path.dirname(named), fs.realpathSync(existing)];
+    for (const start of chains) {
+        for (let dir = start; ; dir = path.dirname(dir)) {
+            const above = fs.statSync(dir, { throwIfNoEntry: false });
+            if (above) {
+                const sticky = (above.mode & 0o1000) !== 0;
+                if (above.uid !== 0 && above.uid !== process.getuid()) { refuse(`the folder ${dir} above it belongs to another user`); }
+                if ((above.mode & 0o002) && !sticky) { refuse(`every user can write the folder ${dir} above it`); }
+                if ((above.mode & 0o020) && !sticky && !groupHoldsOnlyThisUser(above.gid)) {
+                    refuse(`the members of group ${above.gid} can write the folder ${dir} above it, and other users are among them`);
+                }
+            }
+            if (dir === path.dirname(dir)) { break; }
+        }
+    }
+}
+
+/**
+ * The record of the instance in `home`, which must run (instanceProcesses); the drivers and
+ * hidden-ide.sh's commands call it before they change anything.
+ */
+export function readRunningInstance(home) {
+    const record = readInstance(home);
+    if (instanceProcesses(record).length === 0) { throw new Error(`the instance in ${home} does not run`); }
+    return record;
 }
 
 /** The record of the instance in `home`, with `home` added; fails when start has not written one. */
@@ -29,23 +126,49 @@ export function readInstance(home) {
         text = fs.readFileSync(file, 'utf8');
     } catch (error) {
         if (error.code === 'ENOENT') {
-            throw new Error(`${file} does not exist: start an instance with scripts/hidden-ide.sh start, or name its folder with HIDDEN_IDE_HOME`);
+            throw new Error(`${file} does not exist: start an instance with scripts/hidden-ide.sh start, or name its folder with HIDDEN_IDE_HOME (the drivers also take --instance DIR)`);
         }
         throw error;
     }
     return { ...JSON.parse(text), home };
 }
 
-/** Replace the record of the instance in `home` with `record`, through a new file that is renamed over it. */
-export function writeInstance(home, record) {
-    const file = path.join(home, 'instance.json');
-    const { home: _, ...fields } = record;
-    fs.writeFileSync(`${file}.new`, `${JSON.stringify(fields, null, 2)}\n`, { mode: 0o600 });
+/**
+ * Write `text` to `file` through a new file that is renamed over it, so that a reader finds the old
+ * text or the new one, readable only by this user.
+ */
+export function writePrivately(file, text) {
+    fs.writeFileSync(`${file}.new`, text, { mode: 0o600 });
     fs.renameSync(`${file}.new`, file);
 }
 
+/** Replace the record of the instance in `home` with `record` (writePrivately). */
+export function writeInstance(home, record) {
+    const { home: _, ...fields } = record;
+    writePrivately(path.join(home, 'instance.json'), `${JSON.stringify(fields, null, 2)}\n`);
+}
+
+/**
+ * The path of the page of VS Code's workbench window. The instance's window is the one window that
+ * shows this page: the window commands pick it among the IDE's BrowserWindows, and the page
+ * commands and the drivers among its page targets, both by this path, and both refuse when there
+ * is not exactly one.
+ */
+const WORKBENCH_PAGE = '/workbench/workbench.html';
+
+/**
+ * How long a page may go without drawing a frame before it counts as not drawing. A page that
+ * draws runs its requestAnimationFrame callbacks within a frame, about 16 ms; a page in a hidden or
+ * throttled window does not run them at all, which only the absence of a frame within some time
+ * can show. This limit is that time.
+ */
+const DRAW_LIMIT_MS = 2000;
+
+/** An expression for a page: whether it draws, that is whether requestAnimationFrame fires within DRAW_LIMIT_MS. */
+export const drawsExpression = `Promise.race([new Promise(r => requestAnimationFrame(() => r(true))), new Promise(r => setTimeout(() => r(false), ${DRAW_LIMIT_MS}))])`;
+
 /** Whether a target is the page of the IDE's workbench window. */
-export const isWorkbench = (target) => target.type === 'page' && target.url.includes('/workbench/workbench.html');
+export const isWorkbench = (target) => target.type === 'page' && target.url.includes(WORKBENCH_PAGE);
 
 /** The process id of the browser on the connection `browser`, as the browser reports it. */
 async function browserProcess(browser) {
@@ -61,20 +184,49 @@ async function checkBrowserProcess(browser, pid) {
     }
 }
 
-/** The process group of process `pid`, from /proc/<pid>/stat (after the command name, which can hold spaces). */
-function processGroup(pid) {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const [, , group] = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    return Number(group);
+/**
+ * The state, the process group and the start time (in clock ticks after the boot) of process
+ * `pid`, from /proc/<pid>/stat, or undefined when the process does not exist.
+ */
+export function processStat(pid) {
+    let stat;
+    try {
+        stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    } catch (error) {
+        if (error.code === 'ENOENT' || error.code === 'ESRCH') { return undefined; }
+        throw error;
+    }
+    // after the command name, which can hold spaces: state, ppid, pgrp, ... and starttime, field 22
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return { state: fields[0], group: Number(fields[2]), start: Number(fields[19]) };
 }
 
-/** The value of `expression` in a DevTools context: the session's page, or a Node inspector's main context. */
-export async function evaluate(target, expression, contextId) {
-    const r = await target.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, ...(contextId ? { contextId } : {}) });
-    if (r.exceptionDetails) {
-        throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
-    }
-    return r.result.value;
+/** This boot's id: a recorded pid and start time name the same process only within one boot. */
+export const bootId = () => fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+
+/**
+ * Whether process `pid` is the one recorded with the start time `start` in the boot `boot`, and
+ * not another process that got the same pid later.
+ */
+export function isRecordedProcess(pid, start, boot) {
+    return Boolean(pid) && boot === bootId() && processStat(pid)?.start === start;
+}
+
+/**
+ * The processes of the instance `record` that have not exited: the members of its process group,
+ * while the group is still the one that start made, in this boot. After the group's leader has
+ * ended, the group stays the instance's as long as members of it run, since the system gives the
+ * group's number to another group only after all of them have ended. This is the one test of whether an instance runs, for
+ * start, for the commands and for stop.
+ */
+export function instanceProcesses(record) {
+    if (!record.group || record.boot !== bootId()) { return []; }
+    const leader = processStat(record.group);
+    if (leader && leader.start !== record.groupStart) { return []; }
+    return fs.readdirSync('/proc').filter(entry => /^\d+$/.test(entry)).map(Number).filter((pid) => {
+        const stat = processStat(pid);
+        return stat?.group === record.group && stat.state !== 'Z' && stat.state !== 'X';
+    });
 }
 
 /** Fail unless the Node inspector on the connection `main` runs in the process `pid`. */
@@ -85,23 +237,29 @@ async function checkMainProcess(main, pid) {
     }
 }
 
-/** Connect to a recorded endpoint of the instance, with the cause when the IDE does not answer there. */
+/**
+ * Connect to a recorded endpoint of the instance. When that fails, the error says whether the
+ * recorded IDE process still runs, and what the connection reported.
+ */
 async function connectRecorded(instance, url, name) {
     if (!url) {
-        throw new Error(`${path.join(instance.home, 'instance.json')} records no ${name} endpoint: the instance did not finish starting`);
+        throw new Error(`${path.join(instance.home, 'instance.json')} does not record the ${name} endpoint: the instance did not finish starting`);
     }
     try {
         return await connect(url);
     } catch (error) {
-        throw new Error(`the instance's IDE does not answer at its ${name} endpoint ${url}: the IDE has stopped, or another process holds that port now`);
+        const ide = isRecordedProcess(instance.pid, instance.pidStart, instance.boot)
+            ? `the instance's IDE (process ${instance.pid}) runs, and does not answer at its recorded ${name} endpoint`
+            : `the instance's IDE (process ${instance.pid}) has ended`;
+        throw new Error(`${ide}: ${error.message}`);
     }
 }
 
 /** A DevTools connection to the browser of the instance's window, checked to be the instance's IDE. */
-export async function connectWindow(instance) {
+export async function connectWindow(instance, { limitMs = ANSWER_LIMIT_MS } = {}) {
     const browser = await connectRecorded(instance, instance.devtools, 'DevTools');
     try {
-        await checkBrowserProcess(browser, instance.pid);
+        await answerWithin(browser, 'the browser identity', limitMs, () => checkBrowserProcess(browser, instance.pid));
     } catch (error) {
         browser.close();
         throw error;
@@ -110,10 +268,10 @@ export async function connectWindow(instance) {
 }
 
 /** A DevTools connection to the inspector of the instance's main process, checked to be the instance's IDE. */
-export async function connectMainProcess(instance) {
+export async function connectMainProcess(instance, { limitMs = ANSWER_LIMIT_MS } = {}) {
     const main = await connectRecorded(instance, instance.inspector, 'inspector');
     try {
-        await checkMainProcess(main, instance.pid);
+        await answerWithin(main, 'the main-process identity', limitMs, () => checkMainProcess(main, instance.pid));
     } catch (error) {
         main.close();
         throw error;
@@ -123,18 +281,23 @@ export async function connectMainProcess(instance) {
 
 /**
  * The value that `statements` return, run in the main process as the body of an async function in
- * which `electron` is Electron's module and `w` the IDE's window.
+ * which `electron` is Electron's module and `w` the window that shows the workbench (WORKBENCH_PAGE).
  */
-export function inMainProcess(main, statements) {
-    return evaluate(main, `(async () => {
-        // the main process is an ES module, and the inspector's context has neither require nor import()
+export async function inMainProcess(main, statements) {
+    // a refusal comes back as a value, so that its message reaches the caller without the stack of
+    // the main process's code
+    const { refused, value } = await evaluate(main, `(async () => {
+        // the main process is an ES module, and the inspector's context lacks require and import()
         const electron = typeof require === 'function' ? require('electron')
             : process.mainModule ? process.mainModule.require('electron')
             : process.getBuiltinModule('module').createRequire(process.execPath)('electron');
-        const w = electron.BrowserWindow.getAllWindows().find(w => !w.isDestroyed());
-        if (!w) { throw new Error('the IDE has no window'); }
-        ${statements}
+        const windows = electron.BrowserWindow.getAllWindows().filter(w => !w.isDestroyed() && w.webContents.getURL().includes(${JSON.stringify(WORKBENCH_PAGE)}));
+        if (windows.length !== 1) { return { refused: \`the IDE shows \${windows.length} workbench windows, not one\` }; }
+        const w = windows[0];
+        return { value: await (async () => { ${statements} })() };
     })()`);
+    if (refused) { throw new Error(refused); }
+    return value;
 }
 
 /** The workbench window's page target of the browser on `browser`. */
@@ -142,7 +305,7 @@ export async function workbenchTarget(browser) {
     const { targetInfos } = await browser.send('Target.getTargets');
     const pages = targetInfos.filter(isWorkbench);
     if (pages.length !== 1) {
-        throw new Error(`the IDE shows ${pages.length} workbench windows, not one: ${pages.map(t => t.url).join(', ') || 'none'}`);
+        throw new Error(`the IDE shows ${pages.length} workbench windows, not one${pages.length ? `: ${pages.map(t => t.url).join(', ')}` : ''}`);
     }
     return pages[0];
 }
@@ -184,22 +347,35 @@ const SERVER_ANSWER_LIMIT_MS = 5000;
 
 /**
  * The inspector's endpoint of process `pid`: of the ports it listens on at 127.0.0.1, other than
- * its DevTools port, the one whose /json/list names a target of type node.
+ * its DevTools port, the one that names a target of type node in its /json/list.
  */
-async function findInspector(pid, devtoolsPort) {
+export async function findInspector(pid, devtoolsPort, { deadline = Infinity } = {}) {
     const found = [];
+    /** what each port answered, for the error when the inspector is not found exactly once */
+    const outcomes = [];
     for (const port of listeningPorts(pid).filter(p => p !== devtoolsPort)) {
-        let list;
+        const limitMs = Math.min(SERVER_ANSWER_LIMIT_MS, remaining(deadline));
+        let answer;
+        let text;
         try {
-            const answer = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(SERVER_ANSWER_LIMIT_MS) });
-            list = answer.ok ? await answer.json() : [];
-        } catch {
-            continue; // a server of the IDE's own that does not speak this protocol
+            answer = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(limitMs) });
+            text = await answer.text();
+        } catch (error) {
+            outcomes.push(`port ${port}: ${error.name === 'TimeoutError' ? `did not answer within ${limitMs / 1000} s` : error.message}`);
+            continue;
         }
-        found.push(...(Array.isArray(list) ? list : []).filter(t => t.type === 'node' && t.webSocketDebuggerUrl).map(t => t.webSocketDebuggerUrl));
+        let inspectors = [];
+        try {
+            const list = JSON.parse(text);
+            inspectors = Array.isArray(list) ? list.filter(t => t.type === 'node' && t.webSocketDebuggerUrl).map(t => t.webSocketDebuggerUrl) : [];
+        } catch {
+            // the answer is not JSON: a server of the IDE's own that speaks another protocol
+        }
+        outcomes.push(`port ${port}: HTTP ${answer.status}, ${inspectors.length} Node inspector${inspectors.length === 1 ? '' : 's'}`);
+        found.push(...inspectors);
     }
     if (found.length !== 1) {
-        throw new Error(`the IDE (process ${pid}) has ${found.length} Node inspectors on 127.0.0.1, not one: ${found.join(', ') || 'none'}`);
+        throw new Error(`the IDE (process ${pid}) shows ${found.length} Node inspectors on 127.0.0.1, not one (${outcomes.join('; ') || 'it listens on its DevTools port alone'})`);
     }
     return found[0];
 }
@@ -208,28 +384,29 @@ async function findInspector(pid, devtoolsPort) {
  * Wait until the IDE of the instance in `home`, started with --remote-debugging-port=0 and
  * --inspect=0 in the process group `group`, has opened its workbench window, and return its pid as
  * its browser reports it, checked to be in `group`, and its two endpoints, checked to belong to
- * that pid: { pid, devtools, inspector }. The waits follow file and target events; `limitMs` is
- * the last resort for an IDE that runs but never opens its window. The end of the IDE's session is
- * the caller's to watch: hidden-ide.sh waits for whichever comes first.
+ * that pid: { pid, devtools, inspector }. The waits follow file and target events; `ended`, a
+ * promise that settles when the IDE's session ends, ends the wait for DevToolsActivePort, and the
+ * closed connection the later waits; `limitMs` is the last resort for an IDE that runs but never
+ * opens its window.
  */
-export async function waitForInstance(home, group, limitMs) {
+export async function waitForInstance(home, group, limitMs, ended) {
     const deadline = Date.now() + limitMs;
-    const devtools = await waitForActivePort(path.join(home, 'profile'), { limitMs });
-    const browser = await connect(devtools);
+    const devtools = await waitForActivePort(path.join(home, 'profile'), { ended, limitMs });
+    const browser = await connect(devtools, { limitMs: remaining(deadline) });
     let pid;
     try {
-        pid = await browserProcess(browser);
-        if (processGroup(pid) !== group) {
+        pid = await answerWithin(browser, 'the startup browser identity', remaining(deadline), () => browserProcess(browser));
+        if (processStat(pid)?.group !== group) {
             throw new Error(`the browser that wrote ${home}/profile/DevToolsActivePort, process ${pid}, is not in the instance's process group ${group}`);
         }
-        await waitForTarget(browser, isWorkbench, { what: "the IDE's workbench window", limitMs: Math.max(0, deadline - Date.now()) });
+        await waitForTarget(browser, isWorkbench, { what: "the IDE's workbench window", limitMs: remaining(deadline) });
     } finally {
         browser.close();
     }
-    const inspector = await findInspector(pid, Number(new URL(devtools).port));
-    const main = await connect(inspector);
+    const inspector = await findInspector(pid, Number(new URL(devtools).port), { deadline });
+    const main = await connect(inspector, { limitMs: remaining(deadline) });
     try {
-        await checkMainProcess(main, pid);
+        await answerWithin(main, 'the startup main-process identity', remaining(deadline), () => checkMainProcess(main, pid));
     } finally {
         main.close();
     }
