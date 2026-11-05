@@ -49,12 +49,15 @@ function available(viewport: MotionLabPanelRect): MotionLabPanelRect {
     return { x: viewport.x + x, y: viewport.y + y, width: viewport.width - 2 * x, height: viewport.height - 2 * y };
 }
 
-function fit(rect: MotionLabPanelRect, viewport: MotionLabPanelRect): MotionLabPanelRect {
+function fit(rect: MotionLabPanelRect, viewport: MotionLabPanelRect, contentHeight?: number,
+    bottomAnchored = false): MotionLabPanelRect {
     const room = available(viewport);
     const width = clamp(rect.width, Math.min(MOTION_LAB_PANEL_LIMITS.minWidth, room.width), room.width);
-    const height = clamp(rect.height, Math.min(MOTION_LAB_PANEL_LIMITS.minHeight, room.height), room.height);
+    const maximumHeight = Math.min(room.height, contentHeight ?? room.height);
+    const height = clamp(rect.height, Math.min(MOTION_LAB_PANEL_LIMITS.minHeight, maximumHeight), maximumHeight);
+    const y = bottomAnchored ? rect.y + rect.height - height : rect.y;
     return { x: clamp(rect.x, room.x, room.x + room.width - width),
-        y: clamp(rect.y, room.y, room.y + room.height - height), width, height };
+        y: clamp(y, room.y, room.y + room.height - height), width, height };
 }
 
 /** Pure bounded geometry. Viewport changes do not discard the remembered floating rectangle. */
@@ -63,6 +66,8 @@ export class MotionLabPanelGeometry {
     private floating: MotionLabPanelRect;
     private dock: MotionLabDock = 'float';
     private dockWidth: number;
+    private contentHeight?: number;
+    private bottomAnchored = false;
 
     constructor(viewport: MotionLabPanelRect, initial?: MotionLabPanelRect) {
         validateRect(viewport);
@@ -80,6 +85,19 @@ export class MotionLabPanelGeometry {
         this.viewport = { ...viewport };
     }
 
+    setContentHeight(height: number | undefined, fitContent = false): void {
+        if (height !== undefined && (!finite(height) || height <= 0)) {
+            throw new RangeError('Invalid Motion Lab content height.');
+        }
+        const before = fit(this.floating, this.viewport, this.contentHeight, this.bottomAnchored);
+        this.contentHeight = height;
+        if (fitContent && height !== undefined) {
+            this.floating = { ...this.floating, height,
+                ...(this.dock === 'float' ? { x: before.x, y: before.y } : {}) };
+            this.bottomAnchored = false;
+        }
+    }
+
     setDock(dock: MotionLabDock): void {
         if (dock !== 'left' && dock !== 'right' && dock !== 'float') { throw new RangeError('Invalid Motion Lab dock.'); }
         if (this.dock === 'float' && dock !== 'float') { this.dockWidth = this.snapshot().rect.width; }
@@ -88,13 +106,18 @@ export class MotionLabPanelGeometry {
 
     moveTo(x: number, y: number): void {
         if (!finite(x) || !finite(y)) { throw new RangeError('Invalid Motion Lab position.'); }
-        this.floating = fit({ ...this.floating, x, y }, this.viewport);
+        const fitted = fit({ ...this.floating, x, y }, this.viewport, this.contentHeight);
+        this.floating = { ...fitted, height: this.floating.height };
+        this.bottomAnchored = false;
         this.dock = 'float';
     }
 
     resizeTo(width: number, height: number): void {
         if (!finite(width) || !finite(height)) { throw new RangeError('Invalid Motion Lab size.'); }
-        if (this.dock === 'float') { this.floating = fit({ ...this.floating, width, height }, this.viewport); }
+        if (this.dock === 'float') {
+            this.floating = fit({ ...this.floating, width, height }, this.viewport, this.contentHeight);
+            this.bottomAnchored = false;
+        }
         else { this.dockWidth = fit({ ...this.floating, width }, this.viewport).width; }
     }
 
@@ -103,28 +126,41 @@ export class MotionLabPanelGeometry {
             throw new RangeError('Invalid Motion Lab resize.');
         }
         validateRect(start);
-        const room = available(this.viewport), rect = fit(start, this.viewport);
+        // The captured gesture rectangle stays fixed when width changes alter the content ceiling.
+        const room = available(this.viewport), rect = fit(start, this.viewport, start.height);
         const minWidth = Math.min(MOTION_LAB_PANEL_LIMITS.minWidth, room.width);
-        const minHeight = Math.min(MOTION_LAB_PANEL_LIMITS.minHeight, room.height);
+        const minHeight = Math.min(MOTION_LAB_PANEL_LIMITS.minHeight, room.height, this.contentHeight ?? room.height);
         if (this.dock === 'left' && direction === 'e' || this.dock === 'right' && direction === 'w') {
             this.dockWidth = clamp(rect.width + (direction === 'w' ? -dx : dx), minWidth, room.width);
             return;
         }
+        const preserveHeight = this.dock === 'float' && !direction.includes('n') && !direction.includes('s');
         let left = rect.x, right = rect.x + rect.width, top = rect.y, bottom = rect.y + rect.height;
         if (direction.includes('w')) { left = clamp(left + dx, room.x, right - minWidth); }
         else if (direction.includes('e')) { right = clamp(right + dx, left + minWidth, room.x + room.width); }
         if (direction.includes('n')) { top = clamp(top + dy, room.y, bottom - minHeight); }
         else if (direction.includes('s')) { bottom = clamp(bottom + dy, top + minHeight, room.y + room.height); }
-        this.floating = { x: left, y: top, width: right - left, height: bottom - top };
+        this.floating = { x: left, y: top, width: right - left,
+            height: preserveHeight ? this.floating.height : bottom - top };
+        this.bottomAnchored = direction.includes('n');
         this.dock = 'float';
     }
 
+    finishResize(): void {
+        if (!this.bottomAnchored) { return; }
+        const displayed = fit(this.floating, this.viewport, this.contentHeight, true);
+        this.floating = { ...this.floating, y: displayed.y };
+        this.bottomAnchored = false;
+    }
+
     snapshot(): { dock: MotionLabDock; rect: MotionLabPanelRect } {
-        if (this.dock === 'float') { return { dock: this.dock, rect: fit(this.floating, this.viewport) }; }
+        if (this.dock === 'float') {
+            return { dock: this.dock, rect: fit(this.floating, this.viewport, this.contentHeight, this.bottomAnchored) };
+        }
         const room = available(this.viewport);
         const width = clamp(this.dockWidth, Math.min(MOTION_LAB_PANEL_LIMITS.minWidth, room.width), room.width);
         return { dock: this.dock, rect: { x: this.dock === 'left' ? room.x : room.x + room.width - width,
-            y: room.y, width, height: room.height } };
+            y: room.y, width, height: Math.min(room.height, this.contentHeight ?? room.height) } };
     }
 }
 
@@ -133,6 +169,8 @@ interface MotionLabPanelOptions {
     dragHandle: HTMLElement;
     resizeHandles: Readonly<Record<MotionLabResizeDirection, HTMLElement>>;
     dockButtons: Record<MotionLabDock, HTMLButtonElement>;
+    /** Natural outer height at the proposed border-box width, independent of the assigned panel height. */
+    measureContentHeight?: (width: number) => number | undefined;
     onLayout?: (layout: MotionLabPanelLayout) => MotionLabPanelPreparation | void;
     /** Actual displayed geometry changed; invalidate courier destinations before layout consumers run. */
     onGeometryChange?: () => void;
@@ -150,6 +188,8 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
     let emitted: MotionLabPanelLayout | undefined;
     let displayed: MotionLabPanelRect | undefined;
     let layoutRevision = 0;
+    let contentDirty = !!options.measureContentHeight, contentFitPending = false;
+    let contentWidth: number | undefined;
     let motion: { from: MotionLabPanelRect; to: MotionLabPanelRect; moveAt: number;
         preparation?: MotionLabPanelPreparation } | undefined;
     let frame: { id: number } | undefined;
@@ -178,6 +218,29 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
 
     function invalidateGeometry(): void {
         try { options.onGeometryChange?.(); } catch { /* Keep direct manipulation usable. */ }
+    }
+
+    function measureContent(): void {
+        if (!options.measureContentHeight || !visible || doc.hidden || disposed) { return; }
+        const width = model().snapshot().rect.width;
+        if (!contentDirty && contentWidth === width) { return; }
+        const fitContent = contentFitPending, revision = layoutRevision;
+        let height: number | undefined;
+        try { height = options.measureContentHeight(width); } catch { return; }
+        if (revision !== layoutRevision || disposed) { return; }
+        model().setContentHeight(height !== undefined && finite(height) && height > 0 ? height : undefined, fitContent);
+        contentWidth = width;
+        contentDirty = contentFitPending = false;
+    }
+
+    function refreshContent(change: { fit?: boolean } = {}): void {
+        if (!options.measureContentHeight || disposed) { return; }
+        contentDirty = true;
+        contentFitPending ||= change.fit === true;
+        if (!visible || doc.hidden) { return; }
+        // An explicit fit choice is a disclosure action; observer changes wait for the stable destination.
+        if (motion && change.fit === undefined) { invalidateGeometry(); return; }
+        apply('resize', !!motion, true);
     }
 
     function paint(rect: MotionLabPanelRect): boolean {
@@ -247,13 +310,19 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
             }
             paint(rect);
             if (motion !== owned) { return; }
-            if (at >= owned.moveAt + MOTION_LAB_CHOREOGRAPHY.dockMs) { cancelMotion(); }
+            if (at >= owned.moveAt + MOTION_LAB_CHOREOGRAPHY.dockMs) {
+                cancelMotion();
+                if (contentDirty) { refreshContent(); }
+            }
             else { schedule(); }
         });
     }
 
-    function apply(reason: MotionLabPanelReason, animate = false): void {
-        const revision = ++layoutRevision, target = model().snapshot().rect;
+    function apply(reason: MotionLabPanelReason, animate = false, intrinsicChange = false): void {
+        const revision = ++layoutRevision;
+        measureContent();
+        if (revision !== layoutRevision || disposed) { return; }
+        const target = model().snapshot().rect;
         const from = displayed ?? target;
         cancelMotion();
         controls();
@@ -261,7 +330,8 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
         const startedAt = moving ? win.performance.now() : 0;
         const owned: typeof motion = moving ? { from: { ...from }, to: { ...target }, moveAt: startedAt } : undefined;
         if (owned) { motion = owned; host.dataset.panelMoving = 'true'; }
-        const geometryInvalidated = paint(owned ? from : target);
+        let geometryInvalidated = paint(owned ? from : target);
+        if (!geometryInvalidated && intrinsicChange) { invalidateGeometry(); geometryInvalidated = true; }
         if (revision !== layoutRevision || disposed) { return; }
         const preparation = emit(reason, geometryInvalidated);
         if (!owned || motion !== owned || revision !== layoutRevision || disposed || !visible || doc.hidden) { return; }
@@ -291,12 +361,16 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
     }
 
     function motionChanged(): void {
-        if (media.matches) { finishMotion(); }
+        if (media.matches) {
+            finishMotion();
+            if (contentDirty) { refreshContent(); }
+        }
     }
 
     function endGesture(): void {
         const previous = gesture;
         gesture = undefined;
+        if (previous?.kind === 'resize') { model().finishResize(); }
         win.removeEventListener('pointermove', pointerMove);
         win.removeEventListener('pointerup', pointerEnd);
         win.removeEventListener('pointercancel', pointerEnd);
@@ -378,6 +452,7 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
         event.preventDefault();
         event.stopPropagation();
         apply(kind);
+        if (kind === 'resize') { model().finishResize(); }
     }
     const moveKey = (event: KeyboardEvent) => keyboard(event, 'drag');
 
@@ -385,6 +460,7 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
         if (!watching || disposed) { return; }
         endGesture();
         model().setViewport(viewport());
+        contentDirty = !!options.measureContentHeight;
         apply('viewport');
     }
 
@@ -401,7 +477,10 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
     }
 
     function visibility(): void {
-        if (!visible || doc.hidden || disposed) { stopWatching(); return; }
+        if (!visible || doc.hidden || disposed) {
+            contentDirty = !!options.measureContentHeight;
+            stopWatching(); return;
+        }
         if (watching) { return; }
         watching = true;
         model().setViewport(viewport());
@@ -411,7 +490,7 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
         win.visualViewport?.addEventListener('resize', refreshViewport);
         win.visualViewport?.addEventListener('scroll', refreshViewport);
         media.addEventListener('change', motionChanged);
-        if (win.ResizeObserver) {
+        if (win.ResizeObserver && !options.measureContentHeight) {
             observer = new win.ResizeObserver(() => {
                 if (!watching || disposed || motion) { return; }
                 const measured = options.surface.getBoundingClientRect(), rect = model().snapshot().rect;
@@ -430,6 +509,7 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
         visible = value;
         if (visible) {
             model().setViewport(viewport());
+            contentDirty = !!options.measureContentHeight;
             doc.addEventListener('visibilitychange', visibility);
             apply('open');
             visibility();
@@ -464,7 +544,7 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
     options.dockButtons.float.addEventListener('click', float);
 
     return {
-        setVisible, setDock,
+        setVisible, setDock, refreshContent,
         get moving() { return !!motion; },
         snapshot: () => ({ visible, dock: model().snapshot().dock, rect: { ...(displayed ?? model().snapshot().rect) } }),
         dispose(): void {

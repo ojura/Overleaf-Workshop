@@ -45,10 +45,10 @@ export function planPdfDocumentColumn(viewport: PdfDocumentColumnRect, pages: re
         const minimum = viewport.x - left, maximum = viewport.x + viewport.width - right;
         const leftMaximum = Math.min(maximum, panel.rect.x - gap - right);
         const rightMinimum = Math.max(minimum, panel.rect.x + panel.rect.width + gap - left);
-        // Each interval fits the complete page or spread. Staying nearest the applied
-        // position avoids crossing the panel while the original column still overlaps it.
-        const leftShift = minimum <= leftMaximum ? Math.max(minimum, Math.min(leftMaximum, appliedX)) : undefined;
-        const rightShift = rightMinimum <= maximum ? Math.max(rightMinimum, Math.min(maximum, appliedX)) : undefined;
+        // Return toward center within each full-fit interval. Ranking these endpoints
+        // from the applied position keeps a shrinking panel from forcing a side crossing.
+        const leftShift = minimum <= leftMaximum ? Math.max(minimum, Math.min(leftMaximum, 0)) : undefined;
+        const rightShift = rightMinimum <= maximum ? Math.max(rightMinimum, Math.min(maximum, 0)) : undefined;
         if (leftShift === undefined) { return { offsetX: rightShift ?? 0, bounds }; }
         if (rightShift === undefined) { return { offsetX: leftShift, bounds }; }
         const leftDistance = Math.abs(leftShift - appliedX), rightDistance = Math.abs(rightShift - appliedX);

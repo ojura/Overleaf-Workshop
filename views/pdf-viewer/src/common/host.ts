@@ -4,6 +4,7 @@
  * (HostMessage, ViewerMessage).
  */
 import type { HostMessage, SavedState, ViewerMessage } from './protocol';
+import type { MotionLabMeasurementsPreference } from './prefetch-performance';
 
 /** the host's answer to 'ready' */
 export type InitState = Extract<HostMessage, { type: 'initState' }>;
@@ -72,3 +73,13 @@ export function saveState(partial: Partial<SavedState>) {
     vscode.setState(state);
     post({ type: 'saveState', content: state });
 }
+
+/** Both extension viewers read disclosure state after initialization and preserve the full saved reader state on writes. */
+export const hostMeasurementsPreference: MotionLabMeasurementsPreference = Object.freeze({
+    async whenReady() { await ready(); },
+    read: () => typeof state.motionLabMeasurementsOpen === 'boolean' ? state.motionLabMeasurementsOpen : undefined,
+    async write(open: boolean) {
+        await ready();
+        saveState({ motionLabMeasurementsOpen: open });
+    },
+});
