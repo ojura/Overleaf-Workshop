@@ -112,6 +112,28 @@ describe('the shared graduated PDF preview cache', function () {
         assert.ok(value.bytes <= maximum, 'retained bytes stay within the configured budget');
     }
 
+    it('preserves clipped and rotated raster coverage through trail downsizing and rejected replacement', () => {
+        for (const matrix of [[399.1184, 0, 0, 566.9288, 0, 0], [0, -566.9288, 399.1184, 0, 0, 566.9288]]) {
+            const value = cache({ maxBytes: MIB });
+            const original = canvas(396, 564);
+            const projection = { width: 396, height: 564, pageToRaster: matrix };
+            assert.strictEqual(value.retain(1, original, new Set(), projection), true);
+            assert.deepStrictEqual(value.get(1).projection, projection, 'retention keeps the producer mapping');
+            assert.strictEqual(value.retain(2, canvas(), new Set([2])), true);
+            const trail = value.get(1);
+            assert.deepStrictEqual([trail.canvas.width, trail.canvas.height], [135, 192]);
+            assert.deepStrictEqual(trail.projection.pageToRaster, matrix.map((component, index) =>
+                component * (index % 2 === 0 ? 135 / 396 : 192 / 564)));
+            assert.deepStrictEqual([trail.projection.width, trail.projection.height], [135, 192]);
+            assert.strictEqual(original.width, 0, 'the former backing is released after its mapping is rescaled');
+            const retained = trail.projection;
+            assert.strictEqual(value.retain(1, canvas(512, 512), new Set([1, 2]),
+                { width: 512, height: 512, pageToRaster: [512, 0, 0, 512, 0, 0] }), false);
+            assert.strictEqual(value.get(1).projection, retained, 'failed replacement preserves the previous projection');
+            balanced(value, MIB);
+        }
+    });
+
     it('retains the 60 to 90 page trail for a revisit while six prepared pages keep full quality under 8 MiB', () => {
         const value = cache();
         const originals = new Map<number, Canvas>();

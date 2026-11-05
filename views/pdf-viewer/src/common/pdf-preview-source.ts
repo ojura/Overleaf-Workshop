@@ -1,4 +1,5 @@
 import { PDF_PREVIEW_MANIFEST_BYTES, type PdfPreviewIdentity } from '../../../../src/core/viewerProtocol';
+import { createPdfRasterProjection, type PdfRasterProjection } from './pdf-raster-projection';
 export type { PdfPreviewIdentity } from '../../../../src/core/viewerProtocol';
 
 /** Trusted adapters bind an optional preview pyramid to one exact PDF representation. */
@@ -151,7 +152,7 @@ export interface PdfPreviewSourceLoaderOptions {
     /** Infinity means a finished native canvas; zero means no retained pixels. */
     quality(pageNumber: number): number;
     /** Ownership of the canvas transfers on both acceptance and rejection. */
-    onPreview(page: PdfPreviewPage, canvas: HTMLCanvasElement): boolean;
+    onPreview(page: PdfPreviewPage, canvas: HTMLCanvasElement, projection: PdfRasterProjection): boolean;
     onChange(): void;
     onEvent?(type: string, data?: Record<string, number | string | boolean | null>): void;
     decode?(bytes: Uint8Array, asset: PdfPreviewAsset, signal: AbortSignal): Promise<DecodedPdfPreview>;
@@ -336,7 +337,10 @@ export function createPdfPreviewSourceLoader(source: PdfPreviewSource, options: 
             }
             context.drawImage(bitmap.image, 0, 0, width, height);
             const result = canvas;
-            const retained = options.onPreview(job.page, result);
+            // The atlas covers the whole page, and both pixels and logical orientation
+            // have already made the requested quarter-turn in this output canvas.
+            const projection = createPdfRasterProjection(result.width, result.height);
+            const retained = options.onPreview(job.page, result, projection);
             canvas = undefined;
             if (retained) {
                 completed++;

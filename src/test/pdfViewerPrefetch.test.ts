@@ -45,6 +45,8 @@ class Element extends Events {
     dir = '';
     clientWidth = 800;
     clientHeight = 1000;
+    clientLeft = 0;
+    clientTop = 0;
     scrollTop = 0;
     scrollLeft = 0;
     prepend(child: Element) {
@@ -83,6 +85,9 @@ interface RobotDelivery {
     canvas: Canvas;
     kind: 'preview' | 'page';
     imageRegions?: Array<{ id: string; x: number; y: number; width: number; height: number }>;
+    rasterProjection?: { width: number; height: number; pageToRaster: readonly number[] };
+    displayRasterProjection?: RobotDelivery['rasterProjection'];
+    pageProjection?: { content: { x: number; y: number; width: number; height: number }; clip: { x: number; y: number; width: number; height: number } };
 }
 
 class DocumentRobots {
@@ -278,12 +283,17 @@ class PageView {
     renderingState = 0;
     canvas: Canvas | null = null;
     pdfPage?: PdfPage;
+    viewport: { width: number; height: number; scale: number; rotation: number };
+    outputScale?: { sx: number; sy: number };
     resetCalls = 0;
     destroyCalls = 0;
     readonly maxCanvasPixels = 16_777_216;
     get renderingId() { return 'page' + this.id; }
     constructor(readonly id: number, readonly width: number, readonly height: number, readonly fixture: Fixture) {
+        this.viewport = { width, height, scale: 1, rotation: 0 };
         this.div.ownerDocument = fixture.owner;
+        this.div.clientWidth = width;
+        this.div.clientHeight = height;
         this.div.setAttribute('data-page-number', String(id));
         this.div.getBoundingClientRect = () => {
             const top = (id - 1) * height - fixture.container.scrollTop;
@@ -300,7 +310,7 @@ class PageView {
     destroy() { this.destroyCalls++; this.reset(); this.pdfPage?.cleanup(); }
 }
 
-interface FixtureOptions { startPage?: number, pages?: number, width?: number, height?: number, autoPages?: boolean, mobile?: boolean }
+interface FixtureOptions { startPage?: number, pages?: number, width?: number, height?: number, autoPages?: boolean, mobile?: boolean, initialNative?: boolean }
 
 class Fixture {
     readonly visualViewport = Object.assign(new Events(), { offsetLeft: 0, offsetTop: 0, width: 800, height: 1000 });
@@ -383,7 +393,9 @@ class Fixture {
             },
         };
         Object.defineProperty(this.viewer, 'currentPageNumber', { get: () => this.visible().first.id });
-        this.cachePage(this.visible().first.id);
+        const initialPage = this.visible().first.id;
+        if (options.initialNative !== false) { this.cachePage(initialPage); }
+        else { this.pages[initialPage - 1].pdfPage = this.pdf.page(initialPage); }
     }
 
     install(module: any, overrides: Record<string, unknown> = {}) {
@@ -406,6 +418,9 @@ class Fixture {
             },
             ...overrides,
         });
+        // Native draw creates its backing and final outputScale before pagerender.
+        // The controller is installed before that main draw in both real engines.
+        for (const page of [...this.cached]) { this.cachePage(page.id); }
     }
 
     visible() {
@@ -436,14 +451,25 @@ class Fixture {
 
     choose() { return this.queue.getHighestPriority(this.visible(), this.pages, this.viewer.scroll.down); }
 
-    cachePage(id: number) {
+    cachePage(id: number, elapsed = 0) {
         const page = this.pages[id - 1];
-        page.renderingState = 3;
         page.pdfPage = this.pdf.page(id);
         page.pdfPage.retainDisplayIntent();
         page.canvas = new Canvas();
-        page.canvas.width = page.width;
-        page.canvas.height = page.height;
+        page.canvas.width = Math.ceil(page.width);
+        page.canvas.height = Math.ceil(page.height);
+        page.outputScale = { sx: page.canvas.width / page.div.clientWidth, sy: page.canvas.height / page.div.clientHeight };
+        page.canvas.ownerDocument = this.owner;
+        page.canvas.getBoundingClientRect = () => {
+            const box = page.div.getBoundingClientRect();
+            const left = box.left + page.div.clientLeft, top = box.top + page.div.clientTop;
+            return { x: left, y: top, left, top, right: left + page.div.clientWidth, bottom: top + page.div.clientHeight,
+                width: page.div.clientWidth, height: page.div.clientHeight };
+        };
+        page.renderingState = 1;
+        if (this.controller) { this.eventBus.emit('pagerender', { pageNumber: id, source: page }); }
+        this.time += elapsed;
+        page.renderingState = 3;
         this.cached.delete(page);
         this.cached.add(page);
         // The scheduler's full-resolution plan must fit a finite native page buffer.
@@ -453,14 +479,11 @@ class Fixture {
             this.cached.delete(oldest);
             oldest.destroy();
         }
+        if (this.controller) { this.eventBus.emit('pagerendered', { pageNumber: id, source: page, error: null, cssTransform: false }); }
     }
 
     finishNative(id: number) {
-        this.pages[id - 1].renderingState = 1;
-        this.eventBus.emit('pagerender', { pageNumber: id });
-        this.time += 12;
-        this.cachePage(id);
-        this.eventBus.emit('pagerendered', { pageNumber: id, error: null, cssTransform: false });
+        this.cachePage(id, 12);
     }
 
     replaceDocument() {
@@ -469,8 +492,8 @@ class Fixture {
         this.viewer.pdfDocument = this.pdf;
         this.pages = this.pages.map(page => new PageView(page.id, page.width, page.height, this));
         this.cached.clear();
-        this.cachePage(this.visible().first.id);
         this.eventBus.emit('pagesinit');
+        this.cachePage(this.visible().first.id);
     }
 
     get listenerCount() { return this.owner.listenerCount + this.container.listenerCount + this.eventBus.listenerCount + this.visualViewport.listenerCount; }
@@ -630,11 +653,13 @@ describe('the PDF viewers\' shared prefetch controller', function () {
             else if (ending === 'layout') { f.eventBus.emit('scalechanging'); }
             else if (ending === 'replace') { f.replaceDocument(); }
             else { f.dispose(); }
+            const afterExitLatency = f.controller.snapshot().pageLatencyMs;
+            if (ending === 'hide' || ending === 'layout') { assert.strictEqual(afterExitLatency, initialLatency); }
             assert.strictEqual([...timers.values()].filter(timer => timer.delay === 1000).length, 0, ending + ' stops the active timing probe');
             f.time += 43000;
             f.pages[0].renderingState = 3;
             f.eventBus.emit('pagerendered', { pageNumber: 1, error: null, cssTransform: false });
-            assert.strictEqual(f.controller.snapshot().pageLatencyMs, initialLatency, ending + ' cannot teach the predictor a paused render duration');
+            assert.strictEqual(f.controller.snapshot().pageLatencyMs, afterExitLatency, ending + ' cannot teach the predictor a paused render duration');
         }
     });
 
@@ -683,10 +708,10 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.strictEqual([...timers.values()].filter(timer => timer.delay === 1000).length, 0, 'settled preparation never leaves an idle timing heartbeat');
     });
 
-    function robotFixture(enabled = true) {
+    function robotFixture(enabled = true, options: FixtureOptions = {}) {
         const robots = new DocumentRobots();
         const factories: Element[] = [];
-        const f = fixture({}, {
+        const f = fixture(options, {
             robotsEnabled: enabled,
             createDocumentRobots: (container: Element, options?: { onCapacityAvailable?: () => void; onReplacementComplete?: (identity: string) => void }) => {
                 factories.push(container);
@@ -784,14 +809,156 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         function publish(loader: any, id: number, width = 160, height = 200) {
             const page = loader.metadata.get(id) ?? metadata(id); loader.metadata.set(id, page);
             const canvas = new Canvas(); canvas.width = width; canvas.height = height;
-            return { canvas, accepted: loader.settings.onPreview(page, canvas) };
+            const projection = { width, height, pageToRaster: [width, 0, 0, height, 0, 0] };
+            return { canvas, accepted: loader.settings.onPreview(page, canvas, projection) };
         }
         return { f, source, loaders, bind, metadata, publish };
     }
 
+    function measuredNative(f: Fixture) {
+        const view = f.pages[0], canvas = new Canvas();
+        view.div.clientWidth = 330; view.div.clientHeight = 470;
+        view.viewport = { width: 332.59866666666665, height: 472.4406666666667, scale: 0.5, rotation: 0 };
+        view.outputScale = { sx: 1.2, sy: 1.2 };
+        view.pdfPage = f.pdf.page(1);
+        canvas.width = 396; canvas.height = 564;
+        canvas.getBoundingClientRect = () => {
+            const box = view.div.getBoundingClientRect(), left = box.left + view.div.clientLeft, top = box.top + view.div.clientTop;
+            return { x: left, y: top, left, top, right: left + view.div.clientWidth, bottom: top + view.div.clientHeight,
+                width: view.div.clientWidth, height: view.div.clientHeight };
+        };
+        view.canvas = canvas; view.renderingState = 1;
+        f.eventBus.emit('pagerender', { pageNumber: 1, source: view });
+        return { view, canvas };
+    }
+
+    function near(actual: number, expected: number, reason: string) {
+        assert.ok(Math.abs(actual - expected) < 1e-8, reason + ': ' + actual + ' versus ' + expected);
+    }
+
+    function previewMatrix(canvas: Canvas) {
+        assert.match(canvas.style.transform ?? '', /^matrix\(/, 'the retained preview uses its raster-to-page transform');
+        return canvas.style.transform.slice(7, -1).split(',').map(Number);
+    }
+
+    it('projects a complete atlas onto the captured fractional native page instead of squeezing it into the clipped backing', async () => {
+        const robots = new DocumentRobots();
+        const h = previewFixture({ pages: 1, startPage: 1, width: 332.59866666666665, height: 472.4406666666667,
+            initialNative: false, autoPages: false }, robots), f = h.f;
+        const { view, canvas: native } = measuredNative(f), loader = h.bind();
+        await f.frame();
+        const preview = h.publish(loader, 1, 541, 768).canvas;
+        const matrix = previewMatrix(preview);
+        near(matrix[0] * 330, view.viewport.width, 'full atlas horizontal extent');
+        near(matrix[3] * 470, view.viewport.height, 'full atlas vertical extent');
+        assert.strictEqual(preview.style.width, '330px', 'the untransformed CSS box remains bounded by the page');
+        assert.strictEqual(preview.style.height, '470px');
+        assert.match(preview.style.clipPath, /^inset\(/, 'the preview itself clips at the native inner page');
+        const delivered = robots.deliveries[0];
+        near(delivered.pageProjection!.content.width, view.viewport.width, 'delivery uses the logical page width');
+        assert.deepStrictEqual(delivered.pageProjection!.clip, { x: 0, y: 0, width: 330, height: 470 });
+        assert.deepStrictEqual(delivered.rasterProjection, { width: 541, height: 768, pageToRaster: [541, 0, 0, 768, 0, 0] });
+        assert.strictEqual(delivered.displayRasterProjection, delivered.rasterProjection, 'the visible atlas supplies the current display grid');
+        view.renderingState = 3;
+        f.eventBus.emit('pagerendered', { pageNumber: 1, source: view, error: null, cssTransform: false });
+        const refined = robots.refinements.at(-1)!;
+        assert.strictEqual(refined.canvas, native);
+        near(refined.rasterProjection!.pageToRaster[0], 399.1184, 'native source retains clipped horizontal coverage');
+        near(refined.rasterProjection!.pageToRaster[3], 566.9288, 'native source retains clipped vertical coverage');
+        assert.deepStrictEqual(refined.pageProjection, delivered.pageProjection, 'atlas-to-native refinement keeps the same photo targets');
+    });
+
+    it('preserves independent preview ceil padding without compressing its logical page', async () => {
+        const robots = new DocumentRobots();
+        const f = fixture({ pages: 1, startPage: 1, width: 333.3, height: 472.44, initialNative: false },
+            { robotsEnabled: true, createDocumentRobots: () => robots });
+        f.pages[0].div.clientWidth = 330; f.pages[0].div.clientHeight = 470;
+        await f.frame();
+        const render = f.pdf.activeRenders.find(value => value.id === 1)!;
+        assert.ok(render);
+        render.task.finish(); await promisesSettled();
+        const delivered = robots.deliveries[0], preview = delivered.canvas;
+        assert.deepStrictEqual([preview.width, preview.height], [334, 473]);
+        assert.deepStrictEqual(delivered.rasterProjection, { width: 334, height: 473, pageToRaster: [333.3, 0, 0, 472.44, 0, 0] });
+        const matrix = previewMatrix(preview);
+        near(matrix[0] * 330 / 334, 1, 'ceil-padded preview horizontal scale');
+        near(matrix[3] * 470 / 473, 1, 'ceil-padded preview vertical scale');
+        assert.strictEqual(preview.parentNode, f.pages[0].div);
+    });
+
+    for (const angle of [90, 270]) {
+        it('retains native clipping through CSS-only zoom, ' + angle + '-degree rotation and a copied preview', async () => {
+            const robots = new DocumentRobots();
+            robots.refine = value => { robots.refinements.push(value); return 0; };
+            const f = fixture({ pages: 1, startPage: 1, width: 332.59866666666665, height: 472.4406666666667,
+                initialNative: false, autoPages: false }, { robotsEnabled: true, createDocumentRobots: () => robots });
+            const { view, canvas } = measuredNative(f);
+            let nativeMeasurements = 0;
+            const rect = canvas.getBoundingClientRect;
+            canvas.getBoundingClientRect = () => { nativeMeasurements++; return rect(); };
+            await f.frame(); view.renderingState = 3;
+            f.eventBus.emit('pagerendered', { pageNumber: 1, source: view, error: null, cssTransform: false });
+            view.viewport = { width: 944.8813333333334, height: 665.1973333333333, scale: 1, rotation: angle };
+            view.div.clientWidth = 940; view.div.clientHeight = 660;
+            view.outputScale = { sx: 7, sy: 9 };
+            canvas.style.transform = 'rotate(' + angle + 'deg)';
+            f.viewer.pagesRotation = angle; f.eventBus.emit('rotationchanging');
+            f.eventBus.emit('pagerendered', { pageNumber: 1, source: view, error: null, cssTransform: true });
+            const projection = robots.refinements.at(-1)!.rasterProjection!;
+            const expected = angle === 90 ? [0, -566.9288, 399.1184, 0, 0, 566.9288] : [0, 566.9288, -399.1184, 0, 399.1184, 0];
+            projection.pageToRaster.forEach((value, index) => near(value, expected[index], 'retained affine component ' + index));
+            const page = robots.refinements.at(-1)!.pageProjection!;
+            near(page.content.width, view.viewport.width, 'retained zoom width');
+            near(page.content.height, view.viewport.height, 'retained zoom height');
+            near(page.content.x, angle === 90 ? 940 - page.content.width : 0, 'rotated leading horizontal clip');
+            near(page.content.y, angle === 270 ? 660 - page.content.height : 0, 'rotated leading vertical clip');
+            const measurements = nativeMeasurements;
+            for (let index = 0; index < 3; index++) { f.eventBus.emit('updateviewarea'); await f.frame(); }
+            assert.strictEqual(nativeMeasurements, measurements, 'unchanged scroll refreshes reuse local geometry');
+            view.reset(); f.eventBus.emit('updateviewarea'); await f.frame();
+            const preview = view.div.children.find(child => child.className === 'pdfPrefetchPreview') as Canvas;
+            assert.ok(preview, 'the copied clipped raster remains available after native eviction');
+            assert.deepStrictEqual([preview.width, preview.height], [396, 564], 'rotation does not allocate a second full-page backing');
+            const matrix = previewMatrix(preview);
+            near(matrix[0], 0, 'quarter-turn X basis'); near(matrix[3], 0, 'quarter-turn Y basis');
+            assert.ok(matrix[1] !== 0 && matrix[2] !== 0, 'CSS preserves the retained raster orientation');
+        });
+    }
+
+    it('waits for actual native draw provenance before copying an already-finished unknown backing', async () => {
+        const robots = new DocumentRobots();
+        const f = fixture({ pages: 1, startPage: 1, initialNative: false, autoPages: false },
+            { robotsEnabled: true, createDocumentRobots: () => robots });
+        const view = f.pages[0];
+        view.canvas = new Canvas(); view.canvas.width = 800; view.canvas.height = 1000; view.renderingState = 3;
+        await f.frame();
+        assert.strictEqual(f.canvases.length, 0, 'unknown native coverage is not mislabeled as a complete page');
+        assert.strictEqual(robots.deliveries.length, 0);
+        f.finishNative(1);
+        assert.strictEqual(robots.deliveries.length, 1, 'the real draw supplies usable source geometry');
+        assert.ok(robots.deliveries[0].rasterProjection);
+    });
+
+    it('keeps a known cached preview without claiming it is displayed over an unknown finished native backing', async () => {
+        const robots = new DocumentRobots();
+        const h = previewFixture({ pages: 1, startPage: 1, initialNative: false, autoPages: false }, robots), f = h.f;
+        const loader = h.bind(); await f.frame();
+        const preview = h.publish(loader, 1).canvas;
+        assert.strictEqual(robots.deliveries.length, 1);
+        const before = robots.refinements.length, view = f.pages[0];
+        view.canvas = new Canvas(); view.canvas.width = 800; view.canvas.height = 1000; view.renderingState = 3;
+        f.eventBus.emit('pagerendered', { pageNumber: 1, source: view, error: null, cssTransform: true });
+        await f.frame();
+        assert.strictEqual(robots.refinements.length, before, 'a cached but detached preview cannot supply the unknown visible raster grid');
+        assert.strictEqual(preview.parentNode, null);
+        assert.ok(preview.width > 0 && preview.height > 0, 'the known preview remains cached for later use');
+        f.finishNative(1);
+        assert.strictEqual(robots.refinements.at(-1)!.canvas, view.canvas, 'an observed main draw resumes precise publication');
+    });
+
     it('refinement reaches an existing handled delivery when a sharper sidecar or native canvas arrives', async () => {
         const robots = new DocumentRobots();
-        const h = previewFixture({ startPage: 99, pages: 100, autoPages: false }, robots), f = h.f;
+        const h = previewFixture({ startPage: 99, pages: 100, autoPages: false, initialNative: false }, robots), f = h.f;
         f.pages[98].reset();
         const loader = h.bind(); await f.frame();
         const coarse = h.publish(loader, 99, 135, 192);
@@ -809,7 +976,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
     });
 
     it('publishes visible prepared pixels before an unresolved worker trim releases the cold slot', async () => {
-        const { f, robots } = robotFixture();
+        const { f, robots } = robotFixture(true, { initialNative: false });
         f.pages[19].reset();
         const trim = new Deferred<Record<string, number>>();
         (f.pdf as any).getRangeCacheStats = async () => byteStats(1024);
@@ -907,7 +1074,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
 
     it('groups actual spread members independently from printed labels and preserves a single visible half', async () => {
         const robots = new DocumentRobots();
-        const h = previewFixture({ startPage: 99, pages: 120, autoPages: false }, robots);
+        const h = previewFixture({ startPage: 99, pages: 120, autoPages: false, initialNative: false }, robots);
         const { f } = h;
         const spread = new Element(); spread.className = 'spread';
         for (const id of [99, 100]) { spread.prepend(f.pages[id - 1].div); f.pages[id - 1].reset(); }
@@ -932,7 +1099,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
 
     it('uses retained sidecar pixels as real cargo and rotates its image placements with the viewer', async () => {
         const robots = new DocumentRobots();
-        const h = previewFixture({ startPage: 21, autoPages: false }, robots);
+        const h = previewFixture({ startPage: 21, autoPages: false, initialNative: false }, robots);
         const { f } = h;
         f.pages[20].reset(); f.viewer.pagesRotation = 90;
         const loader = h.bind(); await f.frame();
@@ -961,7 +1128,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
     });
 
     it('cancels incompatible sidecars synchronously on layout, hidden state and layer changes', async () => {
-        const h = previewFixture({ startPage: 21, autoPages: false });
+        const h = previewFixture({ startPage: 21, autoPages: false, initialNative: false });
         const { f } = h;
         f.pages[20].reset();
         const loader = h.bind(); await f.frame();
@@ -991,7 +1158,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
     });
 
     it('honors the extension theme global and restores sidecars only after plain colors return', async () => {
-        const h = previewFixture({ startPage: 21, autoPages: false });
+        const h = previewFixture({ startPage: 21, autoPages: false, initialNative: false });
         const { f } = h;
         f.pages[20].reset();
         const loader = h.bind(); await f.frame();
@@ -1012,7 +1179,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
     });
 
     it('rejects sidecar pixels whose page geometry disagrees with the installed PDF page', async () => {
-        const h = previewFixture({ startPage: 21, autoPages: false });
+        const h = previewFixture({ startPage: 21, autoPages: false, initialNative: false });
         const { f } = h;
         f.pages[20].reset();
         const loader = h.bind(); await f.frame();
@@ -1148,7 +1315,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
     });
 
     it('waits for courier capacity once and drains ready visible pages without idle polling', async () => {
-        const { f, robots } = robotFixture();
+        const { f, robots } = robotFixture(true, { initialNative: false });
         robots.maxActive = 1;
         f.visibleIds = [20, 21, 22];
         f.pages[19].reset();
@@ -1331,7 +1498,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
     });
 
     it('gives unfinished visible pages priority over every speculative render', async () => {
-        const f = fixture();
+        const f = fixture({ initialNative: false });
         const visible = f.pages[19];
         visible.renderingState = 0;
         await f.frame();
@@ -1879,7 +2046,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
 
     for (const [width, height] of [[800, 1000], [1000, 800]]) {
         it(`reuses a full-quality sidecar across native rounding and zoom for ${width}x${height} geometry`, async () => {
-            const h = previewFixture({ width, height, startPage: 99, pages: 100, autoPages: false }), f = h.f;
+            const h = previewFixture({ width, height, startPage: 99, pages: 100, autoPages: false, initialNative: false }), f = h.f;
             f.pages[98].reset();
             const loader = h.bind(); await f.frame();
             const scale = 768 / Math.max(width, height);
@@ -1902,7 +2069,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
     }
 
     it('still upgrades a sidecar below the requested longest-edge quality', async () => {
-        const h = previewFixture({ startPage: 99, pages: 100, autoPages: false }), f = h.f;
+        const h = previewFixture({ startPage: 99, pages: 100, autoPages: false, initialNative: false }), f = h.f;
         f.pages[98].reset();
         const loader = h.bind(); await f.frame();
         const sidecar = h.publish(loader, 99, 614, 767);
@@ -2533,7 +2700,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
 
     it('restores authorized robot covers synchronously before the reset page preview reappears', async () => {
         const robots = new DocumentRobots();
-        const h = previewFixture({ startPage: 99, pages: 100, autoPages: false }, robots), f = h.f;
+        const h = previewFixture({ startPage: 99, pages: 100, autoPages: false, initialNative: false }, robots), f = h.f;
         const view = f.pages[98]; view.reset();
         const loader = h.bind(); await f.frame();
         const preview = h.publish(loader, 99);

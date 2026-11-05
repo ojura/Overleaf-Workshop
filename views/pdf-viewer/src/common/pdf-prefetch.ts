@@ -6,6 +6,8 @@ import { createPdfPreviewSourceLoader, rotatePdfPreviewImageRegions, type PdfPre
 import type { RobotDispatchPort } from './prefetch-robots';
 import { createPdfRenderTimings, type PdfRenderMeasurement } from './pdf-render-timing';
 import { installPdfDocumentColumn, type PdfDocumentColumnTransition } from './pdf-document-column';
+import { createPdfRasterProjection, pdfPageFromRaster, pdfRasterPageClip, pdfRasterToCss,
+    reorientPdfRasterProjection, resizePdfRasterProjection, type PdfPageProjection, type PdfRasterProjection } from './pdf-raster-projection';
 import './prefetch.css';
 
 // Both engines pin PDF.js 5.1.91. Keep the small viewer/queue integration here, rather than
@@ -49,6 +51,21 @@ interface Preparation {
 }
 
 interface ImageDecodeHints { imageDecodeScale: number; imageDecodeMaxDimension: number }
+interface NativeRaster {
+    view: any;
+    document: any;
+    projection: PdfRasterProjection;
+    rotation: number;
+    currentProjection: PdfRasterProjection;
+    currentRotation: number;
+}
+interface PageProjectionCache {
+    hasCanvas: boolean;
+    viewport: any;
+    nativeProjection: PdfRasterProjection | undefined;
+    transform: string | undefined;
+    page: PdfPageProjection;
+}
 interface ReplacementIntent {
     identity: string;
     document?: any;
@@ -94,6 +111,8 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     const declinedPreviews = new Set<number>();
     const failed = new Set<number>();
     const renderStarts = new Map<number, PdfRenderMeasurement>();
+    let nativeRasters = new WeakMap<HTMLCanvasElement, NativeRaster>();
+    let pageProjections = new WeakMap<object, PageProjectionCache>();
     const pendingRobotPages = new Set<number>();
     const deferredRobotPages = new Set<number>();
     let robotCapacityBlocked = false;
@@ -223,15 +242,73 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         }
     }
 
+    function captureNativeRaster(view: any): void {
+        const canvas: HTMLCanvasElement | undefined = view?.canvas;
+        const viewport = view?.viewport, output = view?.outputScale;
+        if (!document || document !== viewer.pdfDocument || !canvas?.width || !canvas.height || !viewport || !output) { return; }
+        try {
+            const projection = createPdfRasterProjection(canvas.width, canvas.height, viewport.width * output.sx, viewport.height * output.sy);
+            const rotation = viewport.rotation ?? 0;
+            nativeRasters.set(canvas, { view, document, projection, rotation, currentProjection: projection, currentRotation: rotation });
+            pageProjections.delete(view);
+        } catch { /* A missing main-render extent must not relabel clipped pixels as a complete page. */ }
+    }
+
+    function nativeProjection(view: any): PdfRasterProjection | undefined {
+        const canvas: HTMLCanvasElement | undefined = view?.canvas;
+        const stored = canvas && nativeRasters.get(canvas);
+        if (!stored || stored.view !== view || stored.document !== document
+            || stored.projection.width !== canvas!.width || stored.projection.height !== canvas!.height) { return; }
+        const rotation = view.viewport?.rotation ?? stored.rotation;
+        if (rotation !== stored.currentRotation) {
+            stored.currentProjection = reorientPdfRasterProjection(stored.projection, rotation - stored.rotation);
+            stored.currentRotation = rotation;
+        }
+        return stored.currentProjection;
+    }
+
+    function pageProjection(view: any): PdfPageProjection | undefined {
+        if (!view?.div || !view.viewport) { return; }
+        const canvas: HTMLCanvasElement | undefined = view.canvas ?? undefined;
+        const projection = nativeProjection(view), viewport = view.viewport, transform = canvas?.style.transform;
+        const cached = pageProjections.get(view);
+        if (cached && cached.hasCanvas === !!canvas && cached.viewport === viewport
+            && cached.nativeProjection === projection && cached.transform === transform) { return cached.page; }
+        const clip = { x: 0, y: 0, width: view.div.clientWidth, height: view.div.clientHeight };
+        if (!(clip.width > 0 && clip.height > 0 && viewport.width > 0 && viewport.height > 0)) { return; }
+        let page: PdfPageProjection;
+        if (canvas && projection) {
+            const box = view.div.getBoundingClientRect(), raster = canvas.getBoundingClientRect();
+            if (!(raster.width > 0 && raster.height > 0)) { return; }
+            // Absolute children start at the padding edge. Store local geometry so scrolling
+            // and the shared document-column translation do not require another DOM read.
+            page = pdfPageFromRaster(projection, {
+                x: raster.left - box.left - view.div.clientLeft,
+                y: raster.top - box.top - view.div.clientTop,
+                width: raster.width, height: raster.height,
+            }, clip);
+        } else {
+            page = { content: { x: 0, y: 0, width: viewport.width, height: viewport.height }, clip };
+        }
+        pageProjections.set(view, { hasCanvas: !!canvas, viewport, nativeProjection: projection, transform, page });
+        return page;
+    }
+
     function pixels(id: number): DocumentRobotDelivery | undefined {
         const view = pageView(id);
-        const native = view?.renderingState === FINISHED && view.canvas?.width && view.canvas?.height ? view.canvas : undefined;
-        const canvas = native ?? previews.get(id)?.canvas;
+        const nativeMapping = nativeProjection(view);
+        if (view?.renderingState === FINISHED && view.canvas?.width && view.canvas?.height && !nativeMapping) { return; }
+        const native = view?.renderingState === FINISHED && nativeMapping ? view.canvas : undefined;
+        const preview = previews.get(id), canvas = native ?? preview?.canvas;
         if (!canvas?.width || !canvas?.height || !view?.div) { return; }
+        const rasterProjection = native ? nativeMapping : preview?.projection;
+        const displayedPage = pageProjection(view);
+        if (!rasterProjection || !displayedPage) { return; }
         const page = previewLoader?.page(id);
         const imageRegions = page && previewCompatible() && previewGeometryMatches(page, view)
             ? rotatePdfPreviewImageRegions(page.imageRegions, viewer.pagesRotation || 0) : undefined;
-        return { pageNumber: id, pageElement: view.div, canvas, kind: native ? 'page' : 'preview', imageRegions };
+        return { pageNumber: id, pageElement: view.div, canvas, kind: native ? 'page' : 'preview', imageRegions,
+            rasterProjection, pageProjection: displayedPage, displayRasterProjection: rasterProjection };
     }
 
     /** Each page can deliver its real pixels on first useful entry, including a ready cache hit. */
@@ -363,14 +440,14 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
                 createCanvas,
                 quality: id => pageView(id)?.renderingState === FINISHED ? Infinity
                     : Math.max(previews.get(id)?.canvas.width ?? 0, previews.get(id)?.canvas.height ?? 0),
-                onPreview(page, canvas) {
+                onPreview(page, canvas, projection) {
                     const release = () => { canvas.remove(); canvas.width = canvas.height = 0; return false; };
                     if (!current() || hidden() || layoutPending || !previewCompatible()) { return release(); }
                     const view = pageView(page.pageNumber);
                     if (!view || view.renderingState === FINISHED) { return release(); }
                     // A trusted identity still needs the same page geometry before pixels are attached.
                     if (!previewGeometryMatches(page, view)) { return release(); }
-                    const retained = retainPreview(page.pageNumber, canvas);
+                    const retained = retainPreview(page.pageNumber, canvas, projection);
                     if (retained) { pdfPerformance.event('preview-ready', { page: page.pageNumber, sidecar: true }); }
                     return retained;
                 },
@@ -636,8 +713,8 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         previews.touch(id);
     }
 
-    function retainPreview(id: number, canvas: HTMLCanvasElement) {
-        const retained = previews.retain(id, canvas, new Set([...visible, ...prepared]));
+    function retainPreview(id: number, canvas: HTMLCanvasElement, projection: PdfRasterProjection) {
+        const retained = previews.retain(id, canvas, new Set([...visible, ...prepared]), projection);
         if (retained) {
             declinedPreviews.delete(id);
             // Coverage is useful immediately, even while this job still holds its cold slot for worker trimming.
@@ -654,6 +731,10 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         if (view?.renderingState !== FINISHED) { return; }
         if (view.pdfPage) { markWarm(id, view.pdfPage); }
         if (declinedPreviews.has(id) || !source?.width || !source?.height) { return; }
+        // Both entries install before drawing. If an existing canvas predates installation,
+        // its private original viewport is unknown; wait for a captured main draw or keep a known preview.
+        const projection = nativeProjection(view);
+        if (!projection) { return; }
         const dimension = Math.min(limits.previewMaxDimension, Math.max(source.width, source.height));
         const ratio = dimension / Math.max(source.width, source.height);
         const width = Math.max(1, Math.ceil(source.width * ratio));
@@ -679,7 +760,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             declinedPreviews.add(id);
             return;
         }
-        return retainPreview(id, canvas);
+        return retainPreview(id, canvas, resizePdfRasterProjection(projection, canvas.width, canvas.height));
     }
 
     function attachPreview(id: number): void {
@@ -688,13 +769,24 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         const view = pageView(id);
         if (!visible.includes(id) || !view || view.renderingState === FINISHED) { entry.canvas.remove(); return; }
         const canvas = entry.canvas;
+        const page = pageProjection(view);
+        const clip = page && pdfRasterPageClip(entry.projection, page);
+        if (!page || !clip) { canvas.remove(); return; }
+        const matrix = pdfRasterToCss(entry.projection, page);
+        const sx = entry.projection.width / page.clip.width, sy = entry.projection.height / page.clip.height;
+        const styles = {
+            position: 'absolute', inset: 'auto', left: '0px', top: '0px', width: page.clip.width + 'px', height: page.clip.height + 'px',
+            pointerEvents: 'none', zIndex: '0', transformOrigin: '0 0',
+            // Keep the untransformed CSS box within the page even for high-DPR backings.
+            transform: `matrix(${[matrix[0] * sx, matrix[1] * sx, matrix[2] * sy, matrix[3] * sy, matrix[4], matrix[5]].join(',')})`,
+            clipPath: `inset(${Math.max(0, clip.y / entry.projection.height * 100)}% ${Math.max(0, (entry.projection.width - clip.x - clip.width) / entry.projection.width * 100)}% ${Math.max(0, (entry.projection.height - clip.y - clip.height) / entry.projection.height * 100)}% ${Math.max(0, clip.x / entry.projection.width * 100)}%)`,
+        };
+        for (const name of Object.keys(styles) as (keyof typeof styles)[]) {
+            if (canvas.style[name] !== styles[name]) { canvas.style[name] = styles[name]; }
+        }
         if (canvas.parentNode !== view.div) {
             canvas.className = 'pdfPrefetchPreview';
             canvas.setAttribute('aria-hidden', 'true');
-            Object.assign(canvas.style, {
-                position: 'absolute', inset: '0', width: '100%', height: '100%',
-                pointerEvents: 'none', zIndex: '0',
-            });
             view.div.prepend(canvas);
         }
     }
@@ -972,7 +1064,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             if (!current(job)) { return; }
             markWarm(id, page, imageHints);
             const elapsed = job.measurement.finish();
-            const retained = retainPreview(id, canvas);
+            const retained = retainPreview(id, canvas, createPdfRasterProjection(canvas.width, canvas.height, viewport.width, viewport.height));
             job.canvas = undefined;
             if (elapsed !== undefined) { dynamics.page(elapsed); }
             if (retained) { pdfPerformance.event('preview-ready', { page: id, ms: elapsed ?? 0 }); }
@@ -1063,6 +1155,8 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         for (const job of jobs.values()) { cancel(job); }
         jobs.clear();
         warm.clear();
+        nativeRasters = new WeakMap();
+        pageProjections = new WeakMap();
         clearPreviews();
         failed.clear();
         renderStarts.clear();
@@ -1093,6 +1187,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
 
     function layout(invalidate = false) {
         stop();
+        pageProjections = new WeakMap();
         renderTimings.invalidate(); renderStarts.clear();
         previewLoader?.update([], false);
         clearRobotPending();
@@ -1148,11 +1243,12 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     for (const name of ['scalechanging', 'scrollmodechanged', 'spreadmodechanged']) { bus(name, () => layout()); }
     for (const name of ['rotationchanging', 'prefetchthemechanged']) { bus(name, () => layout(true)); }
     bus('optionalcontentconfigchanged', () => { previewAppearanceCompatible = false; updatePreviewSource(); layout(true); });
-    bus('pagerender', ({ pageNumber, isDetailView }: { pageNumber: number; isDetailView?: boolean }) => {
+    bus('pagerender', ({ pageNumber, isDetailView, source }: { pageNumber: number; isDetailView?: boolean; source?: any }) => {
         if (isDetailView) { return; }
         setIdle(false);
         renderStarts.get(pageNumber)?.cancel();
         const doc = document, view = pageView(pageNumber);
+        if (source === view) { captureNativeRaster(view); }
         renderStarts.set(pageNumber, renderTimings.start(() => !disposed && !hidden()
             && !!doc && doc === document && doc === viewer.pdfDocument && view === pageView(pageNumber)
             && [RUNNING, PAUSED].includes(view?.renderingState)));

@@ -1,7 +1,10 @@
+import { createPdfRasterProjection, resizePdfRasterProjection, type PdfRasterProjection } from './pdf-raster-projection';
+
 /** A retained raster is independent of PDF.js's decoded page resources. */
 export interface PdfPreview {
     canvas: HTMLCanvasElement;
     bytes: number;
+    projection: PdfRasterProjection;
 }
 
 interface Options {
@@ -56,11 +59,15 @@ export class PdfPreviewCache implements Iterable<[number, PdfPreview]> {
      * The caller protects the union of visible and prepared page IDs. A rejected replacement
      * keeps the old entry and its DOM coverage; the new canvas is released in either case.
      */
-    retain(id: number, canvas: HTMLCanvasElement, protectedIds: ReadonlySet<number>): boolean {
+    retain(id: number, canvas: HTMLCanvasElement, protectedIds: ReadonlySet<number>, projection?: PdfRasterProjection): boolean {
         const previous = this.entries.get(id);
         if (previous?.canvas === canvas) { this.touch(id); return true; }
         const bytes = canvas.width * canvas.height * RGBA_BYTES;
         if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > this.options.maxBytes || this.options.maxPages < 1) {
+            this.release(canvas);
+            return false;
+        }
+        if (projection && (projection.width !== canvas.width || projection.height !== canvas.height)) {
             this.release(canvas);
             return false;
         }
@@ -99,7 +106,7 @@ export class PdfPreviewCache implements Iterable<[number, PdfPreview]> {
             this.retainedBytes -= previous.bytes;
             this.release(previous.canvas);
         }
-        this.entries.set(id, { canvas, bytes });
+        this.entries.set(id, { canvas, bytes, projection: projection ?? createPdfRasterProjection(canvas.width, canvas.height) });
         this.retainedBytes += bytes;
         return true;
     }
@@ -115,6 +122,7 @@ export class PdfPreviewCache implements Iterable<[number, PdfPreview]> {
         const bytes = width * height * RGBA_BYTES;
         if (bytes >= entry.bytes) { return; }
         let canvas: HTMLCanvasElement | undefined;
+        let projection: PdfRasterProjection;
         try {
             canvas = this.options.createCanvas();
             canvas.width = width;
@@ -124,12 +132,13 @@ export class PdfPreviewCache implements Iterable<[number, PdfPreview]> {
             context.imageSmoothingEnabled = true;
             context.imageSmoothingQuality = 'high';
             context.drawImage(source, 0, 0, width, height);
+            projection = resizePdfRasterProjection(entry.projection, width, height);
         } catch {
             if (canvas) { this.release(canvas); }
             return;
         }
         // set() preserves the old entry's LRU position; a downgrade is not a new visit.
-        this.entries.set(id, { canvas, bytes });
+        this.entries.set(id, { canvas, bytes, projection });
         this.retainedBytes += bytes - entry.bytes;
         this.release(source);
     }

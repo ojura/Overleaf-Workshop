@@ -84,6 +84,7 @@ class Canvas extends Element {
     set width(value: number) { if (value === 0) { this.zeroWrites++; } this.pixelWidth = value; }
     height = 0;
     readonly copies: any[][] = [];
+    readonly copyTargets: number[][] = [];
     readonly contextOptions: any[] = [];
     readonly transforms: number[][] = [];
     failCopy = false;
@@ -95,6 +96,7 @@ class Canvas extends Element {
             this.beforeCopy?.(args);
             if (this.failCopy && args.length === 9) { throw new Error('copy failed'); }
             this.copies.push(args);
+            this.copyTargets.push([this.width, this.height]);
         },
         getImageData: (_x: number, _y: number, width: number, height: number) => {
             const data = new Uint8ClampedArray(width * height * 4).fill(255);
@@ -218,10 +220,10 @@ class Fixture {
         const stage = new Element(this.document);
         this.document.body.append(stage);
         this.lab = this.module.installPrefetchRobots(stage);
-        this.lab.setActive(true);
         const canvas = stage.children[0] as Canvas;
         canvas.rect = { left: 500, top: 40, width: 300, height: 86 };
         canvas.objectFit = 'contain';
+        this.lab.setActive(true);
         return { stage, canvas, lab: this.lab };
     }
     dispose() {
@@ -905,6 +907,145 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(cover.parentNode, null, 'a document reset retires the old cover identity');
     });
 
+    it('copies both fractional photo endpoints outward without losing the last source pixel', () => {
+        const f = fixture({ maxActors: 1 }); f.desktop();
+        const page = f.page(99);
+        page.canvas.width = 1000; page.canvas.height = 1000;
+        const image = { id: 'fractional-photo', x: 0.1009, y: 0.2009, width: 0.3002, height: 0.2002 };
+        f.api.setVisiblePages([99]);
+        assert.strictEqual(f.api.offer({ ...page, imageRegions: [image] }), 'started');
+        const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
+        const copy = cargo.copies.find(args => args[0] === page.canvas)!;
+        assert.ok(copy, 'the real source image supplies the carried pixels');
+        assert.strictEqual(copy[1], Math.floor(image.x * page.canvas.width));
+        assert.strictEqual(copy[2], Math.floor(image.y * page.canvas.height));
+        assert.strictEqual(copy[1] + copy[3], Math.ceil((image.x + image.width) * page.canvas.width),
+            'the outward right edge must include the pixel touched by the fractional endpoint');
+        assert.strictEqual(copy[2] + copy[4], Math.ceil((image.y + image.height) * page.canvas.height),
+            'the outward bottom edge must include the pixel touched by the fractional endpoint');
+        const payload = f.api.snapshot().pages[0].payloads[0];
+        for (const key of ['x', 'y', 'width', 'height'] as const) {
+            assert.ok(Math.abs(payload.target[key] - image[key]) < 1e-12, 'pixel rounding preserves the logical ' + key);
+        }
+        f.finish();
+        assert.strictEqual(f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+    });
+
+    it('aligns atlas cargo and outward arrival coverage with the rounded native page clip', () => {
+        const f = fixture({ maxActors: 1 }); f.desktop(1.2);
+        const page = f.page(99);
+        page.pageElement.rect = { left: 40, top: 60, width: 330, height: 470 };
+        page.canvas.width = 541; page.canvas.height = 768;
+        const logicalWidth = 332.5986666666667, logicalHeight = 472.4406666666667;
+        const image = { id: 'rounded-native-photo', x: 0.1, y: 0.2, width: 0.6, height: 0.4 };
+        const delivery = { ...page, kind: 'preview' as const, imageRegions: [image],
+            rasterProjection: { width: 541, height: 768, pageToRaster: [541, 0, 0, 768, 0, 0] },
+            pageProjection: { content: { x: 0, y: 0, width: logicalWidth, height: logicalHeight },
+                clip: { x: 0, y: 0, width: 330, height: 470 } },
+            displayRasterProjection: { width: 396, height: 564,
+                pageToRaster: [logicalWidth * 1.2, 0, 0, logicalHeight * 1.2, 0, 0] } };
+        f.api.setVisiblePages([99]); assert.strictEqual(f.api.offer(delivery), 'started');
+        const payload = f.api.snapshot().pages[0].payloads[0];
+        const cover = page.pageElement.children.find(node => node.className === 'pdfDocumentRobotArrival')!;
+        const css = (property: string, extent: number) => parseFloat(cover.style[property])
+            * (cover.style[property].endsWith('%') ? extent / 100 : 1);
+        const left = css('left', 330), top = css('top', 470);
+        const right = left + css('width', 330), bottom = top + css('height', 470);
+        assert.ok(Math.abs(left - Math.floor(image.x * logicalWidth * 1.2) / 1.2) < 1e-9,
+            'the mask starts at the native pixel footprint, not the squeezed atlas percentage');
+        assert.ok(Math.abs(top - Math.floor(image.y * logicalHeight * 1.2) / 1.2) < 1e-9);
+        assert.ok(right >= (image.x + image.width) * logicalWidth && right <= (image.x + image.width) * logicalWidth + 1 / 1.2);
+        assert.ok(bottom >= (image.y + image.height) * logicalHeight && bottom <= (image.y + image.height) * logicalHeight + 1 / 1.2);
+        f.tick(payload.deadline * 0.6199);
+        const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
+        assert.ok(Math.abs(parseFloat(cargo.style.width) - image.width * logicalWidth) < 0.01);
+        assert.ok(Math.abs(parseFloat(cargo.style.height) - image.height * logicalHeight) < 0.01);
+        const center = point(cargo);
+        assert.ok(Math.abs(center.x - (40 + (image.x + image.width / 2) * logicalWidth)) < 0.05);
+        assert.ok(Math.abs(center.y - (60 + (image.y + image.height / 2) * logicalHeight)) < 0.05);
+        f.finish();
+        assert.strictEqual(cover.parentNode, null);
+        assert.strictEqual(f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+    });
+
+    it('preserves a clipped retained quarter-turn through atlas refinement and terminal release', () => {
+        const f = fixture({ maxActors: 1 }); f.desktop(1.2);
+        const page = f.page(99);
+        page.pageElement.rect = { left: 40, top: 60, width: 470, height: 330 };
+        page.canvas.width = 396; page.canvas.height = 564;
+        const originalWidth = 332.5986666666667, originalHeight = 472.4406666666667;
+        const fullWidth = originalWidth * 1.2, fullHeight = originalHeight * 1.2;
+        const image = { id: 'quarter-turn-photo', x: 0.002, y: 0.89, width: 0.2, height: 0.1 };
+        const rasterProjection = { width: 396, height: 564, pageToRaster: [0, -fullHeight, fullWidth, 0, 0, fullHeight] };
+        const delivery = { ...page, imageRegions: [image], rasterProjection,
+            displayRasterProjection: rasterProjection,
+            pageProjection: { content: { x: 470 - originalHeight, y: 0, width: originalHeight, height: originalWidth },
+                clip: { x: 0, y: 0, width: 470, height: 330 } } };
+        f.api.setVisiblePages([99]); assert.strictEqual(f.api.offer(delivery), 'started');
+        const before = f.api.snapshot().pages[0].payloads[0];
+        const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
+        const copy = cargo.copies.find(args => args[0] === page.canvas)!;
+        assert.ok(copy[1] >= 0 && copy[2] >= 0 && copy[1] + copy[3] <= 396 && copy[2] + copy[4] <= 564,
+            'read bounds exclude clipped pixels and ceil padding');
+        assert.deepStrictEqual([cargo.width, cargo.height], [Math.ceil(fullHeight * image.width), Math.ceil(fullWidth * image.height)],
+            'the retained backing rotation must not swap the logical cargo axes');
+        const transform = cargo.transforms[0];
+        const map = (x: number, y: number) => ({ x: transform[0] * x + transform[2] * y + transform[4],
+            y: transform[1] * x + transform[3] * y + transform[5] });
+        const corner = map(fullWidth * image.y, fullHeight * (1 - image.x));
+        const center = map(fullWidth * (image.y + image.height / 2), fullHeight * (1 - image.x - image.width / 2));
+        assert.ok(Math.abs(corner.x) + Math.abs(corner.y) < 1e-9, 'the exact logical corner stays at the cargo origin');
+        assert.ok(Math.abs(center.x - cargo.width / 2) + Math.abs(center.y - cargo.height / 2) < 1e-9,
+            'a clipped read is not stretched over the unchanged target');
+        const cover = page.pageElement.children.find(node => node.className === 'pdfDocumentRobotArrival')!;
+        assert.ok(Math.abs(parseFloat(cover.style.left)) < 1e-9, 'native leading-edge clipping also clips the mask');
+        assert.ok(parseFloat(cover.style.top) + parseFloat(cover.style.height) <= 330);
+        const mask = ['left', 'top', 'width', 'height'].map(key => cover.style[key]);
+        f.tick(100);
+        const atlas = new Canvas(f.document); atlas.width = 768; atlas.height = 541;
+        assert.strictEqual(f.api.refine({ ...delivery, canvas: atlas, kind: 'preview',
+            rasterProjection: { width: 768, height: 541, pageToRaster: [768, 0, 0, 541, 0, 0] } }), 1);
+        const after = f.api.snapshot().pages[0].payloads[0];
+        assert.strictEqual(after.id, before.id); assert.strictEqual(after.deadline, before.deadline);
+        assert.deepStrictEqual(after.helpers, before.helpers); assert.deepStrictEqual(after.target, before.target);
+        assert.deepStrictEqual(['left', 'top', 'width', 'height'].map(key => cover.style[key]), mask,
+            'atlas refinement must not move the native-grid destination cover');
+        f.api.revealArrivals();
+        assert.strictEqual(f.api.refine({ ...delivery, canvas: atlas }), 0);
+        assert.strictEqual(f.api.snapshot().activePayloads + f.api.snapshot().activeArrivalCovers, 0);
+        f.finish(); assert.strictEqual(f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+    });
+
+    it('covers high-density phone edge pixels without extending onto neighbouring caption space', () => {
+        const f = fixture({ maxActors: 1, device: 'mobile' });
+        Object.assign(f.window, { innerWidth: 402, innerHeight: 654, devicePixelRatio: 3 });
+        f.container.rect = { left: 0, top: 32, width: 402, height: 622 };
+        const page = f.page(99);
+        page.pageElement.rect = { left: 11, top: 45, width: 380, height: 540 };
+        page.canvas.width = 1140; page.canvas.height = 1620;
+        const width = 380.8, height = 540.3;
+        const image = { id: 'phone-edge-photo', x: 0.81, y: 0.67, width: 0.19, height: 0.3 };
+        const rasterProjection = { width: 1140, height: 1620, pageToRaster: [width * 3, 0, 0, height * 3, 0, 0] };
+        page.text.textContent = 'The adjacent caption remains readable.';
+        f.api.setVisiblePages([99]);
+        assert.strictEqual(f.api.offer({ ...page, imageRegions: [image], rasterProjection, displayRasterProjection: rasterProjection,
+            pageProjection: { content: { x: 0, y: 0, width, height }, clip: { x: 0, y: 0, width: 380, height: 540 } } }), 'started');
+        const cover = page.pageElement.children.find(node => node.className === 'pdfDocumentRobotArrival')!;
+        const left = parseFloat(cover.style.left), top = parseFloat(cover.style.top);
+        const right = left + parseFloat(cover.style.width), bottom = top + parseFloat(cover.style.height);
+        assert.ok(Math.abs(left - Math.floor(image.x * width * 3) / 3) < 1e-9);
+        assert.ok(Math.abs(top - Math.floor(image.y * height * 3) / 3) < 1e-9);
+        assert.ok(Math.abs(right - 380) < 1e-9, 'the right edge stops at the native page clip');
+        assert.ok(bottom >= (image.y + image.height) * height - 1e-9);
+        assert.ok(bottom <= (image.y + image.height) * height + 1 / 3 + 1e-9,
+            'outward coverage adds at most the touched raster pixel, not a generic margin');
+        assert.strictEqual(cover.style.borderRadius, '0');
+        assert.strictEqual(cover.style.pointerEvents, 'none');
+        assert.strictEqual(page.text.textContent, 'The adjacent caption remains readable.');
+        assert.strictEqual(page.canvas.copies.length, 0);
+        f.finish(); assert.strictEqual(f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+    });
+
     it('masks each admitted fallback rectangle until its cargo is atomically revealed or cancelled', () => {
         const f = fixture(), page = f.page();
         f.api.setVisiblePages([1]); assert.strictEqual(f.api.offer(page), 'started');
@@ -914,9 +1055,15 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.ok(covers.length > 0);
         for (const payload of payloads) {
             const cover = covers.find(node => node.dataset.payload === String(payload.id))!;
-            for (const [property, target] of [['left', 'x'], ['top', 'y'], ['width', 'width'], ['height', 'height']]) {
-                assert.ok(Math.abs(parseFloat(cover.style[property]) / 100 - payload.target[target]) < 1e-9);
-            }
+            const left = parseFloat(cover.style.left), top = parseFloat(cover.style.top);
+            const right = left + parseFloat(cover.style.width), bottom = top + parseFloat(cover.style.height);
+            const exact = { left: payload.target.x * page.pageElement.clientWidth, top: payload.target.y * page.pageElement.clientHeight,
+                right: (payload.target.x + payload.target.width) * page.pageElement.clientWidth,
+                bottom: (payload.target.y + payload.target.height) * page.pageElement.clientHeight };
+            assert.ok(left <= exact.left + 1e-9 && exact.left - left < 1 + 1e-9);
+            assert.ok(top <= exact.top + 1e-9 && exact.top - top < 1 + 1e-9);
+            assert.ok(right >= exact.right - 1e-9 && right - exact.right < 1 + 1e-9);
+            assert.ok(bottom >= exact.bottom - 1e-9 && bottom - exact.bottom < 1 + 1e-9);
             assert.strictEqual(cover.style.opacity, '1');
             assert.strictEqual(cover.style.pointerEvents, 'none');
         }
@@ -935,9 +1082,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(cover.style.pointerEvents, 'none');
         assert.strictEqual(cover.attributes.get('aria-hidden'), 'true');
         assert.strictEqual(cover.style.opacity, '1', 'complete cover geometry is opaque before the next gated paint');
-        [cover.style.left, cover.style.top, cover.style.width, cover.style.height].forEach((value, index) => {
-            assert.ok(value.endsWith('%') && Math.abs(parseFloat(value) - [10, 20, 60, 40][index]) < 0.000001);
-        });
+        assert.deepStrictEqual([cover.style.left, cover.style.top, cover.style.width, cover.style.height].map(parseFloat),
+            [46, 132, 280, 265], 'the exact photo is covered through its outer displayed pixels');
+        assert.strictEqual(cover.style.borderRadius, '0');
         assert.strictEqual(f.api.snapshot().activeArrivalCovers, 1);
         assert.strictEqual(f.api.snapshot().pages[0].payloads[0].arrivalCovered, true);
         let deposited = false;
@@ -2361,8 +2508,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             f.finish();
             assert.strictEqual(f.api.snapshot().retainedBytes, 0);
         }
-        assert.ok(f.owned.flatMap(canvas => canvas.copies).filter(args => args.length === 9)
-            .every(args => args[7] <= module.DOCUMENT_ROBOT_LIMITS.fragmentDimension), 'over-budget team rasters are rejected before copying');
+        assert.ok(f.owned.flatMap(canvas => canvas.copies.map((args, index) => ({ args, target: canvas.copyTargets[index] })))
+            .filter(copy => copy.args.length === 9).every(copy => copy.target[0] <= module.DOCUMENT_ROBOT_LIMITS.fragmentDimension),
+        'over-budget team backing allocations are rejected before copying');
     });
 
     it('rolls back a partially reserved cooperative crew without leaking its shared raster or lab actor', () => {
@@ -2418,11 +2566,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(transit.getBoundingClientRect().top, 120);
         assert.ok(f.api.snapshot().pages[0].actors.every((actor: any) => actor.fromLab), 'clipping keeps the real lab departure');
 
-        f.window.visualViewport = { offsetLeft: 100, offsetTop: 80, width: 500, height: 470 };
+        f.window.visualViewport = Object.assign(new Events(), { offsetLeft: 100, offsetTop: 80, width: 500, height: 470 });
         f.frame();
         assert.strictEqual(transit.style.clipPath, undefined, 'visual viewport clipping is supplied by the browser without sampled clip writes');
         f.container.rect.top = 180;
-        f.window.visualViewport = { offsetLeft: 130, offsetTop: 160, width: 420, height: 360 };
+        Object.assign(f.window.visualViewport, { offsetLeft: 130, offsetTop: 160, width: 420, height: 360 });
         f.frame();
         assert.strictEqual(transit.getBoundingClientRect().top, 180, 'the containing block follows the viewer without a fixed overlay');
         f.finish();
@@ -2788,6 +2936,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(new Set(copiedBodies).size, module.ROBOT_VEHICLES.filter((vehicle: any) => vehicle.id !== 'quad' && vehicle.id !== 'ekokomvoz').length,
             'the lab redraw excludes the borrowed body; the sweeper is painted procedurally');
         canvas.rect.left += 50;
+        lab.invalidateGeometry();
         assert.ok(Math.abs(lab.dispatch.destination('quad').x - origin.x - 50) < 0.0001);
         lab.dispatch.release('quad');
         assert.strictEqual(lab.snapshot().actors.find((actor: any) => actor.vehicle === 'quad').outside, false);

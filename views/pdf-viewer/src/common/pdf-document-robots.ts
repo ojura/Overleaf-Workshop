@@ -9,6 +9,8 @@ import { canCarryRobot } from './robot-rescue';
 import { robotScreenMetrics, robotCaptionMetrics, ROBOT_CAPTION_STYLE } from './robot-screen-scale';
 import { RobotTraffic } from './robot-traffic';
 import { installRobotInteraction, type RobotInteractionPoint } from './robot-interaction';
+import { createPdfRasterProjection, resizePdfRasterProjection, projectPdfRasterCrop, pdfRasterCropSize, pdfRasterToCrop,
+    projectPdfPageRect, clipPdfPageRect, type PdfRasterProjection, type PdfPageProjection } from './pdf-raster-projection';
 
 export const DOCUMENT_ROBOT_LIMITS = Object.freeze({
     maxActors: 4,
@@ -88,6 +90,9 @@ export interface DocumentRobotDelivery {
     canvas: HTMLCanvasElement;
     kind: 'preview' | 'page';
     imageRegions?: readonly DocumentRobotImageRegion[];
+    rasterProjection?: PdfRasterProjection;
+    pageProjection?: PdfPageProjection;
+    displayRasterProjection?: PdfRasterProjection;
 }
 
 type Point = { x: number; y: number };
@@ -101,6 +106,7 @@ interface Geometry {
     bottom: number;
     pageLeft: number;
     pageTop: number;
+    projection?: PdfPageProjection;
 }
 type DeliveryMode = 'solo' | 'formation' | 'handoff' | 'airlift';
 type DeliveryStage = 'rendezvous' | 'handoff' | 'carry' | 'lift' | 'deposit' | 'return';
@@ -195,6 +201,8 @@ interface Episode {
     layer: HTMLDivElement;
     kind: DocumentRobotDelivery['kind'];
     payloads: Payload[];
+    pageProjection?: PdfPageProjection;
+    displayRasterProjection?: PdfRasterProjection;
 }
 interface RetiringPiece {
     page: number;
@@ -439,16 +447,21 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         options.onCapacityAvailable?.();
     }
 
-    function geometry(element: HTMLElement, viewport = viewportBounds()): Geometry | undefined {
+    function geometry(element: HTMLElement, viewport = viewportBounds(), supplied?: PdfPageProjection): Geometry | undefined {
         const page = element.getBoundingClientRect();
-        const width = page.width;
-        const height = page.height;
+        const projection = supplied ?? { content: { x: 0, y: 0, width: element.clientWidth || page.width,
+            height: element.clientHeight || page.height }, clip: { x: 0, y: 0,
+            width: element.clientWidth || page.width, height: element.clientHeight || page.height } };
+        const { content, clip } = projection;
+        const width = content.width, height = content.height;
         if (!(width > 0 && height > 0 && page.width > 0 && page.height > 0)) { return; }
-        const left = clamp((viewport.left - page.left) / page.width, 0, 1);
-        const top = clamp((viewport.top - page.top) / page.height, 0, 1);
-        const right = clamp((viewport.right - page.left) / page.width, 0, 1);
-        const bottom = clamp((viewport.bottom - page.top) / page.height, 0, 1);
-        return right > left && bottom > top ? { width, height, left, top, right, bottom, pageLeft: page.left, pageTop: page.top } : undefined;
+        const originX = page.left + (element.clientLeft || 0), originY = page.top + (element.clientTop || 0);
+        const pageLeft = originX + content.x, pageTop = originY + content.y;
+        const left = clamp((Math.max(viewport.left, originX + clip.x) - pageLeft) / width, 0, 1);
+        const top = clamp((Math.max(viewport.top, originY + clip.y) - pageTop) / height, 0, 1);
+        const right = clamp((Math.min(viewport.right, originX + clip.x + clip.width) - pageLeft) / width, 0, 1);
+        const bottom = clamp((Math.min(viewport.bottom, originY + clip.y + clip.height) - pageTop) / height, 0, 1);
+        return right > left && bottom > top ? { width, height, left, top, right, bottom, pageLeft, pageTop, projection } : undefined;
     }
 
     function nextVehicle(): RobotVehicle {
@@ -478,7 +491,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     }
 
     function selectCrops(source: HTMLCanvasElement, area: Geometry, policy: Presentation,
-        imageRegions?: readonly DocumentRobotImageRegion[]): Crop[] {
+        imageRegions?: readonly DocumentRobotImageRegion[], projection?: PdfRasterProjection): Crop[] {
         const ids = new Set<string>();
         const images: Crop[] = [];
         for (const image of imageRegions ?? []) {
@@ -492,7 +505,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             ids.add(image.id);
             images.push({ x, y, width, height, imageId: image.id, score: 1 + visibleWidth * visibleHeight });
         }
-        if (images.length) { return uniqueCrops(source, images.sort((a, b) => b.score - a.score)).slice(0, 12); }
+        if (images.length) { return uniqueCrops(source, images.sort((a, b) => b.score - a.score), projection).slice(0, 12); }
         const width = Math.min(policy.kind === 'desktop' ? 0.36 : 0.24, policy.minimumWidth / area.width, (area.right - area.left) * 0.75);
         const height = Math.min(policy.kind === 'desktop' ? 0.24 : 0.16, policy.minimumHeight / area.height, (area.bottom - area.top) * 0.75);
         const candidates: Crop[] = [];
@@ -512,14 +525,18 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             sample.width = Math.max(1, Math.round(source.width * scale));
             sample.height = Math.max(1, Math.round(source.height * scale));
             const context = sample.getContext('2d', { willReadFrequently: true });
-            if (!context) { return uniqueCrops(source, candidates); }
+            if (!context) { return uniqueCrops(source, candidates, projection); }
             context.drawImage(source, 0, 0, sample.width, sample.height);
+            const sampleProjection = resizePdfRasterProjection(projection ?? createPdfRasterProjection(source.width, source.height),
+                sample.width, sample.height);
             const pixels = context.getImageData(0, 0, sample.width, sample.height).data;
             const background = [pixels[0], pixels[1], pixels[2], pixels[3]];
             for (const crop of candidates) {
                 let ink = 0, count = 0;
-                const left = Math.floor(crop.x * sample.width), right = Math.ceil((crop.x + crop.width) * sample.width);
-                const top = Math.floor(crop.y * sample.height), bottom = Math.ceil((crop.y + crop.height) * sample.height);
+                const rectangle = projectPdfRasterCrop(sampleProjection, crop)?.pixels;
+                if (!rectangle) { crop.score = 0; continue; }
+                const left = rectangle.x, right = rectangle.x + rectangle.width;
+                const top = rectangle.y, bottom = rectangle.y + rectangle.height;
                 for (let y = top; y < bottom; y++) {
                     for (let x = left; x < right; x++) {
                         const at = (y * sample.width + x) * RGBA_BYTES;
@@ -535,7 +552,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         } catch {
             // A canvas without readable pixels can still supply a bounded drawImage fragment.
         } finally { if (sample) { release(sample); } }
-        return uniqueCrops(source, candidates.sort((a, b) => b.score - a.score));
+        return uniqueCrops(source, candidates.sort((a, b) => b.score - a.score), projection);
     }
 
     function drawVehicle(actor: RobotBody): void {
@@ -591,17 +608,20 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (captionGroup?.actors.includes(id)) { clearCaption(); }
     }
 
-    function sourceRectangle(source: HTMLCanvasElement, crop: Crop) {
-        const sourceX = Math.floor(crop.x * source.width), sourceY = Math.floor(crop.y * source.height);
-        const sourceWidth = Math.max(1, Math.min(source.width - sourceX, Math.ceil(crop.width * source.width)));
-        const sourceHeight = Math.max(1, Math.min(source.height - sourceY, Math.ceil(crop.height * source.height)));
-        return { sourceX, sourceY, sourceWidth, sourceHeight };
+    function sourceRectangle(source: HTMLCanvasElement, crop: Crop, supplied?: PdfRasterProjection) {
+        const projection = supplied ?? createPdfRasterProjection(source.width, source.height);
+        const rectangle = projectPdfRasterCrop(projection, crop);
+        if (!rectangle) { return; }
+        const { x: sourceX, y: sourceY, width: sourceWidth, height: sourceHeight } = rectangle.pixels;
+        return { sourceX, sourceY, sourceWidth, sourceHeight, projection };
     }
 
-    function uniqueCrops(source: HTMLCanvasElement, crops: readonly Crop[]): Crop[] {
+    function uniqueCrops(source: HTMLCanvasElement, crops: readonly Crop[], projection?: PdfRasterProjection): Crop[] {
         const rectangles = new Set<string>();
         return crops.filter(crop => {
-            const { sourceX, sourceY, sourceWidth, sourceHeight } = sourceRectangle(source, crop);
+            const rectangle = sourceRectangle(source, crop, projection);
+            if (!rectangle) { return false; }
+            const { sourceX, sourceY, sourceWidth, sourceHeight } = rectangle;
             const key = sourceX + ':' + sourceY + ':' + sourceWidth + ':' + sourceHeight;
             if (rectangles.has(key)) { return false; }
             rectangles.add(key);
@@ -611,18 +631,23 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         });
     }
 
-    function rasterSize(source: HTMLCanvasElement, crop: Crop, mode: DeliveryMode, policy: Presentation) {
-        const rectangle = sourceRectangle(source, crop);
-        const { sourceWidth, sourceHeight } = rectangle;
+    function rasterSize(source: HTMLCanvasElement, crop: Crop, mode: DeliveryMode, policy: Presentation, projection?: PdfRasterProjection) {
+        const rectangle = sourceRectangle(source, crop, projection);
+        if (!rectangle) { return; }
+        const natural = pdfRasterCropSize(rectangle.projection, crop);
         const dimension = policy.fragmentDimension * (mode === 'solo' ? 1 : DOCUMENT_ROBOT_LIMITS.cooperative.rasterScale);
-        const scale = Math.min(1, dimension / Math.max(sourceWidth, sourceHeight));
-        const width = Math.max(1, Math.floor(sourceWidth * scale)), height = Math.max(1, Math.floor(sourceHeight * scale));
-        return { ...rectangle, width, height, bytes: width * height * RGBA_BYTES };
+        const scale = Math.min(1, dimension / Math.max(natural.width, natural.height));
+        const width = Math.max(1, Math.min(dimension, Math.ceil(natural.width * scale)));
+        const height = Math.max(1, Math.min(dimension, Math.ceil(natural.height * scale)));
+        return { ...rectangle, width, height, bytes: width * height * RGBA_BYTES,
+            transform: pdfRasterToCrop(rectangle.projection, crop, width, height) };
     }
 
     function makePayload(source: HTMLCanvasElement, crop: Crop, area: Geometry, index: number,
-        mode: DeliveryMode, policy: Presentation, ground: boolean): Payload | undefined {
-        const { sourceX, sourceY, sourceWidth, sourceHeight, width, height, bytes } = rasterSize(source, crop, mode, policy);
+        mode: DeliveryMode, policy: Presentation, ground: boolean, projection?: PdfRasterProjection): Payload | undefined {
+        const size = rasterSize(source, crop, mode, policy, projection);
+        if (!size) { return; }
+        const { sourceX, sourceY, sourceWidth, sourceHeight, width, height, bytes, transform } = size;
         if (cargoBytes + bytes > policy.maxCargoBytes) { return; }
         let canvas: HTMLCanvasElement | undefined;
         try {
@@ -630,7 +655,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             canvas.width = width; canvas.height = height;
             const context = canvas.getContext('2d', { alpha: true });
             if (!context) { return; }
-            context.drawImage(source, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, width, height);
+            context.setTransform(...transform);
+            context.drawImage(source, sourceX, sourceY, sourceWidth, sourceHeight, sourceX, sourceY, sourceWidth, sourceHeight);
+            context.setTransform(1, 0, 0, 1, 0, 0);
             const route = ground || mode === 'airlift' ? random.next() < 0.5 ? 0 : 2 : nextRoute();
             const target = { x: crop.x + crop.width / 2, y: crop.y + crop.height / 2 };
             const start = edge(route, area, target), bend = random.range(-0.16, 0.16);
@@ -645,7 +672,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             };
             decorate(canvas, 'pdfDocumentRobotCargo', '1');
             canvas.dataset.payload = String(payload.id);
-            Object.assign(canvas.style, { boxShadow: '0 2px 7px #0003', borderRadius: '2px' });
+            Object.assign(canvas.style, { boxShadow: '0 2px 7px #0003', borderRadius: '0' });
             cargoBytes += bytes;
             peakCargoBytes = Math.max(peakCargoBytes, cargoBytes);
             canvas = undefined;
@@ -658,13 +685,19 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (disposed || !enabled || hidden() || !visible.has(value.pageNumber) || !value.canvas.width || !value.canvas.height) { return 0; }
         const episode = episodes.get(value.pageNumber);
         if (!episode || episode.element !== value.pageElement) { return 0; }
+        if (value.pageProjection) { episode.pageProjection = value.pageProjection; }
+        if (value.displayRasterProjection) { episode.displayRasterProjection = value.displayRasterProjection; }
+        if (episode.pageProjection) {
+            for (const payload of episode.payloads) { paintArrival(payload, episode.pageProjection, episode.displayRasterProjection); }
+        }
         const policy = presentation();
         let count = 0;
         for (const payload of episode.payloads) {
             retireUncovered(payload, episode.element);
             const previous = payload.canvas;
             if (!previous || !previous.parentNode || now() >= payload.started + payload.delay + payload.duration * RETURN_START) { continue; }
-            const size = rasterSize(value.canvas, payload.crop, payload.mode, policy);
+            const size = rasterSize(value.canvas, payload.crop, payload.mode, policy, value.rasterProjection);
+            if (!size) { continue; }
             const key = size.width + 'x' + size.height;
             if (size.width < previous.width || size.height < previous.height
                 || size.width === previous.width && size.height === previous.height || payload.refinementAttempt === key
@@ -677,8 +710,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 next = createCanvas(); next.width = size.width; next.height = size.height;
                 const context = next.getContext('2d', { alpha: true });
                 if (!context) { throw new Error('Refined cargo canvas is unavailable'); }
+                context.setTransform(...size.transform);
                 context.drawImage(value.canvas, size.sourceX, size.sourceY, size.sourceWidth, size.sourceHeight,
-                    0, 0, size.width, size.height);
+                    size.sourceX, size.sourceY, size.sourceWidth, size.sourceHeight);
+                context.setTransform(1, 0, 0, 1, 0, 0);
                 decorate(next, 'pdfDocumentRobotCargo', '1');
                 next.dataset.payload = String(payload.id); next.dataset.courier = String(payload.helpers[0].id);
                 for (const property of ['width', 'height', 'opacity', 'transform', 'translate', 'boxShadow', 'borderRadius', 'clipPath'] as const) {
@@ -1006,6 +1041,23 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             pullDirection: active.phase === 'pull' ? side : undefined });
     }
 
+    function paintArrival(payload: Payload, page: PdfPageProjection, displayed?: PdfRasterProjection): void {
+        const cover = payload.cover;
+        if (!cover || !payload.canvas) { return; }
+        const dpr = Math.max(1, win.devicePixelRatio || 1);
+        const raster = displayed ?? createPdfRasterProjection(Math.max(1, Math.ceil(page.content.width * dpr)),
+            Math.max(1, Math.ceil(page.content.height * dpr)), page.content.width * dpr, page.content.height * dpr);
+        const sampled = projectPdfRasterCrop(raster, payload.crop)?.sampled;
+        const mask = sampled && clipPdfPageRect(page, projectPdfPageRect(page, sampled));
+        if (!mask) { releasePayload(payload); return; }
+        // Round coverage on the displayed raster grid, separately from the cargo source tier and page border box.
+        // This includes touched edge pixels without obscuring a neighbouring caption or page.
+        for (const [property, value] of [['left', mask.x], ['top', mask.y], ['width', mask.width], ['height', mask.height]] as const) {
+            const css = value + 'px';
+            if (cover.style[property] !== css) { cover.style[property] = css; }
+        }
+    }
+
     function releasePayload(payload: Payload): void {
         if (cleaner?.payload === payload) { releaseCleaner(); }
         finishRefinement(payload);
@@ -1097,15 +1149,16 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 if (pages.has(value.pageNumber) || !Number.isSafeInteger(value.pageNumber) || value.pageNumber < 1
                     || !value.canvas.width || !value.canvas.height) { continue; }
                 pages.add(value.pageNumber);
-                const area = geometry(value.pageElement, viewport);
+                const area = geometry(value.pageElement, viewport, value.pageProjection);
                 if (!area || area.width * (area.right - area.left) < policy.minimumWidth
                     || area.height * (area.bottom - area.top) < policy.minimumHeight) { continue; }
-                const crops = selectCrops(value.canvas, area, policy, value.imageRegions)
+                const crops = selectCrops(value.canvas, area, policy, value.imageRegions, value.rasterProjection)
                     .slice(0, policy.kind === 'desktop' ? DOCUMENT_ROBOT_LIMITS.replacement.fragmentsPerDesktopPage : 1);
                 for (const crop of crops) {
                     if (actorCount() >= policy.maxActors) { break; }
                     const ground = area.bottom >= 0.98 && crop.y + crop.height / 2 >= 0.6 && !used.has('forklift');
-                    const payload = makeDelivery(value.canvas, crop, area, scene.pieces.length, 'solo', 1, used, policy, [], ground);
+                    const payload = makeDelivery(value.canvas, crop, area, scene.pieces.length, 'solo', 1, used, policy, [], ground,
+                        value.rasterProjection);
                     if (!payload) { continue; }
                     payload.duration = DOCUMENT_ROBOT_LIMITS.replacement.durationMs;
                     payload.delay = Math.min(payload.delay, 200);
@@ -1601,6 +1654,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     function paintPayload(payload: Payload, pageNumber: number, area: Geometry, at: number,
         destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, viewport: ReturnType<typeof viewportBounds>,
         placements: BodyPlacement[], successfulDeposits: number[][], captionObstacles: SceneObstacle[]): boolean {
+        const episode = episodes.get(pageNumber);
+        if (area.projection) { paintArrival(payload, area.projection, episode?.displayRasterProjection); }
         retireUncovered(payload, episodes.get(pageNumber)?.element);
         const elapsed = at - payload.started - payload.delay;
         if (elapsed < 0) {
@@ -1646,11 +1701,11 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const initialScale = ((leader.launch ?? leader.origin)?.scale ?? leader.spriteScale) / leader.spriteScale;
             const scale = payload.deposited ? 1 : initialScale + (1 - initialScale) * ease(clamp(progress / 0.20, 0, 1));
             const width = payload.crop.width * area.width * scale, height = payload.crop.height * area.height * scale;
-            payload.canvas.style.width = width.toFixed(2) + 'px'; payload.canvas.style.height = height.toFixed(2) + 'px';
+            payload.canvas.style.width = width + 'px'; payload.canvas.style.height = height + 'px';
             payload.canvas.style.opacity = String(payload.deposited ? clamp((RETURN_START - progress) / 0.10, 0, 1)
                 : clamp(progress / (payload.mode === 'formation' ? RENDEZVOUS_END : 0.08), 0, 1));
-            payload.canvas.style.transform = 'translate(' + (path.point.x - sceneOrigin.x - width / 2).toFixed(2) + 'px,'
-                + (path.point.y - sceneOrigin.y - height / 2).toFixed(2) + 'px)';
+            payload.canvas.style.transform = 'translate(' + (path.point.x - sceneOrigin.x - width / 2).toFixed(4) + 'px,'
+                + (path.point.y - sceneOrigin.y - height / 2).toFixed(4) + 'px)';
             captionObstacles.push({ x: path.point.x - sceneOrigin.x - width / 2, y: path.point.y - sceneOrigin.y - height / 2,
                 width, height, group: payload.id });
             if (cleaner?.payload === payload) { paintCleaner(payload, path.point, width, height, at, presentation(viewport)); }
@@ -2115,7 +2170,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             }
             // Read page and lab geometry before any sprite style writes. The scroll container
             // supplies clipping; the browser carries this content-local layer between paints.
-            const areas = new Map([...episodes.values()].map(episode => [episode, geometry(episode.element, viewport)]));
+            const areas = new Map([...episodes.values()].map(episode => [episode, geometry(episode.element, viewport, episode.pageProjection)]));
             const workAreas = new Map([...advance.values()].map(work => [work, advanceGeometry(work, viewport, policy)]));
             const destinations = new Map<RobotBody, RobotDispatchPoint | undefined>();
             const destination = (actor: RobotBody) => {
@@ -2200,8 +2255,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     }
 
     function makeDelivery(source: HTMLCanvasElement, crop: Crop, area: Geometry, index: number, mode: DeliveryMode,
-        helpers: number, used: ReadonlySet<RobotVehicle>, policy: Presentation, staged: AdvanceActor[], ground = false): Payload | undefined {
-        const payload = makePayload(source, crop, area, index, mode, policy, ground);
+        helpers: number, used: ReadonlySet<RobotVehicle>, policy: Presentation, staged: AdvanceActor[], ground = false,
+        projection?: PdfRasterProjection): Payload | undefined {
+        const payload = makePayload(source, crop, area, index, mode, policy, ground, projection);
         if (!payload) { return; }
         for (let helper = 0; helper < helpers; helper++) {
             const actor = makeCourier(payload, area, used, policy, staged);
@@ -2245,7 +2301,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (!value.canvas.width || !value.canvas.height) { return 'deferred'; }
         const viewport = viewportBounds();
         const policy = presentation(viewport);
-        const area = geometry(value.pageElement, viewport);
+        const area = geometry(value.pageElement, viewport, value.pageProjection);
         if (!area || area.width * (area.right - area.left) < policy.minimumWidth
             || area.height * (area.bottom - area.top) < policy.minimumHeight) { return 'deferred'; }
         if (!policy.maxActors || !policy.maxCargoBytes) { seen.add(value.pageNumber); stats.skipped++; return 'skipped'; }
@@ -2258,7 +2314,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             || dispatchOrigin && used.size >= ROBOT_VEHICLES.length) {
             capacityBlocked = true; return 'busy';
         }
-        const crops = selectCrops(value.canvas, area, policy, value.imageRegions);
+        const crops = selectCrops(value.canvas, area, policy, value.imageRegions, value.rasterProjection);
         if (!crops.length) { seen.add(value.pageNumber); stats.skipped++; return 'skipped'; }
         syncSceneOrigin();
         // Ready pixels have priority over parked work. Their bodies are reused, never duplicated.
@@ -2282,7 +2338,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 .sort((a, b) => b.y + b.height - a.y - a.height || b.score - a.score)[0] : undefined;
         const remaining = [...crops];
         if (lower) {
-            const ground = makeDelivery(value.canvas, lower, area, 0, 'solo', 1, used, policy, staged, true);
+            const ground = makeDelivery(value.canvas, lower, area, 0, 'solo', 1, used, policy, staged, true, value.rasterProjection);
             if (ground) {
                 payloads.push(ground); assigned++; used.add('forklift');
                 remaining.splice(remaining.indexOf(lower), 1);
@@ -2298,7 +2354,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             && (largeImage || stagedGround || enlarged.width >= first.width * 1.4 && enlarged.height >= first.height * 1.4)) {
             const helpers = !stagedGround && choice === 'trio' ? Math.min(3, count - assigned) : 2;
             const shared = makeDelivery(value.canvas, enlarged, area, payloads.length,
-                stagedGround || choice === 'airlift' ? 'airlift' : choice === 'handoff' ? 'handoff' : 'formation', helpers, used, policy, staged);
+                stagedGround || choice === 'airlift' ? 'airlift' : choice === 'handoff' ? 'handoff' : 'formation', helpers, used, policy, staged,
+                false, value.rasterProjection);
             if (shared) {
                 payloads.push(shared); assigned += shared.helpers.length;
                 sharedCrop = true;
@@ -2306,7 +2363,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             }
         }
         for (let index = sharedCrop ? 1 : 0; index < remaining.length && assigned < count; index++) {
-            const payload = makeDelivery(value.canvas, remaining[index], area, payloads.length, 'solo', 1, used, policy, staged);
+            const payload = makeDelivery(value.canvas, remaining[index], area, payloads.length, 'solo', 1, used, policy, staged,
+                false, value.rasterProjection);
             if (payload) {
                 payloads.push(payload); assigned++;
                 used.add(payload.helpers[0].vehicle);
@@ -2331,18 +2389,19 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             }
             container.append(transit);
             transit.append(layer);
-            const episode = { page: value.pageNumber, element: value.pageElement, kind: value.kind, layer, payloads };
+            const episode: Episode = { page: value.pageNumber, element: value.pageElement, kind: value.kind, layer, payloads,
+                pageProjection: value.pageProjection, displayRasterProjection: value.displayRasterProjection };
             episodes.set(value.pageNumber, episode);
             for (const payload of payloads) {
                 const cover = doc.createElement('div');
                 initializeSceneNode(cover, 'pdfDocumentRobotArrival', '4');
                 cover.dataset.payload = String(payload.id);
                 if (payload.crop.imageId) { cover.dataset.imageId = payload.crop.imageId; }
-                Object.assign(cover.style, { left: payload.crop.x * 100 + '%', top: payload.crop.y * 100 + '%',
-                    width: payload.crop.width * 100 + '%', height: payload.crop.height * 100 + '%',
-                    background: 'var(--page-bg-color, #fff)', opacity: '1' });
+                Object.assign(cover.style, { background: 'var(--page-bg-color, #fff)', opacity: '1',
+                    border: '0', borderRadius: '0', boxShadow: 'none' });
                 payload.cover = cover;
                 value.pageElement.append(cover);
+                paintArrival(payload, area.projection!, value.displayRasterProjection);
             }
             activePresentation = policy.kind;
             seen.add(value.pageNumber);

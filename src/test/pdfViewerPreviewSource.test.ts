@@ -89,7 +89,7 @@ describe('exact-document page preview sources', function () {
     function setup(spec = manifest(), overrides: Record<string, any> = {}) {
         const calls: Array<{ asset: any; signal: AbortSignal; result: Deferred<Uint8Array> }> = [];
         const changes = new Set<() => void>(), canvases: Canvas[] = [], decoded: Array<{ closed: number }> = [];
-        const paints: Array<{ page: any; canvas: Canvas }> = [], qualities = new Map<number, number>();
+        const paints: Array<{ page: any; canvas: Canvas; projection: any }> = [], qualities = new Map<number, number>();
         let manifestCalls = 0, notifications = 0;
         const source = { identity, loadManifest: async () => { manifestCalls++; return spec.value; },
             loadAsset: (asset: any, signal: AbortSignal) => {
@@ -100,7 +100,7 @@ describe('exact-document page preview sources', function () {
         const options = { pageCount: 100, decodeConcurrency: 1, maxDecodePixels: 1_000_000,
             createCanvas: () => { const canvas = new Canvas(); canvases.push(canvas); return canvas; },
             quality: (id: number) => qualities.get(id) ?? 0,
-            onPreview: (page: any, canvas: Canvas) => { paints.push({ page, canvas }); qualities.set(page.pageNumber, Math.max(canvas.width, canvas.height)); return true; },
+            onPreview: (page: any, canvas: Canvas, projection: any) => { paints.push({ page, canvas, projection }); qualities.set(page.pageNumber, Math.max(canvas.width, canvas.height)); return true; },
             onChange: () => { notifications++; },
             decode: async (_bytes: Uint8Array, asset: any) => {
                 const item = { closed: 0 }; decoded.push(item);
@@ -254,6 +254,19 @@ describe('exact-document page preview sources', function () {
         });
     }
 
+    it('publishes complete logical-page projection after every physical preview quarter-turn', async () => {
+        for (const angle of [0, 90, 180, 270]) {
+            const f = setup(manifest([1], [100]));
+            f.loader.update(f.plan([1], 83, angle)); await until(() => f.calls.length === 1);
+            f.resolve(0); await until(() => f.paints.length === 1);
+            const { canvas, projection } = f.paints[0];
+            const width = angle % 180 ? 83 : 66, height = angle % 180 ? 66 : 83;
+            assert.deepStrictEqual([canvas.width, canvas.height], [width, height]);
+            assert.deepStrictEqual(projection, { width, height, pageToRaster: [width, 0, 0, height, 0, 0] });
+            assert.strictEqual(f.decoded[0].closed, 1, 'projection metadata does not retain the decoded bitmap');
+        }
+    });
+
     it('closes late decode results on hide and on disposal without publishing or allocating canvases', async () => {
         for (const operation of ['hide', 'dispose']) {
             const result = new Deferred<any>(); let closed = 0, started = false;
@@ -270,9 +283,9 @@ describe('exact-document page preview sources', function () {
     it('memoizes rejected cache admission without blocking another visible page\'s refinement', async () => {
         const f = setup();
         const retain = f.options.onPreview;
-        f.options.onPreview = (page: any, canvas: Canvas) => {
+        f.options.onPreview = (page: any, canvas: Canvas, projection: any) => {
             if (page.pageNumber === 1) { canvas.width = canvas.height = 0; return false; }
-            return retain(page, canvas);
+            return retain(page, canvas, projection);
         };
         f.loader.update(f.plan([1, 2])); await until(() => f.calls.length === 2);
         f.resolve(0); f.resolve(1); await until(() => f.calls.length === 3);

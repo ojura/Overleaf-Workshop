@@ -38,6 +38,14 @@ On both device policies, a retained distant preview is sufficient coverage witho
 
 The [graduated preview cache](../views/pdf-viewer/src/common/pdf-preview-cache.ts) protects visible, attached, and prepared rasters, reduces the oldest unprotected entries first, then evicts only if needed. A returning finished native canvas upgrades its smaller trail preview with `drawImage`, without decoding the PDF again. Replacing an attached raster publishes its new node before releasing the previous bitmap. Failed admissions and canvas-allocation failures wait for the visible-page plan to change instead of retrying on every refresh.
 
+### Raster and page coordinates
+
+The shared [raster projection module](../views/pdf-viewer/src/common/pdf-raster-projection.ts) maps normalized logical page coordinates to backing pixels and to displayed CSS pixels. It keeps the full logical content rectangle separate from the visible page clip. PDF.js rounds its canvas backing and CSS dimensions while retaining the unrounded render viewport; using the rounded page box as the full logical page would shift and scale previews and photograph masks. The observed 50% Antigravity view, for example, has a 332.599 × 472.441 CSS-pixel logical page inside a 330 × 470 clip, with a 396 × 564 native backing.
+
+Each preview retains its projection with its canvas. Atlas images cover the complete normalized page. Independently rendered previews retain their unrounded viewport within the ceil-sized backing. Native copies retain the original viewport and actual output scale captured at the main `pagerender` event, including any clipped edge. Cache resizing scales that mapping independently on both axes. CSS-only rotation changes the logical basis of the retained pixels, so a clipped edge moves to the correct side without another full-page bitmap. CSS-only zoom derives displayed content from that saved mapping and the current native canvas box.
+
+Photo crops read outward from the floor of each source start to the ceiling of each source end. The bounded cargo canvas applies the exact logical transform, so the extra sampled edge pixels do not stretch the photograph or change its landing target during refinement. The source cover rounds outward on the displayed raster's pixel grid and clips to the visible page. Preview clipping, source sampling and cover placement use the same projection helpers in both extension engines and Spomenar.
+
 ### Display-sized image decoding
 
 `pdfDocumentCacheOptions()` supplies the same document options to the extension's two engines and Spomenar. Both device policies enable adaptive display-image decoding. Mobile admits one image job per document; desktop admits two while retaining its three cold-page preparation slots and larger raster budgets. These limits cover image construction as well as decoding: one admitted collage page can contain many large photographs. Printing requests original detail.
