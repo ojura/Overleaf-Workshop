@@ -7,10 +7,13 @@ const importModule = new Function('specifier', 'return import(specifier)') as (s
 const repo = path.resolve(__dirname, '..', '..');
 interface Rect { x: number; y: number; width: number; height: number }
 interface Panel { visible: boolean; dock: 'left' | 'right' | 'float'; rect: Rect; reason: string }
-interface Motion { id: number; fromX: number; toX: number; startedAt: number; durationMs: number; bounds?: Rect }
+interface Motion { id: number; fromX: number; toX: number; startedAt: number; durationMs: number; bounds?: Rect; holdAtEnd?: boolean }
 interface Column {
     readonly offsetX: number;
     readonly transition: Motion | undefined;
+    readonly pending: boolean;
+    readonly ready: boolean;
+    readonly readyAt: number;
     setPanel(panel: Panel): void;
     update(layoutChanged?: boolean): void;
     registerLayer(layer: any): () => void;
@@ -70,7 +73,7 @@ describe('PDF document column beside Motion Lab', function () {
     let dir: string;
     let plan: (viewport: Rect, pages: Rect[], panel?: Panel, appliedX?: number) => { offsetX: number; bounds?: Rect };
     let install: (container: any, options: any) => Column;
-    let policy: { durationMs: number; offsetProperty: string };
+    let policy: { durationMs: number; inputSettleMs: number; offsetProperty: string };
     const viewport: Rect = { x: 0, y: 0, width: 1200, height: 800 };
     const page: Rect = { x: 300, y: 0, width: 600, height: 1000 };
     const panel = (dock: Panel['dock'] = 'right', overrides: Partial<Panel> = {}): Panel => ({
@@ -92,8 +95,9 @@ describe('PDF document column beside Motion Lab', function () {
     after(() => { if (dir) { fs.rmSync(dir, { recursive: true, force: true }); } });
 
     function fixture(reduced = false, notification?: () => void) {
-        const clock = { now: 0, next: 0 };
+        const clock = { now: 0, next: 0, timerStarts: 0 };
         const frames = new Map<number, (at: number) => void>();
+        const timers = new Map<number, { at: number; callback(): void }>();
         const transitions: Array<Motion | undefined> = [];
         const media = Object.assign(new Events(), { matches: reduced });
         const visual = Object.assign(new Events(), { offsetLeft: 0, offsetTop: 0, width: 1400, height: 1000 });
@@ -114,6 +118,11 @@ describe('PDF document column beside Motion Lab', function () {
             console: { error: (message: string, error: unknown) => errors.push({ message, error }) },
             matchMedia: () => media,
             getComputedStyle: (element: Element) => ({ translate: element.style.getPropertyValue('translate') || 'none' }),
+            setTimeout(callback: () => void, delay: number) {
+                const id = ++clock.next; clock.timerStarts++;
+                timers.set(id, { at: clock.now + delay, callback }); return id;
+            },
+            clearTimeout(id: number) { timers.delete(id); },
         });
         Object.defineProperty(window, 'ResizeObserver', { value: observerConstructor });
         document.defaultView = window;
@@ -134,10 +143,28 @@ describe('PDF document column beside Motion Lab', function () {
             onTransition(motion: Motion | undefined) { transitions.push(motion); notification?.(); },
         });
         const releaseTransit = api.registerLayer(transit);
-        return { api, pages, container, viewer, transit, media, visual, document, window, frames, transitions, observers, errors, makePage, releaseTransit,
-            frame(at: number) {
-                clock.now = at;
-                for (const [id, callback] of [...frames]) { if (frames.delete(id)) { callback(at); } }
+        const advance = (at: number) => {
+            clock.now = at;
+            for (const [id, timer] of [...timers]) {
+                if (timer.at <= at && timers.delete(id)) { timer.callback(); }
+            }
+        };
+        const frame = (at: number) => {
+            advance(at);
+            for (const [id, callback] of [...frames]) { if (frames.delete(id)) { callback(at); } }
+        };
+        return { api, pages, container, viewer, transit, media, visual, document, window, frames, timers, clock,
+            transitions, observers, errors, makePage, releaseTransit, advance, frame,
+            finish() {
+                for (let step = 0; step < 8 && (frames.size || timers.size); step++) {
+                    const motion = api.transition;
+                    const at = Math.min(...[...timers.values()].map(timer => timer.at),
+                        frames.size && motion ? motion.startedAt + motion.durationMs : Infinity);
+                    assert.ok(Number.isFinite(at), 'each owned callback has a finite scene or settling deadline');
+                    frame(Math.max(clock.now, at));
+                }
+                assert.strictEqual(frames.size + timers.size, 0, 'the latest finite arrangement converges');
+                assert.strictEqual(api.ready, true);
             } };
     }
 
@@ -265,6 +292,155 @@ describe('PDF document column beside Motion Lab', function () {
         }
     });
 
+    it('settles drag, resize and viewport input before moving the column through one finite scene', () => {
+        for (const reason of ['drag', 'resize', 'viewport']) {
+            const f = fixture();
+            try {
+                f.api.setPanel(panel('float', { rect: { x: 950, y: 0, width: 250, height: 800 } }));
+                if (reason === 'viewport') {
+                    f.pages[0].box.x = 400;
+                    f.window.emit('resize');
+                } else { f.api.setPanel(panel('float', { reason })); }
+                assert.strictEqual(f.api.offsetX, 0, reason + ' must wait for settled input instead of applying synchronously');
+                assert.strictEqual(f.api.transition, undefined);
+                assert.strictEqual(f.frames.size, 0);
+                assert.strictEqual(f.timers.size, 1);
+                assert.strictEqual(f.api.ready, false);
+                assert.strictEqual(f.api.readyAt, 300 + policy.durationMs);
+                assert.strictEqual(f.container.dataset.pdfColumnMoving, 'true');
+                f.advance(299); assert.strictEqual(f.api.transition, undefined);
+                f.advance(300);
+                const motion = f.api.transition as Motion | undefined;
+                assert.ok(motion, 'the settled wake starts the finite column scene');
+                assert.strictEqual(motion.startedAt, 300);
+                assert.strictEqual(motion.toX, reason === 'viewport' ? -66 : -116);
+                assert.strictEqual(f.timers.size, 0);
+                f.frame(300 + policy.durationMs);
+                assert.strictEqual(f.api.offsetX, reason === 'viewport' ? -66 : -116);
+                assert.strictEqual(f.api.ready, true);
+                assert.strictEqual(f.frames.size + f.timers.size, 0);
+                assert.strictEqual(f.container.dataset.pdfColumnMoving, undefined);
+                assert.deepStrictEqual([f.container.scrollLeft, f.container.scrollTop], [17, 83]);
+            } finally { f.api.dispose(); }
+        }
+    });
+
+    it('coalesces a drag burst into the latest destination using one owned settling wake', () => {
+        const f = fixture();
+        try {
+            f.api.setPanel(panel('float', { reason: 'drag' }));
+            f.advance(100);
+            f.api.setPanel(panel('float', { reason: 'drag', rect: { x: 780, y: 0, width: 420, height: 800 } }));
+            f.advance(200);
+            f.api.setPanel(panel('float', { reason: 'resize', rect: { x: 750, y: 0, width: 450, height: 800 } }));
+            assert.strictEqual(f.api.offsetX, 0);
+            assert.strictEqual(f.transitions.length, 0, 'pointer samples do not allocate actor jobs');
+            assert.strictEqual(f.clock.timerStarts, 1, 'later samples update the one owned wake');
+            assert.strictEqual(f.api.readyAt, 500 + policy.durationMs);
+            f.advance(300);
+            assert.strictEqual(f.timers.size, 1);
+            assert.strictEqual(f.clock.timerStarts, 2, 'an early wake waits only for the remaining quiet interval');
+            f.advance(400); f.api.update(false); f.api.update();
+            assert.strictEqual(f.api.readyAt, 500 + policy.durationMs, 'unchanged reader plans do not postpone input settling');
+            f.advance(500);
+            assert.strictEqual(f.transitions.length, 1);
+            assert.strictEqual(f.api.transition?.toX, -166);
+            f.frame(500 + policy.durationMs);
+            assert.strictEqual(f.api.offsetX, -166);
+            assert.strictEqual(f.api.ready, true);
+            assert.strictEqual(f.frames.size + f.timers.size, 0);
+        } finally { f.api.dispose(); }
+    });
+
+    it('finishes an engaged leg before taking one latest settled continuation', () => {
+        const f = fixture();
+        try {
+            f.api.setPanel(panel()); f.frame(1000);
+            const original = f.api.transition!, from = f.api.offsetX;
+            f.api.setPanel(panel('left', { reason: 'drag' }));
+            f.advance(1100);
+            f.api.setPanel(panel('left', { reason: 'resize', rect: { x: 0, y: 0, width: 450, height: 800 } }));
+            assert.strictEqual(f.api.offsetX, from);
+            assert.strictEqual(f.api.transition?.id, original.id);
+            assert.strictEqual(f.api.transition?.startedAt, original.startedAt);
+            assert.strictEqual(f.api.transition?.toX, original.toX);
+            assert.strictEqual(f.api.transition?.holdAtEnd, true);
+            assert.strictEqual(f.api.readyAt, policy.durationMs * 2);
+            f.advance(1400);
+            const stale = [...f.frames.values()][0];
+            f.frame(policy.durationMs);
+            const next = f.api.transition!;
+            assert.ok(next.id > original.id);
+            assert.strictEqual(next.fromX, original.toX);
+            assert.strictEqual(next.toX, 166);
+            assert.strictEqual(next.startedAt, policy.durationMs);
+            assert.ok(f.transitions.every(value => value), 'the actor stays owned between legs');
+            const offset = f.api.offsetX;
+            stale(10000);
+            assert.strictEqual(f.api.transition, next);
+            assert.strictEqual(f.api.offsetX, offset);
+            f.frame(policy.durationMs * 2);
+            assert.strictEqual(f.api.offsetX, 166);
+            assert.strictEqual(f.api.ready, true);
+            assert.strictEqual(f.transitions.filter(value => !value).length, 1);
+            assert.strictEqual(f.frames.size + f.timers.size, 0);
+        } finally { f.api.dispose(); }
+    });
+
+    it('parks at the completed edge without frames while the latest input is still settling', () => {
+        const f = fixture();
+        try {
+            f.api.setPanel(panel()); f.frame(2400);
+            f.api.setPanel(panel('left', { reason: 'drag' }));
+            const original = f.api.transition!;
+            f.frame(2500);
+            assert.strictEqual(f.api.offsetX, -116);
+            assert.strictEqual(f.api.transition?.id, original.id);
+            assert.strictEqual(f.api.transition?.holdAtEnd, true);
+            assert.strictEqual(f.frames.size, 0);
+            assert.strictEqual(f.timers.size, 1);
+            assert.strictEqual(f.api.ready, false);
+            assert.strictEqual(f.api.readyAt, 2700 + policy.durationMs);
+            f.advance(2600);
+            f.api.setPanel(panel('left', { reason: 'drag', rect: { x: 0, y: 0, width: 450, height: 800 } }));
+            assert.strictEqual(f.api.readyAt, 2900 + policy.durationMs);
+            f.advance(2700);
+            assert.strictEqual(f.frames.size, 0);
+            f.advance(2900);
+            assert.ok(f.api.transition!.id > original.id);
+            assert.strictEqual(f.api.transition?.fromX, -116);
+            assert.strictEqual(f.api.transition?.toX, 166);
+            f.frame(2900 + policy.durationMs);
+            assert.strictEqual(f.api.ready, true);
+            assert.strictEqual(f.frames.size + f.timers.size, 0);
+        } finally { f.api.dispose(); }
+    });
+
+    it('cancels the owned pending wake on lifecycle exits and rejects its late callback', () => {
+        for (const engaged of [false, true]) {
+            for (const boundary of ['hidden', 'reduced', 'dispose']) {
+                const f = fixture();
+                try {
+                    if (engaged) { f.api.setPanel(panel()); f.frame(1000); }
+                    f.api.setPanel(panel('left', { reason: 'drag' }));
+                    assert.strictEqual(f.timers.size, 1);
+                    const late = [...f.timers.values()][0].callback;
+                    if (boundary === 'hidden') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+                    else if (boundary === 'reduced') { f.media.matches = true; f.media.emit('change'); }
+                    else { f.api.dispose(); }
+                    const offset = f.api.offsetX;
+                    late();
+                    assert.strictEqual(f.api.offsetX, offset);
+                    assert.strictEqual(offset, boundary === 'dispose' ? 0 : 116);
+                    assert.strictEqual(f.api.ready, true);
+                    assert.strictEqual(f.api.transition, undefined);
+                    assert.strictEqual(f.frames.size + f.timers.size, 0);
+                    assert.strictEqual(f.container.dataset.pdfColumnMoving, undefined);
+                } finally { f.api.dispose(); }
+            }
+        }
+    });
+
     it('observes floating-panel geometry and updates a cleared column during drag, resize and page changes', () => {
         const f = fixture();
         try {
@@ -276,21 +452,24 @@ describe('PDF document column beside Motion Lab', function () {
             assert.strictEqual(f.api.offsetX, -116, 'a still-feasible placement stays put while the panel moves away');
             assert.strictEqual(f.frames.size, 0);
             f.api.setPanel(panel('float', { reason: 'drag', rect: { x: 750, y: 0, width: 450, height: 800 } }));
+            f.finish();
             assert.strictEqual(f.api.offsetX, -166);
             f.api.setPanel(panel('float', { reason: 'drag', rect: { x: 950, y: 0, width: 250, height: 800 } }));
+            f.finish();
             assert.strictEqual(f.api.offsetX, 0, 'dragging into the original blank margin restores centering');
             f.api.setPanel(panel('float', { reason: 'drag', rect: { x: 750, y: 0, width: 450, height: 800 } }));
+            f.finish();
             assert.strictEqual(f.api.offsetX, -166);
             const previous = f.pages[0], next = f.makePage({ ...page, x: 350 });
-            f.pages.splice(0, 1, next); f.api.update(false);
+            f.pages.splice(0, 1, next); f.api.update(false); f.finish();
             assert.strictEqual(f.api.offsetX, -216);
             assert.strictEqual(previous.style.getPropertyValue('translate'), '');
             assert.ok(f.observers[0].watched.has(next));
-            next.box.width = 800; f.observers[0].trigger();
+            next.box.width = 800; f.observers[0].trigger(); f.finish();
             assert.strictEqual(f.api.offsetX, 0, 'a wider page must not be clipped to clear the float');
-            next.box.width = 600; f.observers[0].trigger();
+            next.box.width = 600; f.observers[0].trigger(); f.finish();
             assert.strictEqual(f.api.offsetX, -216);
-            next.box.y = -1100; f.api.update(false);
+            next.box.y = -1100; f.api.update(false); f.finish();
             assert.strictEqual(f.api.offsetX, 0, 'vertical scrolling out of the panel overlap restores the column');
             assert.strictEqual(f.frames.size, 0);
             assert.deepStrictEqual([f.container.scrollLeft, f.container.scrollTop], [17, 83]);
@@ -303,14 +482,14 @@ describe('PDF document column beside Motion Lab', function () {
         const f = fixture();
         try {
             f.api.setPanel(panel('float')); f.frame(policy.durationMs);
-            f.visual.offsetLeft = 200; f.visual.width = 800; f.visual.emit('resize');
+            f.visual.offsetLeft = 200; f.visual.width = 800; f.visual.emit('resize'); f.finish();
             assert.strictEqual(f.api.offsetX, 0, 'the remaining left side is narrower than the full page plus gap');
-            f.visual.offsetLeft = 0; f.visual.width = 1400; f.visual.emit('scroll');
+            f.visual.offsetLeft = 0; f.visual.width = 1400; f.visual.emit('scroll'); f.finish();
             assert.strictEqual(f.api.offsetX, -116);
             f.api.setPanel(panel('float', { visible: false, reason: 'close' }));
             assert.strictEqual(f.frames.size, 1);
             assert.strictEqual(f.container.dataset.pdfColumnMoving, 'true');
-            f.frame(policy.durationMs * 2);
+            f.finish();
             assert.strictEqual(f.api.offsetX, 0);
             assert.strictEqual(f.frames.size, 0);
             assert.strictEqual(f.container.dataset.pdfColumnMoving, undefined);
@@ -340,23 +519,26 @@ describe('PDF document column beside Motion Lab', function () {
         } finally { f.api.dispose(); }
     });
 
-    it('publishes animated retargets directly and rejects old callbacks without ending the successor', () => {
+    it('publishes a settled dock continuation without ending its actor and rejects the old callback', () => {
         const f = fixture();
         try {
             const retargetAt = policy.durationMs / 2;
             f.api.setPanel(panel()); f.frame(retargetAt);
             const previous = f.api.transition!, stale = [...f.frames.values()][0], from = f.api.offsetX;
             f.api.setPanel(panel('left', { reason: 'dock' }));
+            assert.strictEqual(f.api.transition?.id, previous.id);
+            assert.strictEqual(f.api.offsetX, from);
+            f.frame(policy.durationMs);
             const next = f.api.transition!;
             assert.ok(next.id > previous.id);
-            assert.deepStrictEqual(f.transitions, [previous, next], 'retargeting must not signal an intermediate actor release');
-            assert.strictEqual(next.fromX, from);
+            assert.ok(f.transitions.every(value => value), 'continuation must not signal an intermediate actor release');
+            assert.strictEqual(next.fromX, previous.toX);
             stale(10000);
             assert.strictEqual(f.api.transition, next);
-            assert.strictEqual(f.api.offsetX, from);
+            assert.strictEqual(f.api.offsetX, previous.toX);
             assert.strictEqual(f.container.dataset.pdfColumnMoving, 'true');
-            f.frame(retargetAt + policy.durationMs);
-            assert.deepStrictEqual(f.transitions, [previous, next, undefined]);
+            f.frame(policy.durationMs * 2);
+            assert.strictEqual(f.transitions.filter(value => !value).length, 1);
             assert.strictEqual(f.container.dataset.pdfColumnMoving, undefined);
             assert.strictEqual(f.frames.size, 0);
         } finally { f.api.dispose(); }
@@ -371,26 +553,27 @@ describe('PDF document column beside Motion Lab', function () {
             assert.strictEqual(f.api.transition?.toX, 306);
             f.api.setPanel(panel('float', { reason: 'dock', rect: { x: 500, y: 0, width: 200, height: 800 } }));
             assert.strictEqual(f.api.offsetX, 0);
-            assert.strictEqual(f.api.transition?.toX, 316);
+            assert.strictEqual(f.api.transition?.toX, 306, 'the committed approach keeps its chosen edge');
             f.api.update(false);
-            assert.strictEqual(f.api.transition?.toX, 316, 'routine measurement preserves the approach direction too');
+            assert.strictEqual(f.api.transition?.toX, 306);
             assert.ok(f.transitions.every(value => value));
             f.frame(policy.durationMs);
+            assert.strictEqual(f.api.transition?.toX, 316, 'the settled destination keeps the same side');
+            f.finish();
             assert.strictEqual(f.api.offsetX, 316);
             assert.strictEqual(f.frames.size, 0);
         } finally { f.api.dispose(); }
     });
 
-    it('ends an animated retarget exactly once on immediate layout, reduced motion, hide or disposal', () => {
-        for (const boundary of ['layout', 'reduced', 'hidden', 'dispose']) {
+    it('ends active and pending motion exactly once on reduced motion, hide or disposal', () => {
+        for (const boundary of ['reduced', 'hidden', 'dispose']) {
             const f = fixture();
             try {
                 f.container.dataset.pdfColumnMoving = 'existing';
                 f.api.setPanel(panel()); f.frame(policy.durationMs / 2);
                 f.api.setPanel(panel('left', { reason: 'dock' }));
                 const stale = [...f.frames.values()][0];
-                if (boundary === 'layout') { f.pages[0].box.x += 50; f.api.update(); }
-                else if (boundary === 'reduced') { f.media.matches = true; f.media.emit('change'); }
+                if (boundary === 'reduced') { f.media.matches = true; f.media.emit('change'); }
                 else if (boundary === 'hidden') { f.document.hidden = true; f.document.emit('visibilitychange'); }
                 else { f.api.dispose(); }
                 const offset = f.api.offsetX;
@@ -461,6 +644,7 @@ describe('PDF document column beside Motion Lab', function () {
             f.pages.splice(0, 1, narrow);
             f.api.update(false);
             assert.ok(reads > 0, 'a different visible page invalidates the width proof');
+            f.finish();
             assert.strictEqual(f.api.offsetX, -116);
             assert.ok(f.observers[0].watched.has(narrow));
         } finally { f.api.dispose(); }
@@ -480,6 +664,8 @@ describe('PDF document column beside Motion Lab', function () {
                 else if (change === 'visual-resize') { f.visual.emit('resize'); }
                 else if (change === 'visual-scroll') { f.visual.emit('scroll'); }
                 else { f.api.setPanel(panel('right', { reason: 'resize' })); }
+                assert.strictEqual(f.api.pending, true, change + ' must plan the new margin');
+                f.finish();
                 assert.strictEqual(f.api.offsetX, -116, change + ' must measure the new margin');
                 assert.strictEqual(f.frames.size, 0);
             } finally { f.api.dispose(); }
@@ -547,7 +733,7 @@ describe('PDF document column beside Motion Lab', function () {
         } finally { f.api.dispose(); }
     });
 
-    it('applies sidebar and zoom changes immediately and cancels the superseded frame', () => {
+    it('arranges sidebar and zoom changes after the committed leg and ignores its consumed callback', () => {
         const f = fixture();
         try {
             f.api.setPanel(panel());
@@ -556,30 +742,36 @@ describe('PDF document column beside Motion Lab', function () {
             f.container.box.x = 200; f.container.box.width = f.container.clientWidth = 1000;
             f.pages[0].box.x = 350;
             f.observers[0].trigger();
+            assert.strictEqual(f.api.offsetX, 0, 'layout changes do not snap the applied column');
+            f.finish();
             assert.strictEqual(f.api.offsetX, -150);
             assert.strictEqual(f.frames.size, 0);
             stale(300);
             assert.strictEqual(f.api.offsetX, -150);
             f.pages[0].box.x = 200; f.pages[0].box.width = 1000;
             f.api.update();
+            f.finish();
             assert.strictEqual(f.api.offsetX, 0);
             assert.strictEqual(f.pages[0].style.getPropertyValue('translate'), '');
         } finally { f.api.dispose(); }
     });
 
-    it('starts a changed dock from the applied position and rejects an old callback', () => {
+    it('starts a changed dock from the completed leg and rejects its old callback', () => {
         const f = fixture();
         try {
             f.api.setPanel(panel()); f.frame(100);
             const from = f.api.offsetX, first = f.api.transition!, stale = [...f.frames.values()][0];
             f.api.setPanel(panel('left', { reason: 'dock' }));
-            assert.strictEqual(f.api.transition?.fromX, from);
+            assert.strictEqual(f.api.offsetX, from);
+            assert.strictEqual(f.api.transition?.id, first.id);
+            f.frame(policy.durationMs);
+            assert.strictEqual(f.api.transition?.fromX, first.toX);
             assert.strictEqual(f.api.transition?.toX, 116);
             assert.ok(f.api.transition!.id > first.id);
             stale(1000);
-            assert.strictEqual(f.api.offsetX, from);
+            assert.strictEqual(f.api.offsetX, first.toX);
             assert.strictEqual(f.frames.size, 1);
-            f.frame(100 + policy.durationMs);
+            f.frame(policy.durationMs * 2);
             assert.strictEqual(f.api.offsetX, 116);
             assert.strictEqual(f.frames.size, 0);
         } finally { f.api.dispose(); }
@@ -590,11 +782,11 @@ describe('PDF document column beside Motion Lab', function () {
         try {
             f.api.setPanel(panel()); f.frame(policy.durationMs);
             f.visual.offsetLeft = 200; f.visual.width = 800;
-            f.visual.emit('resize');
+            f.visual.emit('resize'); f.finish();
             assert.strictEqual(f.api.offsetX, -100, 'only the visible opposite margin is available');
             assert.strictEqual(f.frames.size, 0);
             f.visual.offsetLeft = 0; f.visual.width = 1400;
-            f.visual.emit('scroll');
+            f.visual.emit('scroll'); f.finish();
             assert.strictEqual(f.api.offsetX, -116);
             assert.strictEqual(f.frames.size, 0);
         } finally { f.api.dispose(); }

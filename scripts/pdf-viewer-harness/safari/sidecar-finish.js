@@ -145,6 +145,11 @@
         if (floating) {
           if (panelState().dock !== 'float') { dock('float', check); await settlePanel('restore undock', { check, deadline }); }
           let current = panelState();
+          // Moving first permits growth near a viewport edge; the final drag corrects any clamp while shrinking.
+          if (!closeEnough(current.rect.x, floating.rect.x) || !closeEnough(current.rect.y, floating.rect.y)) {
+            pointGesture('drag', floating.rect.x - current.rect.x, floating.rect.y - current.rect.y, check);
+            current = panelState();
+          }
           if (!closeEnough(current.rect.width, floating.rect.width) || !closeEnough(current.rect.height, floating.rect.height)) {
             pointGesture('resize', floating.rect.width - current.rect.width, floating.rect.height - current.rect.height, check);
           }

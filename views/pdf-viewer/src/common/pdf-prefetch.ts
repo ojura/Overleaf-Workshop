@@ -369,6 +369,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     }
 
     function readerInteraction(event: Event): void {
+        if (event.type === 'keydown' && diagnostics?.ownsEvent(event)) { return; }
         if (event.isTrusted) { cancelReplacement(); documentRobots?.cancelColumnMotion(); }
     }
 
@@ -1338,8 +1339,13 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         onPanelLayout: layout => {
             if (disposed) { return; }
             documentColumn?.setPanel(layout);
-            const motion = documentColumn?.transition;
-            return motion ? { readyAt: motion.startedAt + motion.durationMs } : undefined;
+            const column = documentColumn;
+            if (column && !column.ready) {
+                return {
+                    get readyAt() { return disposed ? 0 : column.readyAt; },
+                    isReady: () => disposed || column.ready,
+                };
+            }
         },
         enabled: options.diagnosticsEnabled,
         robots: {

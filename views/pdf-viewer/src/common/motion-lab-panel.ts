@@ -14,7 +14,21 @@ export interface MotionLabPanelLayout {
 export interface MotionLabPanelPreparation {
     /** The column's finite scene deadline on the same performance clock as the panel. */
     readyAt: number;
+    /** Continued column movement can update its deadline before it reaches the requested position. */
+    isReady?(): boolean;
 }
+
+export const MOTION_LAB_RESIZE_HANDLES = Object.freeze({
+    n: 'Resize Motion Lab from the top edge',
+    ne: 'Resize Motion Lab from the top right corner',
+    e: 'Resize Motion Lab from the right edge',
+    se: 'Resize Motion Lab from the bottom right corner',
+    s: 'Resize Motion Lab from the bottom edge',
+    sw: 'Resize Motion Lab from the bottom left corner',
+    w: 'Resize Motion Lab from the left edge',
+    nw: 'Resize Motion Lab from the top left corner',
+});
+export type MotionLabResizeDirection = keyof typeof MOTION_LAB_RESIZE_HANDLES;
 
 export const MOTION_LAB_PANEL_LIMITS = Object.freeze({
     margin: 8, minWidth: 240, minHeight: 160, defaultWidth: 456, defaultHeight: 560, keyboardStep: 10,
@@ -84,6 +98,27 @@ export class MotionLabPanelGeometry {
         else { this.dockWidth = fit({ ...this.floating, width }, this.viewport).width; }
     }
 
+    resizeFrom(direction: MotionLabResizeDirection, dx: number, dy: number, start = this.snapshot().rect): void {
+        if (!Object.prototype.hasOwnProperty.call(MOTION_LAB_RESIZE_HANDLES, direction) || !finite(dx) || !finite(dy)) {
+            throw new RangeError('Invalid Motion Lab resize.');
+        }
+        validateRect(start);
+        const room = available(this.viewport), rect = fit(start, this.viewport);
+        const minWidth = Math.min(MOTION_LAB_PANEL_LIMITS.minWidth, room.width);
+        const minHeight = Math.min(MOTION_LAB_PANEL_LIMITS.minHeight, room.height);
+        if (this.dock === 'left' && direction === 'e' || this.dock === 'right' && direction === 'w') {
+            this.dockWidth = clamp(rect.width + (direction === 'w' ? -dx : dx), minWidth, room.width);
+            return;
+        }
+        let left = rect.x, right = rect.x + rect.width, top = rect.y, bottom = rect.y + rect.height;
+        if (direction.includes('w')) { left = clamp(left + dx, room.x, right - minWidth); }
+        else if (direction.includes('e')) { right = clamp(right + dx, left + minWidth, room.x + room.width); }
+        if (direction.includes('n')) { top = clamp(top + dy, room.y, bottom - minHeight); }
+        else if (direction.includes('s')) { bottom = clamp(bottom + dy, top + minHeight, room.y + room.height); }
+        this.floating = { x: left, y: top, width: right - left, height: bottom - top };
+        this.dock = 'float';
+    }
+
     snapshot(): { dock: MotionLabDock; rect: MotionLabPanelRect } {
         if (this.dock === 'float') { return { dock: this.dock, rect: fit(this.floating, this.viewport) }; }
         const room = available(this.viewport);
@@ -96,7 +131,7 @@ export class MotionLabPanelGeometry {
 interface MotionLabPanelOptions {
     surface: HTMLElement;
     dragHandle: HTMLElement;
-    resizeHandle: HTMLElement;
+    resizeHandles: Readonly<Record<MotionLabResizeDirection, HTMLElement>>;
     dockButtons: Record<MotionLabDock, HTMLButtonElement>;
     onLayout?: (layout: MotionLabPanelLayout) => MotionLabPanelPreparation | void;
     /** Actual displayed geometry changed; invalidate courier destinations before layout consumers run. */
@@ -107,16 +142,20 @@ interface MotionLabPanelOptions {
 export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanelOptions) {
     const doc = host.ownerDocument, win = doc.defaultView!;
     const media = win.matchMedia('(prefers-reduced-motion: reduce)');
+    const resizeHandles = (Object.keys(MOTION_LAB_RESIZE_HANDLES) as MotionLabResizeDirection[])
+        .map(direction => ({ direction, handle: options.resizeHandles[direction] }));
     let geometry: MotionLabPanelGeometry | undefined;
     let visible = false, disposed = false, watching = false;
     let observer: ResizeObserver | undefined;
     let emitted: MotionLabPanelLayout | undefined;
     let displayed: MotionLabPanelRect | undefined;
     let layoutRevision = 0;
-    let motion: { from: MotionLabPanelRect; to: MotionLabPanelRect; moveAt: number } | undefined;
+    let motion: { from: MotionLabPanelRect; to: MotionLabPanelRect; moveAt: number;
+        preparation?: MotionLabPanelPreparation } | undefined;
     let frame: { id: number } | undefined;
     let gesture: { id: number; handle: HTMLElement; kind: 'drag' | 'resize';
-        x: number; y: number; rect: MotionLabPanelRect; dock: MotionLabDock; floatingResize?: boolean } | undefined;
+        x: number; y: number; rect: MotionLabPanelRect; dock: MotionLabDock; floatingResize?: boolean;
+        direction?: MotionLabResizeDirection } | undefined;
     const sameRect = (a: MotionLabPanelRect, b: MotionLabPanelRect) =>
         (['x', 'y', 'width', 'height'] as const).every(key => a[key] === b[key]);
 
@@ -148,7 +187,11 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
         Object.assign(host.style, { left: rect.x + 'px', top: rect.y + 'px', right: 'auto', bottom: 'auto',
             width: rect.width + 'px', height: rect.height + 'px' });
         Object.assign(options.surface.style, { width: '100%', height: '100%', maxWidth: 'none', maxHeight: 'none' });
-        options.resizeHandle.setAttribute('aria-label', 'Resize Motion Lab with arrow keys; ' + Math.round(rect.width) + ' by ' + Math.round(rect.height) + ' pixels');
+        for (const { direction, handle } of resizeHandles) {
+            const label = MOTION_LAB_RESIZE_HANDLES[direction] + ' with arrow keys; '
+                + Math.round(rect.width) + ' by ' + Math.round(rect.height) + ' pixels';
+            if (handle.getAttribute('aria-label') !== label) { handle.setAttribute('aria-label', label); }
+        }
         invalidateGeometry();
         return true;
     }
@@ -187,6 +230,16 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
         pending.id = win.requestAnimationFrame(at => {
             if (frame !== pending || motion !== owned || disposed || !visible || doc.hidden) { return; }
             frame = undefined;
+            if (owned.preparation) {
+                const preparation = owned.preparation;
+                const readyAt = preparation.readyAt;
+                if (finite(readyAt)) { owned.moveAt = Math.max(owned.moveAt, readyAt); }
+                const ready = preparation.isReady ? preparation.isReady() : at >= owned.moveAt;
+                if (motion !== owned || disposed || !visible || doc.hidden) { return; }
+                if (!ready) { schedule(); return; }
+                if (preparation.isReady) { owned.moveAt = at; }
+                owned.preparation = undefined;
+            }
             const progress = motionLabEase((at - owned.moveAt) / MOTION_LAB_CHOREOGRAPHY.dockMs);
             const rect = { ...owned.to };
             for (const key of ['x', 'y', 'width', 'height'] as const) {
@@ -206,14 +259,15 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
         controls();
         const moving = animate && visible && !doc.hidden && !media.matches && !sameRect(from, target);
         const startedAt = moving ? win.performance.now() : 0;
-        const owned = moving ? { from: { ...from }, to: { ...target }, moveAt: startedAt } : undefined;
+        const owned: typeof motion = moving ? { from: { ...from }, to: { ...target }, moveAt: startedAt } : undefined;
         if (owned) { motion = owned; host.dataset.panelMoving = 'true'; }
         const geometryInvalidated = paint(owned ? from : target);
         if (revision !== layoutRevision || disposed) { return; }
         const preparation = emit(reason, geometryInvalidated);
         if (!owned || motion !== owned || revision !== layoutRevision || disposed || !visible || doc.hidden) { return; }
-        if (preparation && finite(preparation.readyAt)) {
-            owned.moveAt = clamp(preparation.readyAt, startedAt, startedAt + MOTION_LAB_CHOREOGRAPHY.columnDurationMs);
+        if (preparation && (finite(preparation.readyAt) || preparation.isReady)) {
+            owned.preparation = preparation;
+            if (finite(preparation.readyAt)) { owned.moveAt = Math.max(startedAt, preparation.readyAt); }
         }
         schedule();
     }
@@ -263,17 +317,12 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
         const dx = event.clientX - gesture.x, dy = event.clientY - gesture.y;
         if (!finite(dx) || !finite(dy)) { return; }
         if (gesture.kind === 'drag') { model().moveTo(gesture.rect.x + dx, gesture.rect.y + dy); }
-        else {
-            model().resizeTo(gesture.rect.width + (gesture.dock === 'right' ? -dx : dx), gesture.rect.height + dy);
-            if (gesture.floatingResize && gesture.dock === 'right') {
-                model().moveTo(gesture.rect.x + gesture.rect.width - model().snapshot().rect.width, gesture.rect.y);
-            }
-        }
+        else { model().resizeFrom(gesture.direction!, dx, dy, gesture.rect); }
         event.preventDefault();
         apply(gesture.kind);
     }
 
-    function begin(event: PointerEvent, kind: 'drag' | 'resize', handle: HTMLElement): void {
+    function begin(event: PointerEvent, kind: 'drag' | 'resize', handle: HTMLElement, direction?: MotionLabResizeDirection): void {
         if (disposed || !visible || doc.hidden || gesture || event.button !== 0 || event.isPrimary === false) { return; }
         if (!finite(event.clientX) || !finite(event.clientY)) { return; }
         const interruptedDock = takeControl();
@@ -288,9 +337,14 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
             apply('drag');
             state = model().snapshot();
         }
+        if (kind === 'resize') {
+            model().resizeFrom(direction!, 0, 0, state.rect);
+            if (model().snapshot().dock !== state.dock) { apply('resize'); }
+            state = model().snapshot();
+        }
         if (disposed || !visible || doc.hidden) { return; }
         gesture = { id: event.pointerId, handle, kind, x: event.clientX, y: event.clientY, ...state,
-            dock: interruptedDock ?? state.dock, floatingResize: !!interruptedDock && kind === 'resize' };
+            dock: interruptedDock ?? state.dock, floatingResize: !!interruptedDock && kind === 'resize', direction };
         controls();
         event.preventDefault();
         handle.focus({ preventScroll: true });
@@ -303,13 +357,16 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
     }
 
     const beginDrag = (event: PointerEvent) => begin(event, 'drag', options.dragHandle);
-    const beginResize = (event: PointerEvent) => begin(event, 'resize', options.resizeHandle);
 
-    function keyboard(event: KeyboardEvent, kind: 'drag' | 'resize'): void {
+    function keyboard(event: KeyboardEvent, kind: 'drag' | 'resize', direction?: MotionLabResizeDirection): void {
         if (disposed || !visible || doc.hidden || event.altKey || event.ctrlKey || event.metaKey) { return; }
         const delta = event.shiftKey ? MOTION_LAB_PANEL_LIMITS.keyboardStep * 4 : MOTION_LAB_PANEL_LIMITS.keyboardStep;
-        const dx = event.key === 'ArrowLeft' ? -delta : event.key === 'ArrowRight' ? delta : 0;
-        const dy = event.key === 'ArrowUp' ? -delta : event.key === 'ArrowDown' ? delta : 0;
+        let dx = event.key === 'ArrowLeft' ? -delta : event.key === 'ArrowRight' ? delta : 0;
+        let dy = event.key === 'ArrowUp' ? -delta : event.key === 'ArrowDown' ? delta : 0;
+        if (direction) {
+            if (!direction.includes('w') && !direction.includes('e')) { dx = 0; }
+            if (!direction.includes('n') && !direction.includes('s')) { dy = 0; }
+        }
         if (!dx && !dy) { return; }
         endGesture();
         takeControl();
@@ -317,13 +374,12 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
         if (kind === 'drag') {
             if (state.dock !== 'float') { model().setDock('float'); }
             model().moveTo(state.rect.x + dx, state.rect.y + dy);
-        } else { model().resizeTo(state.rect.width + dx, state.rect.height + dy); }
+        } else { model().resizeFrom(direction!, dx, dy, state.rect); }
         event.preventDefault();
         event.stopPropagation();
         apply(kind);
     }
     const moveKey = (event: KeyboardEvent) => keyboard(event, 'drag');
-    const resizeKey = (event: KeyboardEvent) => keyboard(event, 'resize');
 
     function refreshViewport(): void {
         if (!watching || disposed) { return; }
@@ -395,8 +451,14 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
     const dockLeft = () => setDock('left'), dockRight = () => setDock('right'), float = () => setDock('float');
     options.dragHandle.addEventListener('pointerdown', beginDrag);
     options.dragHandle.addEventListener('keydown', moveKey);
-    options.resizeHandle.addEventListener('pointerdown', beginResize);
-    options.resizeHandle.addEventListener('keydown', resizeKey);
+    const resizeListeners = resizeHandles.map(({ direction, handle }) => {
+        const beginResize = (event: PointerEvent) => begin(event, 'resize', handle, direction);
+        const resizeKey = (event: KeyboardEvent) => keyboard(event, 'resize', direction);
+        handle.tabIndex = 0;
+        handle.addEventListener('pointerdown', beginResize);
+        handle.addEventListener('keydown', resizeKey);
+        return { handle, beginResize, resizeKey };
+    });
     options.dockButtons.left.addEventListener('click', dockLeft);
     options.dockButtons.right.addEventListener('click', dockRight);
     options.dockButtons.float.addEventListener('click', float);
@@ -412,8 +474,10 @@ export function installMotionLabPanel(host: HTMLElement, options: MotionLabPanel
             stopWatching();
             options.dragHandle.removeEventListener('pointerdown', beginDrag);
             options.dragHandle.removeEventListener('keydown', moveKey);
-            options.resizeHandle.removeEventListener('pointerdown', beginResize);
-            options.resizeHandle.removeEventListener('keydown', resizeKey);
+            for (const { handle, beginResize, resizeKey } of resizeListeners) {
+                handle.removeEventListener('pointerdown', beginResize);
+                handle.removeEventListener('keydown', resizeKey);
+            }
             options.dockButtons.left.removeEventListener('click', dockLeft);
             options.dockButtons.right.removeEventListener('click', dockRight);
             options.dockButtons.float.removeEventListener('click', float);

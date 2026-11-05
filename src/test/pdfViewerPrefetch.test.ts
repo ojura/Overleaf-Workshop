@@ -340,6 +340,7 @@ class Fixture {
     columnSettings: any;
     readonly column = {
         offsetX: 0, transition: undefined as any, updates: 0, disposed: false,
+        ready: true, readyAt: 0,
         panels: [] as any[], layers: [] as Element[], releases: 0,
         setPanel(value: any) { this.panels.push(value); },
         update() { this.updates++; },
@@ -527,6 +528,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
                     contents: `export const pdfPerformance = globalThis.__pdfPrefetchTestPerformance;
                         export function installPrefetchDiagnostics(container, sample, options = {}) {
                             container.diagnosticsOptions = options;
+                            const host = container.diagnosticsHost = {};
                             let enabled = options.enabled === true;
                             return {
                                 get enabled() { return enabled; },
@@ -535,6 +537,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
                                 setRobotsEnabled(value) { options.robots?.setEnabled(value); },
                                 get robotsEnabled() { return options.robots?.enabled ?? false; },
                                 labSnapshot() { return undefined; },
+                                ownsEvent(event) { return enabled && (event.target === host || event.composedPath?.().includes(host)); },
                                 dispose() {},
                             };
                         }`,
@@ -620,9 +623,12 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.strictEqual(fleet.replacement, undefined, 'a fresh docking scene cancels the captured retirement first');
         assert.strictEqual(fleet.columnMotions.at(-1), motion);
         f.column.transition = motion;
-        assert.deepStrictEqual((f.container as any).diagnosticsOptions.onPanelLayout(panel),
-            { readyAt: motion.startedAt + motion.durationMs }, 'docking follows the owned column scene deadline');
+        f.column.ready = false; f.column.readyAt = motion.startedAt + motion.durationMs;
+        const preparation = (f.container as any).diagnosticsOptions.onPanelLayout(panel);
+        assert.strictEqual(preparation.readyAt, motion.startedAt + motion.durationMs, 'docking follows the owned column scene deadline');
+        assert.strictEqual(preparation.isReady(), false);
         f.column.transition = undefined;
+        f.column.ready = true;
         assert.strictEqual((f.container as any).diagnosticsOptions.onPanelLayout(panel), undefined,
             'a finished or cancelled column leaves no stale docking delay');
         f.columnSettings.onTransition(undefined);
@@ -637,6 +643,41 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         const calls = fleet.columnMotions.length;
         f.columnSettings.onTransition(motion);
         assert.strictEqual(fleet.columnMotions.length, calls, 'late column completion cannot recreate scene work');
+    });
+
+    it('keeps docking preparation live while calm column work is pending or continues into another leg', async () => {
+        const f = fixture(); await f.frame();
+        f.column.ready = false; f.column.readyAt = f.time + 2800;
+        const panel = { visible: true, dock: 'left', rect: { x: 8, y: 8, width: 300, height: 700 }, reason: 'dock' };
+        const preparation = (f.container as any).diagnosticsOptions.onPanelLayout(panel);
+        assert.ok(preparation, 'a quiet-period destination delays docking even before a transition starts');
+        assert.strictEqual(preparation.isReady(), false);
+        assert.strictEqual(preparation.readyAt, f.time + 2800);
+        f.column.readyAt += 2500;
+        assert.strictEqual(preparation.readyAt, f.time + 5300, 'an already-returned preparation reads the continued deadline');
+        f.column.ready = true;
+        assert.strictEqual(preparation.isReady(), true, 'actual completion releases the panel without waiting for the robot return');
+        f.column.ready = false; f.dispose();
+        assert.strictEqual(preparation.isReady(), true, 'disposed owners cannot retain a pending panel scene');
+    });
+
+    it('keeps forklift ownership during Lab keyboard gestures while genuine reader input still preempts it', async () => {
+        const fleet = new DocumentRobots();
+        const f = fixture({}, { robotsEnabled: true, createDocumentRobots: (_container: Element, options: any) => {
+            fleet.onReplacementComplete = options.onReplacementComplete; return fleet;
+        } });
+        await f.frame(); f.controller.setDiagnosticsEnabled(true);
+        f.controller.prepareReplacement('next-edition'); f.eventBus.emit('pagesdestroy');
+        const host = (f.container as any).diagnosticsHost;
+        f.owner.emit('keydown', { key: 'ArrowRight', isTrusted: true, target: host, stoppedAtTarget: true });
+        f.owner.emit('keydown', { key: 'ArrowLeft', isTrusted: true, target: {}, stoppedAtTarget: true,
+            composedPath: () => [{}, host, f.owner] });
+        assert.strictEqual(fleet.columnCancels, 0, 'document capture does not cancel the owned Lab gesture before its handler');
+        assert.strictEqual(fleet.replacement, 'next-edition');
+        f.owner.emit('keydown', { key: 'ArrowDown', isTrusted: true, target: { id: 'pdf-prefetch-diagnostics' },
+            composedPath: () => [f.container, f.owner] });
+        assert.strictEqual(fleet.columnCancels, 1, 'only the actual diagnostics host is excluded');
+        assert.strictEqual(fleet.replacement, undefined);
     });
 
     for (const input of ['wheel', 'pointerdown', 'touchstart', 'keydown']) {

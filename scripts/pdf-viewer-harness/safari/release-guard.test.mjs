@@ -19,19 +19,36 @@ class Events {
 }
 function fixture({ storage = new Map(), origin = 1 } = {}) {
   const window = new Events(), document = new Events(), bus = new Events();
-  const frames = new Map(), timers = new Map(); let serial = 0, resolvePages;
+  const frames = new Map(), timers = new Map(), frameHooks = new Set();
+  let serial = 0, resolvePages, now = Date.now();
   const pagesPromise = new Promise(resolve => { resolvePages = resolve; });
   const ids = new Map();
-  const element = (id = '') => ({ id, isConnected: true, closest: () => null,
-    focus() { document.activeElement = this; }, blur() { document.activeElement = document.body; } });
+  const element = (id = '') => ({ id, tagName: 'DIV', dataset: {}, isConnected: true,
+    closest(selector) {
+      if (selector !== '.page[data-page-number]') return null;
+      for (let node = this; node; node = node.parentElement) {
+        if (node.className === 'page' && node.dataset.pageNumber) return node;
+      }
+      return null;
+    },
+    contains(value) { for (let node = value; node; node = node.parentElement) if (node === this) return true; return false; },
+    focus(options) { this.lastFocusOptions = options; document.activeElement = this; },
+    blur() { document.activeElement = document.body; } });
   document.body = element(); document.documentElement = element(); document.activeElement = document.body;
   document.visibilityState = 'visible'; document.hasFocus = () => true;
   document.getElementById = id => ids.get(id) ?? null;
   document.querySelectorAll = selector => selector.startsWith('#') && ids.has(selector.slice(1)) ? [ids.get(selector.slice(1))] : [];
   let scaleValue = '0.5', scale = 0.5, rejectScale = false;
+  const pages = new Map();
   const viewer = { currentPageNumber: 59, pagesRotation: 0, scrollMode: 0, spreadMode: 1,
     container: Object.assign(element('viewerContainer'), { scrollTop: 1000, scrollLeft: 0 }), pagesPromise,
+    getPageView: index => pages.get(index + 1),
     scrollPageIntoView({ pageNumber }) { this.currentPageNumber = pageNumber; this.container.scrollTop = pageNumber * 10; } };
+  const page = (number, connected = true) => {
+    const div = Object.assign(element(), { className: 'page', dataset: { pageNumber: String(number) }, parentElement: viewer.container });
+    const layer = Object.assign(element(), { className: 'textLayer', tabIndex: 0, parentElement: div, isConnected: connected });
+    const value = { id: number, div, textLayer: { div: layer } }; pages.set(number, value); return value;
+  };
   Object.defineProperties(viewer, {
     currentScaleValue: { get: () => scaleValue, set: value => { scaleValue = value; if (!rejectScale) scale = Number(value); } },
     currentScale: { get: () => scale },
@@ -45,20 +62,29 @@ function fixture({ storage = new Map(), origin = 1 } = {}) {
   const location = { origin: 'https://cloud.larics.fer.hr', pathname: '/spomenar/', href: 'https://cloud.larics.fer.hr/spomenar/#page=59',
     reloads: 0, reload() { this.reloads++; } };
   Object.assign(window, { document, PDFViewerApplication: app, pdfPrefetch: prefetch, location,
-    visualViewport: { scale: 1 }, performance: { timeOrigin: origin }, URL, URLSearchParams, Date, JSON, Number, Math, Promise, Error,
+    visualViewport: { scale: 1 }, performance: { timeOrigin: origin }, URL, URLSearchParams,
+    Date: class extends Date { static now() { return now; } }, JSON, Number, Math, Promise, Error,
     CSS: { escape: value => value }, getSelection: () => ({ isCollapsed: true }),
+    getComputedStyle: () => ({ getPropertyValue: () => '0' }),
+    PointerEvent: class { constructor(type, options) { Object.assign(this, options, { type, isTrusted: false }); } },
     history: { state: {}, replaceState(_state, _title, href) { location.href = href; } },
     sessionStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
     requestAnimationFrame(callback) { const id = ++serial; frames.set(id, callback); return id; },
     cancelAnimationFrame(id) { frames.delete(id); },
-    setTimeout(callback) { const id = ++serial; timers.set(id, callback); return id; },
+    setTimeout(callback, delay = 0) { const id = ++serial; timers.set(id, { callback, at: now + delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
   });
   window.window = window; window.top = window;
   const context = vm.createContext(window), install = vm.runInContext(source, context);
   const api = () => window.__spomenarReleaseGuard;
-  const frame = () => { const current = [...frames.values()]; frames.clear(); for (const callback of current) callback(); };
+  const frame = (elapsed = 16) => {
+    now += elapsed;
+    for (const hook of frameHooks) hook(now);
+    for (const [id, timer] of [...timers]) if (timer.at <= now) { timers.delete(id); timer.callback(); }
+    const current = [...frames.values()]; frames.clear(); for (const callback of current) callback();
+  };
   return { window, document, app, viewer, prefetch, bus, storage, frames, timers, location, api, frame, element, ids,
+    page, pages, frameHooks, get now() { return now; },
     rejectScale: value => { rejectScale = value; },
     install: options => install({ token: 'test-token', document: documentConfig,
       durationMs: 60000, bootstrap: false, ...options }),
@@ -68,7 +94,7 @@ function fixture({ storage = new Map(), origin = 1 } = {}) {
     async drive(promise) {
       let settled = false, result, error;
       promise.then(value => { result = value; settled = true; }, reason => { error = reason; settled = true; });
-      for (let i = 0; i < 20 && !settled; i++) { await drain(); frame(); }
+      for (let i = 0; i < 1000 && !settled; i++) { await drain(); frame(); }
       await drain(); assert.equal(settled, true, 'the real guard operation must finish with bounded frames');
       if (error) throw error; return result;
     },
@@ -78,6 +104,95 @@ function fixture({ storage = new Map(), origin = 1 } = {}) {
       assert.equal(window.__spomenarReleaseGuard, undefined);
     },
   };
+}
+
+const rect = (x, y, width, height) => ({ x, y, width, height, left: x, top: y, right: x + width, bottom: y + height,
+  toJSON() { return { x, y, width, height, left: x, top: y, right: x + width, bottom: y + height }; } });
+function panelFixture(f, { dock = 'float', bounds = rect(180, 80, 320, 240), viewportWidth = 800, viewportHeight = 700 } = {}) {
+  let current = bounds, currentDock = dock, animation, column, columnX = 0, pointer;
+  const actions = [], overlaps = [], details = { open: false }, handles = new Map(), controls = new Map();
+  const host = Object.assign(f.element('pdf-prefetch-diagnostics'), { hidden: false, dataset: { dock } });
+  const floating = rect(100, 70, 240, 220);
+  const root = { activeElement: null };
+  host.shadowRoot = root; f.ids.set(host.id, host); f.prefetch.diagnosticsEnabled = true;
+  const surface = { getBoundingClientRect: () => current };
+  function moveColumn(to) {
+    column = { from: columnX, to, at: f.now };
+    f.viewer.container.dataset.pdfColumnMoving = 'true';
+  }
+  function selectDock(value) {
+    currentDock = value; host.dataset.dock = value;
+    const to = value === 'float' ? floating : rect(value === 'left' ? 0 : 800 - current.width, 0, current.width, 700);
+    animation = { from: current, to, at: f.now };
+    host.dataset.panelMoving = 'true'; moveColumn(value === 'right' ? -40 : 40);
+    actions.push({ kind: 'dock', value, at: f.now });
+  }
+  const makeHandle = direction => {
+    const handle = Object.assign(f.element(), { dataset: direction ? { panelResize: direction } : {},
+      getBoundingClientRect: () => rect(current.x, current.y, 20, 20),
+      focus(options) { this.lastFocusOptions = options; root.activeElement = this; f.document.activeElement = host; },
+      dispatchEvent(event) {
+        if (event.type !== 'pointerdown') return;
+        if (animation || host.dataset.panelMoving === 'true') overlaps.push({ direction, at: f.now });
+        actions.push({ kind: direction ? 'resize' : 'drag', direction, at: f.now });
+        animation = undefined; delete host.dataset.panelMoving;
+        if (currentDock !== 'float' && direction !== (currentDock === 'left' ? 'e' : 'w')) {
+          currentDock = 'float'; host.dataset.dock = 'float';
+          actions.push({ kind: 'adopt-float', direction, at: f.now });
+        }
+        pointer = { direction, from: current, x: event.clientX, y: event.clientY };
+      } });
+    return handle;
+  };
+  const drag = makeHandle();
+  for (const direction of ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw']) handles.set(direction, makeHandle(direction));
+  for (const value of ['left', 'right', 'float']) controls.set(value, { click: () => selectDock(value) });
+  root.querySelectorAll = selector => {
+    if (selector === 'section') return [surface];
+    if (selector === '.panel-drag') return [drag];
+    if (selector === '.measurements') return [details];
+    if (selector === '.panel-resize' || selector === '[data-panel-resize]') return [...handles.values()];
+    const direction = selector.match(/^\[data-panel-resize="([a-z]+)"\]$/)?.[1];
+    if (direction) return handles.has(direction) ? [handles.get(direction)] : [];
+    const dock = selector.match(/^\[data-panel-dock="([a-z]+)"\]$/)?.[1];
+    return dock && controls.has(dock) ? [controls.get(dock)] : [];
+  };
+  root.querySelector = selector => root.querySelectorAll(selector)[0];
+  f.window.getComputedStyle = () => ({ getPropertyValue: () => String(columnX) });
+  f.window.dispatchEvent = event => {
+    if (event.type === 'pointerup') { pointer = undefined; return; }
+    if (event.type !== 'pointermove' || !pointer) return;
+    const dx = event.clientX - pointer.x, dy = event.clientY - pointer.y, from = pointer.from, direction = pointer.direction;
+    const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
+    if (!direction) current = rect(clamp(from.x + dx, 8, viewportWidth - 8 - from.width),
+      clamp(from.y + dy, 8, viewportHeight - 8 - from.height), from.width, from.height);
+    else {
+      const west = direction.includes('w'), north = direction.includes('n');
+      const left = west ? clamp(from.x + dx, 8, from.right - 240) : from.x;
+      const right = direction.includes('e') ? clamp(from.right + dx, from.x + 240, viewportWidth - 8) : from.right;
+      const top = currentDock === 'float' && north ? clamp(from.y + dy, 8, from.bottom - 160) : from.y;
+      const bottom = currentDock === 'float' && direction.includes('s')
+        ? clamp(from.bottom + dy, from.y + 160, viewportHeight - 8) : from.bottom;
+      current = rect(left, top, right - left, bottom - top);
+    }
+    moveColumn(columnX + 12);
+  };
+  f.prefetch.setDiagnosticsEnabled = value => { f.prefetch.diagnosticsEnabled = value; host.hidden = !value; };
+  f.frameHooks.add(now => {
+    if (column) {
+      const progress = Math.min(1, Math.max(0, (now - column.at - 500) / 1800));
+      columnX = column.from + (column.to - column.from) * progress;
+      if (now >= column.at + 2500) { column = undefined; delete f.viewer.container.dataset.pdfColumnMoving; }
+    }
+    if (animation) {
+      const progress = Math.min(1, Math.max(0, (now - animation.at - 2500) / 1200));
+      current = rect(...['x', 'y', 'width', 'height'].map(key => animation.from[key] + (animation.to[key] - animation.from[key]) * progress));
+      if (now >= animation.at + 3700) { animation = undefined; delete host.dataset.panelMoving; }
+    }
+  });
+  return { host, root, handles, actions, overlaps, selectDock,
+    configure(value, bounds) { currentDock = value; host.dataset.dock = value; current = bounds; },
+    snapshot: () => ({ dock: currentDock, rect: current.toJSON(), measurements: details.open }) };
 }
 
 test('initial view waits for the actual pages promise and both later frames', async () => {
@@ -193,6 +308,190 @@ test('a shadow-focused ID cannot alias an unrelated light-DOM focus target', asy
   f.document.activeElement = lightButton;
   assert.deepEqual(JSON.parse(JSON.stringify(f.api().capture().focus)), { kind: 'id', id: 'shared-control' });
   await f.dispose();
+});
+
+test('a canonical anonymous page text layer restores into the new document instance', async t => {
+  const old = fixture(); t.after(() => old.dispose()); old.install(); await old.ready();
+  const oldPage = old.page(59); oldPage.textLayer.div.focus();
+  const saved = old.api().capture(true);
+  assert.deepEqual(JSON.parse(JSON.stringify(saved.focus)), { kind: 'page-text', pageNumber: 59 });
+  const expiresAt = old.api().reload(saved).expiresAt;
+  const fresh = fixture({ storage: old.storage, origin: 2 }); t.after(() => fresh.dispose());
+  const newPage = fresh.page(59); fresh.viewer.currentPageNumber = 1; fresh.viewer.container.scrollTop = 0;
+  fresh.install({ bootstrap: true, expiresAt }); await fresh.ready(); fresh.viewer.container.focus();
+  const restored = await fresh.drive(fresh.api().restore(saved));
+  assert.equal(restored.exact, true);
+  assert.equal(fresh.document.activeElement, newPage.textLayer.div);
+  assert.notEqual(fresh.document.activeElement, oldPage.textLayer.div);
+  assert.equal(newPage.textLayer.div.lastFocusOptions.preventScroll, true);
+  assert.equal(fresh.viewer.container.scrollTop, saved.top);
+});
+
+test('page text focus rejects lookalikes, nested controls and mismatched page ownership', async t => {
+  const f = fixture(); t.after(() => f.dispose()); f.install(); await f.ready();
+  const page = f.page(59);
+  const impostor = Object.assign(f.element(), { className: 'textLayer', tabIndex: 0, parentElement: page.div });
+  const child = Object.assign(f.element(), { parentElement: page.textLayer.div });
+  for (const target of [impostor, child]) {
+    target.focus(); assert.throws(() => f.api().capture(true), /focused control cannot be restored/);
+  }
+  page.textLayer.div.focus(); page.id = 60;
+  assert.throws(() => f.api().capture(true), /focused control cannot be restored/);
+  page.id = 59; page.div.parentElement = undefined;
+  assert.throws(() => f.api().capture(true), /focused control cannot be restored/);
+  assert.equal(f.location.reloads, 0);
+});
+
+test('restoration waits for the authoritative text layer to connect after the initial view', async t => {
+  const f = fixture(); t.after(() => f.dispose()); f.install(); await f.ready();
+  const saved = f.api().capture(); saved.focus = { kind: 'page-text', pageNumber: 59 };
+  const page = f.page(59, false); f.viewer.currentPageNumber = 1; f.viewer.container.scrollTop = 0;
+  let complete = false;
+  const pending = f.api().restore(saved); pending.then(() => { complete = true; }, () => {});
+  for (let i = 0; i < 6; i++) { await drain(); f.frame(); }
+  assert.equal(complete, false);
+  assert.equal(f.document.activeElement, f.document.body);
+  page.textLayer.div.isConnected = true; f.bus.emit('textlayerrendered', { pageNumber: 59 });
+  const restored = await f.drive(pending);
+  assert.equal(restored.exact, true);
+  assert.equal(f.document.activeElement, page.textLayer.div);
+  assert.equal(f.viewer.container.scrollTop, saved.top);
+});
+
+test('trusted input or expiry cancels a pending page text focus without a late focus change', async t => {
+  for (const reason of ['input', 'expiry']) {
+    const f = fixture(); t.after(() => f.dispose()); f.install(); await f.ready();
+    const saved = f.api().capture(); saved.focus = { kind: 'page-text', pageNumber: 59 };
+    const page = f.page(59, false), pending = f.api().restore(saved);
+    let complete = false; pending.then(() => { complete = true; }, () => { complete = true; });
+    const rejected = assert.rejects(pending);
+    for (let i = 0; i < 5; i++) { await drain(); f.frame(); }
+    assert.equal(complete, false, 'the target is still disconnected when cancellation arrives');
+    if (reason === 'input') f.document.emit('touchstart', { isTrusted: true });
+    else f.frame(60000);
+    await rejected; page.textLayer.div.isConnected = true; f.frame(); await drain();
+    assert.equal(f.document.activeElement, f.document.body);
+    assert.equal(f.frames.size, 0);
+  }
+});
+
+test('reload capture rejects a moving column without blocking ordinary state inspection', async t => {
+  const f = fixture(); t.after(() => f.dispose()); f.install(); await f.ready();
+  f.viewer.container.dataset.pdfColumnMoving = 'true';
+  assert.throws(() => f.api().capture(true), /moving|settle/i);
+  assert.equal(f.api().capture().page, 59);
+  assert.equal(f.location.reloads, 0);
+  delete f.viewer.container.dataset.pdfColumnMoving;
+  assert.equal(f.api().capture(true).page, 59);
+});
+
+test('reload capture rejects the stationary panel wait and its later glide', async t => {
+  const f = fixture(); t.after(() => f.dispose()); const panel = panelFixture(f);
+  f.install(); await f.ready(); panel.selectDock('right');
+  const initial = panel.snapshot();
+  assert.throws(() => f.api().capture(true), /moving|settle/i);
+  assert.equal(f.api().capture().panel.rect.x, initial.rect.x);
+  f.frame(2600); await drain();
+  assert.equal(f.viewer.container.dataset.pdfColumnMoving, undefined);
+  assert.equal(panel.host.dataset.panelMoving, 'true');
+  assert.throws(() => f.api().capture(true), /moving|settle/i);
+  f.frame(1200); await drain();
+  assert.equal(f.api().capture(true).panel.dock, 'right');
+  assert.equal(f.location.reloads, 0);
+});
+
+test('all eight stable resize handles preserve their own focus identity', async t => {
+  const f = fixture(); t.after(() => f.dispose()); const panel = panelFixture(f);
+  f.install(); await f.ready();
+  for (const [direction, handle] of panel.handles) {
+    handle.focus(); const saved = f.api().capture(true);
+    assert.deepEqual(JSON.parse(JSON.stringify(saved.focus)), { kind: 'panel', selector: '[data-panel-resize="' + direction + '"]' });
+    f.document.body.focus(); panel.root.activeElement = null;
+    const restored = await f.drive(f.api().restore(saved));
+    assert.equal(restored.exact, true);
+    assert.equal(panel.root.activeElement, handle);
+  }
+  const handle = panel.handles.get('se'); handle.focus(); const saved = f.api().capture(true);
+  const select = panel.root.querySelectorAll;
+  panel.root.querySelectorAll = selector => selector === '[data-panel-resize="se"]' ? [handle, f.element()] : select(selector);
+  assert.throws(() => f.api().capture(true), /focused control cannot be restored/);
+  f.document.body.focus(); panel.root.activeElement = null;
+  await assert.rejects(f.drive(f.api().restore(saved)), /saved focused control is missing/);
+  assert.equal(f.document.activeElement, f.document.body);
+});
+
+test('saved Lab restoration waits for finite dock and column motion before geometry correction', async t => {
+  for (const dock of ['left', 'right', 'float']) {
+    const f = fixture(); t.after(() => f.dispose());
+    const bounds = dock === 'float' ? rect(180, 80, 320, 240) : rect(dock === 'right' ? 440 : 0, 0, 360, 700);
+    const panel = panelFixture(f, { dock, bounds });
+    f.install(); await f.ready(); const saved = f.api().capture(true), began = f.now;
+    panel.configure(dock === 'float' ? 'right' : 'float', dock === 'float' ? rect(560, 0, 240, 700) : rect(100, 70, 240, 220));
+    f.viewer.currentPageNumber = 1; f.viewer.container.scrollTop = 0;
+    const pending = f.api().restore(saved); pending.catch(() => {});
+    for (let i = 0; i < 10; i++) { await drain(); f.frame(); }
+    assert.equal(panel.actions.filter(action => action.kind !== 'dock').length, 0, 'stationary approach cannot be mistaken for dock completion');
+    const restored = await f.drive(pending);
+    assert.equal(restored.exact, true);
+    assert.deepEqual(panel.overlaps, []);
+    assert.equal(panel.actions.find(action => action.kind === 'resize').direction, dock === 'float' ? 'se' : dock === 'right' ? 'w' : 'e');
+    assert.equal(panel.actions.some(action => action.kind === 'adopt-float'), false, 'width restoration must preserve the saved dock');
+    assert.equal(f.viewer.container.dataset.pdfColumnMoving, undefined);
+    assert.equal(panel.host.dataset.panelMoving, undefined);
+    assert.deepEqual(panel.snapshot(), JSON.parse(JSON.stringify(saved.panel)));
+    assert.ok(f.now - began >= 6200 && f.now - began < 8000, 'the actual phases fit the existing normal restore deadline');
+  }
+});
+
+test('matching panel coordinates during the stationary approach do not bypass restoration settling', async t => {
+  const f = fixture(); t.after(() => f.dispose()); const panel = panelFixture(f);
+  f.install(); await f.ready(); const saved = f.api().capture(true);
+  panel.selectDock('float');
+  let complete = false;
+  const pending = f.api().restore(saved); pending.then(() => { complete = true; }, () => {});
+  for (let i = 0; i < 10; i++) { await drain(); f.frame(); }
+  assert.equal(complete, false, 'the matching start rectangle is not the final arrangement');
+  const restored = await f.drive(pending);
+  assert.equal(restored.exact, true);
+  assert.equal(panel.host.dataset.panelMoving, undefined);
+  assert.equal(f.viewer.container.dataset.pdfColumnMoving, undefined);
+  assert.deepEqual(panel.snapshot(), JSON.parse(JSON.stringify(saved.panel)));
+});
+
+test('viewport-clamped floating restoration moves before growing and corrects position after shrinking', async t => {
+  for (const [savedRect, changedRect] of [
+    [rect(100, 80, 600, 300), rect(700, 80, 292, 300)],
+    [rect(700, 80, 292, 300), rect(100, 80, 600, 300)],
+  ]) {
+    const f = fixture(); t.after(() => f.dispose());
+    const panel = panelFixture(f, { bounds: savedRect, viewportWidth: 1000 });
+    f.install(); await f.ready(); const saved = f.api().capture(true), began = f.now;
+    panel.configure('float', changedRect);
+    const restored = await f.drive(f.api().restore(saved));
+    assert.equal(restored.exact, true);
+    assert.deepEqual(panel.snapshot(), JSON.parse(JSON.stringify(saved.panel)));
+    assert.equal(panel.actions[0].kind, 'drag');
+    const gestures = panel.actions.filter(action => action.kind === 'drag' || action.kind === 'resize');
+    assert.ok(gestures.some(action => action.kind === 'resize'));
+    assert.equal(new Set(gestures.map(action => action.at)).size, 1, 'direct gestures share one column settling period');
+    assert.ok(f.now - began < 3000);
+  }
+});
+
+test('trusted input during saved Lab motion prevents later restoration gestures', async t => {
+  const f = fixture(); t.after(() => f.dispose()); const panel = panelFixture(f, { dock: 'right', bounds: rect(440, 0, 360, 700) });
+  f.install(); await f.ready(); const saved = f.api().capture(true);
+  panel.configure('float', rect(100, 70, 240, 220));
+  const pending = f.api().restore(saved), rejected = assert.rejects(pending);
+  let complete = false; pending.then(() => { complete = true; }, () => { complete = true; });
+  for (let i = 0; i < 10; i++) { await drain(); f.frame(); }
+  assert.equal(complete, false, 'input arrives while the dock is still being restored');
+  const before = panel.actions.length;
+  f.viewer.currentPageNumber = 311; f.document.emit('touchstart', { isTrusted: true });
+  await rejected; f.frame(4000); await drain();
+  assert.equal(f.viewer.currentPageNumber, 311);
+  assert.equal(panel.actions.length, before);
+  assert.equal(f.frames.size, 0);
 });
 
 test('reload preflight admits only numeric page and exact synchronous zoom bookmarks', async () => {

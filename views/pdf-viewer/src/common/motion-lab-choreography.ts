@@ -1,4 +1,4 @@
-const phases = Object.freeze({ approachMs: 500, haulMs: 1800, settleMs: 200, dockMs: 1200 });
+const phases = Object.freeze({ approachMs: 500, haulMs: 1800, settleMs: 200, dockMs: 1200, inputSettleMs: 300 });
 
 /** A finite scene: engage the stationary page edge, haul, release, then dock the Lab. */
 export const MOTION_LAB_CHOREOGRAPHY = Object.freeze({

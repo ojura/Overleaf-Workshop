@@ -8,6 +8,7 @@ export type PdfDocumentColumnPanel = MotionLabPanelLayout;
 export const PDF_DOCUMENT_COLUMN_POLICY = Object.freeze({
     gapPx: 16,
     durationMs: MOTION_LAB_CHOREOGRAPHY.columnDurationMs,
+    inputSettleMs: MOTION_LAB_CHOREOGRAPHY.inputSettleMs,
     // Ignore subpixel overlap noise instead of perpetually retargeting a resting column.
     minimumShiftPx: 0.5,
     offsetProperty: '--pdf-document-column-x',
@@ -69,6 +70,8 @@ export interface PdfDocumentColumnTransition {
     reason: PdfDocumentColumnPanel['reason'];
     dock: PdfDocumentColumnPanel['dock'];
     bounds?: PdfDocumentColumnRect;
+    /** Keep the actor parked at the completed edge while the latest input settles. */
+    holdAtEnd?: boolean;
 }
 
 interface Options {
@@ -127,8 +130,12 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
     let previousViewport: PdfDocumentColumnRect | undefined, previousBounds: PdfDocumentColumnRect | undefined;
     let widePages: readonly HTMLElement[] | undefined;
     let transition: Readonly<PdfDocumentColumnTransition> | undefined;
-    let savedMoving: string | undefined;
+    let savedMoving: { value: string | undefined } | undefined;
     let frame: { id: number } | undefined;
+    let waiting = false;
+    let pending: { plan: PdfDocumentColumnPlan; reason: PdfDocumentColumnPanel['reason'];
+        dock: PdfDocumentColumnPanel['dock']; settledAt: number } | undefined;
+    let wake: { id: number } | undefined;
     let disposed = false;
     const observer = typeof win.ResizeObserver === 'function' ? new win.ResizeObserver(() => update()) : undefined;
     const same = (a: number, b: number) => Math.abs(a - b) < PDF_DOCUMENT_COLUMN_POLICY.minimumShiftPx;
@@ -193,41 +200,105 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
         catch (error) { win.console.error('PDF column transition notification failed', error); }
     }
 
+    function markMoving(): void {
+        if (transition || pending) {
+            savedMoving ??= { value: container.dataset.pdfColumnMoving };
+            container.dataset.pdfColumnMoving = 'true';
+        } else if (savedMoving) {
+            if (savedMoving.value === undefined) { delete container.dataset.pdfColumnMoving; }
+            else { container.dataset.pdfColumnMoving = savedMoving.value; }
+            savedMoving = undefined;
+        }
+    }
+
+    function clearWake(): void {
+        if (wake) { win.clearTimeout(wake.id); wake = undefined; }
+    }
+
+    function clearPending(): void { pending = undefined; clearWake(); }
+
+    function updateContact(bounds: PdfDocumentColumnRect | undefined): void {
+        if (!transition || sameRect(transition.bounds, bounds) && !!transition.holdAtEnd === !!pending) { return; }
+        transition = Object.freeze({ ...transition, holdAtEnd: !!pending,
+            bounds: bounds && Object.freeze({ ...bounds }) });
+        notify();
+    }
+
     function end(): void {
         if (frame) { cancelFrame(frame.id); frame = undefined; }
         const previous = transition;
         transition = undefined;
-        if (!offsetX) { restoreStyles(); }
-        if (previous) {
-            if (savedMoving === undefined) { delete container.dataset.pdfColumnMoving; }
-            else { container.dataset.pdfColumnMoving = savedMoving; }
-            savedMoving = undefined;
-            notify();
-        }
+        waiting = false;
+        if (!offsetX && !pending) { restoreStyles(); }
+        markMoving();
+        if (previous) { notify(); }
+    }
+
+    function begin(plan: PdfDocumentColumnPlan, reason: PdfDocumentColumnPanel['reason'], dock: PdfDocumentColumnPanel['dock']): void {
+        clearPending();
+        if (disposed) { return; }
+        if (same(plan.offsetX, offsetX)) { end(); return; }
+        if (frame) { cancelFrame(frame.id); frame = undefined; }
+        const pages = [...new Set(options.pages())].filter(page => page.isConnected !== false);
+        styleRoots(roots(pages)); observe(pages);
+        waiting = false;
+        transition = Object.freeze({ id: ++serial, fromX: offsetX, toX: plan.offsetX,
+            startedAt: now(), durationMs: PDF_DOCUMENT_COLUMN_POLICY.durationMs, reason, dock,
+            bounds: plan.bounds && Object.freeze({ ...plan.bounds }) });
+        markMoving(); notify(); schedule();
+    }
+
+    function commitPending(): void {
+        if (!pending || disposed || transition && !waiting || pending.settledAt > now()) { return; }
+        const intent = pending;
+        begin(intent.plan, intent.reason, intent.dock);
+    }
+
+    function settleWake(): void {
+        if (!pending || disposed) { return; }
+        const remaining = pending.settledAt - now();
+        if (remaining <= 0) { clearWake(); commitPending(); return; }
+        if (wake) { return; }
+        const owned = { id: 0 }; wake = owned;
+        owned.id = win.setTimeout(() => {
+            if (wake !== owned || disposed) { return; }
+            wake = undefined;
+            if (!pending) { return; }
+            if (pending.settledAt > now()) { settleWake(); }
+            else if (!transition || waiting) { measure(false, true, false, pending.reason); }
+        }, remaining);
     }
 
     function schedule(): void {
-        if (disposed || frame || !transition) { return; }
-        const pending = { id: 0 };
-        frame = pending;
-        pending.id = requestFrame(at => {
-            if (frame !== pending || disposed || !transition) { return; }
+        if (disposed || frame || !transition || waiting) { return; }
+        const scheduled = { id: 0 };
+        frame = scheduled;
+        scheduled.id = requestFrame(at => {
+            if (frame !== scheduled || disposed || !transition) { return; }
             frame = undefined;
             const elapsed = at - transition.startedAt;
             const eased = motionLabColumnProgress(elapsed, transition.durationMs);
             apply(transition.fromX + (transition.toX - transition.fromX) * eased);
-            if (elapsed >= transition.durationMs) { apply(transition.toX); end(); }
+            if (elapsed >= transition.durationMs) {
+                apply(transition.toX);
+                if (pending) {
+                    waiting = true;
+                    if (pending.settledAt <= now()) { measure(false, true, false, pending.reason); }
+                    else { settleWake(); }
+                } else { end(); }
+            }
             else { schedule(); }
         });
     }
 
-    function measure(animate = false, layoutChanged = true): void {
+    function measure(discrete = false, layoutChanged = true, inputChanged = false,
+        reason: PdfDocumentColumnPanel['reason'] = 'viewport'): void {
         if (disposed) { return; }
         if (layoutChanged) { widePages = undefined; }
-        if (!panel?.visible && offsetX === 0 && !transition
+        if (!panel?.visible && offsetX === 0 && !transition && !pending
             && !savedOffset && !styled.size && !observed.size) { return; }
         const pages = [...new Set(options.pages())].filter(page => page.isConnected !== false);
-        if (offsetX === 0 && !transition && !savedOffset && widePages?.length === pages.length
+        if (offsetX === 0 && !transition && !pending && !savedOffset && widePages?.length === pages.length
             && pages.every((page, index) => page === widePages![index])) { return; }
         widePages = undefined;
         const next = roots(pages);
@@ -240,19 +311,15 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
             const box = page.getBoundingClientRect();
             return { x: box.left, y: box.top, width: box.width, height: box.height };
         });
-        const plan = planPdfDocumentColumn(view, pageRects, panel, offsetX, transition?.toX ?? offsetX);
+        const plan = planPdfDocumentColumn(view, pageRects, panel, offsetX, pending?.plan.offsetX ?? transition?.toX ?? offsetX);
         // Scrolling cannot expose a usable side margin when every current page is
         // viewport-wide. Page, size, viewport and explicit layout changes remeasure.
         const wide = observer && view.width > 0 && pageRects.length > 0
             && pageRects.every(page => page.width >= view.width);
         const changed = !sameRect(previousViewport, view) || !sameRect(previousBounds, plan.bounds);
         previousViewport = view; previousBounds = plan.bounds;
-        if (transition && same(transition.toX, plan.offsetX) && !changed) { return; }
-        if (!transition && same(plan.offsetX, offsetX)) {
-            if (!plan.offsetX) { apply(0); restoreStyles(); if (wide) { widePages = pages; } }
-            return;
-        }
-        if (!animate || media.matches || doc.hidden || plan.offsetX === offsetX) {
+        if (media.matches || doc.hidden) {
+            clearPending();
             end();
             if (disposed) { return; }
             if (plan.offsetX || offsetX) { styleRoots(next); }
@@ -260,23 +327,39 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
             if (!disposed && offsetX === 0 && wide) { widePages = pages; }
             return;
         }
-        // An animated retarget keeps the actor reservation until the successor ends.
-        if (frame) { cancelFrame(frame.id); frame = undefined; }
-        if (plan.offsetX || offsetX) { styleRoots(next); }
-        if (!transition) { savedMoving = container.dataset.pdfColumnMoving; }
-        transition = Object.freeze({ id: ++serial, fromX: offsetX, toX: plan.offsetX,
-            startedAt: now(), durationMs: PDF_DOCUMENT_COLUMN_POLICY.durationMs,
-            reason: panel?.reason ?? 'viewport', dock: panel?.dock ?? 'float',
-            bounds: plan.bounds && Object.freeze({ ...plan.bounds }) });
-        container.dataset.pdfColumnMoving = 'true';
-        notify();
-        schedule();
+        const engaged = !!transition && !waiting;
+        const destination = engaged ? transition!.toX : offsetX;
+        if (same(plan.offsetX, destination)) {
+            clearPending();
+            if (waiting) { end(); }
+            else { updateContact(plan.bounds); }
+            if (disposed) { return; }
+            if (!transition && !plan.offsetX) { apply(0); restoreStyles(); if (wide) { widePages = pages; } }
+            markMoving();
+            return;
+        }
+        const dock = panel?.dock ?? 'float';
+        if (discrete && !engaged) { begin(plan, reason, dock); return; }
+        const unchanged = pending && same(pending.plan.offsetX, plan.offsetX) && sameRect(pending.plan.bounds, plan.bounds);
+        const settledAt = discrete ? now() : unchanged && !changed && !inputChanged
+            ? pending!.settledAt : now() + PDF_DOCUMENT_COLUMN_POLICY.inputSettleMs;
+        pending = { plan, reason, dock, settledAt };
+        markMoving(); updateContact(plan.bounds);
+        if (!disposed) { settleWake(); }
     }
 
     /** Routine reader plans can retain the proven zero margin; layout callers invalidate it. */
     function update(layoutChanged = true): void { measure(false, layoutChanged); }
     function geometryChanged(): void { update(); }
-    function finish(): void { if (transition) { apply(transition.toX); end(); } }
+    function finish(): void {
+        const target = pending?.plan.offsetX ?? transition?.toX;
+        clearPending();
+        if (target !== undefined) {
+            if (target || offsetX) { styleRoots(roots(options.pages())); }
+            apply(target);
+        }
+        end();
+    }
     function visibility(): void { if (doc.hidden) { finish(); } else { update(); } }
     function motionChanged(): void { if (media.matches) { finish(); } }
     win.addEventListener('resize', geometryChanged);
@@ -288,10 +371,17 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
     return {
         get offsetX() { return offsetX; },
         get transition() { return transition; },
+        get pending() { return !!pending; },
+        get ready() { return !transition && !pending; },
+        get readyAt() {
+            const end = transition && !waiting ? Math.max(now(), transition.startedAt + transition.durationMs) : now();
+            return pending ? Math.max(end, pending.settledAt) + PDF_DOCUMENT_COLUMN_POLICY.durationMs : end;
+        },
         setPanel(value: PdfDocumentColumnPanel): void {
             if (disposed) { return; }
+            const changed = panel?.visible !== value.visible || panel?.dock !== value.dock || !sameRect(panel?.rect, value.rect);
             panel = { ...value, rect: { ...value.rect } };
-            measure(value.reason === 'open' || value.reason === 'dock' || value.reason === 'close');
+            measure(value.reason === 'open' || value.reason === 'dock' || value.reason === 'close', true, changed, value.reason);
         },
         update,
         registerLayer(layer: HTMLElement): () => void {
@@ -311,7 +401,7 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
         dispose(): void {
             if (disposed) { return; }
             disposed = true;
-            apply(0); end(); restoreStyles(); registered.clear(); widePages = undefined;
+            clearPending(); apply(0); end(); restoreStyles(); registered.clear(); widePages = undefined;
             observer?.disconnect(); observed.clear();
             win.removeEventListener('resize', geometryChanged);
             win.visualViewport?.removeEventListener('resize', geometryChanged);

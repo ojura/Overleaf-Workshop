@@ -18,8 +18,13 @@ class RobotEvents {
 }
 
 class RobotElement {
-    width = 0;
-    height = 0;
+    private rasterWidth = 0;
+    private rasterHeight = 0;
+    rasterWrites = 0;
+    get width() { return this.rasterWidth; }
+    set width(value: number) { this.rasterWidth = value; this.rasterWrites++; this.ownerDocument.trackRaster?.(); }
+    get height() { return this.rasterHeight; }
+    set height(value: number) { this.rasterHeight = value; this.rasterWrites++; this.ownerDocument.trackRaster?.(); }
     className = '';
     textContent = '';
     readonly dataset: Record<string, string> = {};
@@ -53,6 +58,7 @@ class RobotElement {
 
 class RobotRuntime {
     now = 0;
+    peakRasterBytes = 0;
     readonly callbacks = new Map<number, (at: number) => void>();
     readonly canvases: RobotElement[] = [];
     readonly observers: Array<{ kind: string, callback: (entries: any[]) => void, disconnected: boolean, targets: unknown[] }> = [];
@@ -103,6 +109,8 @@ class RobotRuntime {
         });
         Object.assign(this.document, {
             hidden: false, defaultView: this.window,
+            trackRaster: () => { this.peakRasterBytes = Math.max(this.peakRasterBytes,
+                this.canvases.reduce((sum, canvas) => sum + canvas.width * canvas.height * 4, 0)); },
             createElement: (tag: string) => {
                 const element = new RobotElement(this.document);
                 if (tag === 'canvas') { this.canvases.push(element); }
@@ -224,6 +232,87 @@ describe('the procedural PDF robot fleet', function () {
         } finally { runtime.dispose(); }
     });
 
+    it('rebuilds sharp fleet and body rasters at the displayed density through one coalesced resize frame', () => {
+        const runtime = new RobotRuntime(robots);
+        try {
+            runtime.lab.update(ready); runtime.lab.setActive(true);
+            const canvas = runtime.stage.children.find(node => node.className === 'robot-canvas')!;
+            assert.ok(runtime.lab.dispatch.reserve('quad'));
+            const state = runtime.lab.snapshot();
+            const allocations = runtime.canvases.length;
+            const initial = { width: canvas.width, height: canvas.height, frames: state.renderer.frames, reads: canvas.rectReads };
+            runtime.window.devicePixelRatio = 2;
+            for (let index = 0; index < 60; index++) {
+                canvas.rect.width = 500 + index * 10; canvas.rect.height = canvas.rect.width * 250 / 480;
+                runtime.resize();
+            }
+            canvas.rect.width = 960; canvas.rect.height = 500; runtime.resize();
+            assert.strictEqual(runtime.lab.snapshot().renderer.frames, initial.frames, 'pointer-rate size delivery does not repaint synchronously');
+            assert.strictEqual(canvas.rectReads, initial.reads, 'the burst does not measure each intermediate size');
+            assert.strictEqual(runtime.callbacks.size, 1, 'one owned frame consumes the final geometry');
+            runtime.frame();
+            assert.strictEqual(canvas.width, 1920); assert.strictEqual(canvas.height, 1000);
+            assert.strictEqual(runtime.lab.snapshot().renderer.frames, initial.frames + 1);
+            assert.strictEqual(runtime.callbacks.size, 0, 'a resized parked fleet returns to sleep');
+            assert.strictEqual(runtime.canvases.length, allocations, 'backing surfaces are reused');
+            assert.ok(runtime.canvases.slice(2).every(body => body.width >= Math.ceil(128 * 4 / Math.sqrt(2))));
+            assert.deepStrictEqual(runtime.lab.snapshot().actors, state.actors, 'raster resizing does not reset the fleet or its external lease');
+            const writes = runtime.canvases.map(surface => surface.rasterWrites);
+            canvas.rect.left += 70; canvas.rect.top -= 30; runtime.resize(); runtime.frame();
+            assert.deepStrictEqual(runtime.canvases.map(surface => surface.rasterWrites), writes, 'position-only changes reuse every backing store');
+            canvas.rect.width = 950; canvas.rect.height = 950 * 250 / 480; runtime.resize(); runtime.frame();
+            assert.deepStrictEqual(runtime.canvases.map(surface => surface.rasterWrites), writes, 'small shrink oscillations do not rebuild the caches');
+        } finally { runtime.dispose(); }
+    });
+
+    it('uses the fitted compact image and current DPR for sharpness without allocating the letterbox', () => {
+        const runtime = new RobotRuntime(robots);
+        try {
+            runtime.lab.update(ready); runtime.lab.setActive(true);
+            const canvas = runtime.stage.children.find(node => node.className === 'robot-canvas')!;
+            canvas.rect.width = 960; canvas.rect.height = 86;
+            runtime.window.devicePixelRatio = 2;
+            runtime.queries.get('(resolution: 1dppx)')!.emit('change'); runtime.frame();
+            assert.ok(canvas.width >= 480 * 86 / 250 * 2 && canvas.width < 960,
+                'contain fitting uses the actual 165 CSS px image rather than its 960 CSS px element');
+            assert.ok(canvas.height >= 86 * 2);
+            const densityTwoWidth = canvas.width;
+            runtime.window.devicePixelRatio = 4;
+            runtime.queries.get('(resolution: 2dppx)')!.emit('change'); runtime.frame();
+            assert.ok(canvas.width > densityTwoWidth && canvas.width >= 480 * 86 / 250 * 4,
+                'DPR changes rebuild a sharp backing instead of stretching the initial bitmap');
+            assert.strictEqual(canvas.width / canvas.height, 480 / 250, 'intrinsic aspect ratio stays equal to the logical scene');
+            assert.strictEqual(runtime.callbacks.size, 0);
+        } finally { runtime.dispose(); }
+    });
+
+    it('bounds every fleet backing and cache together even during resize replacement, then releases all pixels', () => {
+        const runtime = new RobotRuntime(robots);
+        try {
+            runtime.lab.update(ready); runtime.lab.setActive(true);
+            const canvas = runtime.stage.children.find(node => node.className === 'robot-canvas')!;
+            const budget = 64 * 1024 * 1024;
+            for (const [width, height, dpr] of [[8000, 5000, 4], [6400, 3600, 1], [9000, 6000, 3], [480, 250, 1]]) {
+                canvas.rect.width = width; canvas.rect.height = height; runtime.window.devicePixelRatio = dpr;
+                runtime.resize(); runtime.frame();
+                const bytes = runtime.canvases.reduce((sum, surface) => sum + surface.width * surface.height * 4, 0);
+                assert.strictEqual(runtime.lab.snapshot().renderer.raster.bytes, bytes, 'telemetry counts the stage, background and every body cache');
+                assert.ok(bytes <= budget && runtime.peakRasterBytes <= budget, 'old and new owned backing stores never overlap beyond the joint budget');
+                assert.ok(runtime.canvases.every(surface => surface.width <= 8192 && surface.height <= 8192));
+            }
+            assert.strictEqual(runtime.lab.snapshot().renderer.raster.limited, false);
+            runtime.document.hidden = true; runtime.document.emit('visibilitychange');
+            const writes = runtime.canvases.map(surface => surface.rasterWrites);
+            canvas.rect.width = 1200; canvas.rect.height = 625; runtime.resize();
+            assert.strictEqual(runtime.callbacks.size, 0);
+            assert.deepStrictEqual(runtime.canvases.map(surface => surface.rasterWrites), writes, 'hidden resize work is deferred');
+            runtime.document.hidden = false; runtime.document.emit('visibilitychange');
+            assert.ok(canvas.width >= 1200);
+            runtime.lab.dispose();
+            assert.strictEqual(runtime.lab.snapshot().renderer.raster.bytes, 0);
+        } finally { runtime.dispose(); }
+    });
+
     it('invalidates shared geometry for real size, viewport, density and lifecycle changes without polling', () => {
         const runtime = new RobotRuntime(robots);
         try {
@@ -236,6 +325,8 @@ describe('the procedural PDF robot fleet', function () {
                 const result = point();
                 assert.deepStrictEqual(point(), result);
                 assert.strictEqual(canvas.rectReads, previous + 1);
+                runtime.frame();
+                assert.strictEqual(canvas.rectReads, previous + 1, 'the deferred paint shares the already-measured geometry');
                 assert.strictEqual(runtime.callbacks.size, 0);
                 return result;
             };
@@ -335,6 +426,7 @@ describe('the procedural PDF robot fleet', function () {
             runtime.document.emit('pointerdown');
             assert.strictEqual(runtime.lab.snapshot().renderer.frames, frames + 1, 'an input event refreshes the visible settled stage once');
             runtime.resize();
+            runtime.frame();
             assert.strictEqual(runtime.lab.snapshot().renderer.frames, frames + 2, 'a resized stage repaints once');
             assert.strictEqual(runtime.callbacks.size, 0);
             runtime.document.hidden = true;
@@ -352,7 +444,7 @@ describe('the procedural PDF robot fleet', function () {
         } finally { runtime.dispose(); }
     });
 
-    it('places readable compact labels on a single unchanged-time resize without starting idle frames', () => {
+    it('places readable compact labels on one coalesced resize paint without continuing idle frames', () => {
         const runtime = new RobotRuntime(robots);
         try {
             runtime.lab.update(ready); runtime.lab.setActive(true);
@@ -361,6 +453,7 @@ describe('the procedural PDF robot fleet', function () {
             canvas.rect.width = 300; canvas.rect.height = 86;
             const before = runtime.lab.snapshot().renderer.frames;
             runtime.resize();
+            runtime.frame();
             const names = new Set(robots.ROBOT_VEHICLES.map((vehicle: any) => vehicle.name));
             const labels = canvas.texts.filter(value => names.has(value.text));
             assert.ok(labels.length > 0 && labels.length <= 3, 'a static compact stage admits no more than three fitting names');
@@ -382,8 +475,8 @@ describe('the procedural PDF robot fleet', function () {
             const shownNames = () => canvas.texts.filter(value => names.has(value.text));
             const initial = shownNames().map(value => value.text).sort();
             assert.ok(initial.length > 0 && initial.length <= 3);
-            canvas.texts.length = 0; runtime.resize();
-            assert.deepStrictEqual(shownNames().map(value => value.text).sort(), initial, 'unchanged-time admission does not rotate ambient names');
+            canvas.texts.length = 0; runtime.resize(); runtime.frame();
+            assert.deepStrictEqual(shownNames().map(value => value.text).sort(), initial, 'one deferred resize paint does not rotate ambient names');
             const events = Array.from({ length: 15 }, (_, index) => ({ sequence: index + 1, at: 10, type: 'fetch', data: { bytes: 4096 } }));
             runtime.tick(10); runtime.lab.update({ ...ready, performance: { events } });
             let sawNotice = false;
@@ -557,6 +650,77 @@ describe('the procedural PDF robot fleet', function () {
             assert.strictEqual(frame.stats.deliveredCargo, 15, 'seed ' + seed + ' must finish its finite stationary backlog');
             assert.strictEqual(frame.queuedCargo.length, 0);
             assert.ok(frame.actors.every((actor: any) => actor.job !== 'delivery'));
+        }
+    });
+
+    for (const fps of [30, 60]) {
+        it('finishes the seed13 fifteen-parcel burst and sleeps at exact ' + fps + ' Hz', () => {
+            const fleet = new robots.RobotChoreographer(13);
+            fleet.open(0, ready);
+            fleet.step(0);
+            const events = Array.from({ length: 15 }, (_, index) => ({
+                sequence: index + 1, at: 10, type: 'fetch', data: { bytes: 131072 },
+            }));
+            fleet.update(10, { ...ready, performance: { events } });
+            let at = 10, frame = fleet.snapshot();
+            for (let count = 0; count < fps * 200 && fleet.needsAnimation(); count++) {
+                at += 1000 / fps;
+                frame = fleet.step(at);
+            }
+            assert.strictEqual(frame.stats.deliveredCargo, 15);
+            assert.strictEqual(frame.queuedCargo.length, 0);
+            const unfinished = frame.actors.filter((actor: any) => actor.job !== 'idle' || actor.carrying || actor.notice !== null
+                || Math.hypot(actor.x - actor.goal.x, actor.y - actor.goal.y) > 1 || Math.hypot(actor.vx, actor.vy) > 2);
+            assert.strictEqual(unfinished.length, 0, 'finite trips and their notices must settle: ' + JSON.stringify(unfinished));
+            assert.strictEqual(fleet.needsAnimation(), false);
+            fleet.update(at + 250, { ...ready, performance: { events } });
+            assert.strictEqual(fleet.needsAnimation(), false, 'identical telemetry cannot restart the completed burst');
+        });
+    }
+
+    it('keeps detour right of way through its waypoint and releases it at the trip and lifecycle boundaries', () => {
+        const blocked = () => {
+            const fleet = new robots.RobotChoreographer(13);
+            fleet.open(0, ready); fleet.step(0);
+            const actor = fleet.actors.find((candidate: any) => candidate.vehicle === 'mecanum');
+            const obstacle = fleet.actors.find((candidate: any) => candidate.vehicle === 'ekokomvoz');
+            for (const other of fleet.actors) {
+                if (other !== actor && other !== obstacle) { fleet.reserveVehicle(other.vehicle, 0); }
+            }
+            actor.x = 205; actor.y = 200; actor.patience = 0;
+            obstacle.x = 180; obstacle.y = 205;
+            fleet.assign(obstacle, 'delivery', [{ x: obstacle.x, y: obstacle.y, activity: 'load', holdMs: Infinity }]);
+            obstacle.task.arrivedAt = 0;
+            let at = 1000 / 30;
+            fleet.step(at);
+            assert.ok(actor.detour, 'the blocked return actually selects an avoidance waypoint');
+            assert.strictEqual(actor.detourGoal, actor.goal, 'the priority belongs to this underlying trip');
+            fleet.reserveVehicle(obstacle.vehicle, at);
+            return { fleet, actor, advance() {
+                const before = { x: actor.x, y: actor.y };
+                at += 1000 / 30; fleet.step(at);
+                const vehicle = robots.ROBOT_VEHICLES.find((entry: any) => entry.id === actor.vehicle);
+                assert.ok(Math.hypot(actor.x - before.x, actor.y - before.y) <= vehicle.speed * 1.8 / 30 + 1e-8,
+                    'right of way preserves bounded physical motion');
+            } };
+        };
+        const returning = blocked();
+        for (let index = 0; index < 600 && returning.actor.detour; index++) { returning.advance(); }
+        assert.strictEqual(returning.actor.detour, null);
+        assert.ok(Math.hypot(returning.actor.x - returning.actor.goal.x, returning.actor.y - returning.actor.goal.y) > 5);
+        assert.strictEqual(returning.actor.detourGoal, returning.actor.goal, 'the waypoint cannot surrender priority before the actual destination');
+        for (let index = 0; index < 600 && returning.fleet.needsAnimation(); index++) { returning.advance(); }
+        assert.strictEqual(returning.fleet.needsAnimation(), false);
+        assert.strictEqual(returning.actor.detourGoal, null);
+        assert.strictEqual(returning.actor.activity, 'park');
+        assert.strictEqual(returning.actor.notice, null);
+        for (const change of ['assign', 'release', 'open'] as const) {
+            const { fleet, actor } = blocked();
+            if (change === 'assign') { fleet.assign(actor, 'idle', [{ x: 300, y: 190, activity: 'inspect', holdMs: 200 }]); }
+            else if (change === 'release') { fleet.release(actor); }
+            else { fleet.open(100, ready); }
+            assert.strictEqual(actor.detour, null, change);
+            assert.strictEqual(actor.detourGoal, null, change + ' releases the previous trip priority');
         }
     });
 

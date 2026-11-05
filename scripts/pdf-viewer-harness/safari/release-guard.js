@@ -103,13 +103,50 @@
     if (!root || host.hidden) return;
     const surface = root.querySelector('section');
     if (!surface) return;
-    return { host, root, surface, drag: root.querySelector('.panel-drag'), resize: root.querySelector('.panel-resize') };
+    const direction = host.dataset.dock === 'right' ? 'w' : host.dataset.dock === 'left' ? 'e' : 'se';
+    return { host, root, surface, drag: root.querySelector('.panel-drag'),
+      resize: uniqueControl(root, '[data-panel-resize="' + direction + '"]') };
+  }
+  function uniqueControl(root, selector) {
+    const matches = root?.querySelectorAll(selector);
+    return matches?.length === 1 ? matches[0] : undefined;
   }
   function panelState() {
     const value = panel();
     if (!value) return null;
     return { dock: value.host.dataset.dock || 'float', rect: value.surface.getBoundingClientRect().toJSON(),
       measurements: !!value.root.querySelector('.measurements')?.open };
+  }
+  const arrangementMoving = () => document.getElementById('pdf-prefetch-diagnostics')?.dataset.panelMoving === 'true'
+    || viewer?.container.dataset.pdfColumnMoving === 'true';
+  function arrangementState() {
+    return { panel: panelState(), columnX: Number.parseFloat(getComputedStyle(viewer.container)
+      .getPropertyValue('--pdf-document-column-x')) || 0, page: viewer.currentPageNumber,
+      top: viewer.container.scrollTop, left: viewer.container.scrollLeft };
+  }
+  function sameArrangement(left, right) {
+    if (left.page !== right.page || ['columnX', 'top', 'left'].some(key => !near(left[key], right[key], 0.01))) return false;
+    if (!left.panel || !right.panel) return left.panel === right.panel;
+    return left.panel.dock === right.panel.dock && left.panel.measurements === right.panel.measurements
+      && ['x', 'y', 'width', 'height'].every(key => near(left.panel.rect[key], right.panel.rect[key], 0.01));
+  }
+  async function settleArrangement() {
+    let previous;
+    for (;;) {
+      guard(true);
+      const current = arrangementState();
+      if (!arrangementMoving()) {
+        if (previous && sameArrangement(previous, current)) return;
+        previous = current;
+      } else previous = undefined;
+      await nextFrame();
+    }
+  }
+  function pageTextTarget(pageNumber) {
+    if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > expected.pages) return;
+    const view = viewer?.getPageView(pageNumber - 1), root = view?.div, target = view?.textLayer?.div;
+    if (view?.id === pageNumber && root?.isConnected && root.dataset.pageNumber === String(pageNumber)
+        && viewer.container.contains(root) && target?.isConnected && root.contains(target)) return target;
   }
   function focusDescriptor() {
     const element = deepFocus();
@@ -119,12 +156,22 @@
     if (element === document.body) return { kind: 'body' };
     if (element === document.documentElement) return { kind: 'html' };
     if (element === viewer?.container) return { kind: 'viewer' };
+    const pageRoot = element?.closest('.page[data-page-number]');
+    const pageNumber = Number(pageRoot?.dataset.pageNumber);
+    if (element && pageTextTarget(pageNumber) === element && viewer.getPageView(pageNumber - 1).div === pageRoot) {
+      return { kind: 'page-text', pageNumber };
+    }
     if (element?.id && document.getElementById(element.id) === element
       && document.querySelectorAll('#' + CSS.escape(element.id)).length === 1) return { kind: 'id', id: element.id };
     const controls = panel();
     if (controls) {
-      for (const selector of ['.panel-drag', '.panel-resize', '[data-panel-dock="left"]', '[data-panel-dock="right"]', '[data-panel-dock="float"]']) {
-        if (controls.root.querySelectorAll(selector).length === 1 && controls.root.querySelector(selector) === element) return { kind: 'panel', selector };
+      const selectors = ['.panel-drag', '[data-panel-dock="left"]', '[data-panel-dock="right"]', '[data-panel-dock="float"]'];
+      const direction = element?.dataset?.panelResize;
+      if (typeof direction === 'string' && /^(?:[ns][ew]?|[ew])$/.test(direction)) {
+        selectors.push('[data-panel-resize="' + direction + '"]');
+      }
+      for (const selector of selectors) {
+        if (uniqueControl(controls.root, selector) === element) return { kind: 'panel', selector };
       }
     }
     throw new Error('The focused control cannot be restored unambiguously');
@@ -133,8 +180,9 @@
     if (saved.kind === 'body') return document.body;
     if (saved.kind === 'html') return document.documentElement;
     if (saved.kind === 'viewer') return viewer.container;
+    if (saved.kind === 'page-text') return pageTextTarget(saved.pageNumber);
     if (saved.kind === 'id' && document.querySelectorAll('#' + CSS.escape(saved.id)).length === 1) return document.getElementById(saved.id);
-    if (saved.kind === 'panel') return panel()?.root.querySelector(saved.selector);
+    if (saved.kind === 'panel') return uniqueControl(panel()?.root, saved.selector);
   }
   function assertReloadBookmark() {
     const reject = () => { throw new Error('Reload requires a synchronous page/zoom bookmark'); };
@@ -182,7 +230,10 @@
   }
   function capture(forReload = false) {
     guard(true);
-    if (forReload) assertReloadBookmark();
+    if (forReload) {
+      if (arrangementMoving()) throw new Error('The Motion Lab arrangement is still moving');
+      assertReloadBookmark();
+    }
     const state = readState();
     if (state.lab && !state.panel) throw new Error('The open Motion Lab has no restorable geometry');
     if (['page', 'scale', 'top', 'left', 'rotation', 'scrollMode', 'spreadMode', 'sidebar'].some(key => !Number.isFinite(state[key]))) {
@@ -227,7 +278,7 @@
     guard(true);
     if (new URL(saved.url).origin !== location.origin || new URL(saved.url).pathname !== location.pathname) throw new Error('Saved URL belongs to another page');
     const existing = capture();
-    if (!differences(saved, existing).length) return { exact: true, state: existing };
+    if (!differences(saved, existing).length && !arrangementMoving()) return { exact: true, state: existing };
     const sidebar = app.pdfSidebar;
     if ((sidebar?.visibleView ?? 0) !== saved.sidebar) {
       if (!sidebar) throw new Error('The saved sidebar is unavailable');
@@ -237,14 +288,21 @@
     if (viewer.scrollMode !== saved.scrollMode) viewer.scrollMode = saved.scrollMode;
     if (viewer.spreadMode !== saved.spreadMode) viewer.spreadMode = saved.spreadMode;
     if (viewer.currentScaleValue !== saved.scaleValue) viewer.currentScaleValue = saved.scaleValue;
+    viewer.scrollPageIntoView({ pageNumber: saved.page });
+    viewer.container.scrollTop = saved.top; viewer.container.scrollLeft = saved.left;
     if (window.pdfPrefetch.robotsEnabled !== saved.robots) window.pdfPrefetch.setRobotsEnabled(saved.robots);
     if (window.pdfPrefetch.diagnosticsEnabled !== saved.lab) window.pdfPrefetch.setDiagnosticsEnabled(saved.lab);
     await twoFrames(); guard(true);
     if (saved.lab) {
       if (!panelState()) throw new Error('Motion Lab failed to reopen');
       if (panelState().dock !== saved.panel.dock) dock(saved.panel.dock);
-      await twoFrames(); guard(true);
+      await settleArrangement(); guard(true);
       let current = panelState();
+      if (saved.panel.dock === 'float') {
+        // Make room at the saved anchor before a bounded southeast resize.
+        gesture('drag', saved.panel.rect.x - current.rect.x, saved.panel.rect.y - current.rect.y);
+        current = panelState();
+      }
       gesture('resize', (saved.panel.rect.width - current.rect.width) * (saved.panel.dock === 'right' ? -1 : 1),
         saved.panel.dock === 'float' ? saved.panel.rect.height - current.rect.height : 0);
       if (saved.panel.dock === 'float') {
@@ -252,11 +310,13 @@
       }
       const details = panel()?.root.querySelector('.measurements');
       if (details) details.open = saved.panel.measurements;
-      await twoFrames(); guard(true);
     }
-    viewer.scrollPageIntoView({ pageNumber: saved.page });
-    viewer.container.scrollTop = saved.top; viewer.container.scrollLeft = saved.left;
-    const target = focusElement(saved.focus);
+    await settleArrangement(); guard(true);
+    let target = focusElement(saved.focus);
+    while (saved.focus.kind === 'page-text' && !target) {
+      guard(true); await nextFrame(); guard(true);
+      target = focusElement(saved.focus);
+    }
     if (!target?.isConnected || typeof target.focus !== 'function') throw new Error('The saved focused control is missing');
     if (deepFocus() !== target) {
       guard(true);

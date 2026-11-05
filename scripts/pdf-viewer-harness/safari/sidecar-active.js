@@ -38,8 +38,10 @@
     const host = document.getElementById('pdf-prefetch-diagnostics');
     const root = host?.shadowRoot;
     if (!root || host.hidden) return;
+    const dock = host.dataset.dock || 'float', direction = dock === 'right' ? 'w' : dock === 'left' ? 'e' : 'se';
+    const handles = root.querySelectorAll('[data-panel-resize="' + direction + '"]');
     return { host, root, surface: root.querySelector('section'), drag: root.querySelector('.panel-drag'),
-      resize: root.querySelector('.panel-resize'), dock: host.dataset.dock || 'float' };
+      resize: handles.length === 1 ? handles[0] : undefined, dock };
   };
   const panelState = () => {
     const value = panel();

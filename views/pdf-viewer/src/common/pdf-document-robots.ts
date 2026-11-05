@@ -228,7 +228,7 @@ interface ColumnPull {
     opacity: number;
     laneY: number;
     side: -1 | 1;
-    phase: 'approach' | 'pull' | 'return';
+    phase: 'approach' | 'pull' | 'waiting' | 'return';
     returnAt?: number;
     returnFrom?: Point & { scale: number };
 }
@@ -389,7 +389,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         ...(columnPull ? [columnPull.body] : [])];
     const allActors = (): RobotBody[] => [...currentActors(), ...(retiring?.pieces.flatMap(piece => piece.payload.helpers) ?? [])];
     const actorCount = () => allActors().length + Number(!!cleaner);
-    const moving = () => !!retiring || !!columnPull || !!greeting
+    const moving = () => !!retiring || !!columnPull && columnPull.phase !== 'waiting' || !!greeting
         || episodes.size > 0 || [...advance.values()].some(work => work.actors.length && work.phase !== 'parked');
     const documentOffset = () => { const offset = options.documentOffset?.() ?? 0; return Number.isFinite(offset) ? offset : 0; };
 
@@ -988,19 +988,28 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const end = columnPull.motion.startedAt + columnPull.motion.durationMs;
             if (now() + 0.01 < end) { clearColumnPull(); cancelFrameIfEmpty(); notifyCapacity(); }
             else {
-                columnPull.returnAt ??= end;
+                columnPull.returnAt ??= columnPull.motion.holdAtEnd ? now() : end;
+                columnPull.motion = { ...columnPull.motion, holdAtEnd: false };
                 // The column just wrote its final translation. Read geometry in the queued paint.
                 dirty = true;
                 schedule();
             }
             return;
         }
-        if (columnPull?.motion.id === motion.id) { return; }
         const area = motion.bounds;
         if (disposed || !enabled || hidden() || media.matches || !area
             || ![motion.fromX, motion.toX, motion.startedAt, motion.durationMs, area.x, area.y, area.width, area.height].every(Number.isFinite)
             || motion.durationMs <= 0 || motion.durationMs > MOTION_LAB_CHOREOGRAPHY.columnDurationMs || area.width <= 0 || area.height <= 0
             || Math.abs(motion.toX - motion.fromX) < 0.5) { clearColumnPull(); return; }
+        if (columnPull?.motion.id === motion.id) {
+            const active = columnPull;
+            active.motion = { ...active.motion, bounds: { ...area }, holdAtEnd: motion.holdAtEnd };
+            if (motion.holdAtEnd) { active.returnAt = undefined; active.returnFrom = undefined; }
+            else if (active.phase === 'waiting') { active.returnAt = now(); active.returnFrom = undefined; }
+            // Geometry and continuation intent do not restart the committed leg.
+            dirty = true; schedule();
+            return;
+        }
         clearRetiring(); releaseCleaner();
         const viewport = viewportBounds(), policy = presentation(viewport);
         const previous = columnPull;
@@ -1049,7 +1058,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (!active) { return; }
         const { body, motion, side } = active;
         const end = motion.startedAt + motion.durationMs;
-        if (at >= end + DOCUMENT_ROBOT_LIMITS.advance.returnMs || actorCount() > policy.maxActors || !resizeSprite(body, policy)) {
+        if (!motion.holdAtEnd && at >= (active.returnAt ?? end) + DOCUMENT_ROBOT_LIMITS.advance.returnMs
+            || actorCount() > policy.maxActors || !resizeSprite(body, policy)) {
             clearColumnPull(); return;
         }
         const pull = ROBOT_FORKLIFT_ATTACHMENT.pull[side === 1 ? 'right' : 'left'];
@@ -1063,7 +1073,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         let scale = active.start.scale + (policy.spriteScale - active.start.scale) * approach;
         let opacity = active.startOpacity + (1 - active.startOpacity) * Math.min(1, progress * 15);
         active.phase = elapsed < MOTION_LAB_CHOREOGRAPHY.approachMs ? 'approach' : 'pull';
-        if (at >= end || active.returnAt !== undefined) {
+        if (at >= end && motion.holdAtEnd) {
+            active.phase = 'waiting'; point = target; scale = policy.spriteScale; opacity = 1;
+        } else if (at >= end || active.returnAt !== undefined) {
             active.returnAt ??= end;
             active.returnFrom ??= { ...target, scale: policy.spriteScale };
             active.phase = 'return';
@@ -1078,7 +1090,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         active.point = { ...point, scale }; active.offsetX = offsetX; active.opacity = opacity;
         placements.push({ body, point, scale, opacity, tilt: 0, activity: active.phase === 'pull' ? 'assist' : 'navigate',
             carrying: false, progress: Math.round(progress * 12) / 12, look: side, phase: 'parked', fixed: true,
-            remainingMs: end + DOCUMENT_ROBOT_LIMITS.advance.returnMs - at, pages: [...visible],
+            remainingMs: active.phase === 'waiting' ? 0 : (active.returnAt ?? end) + DOCUMENT_ROBOT_LIMITS.advance.returnMs - at,
+            pages: [...visible],
             pullDirection: active.phase === 'pull' ? side : undefined });
     }
 
@@ -2273,7 +2286,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 const payload = piece.payload;
                 if (at >= payload.started + payload.delay + payload.duration * RETURN_START) { payload.helpers.forEach(destination); }
             }
-            if (columnPull && at >= columnPull.motion.startedAt + columnPull.motion.durationMs) { destination(columnPull.body); }
+            if (columnPull && !columnPull.motion.holdAtEnd
+                && at >= columnPull.motion.startedAt + columnPull.motion.durationMs) { destination(columnPull.body); }
             const placements: BodyPlacement[] = [], captionObstacles: SceneObstacle[] = [];
             try { paintColumnPull(at, viewport, policy, destinations, placements); }
             catch { clearColumnPull(); stats.rejected++; }
@@ -2599,7 +2613,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 documentOffset: documentOffset(),
                 columnPull: columnPull ? { id: columnPull.motion.id, actor: columnPull.body.id, vehicle: columnPull.body.vehicle,
                     phase: columnPull.phase, startedAt: columnPull.motion.startedAt,
-                    deadline: columnPull.motion.startedAt + columnPull.motion.durationMs + DOCUMENT_ROBOT_LIMITS.advance.returnMs } : undefined,
+                    deadline: columnPull.phase === 'waiting' ? undefined
+                        : (columnPull.returnAt ?? columnPull.motion.startedAt + columnPull.motion.durationMs)
+                            + DOCUMENT_ROBOT_LIMITS.advance.returnMs } : undefined,
                 activeArrivalCovers: [...episodes.values()].reduce((count, episode) => count
                     + episode.payloads.filter(payload => payload.cover?.parentNode).length, 0),
                 activeRefinements: [...episodes.values()].reduce((count, episode) => count

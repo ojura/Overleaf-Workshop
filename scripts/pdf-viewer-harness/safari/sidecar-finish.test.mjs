@@ -11,9 +11,9 @@ const box = (x, y, width, height) => ({ x, y, left: x, top: y, width, height,
   right: x + width, bottom: y + height, toJSON() { return { ...this, toJSON: undefined }; } });
 
 function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 0, pageLeft = 300, pageWidth = 300,
-  stallDock, insufficientFloat = false, interruptDuringRestore = false } = {}) {
+  stallDock, insufficientFloat = false, interruptDuringRestore = false, recoverFloatFrom } = {}) {
   let now = 0, serial = 0, columnX = 0, animation, column, pointer, callback, restoring;
-  let closed = false, interrupted = false, stalled = false, recovery = false;
+  let closed = false, interrupted = false, stalled = false, recovery = false, recoveryPositioned = false;
   const timers = new Map(), overlaps = [], history = [];
   const readerRight = readerLeft + 1000;
   const originalFloat = box(floatX, 80, floatWidth, 220);
@@ -91,11 +91,15 @@ function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 
       if (event.type === 'pointerup') { pointer = undefined; return; }
       if (event.type !== 'pointermove' || !pointer) return;
       const dx = event.clientX - pointer.x, dy = event.clientY - pointer.y, old = pointer.rect;
+      const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
       if (pointer.kind === 'drag') {
         currentDock = 'float'; host.dataset.dock = currentDock;
-        rect = box(old.x + dx, old.y + dy, old.width, old.height);
+        rect = box(recoverFloatFrom ? clamp(old.x + dx, 8, readerRight - 8 - old.width) : old.x + dx,
+          recoverFloatFrom ? clamp(old.y + dy, 8, 700 - 8 - old.height) : old.y + dy, old.width, old.height);
       } else if (currentDock === 'right') rect = box(old.x + dx, old.y, old.width - dx, old.height);
-      else rect = box(old.x, old.y, old.width + dx, old.height + (currentDock === 'float' ? dy : 0));
+      else rect = box(old.x, old.y,
+        recoverFloatFrom && currentDock === 'float' ? clamp(old.width + dx, 240, readerRight - 8 - old.x) : old.width + dx,
+        recoverFloatFrom && currentDock === 'float' ? clamp(old.height + dy, 160, 700 - 8 - old.y) : old.height + (currentDock === 'float' ? dy : 0));
       if (currentDock === 'float') floating = clone(rect);
       moveColumn(plan(currentDock, rect));
       history.push({ action: pointer.kind, at: now, recovery });
@@ -117,6 +121,12 @@ function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 
       restoring = (async () => {
         if (result.interrupted) return false;
         recovery = true;
+        if (callback && recoverFloatFrom && !recoveryPositioned) {
+          recoveryPositioned = true; currentDock = host.dataset.dock = 'float';
+          rect = box(...recoverFloatFrom); floating = clone(rect);
+          animation = column = undefined; delete host.dataset.panelMoving; delete container.dataset.pdfColumnMoving;
+          history.push({ action: 'recovery-position', at: now, recovery });
+        }
         if (interruptDuringRestore) timeout(() => { interrupted = result.interrupted = true; reading.page = 311; }, 32);
         await callback?.({ guard: () => guard(true), deadline: now + budget.restoreMs });
         if (result.interrupted) return false;
@@ -218,4 +228,23 @@ test('trusted input during asynchronous recovery keeps the user-selected reader 
   assert.equal(h.reading.page, 311);
   assert.equal(result.observersRemoved, true);
   assert.equal(h.timers.size, 0);
+});
+
+test('viewport-clamped floating recovery handles growth-leftward and shrink-rightward within one settle', async () => {
+  for (const options of [
+    { floatX: 100, floatWidth: 600, recoverFloatFrom: [700, 80, 292, 220] },
+    { floatX: 700, floatWidth: 292, recoverFloatFrom: [100, 80, 600, 220] },
+  ]) {
+    const h = fixture({ ...options, stallDock: 'right' }), result = await h.run();
+    assert.match(result.failure, /did not settle/i, 'the owned failure enters the actual recovery callback');
+    assert.equal(result.cleanupError, undefined);
+    assert.ok(h.history.some(event => event.action === 'recovery-position'));
+    for (const key of ['x', 'y', 'width', 'height']) assert.ok(Math.abs(h.panelState().rect[key] - h.original[key]) <= 1, key);
+    const gestures = h.history.filter(event => event.recovery && ['drag', 'resize'].includes(event.action));
+    assert.equal(gestures[0].action, 'drag');
+    assert.ok(gestures.some(event => event.action === 'resize'));
+    assert.equal(new Set(gestures.map(event => event.at)).size, 1);
+    assert.equal(h.reading.page, result.saved.page);
+    assert.equal(h.timers.size, 0);
+  }
 });

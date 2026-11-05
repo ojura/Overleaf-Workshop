@@ -81,6 +81,31 @@ test('both sidecar expressions remain inert until an explicit owned invocation',
   await assert.rejects(finish({ token: 'another-sidecar-token' }), /owner/);
 });
 
+test('panel geometry uses the unique floating corner or dock-preserving inner width edge', () => {
+  const begin = phone.indexOf('  const panel = () => {'), end = phone.indexOf('  const panelState =', begin);
+  assert.ok(begin >= 0 && end > begin, 'the actual active-probe panel selector is available');
+  const handles = new Map(['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'].map(direction =>
+    [direction, { dataset: { panelResize: direction } }]));
+  let duplicate = false, missing = false;
+  const root = { querySelectorAll(selector) {
+    if (selector === '.panel-resize') return [...handles.values()];
+    const direction = selector.match(/^\[data-panel-resize="([a-z]+)"\]$/)?.[1];
+    const handle = handles.get(direction);
+    return handle && !missing ? duplicate ? [handle, { ...handle }] : [handle] : [];
+  } };
+  root.querySelector = selector => root.querySelectorAll(selector)[0];
+  const host = { shadowRoot: root, dataset: { dock: 'float' }, hidden: false };
+  const context = { document: { getElementById: () => host } };
+  vm.runInNewContext(phone.slice(begin, end) + '\nglobalThis.readPanel = panel;', context);
+  for (const [dock, direction] of [['float', 'se'], ['left', 'e'], ['right', 'w']]) {
+    host.dataset.dock = dock;
+    assert.equal(context.readPanel().resize, handles.get(direction), dock + ' must use the exact supported handle');
+    duplicate = true; assert.equal(context.readPanel().resize, undefined, 'an ambiguous handle cannot drive a gesture');
+    duplicate = false; missing = true; assert.equal(context.readPanel().resize, undefined);
+    missing = false;
+  }
+});
+
 test('retained refinements remain monotone and partial-zero or shrinking rasters fail', () => {
   const h = primed();
   h.sample({ ...clone(event.before), refinements: event.before.refinements + 1, rasterWidth: 342, rasterHeight: 194 },

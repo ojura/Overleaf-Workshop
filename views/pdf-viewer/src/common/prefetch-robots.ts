@@ -3,6 +3,7 @@ import { robotScreenMetrics, robotCaptionMetrics, ROBOT_LAB_CAPTION_STYLE } from
 import { paintEkokomvoz } from './robot-ekokomvoz-artwork';
 import { LabelPlacementSolver } from './label-placement';
 import { ROBOT_RESCUE_POLICY } from './robot-rescue';
+import { robotRasterPlan, ROBOT_RASTER_LIMITS, type RobotRasterPlan } from './robot-raster-sizing';
 
 /**
  * The motion lab's crew keep their own jobs, destinations and patience. Scenarios give them
@@ -165,6 +166,7 @@ interface Actor {
     noticeCandidate: Notice;
     noticeCandidateSince: number;
     detour: Point | null;
+    detourGoal: Point | null;
     needsHelp: boolean;
     partner: number | null;
     battery: number;
@@ -187,11 +189,11 @@ function trafficPriority(actor: Actor): number {
         && ['load', 'unload'].includes(actor.task!.steps[actor.task!.index].activity);
     // The departing courier clears the bay before another loaded courier enters it.
     const departing = delivery && actor.task!.index > 1;
-    // Unfinished travel has right of way over a settled idle body. This also lets a
-    // returning bulky vehicle clear a detour beside the stage boundary.
+    // A detour retains right of way through its underlying trip. Dropping priority at
+    // each waypoint made two returning vehicles repeatedly yield and circle each other.
     const travelling = distance(actor, actor.goal) > 1;
     return (docked ? 40 : departing ? 30 : actor.carrying ? 20 : delivery ? 10
-        : actor.detour !== null ? 7 : travelling ? 5 : 0) - actor.id / 10;
+        : actor.detour !== null || actor.detourGoal === actor.goal ? 7 : travelling ? 5 : 0) - actor.id / 10;
 }
 
 function lastWhere<T>(values: readonly T[], predicate: (value: T) => boolean): T | undefined {
@@ -278,7 +280,7 @@ export class RobotChoreographer {
                 vx: 0, vy: 0, activity: 'park', task: null, carrying: false,
                 temperament, patience: patienceLimit, patienceLimit, blockedMs: 0, yieldTo: null,
                 notice: null, noticeSince: 0, noticeCandidate: null, noticeCandidateSince: 0,
-                detour: null, needsHelp: false, partner: null, battery: rng.range(0.55, 1),
+                detour: null, detourGoal: null, needsHelp: false, partner: null, battery: rng.range(0.55, 1),
                 distance: 0, idleUntil: rng.range(1000, 6000), phase: rng.range(0, Math.PI * 2), look: 0, reservedAt: null, rng,
             };
         });
@@ -677,6 +679,7 @@ export class RobotChoreographer {
         actor.carrying = actor.needsHelp = false;
         actor.partner = actor.yieldTo = null;
         actor.detour = null;
+        actor.detourGoal = null;
         actor.goal = { ...actor.home };
         actor.activity = 'park';
         actor.patience = actor.patienceLimit;
@@ -689,6 +692,7 @@ export class RobotChoreographer {
         actor.goal = { x: steps[0].x, y: steps[0].y };
         actor.activity = 'navigate';
         actor.detour = null;
+        actor.detourGoal = null;
         actor.carrying = false;
         actor.partner = partner ?? null;
         actor.yieldTo = null;
@@ -735,7 +739,13 @@ export class RobotChoreographer {
 
     private arrive(actor: Actor): void {
         const task = actor.task;
-        if (!task) { return; }
+        if (!task) {
+            if (distance(actor, actor.goal) <= 1 && Math.hypot(actor.vx, actor.vy) <= 2) {
+                actor.detourGoal = null;
+                actor.activity = 'park';
+            }
+            return;
+        }
         const target = task.steps[task.index];
         if (!target) { this.release(actor); return; }
         if (task.arrivedAt === null && task.kind === 'delivery' && ['load', 'unload'].includes(target.activity)) {
@@ -745,7 +755,7 @@ export class RobotChoreographer {
                 && distance(other.goal, target) < 1);
             if (occupied) { actor.yieldTo = occupied.id; actor.activity = 'yield'; return; }
         }
-        if (task.arrivedAt === null) { task.arrivedAt = this.now; }
+        if (task.arrivedAt === null) { task.arrivedAt = this.now; actor.detourGoal = null; }
         actor.activity = target.activity;
         if (this.now - task.arrivedAt < target.holdMs) { return; }
         if (task.kind === 'help') {
@@ -839,6 +849,7 @@ export class RobotChoreographer {
                         x: clamp(actor.x + Math.sign(dx || side) * 44, 28, 450),
                         y: clamp(actor.y + side * 37, spec.air ? 35 : 152, spec.air ? 130 : 225),
                     };
+                    actor.detourGoal = actor.goal;
                     actor.activity = 'replan';
                     actor.patience = actor.patienceLimit;
                     actor.yieldTo = null;
@@ -1283,28 +1294,68 @@ class RobotStagePainter {
     private readonly context: Paint;
     private readonly background: HTMLCanvasElement;
     private readonly bodies = new Map<RobotVehicle, HTMLCanvasElement>();
-    private readonly ratio: number;
+    private raster: RobotRasterPlan | undefined;
+    private rasterGeometry: RobotCanvasGeometry | undefined;
+    private rasterDpr = NaN;
+    private resizes = 0;
     private readonly labels = new LabelPlacementSolver();
     private labelGeometry = '';
     constructor(private readonly canvas: HTMLCanvasElement) {
         const doc = canvas.ownerDocument;
-        this.ratio = Math.min(2, doc.defaultView?.devicePixelRatio || 1);
-        canvas.width = Math.ceil(ROBOT_LIMITS.width * this.ratio);
-        canvas.height = Math.ceil(ROBOT_LIMITS.height * this.ratio);
+        canvas.width = canvas.height = 0;
         this.context = canvas.getContext('2d', { alpha: false })!;
         this.background = doc.createElement('canvas');
-        this.background.width = canvas.width; this.background.height = canvas.height;
-        const bg = this.background.getContext('2d')!;
-        bg.scale(this.ratio, this.ratio);
-        this.paintBackground(bg);
+        this.background.width = this.background.height = 0;
         for (const vehicle of ROBOT_VEHICLES) {
             const image = doc.createElement('canvas');
-            image.width = Math.ceil(ROBOT_ARTWORK_SIZE.width * this.ratio); image.height = Math.ceil(ROBOT_ARTWORK_SIZE.height * this.ratio);
-            const ctx = image.getContext('2d')!;
-            ctx.scale(this.ratio, this.ratio); ctx.translate(ROBOT_ARTWORK_SIZE.width / 2, ROBOT_ARTWORK_SIZE.height / 2);
-            bodyArtwork(ctx, vehicle);
+            image.width = image.height = 0;
             this.bodies.set(vehicle.id, image);
         }
+    }
+
+    private resize(geometry: RobotCanvasGeometry): void {
+        const devicePixelRatio = this.canvas.ownerDocument.defaultView?.devicePixelRatio ?? 1;
+        if (this.rasterGeometry === geometry && this.rasterDpr === devicePixelRatio) { return; }
+        this.rasterGeometry = geometry; this.rasterDpr = devicePixelRatio;
+        const next = robotRasterPlan({ width: ROBOT_LIMITS.width, height: ROBOT_LIMITS.height,
+            bodyWidth: ROBOT_ARTWORK_SIZE.width, bodyHeight: ROBOT_ARTWORK_SIZE.height, bodyCount: this.bodies.size },
+        { ...geometry, devicePixelRatio }, this.raster);
+        const stageChanged = this.canvas.width !== next.width || this.canvas.height !== next.height;
+        const bodiesChanged = this.raster?.bodyWidth !== next.bodyWidth || this.raster?.bodyHeight !== next.bodyHeight;
+        this.raster = next;
+        if (!stageChanged && !bodiesChanged) { return; }
+        // Release every replaced surface first. Growing one cache while the old cohort is
+        // still owned would otherwise exceed the joint limit during a large resize.
+        if (stageChanged) {
+            this.canvas.width = this.canvas.height = 0;
+            this.background.width = this.background.height = 0;
+        }
+        if (bodiesChanged) { for (const body of this.bodies.values()) { body.width = body.height = 0; } }
+        if (stageChanged) {
+            this.canvas.width = this.background.width = next.width;
+            this.canvas.height = this.background.height = next.height;
+            const bg = this.background.getContext('2d')!;
+            bg.setTransform(next.width / ROBOT_LIMITS.width, 0, 0, next.height / ROBOT_LIMITS.height, 0, 0);
+            this.paintBackground(bg);
+        }
+        if (bodiesChanged) {
+            for (const vehicle of ROBOT_VEHICLES) {
+                const image = this.bodies.get(vehicle.id)!;
+                image.width = next.bodyWidth; image.height = next.bodyHeight;
+                const ctx = image.getContext('2d')!;
+                ctx.setTransform(next.bodyWidth / ROBOT_ARTWORK_SIZE.width, 0, 0, next.bodyHeight / ROBOT_ARTWORK_SIZE.height, 0, 0);
+                ctx.translate(ROBOT_ARTWORK_SIZE.width / 2, ROBOT_ARTWORK_SIZE.height / 2);
+                bodyArtwork(ctx, vehicle);
+            }
+        }
+        this.resizes++;
+    }
+
+    rasterSnapshot() {
+        return { width: this.canvas.width, height: this.canvas.height,
+            bodyWidth: this.raster?.bodyWidth ?? 0, bodyHeight: this.raster?.bodyHeight ?? 0,
+            density: this.raster?.density ?? 0, bytes: this.raster?.bytes ?? 0,
+            budgetBytes: ROBOT_RASTER_LIMITS.maxBytes, limited: this.raster?.limited ?? false, resizes: this.resizes };
     }
 
     private paintBackground(ctx: Paint): void {
@@ -1338,10 +1389,11 @@ class RobotStagePainter {
     }
 
     draw(frame: RobotFrame, geometry: RobotCanvasGeometry, reduced = false): void {
+        this.resize(geometry);
         const ctx = this.context;
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.drawImage(this.background, 0, 0);
-        ctx.setTransform(this.ratio, 0, 0, this.ratio, 0, 0);
+        ctx.setTransform(this.canvas.width / ROBOT_LIMITS.width, 0, 0, this.canvas.height / ROBOT_LIMITS.height, 0, 0);
         const time = reduced ? 0 : frame.at / 1000;
         const panic = frame.mode === 'outage';
         ellipse(ctx, 457, 20, 3, 3, panic ? '#ff9a7d' : frame.mode === 'quiet' ? '#b5a7df' : '#70e7d3');
@@ -1561,6 +1613,8 @@ class RobotStagePainter {
         this.background.width = this.background.height = 0;
         for (const body of this.bodies.values()) { body.width = body.height = 0; }
         this.bodies.clear();
+        this.raster = undefined;
+        this.rasterGeometry = undefined;
     }
 }
 
@@ -1571,7 +1625,8 @@ export interface RobotLab {
     invalidateGeometry(): void;
     setActive(active: boolean): void;
     update(input: RobotTelemetry): void;
-    snapshot(): RobotFrame & { renderer: { active: boolean; scheduled: boolean; reducedMotion: boolean; frames: number; meanDrawMs: number; maxDrawMs: number } };
+    snapshot(): RobotFrame & { renderer: { active: boolean; scheduled: boolean; reducedMotion: boolean; frames: number; meanDrawMs: number; maxDrawMs: number;
+        raster: ReturnType<RobotStagePainter['rasterSnapshot']> } };
     dispose(): void;
 }
 
@@ -1620,6 +1675,7 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     let geometry: RobotCanvasGeometry | undefined;
     let geometryDpr = NaN;
     let density: MediaQueryList | undefined;
+    let geometryPending = false;
 
     function invalidateGeometry(): void { geometry = undefined; }
 
@@ -1643,7 +1699,9 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     function geometryChanged(): void {
         if (disposed) { return; }
         invalidateGeometry();
-        schedule();
+        if (!active || doc.hidden || !inView) { return; }
+        geometryPending = true;
+        if (raf === undefined) { raf = win.requestAnimationFrame(loop); }
     }
 
     function densityChanged(): void {
@@ -1691,18 +1749,20 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
 
     function cancel(): void {
         if (raf !== undefined) { win.cancelAnimationFrame(raf); raf = undefined; }
+        geometryPending = false;
     }
 
     function loop(now: number): void {
         raf = undefined;
-        if (!active || disposed || doc.hidden || !inView || media.matches) { return; }
+        if (!active || disposed || doc.hidden || !inView) { geometryPending = false; return; }
         const interval = 1000 / ROBOT_LIMITS.maxFps;
         const elapsed = now - lastDraw;
-        if (!Number.isFinite(lastDraw) || elapsed >= interval) {
-            lastDraw = Number.isFinite(lastDraw) ? now - elapsed % interval : now;
+        if (!Number.isFinite(lastDraw) || elapsed >= interval || geometryPending && elapsed + 1e-6 >= interval) {
+            lastDraw = Number.isFinite(lastDraw) && elapsed >= interval ? now - elapsed % interval : now;
+            geometryPending = false;
             if (!render(now)) { return; }
         }
-        if (wantsAnimation()) { raf = win.requestAnimationFrame(loop); }
+        if (geometryPending || !media.matches && wantsAnimation()) { raf = win.requestAnimationFrame(loop); }
     }
 
     function wantsAnimation(): boolean {
@@ -1808,6 +1868,7 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
                 renderer: {
                     active, scheduled: raf !== undefined, reducedMotion: media.matches,
                     frames, meanDrawMs: frames ? totalDrawMs / frames : 0, maxDrawMs,
+                    raster: painter.rasterSnapshot(),
                 },
             };
         },

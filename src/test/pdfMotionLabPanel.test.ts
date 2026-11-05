@@ -7,6 +7,8 @@ const importModule = new Function('specifier', 'return import(specifier)') as (s
 const repo = path.resolve(__dirname, '..', '..');
 const viewport = { x: 0, y: 0, width: 1000, height: 800 };
 const initial = { x: 300, y: 200, width: 340, height: 300 };
+const directions = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'] as const;
+type ResizeDirection = typeof directions[number];
 
 describe('Motion Lab panel geometry and controls', function () {
     this.timeout(30_000);
@@ -84,7 +86,7 @@ describe('Motion Lab panel geometry and controls', function () {
         }
     });
 
-    function fixture(onLayout?: (layout: any) => { readyAt: number } | void, motion = false) {
+    function fixture(onLayout?: (layout: any) => { readyAt: number; isReady?(): boolean } | void, motion = false) {
         class Events {
             readonly listeners = new Map<string, Set<(event: any) => void>>();
             addEventListener(name: string, listener: (event: any) => void) {
@@ -126,7 +128,11 @@ describe('Motion Lab panel geometry and controls', function () {
             readonly dataset: Record<string, string> = {};
             readonly attributes = new Map<string, string>();
             readonly captured = new Set<number>();
+            hidden = false;
+            tabIndex = 0;
             setAttribute(name: string, value: string) { this.attributes.set(name, value); }
+            getAttribute(name: string) { return this.attributes.get(name) ?? null; }
+            removeAttribute(name: string) { this.attributes.delete(name); }
             focus() { document.activeElement = this; }
             setPointerCapture(id: number) { this.captured.add(id); }
             releasePointerCapture(id: number) { this.captured.delete(id); }
@@ -138,16 +144,20 @@ describe('Motion Lab panel geometry and controls', function () {
             }
         }
         let measured: typeof initial | undefined;
-        const host = new Node(), surface = new Node(), drag = new Node(), resize = new Node();
+        const host = new Node(), surface = new Node(), drag = new Node();
+        const resizes = Object.fromEntries(directions.map(direction => {
+            const handle = new Node(); handle.dataset.panelResize = direction; return [direction, handle];
+        })) as Record<ResizeDirection, Node>;
+        const resize = resizes.se;
         const buttons = { left: new Node(), right: new Node(), float: new Node() };
         const layouts: any[] = [], painted: any[] = [];
-        const panel = api.installMotionLabPanel(host, { surface, dragHandle: drag, resizeHandle: resize, dockButtons: buttons,
+        const panel = api.installMotionLabPanel(host, { surface, dragHandle: drag, resizeHandles: resizes, dockButtons: buttons,
             onLayout(layout: any) { layouts.push(layout); return onLayout?.(layout); },
             onGeometryChange() { painted.push(surface.getBoundingClientRect()); } });
         const pointer = (x: number, y: number, id = 1) => ({ button: 0, isPrimary: true, pointerId: id, clientX: x, clientY: y,
             preventDefault() {}, stopPropagation() {} });
         const key = (value: string, shiftKey = false) => ({ key: value, shiftKey, preventDefault() {}, stopPropagation() {} });
-        return { host, surface, drag, resize, buttons, visual, win, document, observers, layouts, painted, panel, pointer, key,
+        return { host, surface, drag, resize, resizes, buttons, visual, win, document, observers, layouts, painted, panel, pointer, key,
             frames, media,
             advance(at: number) {
                 now = at;
@@ -156,6 +166,201 @@ describe('Motion Lab panel geometry and controls', function () {
             },
             measure(rect?: typeof initial) { measured = rect; } };
     }
+
+    it('resizes from all eight floating window handles with the opposite edges anchored', () => {
+        for (const direction of directions) {
+            const f = fixture();
+            try {
+                f.panel.setVisible(true);
+                const dx = direction.includes('w') ? -50 : direction.includes('e') ? 50 : 0;
+                const dy = direction.includes('n') ? -40 : direction.includes('s') ? 40 : 0;
+                const handle = f.resizes[direction];
+                handle.emit('pointerdown', f.pointer(400, 300));
+                assert.ok(handle.captured.has(1), direction + ' captures its resize');
+                f.win.emit('pointermove', f.pointer(400 + dx, 300 + dy));
+                assert.deepStrictEqual(f.panel.snapshot().rect, {
+                    x: initial.x + Math.min(0, dx), y: initial.y + Math.min(0, dy),
+                    width: initial.width + Math.abs(dx), height: initial.height + Math.abs(dy),
+                }, direction);
+                assert.strictEqual(f.frames.size, 0);
+                f.win.emit('pointerup', f.pointer(400 + dx, 300 + dy));
+                assert.strictEqual(handle.captured.size, 0);
+            } finally { f.panel.dispose(); }
+        }
+    });
+
+    it('clamps the moved edges at minimum size and viewport boundaries without moving their opposite corner', () => {
+        const cases: Array<[ResizeDirection, number, number, typeof initial]> = [
+            ['se', 10000, 10000, { x: 300, y: 200, width: 602, height: 512 }],
+            ['nw', -10000, -10000, { x: 18, y: 28, width: 622, height: 472 }],
+            ['ne', 10000, -10000, { x: 300, y: 28, width: 602, height: 472 }],
+            ['sw', -10000, 10000, { x: 18, y: 200, width: 622, height: 512 }],
+            ['se', -10000, -10000, { x: 300, y: 200, width: 240, height: 160 }],
+            ['nw', 10000, 10000, { x: 400, y: 340, width: 240, height: 160 }],
+        ];
+        for (const [direction, dx, dy, expected] of cases) {
+            const f = fixture();
+            try {
+                f.panel.setVisible(true);
+                f.resizes[direction].emit('pointerdown', f.pointer(400, 300));
+                f.win.emit('pointermove', f.pointer(400 + dx, 300 + dy));
+                assert.deepStrictEqual(f.panel.snapshot().rect, expected, direction + ':' + dx + ',' + dy);
+                f.win.emit('pointerup', f.pointer(400 + dx, 300 + dy));
+                f.visual.offsetLeft = 200; f.visual.offsetTop = 100; f.visual.width = 180; f.visual.height = 120;
+                f.visual.emit('resize');
+                const contracted = f.panel.snapshot().rect;
+                f.resizes[direction].emit('pointerdown', f.pointer(250, 150));
+                f.win.emit('pointermove', f.pointer(250 + dx, 150 + dy));
+                assert.deepStrictEqual(f.panel.snapshot().rect, contracted, 'a smaller viewport is already at its effective minimum');
+            } finally { f.panel.dispose(); }
+        }
+    });
+
+    it('can expand upward and leftward from the initial bottom-right panel position', () => {
+        const f = fixture();
+        try {
+            const corner = { x: 562, y: 412, width: 340, height: 300 };
+            f.measure(corner); f.panel.setVisible(true); f.measure();
+            f.resizes.nw.emit('pointerdown', f.pointer(corner.x, corner.y));
+            f.win.emit('pointermove', f.pointer(corner.x - 100, corner.y - 100));
+            assert.deepStrictEqual(f.panel.snapshot().rect, { x: 462, y: 312, width: 440, height: 400 });
+            assert.strictEqual(f.panel.snapshot().rect.x + f.panel.snapshot().rect.width, 902);
+            assert.strictEqual(f.panel.snapshot().rect.y + f.panel.snapshot().rect.height, 712);
+        } finally { f.panel.dispose(); }
+    });
+
+    it('keeps all eight window handles operable at either dock', () => {
+        const f = fixture(undefined, true);
+        try {
+            f.panel.setVisible(true);
+            for (const dock of ['float', 'left', 'right'] as const) {
+                f.panel.setDock(dock);
+                for (const direction of directions) {
+                    const handle = f.resizes[direction];
+                    assert.strictEqual(handle.count('pointerdown'), 1, dock + '/' + direction);
+                    assert.strictEqual(handle.count('keydown'), 1);
+                    assert.strictEqual(handle.hidden, false);
+                    assert.strictEqual(handle.attributes.has('disabled'), false);
+                    assert.strictEqual(handle.tabIndex, 0);
+                    assert.ok(handle.attributes.get('aria-label')?.includes('arrow keys'));
+                }
+            }
+            assert.deepStrictEqual(Object.keys(api.MOTION_LAB_RESIZE_HANDLES), [...directions]);
+        } finally { f.panel.dispose(); }
+    });
+
+    it('resizes the inner dock edge by width only while keeping its dock and full-height edge fixed', () => {
+        for (const dock of ['left', 'right'] as const) {
+            for (const direction of (dock === 'left' ? ['e'] : ['w']) as ResizeDirection[]) {
+                const f = fixture();
+                try {
+                    f.panel.setVisible(true); f.panel.setDock(dock);
+                    const before = f.panel.snapshot().rect, dx = dock === 'left' ? 60 : -60;
+                    f.resizes[direction].emit('pointerdown', f.pointer(400, 300));
+                    f.win.emit('pointermove', f.pointer(400 + dx, 10000));
+                    const after = f.panel.snapshot();
+                    assert.strictEqual(after.dock, dock);
+                    assert.deepStrictEqual(after.rect, { ...before,
+                        x: before.x + (dock === 'right' ? -60 : 0), width: before.width + 60 });
+                    f.win.emit('pointerup', f.pointer(400 + dx, 10000));
+                    f.panel.setDock('float');
+                    assert.deepStrictEqual(f.panel.snapshot().rect, initial, 'dock resizing preserves the remembered floating rectangle');
+                } finally { f.panel.dispose(); }
+            }
+        }
+    });
+
+    it('undocks every corner and other dock edge at the displayed rectangle before anchored resizing', () => {
+        for (const dock of ['left', 'right'] as const) {
+            for (const direction of directions.filter(value => value !== (dock === 'left' ? 'e' : 'w'))) {
+                const f = fixture();
+                try {
+                    f.panel.setVisible(true); f.panel.setDock(dock);
+                    const before = f.panel.snapshot().rect;
+                    const dx = direction.includes('w') ? 40 : direction.includes('e') ? -40 : 0;
+                    const dy = direction.includes('n') ? 30 : direction.includes('s') ? -30 : 0;
+                    f.resizes[direction].emit('pointerdown', f.pointer(400, 300));
+                    assert.deepStrictEqual(f.panel.snapshot().rect, before, 'taking a dock corner does not move it');
+                    assert.strictEqual(f.panel.snapshot().dock, 'float');
+                    f.win.emit('pointermove', f.pointer(400 + dx, 300 + dy));
+                    const expected = { x: before.x + Math.max(0, dx), y: before.y + Math.max(0, dy),
+                        width: before.width - Math.abs(dx), height: before.height - Math.abs(dy) };
+                    assert.deepStrictEqual(f.panel.snapshot().rect, expected, dock + '/' + direction);
+                    f.win.emit('pointerup', f.pointer(400 + dx, 300 + dy));
+                    f.panel.setDock(dock); f.panel.setDock('float');
+                    assert.deepStrictEqual(f.panel.snapshot().rect, expected, 'intentional undocking remembers the resized floating rectangle');
+                } finally { f.panel.dispose(); }
+            }
+        }
+    });
+
+    it('uses the selected edges for keyboard resizing and keeps only the inner width edge docked', () => {
+        const f = fixture();
+        try {
+            f.panel.setVisible(true);
+            f.resizes.n.emit('keydown', f.key('ArrowUp', true));
+            f.resizes.w.emit('keydown', f.key('ArrowLeft'));
+            assert.deepStrictEqual(f.panel.snapshot().rect, { x: 290, y: 160, width: 350, height: 340 });
+            f.panel.setDock('right');
+            const before = f.panel.snapshot().rect;
+            f.resizes.w.emit('keydown', f.key('ArrowLeft', true));
+            f.resizes.w.emit('keydown', f.key('ArrowUp', true));
+            assert.deepStrictEqual(f.panel.snapshot().rect, { ...before, x: before.x - 40, width: before.width + 40 });
+            assert.strictEqual(f.frames.size, 0);
+            assert.ok(f.resizes.w.attributes.get('aria-label')!.includes('390 by 684'));
+            f.resizes.nw.emit('keydown', f.key('ArrowDown'));
+            assert.strictEqual(f.panel.snapshot().dock, 'float');
+            assert.deepStrictEqual(f.panel.snapshot().rect, { ...before, x: before.x - 40, y: before.y + 10,
+                width: before.width + 40, height: before.height - 10 });
+        } finally { f.panel.dispose(); }
+    });
+
+    it('takes over a docking corner at its displayed rectangle and keeps the opposite corner fixed', () => {
+        const f = fixture(undefined, true);
+        try {
+            f.panel.setVisible(true); f.panel.setDock('right'); f.advance(600);
+            const displayed = f.panel.snapshot().rect, stale = [...f.frames.values()][0];
+            f.resizes.nw.emit('pointerdown', f.pointer(displayed.x, displayed.y));
+            assert.deepStrictEqual(f.panel.snapshot().rect, displayed);
+            assert.strictEqual(f.frames.size, 0);
+            assert.strictEqual(f.host.dataset.dock, 'right');
+            f.win.emit('pointermove', f.pointer(displayed.x - 30, displayed.y - 20));
+            const resized = { ...displayed, x: displayed.x - 30, y: displayed.y - 20,
+                width: displayed.width + 30, height: displayed.height + 20 };
+            assert.deepStrictEqual(f.panel.snapshot().rect, resized);
+            stale(10000);
+            assert.deepStrictEqual(f.panel.snapshot().rect, resized);
+            f.win.emit('pointerup', f.pointer(displayed.x - 30, displayed.y - 20));
+            assert.strictEqual(f.panel.snapshot().dock, 'float');
+            assert.strictEqual(f.host.dataset.dock, 'float');
+        } finally { f.panel.dispose(); }
+    });
+
+    it('releases capture and all directional handle listeners on every resize cleanup path', () => {
+        for (const stop of ['cancel', 'lost', 'blur', 'close', 'hidden', 'viewport', 'dispose']) {
+            const f = fixture();
+            try {
+                f.panel.setVisible(true);
+                const handle = f.resizes.nw;
+                handle.emit('pointerdown', f.pointer(300, 200));
+                assert.ok(handle.captured.has(1));
+                const late = [...f.win.listeners.get('pointermove')!][0];
+                if (stop === 'cancel') { f.win.emit('pointercancel', f.pointer(300, 200)); }
+                else if (stop === 'lost') { handle.emit('lostpointercapture'); }
+                else if (stop === 'blur') { f.win.emit('blur'); }
+                else if (stop === 'close') { f.panel.setVisible(false); }
+                else if (stop === 'hidden') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+                else if (stop === 'viewport') { f.visual.width = 600; f.visual.emit('resize'); }
+                else { f.panel.dispose(); }
+                const settled = f.panel.snapshot();
+                late(f.pointer(200, 100));
+                assert.deepStrictEqual(f.panel.snapshot(), settled, stop);
+                assert.strictEqual(handle.captured.size, 0);
+                assert.strictEqual(f.win.count('pointermove'), 0);
+            } finally { f.panel.dispose(); }
+            for (const handle of Object.values(f.resizes)) { assert.strictEqual(handle.count(), 0); }
+        }
+    });
 
     it('adds no observers or global work while closed and reports only changed layouts', () => {
         const f = fixture();
@@ -218,7 +423,7 @@ describe('Motion Lab panel geometry and controls', function () {
         let rect = f.panel.snapshot().rect;
         assert.strictEqual(f.panel.snapshot().dock, 'right');
         assert.strictEqual(f.buttons.right.attributes.get('aria-pressed'), 'true');
-        f.resize.emit('pointerdown', f.pointer(rect.x, rect.y + rect.height));
+        f.resizes.w.emit('pointerdown', f.pointer(rect.x, rect.y + rect.height));
         f.win.emit('pointermove', f.pointer(rect.x - 60, rect.y + rect.height - 200));
         assert.strictEqual(f.panel.snapshot().rect.width, rect.width + 60);
         assert.strictEqual(f.panel.snapshot().rect.height, rect.height);
@@ -311,7 +516,7 @@ describe('Motion Lab panel geometry and controls', function () {
         f.buttons.left.emit('click');
         assert.deepStrictEqual(f.panel.snapshot(), final);
         assert.strictEqual(f.layouts.at(-1).visible, false);
-        for (const node of [f.drag, f.resize, ...Object.values(f.buttons)]) { assert.strictEqual(node.count(), 0); }
+        for (const node of [f.drag, ...Object.values(f.resizes), ...Object.values(f.buttons)]) { assert.strictEqual(node.count(), 0); }
         assert.strictEqual(f.win.count(), 0);
     });
 
@@ -383,6 +588,47 @@ describe('Motion Lab panel geometry and controls', function () {
         } finally { f.panel.dispose(); }
     });
 
+    it('waits for actual column clearance across a continuation and starts the glide only once', () => {
+        let readyAt = 2500, ready = false, reads = 0;
+        const preparation = { get readyAt() { return readyAt; }, isReady() { reads++; return ready; } };
+        const f = fixture(layout => layout.reason === 'dock' ? preparation : undefined, true);
+        try {
+            f.panel.setVisible(true); f.panel.setDock('left');
+            const layouts = f.layouts.length, paints = f.painted.length;
+            f.advance(2500);
+            readyAt = 5000;
+            f.advance(3700); f.advance(5000);
+            assert.deepStrictEqual(f.panel.snapshot().rect, initial, 'the old deadline cannot begin the glide before clearance');
+            assert.strictEqual(f.painted.length, paints, 'a pending clearance does not repaint the stationary panel');
+            assert.strictEqual(f.layouts.length, layouts);
+            assert.strictEqual(f.frames.size, 1);
+            ready = true; f.advance(5100);
+            const settledReads = reads;
+            assert.deepStrictEqual(f.panel.snapshot().rect, initial);
+            ready = false; readyAt = 10000;
+            f.advance(5700);
+            assert.deepStrictEqual(f.panel.snapshot().rect, { x: 159, y: 114, width: 340, height: 492 });
+            f.advance(6300);
+            assert.strictEqual(f.frames.size, 0);
+            assert.strictEqual(f.host.dataset.panelMoving, undefined);
+            assert.strictEqual(reads, settledReads, 'the started glide no longer consults the earlier preparation');
+        } finally { f.panel.dispose(); }
+    });
+
+    it('honors a readyAt-only preparation beyond one column leg', () => {
+        const f = fixture(layout => layout.reason === 'dock' ? { readyAt: 5000 } : undefined, true);
+        try {
+            f.panel.setVisible(true); f.panel.setDock('left');
+            f.advance(4000);
+            assert.deepStrictEqual(f.panel.snapshot().rect, initial);
+            f.advance(5000); f.advance(5600);
+            assert.deepStrictEqual(f.panel.snapshot().rect, { x: 159, y: 114, width: 340, height: 492 });
+            f.advance(6200);
+            assert.strictEqual(f.frames.size, 0);
+            assert.strictEqual(f.host.dataset.panelMoving, undefined);
+        } finally { f.panel.dispose(); }
+    });
+
     it('retargets and hands a moving panel to the pointer at its displayed rectangle', () => {
         const f = fixture(undefined, true);
         try {
@@ -412,7 +658,7 @@ describe('Motion Lab panel geometry and controls', function () {
             f.panel.setVisible(true); f.panel.setDock('right'); f.advance(600);
             const displayed = f.panel.snapshot().rect;
             const point = { x: displayed.x, y: displayed.y + displayed.height };
-            f.resize.emit('pointerdown', f.pointer(point.x, point.y));
+            f.resizes.w.emit('pointerdown', f.pointer(point.x, point.y));
             assert.deepStrictEqual(f.panel.snapshot().rect, displayed);
             assert.strictEqual(f.host.dataset.dock, 'right', 'the captured resize handle stays on the inner edge');
             f.win.emit('pointermove', f.pointer(point.x - 30, point.y));
@@ -432,23 +678,29 @@ describe('Motion Lab panel geometry and controls', function () {
     });
 
     it('cancels every docking frame on lifecycle changes and ignores callbacks owned by the old scene', () => {
-        for (const stop of ['close', 'hidden', 'viewport', 'reduced', 'dispose'] as const) {
-            const f = fixture(undefined, true);
-            try {
-                f.panel.setVisible(true); f.panel.setDock('left'); f.advance(300);
-                const stale = [...f.frames.values()][0];
-                if (stop === 'close') { f.panel.setVisible(false); }
-                else if (stop === 'hidden') { f.document.hidden = true; f.document.emit('visibilitychange'); }
-                else if (stop === 'viewport') { f.visual.width = 280; f.visual.emit('resize'); }
-                else if (stop === 'reduced') { f.media.matches = true; f.media.emit('change'); }
-                else { f.panel.dispose(); }
-                const settled = f.panel.snapshot();
-                assert.strictEqual(f.frames.size, 0, stop);
-                assert.strictEqual(f.host.dataset.panelMoving, undefined, stop);
-                stale(10_000);
-                assert.deepStrictEqual(f.panel.snapshot(), settled, stop);
-                assert.strictEqual(f.frames.size, 0, stop);
-            } finally { f.panel.dispose(); }
+        for (const waiting of [false, true]) {
+            for (const stop of ['close', 'hidden', 'viewport', 'reduced', 'pointer', 'keyboard', 'dispose'] as const) {
+                let reads = 0;
+                const f = fixture(waiting ? () => ({ readyAt: 5000, isReady() { reads++; return false; } }) : undefined, true);
+                try {
+                    f.panel.setVisible(true); f.panel.setDock('left'); f.advance(300);
+                    const stale = [...f.frames.values()][0];
+                    if (stop === 'close') { f.panel.setVisible(false); }
+                    else if (stop === 'hidden') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+                    else if (stop === 'viewport') { f.visual.width = 280; f.visual.emit('resize'); }
+                    else if (stop === 'reduced') { f.media.matches = true; f.media.emit('change'); }
+                    else if (stop === 'pointer') { f.resizes.nw.emit('pointerdown', f.pointer(300, 200)); }
+                    else if (stop === 'keyboard') { f.resizes.nw.emit('keydown', f.key('ArrowDown')); }
+                    else { f.panel.dispose(); }
+                    const settled = f.panel.snapshot(), stoppedReads = reads;
+                    assert.strictEqual(f.frames.size, 0, stop);
+                    assert.strictEqual(f.host.dataset.panelMoving, undefined, stop);
+                    stale(10_000);
+                    assert.deepStrictEqual(f.panel.snapshot(), settled, stop);
+                    assert.strictEqual(f.frames.size, 0, stop);
+                    assert.strictEqual(reads, stoppedReads, 'cancelled preparation is not consulted again');
+                } finally { f.panel.dispose(); }
+            }
         }
     });
 

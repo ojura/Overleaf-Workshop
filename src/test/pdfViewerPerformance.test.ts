@@ -323,6 +323,7 @@ describe('PDF prefetch performance measurements', function () {
         };
         const remove = (name: string, listener: unknown) => { listeners.get(name)?.delete(listener); };
         const canvases: Node[] = [], observers: Array<{ disconnected: boolean }> = [];
+        const resizeDirections = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'];
         const layouts: any[] = [];
         const layoutInvalidations: number[] = [];
         let invalidations = 0;
@@ -343,18 +344,20 @@ describe('PDF prefetch performance measurements', function () {
             readonly children: Node[] = [];
             readonly style: Record<string, string> = {};
             readonly dataset: Record<string, string> = {};
-            readonly handlers = new Map<string, Set<() => void>>();
+            readonly handlers = new Map<string, Set<(event?: any) => void>>();
+            readonly attributes = new Map<string, string>();
             shadow: any;
             append(...nodes: Node[]) { for (const node of nodes) { node.remove(); node.parentNode = this; this.children.push(node); } }
             replaceChildren(...nodes: Node[]) { for (const node of [...this.children]) { node.remove(); } this.append(...nodes); }
             remove() { if (this.parentNode) { this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1); this.parentNode = null; } }
-            setAttribute() {}
-            addEventListener(name: string, listener: () => void) {
+            setAttribute(name: string, value: string) { this.attributes.set(name, value); }
+            getAttribute(name: string) { return this.attributes.get(name) ?? null; }
+            addEventListener(name: string, listener: (event?: any) => void) {
                 if (!this.handlers.has(name)) { this.handlers.set(name, new Set()); }
                 this.handlers.get(name)!.add(listener);
             }
-            removeEventListener(name: string, listener: () => void) { this.handlers.get(name)?.delete(listener); }
-            emit(name: string) { for (const listener of [...this.handlers.get(name) ?? []]) { listener(); } }
+            removeEventListener(name: string, listener: (event?: any) => void) { this.handlers.get(name)?.delete(listener); }
+            emit(name: string, event?: any) { for (const listener of [...this.handlers.get(name) ?? []]) { listener(event); } }
             focus() { document.activeElement = this; }
             getBoundingClientRect() { return { x: 500, y: 100, left: 500, top: 100, right: 956, bottom: 600, width: 456, height: 500 }; }
             getContext() { return context; }
@@ -365,7 +368,30 @@ describe('PDF prefetch performance measurements', function () {
                     return nodes.get(selector)!;
                 };
                 const fields = ['margin', 'status'].map(name => { const node = lookup('[data-field="' + name + '"]'); node.dataset.field = name; return node; });
-                return this.shadow = { innerHTML: '', querySelectorAll: () => fields, querySelector: lookup };
+                let html = '';
+                return this.shadow = {
+                    get innerHTML() { return html; },
+                    set innerHTML(value: string) {
+                        html = value;
+                        const buttons = [...value.matchAll(/<button\b[^>]*\bdata-panel-resize="([^"]+)"[^>]*>[\s\S]*?<\/button>/g)];
+                        assert.deepStrictEqual(buttons.map(match => match[1]), resizeDirections, 'the actual markup must provide all eight semantic resize buttons');
+                        const labels = new Set<string>();
+                        for (const button of buttons) {
+                            const node = lookup('[data-panel-resize="' + button[1] + '"]');
+                            node.dataset.panelResize = button[1];
+                            for (const attribute of button[0].matchAll(/([\w-]+)="([^"]*)"/g)) {
+                                node.setAttribute(attribute[1], attribute[2]);
+                            }
+                            assert.strictEqual(node.getAttribute('type'), 'button');
+                            const label = node.getAttribute('aria-label');
+                            assert.ok(label?.startsWith('Resize Motion Lab from the '));
+                            labels.add(label!);
+                            assert.ok(button.index! > value.indexOf('</section>'), 'resize zones are outside the clipped section');
+                        }
+                        assert.strictEqual(labels.size, 8, 'each focusable resize control identifies its edge or corner');
+                    },
+                    querySelectorAll: () => fields, querySelector: lookup,
+                };
             }
         }
         class Observer {
@@ -398,6 +424,7 @@ describe('PDF prefetch performance measurements', function () {
         document.body.append(container); container.append(transit);
         const diagnostics = performanceModule.installPrefetchDiagnostics(container, () => { assert.fail('a hidden document does not sample'); },
             { onPanelLayout: (layout: any) => { layouts.push(layout); layoutInvalidations.push(invalidations); } });
+        assert.strictEqual(diagnostics.ownsEvent({ target: container, composedPath: () => [container] }), false, 'an uncreated lab owns no event');
         try {
             diagnostics.setEnabled(true);
             const host = [...container.children, ...document.body.children].find(node => node.id === 'pdf-prefetch-diagnostics')!;
@@ -408,6 +435,22 @@ describe('PDF prefetch performance measurements', function () {
             assert.ok(Number(layer[1]) < 2147483647, 'the real courier may paint above the lab during departure and return');
             assert.deepStrictEqual(layouts.map(layout => [layout.visible, layout.reason]), [[true, 'open']]);
             assert.ok(host.shadow.innerHTML.includes('class="panel-drag" tabindex="0"'), 'the title has keyboard movement access');
+            const resizeHandles = resizeDirections.map(direction => host.shadow.querySelector('[data-panel-resize="' + direction + '"]'));
+            assert.strictEqual(new Set(resizeHandles).size, 8);
+            for (const handle of resizeHandles) {
+                assert.strictEqual(handle.tabIndex, 0);
+                assert.strictEqual(handle.handlers.get('pointerdown')?.size, 1);
+                assert.strictEqual(handle.handlers.get('keydown')?.size, 1);
+                assert.match(handle.getAttribute('aria-label'), /with arrow keys; \d+ by \d+ pixels/);
+            }
+            assert.strictEqual(diagnostics.ownsEvent({ target: host }), true, 'a shallow retargeted event belongs to this host');
+            assert.strictEqual(diagnostics.ownsEvent({ target: resizeHandles[0], composedPath: () => [resizeHandles[0], host, document.body] }), true);
+            const lookalike = new Node(); lookalike.id = host.id;
+            assert.strictEqual(diagnostics.ownsEvent({ target: lookalike, composedPath: () => [lookalike, document.body] }), false);
+            assert.strictEqual(diagnostics.ownsEvent({ target: container, composedPath: () => [container, document.body] }), false);
+            host.hidden = true;
+            assert.strictEqual(diagnostics.ownsEvent({ target: host, composedPath: () => [host] }), false);
+            host.hidden = false;
             const lab = (host.shadow.querySelector('[data-robot-stage]') as any).robotLab;
             lab.invalidateGeometry = () => { invalidations++; };
             host.shadow.querySelector('[data-panel-dock="left"]').emit('click');
@@ -420,14 +463,31 @@ describe('PDF prefetch performance measurements', function () {
             host.shadow.querySelector('.measurements').emit('toggle');
             assert.strictEqual(invalidations, 3, 'internal scrolling and compact-details changes invalidate the same snapshot');
             const content = host.shadow.querySelector('.panel-content'), measurements = host.shadow.querySelector('.measurements');
+            host.shadow.querySelector('[data-panel-dock="float"]').emit('click');
+            document.hidden = false;
+            const keys = ['ArrowUp', 'ArrowRight', 'ArrowRight', 'ArrowDown', 'ArrowDown', 'ArrowLeft', 'ArrowLeft', 'ArrowUp'];
+            for (const [index, handle] of resizeHandles.entries()) {
+                const before = { ...layouts.at(-1).rect };
+                let prevented = false;
+                handle.emit('keydown', { key: keys[index], preventDefault() { prevented = true; }, stopPropagation() {} });
+                assert.ok(prevented, resizeDirections[index] + ' keyboard input is wired to its declared axes');
+                assert.notDeepStrictEqual(layouts.at(-1).rect, before);
+            }
+            document.hidden = true;
             diagnostics.setEnabled(false);
             assert.strictEqual(host.hidden, true);
+            assert.strictEqual(diagnostics.ownsEvent({ target: host, composedPath: () => [host] }), false);
             assert.strictEqual(layouts.at(-1).visible, false);
             diagnostics.setEnabled(true);
             assert.strictEqual(document.body.children.filter((node: Node) => node.id === host.id).length, 1);
             diagnostics.dispose();
             assert.strictEqual(content.handlers.get('scroll')?.size, 0);
             assert.strictEqual(measurements.handlers.get('toggle')?.size, 0);
+            assert.strictEqual(diagnostics.ownsEvent({ target: host, composedPath: () => [host] }), false);
+            for (const handle of resizeHandles) {
+                assert.strictEqual(handle.handlers.get('pointerdown')?.size, 0);
+                assert.strictEqual(handle.handlers.get('keydown')?.size, 0);
+            }
         } finally { diagnostics.dispose(); }
         assert.deepStrictEqual(container.children, [transit]);
         assert.deepStrictEqual(document.body.children, [container]);

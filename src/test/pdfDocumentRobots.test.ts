@@ -809,6 +809,102 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         }
     });
 
+    it('parks the owned column actor without frames and continues after the latest input settles', () => {
+        let offset = 0, transit: Element | undefined, reserved = 0, released = 0;
+        const f = fixture({ maxActors: 1, documentOffset: () => offset,
+            registerDocumentLayer: (layer: Element) => { transit = layer; return () => {}; } }); f.desktop();
+        const page = f.page(99); page.pageElement.rect.left = 250; f.api.setVisiblePages([99]);
+        const dock = { x: 100, y: 300, scale: 1 };
+        f.api.setDispatchOrigin({ reserve: () => { reserved++; return dock; },
+            destination: () => dock, release: () => { released++; } });
+        const motion = { id: 1, fromX: 0, toX: -120, startedAt: f.now, durationMs: 400, holdAtEnd: true,
+            reason: 'drag', dock: 'float', bounds: { x: 250, y: 60, width: 400, height: 600 } };
+        f.api.setColumnTransition(motion);
+        const actor = f.api.snapshot().columnPull.actor;
+        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor))!;
+        offset = -120; transit!.style.translate = offset + 'px'; page.pageElement.rect.left = 250 + offset;
+        f.tick(400);
+        assert.strictEqual(f.api.snapshot().columnPull.phase, 'waiting');
+        assert.strictEqual(f.callbacks.size, 0, 'the parked actor does not animate while input settles');
+        const frames = f.api.snapshot().frames;
+        f.tick(10000);
+        assert.strictEqual(f.api.snapshot().frames, frames);
+        assert.strictEqual(f.api.snapshot().columnPull.actor, actor);
+        assert.deepStrictEqual([reserved, released], [1, 0]);
+
+        const contact = { ...motion, bounds: { ...motion.bounds, x: 290 } };
+        page.pageElement.rect.left += 40;
+        f.api.setColumnTransition(contact); f.frame();
+        const hand = module.ROBOT_FORKLIFT_ATTACHMENT.pull.right;
+        const attachment = hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * f.api.snapshot().spriteScale;
+        assert.ok(Math.abs(point(sprite).x + attachment - (290 + offset)) < 0.05,
+            'same-ID geometry keeps the parked manipulator at the actual page edge');
+        assert.strictEqual(f.api.snapshot().columnPull.startedAt, motion.startedAt);
+        assert.strictEqual(f.callbacks.size, 0);
+
+        f.api.setColumnTransition({ ...contact, id: 2, fromX: offset, toX: -180, startedAt: f.now, holdAtEnd: false });
+        assert.strictEqual(f.api.snapshot().columnPull.actor, actor);
+        offset = -180; transit!.style.translate = offset + 'px'; page.pageElement.rect.left = 290 + offset;
+        f.tick(400); f.api.setColumnTransition(undefined); f.finish();
+        assert.deepStrictEqual([reserved, released], [1, 1]);
+        assert.strictEqual(sprite.zeroWrites, 1);
+        assert.strictEqual(f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+    });
+
+    it('updates same-ID column contact during a haul without restarting its approach or clock', () => {
+        let offset = 0, transit: Element | undefined;
+        const f = fixture({ maxActors: 1, documentOffset: () => offset,
+            registerDocumentLayer: (layer: Element) => { transit = layer; return () => {}; } }); f.desktop();
+        const page = f.page(99); page.pageElement.rect.left = 250; f.api.setVisiblePages([99]);
+        const motion = { id: 1, fromX: 0, toX: -120, startedAt: f.now, durationMs: 400,
+            reason: 'viewport', dock: 'right', bounds: { x: 250, y: 60, width: 400, height: 600 } };
+        f.api.setColumnTransition(motion);
+        offset = -70; transit!.style.translate = offset + 'px'; page.pageElement.rect.left = 180;
+        f.tick(200);
+        const initial = f.api.snapshot().columnPull;
+        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(initial.actor))!;
+        f.api.setColumnTransition({ ...motion, bounds: { ...motion.bounds, x: 290 }, holdAtEnd: true });
+        f.frame();
+        const current = f.api.snapshot(), hand = module.ROBOT_FORKLIFT_ATTACHMENT.pull.right;
+        assert.deepStrictEqual([current.columnPull.actor, current.columnPull.startedAt, current.columnPull.phase],
+            [initial.actor, initial.startedAt, 'pull']);
+        assert.ok(Math.abs(point(sprite).x + hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * current.spriteScale - 220) < 0.05,
+            'viewport contact updates are used by the existing haul');
+        f.api.cancelColumnMotion();
+        assert.strictEqual(sprite.zeroWrites, 1);
+        assert.strictEqual(f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+    });
+
+    it('returns or cancels a parked column actor once on each ownership boundary', () => {
+        for (const ending of ['complete', 'ready', 'offscreen', 'hide', 'reduce', 'disable', 'reset', 'dispose', 'cancel']) {
+            let reserved = 0, released = 0;
+            const f = fixture({ maxActors: 1 }); f.desktop();
+            const page = f.page(99); page.pageElement.rect.left = 250; f.api.setVisiblePages([99]);
+            const dock = { x: 100, y: 300, scale: 1 };
+            f.api.setDispatchOrigin({ reserve: () => { reserved++; return dock; },
+                destination: () => dock, release: () => { released++; } });
+            f.api.setColumnTransition({ id: 1, fromX: 0, toX: -120, startedAt: f.now, durationMs: 400, holdAtEnd: true,
+                reason: 'resize', dock: 'float', bounds: { x: 250, y: 60, width: 400, height: 600 } });
+            const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width)!;
+            f.tick(400); f.tick(1000);
+            assert.strictEqual(f.api.snapshot().columnPull.phase, 'waiting');
+            assert.strictEqual(f.callbacks.size, 0);
+            if (ending === 'complete') { f.api.setColumnTransition(undefined); f.frame();
+                assert.strictEqual(f.api.snapshot().columnPull.phase, 'return'); f.finish(); }
+            else if (ending === 'ready') { assert.strictEqual(f.api.offer(page), 'started'); f.finish(); }
+            else if (ending === 'offscreen') { f.api.setVisiblePages([]); }
+            else if (ending === 'hide') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+            else if (ending === 'reduce') { f.media.matches = true; f.media.emit('change'); }
+            else if (ending === 'disable') { f.api.setEnabled(false); }
+            else if (ending === 'cancel') { f.api.cancelColumnMotion(); }
+            else { f.api[ending](); }
+            assert.strictEqual(f.api.snapshot().columnPull, undefined, ending);
+            assert.strictEqual(sprite.zeroWrites, 1, ending);
+            assert.strictEqual(released, reserved, ending);
+            assert.strictEqual(f.api.snapshot().retainedBytes + f.callbacks.size, 0, ending);
+        }
+    });
+
     it('preempts the document pull for ready cargo and cancels it on hard lifecycle boundaries', () => {
         for (const ending of ['ready', 'offscreen', 'hide', 'reduce', 'disable', 'reset', 'replacement', 'dispose', 'cancel']) {
             const f = fixture({ maxActors: 1 }); f.desktop();
