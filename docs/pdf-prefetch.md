@@ -280,7 +280,17 @@ The probe reports visible-content missing time as the fraction of sampled elapse
 
 ### Activating an installed viewer
 
-`./scripts/install-local-build.sh` installs the checkout's frontend bundles into the matching local extension. To activate them in an existing Antigravity reader, capture the document identity, page, zoom, rotation, spread and scroll modes, exact scroll offsets, sidebar, Motion Lab state, editor group, split widths and focus. Close the clean PDF editor and use `View: Reopen Closed Editor`. If it reopens in the left group, use `View: Move Editor into Right Group`; if the original expanded split changed, use `View: Expand Editor Group`. Expand Editor Group returns the other group to its minimum width. Restore the captured reading and panel state, with trusted user input taking priority.
+`./scripts/install-local-build.sh` installs the checkout's frontend bundles into the matching local extension. Before recreating an existing Antigravity reader, capture the document identity, page, zoom, rotation, spread and scroll modes, exact scroll offsets, sidebar, Motion Lab state, editor groups, split widths, tab preview/sticky state and focus. Restore those captured values after the new reader loads, with trusted user input taking priority.
+
+For the existing two-group layout with a clean, kept source tab on the left and a clean, kept PDF tab on the right, keep the right group alive during recreation to preserve its width:
+
+1. Use `View: Focus First Editor Group` and verify that the source tab is the active editor in the active group.
+2. Use `View: Split Editor into Right Group`. This copies the source into the existing right group as a temporary second tab. Verify that both original groups and the PDF tab remain present.
+3. Close only the clean PDF tab and use `View: Reopen Closed Editor`. Wait for the replacement reader's document and service worker to become ready.
+4. Focus the right group with `View: Focus Last Editor Group`. If needed, use `View: Open Next Editor in Group` to select the temporary source tab; verify that selection before using `View: Move Editor into Left Group`. Moving the duplicate back merges it with the existing source tab and leaves the right group containing the PDF.
+5. Restore the captured reader, panel and focus state. Verify both group widths, the exact tabs and active group, and the reader state after the final focus action.
+
+Use the workbench's group and editor commands for automated selection. A synthetic click on an already selected tab did not activate its group in the live check, so the following split acted on the PDF instead. The explicit commands and active-state checks preserved the measured 468.997 / 1266.992-pixel split. Copy, reopen and move keep editors open; automation should verify already-kept, non-sticky tabs before this sequence. Reserve time for recovery, reconcile the actual tabs after an interrupted command, and keep input and document-identity guards attached through restoration and cleanup.
 
 Prefer this editor recreation over `Developer: Reload Webviews` for live updates. The reload command iterates registered overlays and their underlying elements, so one invocation can send the same content twice. The observed reload left the replacement content without service-worker control and its extension-resource requests failed. Normal close and reopen recovered controlled resources and loaded the installed bundle.
 
