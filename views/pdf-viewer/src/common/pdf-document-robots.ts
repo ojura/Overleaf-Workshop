@@ -1,9 +1,9 @@
 import { paintRobotVehicle, RobotRandom, ROBOT_ARTWORK_SIZE, ROBOT_FORKLIFT_ATTACHMENT, ROBOT_AIRLIFT_ATTACHMENT, ROBOT_VEHICLES, type RobotArtworkActor, type RobotVehicle, type RobotDispatchPort, type RobotDispatchPoint } from './prefetch-robots';
 import { pdfCachePolicy } from './scroll-prefetch';
 import { RobotEncounters, ROBOT_INTERACTION_REACTIONS, type RobotEncounterActor, type RobotEncounterReaction } from './robot-encounters';
-import { LabelPlacementSolver, type LabelPlacement, type PlacementRect } from './label-placement';
+import { LabelPlacementSolver, LABEL_PLACEMENT_LIMITS, type LabelPlacement, type LabelPlacementInput, type PlacementRect } from './label-placement';
 import { ASAP_CLEANER_ARTWORK_SIZE, paintAsapCleaner } from './robot-cleaner-artwork';
-import { computeCargoRoute, needsCargoAirlift, GROUND_ROUTE_MAX_SLOPE, CARGO_ROUTE_POLICY, type CargoRouteState } from './robot-cargo-routes';
+import { computeCargoRoute, needsCargoAirlift, clampGroundRoutePoint, GROUND_ROUTE_MAX_SLOPE, CARGO_ROUTE_POLICY, type CargoRouteState } from './robot-cargo-routes';
 import type { PdfDocumentColumnTransition } from './pdf-document-column';
 import { canCarryRobot } from './robot-rescue';
 import { robotScreenMetrics, robotCaptionMetrics, ROBOT_CAPTION_STYLE } from './robot-screen-scale';
@@ -185,6 +185,8 @@ interface AdvanceWork {
     signature: string;
     geometry: string;
     message: string;
+    labelAnchor?: Point;
+    labelSize?: { key: string; width: number; height: number };
     anchor?: { element: HTMLElement; x: number; y: number; left: number; right: number; bottom: number };
 }
 interface Episode {
@@ -315,6 +317,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     const encounters = new RobotEncounters(options.encounterRandom ?? (() => encounterRandom.next()), DOCUMENT_ROBOT_LIMITS.desktop.maxActors);
     const traffic = options.createTraffic?.() ?? new RobotTraffic();
     const captionPlacement = new LabelPlacementSolver();
+    const workLabelPlacement = new LabelPlacementSolver();
     const media = win.matchMedia('(prefers-reduced-motion: reduce)');
     const episodes = new Map<number, Episode>();
     const advance = new Map<string, AdvanceWork>();
@@ -489,7 +492,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             ids.add(image.id);
             images.push({ x, y, width, height, imageId: image.id, score: 1 + visibleWidth * visibleHeight });
         }
-        if (images.length) { return images.sort((a, b) => b.score - a.score).slice(0, 12); }
+        if (images.length) { return uniqueCrops(source, images.sort((a, b) => b.score - a.score)).slice(0, 12); }
         const width = Math.min(policy.kind === 'desktop' ? 0.36 : 0.24, policy.minimumWidth / area.width, (area.right - area.left) * 0.75);
         const height = Math.min(policy.kind === 'desktop' ? 0.24 : 0.16, policy.minimumHeight / area.height, (area.bottom - area.top) * 0.75);
         const candidates: Crop[] = [];
@@ -509,7 +512,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             sample.width = Math.max(1, Math.round(source.width * scale));
             sample.height = Math.max(1, Math.round(source.height * scale));
             const context = sample.getContext('2d', { willReadFrequently: true });
-            if (!context) { return candidates; }
+            if (!context) { return uniqueCrops(source, candidates); }
             context.drawImage(source, 0, 0, sample.width, sample.height);
             const pixels = context.getImageData(0, 0, sample.width, sample.height).data;
             const background = [pixels[0], pixels[1], pixels[2], pixels[3]];
@@ -532,7 +535,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         } catch {
             // A canvas without readable pixels can still supply a bounded drawImage fragment.
         } finally { if (sample) { release(sample); } }
-        return candidates.sort((a, b) => b.score - a.score);
+        return uniqueCrops(source, candidates.sort((a, b) => b.score - a.score));
     }
 
     function drawVehicle(actor: RobotBody): void {
@@ -588,14 +591,33 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (captionGroup?.actors.includes(id)) { clearCaption(); }
     }
 
-    function rasterSize(source: HTMLCanvasElement, crop: Crop, mode: DeliveryMode, policy: Presentation) {
+    function sourceRectangle(source: HTMLCanvasElement, crop: Crop) {
         const sourceX = Math.floor(crop.x * source.width), sourceY = Math.floor(crop.y * source.height);
         const sourceWidth = Math.max(1, Math.min(source.width - sourceX, Math.ceil(crop.width * source.width)));
         const sourceHeight = Math.max(1, Math.min(source.height - sourceY, Math.ceil(crop.height * source.height)));
+        return { sourceX, sourceY, sourceWidth, sourceHeight };
+    }
+
+    function uniqueCrops(source: HTMLCanvasElement, crops: readonly Crop[]): Crop[] {
+        const rectangles = new Set<string>();
+        return crops.filter(crop => {
+            const { sourceX, sourceY, sourceWidth, sourceHeight } = sourceRectangle(source, crop);
+            const key = sourceX + ':' + sourceY + ':' + sourceWidth + ':' + sourceHeight;
+            if (rectangles.has(key)) { return false; }
+            rectangles.add(key);
+            // Different placement IDs and clamped sample rows can copy the same pixels.
+            // Keep the admitted crop's original destination and refine that one payload.
+            return true;
+        });
+    }
+
+    function rasterSize(source: HTMLCanvasElement, crop: Crop, mode: DeliveryMode, policy: Presentation) {
+        const rectangle = sourceRectangle(source, crop);
+        const { sourceWidth, sourceHeight } = rectangle;
         const dimension = policy.fragmentDimension * (mode === 'solo' ? 1 : DOCUMENT_ROBOT_LIMITS.cooperative.rasterScale);
         const scale = Math.min(1, dimension / Math.max(sourceWidth, sourceHeight));
         const width = Math.max(1, Math.floor(sourceWidth * scale)), height = Math.max(1, Math.floor(sourceHeight * scale));
-        return { sourceX, sourceY, sourceWidth, sourceHeight, width, height, bytes: width * height * RGBA_BYTES };
+        return { ...rectangle, width, height, bytes: width * height * RGBA_BYTES };
     }
 
     function makePayload(source: HTMLCanvasElement, crop: Crop, area: Geometry, index: number,
@@ -639,6 +661,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const policy = presentation();
         let count = 0;
         for (const payload of episode.payloads) {
+            retireUncovered(payload, episode.element);
             const previous = payload.canvas;
             if (!previous || !previous.parentNode || now() >= payload.started + payload.delay + payload.duration * RETURN_START) { continue; }
             const size = rasterSize(value.canvas, payload.crop, payload.mode, policy);
@@ -839,7 +862,16 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const target = { x: area.pageLeft + (payload.crop.x + payload.crop.width / 2) * area.width + offset.x,
                 y: payload.ground ? area.pageTop + area.height - DOCUMENT_ROBOT_LIMITS.forklift.baseInset * policy.spriteScale
                     : area.pageTop + (payload.crop.y + payload.crop.height / 2) * area.height + offset.y };
-            return payload.mode === 'solo' ? !needsCargoAirlift(origin, target) : Math.abs(origin.y - target.y) <= 1;
+            if (needsCargoAirlift(origin, target)) { return false; }
+            if (payload.mode !== 'formation') { return true; }
+            const ground = payload.helpers.find(helper => !ROBOT_VEHICLES.find(spec => spec.id === helper.vehicle)!.air
+                && (helper.launch || helper.origin));
+            if (!ground) { return true; }
+            const launch = (ground.launch ?? ground.origin)!;
+            const groundOffset = helperOffset(ground, area, 0);
+            // A formation gathers at the first actual ground launch before carrying together.
+            return !needsCargoAirlift(origin, { x: launch.x - groundOffset.x + offset.x,
+                y: launch.y - groundOffset.y + offset.y });
         };
         const index = staged.findIndex(actor => !used.has(actor.body.vehicle) && accepts(actor.body.vehicle)
             && acceptsOrigin(actor.body.vehicle, actor.point));
@@ -984,6 +1016,30 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         capacityFreed = true;
     }
 
+    function retireUncovered(payload: Payload, pageElement: HTMLElement | undefined): void {
+        // Native pixels can arrive after deposit is due but before its queued paint.
+        // Retire ownership before refinement can allocate a crop that would be released immediately.
+        if (payload.canvas && (now() >= payload.started + payload.delay + payload.duration * DEPOSIT_START
+            || !payload.cover?.isConnected || payload.cover.parentNode !== pageElement)) {
+            releasePayload(payload);
+        }
+    }
+
+    /** PDF.js may remove page children during reset; only this live episode can restore its cover. */
+    function restoreArrivals(pageNumber: number, pageElement: HTMLElement): void {
+        const episode = episodes.get(pageNumber);
+        if (disposed || !enabled || hidden() || !visible.has(pageNumber) || episode?.element !== pageElement) { return; }
+        for (const payload of episode.payloads) {
+            const cover = payload.cover;
+            if (!payload.canvas || !cover) { continue; }
+            if (!pageElement.isConnected || payload.deposited
+                || now() >= payload.started + payload.delay + payload.duration * DEPOSIT_START
+                || cover.parentNode && cover.parentNode !== pageElement) { releasePayload(payload); continue; }
+            try { if (cover.parentNode !== pageElement) { pageElement.append(cover); } }
+            catch { releasePayload(payload); }
+        }
+    }
+
     function dropPayload(payload: Payload, completed = false): void {
         for (const actor of payload.helpers) { releaseActor(actor, completed); }
         payload.helpers.length = 0;
@@ -1095,6 +1151,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         clearRetiring();
         for (const episode of [...episodes.values()]) { dropEpisode(episode, true); }
         for (const work of [...advance.values()]) { dropAdvance(work); }
+        workLabelPlacement.reset();
         activePresentation = undefined;
         capacityFreed = false;
         lastPaint = -Infinity;
@@ -1164,6 +1221,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
 
     function paintAdvance(work: AdvanceWork, at: number, viewport: ReturnType<typeof viewportBounds>, policy: Presentation,
         area: ReturnType<typeof advanceGeometry>, destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, placements: BodyPlacement[]): void {
+        work.labelAnchor = undefined;
         if (!area) {
             for (const actor of work.actors) { releaseActor(actor.body); }
             work.actors.length = 0; work.phase = 'parked'; work.label.style.opacity = '0';
@@ -1181,16 +1239,13 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 work.phase = elapsed < timing.arrivalMs ? 'arriving'
                     : elapsed < timing.arrivalMs + timing.coordinationMs ? 'coordinating' : 'parked';
             }
-            work.label.style.opacity = '1';
+            work.labelAnchor = {
+                x: clamp(area.x, area.stageLeft + 70, area.stageRight - 70) - sceneOrigin.x,
+                y: Math.min(area.stageBottom - 62, area.y + ROBOT_ARTWORK_SIZE.height * policy.spriteScale * 0.42) - sceneOrigin.y,
+            };
         }
         work.message = advanceMessage(work);
         if (work.label.textContent !== work.message) { work.label.textContent = work.message; }
-        const caption = robotCaptionMetrics({ devicePixelRatio: win.devicePixelRatio });
-        Object.assign(work.label.style, { fontSize: caption.fontSize + 'px', lineHeight: caption.lineHeight + 'px',
-            padding: caption.paddingY + 'px ' + caption.paddingX + 'px' });
-        work.label.style.left = clamp(area.x, area.stageLeft + 70, area.stageRight - 70) - sceneOrigin.x + 'px';
-        work.label.style.top = Math.min(area.stageBottom - 62, area.y + ROBOT_ARTWORK_SIZE.height * policy.spriteScale * 0.42) - sceneOrigin.y + 'px';
-        work.label.style.maxWidth = Math.max(120, Math.min(300, viewport.right - viewport.left - 24)) + 'px';
         for (let index = work.actors.length - 1; index >= 0; index--) {
             const actor = work.actors[index], body = actor.body;
             if (!resizeSprite(body, policy)) { releaseActor(body); work.actors.splice(index, 1); continue; }
@@ -1235,7 +1290,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (!ids.length && !settings.preserveReplacement) { clearRetiring(); }
         visible = new Set(ids);
         if (captionGroup && ![...captionGroup.pages].some(page => visible.has(page))) { clearCaption(); }
-        for (const episode of [...episodes.values()]) { if (!visible.has(episode.page)) { dropEpisode(episode, true); } }
+        for (const episode of [...episodes.values()]) {
+            if (!visible.has(episode.page)) { dropEpisode(episode, true); }
+            else { for (const payload of episode.payloads) { retireUncovered(payload, episode.element); } }
+        }
         for (const work of [...advance.values()]) {
             work.pages = work.pages.filter(page => visible.has(page.pageNumber));
             if (!work.pages.length) { dropAdvance(work); }
@@ -1265,8 +1323,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 layer.className = 'pdfDocumentRobotAdvance';
                 Object.assign(layer.style, { position: 'absolute', inset: '0', pointerEvents: 'none' });
                 initializeSceneNode(label, 'pdfDocumentRobotWorkStatus', '3');
-                Object.assign(label.style, { transform: 'translateX(-50%)',
-                    borderRadius: '10px', border: '1px solid ' + ROBOT_CAPTION_STYLE.borderColor, background: ROBOT_CAPTION_STYLE.background,
+                Object.assign(label.style, { boxSizing: 'border-box',
+                    borderRadius: '5px', border: '1px solid ' + ROBOT_CAPTION_STYLE.borderColor, background: ROBOT_CAPTION_STYLE.background,
                     color: ROBOT_CAPTION_STYLE.color, fontFamily: 'system-ui, sans-serif', fontWeight: String(ROBOT_CAPTION_STYLE.fontWeight),
                     textAlign: 'center', whiteSpace: 'pre-line', overflowWrap: 'anywhere',
                     boxShadow: '0 3px 12px #0002' });
@@ -1387,18 +1445,24 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         let control = launch ? { x: (start.x + target.x) / 2 + (payload.route % 2 ? 70 : -70), y: Math.min(start.y, target.y) - 45 }
             : project(payload.control);
         const groundTeam = payload.helpers.some(actor => !ROBOT_VEHICLES.find(spec => spec.id === actor.vehicle)!.air);
+        let groundStart = start;
         if (launch && !ROBOT_VEHICLES.find(spec => spec.id === leader.vehicle)!.air) {
             start = { x: launch.x - offset.x, y: launch.y - offset.y };
         }
         if (groundTeam && !payload.ground && payload.mode !== 'airlift') {
-            if (!launch || payload.mode !== 'solo') {
-                const edgeX = payload.route < 2 ? area.pageLeft - 80 : area.pageLeft + area.width + 80;
-                if (payload.mode !== 'handoff') { start = { x: edgeX, y: target.y }; }
-            }
+            const ground = payload.helpers.find(actor => !ROBOT_VEHICLES.find(spec => spec.id === actor.vehicle)!.air
+                && (actor.launch || actor.origin));
+            const groundLaunch = ground && (ground.launch ?? ground.origin);
+            const groundOffset = ground && helperOffset(ground, area, 0);
+            const edgeX = payload.route < 2 ? area.pageLeft - 80 : area.pageLeft + area.width + 80;
+            groundStart = groundLaunch && groundOffset
+                ? { x: groundLaunch.x - groundOffset.x, y: groundLaunch.y - groundOffset.y }
+                : clampGroundRoutePoint(target, { x: edgeX, y: project(payload.start).y });
+            if (payload.mode !== 'handoff') { start = groundStart; }
             control = { x: (start.x + target.x) / 2, y: (start.y + target.y) / 2 };
         }
         const rendezvous = groundTeam && payload.mode === 'handoff'
-            ? { x: start.x + (target.x - start.x) * 0.38, y: target.y } : curve(start, control, target, 0.38);
+            ? straight(groundStart, target, 0.38) : curve(start, control, target, 0.38);
         const groundY = area.pageTop + area.height - DOCUMENT_ROBOT_LIMITS.forklift.baseInset * leader.spriteScale;
         let route: CargoRouteState | undefined;
         let point: Point;
@@ -1436,7 +1500,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const begin = payload.mode === 'formation' ? RENDEZVOUS_END : 0;
             point = curve(start, control, target, ease(clamp((progress - begin) / (DEPOSIT_START - begin), 0, 1)));
         }
-        return { start, control, target, rendezvous, point, project, groundY, route };
+        return { start, control, target, groundStart, rendezvous, point, project, groundY, route };
     }
 
     function paintActor(actor: Courier, pageNumber: number, area: Geometry, path: ReturnType<typeof payloadPath>,
@@ -1461,7 +1525,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             if (payload.ground && (!launch || progress >= DOCUMENT_ROBOT_LIMITS.forklift.approachEnd)) { robot.y = path.groundY; }
         } else if (payload.mode === 'handoff' && !air && progress < HANDOFF_START) {
             const destination = { x: path.rendezvous.x + offset.x, y: path.rendezvous.y + offset.y };
-            const start = launch ?? { x: path.start.x + offset.x, y: destination.y };
+            const start = launch ?? { x: path.groundStart.x + offset.x, y: path.groundStart.y + offset.y };
             robot = straight(start, destination, ease(clamp(progress / RENDEZVOUS_END, 0, 1)));
         } else if (payload.mode === 'handoff' && !air && progress < HANDOFF_END) {
             robot = { x: path.rendezvous.x + offset.x, y: path.rendezvous.y + offset.y };
@@ -1497,7 +1561,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 returningToLab = !!shallowDock;
                 const departureTarget = shallowDock ? { x: destination.x, y: destination.y }
                     : air ? path.project(actor.departure)
-                        : { x: payload.route < 2 ? viewport.left - 140 : viewport.right + 140, y: from.y };
+                        : clampGroundRoutePoint(from, { x: payload.route < 2 ? viewport.left - 140 : viewport.right + 140,
+                            y: path.project(actor.departure).y + offset.y });
                 if (actor.port && !shallowDock && air) {
                 const width = win.innerWidth || viewport.right, height = win.innerHeight || viewport.bottom;
                 if (payload.route % 2) { departureTarget.y = payload.route === 1 ? -100 : height + 100; }
@@ -1535,6 +1600,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     function paintPayload(payload: Payload, pageNumber: number, area: Geometry, at: number,
         destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, viewport: ReturnType<typeof viewportBounds>,
         placements: BodyPlacement[], successfulDeposits: number[][], captionObstacles: SceneObstacle[]): boolean {
+        retireUncovered(payload, episodes.get(pageNumber)?.element);
         const elapsed = at - payload.started - payload.delay;
         if (elapsed < 0) {
             for (const actor of payload.helpers) { actor.sprite.style.opacity = '0'; }
@@ -1549,7 +1615,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             : payload.mode === 'handoff' && progress >= HANDOFF_START && progress < HANDOFF_END ? 'handoff'
                 : payload.mode !== 'solo' && progress < (payload.mode === 'handoff' ? HANDOFF_START : RENDEZVOUS_END) ? 'rendezvous' : 'carry';
         if (progress >= DEPOSIT_START && !payload.deposited) {
-            payload.cover?.remove(); payload.cover = undefined;
+            releasePayload(payload);
             payload.deposited = true; stats.deliveredFragments++;
             successfulDeposits.push(payload.helpers.map(actor => actor.id));
         }
@@ -1641,17 +1707,20 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 const groundBody = !ROBOT_VEHICLES.find(spec => spec.id === leader.vehicle)!.air;
                 const groundY = area.pageTop + area.height - DOCUMENT_ROBOT_LIMITS.forklift.baseInset * leader.spriteScale;
                 const carryY = groundY + FORKLIFT_ATTACHMENT_PX.carryY * leader.spriteScale - height / 2;
-                const exit = { x: payload.route === 0 ? viewport.left - width - 100 : payload.route === 2 ? viewport.right + width + 100 : target.x,
+                let exit = { x: payload.route === 0 ? viewport.left - width - 100 : payload.route === 2 ? viewport.right + width + 100 : target.x,
                     y: payload.ground ? carryY : groundBody ? target.y
                         : payload.route === 1 ? viewport.top - height - 100 : payload.route === 3 ? viewport.bottom + height + 100 : target.y };
-                if (groundBody && !payload.ground) { exit.x = payload.route < 2 ? viewport.left - width - 100 : viewport.right + width + 100; }
+                if (groundBody && !payload.ground) {
+                    exit = clampGroundRoutePoint(target, { x: payload.route < 2 ? viewport.left - width - 100 : viewport.right + width + 100,
+                        y: area.pageTop + payload.start.y * area.height });
+                }
                 let point = target;
                 const begin = payload.ground ? timing.lowerEnd : timing.pickupEnd;
                 if (payload.ground && progress >= timing.pickupEnd && progress < begin) {
                     point = { x: target.x, y: target.y + (carryY - target.y) * ease((progress - timing.pickupEnd) / (begin - timing.pickupEnd)) };
                 } else if (progress >= begin) {
                     const from = { x: target.x, y: payload.ground ? carryY : target.y };
-                    point = curve(from, { x: (from.x + exit.x) / 2, y: groundBody ? from.y : Math.min(from.y, exit.y) - 45 }, exit,
+                    point = curve(from, { x: (from.x + exit.x) / 2, y: groundBody ? (from.y + exit.y) / 2 : Math.min(from.y, exit.y) - 45 }, exit,
                         ease(clamp((progress - begin) / (RETURN_START - begin), 0, 1)));
                 }
                 payload.stage = progress < timing.pickupEnd ? 'rendezvous' : progress >= RETURN_START ? 'return' : 'carry';
@@ -1697,6 +1766,61 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         }
     }
 
+    function paintWorkLabels(placements: readonly BodyPlacement[], viewport: ReturnType<typeof viewportBounds>, obstacles: readonly PlacementRect[]): void {
+        const bounds = { x: viewport.left - sceneOrigin.x + 8, y: viewport.top - sceneOrigin.y + 8,
+            width: viewport.right - viewport.left - 16, height: viewport.bottom - viewport.top - 16 };
+        const labels: LabelPlacementInput[] = [];
+        const nodes = new Map<string, HTMLDivElement>();
+        const metrics = robotCaptionMetrics({ devicePixelRatio: win.devicePixelRatio });
+        for (const work of advance.values()) {
+            work.label.style.opacity = '0';
+            if (!work.labelAnchor || work.phase === 'returning' || !work.message || bounds.width < 100 || bounds.height <= 0
+                || labels.length >= LABEL_PLACEMENT_LIMITS.labels - 1) { continue; }
+            const maxWidth = Math.min(224, bounds.width);
+            const key = [work.message, maxWidth, metrics.fontSize, metrics.lineHeight].join('|');
+            if (work.labelSize?.key !== key) {
+                Object.assign(work.label.style, { fontSize: metrics.fontSize + 'px', lineHeight: metrics.lineHeight + 'px',
+                    padding: metrics.paddingY + 'px ' + metrics.paddingX + 'px', width: 'max-content',
+                    maxWidth: maxWidth + 'px', height: 'auto' });
+                const measured = work.label.getBoundingClientRect();
+                work.labelSize = { key, width: measured.width, height: measured.height };
+                work.label.style.height = measured.height + 'px';
+            }
+            const { width, height } = work.labelSize;
+            if (!(width > 0 && height > 0)) { continue; }
+            const id = 'work:' + work.key;
+            nodes.set(id, work.label);
+            labels.push({ id, anchor: work.labelAnchor, width, height, radius: 6, clearance: 4,
+                priority: work.pages.some(page => page.state === 'preparing') ? 2 : 1, leaderAnchors: [] });
+        }
+        if (bounds.width <= 0 || bounds.height <= 0) { workLabelPlacement.reset(); return; }
+        // Reserve the visible speech rectangle first, including a static bubble whose robots
+        // already returned. Clip it to the viewport so it always consumes exactly one slot.
+        const speech = captionGroup?.node.style.opacity === '1' ? captionGroup.placement : undefined;
+        let reserved = false;
+        if (speech) {
+            const x = Math.max(bounds.x, speech.x), y = Math.max(bounds.y, speech.y);
+            const width = Math.min(bounds.x + bounds.width, speech.x + speech.width) - x;
+            const height = Math.min(bounds.y + bounds.height, speech.y + speech.height) - y;
+            if (width > 0 && height > 0) {
+                const center = { x: x + width / 2, y: y + height / 2 };
+                labels.push({ id: 'speech', anchor: center, width, height, priority: 3,
+                    candidates: [{ ...center, base: center }], leaderAnchors: [] });
+                reserved = true;
+            }
+        }
+        const bodies = placements.filter(value => value.opacity > 0.2).map(value => ({
+            x: value.point.x - sceneOrigin.x - ROBOT_ARTWORK_SIZE.width * value.scale / 2,
+            y: value.point.y - sceneOrigin.y - ROBOT_ARTWORK_SIZE.height * value.scale / 2,
+            width: ROBOT_ARTWORK_SIZE.width * value.scale, height: ROBOT_ARTWORK_SIZE.height * value.scale,
+        }));
+        const placed = workLabelPlacement.layout({ now: now(), bounds, labels, obstacles: [...bodies, ...obstacles], maxVisible: reserved ? 2 : 1 });
+        for (const placement of placed) {
+            const node = nodes.get(placement.id);
+            if (node) { Object.assign(node.style, { left: placement.x + 'px', top: placement.y + 'px', opacity: placement.blocked ? '0' : '1' }); }
+        }
+    }
+
     function paintCaption(placements: readonly BodyPlacement[], reactions: ReadonlyMap<number, RobotEncounterReaction>,
         viewport: ReturnType<typeof viewportBounds>, policy: Presentation, obstacles: readonly PlacementRect[]): void {
         const selected = placements.find(value => reactions.get(value.body.id)?.caption);
@@ -1717,14 +1841,14 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const lines = speakers.map(value => ROBOT_VEHICLES.find(spec => spec.id === value.body.vehicle)!.name
             + ': ' + reactions.get(value.body.id)!.caption);
         const { fontSize, lineHeight, paddingX, paddingY } = robotCaptionMetrics({ devicePixelRatio: win.devicePixelRatio });
-        const width = Math.min(policy.kind === 'desktop' ? 320 : 256, viewport.right - viewport.left - 20);
+        const width = Math.min(policy.kind === 'desktop' ? 256 : 224, viewport.right - viewport.left - 20);
         if (width < 100) { clearCaption(); return; }
         if (captionGroup?.id !== first.captionId) {
             clearCaption();
             const node = doc.createElement('div');
             initializeSceneNode(node, 'pdfDocumentRobotCaption', '4');
             Object.assign(node.style, { boxSizing: 'border-box',
-                padding: paddingY + 'px ' + paddingX + 'px', borderRadius: '10px', border: '1px solid ' + ROBOT_CAPTION_STYLE.borderColor,
+                padding: paddingY + 'px ' + paddingX + 'px', borderRadius: '5px', border: '1px solid ' + ROBOT_CAPTION_STYLE.borderColor,
                 background: ROBOT_CAPTION_STYLE.background, color: ROBOT_CAPTION_STYLE.color,
                 fontFamily: 'system-ui, sans-serif', fontWeight: String(ROBOT_CAPTION_STYLE.fontWeight),
                 textAlign: 'center', whiteSpace: 'pre-line', overflowWrap: 'anywhere', boxShadow: '0 2px 8px #0002' });
@@ -1790,7 +1914,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             if (!leader) {
                 leader = doc.createElement('div');
                 initializeSceneNode(leader, 'pdfDocumentRobotCaptionLeader', '3');
-                Object.assign(leader.style, { height: '1.5px', background: '#667e69', transformOrigin: '0 50%' });
+                Object.assign(leader.style, { height: '1.5px', background: ROBOT_CAPTION_STYLE.borderColor, transformOrigin: '0 50%' });
                 group.leaders.push(leader); transit.append(leader);
             }
             const dx = line.to.x - line.from.x, dy = line.to.y - line.from.y;
@@ -1885,7 +2009,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             for (const payload of episode.payloads) {
                 const motion = finalMotion.get(payload.id) ?? { x: 0, y: 0 };
                 const shown = visibility.get(payload.id) ?? 1;
-                if (shown < 1) { payload.cover?.remove(); payload.cover = undefined; }
+                if (shown < 1) { releasePayload(payload); }
                 const translate = motion.x.toFixed(3) + 'px ' + motion.y.toFixed(3) + 'px';
                 for (const element of [payload.canvas, payload.underlay?.canvas, payload.mast, payload.sling,
                     cleaner?.payload === payload ? cleaner.sprite : undefined]) {
@@ -1939,7 +2063,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (!failed.size) {
             const captionActors = displayed.filter(value => captionGroup?.actors.includes(value.body.id));
             if (captionActors.length && captionActors.every(value => (visibility.get(key(value)) ?? 1) <= 0.2)) { clearCaption(); }
-            paintCaption(displayed.filter(value => value.opacity > 0.2), reactions, viewport, policy, displayedObstacles); return;
+            paintCaption(displayed.filter(value => value.opacity > 0.2), reactions, viewport, policy, displayedObstacles);
+            paintWorkLabels(displayed, viewport, displayedObstacles); return;
         }
         if (columnPull && failed.has(columnPull.body)) { clearColumnPull(); }
         for (const episode of [...episodes.values()]) {
@@ -1965,6 +2090,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 work.phase = 'parked'; work.message = advanceMessage(work); work.label.textContent = work.message;
             }
         }
+        paintWorkLabels(displayed.filter(value => !failed.has(value.body)), viewport, displayedObstacles);
     }
 
     function paint(at: number, scheduled = false): void {
@@ -2207,10 +2333,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const episode = { page: value.pageNumber, element: value.pageElement, kind: value.kind, layer, payloads };
             episodes.set(value.pageNumber, episode);
             for (const payload of payloads) {
-                if (!payload.crop.imageId) { continue; }
                 const cover = doc.createElement('div');
                 initializeSceneNode(cover, 'pdfDocumentRobotArrival', '4');
-                cover.dataset.payload = String(payload.id); cover.dataset.imageId = payload.crop.imageId;
+                cover.dataset.payload = String(payload.id);
+                if (payload.crop.imageId) { cover.dataset.imageId = payload.crop.imageId; }
                 Object.assign(cover.style, { left: payload.crop.x * 100 + '%', top: payload.crop.y * 100 + '%',
                     width: payload.crop.width * 100 + '%', height: payload.crop.height * 100 + '%',
                     background: 'var(--page-bg-color, #fff)', opacity: '1' });
@@ -2287,9 +2413,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     return {
         offer,
         refine,
+        restoreArrivals,
         revealArrivals() {
             for (const episode of episodes.values()) {
-                for (const payload of episode.payloads) { payload.cover?.remove(); payload.cover = undefined; }
+                for (const payload of episode.payloads) { releasePayload(payload); }
             }
         },
         setVisibleWork,

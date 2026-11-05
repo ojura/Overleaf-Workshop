@@ -26,7 +26,7 @@ export interface PlacementLeader { from: PlacementPoint; to: PlacementPoint }
 export interface LabelPlacement extends PlacementRect {
     id: string;
     opacity: number;
-    /** Immediate geometric admission, independent of animated opacity or the caller clock. */
+    /** Immediate geometry and budget admission, independent of opacity or the caller clock. */
     blocked: boolean;
     leaders: readonly PlacementLeader[];
 }
@@ -37,6 +37,8 @@ export interface LabelPlacementFrame {
     bounds: PlacementRect;
     labels: readonly LabelPlacementInput[];
     obstacles?: readonly PlacementRect[];
+    /** Admit at most this many fitting labels, in priority then stable-ID order. */
+    maxVisible?: number;
 }
 
 export const LABEL_PLACEMENT_LIMITS = Object.freeze({ labels: 32, obstacles: 64, candidates: 24, leaderAnchors: 3 });
@@ -158,6 +160,10 @@ function ringCandidates(label: LabelPlacementInput): LabelCandidate[] {
 function validate(frame: LabelPlacementFrame) {
     finite(frame.now, 'clock');
     rectangle(frame.bounds, 'bounds');
+    if (frame.maxVisible !== undefined && (!Number.isInteger(frame.maxVisible)
+        || frame.maxVisible < 0 || frame.maxVisible > LABEL_PLACEMENT_LIMITS.labels)) {
+        throw new RangeError('Invalid label placement visibility budget.');
+    }
     if (frame.labels.length > LABEL_PLACEMENT_LIMITS.labels || (frame.obstacles?.length ?? 0) > LABEL_PLACEMENT_LIMITS.obstacles) {
         throw new RangeError('Too many label placement labels or obstacles.');
     }
@@ -211,6 +217,13 @@ export class LabelPlacementSolver {
             || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
         for (const label of order) {
             const remembered = this.memory.get(label.id);
+            if (placed.length >= (frame.maxVisible ?? LABEL_PLACEMENT_LIMITS.labels)) {
+                if (remembered) { remembered.opacity = 0; remembered.wait = 0; }
+                const center = remembered ? { x: label.anchor.x + remembered.center.x + remembered.offset.x,
+                    y: label.anchor.y + remembered.center.y + remembered.offset.y } : label.anchor;
+                result.set(label.id, { id: label.id, ...atCenter(center, label), opacity: 0, blocked: true, leaders: [] });
+                continue;
+            }
             const candidates = label.candidates ?? ringCandidates(label);
             const anchors = label.leaderAnchors ?? [label.anchor];
             const home = remembered ? { x: label.anchor.x + remembered.base.x, y: label.anchor.y + remembered.base.y } : undefined;

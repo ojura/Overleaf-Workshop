@@ -27,9 +27,9 @@ class RobotElement {
     readonly children: RobotElement[] = [];
     readonly attributes = new Map<string, string>();
     rect = { left: 0, top: 0, width: 480, height: 250 };
-    readonly texts: Array<{ text: string; x: number; y: number; font: string }> = [];
+    readonly texts: Array<{ text: string; x: number; y: number; font: string; color: string }> = [];
     readonly context = new Proxy({ fillText: (text: string, x: number, y: number) => {
-        this.texts.push({ text, x, y, font: this.context.font });
+        this.texts.push({ text, x, y, font: this.context.font, color: this.context.fillStyle });
     } } as Record<string, any>, {
         get(target, key: string) {
             if (key in target) { return target[key]; }
@@ -162,8 +162,10 @@ describe('the procedural PDF robot fleet', function () {
             assert.strictEqual(opened.renderer.active, true);
             assert.strictEqual(runtime.stage.children.length, 3);
             const caption = runtime.stage.children.find(node => node.className === 'robot-caption')!;
-            assert.ok(parseFloat(caption.style.fontSize) >= 16 && caption.style.background === '#fffdf5'
-                && caption.style.color === '#17212b' && caption.style.opacity === '1');
+            assert.ok(caption.style.fontSize === '12px' && caption.style.lineHeight === '16px'
+                && caption.style.background === '#101c2b' && caption.style.color === '#e8f0fa' && caption.style.opacity === '1');
+            assert.strictEqual(caption.style.padding, '3px 6px');
+            assert.strictEqual(caption.style.border, '0', 'the scene summary stays a quiet compact block');
             assert.strictEqual(runtime.callbacks.size, 0, 'a parked fleet needs no animation frame');
             const frames = opened.renderer.frames;
             for (let sample = 0; sample < 240; sample++) {
@@ -231,10 +233,39 @@ describe('the procedural PDF robot fleet', function () {
             runtime.resize();
             const names = new Set(robots.ROBOT_VEHICLES.map((vehicle: any) => vehicle.name));
             const labels = canvas.texts.filter(value => names.has(value.text));
-            assert.ok(labels.length > 0 && labels.length < names.size, 'the first static paint shows admitted labels and suppresses conflicting ones');
-            assert.ok(labels.every(value => parseFloat(value.font.split(' ')[1]) * (86 / 250) >= 16), 'drawing sizes compensate the fitted canvas');
+            assert.ok(labels.length > 0 && labels.length <= 3, 'a static compact stage admits no more than three fitting names');
+            assert.ok(labels.every(value => Math.abs(parseFloat(value.font.split(' ')[1]) * (86 / 250) - 12) < 1e-8), 'drawing sizes compensate the fitted canvas');
+            assert.ok(labels.every(value => value.color === '#e8f0fa'));
             assert.strictEqual(runtime.lab.snapshot().renderer.frames, before + 1);
             assert.strictEqual(runtime.callbacks.size, 0, 'label placement does not need a fade-in animation');
+        } finally { runtime.dispose(); }
+    });
+
+    it('keeps lab label admission stable at the measured panel size and favors active notices', () => {
+        const runtime = new RobotRuntime(robots);
+        try {
+            const canvas = runtime.stage.children.find(node => node.className === 'robot-canvas')!;
+            canvas.rect.width = 455.79; canvas.rect.height = 237.38;
+            runtime.window.devicePixelRatio = 1.2;
+            runtime.lab.update(ready); runtime.lab.setActive(true);
+            const names = new Set(robots.ROBOT_VEHICLES.map((vehicle: any) => vehicle.name));
+            const shownNames = () => canvas.texts.filter(value => names.has(value.text));
+            const initial = shownNames().map(value => value.text).sort();
+            assert.ok(initial.length > 0 && initial.length <= 3);
+            canvas.texts.length = 0; runtime.resize();
+            assert.deepStrictEqual(shownNames().map(value => value.text).sort(), initial, 'unchanged-time admission does not rotate ambient names');
+            const events = Array.from({ length: 15 }, (_, index) => ({ sequence: index + 1, at: 10, type: 'fetch', data: { bytes: 4096 } }));
+            runtime.tick(10); runtime.lab.update({ ...ready, performance: { events } });
+            let sawNotice = false;
+            for (let frame = 0; frame < 180 && !sawNotice; frame++) {
+                canvas.texts.length = 0; runtime.frame();
+                const shown = shownNames();
+                assert.ok(shown.length <= 3);
+                const notices = runtime.lab.snapshot().actors.filter((actor: any) => actor.notice);
+                sawNotice = notices.some((actor: any) => shown.some(value => value.text === robots.ROBOT_VEHICLES.find((vehicle: any) => vehicle.id === actor.vehicle).name)
+                    && canvas.texts.some(value => value.text === actor.notice));
+            }
+            assert.ok(sawNotice, 'traffic notices receive a readable slot within the same three-group budget');
         } finally { runtime.dispose(); }
     });
 

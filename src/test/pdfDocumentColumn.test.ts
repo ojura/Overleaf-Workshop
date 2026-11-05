@@ -12,7 +12,7 @@ interface Column {
     readonly offsetX: number;
     readonly transition: Motion | undefined;
     setPanel(panel: Panel): void;
-    update(): void;
+    update(layoutChanged?: boolean): void;
     registerLayer(layer: any): () => void;
     dispose(): void;
 }
@@ -179,6 +179,117 @@ describe('PDF document column beside a docked Motion Lab', function () {
         assert.strictEqual(plan({ x: 200, y: 0, width: 1000, height: 800 },
             [{ ...page, x: 350 }], panel()).offsetX, -150, 'sidebar geometry changes the available left margin');
         assert.strictEqual(plan(viewport, [{ ...page, width: NaN }], panel()).offsetX, 0);
+    });
+
+    it('does no geometry or computed-style work while the unshifted lab is absent, closed or floating', () => {
+        for (const state of [undefined, panel('right', { visible: false }), panel('float')]) {
+            const f = fixture();
+            let reads = 0;
+            const rect = f.container.getBoundingClientRect.bind(f.container);
+            const pageRect = f.pages[0].getBoundingClientRect.bind(f.pages[0]);
+            const computed = f.window.getComputedStyle;
+            f.container.getBoundingClientRect = () => { reads++; return rect(); };
+            f.pages[0].getBoundingClientRect = () => { reads++; return pageRect(); };
+            f.window.getComputedStyle = element => { reads++; return computed(element); };
+            try {
+                if (state) { f.api.setPanel(state); }
+                for (let step = 0; step < 12; step++) {
+                    f.api.update();
+                    f.observers[0].trigger();
+                    f.window.emit('resize');
+                    f.visual.emit('resize');
+                    f.visual.emit('scroll');
+                }
+                assert.strictEqual(reads, 0, 'an inactive column must not flush layout during reader refreshes');
+                assert.strictEqual(f.frames.size, 0);
+                assert.strictEqual(f.transitions.length, 0);
+                assert.strictEqual(f.observers[0].watched.size, 0);
+                assert.strictEqual(f.container.style.values.size, 0);
+                assert.strictEqual(f.pages[0].style.values.size, 0);
+            } finally { f.api.dispose(); }
+        }
+    });
+
+    it('finishes close cleanup before taking the inactive path and measures changed pages when reopened', () => {
+        const f = fixture();
+        try {
+            f.api.setPanel(panel()); f.frame(policy.durationMs);
+            assert.strictEqual(f.api.offsetX, -116);
+            f.api.setPanel(panel('right', { visible: false, reason: 'close' }));
+            assert.strictEqual(f.frames.size, 1, 'closing an applied shift keeps its finite return');
+            f.frame(policy.durationMs * 2);
+            assert.strictEqual(f.api.offsetX, 0);
+            assert.strictEqual(f.pages[0].style.getPropertyValue('translate'), '');
+            assert.strictEqual(f.transit.style.getPropertyValue('translate'), '');
+            assert.strictEqual(f.container.style.getPropertyValue(policy.offsetProperty), '');
+            assert.strictEqual(f.observers[0].watched.size, 0);
+
+            const next = f.makePage({ ...page, x: 350 });
+            f.pages.splice(0, 1, next);
+            f.container.box.x = 200; f.container.box.width = f.container.clientWidth = 1000;
+            let reads = 0;
+            const rect = f.container.getBoundingClientRect.bind(f.container);
+            const pageRect = next.getBoundingClientRect.bind(next);
+            f.container.getBoundingClientRect = () => { reads++; return rect(); };
+            next.getBoundingClientRect = () => { reads++; return pageRect(); };
+            f.api.update(); f.window.emit('resize'); f.visual.emit('scroll');
+            assert.strictEqual(reads, 0, 'closed reader changes need no layout measurement');
+            f.api.setPanel(panel());
+            assert.ok(reads > 0, 'opening uses current page and viewport geometry');
+            assert.strictEqual(f.api.transition?.toX, -150);
+            f.frame(policy.durationMs * 3);
+            assert.strictEqual(f.api.offsetX, -150);
+            assert.ok(f.observers[0].watched.has(next));
+            assert.strictEqual(f.frames.size, 0);
+        } finally { f.api.dispose(); }
+    });
+
+    it('reuses a viewport-wide zero-shift proof only for unchanged page elements during routine scroll updates', () => {
+        const f = fixture();
+        try {
+            f.pages[0].box.x = -100; f.pages[0].box.width = 1600;
+            f.api.setPanel(panel());
+            assert.strictEqual(f.api.offsetX, 0);
+            let reads = 0;
+            const rect = f.container.getBoundingClientRect.bind(f.container);
+            const pageRect = f.pages[0].getBoundingClientRect.bind(f.pages[0]);
+            f.container.getBoundingClientRect = () => { reads++; return rect(); };
+            f.pages[0].getBoundingClientRect = () => { reads++; return pageRect(); };
+            for (let step = 0; step < 30; step++) {
+                f.container.scrollLeft += 3; f.container.scrollTop += 7;
+                f.pages[0].box.x -= 3; f.pages[0].box.y -= 7;
+                f.api.update(false);
+            }
+            assert.strictEqual(reads, 0, 'scrolling cannot create horizontal margin beside a viewport-wide page');
+            assert.strictEqual(f.frames.size, 0);
+            assert.strictEqual(f.transitions.length, 0);
+            const narrow = f.makePage();
+            f.pages.splice(0, 1, narrow);
+            f.api.update(false);
+            assert.ok(reads > 0, 'a different visible page invalidates the width proof');
+            assert.strictEqual(f.api.offsetX, -116);
+            assert.ok(f.observers[0].watched.has(narrow));
+        } finally { f.api.dispose(); }
+    });
+
+    it('invalidates a wide-page zero-shift proof on layout, observed size, browser viewport and panel changes', () => {
+        for (const change of ['layout', 'observer', 'window', 'visual-resize', 'visual-scroll', 'panel']) {
+            const f = fixture();
+            try {
+                f.pages[0].box.x = -100; f.pages[0].box.width = 1600;
+                f.api.setPanel(panel());
+                f.api.update(false);
+                f.pages[0].box.x = 300; f.pages[0].box.width = 600;
+                if (change === 'layout') { f.api.update(true); }
+                else if (change === 'observer') { f.observers[0].trigger(); }
+                else if (change === 'window') { f.window.emit('resize'); }
+                else if (change === 'visual-resize') { f.visual.emit('resize'); }
+                else if (change === 'visual-scroll') { f.visual.emit('scroll'); }
+                else { f.api.setPanel(panel('right', { reason: 'resize' })); }
+                assert.strictEqual(f.api.offsetX, -116, change + ' must measure the new margin');
+                assert.strictEqual(f.frames.size, 0);
+            } finally { f.api.dispose(); }
+        }
     });
 
     it('moves pages and transit by one applied value without changing native scroll or transforms', () => {

@@ -40,10 +40,11 @@ class Element extends Events {
     get parentElement() { return this.parentNode; }
     getBoundingClientRect() {
         this.layoutReads++;
-        if (this.className === 'pdfDocumentRobotCaption') {
-            const width = parseFloat(this.style.width) || 0;
+        if (this.className === 'pdfDocumentRobotCaption' || this.className === 'pdfDocumentRobotWorkStatus') {
+            const width = parseFloat(this.style.width) || parseFloat(this.style.maxWidth) || 0;
             const height = this.style.height === 'auto'
-                ? this.ownerDocument.captionHeight ?? 16 + this.textContent.split('\n').length * parseFloat(this.style.lineHeight)
+                ? (this.className === 'pdfDocumentRobotCaption' ? this.ownerDocument.captionHeight : this.ownerDocument.workStatusHeight)
+                    ?? 16 + this.textContent.split('\n').length * parseFloat(this.style.lineHeight)
                 : parseFloat(this.style.height) || 0;
             return { left: 0, top: 0, x: 0, y: 0, width, height, right: width, bottom: height };
         }
@@ -789,6 +790,107 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         }
     });
 
+    it('retires expired arrival pixels before refining ahead of a delayed paint', () => {
+        const { f, source } = coarsePhoto({ maxActors: 4 });
+        const before = f.api.snapshot().pages[0].payloads[0];
+        const coarse = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
+        const allocated = f.owned.length;
+        assert.ok(f.callbacks.size > 0, 'the deposit paint is still queued');
+        // Move the clock past deposit without delivering that queued animation frame.
+        f.now = before.deadline * 0.63;
+        assert.strictEqual(f.api.snapshot().pages[0].payloads[0].deposited, false);
+        assert.strictEqual(f.api.refine(source()), 0, 'expired pixels cannot authorize a late refinement');
+        assert.strictEqual(f.owned.length, allocated, 'no replacement crop or cleaner is allocated');
+        const state = f.api.snapshot(), after = state.pages[0].payloads[0];
+        assert.strictEqual(state.activePayloads + state.activeArrivalCovers + state.cargoBytes, 0);
+        assert.strictEqual(state.cleaner, undefined);
+        assert.strictEqual(coarse.zeroWrites, 1);
+        assert.strictEqual(after.id, before.id); assert.strictEqual(after.deadline, before.deadline);
+        assert.deepStrictEqual(after.helpers, before.helpers);
+        f.finish();
+        assert.strictEqual(coarse.zeroWrites, 1, 'the later deposit and return cannot release pixels twice');
+        assert.strictEqual(f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+    });
+
+    for (const ending of ['reader input', 'traffic fade', 'deposit', 'detached cover', 'detached cover before paint']) {
+        it('terminally retires revealed cargo after ' + ending + ' while preserving its finite return owner', () => {
+            let visibility = 1;
+            const { f, page, delivery, source } = coarsePhoto({ maxActors: 4,
+                createTraffic: () => ({ update: (_at: number, groups: Array<{ id: number }>) =>
+                    new Map(groups.map(group => [group.id, { x: 0, y: 0, visibility }])), reset() {} }) });
+            f.tick(100); assert.strictEqual(f.api.refine(source()), 1);
+            const before = f.api.snapshot().pages[0].payloads[0];
+            const rasters = f.owned.filter(canvas => ['pdfDocumentRobotCargo', 'pdfDocumentRobotCargoUnderlay'].includes(canvas.className) && canvas.width);
+            assert.strictEqual(rasters.length, 2);
+            assert.ok(f.api.snapshot().cleaner);
+            if (ending === 'reader input') { f.api.revealArrivals(); }
+            else if (ending === 'traffic fade') { visibility = 0.5; f.frame(); }
+            else if (ending === 'deposit') { f.tick(before.deadline * 0.63 - f.now); }
+            else {
+                page.pageElement.replaceChildren(page.canvas, page.text);
+                if (ending === 'detached cover') {
+                    assert.strictEqual(f.api.refine(source(1080, 1536)), 0, 'a detached cover cannot authorize a fresh raster');
+                } else { f.frame(); }
+            }
+            const state = f.api.snapshot(), after = state.pages[0].payloads[0];
+            assert.strictEqual(state.activePayloads + state.activeArrivalCovers + state.cargoBytes, 0);
+            assert.strictEqual(state.cleaner, undefined);
+            assert.ok(rasters.every(canvas => canvas.zeroWrites === 1 && !canvas.parentNode));
+            assert.strictEqual(after.id, before.id); assert.strictEqual(after.deadline, before.deadline);
+            assert.deepStrictEqual(after.helpers, before.helpers);
+            visibility = 1; f.frame();
+            assert.strictEqual(f.api.offer(delivery), 'skipped');
+            assert.strictEqual(f.api.refine(source(1080, 1536)), 0, 'revealed cargo cannot be revived by later quality');
+            assert.strictEqual(f.api.snapshot().activePayloads + f.api.snapshot().activeArrivalCovers, 0);
+            f.finish();
+            assert.strictEqual(f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+        });
+    }
+
+    it('reattaches only the same authorized cover to its current page before native rendering resumes', () => {
+        const { f, page, source } = coarsePhoto({ maxActors: 4 });
+        f.tick(100); assert.strictEqual(f.api.refine(source()), 1);
+        const cover = page.pageElement.children.find(node => node.className === 'pdfDocumentRobotArrival')!;
+        const before = f.api.snapshot(), allocated = f.owned.length;
+        page.pageElement.replaceChildren(page.canvas, page.text);
+        const foreign = f.page(99);
+        f.api.restoreArrivals(99, foreign.pageElement);
+        assert.strictEqual(cover.parentNode, null, 'the same page number does not authorize a different page element');
+        f.api.restoreArrivals(99, page.pageElement);
+        assert.strictEqual(cover.parentNode, page.pageElement);
+        assert.strictEqual(f.owned.length, allocated, 'restoration reuses the exact cover and rasters');
+        f.frame();
+        assert.strictEqual(f.api.snapshot().activeArrivalCovers, 1);
+        assert.strictEqual(f.api.snapshot().cargoBytes, before.cargoBytes);
+        assert.strictEqual(f.api.snapshot().pages[0].payloads[0].id, before.pages[0].payloads[0].id);
+        f.api.revealArrivals(); f.api.restoreArrivals(99, page.pageElement);
+        assert.strictEqual(f.api.snapshot().activeArrivalCovers + f.api.snapshot().activePayloads, 0);
+        f.api.reset(); f.api.setVisiblePages([99]); f.api.restoreArrivals(99, page.pageElement);
+        assert.strictEqual(cover.parentNode, null, 'a document reset retires the old cover identity');
+    });
+
+    it('masks each admitted fallback rectangle until its cargo is atomically revealed or cancelled', () => {
+        const f = fixture(), page = f.page();
+        f.api.setVisiblePages([1]); assert.strictEqual(f.api.offer(page), 'started');
+        const payloads = f.api.snapshot().pages[0].payloads;
+        const covers = page.pageElement.children.filter(node => node.className === 'pdfDocumentRobotArrival');
+        assert.strictEqual(covers.length, payloads.length);
+        assert.ok(covers.length > 0);
+        for (const payload of payloads) {
+            const cover = covers.find(node => node.dataset.payload === String(payload.id))!;
+            for (const [property, target] of [['left', 'x'], ['top', 'y'], ['width', 'width'], ['height', 'height']]) {
+                assert.ok(Math.abs(parseFloat(cover.style[property]) / 100 - payload.target[target]) < 1e-9);
+            }
+            assert.strictEqual(cover.style.opacity, '1');
+            assert.strictEqual(cover.style.pointerEvents, 'none');
+        }
+        f.api.revealArrivals();
+        assert.strictEqual(f.api.snapshot().activeArrivalCovers + f.api.snapshot().activePayloads, 0);
+        assert.ok(covers.every(cover => !cover.parentNode));
+        assert.deepStrictEqual([page.canvas.width, page.canvas.height], [4320, 6480]);
+        f.finish(); assert.strictEqual(f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+    });
+
     it('reveals the exact atlas photograph at its actual deposit while leaving native page pixels intact', () => {
         const { f, page } = coarsePhoto();
         const cover = page.pageElement.children.find(node => node.className === 'pdfDocumentRobotArrival')!;
@@ -817,7 +919,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.finish();
     });
 
-    it('removes destination gaps on cancellation and never masks generic crops or a rejected admission', () => {
+    it('removes destination gaps on cancellation and never masks a rejected admission', () => {
         for (const ending of ['offscreen', 'hide', 'reduce', 'disable', 'reset', 'replacement', 'dispose']) {
             const { f, page } = coarsePhoto();
             const cover = page.pageElement.children.find(node => node.className === 'pdfDocumentRobotArrival')!;
@@ -833,20 +935,19 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             assert.strictEqual(cover.parentNode, null, ending);
             assert.strictEqual(f.api.snapshot().activeArrivalCovers, 0, ending);
         }
-        for (const maxActors of [0, 2]) {
-            const f = fixture({ maxActors }), page = f.page();
-            f.api.setVisiblePages([1]); f.api.offer(page);
-            assert.strictEqual(page.pageElement.children.filter(node => node.className === 'pdfDocumentRobotArrival').length, 0,
-                'generic ink crops and rejected work leave the underlying page visible');
-        }
+        const f = fixture({ maxActors: 0 }), page = f.page();
+        f.api.setVisiblePages([1]); f.api.offer(page);
+        assert.strictEqual(page.pageElement.children.filter(node => node.className === 'pdfDocumentRobotArrival').length, 0,
+            'rejected work leaves the underlying page visible');
     });
 
-    it('reveals destination pixels immediately on reader input without replaying or canceling their cargo', () => {
+    it('reveals destination pixels immediately on reader input while preserving the finite actor return', () => {
         const { f, page, delivery } = coarsePhoto();
         const before = f.api.snapshot().pages[0].payloads[0];
         assert.strictEqual(f.api.snapshot().activeArrivalCovers, 1);
         f.api.revealArrivals();
         assert.strictEqual(f.api.snapshot().activeArrivalCovers, 0);
+        assert.strictEqual(f.api.snapshot().activePayloads, 0);
         assert.deepStrictEqual(f.api.snapshot().pages[0].payloads[0].helpers, before.helpers);
         assert.strictEqual(f.api.snapshot().pages[0].payloads[0].deadline, before.deadline);
         f.api.setVisiblePages([99]); f.frame();
@@ -893,19 +994,62 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             page.pageElement.remove(); page.canvas.width = page.canvas.height = 0;
         }
         const actors = () => scenes.map(f => f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width).map(point));
+        const samePositions = (message: string) => {
+            const [expected, actual] = actors();
+            assert.strictEqual(actual.length, expected.length, message);
+            for (let index = 0; index < actual.length; index++) {
+                // Large scroll-origin subtraction can leave sub-nanopixel arithmetic residue.
+                assert.ok(Math.hypot(actual[index].x - expected[index].x, actual[index].y - expected[index].y) < 1e-8, message);
+            }
+        };
         scenes[1].container.scrollTop = 0;
         scenes[1].api.setVisiblePages([], { preserveReplacement: true });
         scenes.forEach(f => f.frame());
-        assert.deepStrictEqual(actors()[1], actors()[0], 'PDF.js reset cannot pin old cargo to page 425 content coordinates');
+        samePositions('PDF.js reset cannot pin old cargo to page 425 content coordinates');
         scenes[1].container.scrollTop = 424000;
         scenes.forEach(f => f.frame());
-        assert.deepStrictEqual(actors()[1], actors()[0], 'restoring reader position cannot shift the finite outbound scene');
+        samePositions('restoring reader position cannot shift the finite outbound scene');
         for (const f of scenes) {
             f.finish();
             assert.strictEqual(f.api.snapshot().replacement, undefined);
             assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes, 0);
             assert.strictEqual(f.callbacks.size, 0);
         }
+    });
+
+    it('removes old fragments along a gentle ground diagonal with the body and cargo still attached', () => {
+        const f = fixture({ maxActors: 1, encounterRandom: () => 0.99 }); f.desktop();
+        let actor: any, payload: any;
+        for (let id = 1; id <= 12; id++) {
+            const page = f.page(id); f.api.retireDocument([page], 'edition-' + id);
+            const scene = f.api.snapshot().replacement;
+            actor = scene?.actors.find((value: any) => value.vehicle !== 'forklift'
+                && !module.ROBOT_VEHICLES.find((spec: any) => spec.id === value.vehicle).air);
+            if (actor) { payload = scene.payloads.find((value: any) => value.helpers.includes(actor.id)); break; }
+            f.finish();
+        }
+        assert.ok(actor && payload, 'the extraction fixture contains a self-propelled ground carrier');
+        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
+        const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.dataset.payload === String(payload.id))!;
+        const samples: Array<{ body: { x: number; y: number }; cargo: { x: number; y: number } }> = [];
+        while (f.callbacks.size) {
+            f.frame();
+            const current = f.api.snapshot().replacement?.payloads.find((value: any) => value.id === payload.id);
+            if (current?.stage === 'carry') { samples.push({ body: point(sprite), cargo: point(cargo) }); }
+        }
+        assert.ok(samples.length > 3);
+        const first = samples[0], last = samples.at(-1)!;
+        assert.ok(Math.abs(last.body.y - first.body.y) > 5, 'the old pixels take a visibly diagonal side exit');
+        for (let index = 1; index < samples.length; index++) {
+            const a = samples[index - 1], b = samples[index];
+            assert.ok(Math.abs(b.body.y - a.body.y) <= Math.abs(b.body.x - a.body.x) * 0.25 + 0.03);
+            assert.ok(Math.abs((b.body.x - b.cargo.x) - (first.body.x - first.cargo.x)) < 0.03);
+            assert.ok(Math.abs((b.body.y - b.cargo.y) - (first.body.y - first.cargo.y)) < 0.03);
+        }
+        assert.strictEqual(cargo.zeroWrites, 1);
+        assert.strictEqual(f.api.snapshot().replacement, undefined);
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes, 0);
+        assert.strictEqual(f.callbacks.size, 0);
     });
 
     it('replacement releases every shared bitmap and borrowed actor once on completion or cancellation', () => {
@@ -1009,6 +1153,14 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const writes = bubble.textWrites;
         for (let step = 0; step < 12; step++) { f.frame(); }
         assert.strictEqual(bubble.textWrites, writes, 'cached text remains untouched while gesture poses advance');
+        const statuses = sceneNodes(f.container).filter(node => node.className === 'pdfDocumentRobotWorkStatus' && node.style.opacity === '1');
+        assert.strictEqual(statuses.length, 1, 'one work status remains readable alongside the exchange');
+        const status = statuses[0], statusRect = status.getBoundingClientRect();
+        const statusLeft = parseFloat(status.style.left), statusTop = parseFloat(status.style.top);
+        const bubbleLeft = parseFloat(bubble.style.left), bubbleTop = parseFloat(bubble.style.top);
+        const overlapWidth = Math.min(statusLeft + statusRect.width, bubbleLeft + width) - Math.max(statusLeft, bubbleLeft);
+        const overlapHeight = Math.min(statusTop + statusRect.height, bubbleTop + height) - Math.max(statusTop, bubbleTop);
+        assert.ok(Math.max(0, overlapWidth) * Math.max(0, overlapHeight) <= 4, 'solver admission keeps the opaque status out of the grouped speech bubble');
     });
 
     it('places the measured multiline caption and reuses its dimensions while the exchange moves', () => {
@@ -1083,9 +1235,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             assert.ok(captions.length > 0 && captions.every(node => node.textContent.length > 0));
             assert.ok(captions.every(node => node.style.pointerEvents === 'none'
                 && node.attributes.get('aria-hidden') === 'true' && node.style.whiteSpace === 'pre-line'));
-            assert.ok(captions.every(node => parseFloat(node.style.fontSize) >= 16
-                && node.style.background === '#fffdf5' && node.style.color === '#17212b' && ['0', '1'].includes(node.style.opacity)),
-                'dialogue keeps a readable CSS floor and opaque high-contrast text throughout its hold');
+            assert.ok(captions.every(node => node.style.fontSize === '12px' && node.style.lineHeight === '16px'
+                && node.style.background === '#f5f7fa' && node.style.color === '#17212b' && ['0', '1'].includes(node.style.opacity)),
+                'dialogue stays compact and opaque throughout its hold');
         }
         assert.ok(observed, 'the seeded successful delivery has a finite satisfied reaction');
         assert.ok(visibleDialogue, 'the readable bubble actually appears during the finite successful reaction');
@@ -1199,7 +1351,13 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         });
         assert.strictEqual(f.api.snapshot().frames, frames);
         assert.strictEqual(f.owned.length, allocated);
-        assert.deepStrictEqual(page.pageElement.children, [page.canvas, page.text]);
+        const payloads = f.api.snapshot().pages[0].payloads;
+        assert.deepStrictEqual(page.pageElement.children.map(node => node === page.canvas ? 'canvas'
+            : node === page.text ? 'text' : node.className + ':' + node.dataset.payload),
+            ['canvas', 'text', ...payloads.filter((payload: any) => payload.rasterWidth > 0)
+                .map((payload: any) => 'pdfDocumentRobotArrival:' + payload.id)]);
+        assert.ok(page.pageElement.children.slice(2).every(node => node.style.pointerEvents === 'none'
+            && node.attributes.get('aria-hidden') === 'true'));
     });
 
     it('carries a parked advance crew with the document and promotes its actual scrolled position', () => {
@@ -1477,8 +1635,13 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         for (const key of ['x', 'y', 'width', 'height'] as const) { assert.ok(Math.abs(payload.target[key] - lower[key]) < 1e-9); }
         const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.dataset.courier === String(actor.id))!;
         const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo')!;
+        const cover = page.pageElement.children.find(node => node.className === 'pdfDocumentRobotArrival'
+            && node.dataset.payload === String(payload.id))!;
+        const beforeDeposit = payload.deadline * 0.62 - 0.001;
         const positions: Array<{ robot: { x: number; y: number }; cargo: { x: number; y: number }; stage: string }> = [];
         for (let tick = 0; tick < 100; tick++) {
+            // Leave a full paint interval for the exact loaded endpoint sample.
+            if (f.now + 68 >= beforeDeposit) { break; }
             f.frame();
             const current = f.api.snapshot().pages[0]?.payloads[0];
             if (!current) { break; }
@@ -1493,9 +1656,19 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.ok(660 - travel[0].robot.y > 0 && 660 - travel[0].robot.y < 70, 'wheel height is tied to the real page lower edge');
         assert.ok(Math.abs(travel[0].robot.x - travel.at(-1)!.robot.x) > 20, 'the forklift actually drives along the base');
         assert.ok(lift[0].cargo.y - lift.at(-1)!.cargo.y > 10, 'the payload rises while the vehicle stays grounded');
+        f.tick(beforeDeposit - f.now);
+        assert.ok(cargo.isConnected && cover.isConnected);
+        assert.strictEqual(f.api.snapshot().pages[0].payloads[0].deposited, false);
         const delivered = point(cargo);
         assert.ok(Math.abs(delivered.x - (40 + (lower.x + lower.width / 2) * 400)) < 0.02);
         assert.ok(Math.abs(delivered.y - (60 + (lower.y + lower.height / 2) * 600)) < 0.02);
+        f.frame();
+        const deposited = f.api.snapshot().pages[0].payloads[0];
+        assert.strictEqual(deposited.deposited, true);
+        assert.strictEqual(cargo.parentNode, null); assert.strictEqual(cargo.zeroWrites, 1);
+        assert.strictEqual(cover.parentNode, null);
+        assert.deepStrictEqual(deposited.helpers, payload.helpers); assert.strictEqual(deposited.deadline, payload.deadline);
+        assert.ok(sprite.isConnected, 'the original actor still owns its finite return');
         f.finish();
         assert.strictEqual(f.api.snapshot().deliveredFragments, 1);
         assert.strictEqual(f.api.snapshot().retainedBytes, 0);
@@ -1679,7 +1852,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.api.setVisibleWork([work([page], ['preparing'])]);
         assert.ok(f.api.snapshot().advance[0].message.includes('88'));
         const status = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotWorkStatus')!;
-        assert.ok(parseFloat(status.style.fontSize) >= 16 && status.style.background === '#fffdf5'
+        assert.ok(status.style.fontSize === '12px' && status.style.lineHeight === '16px' && status.style.background === '#f5f7fa'
             && status.style.color === '#17212b' && status.style.opacity === '1');
         assert.strictEqual(f.api.snapshot().activeActors, 0);
         assert.strictEqual(f.owned.length, 0);
@@ -1693,6 +1866,29 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.api.setVisibleWork([work([page])]);
         assert.strictEqual(f.api.snapshot().activeActors, 1);
         assert.strictEqual(f.api.hasHandled(99), false);
+    });
+
+    it('admits one stable measured work status on a static paint and suppresses a clipped label', () => {
+        const f = fixture(); f.desktop(); f.media.matches = true;
+        const pages = [f.page(99), f.page(100), f.page(101)];
+        const groups = [work([pages[0]], ['waiting'], 'a'), work([pages[1]], ['preparing'], 'b'), work([pages[2]], ['waiting'], 'c')];
+        f.api.setVisibleWork(groups);
+        const statuses = () => sceneNodes(f.container).filter(node => node.className === 'pdfDocumentRobotWorkStatus');
+        const shown = () => statuses().filter(node => node.style.opacity === '1');
+        assert.strictEqual(statuses().length, 3);
+        assert.strictEqual(shown().length, 1);
+        const selected = shown()[0];
+        assert.ok(selected.textContent.startsWith('Preparing page 89'), 'active preparation takes priority over ambient waiting statuses');
+        assert.strictEqual(selected.layoutReads, 1);
+        f.api.setVisibleWork([...groups].reverse());
+        assert.strictEqual(shown()[0], selected, 'input order does not cycle the admitted status');
+        assert.strictEqual(selected.layoutReads, 1, 'unchanged text metrics are cached');
+        f.document.workStatusHeight = 2000;
+        f.api.setVisibleWork(groups.map(group => ({ ...group, pages: group.pages.map(page => ({ ...page, label: page.label + ' updated' })) })));
+        assert.strictEqual(shown().length, 0, 'a measured rectangle that cannot fit is hidden on the same static paint');
+        assert.strictEqual(f.callbacks.size + f.timers.size, 0);
+        f.api.setVisiblePages([]);
+        assert.strictEqual(statuses().length, 0);
     });
 
     it('does not retry failed advance artwork on every refresh and still accepts later real pixels', () => {
@@ -1777,7 +1973,12 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(transit.attributes.get('aria-hidden'), 'true');
         assert.ok(f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotCargo').every(canvas => canvas.contextOptions[0]?.alpha === true),
             'copied PDF fragments preserve source alpha');
-        assert.deepStrictEqual(page.pageElement.children, [page.canvas, page.text], 'the real canvas and selectable text remain untouched');
+        assert.deepStrictEqual(page.pageElement.children.map(node => node === page.canvas ? 'canvas'
+            : node === page.text ? 'text' : node.className + ':' + node.dataset.payload),
+            ['canvas', 'text', ...began.pages[0].payloads.map((payload: any) => 'pdfDocumentRobotArrival:' + payload.id)],
+            'the original canvas/text stay in order and only their owned arrival covers are added');
+        assert.ok(page.pageElement.children.slice(2).every(node => node.style.pointerEvents === 'none'
+            && node.attributes.get('aria-hidden') === 'true'));
         for (const episode of transit.children) {
             assert.strictEqual(episode.style.pointerEvents, 'none');
             assert.ok(episode.children.every((child: Element) => child.style.pointerEvents === 'none'));
@@ -1850,7 +2051,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('recruits an aircraft to carry the L-UGV itself through a steep leg before its final ground drive', () => {
-        const { f, payload } = cooperative('airlift');
+        const { f, page, payload } = cooperative('airlift');
         const episode = f.api.snapshot().pages[0];
         const ground = episode.actors.find((actor: any) => actor.vehicle === 'lugv');
         const air = episode.actors.find((actor: any) => actor.locomotion === 'air');
@@ -1858,12 +2059,24 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const sprites = [ground, air].map(actor => f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle'
             && canvas.dataset.courier === String(actor.id))!);
         const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.dataset.payload === String(payload.id))!;
+        const cover = page.pageElement.children.find(node => node.className === 'pdfDocumentRobotArrival'
+            && node.dataset.payload === String(payload.id))!;
         const samples: any[] = [];
         const baseline = f.api.snapshot().deliveredFragments;
+        let deposited = false;
         for (let step = 0; step < 120; step++) {
             f.frame();
             const state = f.api.snapshot().pages[0]?.payloads.find((item: any) => item.id === payload.id);
             if (!state || state.stage === 'return') { break; }
+            if (state.deposited) {
+                deposited = true;
+                assert.strictEqual(cargo.parentNode, null); assert.strictEqual(cargo.zeroWrites, 1);
+                assert.strictEqual(cover.parentNode, null, 'deposit reveals the source and retires its copy together');
+                assert.deepStrictEqual(state.helpers, payload.helpers);
+                assert.strictEqual(state.deadline, payload.deadline);
+                assert.ok(sprites.every(sprite => sprite.isConnected), 'the original helpers remain for their finite return');
+                break;
+            }
             const route = state.routeState;
             assert.ok(route);
             const positions = sprites.map(point), photo = point(cargo);
@@ -1872,6 +2085,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             assert.ok(Math.hypot(photo.x - route.cargo.x, photo.y - route.cargo.y) < 0.03);
             samples.push({ ...route, phase: route.phase, ground: positions[0], air: positions[1], cargo: photo });
         }
+        assert.strictEqual(deposited, true);
         for (const phase of ['drive', 'recruit', 'rendezvous', 'lift', 'carry', 'set-down', 'final-drive']) {
             assert.ok(samples.some(sample => sample.phase === phase), phase + ' is visible within the original delivery deadline');
         }
@@ -1899,6 +2113,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     it('keeps self-propelled ground deliveries and their returns shallow while aircraft retain aerial paths', () => {
         const f = fixture({ maxActors: 3 }); f.desktop();
         let groundSegments = 0, airSegments = 0;
+        const diagonals = { approachUp: 0, approachDown: 0, returnUp: 0, returnDown: 0 };
         for (let id = 1; id <= 10; id++) {
             const page = f.page(id);
             page.pageElement.rect = { left: 40, top: 60, width: 465, height: 661 };
@@ -1910,15 +2125,24 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                     const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.dataset.courier === String(actor.id))!;
                     if (!sprite.style.transform) { continue; }
                     const locomotion = module.ROBOT_VEHICLES.find((spec: any) => spec.id === actor.vehicle).air ? 'air' : 'ground';
-                    const current = { ...actor, point: point(sprite) }, last = previous.get(actor.id);
+                    const payload = f.api.snapshot().pages[0]?.payloads.find((value: any) => value.id === actor.payloadId);
+                    const current = { ...actor, point: point(sprite), motion: payload?.motion ?? { x: 0, y: 0 } }, last = previous.get(actor.id);
                     if (last && !actor.carried && !last.carried && actor.departing === last.departing
                         && actor.routePhase === last.routePhase && Number(sprite.style.opacity) > 0.2) {
                         const dx = current.point.x - last.point.x, dy = current.point.y - last.point.y;
                         if (locomotion === 'air') { if (Math.abs(dy) > 1) { airSegments++; } }
                         else {
-                            assert.ok(Math.abs(dy) <= Math.abs(dx) * 0.25 + 0.08,
-                                actor.vehicle + ' must drive shallowly or be visibly carried: ' + dx + ',' + dy);
+                            // Encounters and traffic apply a shared horizontal nudge to cargo and
+                            // helpers. Check the authored tangent independently of that yielding.
+                            const routeDx = dx - (current.motion.x - last.motion.x);
+                            const routeDy = dy - (current.motion.y - last.motion.y);
+                            assert.ok(Math.abs(routeDy) <= Math.abs(routeDx) * 0.25 + 0.08,
+                                actor.vehicle + ' must drive shallowly or be visibly carried: ' + routeDx + ',' + routeDy);
                             if (Math.abs(dx) > 1) { groundSegments++; }
+                            if (Math.abs(dx) > 1 && Math.abs(dy) > 0.1) {
+                                diagonals[actor.departing ? dy < 0 ? 'returnUp' : 'returnDown'
+                                    : dy < 0 ? 'approachUp' : 'approachDown']++;
+                            }
                         }
                     }
                     previous.set(actor.id, current);
@@ -1926,6 +2150,55 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             }
         }
         assert.ok(groundSegments > 10 && airSegments > 10, 'the regression exercises both distinct locomotion classes');
+        assert.ok(Object.values(diagonals).every(count => count > 3),
+            'ordinary ground approaches and returns visibly climb and descend: ' + JSON.stringify(diagonals));
+    });
+
+    it('keeps a sloped lab handoff continuous from the real dock through deposit and return', () => {
+        const f = fixture({ maxActors: 2, encounterRandom: () => 0.99 }); f.desktop();
+        const held = new Set<string>();
+        const dock = { x: 0, y: 460, scale: 1.92 }, airDock = { x: 900, y: 80, scale: 1.92 };
+        f.api.setDispatchOrigin({ reserve(vehicle: string) {
+            if (!['rover', 'quad'].includes(vehicle) || held.has(vehicle)) { return; }
+            held.add(vehicle); return vehicle === 'rover' ? dock : airDock;
+        }, destination: (vehicle: string) => vehicle === 'rover' ? dock : airDock,
+        release: (vehicle: string) => held.delete(vehicle) });
+        let payload: any;
+        for (let id = 1; id <= 16; id++) {
+            const page = f.page(id);
+            page.pageElement.rect = { left: 40, top: 60, width: 465, height: 661 };
+            f.api.setVisiblePages([id]);
+            f.api.offer({ ...page, imageRegions: [{ id: 'sloped-handoff', x: 0.3, y: 0.32, width: 0.45, height: 0.3 }] });
+            payload = f.api.snapshot().pages[0]?.payloads.find((value: any) => value.mode === 'handoff');
+            if (payload) { break; } f.finish();
+        }
+        assert.ok(payload, 'a ground dock at a different height can join a gentle cooperative handoff');
+        const actor = f.api.snapshot().pages[0].actors.find((value: any) => value.vehicle === 'rover');
+        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
+        let previous = point(sprite), handoff: { x: number; y: number } | undefined;
+        assert.ok(Math.hypot(previous.x - dock.x, previous.y - dock.y) < 0.03, 'the real borrowed body does not teleport');
+        let climbed = false, returned = false, last = previous;
+        const delivered = f.api.snapshot().deliveredFragments;
+        while (f.callbacks.size) {
+            f.frame();
+            const current = f.api.snapshot().pages[0]?.payloads.find((value: any) => value.id === payload.id);
+            if (!current) { break; }
+            const position = point(sprite), dx = position.x - previous.x, dy = position.y - previous.y;
+            assert.ok(Math.abs(dy) <= Math.abs(dx) * 0.25 + 0.03, 'one shared crew follows the actual shallow tangent');
+            if (current.stage === 'handoff') {
+                if (handoff) { assert.deepStrictEqual(position, handoff, 'the ground body waits at the exact handoff'); }
+                handoff = position;
+            }
+            if (current.stage === 'carry' && Math.abs(dy) > 0.1) { climbed = true; }
+            if (current.stage === 'return' && Math.abs(dy) > 0.1) { returned = true; }
+            previous = position; last = position;
+        }
+        assert.ok(climbed && returned && handoff, 'both the loaded drive and empty return change height');
+        assert.ok(Math.hypot(last.x - dock.x, last.y - dock.y) < 2, 'the finite return reaches the actual lab dock');
+        assert.strictEqual(f.api.snapshot().deliveredFragments, delivered + 1);
+        assert.strictEqual(held.size, 0);
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes, 0);
+        assert.strictEqual(f.callbacks.size, 0);
     });
 
     it('returns the aircraft independently when its carried ground partner has a shallow route home', () => {
@@ -2314,6 +2587,63 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.api.snapshot().retainedBytes, 0);
     });
 
+    it('admits each sampled source rectangle once in a useful thin visible page slice', () => {
+        for (const visibleHeight of [120, 140, 159]) {
+            const f = fixture(); f.desktop();
+            const page = f.page();
+            page.pageElement.rect = { left: 40, top: f.window.innerHeight - visibleHeight, width: 1000, height: 600 };
+            f.api.setVisiblePages([1]);
+            assert.strictEqual(f.api.offer(page), 'started');
+            const copies = f.owned.flatMap(canvas => canvas.copies.filter(args => args.length === 9 && args[0] === page.canvas));
+            assert.ok(copies.length >= 2, 'the useful slice admits more than one distinct cargo');
+            const rectangles = copies.map(args => args.slice(1, 5).join(':'));
+            assert.strictEqual(new Set(rectangles).size, rectangles.length,
+                visibleHeight + ' CSS px slice must not allocate repeated clamped rows');
+        }
+    });
+
+    it('deduplicates identical photo geometry under different placement IDs while retaining distinct destinations', () => {
+        const f = fixture({ maxActors: 6 }); f.desktop();
+        const page = f.page();
+        page.pageElement.rect = { left: 40, top: 60, width: 1000, height: 1000 };
+        const first = { id: 'photo-layer-a', x: 0.2, y: 0.1, width: 0.08, height: 0.08 };
+        const other = { id: 'other-placement', x: 0.6, y: 0.1, width: 0.08, height: 0.08 };
+        f.api.setVisiblePages([1]);
+        assert.strictEqual(f.api.offer({ ...page, imageRegions: [first, { ...first, id: 'photo-layer-b' }, other] }), 'started');
+        const state = f.api.snapshot(), payloads = state.pages[0].payloads;
+        assert.strictEqual(payloads.length, 2, 'placement aliases share one cargo allocation');
+        assert.deepStrictEqual(payloads.map((payload: any) => payload.target.x).sort(), [first.x, other.x]);
+        assert.strictEqual(page.pageElement.children.filter(node => node.className === 'pdfDocumentRobotArrival').length, 2);
+        const copies = f.owned.flatMap(canvas => canvas.copies.filter(args => args.length === 9 && args[0] === page.canvas));
+        assert.strictEqual(copies.length, 2);
+        assert.strictEqual(new Set(copies.map(args => args.slice(1, 5).join(':'))).size, 2);
+    });
+
+    it('repeated preview and native publication refines existing cargo without restarting its identity or deadline', () => {
+        const { f, delivery, source } = coarsePhoto({ maxActors: 4 });
+        f.tick(100);
+        const before = f.api.snapshot().pages[0].payloads[0];
+        const sharper = { ...source(), kind: 'page' as const };
+        assert.strictEqual(f.api.refine(sharper), 1);
+        const allocations = f.owned.length, cleaner = f.api.snapshot().cleaner;
+        for (const repeated of [delivery, sharper, { ...sharper, kind: 'preview' as const }, sharper]) {
+            assert.strictEqual(f.api.offer(repeated), 'skipped');
+            assert.strictEqual(f.api.refine(repeated), 0);
+        }
+        assert.strictEqual(f.owned.length, allocations, 'same or lower quality does not allocate another copy');
+        const after = f.api.snapshot().pages[0].payloads[0];
+        for (const key of ['id', 'deadline', 'mode', 'imageId']) { assert.strictEqual(after[key], before[key]); }
+        assert.deepStrictEqual(after.helpers, before.helpers);
+        assert.deepStrictEqual(after.target, before.target);
+        assert.strictEqual(after.refinements, 1);
+        assert.deepStrictEqual(f.api.snapshot().cleaner, cleaner, 'repeated quality does not restart the finite cleaner');
+        f.finish();
+        assert.strictEqual(f.api.offer(sharper), 'skipped');
+        assert.strictEqual(f.api.refine(source(1080, 1536)), 0);
+        assert.strictEqual(f.api.snapshot().episodes, 1);
+        assert.strictEqual(f.api.snapshot().activePayloads + f.api.snapshot().retainedBytes, 0);
+    });
+
     it('coalesces preview and native readiness and never replays a delivered page on revisit or zoom', () => {
         const f = fixture();
         const page = f.page();
@@ -2338,19 +2668,27 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.api.setVisiblePages([1]);
         f.api.deliver(page);
         const first = f.api.snapshot().pages[0].actors[0];
-        for (let frame = 0; frame < 120; frame++) {
-            f.frame();
-            const actor = f.api.snapshot().pages[0]?.actors.find((candidate: any) => candidate.id === first.id);
-            if (actor?.deposited) { break; }
-        }
+        const payload = f.api.snapshot().pages[0].payloads.find((candidate: any) => candidate.id === first.payloadId);
+        const cover = page.pageElement.children.find(node => node.className === 'pdfDocumentRobotArrival'
+            && node.dataset.payload === String(payload.id))!;
+        f.tick(100);
         page.pageElement.rect = { left: 75, top: 20, width: 500, height: 650 };
-        f.frame();
+        // Inspect the loaded endpoint immediately before the atomic deposit retires its raster.
+        f.tick(payload.deadline * 0.62 - f.now - 0.001);
         const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.dataset.courier === String(first.id))!;
+        assert.ok(cargo.isConnected && cover.isConnected);
+        assert.strictEqual(f.api.snapshot().pages[0].payloads.find((candidate: any) => candidate.id === payload.id).deposited, false);
         const match = cargo.style.transform.match(/translate\(([-\d.]+)px,([-\d.]+)px\)/)!;
         assert.ok(Math.abs(Number(match[1]) - (75 + first.target.x * 500)) < 0.02);
         assert.ok(Math.abs(Number(match[2]) - (20 + first.target.y * 650)) < 0.02);
         assert.ok(Math.abs(parseFloat(cargo.style.width) - first.target.width * 500) < 0.02);
         assert.ok(Math.abs(parseFloat(cargo.style.height) - first.target.height * 650) < 0.02);
+        f.frame();
+        assert.strictEqual(cargo.parentNode, null); assert.strictEqual(cargo.zeroWrites, 1);
+        assert.strictEqual(cover.parentNode, null);
+        const deposited = f.api.snapshot().pages[0].payloads.find((candidate: any) => candidate.id === payload.id);
+        assert.strictEqual(deposited.deposited, true); assert.strictEqual(deposited.deadline, payload.deadline);
+        f.finish(); assert.strictEqual(f.callbacks.size + f.api.snapshot().retainedBytes, 0);
     });
 
     it('bounds fast-traverse resources and fences old callbacks after visibility removal, replacement and disposal', () => {

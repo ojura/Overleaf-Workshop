@@ -207,6 +207,35 @@ describe('measured robot caption placement', function () {
         assert.strictEqual(placed[0].opacity, 1);
     });
 
+    it('admits a stable priority and ID budget without waiting for opacity or caller time', () => {
+        const solver = new api.LabelPlacementSolver();
+        const inputs = [
+            label('ambient-b', { candidates: [candidate(100, 100)] }),
+            label('notice', { priority: 2, candidates: [candidate(200, 200)] }),
+            label('ambient-a', { candidates: [candidate(300, 300)] }),
+        ];
+        const layout = (labels: any[], maxVisible: number) => solver.layout({ now: 0, bounds, labels, maxVisible });
+        const first = layout(inputs, 2);
+        assert.deepStrictEqual(first.map((placed: any) => [placed.id, placed.blocked]),
+            [['ambient-b', true], ['notice', false], ['ambient-a', false]]);
+        assert.ok(first.every((placed: any) => placed.opacity === 0));
+        assert.deepStrictEqual(layout([...inputs].reverse(), 2).filter((placed: any) => !placed.blocked).map((placed: any) => placed.id).sort(),
+            ['ambient-a', 'notice']);
+        assert.ok(layout(inputs, 0).every((placed: any) => placed.blocked && placed.opacity === 0 && placed.leaders.length === 0));
+        const [readmitted] = layout([inputs[0]], 1);
+        assert.strictEqual(readmitted.blocked, false, 'an omitted or budget-hidden name is immediately eligible on a later static paint');
+    });
+
+    it('spends the visibility budget only on labels that fit', () => {
+        const solver = new api.LabelPlacementSolver();
+        const placed = solver.layout({ now: 0, bounds, maxVisible: 1, labels: [
+            label('notice', { priority: 2, width: 500, height: 500, candidates: [candidate(200, 200)] }),
+            label('fitting', { candidates: [candidate(100, 100)] }),
+            label('later', { candidates: [candidate(300, 300)] }),
+        ] });
+        assert.deepStrictEqual(placed.map((value: any) => value.blocked), [true, false, true]);
+    });
+
     it('forgets omitted IDs and resets both placement history and the caller clock', () => {
         const solver = new api.LabelPlacementSolver();
         const forced = label('a', { candidates: [candidate(100, 50, 3000), candidate(100, 150)] });
@@ -238,6 +267,7 @@ describe('measured robot caption placement', function () {
             { labels: [label('a', { candidates: manyCandidates })] }, { labels: [label('a', { leaderAnchors: manyLeaders })] },
             { labels: [label('a', { height: Number.NaN })] }, { labels: [label('a', { height: 0 })] },
             { labels: [input, input] }, { labels: [label('a', { candidates: [] })] },
+            ...[-1, 0.5, NaN, Infinity, limits.labels + 1].map(maxVisible => ({ labels: [input], maxVisible })),
         ]) {
             assert.throws(() => solver.layout({ now: 1000, bounds, ...bad }), /label placement|Label placement/);
         }

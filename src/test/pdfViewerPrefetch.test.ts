@@ -162,6 +162,8 @@ class DocumentRobots {
     cancelColumnMotion() { this.columnCancels++; }
     revealedArrivals = 0;
     revealArrivals() { this.revealedArrivals++; }
+    readonly restoredArrivals: Array<{ pageNumber: number; pageElement: Element }> = [];
+    restoreArrivals(pageNumber: number, pageElement: Element) { this.restoredArrivals.push({ pageNumber, pageElement }); }
     dispose() { this.disposeCalls++; this.enabled = false; this.blocked = false; this.active.clear(); }
 }
 
@@ -1875,6 +1877,44 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.ok(visible.div.children.some(canvas => canvas.className === 'pdfPrefetchPreview'), 'visible preview survives LRU eviction');
     });
 
+    for (const [width, height] of [[800, 1000], [1000, 800]]) {
+        it(`reuses a full-quality sidecar across native rounding and zoom for ${width}x${height} geometry`, async () => {
+            const h = previewFixture({ width, height, startPage: 99, pages: 100, autoPages: false }), f = h.f;
+            f.pages[98].reset();
+            const loader = h.bind(); await f.frame();
+            const scale = 768 / Math.max(width, height);
+            const sidecar = h.publish(loader, 99, Math.round(width * scale), Math.round(height * scale));
+            assert.strictEqual(sidecar.accepted, true, 'the exact document/page geometry admits the sidecar');
+            const allocations = f.canvases.length;
+            f.finishNative(99);
+            assert.strictEqual(f.canvases.length, allocations, 'native completion must not copy for rounding alone');
+            assert.ok(sidecar.canvas.width > 0, 'the retained full-quality preview keeps its bitmap');
+            const native = f.pages[98].canvas!;
+            native.width = width * 3; native.height = height * 3;
+            f.eventBus.emit('pagerendered', { pageNumber: 99, error: null, cssTransform: false });
+            for (let step = 0; step < 3; step++) {
+                f.eventBus.emit('updateviewarea');
+                await f.frame();
+            }
+            assert.strictEqual(f.canvases.length, allocations, 'a larger native canvas and refreshes reuse the same preview tier');
+            assert.ok(sidecar.canvas.width > 0);
+        });
+    }
+
+    it('still upgrades a sidecar below the requested longest-edge quality', async () => {
+        const h = previewFixture({ startPage: 99, pages: 100, autoPages: false }), f = h.f;
+        f.pages[98].reset();
+        const loader = h.bind(); await f.frame();
+        const sidecar = h.publish(loader, 99, 614, 767);
+        assert.strictEqual(sidecar.accepted, true);
+        const allocations = f.canvases.length;
+        f.finishNative(99);
+        assert.strictEqual(f.canvases.length, allocations + 1, 'axis tolerance must not lower the requested quality tier');
+        assert.strictEqual(Math.max(f.canvases.at(-1)!.width, f.canvases.at(-1)!.height), 768);
+        assert.strictEqual(f.canvases.at(-1)!.copies, 1);
+        assert.strictEqual(sidecar.canvas.width, 0, 'the lower-quality bitmap is released after replacement');
+    });
+
     it('upgrades a small mobile trail raster from a finished native canvas without decoding again', async () => {
         const f = fixture({ mobile: true, startPage: 1, pages: 80 });
         await f.frame();
@@ -2489,6 +2529,32 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         await f.frame();
         assert.strictEqual(raster.parentNode, f.pages[20].div, 'the saved raster is shown while the page returns');
         assert.strictEqual(f.pdf.renders.filter(render => render.id === 21).length, 2, 'the retained raster does not suppress warming the cleaned resources');
+    });
+
+    it('restores authorized robot covers synchronously before the reset page preview reappears', async () => {
+        const robots = new DocumentRobots();
+        const h = previewFixture({ startPage: 99, pages: 100, autoPages: false }, robots), f = h.f;
+        const view = f.pages[98]; view.reset();
+        const loader = h.bind(); await f.frame();
+        const preview = h.publish(loader, 99);
+        assert.strictEqual(preview.canvas.parentNode, view.div);
+        view.setPdfPage(f.pdf.page(99)); view.renderingState = 1;
+        assert.strictEqual(preview.canvas.parentNode, null);
+        const workCalls = robots.workCalls.length;
+        const record = robots.restoreArrivals.bind(robots);
+        robots.restoreArrivals = (pageNumber, pageElement) => {
+            assert.strictEqual(preview.canvas.parentNode, null, 'restore the cover before attaching visible pixels');
+            assert.strictEqual(robots.workCalls.length, workCalls, 'restore before work refresh can retire a detached cover');
+            record(pageNumber, pageElement);
+        };
+        f.eventBus.emit('pagerender', { pageNumber: 99 });
+        assert.deepStrictEqual(robots.restoredArrivals, [{ pageNumber: 99, pageElement: view.div }]);
+        assert.strictEqual(preview.canvas.parentNode, view.div);
+        f.eventBus.emit('pagerender', { pageNumber: 99, isDetailView: true });
+        f.viewer.pdfDocument = {};
+        f.eventBus.emit('pagerender', { pageNumber: 99 });
+        assert.strictEqual(robots.restoredArrivals.length, 1, 'detail and stale-document events cannot restore a cover');
+        f.viewer.pdfDocument = f.pdf;
     });
 
     it('reattaches a saved preview after native setPdfPage clears the page div', async () => {

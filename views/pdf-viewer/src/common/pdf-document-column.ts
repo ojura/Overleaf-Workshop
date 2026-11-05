@@ -109,6 +109,7 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
     let panel: PdfDocumentColumnPanel | undefined;
     let offsetX = 0, serial = 0;
     let previousViewport: PdfDocumentColumnRect | undefined, previousBounds: PdfDocumentColumnRect | undefined;
+    let widePages: readonly HTMLElement[] | undefined;
     let transition: Readonly<PdfDocumentColumnTransition> | undefined;
     let frame: { id: number } | undefined;
     let disposed = false;
@@ -198,31 +199,44 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
         });
     }
 
-    function measure(animate = false): void {
+    function measure(animate = false, layoutChanged = true): void {
         if (disposed) { return; }
+        if (layoutChanged) { widePages = undefined; }
+        if ((!panel?.visible || panel.dock === 'float') && offsetX === 0 && !transition
+            && !savedOffset && !styled.size && !observed.size) { return; }
         const pages = [...new Set(options.pages())].filter(page => page.isConnected !== false);
+        if (offsetX === 0 && !transition && !savedOffset && widePages?.length === pages.length
+            && pages.every((page, index) => page === widePages![index])) { return; }
+        widePages = undefined;
         const next = roots(pages);
         observe(pages);
         // New visible pages receive the currently applied value before measurement.
         // Otherwise subtracting offsetX would feed an unshifted page back into policy.
         if (savedOffset) { styleRoots(next); }
         const view = viewport();
-        const plan = planPdfDocumentColumn(view, pages.map(page => {
+        const pageRects = pages.map(page => {
             const box = page.getBoundingClientRect();
             return { x: box.left, y: box.top, width: box.width, height: box.height };
-        }), panel, offsetX);
+        });
+        const plan = planPdfDocumentColumn(view, pageRects, panel, offsetX);
+        // Scrolling cannot expose a usable side margin when every current page is
+        // viewport-wide. Page, size, viewport and explicit layout changes remeasure.
+        const wide = observer && view.width > 0 && pageRects.length > 0
+            && pageRects.every(page => page.width >= view.width);
         const changed = !sameRect(previousViewport, view) || !sameRect(previousBounds, plan.bounds);
         previousViewport = view; previousBounds = plan.bounds;
         if (transition && same(transition.toX, plan.offsetX) && !changed) { return; }
         if (!transition && same(plan.offsetX, offsetX)) {
-            if (!plan.offsetX) { apply(0); restoreStyles(); }
+            if (!plan.offsetX) { apply(0); restoreStyles(); if (wide) { widePages = pages; } }
             return;
         }
         end();
         if (disposed) { return; }
         if (plan.offsetX || offsetX) { styleRoots(next); }
         if (!animate || media.matches || doc.hidden || plan.offsetX === offsetX) {
-            apply(plan.offsetX); end(); return;
+            apply(plan.offsetX); end();
+            if (!disposed && offsetX === 0 && wide) { widePages = pages; }
+            return;
         }
         transition = Object.freeze({ id: ++serial, fromX: offsetX, toX: plan.offsetX,
             startedAt: now(), durationMs: PDF_DOCUMENT_COLUMN_POLICY.durationMs,
@@ -232,13 +246,15 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
         schedule();
     }
 
-    function update(): void { measure(); }
+    /** Routine reader plans can retain the proven zero margin; layout callers invalidate it. */
+    function update(layoutChanged = true): void { measure(false, layoutChanged); }
+    function geometryChanged(): void { update(); }
     function finish(): void { if (transition) { apply(transition.toX); end(); } }
     function visibility(): void { if (doc.hidden) { finish(); } else { update(); } }
     function motionChanged(): void { if (media.matches) { finish(); } }
-    win.addEventListener('resize', update);
-    win.visualViewport?.addEventListener('resize', update);
-    win.visualViewport?.addEventListener('scroll', update);
+    win.addEventListener('resize', geometryChanged);
+    win.visualViewport?.addEventListener('resize', geometryChanged);
+    win.visualViewport?.addEventListener('scroll', geometryChanged);
     doc.addEventListener('visibilitychange', visibility);
     media.addEventListener('change', motionChanged);
 
@@ -268,11 +284,11 @@ export function installPdfDocumentColumn(container: HTMLElement, options: Option
         dispose(): void {
             if (disposed) { return; }
             disposed = true;
-            apply(0); end(); restoreStyles(); registered.clear();
+            apply(0); end(); restoreStyles(); registered.clear(); widePages = undefined;
             observer?.disconnect(); observed.clear();
-            win.removeEventListener('resize', update);
-            win.visualViewport?.removeEventListener('resize', update);
-            win.visualViewport?.removeEventListener('scroll', update);
+            win.removeEventListener('resize', geometryChanged);
+            win.visualViewport?.removeEventListener('resize', geometryChanged);
+            win.visualViewport?.removeEventListener('scroll', geometryChanged);
             doc.removeEventListener('visibilitychange', visibility);
             media.removeEventListener('change', motionChanged);
         },

@@ -59,6 +59,27 @@ describe('ground cargo routes and cooperative airlifts', function () {
         assert.deepStrictEqual(routes.computeCargoRoute({ ...options, progress: 1 }).ground, options.to);
     });
 
+    it('preserves authored gentle climbs and descents while bounding steep side-entry heights', () => {
+        const anchor = Object.freeze({ x: 200, y: 300 });
+        for (const direction of [-1, 1]) {
+            for (const vertical of [-1, 1]) {
+                const shallow = Object.freeze({ x: anchor.x + direction * 100, y: anchor.y + vertical * 20 });
+                const retained = routes.clampGroundRoutePoint(anchor, shallow);
+                assert.deepStrictEqual(retained, shallow);
+                assert.notStrictEqual(retained, shallow);
+                const clipped = routes.clampGroundRoutePoint(anchor, { x: shallow.x, y: anchor.y + vertical * 90 });
+                assert.deepStrictEqual(clipped, { x: shallow.x, y: anchor.y + vertical * 25 });
+                assert.strictEqual(routes.needsCargoAirlift(anchor, clipped), false);
+            }
+        }
+        assert.deepStrictEqual(routes.clampGroundRoutePoint(anchor, { x: 200, y: 500 }), anchor);
+        assert.deepStrictEqual(routes.clampGroundRoutePoint(anchor, { x: 300, y: 500 }, 0.1), { x: 300, y: 310 });
+        for (const requested of [{ x: NaN, y: 0 }, { x: 0, y: Infinity }]) {
+            assert.throws(() => routes.clampGroundRoutePoint(anchor, requested), RangeError);
+        }
+        assert.throws(() => routes.clampGroundRoutePoint(anchor, anchor, -1), RangeError);
+    });
+
     it('stops and recruits, rendezvouses, carries the robot, sets it down and finishes by driving', () => {
         const options = input(), phases: string[] = [];
         for (let index = 0; index <= 1000; index++) {

@@ -654,11 +654,15 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         if (view?.renderingState !== FINISHED) { return; }
         if (view.pdfPage) { markWarm(id, view.pdfPage); }
         if (declinedPreviews.has(id) || !source?.width || !source?.height) { return; }
-        const ratio = Math.min(1, limits.previewMaxDimension / Math.max(source.width, source.height));
+        const dimension = Math.min(limits.previewMaxDimension, Math.max(source.width, source.height));
+        const ratio = dimension / Math.max(source.width, source.height);
         const width = Math.max(1, Math.ceil(source.width * ratio));
         const height = Math.max(1, Math.ceil(source.height * ratio));
         const previous = previews.get(id)?.canvas;
-        if (previous && (previous.width >= width && previous.height >= height
+        // Same-page sidecars round their scaled axes; native snapshots ceil them. Keep
+        // the requested longest-edge quality without copying again for that one pixel.
+        if (previous && (Math.max(previous.width, previous.height) >= dimension
+            && previous.width + 1 >= width && previous.height + 1 >= height
             || !nativeTarget(id) && !visible.includes(id))) { return; }
         let canvas: HTMLCanvasElement | undefined;
         try {
@@ -803,7 +807,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         const nextSignature = visible.join(',');
         if (signature !== nextSignature) { declinedPreviews.clear(); }
         signature = nextSignature;
-        documentColumn?.update();
+        documentColumn?.update(layoutPending);
         updateRobotPages();
         if (!visible.length) { return; }
         const box = container.getBoundingClientRect();
@@ -1152,6 +1156,9 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         renderStarts.set(pageNumber, renderTimings.start(() => !disposed && !hidden()
             && !!doc && doc === document && doc === viewer.pdfDocument && view === pageView(pageNumber)
             && [RUNNING, PAUSED].includes(view?.renderingState)));
+        if (doc && doc === viewer.pdfDocument && view?.div) {
+            documentRobots?.restoreArrivals(pageNumber, view.div);
+        }
         updateRobotPages();
         maintainRangeChecks();
         // setPdfPage/reset removed our earlier child; restore it before the first native paint.

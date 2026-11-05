@@ -1,5 +1,5 @@
 import type { RobotExpression } from './robot-encounters';
-import { robotScreenMetrics, robotCaptionMetrics, ROBOT_CAPTION_STYLE } from './robot-screen-scale';
+import { robotScreenMetrics, robotCaptionMetrics, ROBOT_LAB_CAPTION_STYLE } from './robot-screen-scale';
 import { paintEkokomvoz } from './robot-ekokomvoz-artwork';
 import { LabelPlacementSolver } from './label-placement';
 import { ROBOT_RESCUE_POLICY } from './robot-rescue';
@@ -1387,27 +1387,28 @@ class RobotStagePainter {
             displayScale: geometry.fit });
         const geometryKey = [geometry.width, geometry.height, geometry.bodyScale, metrics.localFontSize, metrics.localLineHeight].join(',');
         if (this.labelGeometry !== geometryKey) { this.labelGeometry = geometryKey; this.labels.reset(); }
-        ctx.font = ROBOT_CAPTION_STYLE.fontWeight + ' ' + metrics.localFontSize + 'px system-ui, sans-serif';
+        ctx.font = ROBOT_LAB_CAPTION_STYLE.fontWeight + ' ' + metrics.localFontSize + 'px system-ui, sans-serif';
         const text = new Map(actors.map(actor => [String(actor.id), [vehicleOf(actor).name, ...(actor.notice ? [actor.notice] : [])]]));
-        const placed = this.labels.layout({ now: at, bounds: { x: 4, y: 4, width: ROBOT_LIMITS.width - 8, height: ROBOT_LIMITS.height - 8 },
+        const placed = this.labels.layout({ now: at, maxVisible: 3,
+            bounds: { x: 4, y: 4, width: ROBOT_LIMITS.width - 8, height: ROBOT_LIMITS.height - 8 },
             labels: actors.map(actor => {
                 const lines = text.get(String(actor.id))!;
                 const width = Math.max(...lines.map(value => ctx.measureText(value)?.width ?? value.length * metrics.localFontSize * 0.58));
                 return { id: String(actor.id), anchor: { x: actor.x, y: actor.y - 24 * geometry.bodyScale },
                     width: Math.min(ROBOT_LIMITS.width - 12, width + metrics.localPaddingX * 2),
                     height: lines.length * metrics.localLineHeight + metrics.localPaddingY * 2,
-                    radius: 8 * geometry.bodyScale, priority: actor.notice ? 2 : 1 };
+                    radius: 8 * geometry.bodyScale, priority: actor.notice ? 3 : actor.carrying || actor.job === 'delivery' ? 2 : 1 };
             }), obstacles: actors.map(actor => ({ x: actor.x - 25 * geometry.bodyScale, y: actor.y - 20 * geometry.bodyScale,
                 width: 50 * geometry.bodyScale, height: 40 * geometry.bodyScale })),
         });
         for (const placement of placed) {
             if (placement.blocked) { continue; }
-            for (const leader of placement.leaders) { line(ctx, [[leader.from.x, leader.from.y], [leader.to.x, leader.to.y]], ROBOT_CAPTION_STYLE.borderColor, 1); }
+            for (const leader of placement.leaders) { line(ctx, [[leader.from.x, leader.from.y], [leader.to.x, leader.to.y]], ROBOT_LAB_CAPTION_STYLE.borderColor, 1); }
             rounded(ctx, placement.x, placement.y, placement.width, placement.height, 5,
-                ROBOT_CAPTION_STYLE.background, ROBOT_CAPTION_STYLE.borderColor);
+                ROBOT_LAB_CAPTION_STYLE.background, ROBOT_LAB_CAPTION_STYLE.borderColor);
             text.get(placement.id)!.forEach((value, index) => label(ctx, value, placement.x + placement.width / 2,
                 placement.y + metrics.localPaddingY + metrics.localFontSize + index * metrics.localLineHeight,
-                ROBOT_CAPTION_STYLE.color, metrics.localFontSize));
+                ROBOT_LAB_CAPTION_STYLE.color, metrics.localFontSize));
         }
     }
 
@@ -1627,9 +1628,9 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
         const metrics = robotCaptionMetrics({ devicePixelRatio: win.devicePixelRatio });
         Object.assign(caption.style, { padding: metrics.paddingY + 'px ' + metrics.paddingX + 'px',
             fontSize: metrics.fontSize + 'px', lineHeight: metrics.lineHeight + 'px',
-            fontWeight: String(ROBOT_CAPTION_STYLE.fontWeight), color: ROBOT_CAPTION_STYLE.color,
-            background: ROBOT_CAPTION_STYLE.background, border: '1px solid ' + ROBOT_CAPTION_STYLE.borderColor,
-            borderRadius: '8px', whiteSpace: 'normal', overflowWrap: 'anywhere', opacity: '1' });
+            fontWeight: '400', color: ROBOT_LAB_CAPTION_STYLE.color,
+            background: ROBOT_LAB_CAPTION_STYLE.background, border: '0',
+            borderRadius: '3px', whiteSpace: 'normal', overflowWrap: 'anywhere', opacity: '1' });
         if (caption.textContent !== latest.caption) { caption.textContent = latest.caption; }
         const working = latest.actors.filter(actor => actor.job === 'delivery').length;
         const text = latest.mode === 'quiet'

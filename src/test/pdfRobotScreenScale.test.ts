@@ -81,17 +81,16 @@ describe('Robot screen scale and readable captions', function () {
         assert.strictEqual(input.width, Number.MAX_VALUE);
     });
 
-    it('keeps a sixteen-pixel CSS caption floor when sprite compensation shrinks artwork', () => {
+    it('keeps compact twelve-pixel CSS captions independent of sprite density compensation', () => {
         const one = api.robotCaptionMetrics({ devicePixelRatio: 1 });
-        assert.strictEqual(one.fontSize, 18);
-        assert.strictEqual(one.lineHeight, 25);
-        for (const devicePixelRatio of [1.25, 1.5, 2, 3, 4, 100]) {
+        assert.strictEqual(one.fontSize, 12);
+        assert.strictEqual(one.lineHeight, 16);
+        assert.strictEqual(one.paddingX, 6);
+        assert.strictEqual(one.paddingY, 3);
+        for (const devicePixelRatio of [0.5, 1.2, 1.25, 1.5, 2, 3, 4, 100]) {
             const value = api.robotCaptionMetrics({ devicePixelRatio });
-            assert.ok(value.fontSize >= 16 && value.fontSize <= 18);
-            assert.ok(value.lineHeight >= value.fontSize * 1.35);
+            assert.deepStrictEqual(value, one);
         }
-        assert.strictEqual(api.robotCaptionMetrics({ devicePixelRatio: 4 }).fontSize, 16);
-        assert.ok(api.robotCaptionMetrics({ devicePixelRatio: 0.5 }).fontSize > 18);
     });
 
     it('preserves readable canvas text and padding after canvas fit and artwork transforms', () => {
@@ -100,9 +99,9 @@ describe('Robot screen scale and readable captions', function () {
                 const value = api.robotCaptionMetrics({ devicePixelRatio, displayScale });
                 near(value.localFontSize * displayScale, value.fontSize);
                 near(value.localLineHeight * displayScale, value.lineHeight);
-                near(value.localPaddingX * displayScale, 10);
-                near(value.localPaddingY * displayScale, 8);
-                assert.ok(value.localFontSize * displayScale >= 16 - 1e-12);
+                near(value.localPaddingX * displayScale, 6);
+                near(value.localPaddingY * displayScale, 3);
+                near(value.localFontSize * displayScale, 12);
             }
         }
     });
@@ -128,7 +127,7 @@ describe('Robot screen scale and readable captions', function () {
         assert.ok(Object.values(large).every(value => typeof value === 'number' && Number.isFinite(value) && value > 0));
     });
 
-    it('provides an opaque high-contrast palette for both DOM and canvas captions', () => {
+    it('provides opaque neutral palettes for light documents and the dark lab', () => {
         const style = api.ROBOT_CAPTION_STYLE;
         function luminance(hex: string): number {
             assert.match(hex, /^#[0-9a-f]{6}$/i);
@@ -140,5 +139,10 @@ describe('Robot screen scale and readable captions', function () {
         assert.ok((luminance(style.background) + 0.05) / (luminance(style.borderColor) + 0.05) > 4.5);
         assert.strictEqual(style.fontWeight, 600);
         assert.ok(Object.isFrozen(style));
+        const lab = api.ROBOT_LAB_CAPTION_STYLE;
+        assert.ok((luminance(lab.color) + 0.05) / (luminance(lab.background) + 0.05) > 12);
+        assert.deepStrictEqual(lab, { background: '#101c2b', color: '#e8f0fa', borderColor: '#43566b', fontWeight: 600 });
+        assert.strictEqual(style.background, '#f5f7fa');
+        assert.ok(Object.isFrozen(lab));
     });
 });

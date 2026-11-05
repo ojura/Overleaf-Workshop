@@ -15,6 +15,7 @@ export interface RobotScreenMetrics {
 }
 
 export interface RobotCaptionInput {
+    /** Accepted with screen inputs; caption CSS sizes stay constant across density. */
     devicePixelRatio?: number;
     /** CSS pixels per drawing unit, including canvas fitting and local artwork transforms. */
     displayScale?: number;
@@ -36,9 +37,17 @@ export interface RobotCaptionMetrics {
 }
 
 export const ROBOT_CAPTION_STYLE = Object.freeze({
-    background: '#fffdf5',
+    background: '#f5f7fa',
     color: '#17212b',
     borderColor: '#405466',
+    fontWeight: 600,
+});
+
+/** The Motion Lab is an explicitly dark surface, independent of PDF page recoloring. */
+export const ROBOT_LAB_CAPTION_STYLE = Object.freeze({
+    background: '#101c2b',
+    color: '#e8f0fa',
+    borderColor: '#43566b',
     fontWeight: 600,
 });
 
@@ -59,13 +68,12 @@ export function robotScreenMetrics(input: RobotScreenInput): RobotScreenMetrics 
 }
 
 /**
- * An 18 CSS px target follows the sprite compensation down to a readable 16 CSS px floor.
+ * Compact captions keep a 12 CSS px size independently of sprite compensation.
  * Pass the complete CSS-pixels-per-drawing-unit transform for canvas text. Do not include
  * the canvas backing DPR: it changes raster density, not the displayed text dimensions.
  */
 export function robotCaptionMetrics(input: RobotCaptionInput = {}): RobotCaptionMetrics {
-    const fontSize = Math.max(16, 18 / Math.sqrt(normalizedDpr(input.devicePixelRatio)));
-    const lineHeight = Math.ceil(fontSize * 1.35), paddingX = 10, paddingY = 8;
+    const fontSize = 12, lineHeight = 16, paddingX = 6, paddingY = 3;
     const requested = input.displayScale ?? 1;
     const displayScale = Number.isFinite(requested) && requested > 0 && Number.isFinite(lineHeight / requested) ? requested : 1;
     return {

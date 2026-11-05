@@ -65,6 +65,14 @@ export function needsCargoAirlift(from: CargoRoutePoint, to: CargoRoutePoint, ma
     return height > width * maxSlope;
 }
 
+/** Keep an authored side-entry or exit height where a ground vehicle can drive to it. */
+export function clampGroundRoutePoint(anchor: CargoRoutePoint, requested: CargoRoutePoint,
+    maxSlope = GROUND_ROUTE_MAX_SLOPE): CargoRoutePoint {
+    if (!needsCargoAirlift(anchor, requested, maxSlope)) { return copy(requested); }
+    const climb = Math.abs(requested.x - anchor.x) * maxSlope;
+    return { x: requested.x, y: anchor.y + Math.sign(requested.y - anchor.y) * climb };
+}
+
 /**
  * Ground approaches and departures remain shallow. A steep leg starts with a stop and
  * rendezvous, then the aircraft carries the ground body through lift, crossing and landing.
