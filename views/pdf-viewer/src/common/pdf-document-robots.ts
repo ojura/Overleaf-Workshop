@@ -1048,10 +1048,15 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const raster = displayed ?? createPdfRasterProjection(Math.max(1, Math.ceil(page.content.width * dpr)),
             Math.max(1, Math.ceil(page.content.height * dpr)), page.content.width * dpr, page.content.height * dpr);
         const sampled = projectPdfRasterCrop(raster, payload.crop)?.sampled;
-        const mask = sampled && clipPdfPageRect(page, projectPdfPageRect(page, sampled));
+        const bounds = sampled && projectPdfPageRect(page, sampled);
+        const density = Number.isFinite(win.devicePixelRatio) && win.devicePixelRatio > 0 ? win.devicePixelRatio : 1;
+        const viewportScale = win.visualViewport?.scale ?? 1;
+        const guard = 1 / (density * (Number.isFinite(viewportScale) && viewportScale > 0 ? viewportScale : 1));
+        // A fractional CSS edge can leave one composited display pixel visible beyond the sampled raster footprint.
+        // Cover that pixel at the current pinch scale, without changing cargo sampling or the logical photo target.
+        const mask = bounds && clipPdfPageRect(page, { x: bounds.x - guard, y: bounds.y - guard,
+            width: bounds.width + guard * 2, height: bounds.height + guard * 2 });
         if (!mask) { releasePayload(payload); return; }
-        // Round coverage on the displayed raster grid, separately from the cargo source tier and page border box.
-        // This includes touched edge pixels without obscuring a neighbouring caption or page.
         for (const [property, value] of [['left', mask.x], ['top', mask.y], ['width', mask.width], ['height', mask.height]] as const) {
             const css = value + 'px';
             if (cover.style[property] !== css) { cover.style[property] = css; }
