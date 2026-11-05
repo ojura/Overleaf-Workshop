@@ -3,11 +3,13 @@ import { pdfCachePolicy } from './scroll-prefetch';
 import { RobotEncounters, ROBOT_INTERACTION_REACTIONS, type RobotEncounterActor, type RobotEncounterReaction } from './robot-encounters';
 import { LabelPlacementSolver, LABEL_PLACEMENT_LIMITS, type LabelPlacement, type LabelPlacementInput, type PlacementRect } from './label-placement';
 import { ASAP_CLEANER_ARTWORK_SIZE, paintAsapCleaner } from './robot-cleaner-artwork';
-import { computeCargoRoute, needsCargoAirlift, clampGroundRoutePoint, GROUND_ROUTE_MAX_SLOPE, CARGO_ROUTE_POLICY, type CargoRouteState } from './robot-cargo-routes';
+import { computeCargoRoute, needsCargoAirlift, cargoAirliftReason, groundRouteDirection, clampGroundRoutePoint,
+    CARGO_ROUTE_POLICY, type CargoRouteState, type CargoAirliftReason, type GroundRouteDirection } from './robot-cargo-routes';
 import type { PdfDocumentColumnTransition } from './pdf-document-column';
 import { MOTION_LAB_CHOREOGRAPHY, motionLabColumnElapsed, motionLabEase } from './motion-lab-choreography';
 import { canCarryRobot } from './robot-rescue';
 import { robotScreenMetrics, robotCaptionMetrics, ROBOT_CAPTION_STYLE } from './robot-screen-scale';
+import { robotDocumentMetrics, selectRobotImageCrops, type RobotDocumentSize, type RobotImageCrop } from './robot-document-policy';
 import { RobotTraffic } from './robot-traffic';
 import { installRobotInteraction, type RobotInteractionPoint } from './robot-interaction';
 import { createPdfRasterProjection, resizePdfRasterProjection, projectPdfRasterCrop, pdfRasterCropSize, pdfRasterToCrop,
@@ -25,9 +27,10 @@ export const DOCUMENT_ROBOT_LIMITS = Object.freeze({
     maxDurationMs: 2900,
     trafficSettleMs: 180,
     spriteScale: 0.64,
+    maxDpr: 3,
     advance: Object.freeze({ arrivalMs: 900, coordinationMs: 550, returnMs: 650, desktopCrew: 2, mobileCrew: 1 }),
     replacement: Object.freeze({ durationMs: 2100, pickupEnd: 0.22, lowerEnd: 0.38, fragmentsPerDesktopPage: 3 }),
-    cleaner: Object.freeze({ durationMs: 600, minDurationMs: 260, gestureSteps: 12 }),
+    cleaner: Object.freeze({ durationMs: 600, minDurationMs: 260, gestureSteps: 12, desktopScale: 0.85, compactScale: 0.55 }),
     cooperative: Object.freeze({ rasterScale: 1.5, cropScale: 1.8, durationScale: 1.25 }),
     forklift: Object.freeze({ approachEnd: 0.16, liftStart: 0.44, baseInset: 14 }),
     desktop: Object.freeze({
@@ -42,7 +45,6 @@ export const DOCUMENT_ROBOT_LIMITS = Object.freeze({
         spriteScale: 1.92,
         minSpriteScale: 1.4,
         scaleWidth: 560,
-        maxDpr: 3,
     }),
 });
 
@@ -58,6 +60,8 @@ interface Options {
     onCapacityAvailable?: () => void;
     onReplacementComplete?: (identity: string) => void;
     documentOffset?: () => number;
+    /** Numeric content extent of the current page; the controller supplies it without a new layout read. */
+    documentSize?: () => RobotDocumentSize | undefined;
     registerDocumentLayer?: (layer: HTMLElement) => () => void;
     encounterRandom?: () => number;
     createTraffic?: () => Pick<RobotTraffic, 'update' | 'reset'>;
@@ -97,7 +101,8 @@ export interface DocumentRobotDelivery {
 }
 
 type Point = { x: number; y: number };
-type Crop = { x: number; y: number; width: number; height: number; score: number; imageId?: string };
+type Crop = { x: number; y: number; width: number; height: number; score: number; imageId?: string;
+    imageIds?: readonly string[]; kind?: RobotImageCrop['kind'] };
 interface Geometry {
     width: number;
     height: number;
@@ -126,6 +131,7 @@ interface Payload {
     mast?: HTMLDivElement;
     sling?: HTMLDivElement;
     cover?: HTMLDivElement;
+    landingShadow?: HTMLDivElement;
     underlay?: { canvas: HTMLCanvasElement; bytes: number };
     bytes: number;
     helpers: Courier[];
@@ -137,6 +143,9 @@ interface Payload {
     refinementAttempt?: string;
     cleanerShown?: boolean;
     routeState?: CargoRouteState;
+    airliftReason?: CargoAirliftReason;
+    returnPlanned?: boolean;
+    returnCarry?: GroundCarry;
     motion?: Point;
     visibility?: number;
 }
@@ -165,18 +174,31 @@ interface RobotBody {
     origin?: RobotDispatchPoint;
     launch?: RobotDispatchPoint;
     reactionCarried?: boolean;
+    /** Direction of the last committed self-driven leg, independent of gaze and comic motion. */
+    drivingDirection?: GroundRouteDirection;
+    carried?: boolean;
 }
 interface Courier extends RobotBody {
     payload: Payload;
     slot: number;
     departure: Point;
-    carried?: boolean;
     routePhase?: string;
+}
+interface GroundCarry {
+    ground: RobotBody;
+    air: RobotBody;
+    from: Point;
+    airFrom: Point;
+    groundScale: number;
+    airScale: number;
+    reason?: CargoAirliftReason;
+    route?: CargoRouteState;
 }
 interface AdvanceActor {
     body: RobotBody;
     start: Point & { scale: number };
     point: Point & { scale: number };
+    formationOffset?: Point;
 }
 interface AdvanceWork {
     key: string;
@@ -188,6 +210,9 @@ interface AdvanceWork {
     started: number;
     gestureAt?: number;
     returnAt?: number;
+    returnPlanned?: boolean;
+    returnCarry?: GroundCarry;
+    sling?: HTMLDivElement;
     admitted: boolean;
     signature: string;
     geometry: string;
@@ -202,6 +227,7 @@ interface Episode {
     layer: HTMLDivElement;
     kind: DocumentRobotDelivery['kind'];
     payloads: Payload[];
+    pageSize: RobotDocumentSize;
     pageProjection?: PdfPageProjection;
     displayRasterProjection?: PdfRasterProjection;
 }
@@ -219,6 +245,7 @@ interface RetiringScene {
 }
 interface ColumnPull {
     motion: Readonly<PdfDocumentColumnTransition>;
+    documentSize: RobotDocumentSize;
     body: RobotBody;
     layer: HTMLDivElement;
     start: Point & { scale: number };
@@ -241,6 +268,9 @@ interface Presentation {
     fragmentDimension: number;
     spriteScale: number;
     spriteDpr: number;
+    documentScale: number;
+    cargoEdge: number;
+    cleanerScale: number;
     minimumWidth: number;
     minimumHeight: number;
 }
@@ -413,6 +443,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 actor.start.x += dx; actor.start.y += dy;
                 actor.point.x += dx; actor.point.y += dy;
             }
+            if (work.returnCarry) { rebaseCarry(work.returnCarry, dx, dy); }
+        }
+        for (const episode of episodes.values()) {
+            for (const payload of episode.payloads) { if (payload.returnCarry) { rebaseCarry(payload.returnCarry, dx, dy); } }
         }
         for (const actor of currentActors()) {
             if (actor === columnPull?.body) { continue; }
@@ -431,6 +465,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const maxActors = desktop ? clamp(Math.round(width * height / policy.pixelsPerActor), policy.minActors, policy.maxActors)
             : DOCUMENT_ROBOT_LIMITS.maxActors;
         const maxCargoBytes = desktop ? policy.maxCargoBytes : DOCUMENT_ROBOT_LIMITS.maxCargoBytes;
+        const document = robotDocumentMetrics(options.documentSize?.() ?? { width: 0, height: 0 }, desktop ? 'desktop' : 'compact');
         return {
             kind: desktop ? 'desktop' : 'compact',
             maxActors: clamp(Math.floor(options.maxActors ?? maxActors), 0, maxActors),
@@ -439,11 +474,22 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             maxFragmentsPerPage: desktop ? policy.maxActors : DOCUMENT_ROBOT_LIMITS.maxFragmentsPerPage,
             fragmentDimension: desktop ? policy.fragmentDimension : DOCUMENT_ROBOT_LIMITS.fragmentDimension,
             spriteScale: (desktop ? clamp(width / policy.scaleWidth, policy.minSpriteScale, policy.spriteScale)
-                : DOCUMENT_ROBOT_LIMITS.spriteScale) * screen.cssScale,
-            spriteDpr: desktop ? clamp(win.devicePixelRatio || 1, 1, policy.maxDpr) : 1,
+                : DOCUMENT_ROBOT_LIMITS.spriteScale) * screen.cssScale * document.bodyScale,
+            spriteDpr: clamp(win.devicePixelRatio || 1, 1, DOCUMENT_ROBOT_LIMITS.maxDpr),
+            documentScale: document.bodyScale,
+            cargoEdge: document.cargoEdge,
+            cleanerScale: (desktop ? DOCUMENT_ROBOT_LIMITS.cleaner.desktopScale : DOCUMENT_ROBOT_LIMITS.cleaner.compactScale)
+                * screen.cssScale * document.bodyScale,
             minimumWidth: desktop ? 160 : 128,
             minimumHeight: desktop ? 120 : 96,
         };
+    }
+
+    function pagePresentation(policy: Presentation, size: RobotDocumentSize): Presentation {
+        const document = robotDocumentMetrics(size, policy.kind);
+        return { ...policy, spriteScale: policy.spriteScale / policy.documentScale * document.bodyScale,
+            cleanerScale: policy.cleanerScale / policy.documentScale * document.bodyScale,
+            documentScale: document.bodyScale, cargoEdge: document.cargoEdge };
     }
 
     function notifyCapacity(): void {
@@ -500,22 +546,12 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
 
     function selectCrops(source: HTMLCanvasElement, area: Geometry, policy: Presentation,
         imageRegions?: readonly DocumentRobotImageRegion[], projection?: PdfRasterProjection): Crop[] {
-        const ids = new Set<string>();
-        const images: Crop[] = [];
-        for (const image of imageRegions ?? []) {
-            if (!image.id || ids.has(image.id) || ![image.x, image.y, image.width, image.height].every(Number.isFinite)
-                || image.width <= 0 || image.height <= 0) { continue; }
-            const x = clamp(image.x, 0, 1), y = clamp(image.y, 0, 1);
-            const width = clamp(image.x + image.width, 0, 1) - x, height = clamp(image.y + image.height, 0, 1) - y;
-            const visibleWidth = Math.min(x + width, area.right) - Math.max(x, area.left);
-            const visibleHeight = Math.min(y + height, area.bottom) - Math.max(y, area.top);
-            if (visibleWidth * area.width < 32 || visibleHeight * area.height < 32) { continue; }
-            ids.add(image.id);
-            images.push({ x, y, width, height, imageId: image.id, score: 1 + visibleWidth * visibleHeight });
-        }
-        if (images.length) { return uniqueCrops(source, images.sort((a, b) => b.score - a.score), projection).slice(0, 12); }
-        const width = Math.min(policy.kind === 'desktop' ? 0.36 : 0.24, policy.minimumWidth / area.width, (area.right - area.left) * 0.75);
-        const height = Math.min(policy.kind === 'desktop' ? 0.24 : 0.16, policy.minimumHeight / area.height, (area.bottom - area.top) * 0.75);
+        const images = selectRobotImageCrops(imageRegions ?? [], area,
+            { x: area.left, y: area.top, width: area.right - area.left, height: area.bottom - area.top },
+            { bodyScale: policy.documentScale, cargoEdge: policy.cargoEdge });
+        if (images.length) { return uniqueCrops(source, images, projection); }
+        const width = Math.min(policy.kind === 'desktop' ? 0.36 : 0.24, policy.minimumWidth * policy.documentScale / area.width, (area.right - area.left) * 0.75);
+        const height = Math.min(policy.kind === 'desktop' ? 0.24 : 0.16, policy.minimumHeight * policy.documentScale / area.height, (area.bottom - area.top) * 0.75);
         const candidates: Crop[] = [];
         for (let row = 0; row < 4; row++) {
             for (let column = 0; column < 3; column++) {
@@ -574,7 +610,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     }
 
     function spriteSize(policy: Presentation, origin?: RobotDispatchPoint) {
-        const scale = policy.kind === 'desktop' ? Math.max(policy.spriteScale, origin?.scale ?? 0) * policy.spriteDpr : 1;
+        const scale = Math.max(policy.spriteScale, origin?.scale ?? 0) * policy.spriteDpr;
         const width = Math.ceil(ROBOT_ARTWORK_SIZE.width * scale), height = Math.ceil(ROBOT_ARTWORK_SIZE.height * scale);
         return { width, height, bytes: width * height * RGBA_BYTES };
     }
@@ -721,7 +757,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (episode.pageProjection) {
             for (const payload of episode.payloads) { paintArrival(payload, episode.pageProjection, episode.displayRasterProjection); }
         }
-        const policy = presentation();
+        const policy = pagePresentation(presentation(), episode.pageProjection?.content ?? episode.pageSize);
         let count = 0;
         for (const payload of episode.payloads) {
             retireUncovered(payload, episode.element);
@@ -815,7 +851,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const remaining = payload.started + payload.delay + payload.duration * RETURN_START - now();
         if (cleaner || payload.cleanerShown || media.matches || remaining < DOCUMENT_ROBOT_LIMITS.cleaner.minDurationMs
             || actorCount() >= policy.maxActors || !payload.canvas?.parentNode) { return; }
-        const backingScale = (policy.kind === 'desktop' ? 0.85 : 0.55) * policy.spriteDpr;
+        const backingScale = policy.cleanerScale * policy.spriteDpr;
         const width = Math.ceil(ASAP_CLEANER_ARTWORK_SIZE.width * backingScale), height = Math.ceil(ASAP_CLEANER_ARTWORK_SIZE.height * backingScale);
         const bytes = width * height * RGBA_BYTES;
         if (spriteBytes + bytes > policy.maxSpriteBytes) { return; }
@@ -844,7 +880,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         try {
             const pose = Math.floor(active.phase * DOCUMENT_ROBOT_LIMITS.cleaner.gestureSteps);
             if (pose !== active.drawn) { active.drawn = pose; drawCleaner(active); }
-            const scale = Math.min(policy.kind === 'desktop' ? 0.85 : 0.55,
+            const scale = Math.min(policy.cleanerScale,
                 width * 0.45 / ASAP_CLEANER_ARTWORK_SIZE.width, height * 0.7 / ASAP_CLEANER_ARTWORK_SIZE.height);
             const bodyWidth = ASAP_CLEANER_ARTWORK_SIZE.width * scale, bodyHeight = ASAP_CLEANER_ARTWORK_SIZE.height * scale;
             const amount = ease(active.phase), x = point.x + (amount - 0.5) * width * active.direction;
@@ -914,13 +950,14 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     }
 
     function makeCourier(payload: Payload, area: Geometry, used: ReadonlySet<RobotVehicle>, policy: Presentation,
-        staged: AdvanceActor[]): Courier | undefined {
+        staged: AdvanceActor[], preferredGround?: RobotVehicle): Courier | undefined {
         const accepts = (vehicle: RobotVehicle) => (payload.ground ? vehicle === 'forklift' : vehicle !== 'forklift')
             && !payload.helpers.some(helper => helper.vehicle === vehicle)
             && (payload.mode !== 'handoff' || ROBOT_VEHICLES.find(spec => spec.id === vehicle)!.air === (payload.helpers.length === 0))
             && (payload.mode !== 'airlift' || (payload.helpers.length === 0
                 ? !ROBOT_VEHICLES.find(spec => spec.id === vehicle)!.air
-                    && ROBOT_VEHICLES.some(spec => spec.air && !used.has(spec.id) && canCarryRobot(spec.id, vehicle))
+                    && (!preferredGround || vehicle === preferredGround)
+                    && (!!preferredGround || ROBOT_VEHICLES.some(spec => spec.air && !used.has(spec.id) && canCarryRobot(spec.id, vehicle)))
                 : ROBOT_VEHICLES.find(spec => spec.id === vehicle)!.air && canCarryRobot(vehicle, payload.helpers[0].vehicle)));
         const acceptsOrigin = (vehicle: RobotVehicle, origin?: RobotDispatchPoint) => {
             if (!origin || payload.mode === 'airlift' || ROBOT_VEHICLES.find(spec => spec.id === vehicle)!.air) { return true; }
@@ -945,9 +982,13 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const body = waiting?.body ?? makeBody(new Set([...used, ...staged.map(actor => actor.body.vehicle)]), policy,
             vehicle => accepts(vehicle) && (payload.mode !== 'airlift' || payload.helpers.length > 0 || vehicle === 'lugv'), acceptsOrigin);
         if (!body) { return; }
+        return promoteCourier(body, payload, area, waiting?.point);
+    }
+
+    function promoteCourier(body: RobotBody, payload: Payload, area: Geometry, launch?: RobotDispatchPoint): Courier | undefined {
         try {
             encounters.forget(body.id); detachActorCaption(body.id);
-            if (waiting) { body.launch = { ...waiting.point }; }
+            if (launch) { body.launch = { ...launch }; }
             const target = { x: payload.crop.x + payload.crop.width / 2, y: payload.crop.y + payload.crop.height / 2 };
             const actor: Courier = Object.assign(body, { payload, slot: payload.helpers.length,
                 departure: edge((payload.route + 1 + Math.floor(random.next() * 2)) % 4, area, target) });
@@ -958,6 +999,50 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             drawVehicle(actor);
             return actor;
         } catch { releaseActor(body); return; }
+    }
+
+    function commitGroundDrive(body: RobotBody, from: Point, to: Point): void {
+        if (ROBOT_VEHICLES.find(spec => spec.id === body.vehicle)!.air) { return; }
+        body.drivingDirection = groundRouteDirection(from, to) ?? body.drivingDirection;
+    }
+
+    function rebaseCarry(carry: GroundCarry, dx: number, dy: number): void {
+        carry.from.x += dx; carry.from.y += dy;
+        carry.airFrom.x += dx; carry.airFrom.y += dy;
+    }
+
+    /** The caller adopts a new/staged body immediately. Existing payload helpers are never borrowed. */
+    function recruitAircraft(ground: RobotBody, owned: readonly { body: RobotBody; point: Point }[], policy: Presentation,
+        allowNew: boolean): { body: RobotBody; point?: Point & { scale?: number }; adopted: boolean } | undefined {
+        const accepts = (vehicle: RobotVehicle) => ROBOT_VEHICLES.find(spec => spec.id === vehicle)!.air && canCarryRobot(vehicle, ground.vehicle);
+        const existing = owned.find(value => accepts(value.body.vehicle));
+        if (existing) { return { ...existing, adopted: false }; }
+        if (!allowNew) { return; }
+        for (const work of advance.values()) {
+            if (work.phase === 'returning') { continue; }
+            const index = work.actors.findIndex(actor => accepts(actor.body.vehicle));
+            if (index < 0) { continue; }
+            const actor = work.actors.splice(index, 1)[0];
+            if (!work.actors.length) { work.phase = 'parked'; }
+            work.message = advanceMessage(work); work.label.textContent = work.message;
+            return { body: actor.body, point: { ...actor.point }, adopted: true };
+        }
+        if (actorCount() >= policy.maxActors) { return; }
+        const body = makeBody(new Set(allActors().map(actor => actor.vehicle)), policy, accepts);
+        return body ? { body, point: body.origin ? { ...body.origin } : undefined, adopted: true } : undefined;
+    }
+
+    function makeSling(): HTMLDivElement {
+        const sling = doc.createElement('div');
+        initializeSceneNode(sling, 'pdfDocumentRobotSling', '1');
+        Object.assign(sling.style, { borderStyle: 'solid', borderWidth: '0 1.5px', borderColor: '#bdcdd1', boxSizing: 'border-box' });
+        return sling;
+    }
+
+    function carryRoute(carry: GroundCarry, target: Point, progress: number): CargoRouteState {
+        return carry.route = computeCargoRoute({ progress, from: carry.from, to: target, airFrom: carry.airFrom,
+            cargoOffset: { x: 0, y: 0 }, airOffset: airliftOffset(carry.ground, carry.air),
+            groundRun: CARGO_ROUTE_POLICY.defaultGroundRun * carry.ground.spriteScale, carryReason: carry.reason });
     }
 
     function releaseActor(actor: RobotBody): void {
@@ -1011,7 +1096,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             return;
         }
         clearRetiring(); releaseCleaner();
-        const viewport = viewportBounds(), policy = presentation(viewport);
+        // The controller supplies one page's content extent. Direct callers without
+        // that information use the finite motion bounds as their presentation size.
+        const documentSize = options.documentSize?.() ?? { width: area.width, height: area.height };
+        const viewport = viewportBounds(), policy = pagePresentation(presentation(viewport), documentSize);
         const previous = columnPull;
         if (actorCount() - Number(!!previous) >= policy.maxActors
             || allActors().some(actor => actor !== previous?.body && actor.vehicle === 'forklift')) { clearColumnPull(); return; }
@@ -1041,7 +1129,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 Object.assign(layer.style, { position: 'absolute', inset: '0', pointerEvents: 'none' });
                 layer.append(body.sprite); container.append(transit); transit.append(layer);
             }
-            columnPull = { motion: { ...motion, bounds: { ...area } }, body, layer, start,
+            columnPull = { motion: { ...motion, bounds: { ...area } }, documentSize: { ...documentSize }, body, layer, start,
                 point: { ...start }, offsetX, startOpacity: opacity, opacity, laneY, side, phase: 'approach' };
             activePresentation = policy.kind;
             requestPaint();
@@ -1056,6 +1144,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, placements: BodyPlacement[]): void {
         const active = columnPull;
         if (!active) { return; }
+        policy = pagePresentation(policy, active.documentSize);
         const { body, motion, side } = active;
         const end = motion.startedAt + motion.durationMs;
         if (!motion.holdAtEnd && at >= (active.returnAt ?? end) + DOCUMENT_ROBOT_LIMITS.advance.returnMs
@@ -1119,7 +1208,12 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         }
     }
 
+    function releaseLandingShadow(payload: Payload): void {
+        payload.landingShadow?.remove(); payload.landingShadow = undefined;
+    }
+
     function releasePayload(payload: Payload): void {
+        releaseLandingShadow(payload);
         if (cleaner?.payload === payload) { releaseCleaner(); }
         finishRefinement(payload);
         payload.cover?.remove(); payload.cover = undefined;
@@ -1139,7 +1233,35 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (pendingDeposits.length < DOCUMENT_ROBOT_LIMITS.desktop.maxActors) {
             pendingDeposits.push(payload.helpers.map(actor => actor.id));
         }
+        const parent = payload.canvas.parentNode, shown = Number(payload.canvas.style.opacity) > 0;
+        const boxShadow = payload.canvas.style.boxShadow;
         releasePayload(payload);
+        // Keep only the shadow during the existing settle interval. The native photo is
+        // already uncovered and no copied bitmap or independent animation clock survives.
+        const elapsed = now() - payload.started - payload.delay - payload.duration * DEPOSIT_START;
+        if (!parent?.isConnected || !shown || elapsed >= MOTION_LAB_CHOREOGRAPHY.settleMs) { return; }
+        let shadow: HTMLDivElement | undefined;
+        try {
+            shadow = doc.createElement('div');
+            initializeSceneNode(shadow, 'pdfDocumentRobotLandingShadow', '1');
+            shadow.dataset.payload = String(payload.id);
+            Object.assign(shadow.style, { boxShadow, borderRadius: '0' });
+            parent.appendChild(shadow);
+            payload.landingShadow = shadow;
+        } catch { shadow?.remove(); }
+    }
+
+    function paintLandingShadow(payload: Payload, area: Geometry, at: number): void {
+        const shadow = payload.landingShadow;
+        if (!shadow) { return; }
+        const elapsed = at - payload.started - payload.delay - payload.duration * DEPOSIT_START;
+        if (elapsed >= MOTION_LAB_CHOREOGRAPHY.settleMs) { releaseLandingShadow(payload); return; }
+        const opacity = 1 - ease(clamp(elapsed / MOTION_LAB_CHOREOGRAPHY.settleMs, 0, 1));
+        Object.assign(shadow.style, {
+            width: payload.crop.width * area.width + 'px', height: payload.crop.height * area.height + 'px', opacity: String(opacity),
+            transform: 'translate(' + (area.pageLeft + payload.crop.x * area.width - sceneOrigin.x).toFixed(4) + 'px,'
+                + (area.pageTop + payload.crop.y * area.height - sceneOrigin.y).toFixed(4) + 'px)',
+        });
     }
 
     function retireUncovered(payload: Payload, pageElement: HTMLElement | undefined): void {
@@ -1169,6 +1291,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     function dropPayload(payload: Payload): void {
         for (const actor of payload.helpers) { releaseActor(actor); }
         payload.helpers.length = 0;
+        payload.returnCarry = undefined;
         releasePayload(payload);
         payload.sling?.remove(); payload.sling = undefined;
     }
@@ -1229,12 +1352,13 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 const area = geometry(value.pageElement, viewport, value.pageProjection);
                 if (!area || area.width * (area.right - area.left) < policy.minimumWidth
                     || area.height * (area.bottom - area.top) < policy.minimumHeight) { continue; }
-                const crops = selectCrops(value.canvas, area, policy, value.imageRegions, value.rasterProjection)
+                const pagePolicy = pagePresentation(policy, area);
+                const crops = selectCrops(value.canvas, area, pagePolicy, value.imageRegions, value.rasterProjection)
                     .slice(0, policy.kind === 'desktop' ? DOCUMENT_ROBOT_LIMITS.replacement.fragmentsPerDesktopPage : 1);
                 for (const crop of crops) {
                     if (actorCount() >= policy.maxActors) { break; }
                     const ground = area.bottom >= 0.98 && crop.y + crop.height / 2 >= 0.6 && !used.has('forklift');
-                    const payload = makeDelivery(value.canvas, crop, area, scene.pieces.length, 'solo', 1, used, policy, [], ground,
+                    const payload = makeDelivery(value.canvas, crop, area, scene.pieces.length, 'solo', 1, used, pagePolicy, [], ground,
                         value.rasterProjection);
                     if (!payload) { continue; }
                     payload.duration = DOCUMENT_ROBOT_LIMITS.replacement.durationMs;
@@ -1297,9 +1421,14 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
 
     const pendingWorkPages = (work: AdvanceWork) => work.pages.filter(page => page.state === 'waiting' || page.state === 'preparing');
 
+    function clearAdvanceCarry(work: AdvanceWork): void {
+        work.returnCarry = undefined; work.sling?.remove(); work.sling = undefined;
+    }
+
     function dropAdvance(work: AdvanceWork): void {
         for (const actor of work.actors) { releaseActor(actor.body); }
         work.actors.length = 0;
+        clearAdvanceCarry(work);
         work.layer.remove();
         advance.delete(work.key);
         if (!episodes.size && !advance.size && !retiring && !captionGroup && !columnPull) { transit.remove(); }
@@ -1320,10 +1449,11 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (element.isConnected === false) { return; }
         const reference = element.getBoundingClientRect();
         if (!(reference.width > 0 && reference.height > 0)) { return; }
-        const scale = policy.spriteScale;
+        const pagePolicy = pagePresentation(policy, areas.find(value => value.element === element)?.area ?? reference);
+        const scale = pagePolicy.spriteScale;
         const x = work.anchor ? reference.left + work.anchor.x * reference.width : (left + right) / 2;
         const y = work.anchor ? reference.top + work.anchor.y * reference.height : top + Math.min((bottom - top) * 0.35, 115 * scale);
-        return { x, y, left, right, top, bottom, reference, element,
+        return { x, y, left, right, top, bottom, reference, element, policy: pagePolicy,
             stageLeft: work.anchor ? reference.left + work.anchor.left * reference.width : viewport.left,
             stageRight: work.anchor ? reference.left + work.anchor.right * reference.width : viewport.right,
             stageBottom: work.anchor ? reference.top + work.anchor.bottom * reference.height : viewport.bottom,
@@ -1352,18 +1482,66 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         }
     }
 
+    function advanceTarget(work: AdvanceWork, actor: AdvanceActor, index: number,
+        area: NonNullable<ReturnType<typeof advanceGeometry>>): Point {
+        const offset = actor.formationOffset ?? { x: (index - (work.actors.length - 1) / 2) * 102, y: index % 2 ? 9 : -9 };
+        const target = { x: clamp(area.x + offset.x * area.policy.spriteScale, area.stageLeft + 35, area.stageRight - 35), y: area.y + offset.y };
+        return ROBOT_VEHICLES.find(spec => spec.id === actor.body.vehicle)!.air ? target : clampGroundRoutePoint(actor.start, target);
+    }
+
+    function planAdvanceReturn(work: AdvanceWork, viewport: ReturnType<typeof viewportBounds>, policy: Presentation,
+        destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, at: number): void {
+        if (work.returnPlanned) { return; }
+        work.returnPlanned = true;
+        const actor = work.actors.find(value => value.body.vehicle === 'lugv');
+        if (!actor) { return; }
+        const target = destinations.get(actor.body) ?? { x: viewport.right + 140, y: actor.start.y };
+        const reason = cargoAirliftReason(actor.start, target, actor.body.vehicle, actor.body.drivingDirection);
+        if (!reason) { commitGroundDrive(actor.body, actor.start, target); return; }
+        const early = (at - work.returnAt!) / DOCUMENT_ROBOT_LIMITS.advance.returnMs < CARGO_ROUTE_POLICY.recruitEnd;
+        const claim = recruitAircraft(actor.body, work.actors.map(value => ({ body: value.body, point: value.start })), policy, early);
+        if (!claim) { commitGroundDrive(actor.body, actor.start, clampGroundRoutePoint(actor.start, target)); return; }
+        if (claim.adopted && !resizeSprite(claim.body, policy)) { releaseActor(claim.body); return; }
+        let adopted: AdvanceActor | undefined;
+        try {
+            const airFrom = claim.point ?? { x: actor.start.x + 90, y: actor.start.y - 140 * claim.body.spriteScale };
+            if (claim.adopted) {
+                const start = { ...airFrom, scale: claim.point?.scale ?? claim.body.spriteScale };
+                adopted = { body: claim.body, start: { ...start }, point: { ...start } };
+                work.actors.push(adopted); work.layer.append(claim.body.sprite);
+            }
+            const sling = makeSling(); work.layer.append(sling); work.sling = sling;
+            work.returnCarry = { ground: actor.body, air: claim.body, from: { ...actor.start }, airFrom: { ...airFrom },
+                groundScale: actor.start.scale, airScale: claim.point?.scale ?? claim.body.spriteScale, reason };
+            for (const body of [actor.body, claim.body]) { encounters.forget(body.id); detachActorCaption(body.id); }
+            if (reason !== 'turn') { commitGroundDrive(actor.body, actor.start, target); }
+        } catch {
+            work.sling?.remove(); work.sling = undefined;
+            if (adopted) { work.actors.splice(work.actors.indexOf(adopted), 1); }
+            if (claim.adopted) { releaseActor(claim.body); }
+        }
+    }
+
     function paintAdvance(work: AdvanceWork, at: number, viewport: ReturnType<typeof viewportBounds>, policy: Presentation,
         area: ReturnType<typeof advanceGeometry>, destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, placements: BodyPlacement[]): void {
         work.labelAnchor = undefined;
         if (!area) {
             if (captionGroup && work.pages.some(page => captionGroup!.pages.has(page.pageNumber))) { clearCaption(); }
             for (const actor of work.actors) { releaseActor(actor.body); }
+            clearAdvanceCarry(work);
             work.actors.length = 0; work.phase = 'parked'; work.label.style.opacity = '0';
             return;
         }
+        policy = area.policy;
         const timing = DOCUMENT_ROBOT_LIMITS.advance;
         const elapsed = at - work.started;
         if (work.phase === 'returning' && at - work.returnAt! >= timing.returnMs) { dropAdvance(work); return; }
+        if (work.phase === 'returning') { planAdvanceReturn(work, viewport, policy, destinations, at); }
+        const carry = work.returnCarry;
+        const returnProgress = work.phase === 'returning' ? clamp((at - work.returnAt!) / timing.returnMs, 0, 1) : 0;
+        const route = carry && carryRoute(carry, destinations.get(carry.ground)
+            ?? { x: viewport.right + 140, y: carry.from.y }, returnProgress);
+        if (carry && route && work.sling) { paintSling(work.sling, carry.ground, carry.air, route); }
         if (work.phase !== 'returning') {
             if (!work.actors.length || media.matches) { work.phase = 'parked'; }
             else if (work.gestureAt !== undefined) {
@@ -1382,12 +1560,13 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (work.label.textContent !== work.message) { work.label.textContent = work.message; }
         for (let index = work.actors.length - 1; index >= 0; index--) {
             const actor = work.actors[index], body = actor.body;
-            if (!resizeSprite(body, policy)) { releaseActor(body); work.actors.splice(index, 1); continue; }
-            const offset = (index - (work.actors.length - 1) / 2) * 102 * policy.spriteScale;
-            const target = { x: clamp(area.x + offset, area.stageLeft + 35, area.stageRight - 35), y: area.y + (index % 2 ? 9 : -9) };
+            if (!resizeSprite(body, policy)) {
+                if (carry && (body === carry.ground || body === carry.air)) { dropAdvance(work); return; }
+                releaseActor(body); work.actors.splice(index, 1); continue;
+            }
+            const target = advanceTarget(work, actor, index, area);
             const air = ROBOT_VEHICLES.find(spec => spec.id === body.vehicle)!.air;
-            if (!air) { const climb = Math.abs(target.x - actor.start.x) * GROUND_ROUTE_MAX_SLOPE;
-                target.y = clamp(target.y, actor.start.y - climb, actor.start.y + climb); }
+            body.carried = false;
             const arrival = ease(clamp(elapsed / timing.arrivalMs, 0, 1));
             let point: Point = air ? curve(actor.start, { x: target.x, y: actor.start.y }, target, arrival) : straight(actor.start, target, arrival);
             let scale = actor.start.scale + (policy.spriteScale - actor.start.scale) * arrival;
@@ -1406,14 +1585,32 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 point = air ? curve(actor.start, { x: end.x, y: actor.start.y }, end, progress) : straight(actor.start, end, progress);
                 scale = actor.start.scale + ((end.scale ?? policy.spriteScale) - actor.start.scale) * progress;
                 opacity = end === destination ? 1 : 1 - progress;
+                if (carry && route && (body === carry.ground || body === carry.air)) {
+                    body.carried = body === carry.ground && route.groundCarried;
+                    point = body === carry.ground ? route.ground : route.air;
+                    const released = ease(clamp((returnProgress - CARGO_ROUTE_POLICY.setDownEnd) / (1 - CARGO_ROUTE_POLICY.setDownEnd), 0, 1));
+                    const incomingScale = body === carry.ground ? carry.groundScale : carry.airScale;
+                    const grownScale = incomingScale + (body.spriteScale - incomingScale) * ease(clamp(returnProgress / CARGO_ROUTE_POLICY.driveEnd, 0, 1));
+                    scale = grownScale + ((destination?.scale ?? policy.spriteScale) - grownScale) * released;
+                    if (body === carry.air && destination && !route.groundCarried && returnProgress >= CARGO_ROUTE_POLICY.setDownEnd) {
+                        point = straight(route.air, destination, released);
+                    }
+                    opacity = destination ? 1 : 1 - progress;
+                }
             }
-            const activity = work.phase === 'arriving' || work.phase === 'returning' ? 'navigate'
+            const paired = !!carry && !!route && (body === carry.ground || body === carry.air);
+            const carrying = paired && body === carry!.air && route!.groundCarried;
+            const activity = paired && route!.phase !== 'arrived' ? body === carry!.ground
+                ? route!.phase === 'recruit' || route!.phase === 'rendezvous' ? 'signal' : route!.groundCarried ? 'park' : 'navigate'
+                : route!.groundCarried ? 'assist' : route!.phase === 'rendezvous' ? 'load' : 'navigate'
+                : work.phase === 'arriving' || work.phase === 'returning' ? 'navigate'
                 : work.phase === 'coordinating' ? 'assist' : 'park';
             const look = work.actors.length > 1 ? index ? -1 : 1 : 1;
             const remainingMs = work.phase === 'returning' ? timing.returnMs - (at - work.returnAt!)
                 : work.phase === 'parked' ? 0 : (work.gestureAt ?? work.started + timing.arrivalMs) + timing.coordinationMs - at;
-            placements.push({ body, point, scale, opacity, tilt, activity, carrying: false, progress: 0, look,
-                phase: work.phase === 'parked' ? 'parked' : work.phase === 'returning' ? 'return' : 'advance', remainingMs,
+            placements.push({ body, point, scale, opacity, tilt, activity, carrying, progress: 0, look,
+                phase: paired || work.phase === 'parked' ? 'parked' : work.phase === 'returning' ? 'return' : 'advance', remainingMs,
+                group: paired ? -(carry!.ground.id + 1) : undefined,
                 pages: work.pages.map(page => page.pageNumber), advance: actor });
         }
         if (!work.actors.length) { work.phase = 'parked'; }
@@ -1490,10 +1687,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                     const used = new Set(allActors().map(actor => actor.vehicle));
                     try {
                         for (let index = 0; index < crew; index++) {
-                            const body = makeBody(used, policy);
+                            const body = makeBody(used, area.policy);
                             if (!body) { break; }
                             const start = { ...(body.origin ?? { x: viewport.right + 90, y: area.y + index * 20 }),
-                                scale: body.origin?.scale ?? policy.spriteScale };
+                                scale: body.origin?.scale ?? area.policy.spriteScale };
                             work.actors.push({ body, start: { ...start }, point: { ...start } });
                             work.layer.append(body.sprite); used.add(body.vehicle);
                         }
@@ -1502,6 +1699,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                         work.actors.length = 0; stats.rejected++;
                     }
                     if (work.actors.length) {
+                        work.actors.forEach((actor, index) => {
+                            actor.formationOffset = { x: (index - (work!.actors.length - 1) / 2) * 102, y: index % 2 ? 9 : -9 };
+                            commitGroundDrive(actor.body, actor.start, advanceTarget(work!, actor, index, area));
+                        });
                         // The visible slice selects an entrance once. Later scrolls keep that
                         // destination on the same page, even when the viewport clips the page.
                         const reference = area.reference;
@@ -1528,6 +1729,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             - Number(a.pages.some(page => page.pageNumber === pageNumber)));
         return works.flatMap(work => {
             const actors = work.actors.splice(0);
+            clearAdvanceCarry(work);
+            for (const actor of actors) { actor.body.carried = false; }
             work.phase = 'parked';
             work.message = advanceMessage(work); work.label.textContent = work.message;
             if (!pendingWorkPages(work).length) { dropAdvance(work); }
@@ -1535,7 +1738,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         });
     }
 
-    function cargoBodyOffset(vehicle: RobotVehicle, slot: number, spriteScale: number, payload: Payload, area: Geometry, progress: number): Point {
+    function cargoBodyOffset(vehicle: RobotVehicle, slot: number, spriteScale: number,
+        payload: Pick<Payload, 'ground' | 'mode' | 'crop'>, area: Geometry, progress: number): Point {
         const bodyScale = spriteScale / DOCUMENT_ROBOT_LIMITS.spriteScale;
         const air = ROBOT_VEHICLES.find(spec => spec.id === vehicle)!.air;
         if (payload.ground) { return { x: -FORKLIFT_ATTACHMENT_PX.cargoX * spriteScale,
@@ -1560,8 +1764,16 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         return cargoBodyOffset(actor.vehicle, actor.slot, actor.spriteScale, actor.payload, area, progress);
     }
 
-    function airliftOffset(payload: Payload): Point {
-        const ground = payload.helpers[0], air = payload.helpers[1], attachment = ROBOT_AIRLIFT_ATTACHMENT;
+    function cargoDestination(vehicle: RobotVehicle, slot: number, scale: number,
+        payload: Pick<Payload, 'ground' | 'mode' | 'crop'>, area: Geometry, progress = 0): Point {
+        const offset = cargoBodyOffset(vehicle, slot, scale, payload, area, progress);
+        return { x: area.pageLeft + (payload.crop.x + payload.crop.width / 2) * area.width + offset.x,
+            y: payload.ground ? area.pageTop + area.height - DOCUMENT_ROBOT_LIMITS.forklift.baseInset * scale
+                : area.pageTop + (payload.crop.y + payload.crop.height / 2) * area.height + offset.y };
+    }
+
+    function airliftOffset(ground: RobotBody, air: RobotBody): Point {
+        const attachment = ROBOT_AIRLIFT_ATTACHMENT;
         return { x: attachment.groundGrab.x * attachment.groundScale * ground.spriteScale
                 - attachment.airGrab.x * attachment.airScale * air.spriteScale,
             y: attachment.groundGrab.y * attachment.groundScale * ground.spriteScale
@@ -1606,9 +1818,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 ?? { x: groundFrom.x + (payload.route === 0 ? -90 : 90), y: groundFrom.y - 140 * air.spriteScale };
             route = computeCargoRoute({ progress: clamp(progress / DEPOSIT_START, 0, 1),
                 from: groundFrom, to: { x: target.x + offset.x, y: target.y + offset.y }, airFrom,
-                cargoOffset: { x: -offset.x, y: -offset.y }, airOffset: airliftOffset(payload),
+                cargoOffset: { x: -offset.x, y: -offset.y }, airOffset: airliftOffset(leader, air),
                 bounds: { left: area.pageLeft - 50, right: area.pageLeft + area.width + 50 },
-                groundRun: CARGO_ROUTE_POLICY.defaultGroundRun * leader.spriteScale });
+                groundRun: CARGO_ROUTE_POLICY.defaultGroundRun * leader.spriteScale, carryReason: payload.airliftReason });
             point = route.cargo;
         }
         else if (progress >= DEPOSIT_START) { point = target; }
@@ -1641,6 +1853,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, viewport: ReturnType<typeof viewportBounds>, placements: BodyPlacement[]): void {
         const payload = actor.payload, progress = payload.progress;
         const air = ROBOT_VEHICLES.find(vehicle => vehicle.id === actor.vehicle)!.air;
+        const pair = progress >= RETURN_START ? payload.returnCarry : payload.mode === 'airlift'
+            ? { ground: payload.helpers[0], air: payload.helpers[1] } : undefined;
+        const paired = !!pair && (actor === pair.ground || actor === pair.air);
         const offset = helperOffset(actor, area, progress);
         const normalScale = actor.spriteScale;
         const launch = actor.launch ?? actor.origin;
@@ -1649,7 +1864,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         let spriteScale = launch ? originScale + (normalScale - originScale) * ease(clamp(progress / growthEnd, 0, 1)) : normalScale;
         let robot = { x: path.point.x + offset.x, y: path.point.y + offset.y };
         actor.carried = false; actor.routePhase = undefined;
-        if (payload.mode === 'airlift' && path.route) {
+        if (paired && path.route) {
             robot = air ? path.route.air : path.route.ground;
             actor.carried = !air && path.route.groundCarried;
             actor.routePhase = path.route.phase;
@@ -1679,11 +1894,14 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             returningToLab = !!destination;
             const returnProgress = ease((progress - RETURN_START) / (1 - RETURN_START));
             const destinationScale = destination?.scale ?? normalScale;
-            if (payload.mode === 'airlift' && path.route) {
+            if (paired && path.route) {
+                const legProgress = (progress - RETURN_START) / (1 - RETURN_START);
                 const releaseProgress = !path.route.requiresAir ? returnProgress
-                    : ease(clamp(((progress - RETURN_START) / (1 - RETURN_START) - CARGO_ROUTE_POLICY.setDownEnd)
+                    : ease(clamp((legProgress - CARGO_ROUTE_POLICY.setDownEnd)
                         / (1 - CARGO_ROUTE_POLICY.setDownEnd), 0, 1));
-                spriteScale = normalScale + (destinationScale - normalScale) * releaseProgress;
+                const incomingScale = actor === pair!.ground ? payload.returnCarry!.groundScale : payload.returnCarry!.airScale;
+                const grownScale = incomingScale + (normalScale - incomingScale) * ease(clamp(legProgress / CARGO_ROUTE_POLICY.driveEnd, 0, 1));
+                spriteScale = grownScale + (destinationScale - grownScale) * releaseProgress;
                 if (air && destination && !path.route.groundCarried
                     && (!path.route.requiresAir || path.route.phase === 'final-drive')) {
                     robot = straight(path.route.air, destination, releaseProgress);
@@ -1707,12 +1925,12 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             }
         }
         const photoLoaded = !!payload.canvas;
-        const carrying = payload.mode === 'airlift' && air ? !!path.route?.groundCarried
+        const carrying = paired && air ? !!path.route?.groundCarried
             : photoLoaded && !(payload.mode === 'handoff' && (air ? payload.handedOff : !payload.handedOff));
         const lifting = photoLoaded && payload.ground && progress >= DOCUMENT_ROBOT_LIMITS.forklift.liftStart;
         const liftProgress = lifting ? Math.round(clamp((progress - DOCUMENT_ROBOT_LIMITS.forklift.liftStart)
             / (DEPOSIT_START - DOCUMENT_ROBOT_LIMITS.forklift.liftStart), 0, 1) * 12) / 12 : 0;
-        const activity = payload.mode === 'airlift' && path.route && path.route.phase !== 'arrived'
+        const activity = paired && path.route && path.route.phase !== 'arrived'
             ? !air ? path.route.phase === 'recruit' || path.route.phase === 'rendezvous' ? 'signal'
                 : path.route.groundCarried ? 'park' : 'navigate'
                 : path.route.groundCarried ? 'assist' : path.route.phase === 'rendezvous' ? 'load' : 'navigate'
@@ -1721,11 +1939,11 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 : payload.handedOff ? 'deliver' : progress >= RENDEZVOUS_END ? 'load' : 'navigate'
                 : payload.mode === 'formation' ? 'assist' : 'deliver';
         const opacity = Math.min(1, launch ? 1 : progress / 0.08, returningToLab ? 1 : (1 - progress) / 0.12);
-        const tilt = air && payload.mode !== 'airlift' && !(payload.mode === 'handoff' && payload.handedOff && !actor.departing)
+        const tilt = air && !paired && !(payload.mode === 'handoff' && payload.handedOff && !actor.departing)
             ? clamp((path.target.x - path.start.x) / area.width * 9, -8, 8) * (carrying ? 1 : -0.5) : 0;
         placements.push({ body: actor, point: robot, scale: spriteScale, opacity, tilt, activity, carrying,
             progress: lifting ? liftProgress : payload.deposited ? 1 : 0, look: payload.start.x < payload.crop.x + payload.crop.width / 2 ? 1 : -1,
-            phase: payload.mode === 'airlift' && actor.departing ? 'parked' : actor.departing ? 'return'
+            phase: paired && actor.departing ? 'parked' : actor.departing ? 'return'
                 : payload.deposited ? 'deposit' : photoLoaded ? 'cargo' : 'return',
             remainingMs: !photoLoaded ? (1 - progress) * payload.duration
                 : Math.max(0, (payload.ground ? DOCUMENT_ROBOT_LIMITS.forklift.liftStart : DEPOSIT_START) - progress) * payload.duration,
@@ -1733,9 +1951,46 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             fixed: payload.deposited && !actor.departing || payload.ground && lifting || payload.stage === 'handoff' });
     }
 
+    function planPayloadReturn(payload: Payload, area: Geometry, path: ReturnType<typeof payloadPath>, layer: HTMLElement,
+        destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, viewport: ReturnType<typeof viewportBounds>, policy: Presentation): void {
+        if (payload.returnPlanned) { return; }
+        payload.returnPlanned = true;
+        const ground = payload.mode === 'airlift' ? payload.helpers[0] : payload.helpers.find(actor => actor.vehicle === 'lugv');
+        if (!ground) { return; }
+        const from = payload.mode === 'airlift' ? path.route!.ground
+            : cargoDestination(ground.vehicle, ground.slot, ground.spriteScale, payload, area);
+        const target = destinations.get(ground) ?? { x: payload.route < 2 ? viewport.left - 140 : viewport.right + 140,
+            y: payload.mode === 'airlift' ? path.groundY : from.y };
+        const reason = cargoAirliftReason(from, target, ground.vehicle, ground.drivingDirection);
+        if (!reason && payload.mode !== 'airlift') { commitGroundDrive(ground, from, target); return; }
+        const early = (payload.progress - RETURN_START) / (1 - RETURN_START) < CARGO_ROUTE_POLICY.recruitEnd;
+        const claim = recruitAircraft(ground, payload.helpers.map(body => ({ body,
+            point: payload.mode === 'airlift' && body === payload.helpers[1] ? path.route!.air
+                : cargoDestination(body.vehicle, body.slot, body.spriteScale, payload, area, RETURN_START) })), policy, early);
+        if (!claim) { commitGroundDrive(ground, from, clampGroundRoutePoint(from, target)); return; }
+        if (claim.adopted && !resizeSprite(claim.body, policy)) { releaseActor(claim.body); return; }
+        let adopted: Courier | undefined, sling: HTMLDivElement | undefined;
+        try {
+            const airFrom = claim.point ?? { x: from.x + 90, y: from.y - 140 * claim.body.spriteScale };
+            if (claim.adopted) {
+                adopted = promoteCourier(claim.body, payload, area, claim.point);
+                if (!adopted) { return; }
+                payload.helpers.push(adopted); layer.append(adopted.sprite);
+            }
+            if (!payload.sling) { sling = makeSling(); layer.append(sling); payload.sling = sling; }
+            payload.returnCarry = { ground, air: claim.body, from: { ...from }, airFrom: { ...airFrom },
+                groundScale: ground.spriteScale, airScale: claim.point?.scale ?? claim.body.spriteScale, reason };
+            for (const body of [ground, claim.body]) { encounters.forget(body.id); detachActorCaption(body.id); }
+            if (reason !== 'turn') { commitGroundDrive(ground, from, target); }
+        } catch {
+            if (sling) { sling.remove(); payload.sling = undefined; }
+            if (adopted) { payload.helpers.splice(payload.helpers.indexOf(adopted), 1); releaseActor(adopted); }
+        }
+    }
+
     function paintPayload(payload: Payload, pageNumber: number, area: Geometry, at: number,
         destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, viewport: ReturnType<typeof viewportBounds>,
-        placements: BodyPlacement[], captionObstacles: SceneObstacle[]): boolean {
+        placements: BodyPlacement[], captionObstacles: SceneObstacle[], policy: Presentation): boolean {
         const episode = episodes.get(pageNumber);
         if (area.projection) { paintArrival(payload, area.projection, episode?.displayRasterProjection); }
         retireUncovered(payload, episodes.get(pageNumber)?.element);
@@ -1756,22 +2011,26 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (progress >= RETURN_START) { releasePayload(payload); }
         else if (payload.cover) { payload.cover.style.opacity = '1'; }
         const path = payloadPath(payload, area, progress);
-        if (payload.mode === 'airlift' && path.route) {
-            if (progress >= RETURN_START) {
-                const ground = payload.helpers[0], dock = destinations.get(ground);
-                const target = dock ?? { x: payload.route === 0 ? viewport.left - 140 : viewport.right + 140, y: path.groundY };
-                path.route = computeCargoRoute({ progress: (progress - RETURN_START) / (1 - RETURN_START),
-                    from: path.route.ground, to: target, airFrom: path.route.air,
-                    cargoOffset: { x: 0, y: 0 }, airOffset: airliftOffset(payload),
-                    bounds: { left: Math.min(viewport.left - 80, target.x), right: Math.max(viewport.right + 80, target.x) },
-                    groundRun: CARGO_ROUTE_POLICY.defaultGroundRun * ground.spriteScale });
+        paintLandingShadow(payload, area, at);
+        if (progress >= RETURN_START && episode) {
+            planPayloadReturn(payload, area, path, episode.layer, destinations, viewport, policy);
+            const carry = payload.returnCarry;
+            if (carry) {
+                path.route = carryRoute(carry, destinations.get(carry.ground)
+                    ?? { x: payload.route < 2 ? viewport.left - 140 : viewport.right + 140,
+                        y: payload.mode === 'airlift' ? path.groundY : carry.from.y }, (progress - RETURN_START) / (1 - RETURN_START));
+                if (payload.sling) { paintSling(payload.sling, carry.ground, carry.air, path.route); }
             }
+        }
+        if (path.route) {
             payload.routeState = path.route;
-            if (progress < DEPOSIT_START) {
+            if (payload.mode === 'airlift' && progress < DEPOSIT_START) {
                 payload.stage = ['drive', 'recruit', 'rendezvous'].includes(path.route.phase) ? 'rendezvous'
                     : path.route.phase === 'lift' || path.route.phase === 'set-down' ? 'lift' : 'carry';
             }
-            paintSling(payload, path.route);
+            if (payload.mode === 'airlift' && progress < RETURN_START && payload.sling) {
+                paintSling(payload.sling, payload.helpers[0], payload.helpers[1], path.route);
+            }
         }
         for (const actor of payload.helpers) { paintActor(actor, pageNumber, area, path, destinations, viewport, placements); }
         if (payload.canvas) {
@@ -1786,7 +2045,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 + (path.point.y - sceneOrigin.y - height / 2).toFixed(4) + 'px)';
             captionObstacles.push({ x: path.point.x - sceneOrigin.x - width / 2, y: path.point.y - sceneOrigin.y - height / 2,
                 width, height, group: payload.id });
-            if (cleaner?.payload === payload) { paintCleaner(payload, path.point, width, height, at, presentation(viewport)); }
+            if (cleaner?.payload === payload) { paintCleaner(payload, path.point, width, height, at, policy); }
             paintMast(payload, path.groundY, path.point, height,
                 (leader.launch || leader.origin) && progress < DOCUMENT_ROBOT_LIMITS.forklift.approachEnd ? '0' : payload.canvas.style.opacity);
         }
@@ -1808,14 +2067,13 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             height: FORKLIFT_ATTACHMENT_PX.forkHeight * scale + 'px' });
     }
 
-    function paintSling(payload: Payload, route: CargoRouteState): void {
-        if (!payload.sling) { return; }
-        if (!route.groundCarried) { payload.sling.style.opacity = '0'; return; }
-        const ground = payload.helpers[0], air = payload.helpers[1], attachment = ROBOT_AIRLIFT_ATTACHMENT;
+    function paintSling(sling: HTMLDivElement, ground: RobotBody, air: RobotBody, route: CargoRouteState): void {
+        if (!route.groundCarried) { sling.style.opacity = '0'; return; }
+        const attachment = ROBOT_AIRLIFT_ATTACHMENT;
         const width = attachment.slingWidth * ground.spriteScale;
         const top = route.air.y + 18 * attachment.airScale * air.spriteScale;
         const bottom = route.ground.y + attachment.groundGrab.y * attachment.groundScale * ground.spriteScale;
-        Object.assign(payload.sling.style, { left: route.ground.x - width / 2 - sceneOrigin.x + 'px',
+        Object.assign(sling.style, { left: route.ground.x - width / 2 - sceneOrigin.x + 'px',
             top: top - sceneOrigin.y + 'px', width: width + 'px', height: Math.max(1, bottom - top) + 'px', opacity: '1' });
     }
 
@@ -1824,11 +2082,12 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const timing = DOCUMENT_ROBOT_LIMITS.replacement;
         for (let index = scene.pieces.length - 1; index >= 0; index--) {
             const piece = scene.pieces[index], payload = piece.payload;
+            const pagePolicy = pagePresentation(policy, piece.area);
             try {
                 const elapsed = at - payload.started - payload.delay;
                 if (elapsed < 0) { continue; }
                 const progress = payload.progress = clamp(elapsed / payload.duration, 0, 1);
-                if (progress >= 1 || actorCount() > policy.maxActors || !payload.helpers.every(actor => resizeSprite(actor, policy))) {
+                if (progress >= 1 || actorCount() > policy.maxActors || !payload.helpers.every(actor => resizeSprite(actor, pagePolicy))) {
                     dropRetiringPiece(scene, index, progress < 1); continue;
                 }
                 // PDF.js resets scrollTop before restoring its initial view. Only this short
@@ -2107,7 +2366,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 caption: captionUntil > at ? line : '', captionId: (isGreeting ? 'greet:' : 'hover:') + focus.body.id + ':' + attention.started,
                 captionUntil });
         }
-        const key = (value: BodyPlacement) => value.payload?.id ?? -(value.body.id + 1);
+        const key = (value: BodyPlacement) => value.payload?.id ?? value.group ?? -(value.body.id + 1);
         const grounded = new Set(live.filter(value => !ROBOT_VEHICLES.find(spec => spec.id === value.body.vehicle)!.air
             && !reactions.get(value.body.id)?.carried && !(value.body as Courier).carried).map(key));
         const fixedGroups = new Set(live.filter(value => value.fixed || value.phase === 'parked').map(key));
@@ -2169,6 +2428,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                         element.style.translate = translate;
                         element.style.opacity = String((Number(element.style.opacity) || 0) * shown);
                     }
+                }
+                if (payload.landingShadow) {
+                    payload.landingShadow.style.opacity = String(Number(payload.landingShadow.style.opacity) * shown);
                 }
             }
         }
@@ -2234,6 +2496,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             }
         }
         for (const work of advance.values()) {
+            if (work.returnCarry && (failed.has(work.returnCarry.ground) || failed.has(work.returnCarry.air))) {
+                dropAdvance(work); continue;
+            }
             work.actors = work.actors.filter(actor => {
                 if (!failed.has(actor.body)) { return true; }
                 releaseActor(actor.body); return false;
@@ -2296,11 +2561,12 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 if (!visible.has(episode.page) || episode.element.isConnected === false) { dropEpisode(episode, true); continue; }
                 const area = areas.get(episode);
                 if (!area) { dropEpisode(episode, true); continue; }
+                const pagePolicy = pagePresentation(policy, area);
                 for (let index = episode.payloads.length - 1; index >= 0; index--) {
                     const payload = episode.payloads[index];
                     try {
-                        if (actorCount() <= policy.maxActors && payload.helpers.every(actor => resizeSprite(actor, policy))
-                            && paintPayload(payload, episode.page, area, at, destinations, viewport, placements, captionObstacles)) { continue; }
+                        if (actorCount() <= policy.maxActors && payload.helpers.every(actor => resizeSprite(actor, pagePolicy))
+                            && paintPayload(payload, episode.page, area, at, destinations, viewport, placements, captionObstacles, pagePolicy)) { continue; }
                     } catch { stats.rejected++; }
                     dropPayload(payload);
                     episode.payloads.splice(index, 1);
@@ -2311,6 +2577,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 try { paintAdvance(work, at, viewport, policy, workAreas.get(work), destinations, placements); }
                 catch {
                     for (const actor of work.actors) { releaseActor(actor.body); }
+                    clearAdvanceCarry(work);
                     work.actors.length = 0; work.admitted = true; work.phase = 'parked';
                     work.message = advanceMessage(work); work.label.textContent = work.message;
                     stats.rejected++;
@@ -2353,15 +2620,35 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
 
     function makeDelivery(source: HTMLCanvasElement, crop: Crop, area: Geometry, index: number, mode: DeliveryMode,
         helpers: number, used: ReadonlySet<RobotVehicle>, policy: Presentation, staged: AdvanceActor[], ground = false,
-        projection?: PdfRasterProjection): Payload | undefined {
+        projection?: PdfRasterProjection, preferredGround?: RobotVehicle): Payload | undefined {
         const payload = makePayload(source, crop, area, index, mode, policy, ground, projection);
         if (!payload) { return; }
         for (let helper = 0; helper < helpers; helper++) {
-            const actor = makeCourier(payload, area, used, policy, staged);
-            if (!actor) { dropPayload(payload); return; }
+            const actor = makeCourier(payload, area, used, policy, staged, preferredGround);
+            if (!actor) {
+                const leader = payload.helpers[0], launch = leader && (leader.launch ?? leader.origin);
+                if (preferredGround && helper === 1 && launch && !needsCargoAirlift(launch,
+                    cargoDestination(leader.vehicle, 0, leader.spriteScale, payload, area))) {
+                    payload.mode = 'solo'; break;
+                }
+                dropPayload(payload); return;
+            }
             payload.helpers.push(actor);
         }
         if (payload.helpers.some(actor => actor.origin || actor.launch)) { payload.delay = 0; }
+        const path = payloadPath(payload, area, 0);
+        if (payload.mode === 'airlift') {
+            const leader = payload.helpers[0];
+            payload.airliftReason = cargoAirliftReason(path.route!.ground,
+                cargoDestination(leader.vehicle, 0, leader.spriteScale, payload, area), leader.vehicle, leader.drivingDirection);
+        }
+        for (const actor of payload.helpers) {
+            if (payload.airliftReason === 'turn') { continue; }
+            const offset = helperOffset(actor, area, 0);
+            const from = actor.launch ?? actor.origin ?? (payload.mode === 'airlift' && actor === payload.helpers[0]
+                ? path.route!.ground : { x: path.start.x + offset.x, y: path.start.y + offset.y });
+            commitGroundDrive(actor, from, cargoDestination(actor.vehicle, actor.slot, actor.spriteScale, payload, area));
+        }
         payload.canvas!.dataset.courier = String(payload.helpers[0].id);
         if (ground) {
             try {
@@ -2372,12 +2659,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 mast.append(fork); payload.mast = mast;
             } catch { dropPayload(payload); return; }
         }
-        if (mode === 'airlift') {
+        if (payload.mode === 'airlift') {
             try {
-                const sling = doc.createElement('div');
-                initializeSceneNode(sling, 'pdfDocumentRobotSling', '1');
-                Object.assign(sling.style, { borderStyle: 'solid', borderWidth: '0 1.5px', borderColor: '#bdcdd1', boxSizing: 'border-box' });
-                payload.sling = sling;
+                payload.sling = makeSling();
             } catch { dropPayload(payload); return; }
         }
         return payload;
@@ -2397,10 +2681,11 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (media.matches) { seen.add(value.pageNumber); stats.skipped++; return 'skipped'; }
         if (!value.canvas.width || !value.canvas.height) { return 'deferred'; }
         const viewport = viewportBounds();
-        const policy = presentation(viewport);
+        let policy = presentation(viewport);
         const area = geometry(value.pageElement, viewport, value.pageProjection);
         if (!area || area.width * (area.right - area.left) < policy.minimumWidth
             || area.height * (area.bottom - area.top) < policy.minimumHeight) { return 'deferred'; }
+        policy = pagePresentation(policy, area);
         if (!policy.maxActors || !policy.maxCargoBytes) { seen.add(value.pageNumber); stats.skipped++; return 'skipped'; }
         releaseCleaner();
         clearColumnPull();
@@ -2443,16 +2728,19 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         }
         const first = remaining[0];
         const enlarged = first && (first.imageId ? first : largerCrop(first, area));
+        const turningLugv = enlarged && staged.find(actor => actor.body.vehicle === 'lugv'
+            && cargoAirliftReason(actor.point, cargoDestination('lugv', 0, policy.spriteScale,
+                { mode: 'airlift', ground: false, crop: enlarged }, area), 'lugv', actor.body.drivingDirection) === 'turn');
         const stagedGround = staged.some(actor => actor.body.vehicle !== 'forklift'
             && !ROBOT_VEHICLES.find(spec => spec.id === actor.body.vehicle)!.air
             && ROBOT_VEHICLES.some(spec => spec.air && !used.has(spec.id) && canCarryRobot(spec.id, actor.body.vehicle)));
         let sharedCrop = false;
-        if (first && enlarged && (largeImage || stagedGround || choice !== 'solo') && count - assigned >= 2 && first.score >= 1
-            && (largeImage || stagedGround || enlarged.width >= first.width * 1.4 && enlarged.height >= first.height * 1.4)) {
-            const helpers = !stagedGround && choice === 'trio' ? Math.min(3, count - assigned) : 2;
+        if (first && enlarged && (largeImage || stagedGround || turningLugv || choice !== 'solo') && count - assigned >= 2 && first.score >= 1
+            && (largeImage || stagedGround || turningLugv || enlarged.width >= first.width * 1.4 && enlarged.height >= first.height * 1.4)) {
+            const helpers = !stagedGround && !turningLugv && choice === 'trio' ? Math.min(3, count - assigned) : 2;
             const shared = makeDelivery(value.canvas, enlarged, area, payloads.length,
-                stagedGround || choice === 'airlift' ? 'airlift' : choice === 'handoff' ? 'handoff' : 'formation', helpers, used, policy, staged,
-                false, value.rasterProjection);
+                turningLugv || stagedGround || choice === 'airlift' ? 'airlift' : choice === 'handoff' ? 'handoff' : 'formation', helpers, used, policy, staged,
+                false, value.rasterProjection, turningLugv ? 'lugv' : undefined);
             if (shared) {
                 payloads.push(shared); assigned += shared.helpers.length;
                 sharedCrop = true;
@@ -2487,6 +2775,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             container.append(transit);
             transit.append(layer);
             const episode: Episode = { page: value.pageNumber, element: value.pageElement, kind: value.kind, layer, payloads,
+                pageSize: { width: area.width, height: area.height },
                 pageProjection: value.pageProjection, displayRasterProjection: value.displayRasterProjection };
             episodes.set(value.pageNumber, episode);
             for (const payload of payloads) {
@@ -2613,6 +2902,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 documentOffset: documentOffset(),
                 columnPull: columnPull ? { id: columnPull.motion.id, actor: columnPull.body.id, vehicle: columnPull.body.vehicle,
                     phase: columnPull.phase, startedAt: columnPull.motion.startedAt,
+                    spriteScale: columnPull.body.spriteScale, documentSize: { ...columnPull.documentSize },
                     deadline: columnPull.phase === 'waiting' ? undefined
                         : (columnPull.returnAt ?? columnPull.motion.startedAt + columnPull.motion.durationMs)
                             + DOCUMENT_ROBOT_LIMITS.advance.returnMs } : undefined,
@@ -2628,19 +2918,27 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                     started: cleaner.started, duration: cleaner.duration, phase: cleaner.phase, bytes: cleaner.bytes } : undefined,
                 replacement: retiring ? { identity: retiring.identity, started: retiring.started,
                     payloads: retiring.pieces.map(({ page, payload }) => ({ id: payload.id, page, imageId: payload.crop.imageId,
+                        cropKind: payload.crop.kind ?? 'fragment', imageIds: payload.crop.imageIds,
                         progress: payload.progress, stage: payload.stage, helpers: payload.helpers.map(actor => actor.id),
                         target: { x: payload.crop.x, y: payload.crop.y, width: payload.crop.width, height: payload.crop.height } })),
                     actors: retiring.pieces.flatMap(piece => piece.payload.helpers.map(actor => ({ id: actor.id, vehicle: actor.vehicle, fromLab: !!actor.port }))),
                 } : undefined,
                 advance: [...advance.values()].map(work => ({ key: work.key, pages: work.pages.map(page => page.pageNumber),
                     phase: work.phase, message: work.message,
+                    returnCarry: work.returnCarry ? { ground: work.returnCarry.ground.id, air: work.returnCarry.air.id,
+                        reason: work.returnCarry.reason, route: work.returnCarry.route ? { ...work.returnCarry.route,
+                            ground: { ...work.returnCarry.route.ground }, air: { ...work.returnCarry.route.air }, cargo: { ...work.returnCarry.route.cargo } } : undefined } : undefined,
                     actors: work.actors.map(actor => ({ id: actor.body.id, vehicle: actor.body.vehicle, fromLab: !!actor.body.port,
+                        drivingDirection: actor.body.drivingDirection, carried: !!actor.body.carried,
+                        spriteScale: actor.body.spriteScale,
                         reaction: actor.body.pose.expression ?? null, malfunction: actor.body.pose.malfunction ?? null,
                         opacity: Number(actor.body.sprite.style.opacity) || 0,
                         caption: captionGroup?.lines.get(actor.body.id) ?? null })) })),
                 pages: [...episodes.values()].map(episode => ({
                     page: episode.page, kind: episode.kind,
+                    documentSize: { ...(episode.pageProjection?.content ?? episode.pageSize) },
                     payloads: episode.payloads.map(payload => ({ id: payload.id, mode: payload.mode, ground: payload.ground, imageId: payload.crop.imageId,
+                        cropKind: payload.crop.kind ?? 'fragment', imageIds: payload.crop.imageIds,
                         deadline: payload.started + payload.delay + payload.duration, refinements: payload.refinements,
                         arrivalCovered: !!payload.cover?.parentNode, refinementPending: !!payload.underlay,
                         refinementProgress: cleaner?.payload === payload ? ease(cleaner.phase) : 1,
@@ -2654,6 +2952,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                         carrier: payload.mode === 'handoff' ? payload.handedOff ? 'ground' : 'aerial' : 'team',
                         target: { x: payload.crop.x, y: payload.crop.y, width: payload.crop.width, height: payload.crop.height } })),
                     actors: actorsOf(episode).map(actor => ({ id: actor.id, vehicle: actor.vehicle, route: actor.payload.route,
+                        drivingDirection: actor.drivingDirection,
+                        spriteScale: actor.spriteScale,
                         payloadId: actor.payload.id, role: actor.payload.mode === 'handoff' || actor.payload.mode === 'airlift'
                             ? ROBOT_VEHICLES.find(spec => spec.id === actor.vehicle)!.air ? 'aerial' : 'ground' : actor.payload.mode === 'solo' ? 'solo' : 'helper',
                         target: { x: actor.payload.crop.x, y: actor.payload.crop.y, width: actor.payload.crop.width, height: actor.payload.crop.height },

@@ -47,6 +47,39 @@ describe('ground cargo routes and cooperative airlifts', function () {
         assert.strictEqual(routes.needsCargoAirlift({ x: 0, y: 0 }, { x: 100, y: 40 }, 0.5), false);
     });
 
+    it('prefers carrying only an L-UGV reversal of its committed horizontal driving direction', () => {
+        const from = { x: 100, y: 300 }, left = { x: -100, y: 320 }, right = { x: 300, y: 320 };
+        assert.strictEqual(routes.cargoAirliftReason(from, left, 'lugv', 1), 'turn');
+        assert.strictEqual(routes.cargoAirliftReason(from, right, 'lugv', -1), 'turn');
+        assert.strictEqual(routes.cargoAirliftReason(from, right, 'lugv', 1), undefined);
+        assert.strictEqual(routes.cargoAirliftReason(from, left, 'lugv'), undefined, 'a new actor has no invented heading');
+        assert.strictEqual(routes.cargoAirliftReason(from, from, 'lugv', 1), undefined);
+        for (const vehicle of ['rover', 'mecanum', 'walker', 'hexapod', 'forklift', 'ekokomvoz']) {
+            assert.strictEqual(routes.cargoAirliftReason(from, left, vehicle, 1), undefined);
+        }
+        assert.strictEqual(routes.cargoAirliftReason(from, { x: 300, y: 500 }, 'lugv', 1), 'slope');
+        assert.strictEqual(routes.cargoAirliftReason(from, { x: 100, y: 500 }, 'rover', 1), 'slope');
+        assert.strictEqual(routes.groundRouteDirection(from, left), -1);
+        assert.strictEqual(routes.groundRouteDirection(from, right), 1);
+        assert.strictEqual(routes.groundRouteDirection(from, { x: 100, y: 500 }), undefined);
+    });
+
+    it('carries a requested shallow turn without reversing during pickup or final drive', () => {
+        const options = input({ from: { x: 300, y: 300 }, to: { x: 80, y: 280 }, carryReason: 'turn' });
+        const policy = routes.CARGO_ROUTE_POLICY;
+        for (let index = 0; index <= 100; index++) {
+            const progress = index / 100, value = routes.computeCargoRoute({ ...options, progress });
+            assert.strictEqual(value.requiresAir, true);
+            assert.strictEqual(value.reason, 'turn');
+            sharedCargo(value, options);
+            if (progress < policy.rendezvousEnd) { assert.deepStrictEqual(value.ground, options.from); }
+            if (progress >= policy.setDownEnd) { assert.deepStrictEqual(value.ground, options.to); }
+        }
+        const carried = routes.computeCargoRoute({ ...options, progress: 0.6 });
+        assert.strictEqual(carried.groundCarried, true);
+        assert.ok(carried.ground.x < options.from.x && carried.ground.x > options.to.x);
+    });
+
     it('drives a shallow leg directly without recruiting or carrying the ground body', () => {
         const options = input({ to: { x: 480, y: 700 } });
         for (let index = 0; index <= 100; index++) {

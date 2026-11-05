@@ -598,6 +598,31 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         return result;
     }
 
+    it('supplies the current page content size without measuring a spread or rereading layout', async () => {
+        let settings: any;
+        const fleet = new DocumentRobots();
+        const f = fixture({ initialNative: false, width: 640, height: 900 }, {
+            robotsEnabled: true, createDocumentRobots: (_container: Element, value: any) => { settings = value; return fleet; },
+        });
+        await f.frame();
+        f.visibleIds = [20, 21];
+        f.pages[20].viewport = { width: 900, height: 640, scale: 1, rotation: 90 };
+        f.eventBus.emit('updateviewarea'); await f.frame();
+        let reads = 0;
+        for (const view of f.pages) {
+            const original = view.div.getBoundingClientRect.bind(view.div);
+            view.div.getBoundingClientRect = () => { reads++; return original(); };
+        }
+        for (let sample = 0; sample < 20; sample++) {
+            assert.deepStrictEqual(settings.documentSize(), { width: 640, height: 900 });
+        }
+        assert.strictEqual(reads, 0, 'the admitted column size comes from numeric content geometry');
+        f.visibleIds = [21]; f.eventBus.emit('updateviewarea'); await f.frame();
+        reads = 0;
+        assert.deepStrictEqual(settings.documentSize(), { width: 900, height: 640 });
+        assert.strictEqual(reads, 0);
+    });
+
     it('shares docked column geometry with the document renderer and cancels retired editions before a pull', async () => {
         const fleet = new DocumentRobots(); let settings: any;
         const f = fixture({}, { robotsEnabled: true, createDocumentRobots: (_container: Element, value: any) => {

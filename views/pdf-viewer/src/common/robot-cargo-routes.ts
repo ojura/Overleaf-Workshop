@@ -16,6 +16,8 @@ export const CARGO_ROUTE_POLICY = Object.freeze({
 });
 
 export type CargoRoutePhase = 'drive' | 'recruit' | 'rendezvous' | 'lift' | 'carry' | 'set-down' | 'final-drive' | 'arrived';
+export type GroundRouteDirection = -1 | 1;
+export type CargoAirliftReason = 'slope' | 'turn';
 export interface CargoRouteOptions {
     progress: number;
     /** Ground body centers in CSS pixels, with positive Y pointing down. */
@@ -25,10 +27,12 @@ export interface CargoRouteOptions {
     /** Actual artwork attachment offsets, after the caller applies sprite scale. */
     cargoOffset: CargoRoutePoint;
     airOffset: CargoRoutePoint;
-    /** Pickup and set-down body centers stay within these horizontal bounds. */
+    /** Constrain self-driven pickup/set-down lanes. A carried turn preserves its exact from/to poses instead. */
     bounds?: { left: number; right: number };
     groundRun?: number;
     maxSlope?: number;
+    /** The caller has admitted a real carrier for this committed leg. A turn skips self-driven pickup/set-down. */
+    carryReason?: CargoAirliftReason;
 }
 export interface CargoRouteState {
     phase: CargoRoutePhase;
@@ -37,6 +41,7 @@ export interface CargoRouteState {
     cargo: CargoRoutePoint;
     groundCarried: boolean;
     requiresAir: boolean;
+    reason?: CargoAirliftReason;
 }
 
 function finite(value: number, name: string) {
@@ -65,6 +70,24 @@ export function needsCargoAirlift(from: CargoRoutePoint, to: CargoRoutePoint, ma
     return height > width * maxSlope;
 }
 
+/** Record only an authored driving leg, never a painted displacement, expression or gaze. */
+export function groundRouteDirection(from: CargoRoutePoint, to: CargoRoutePoint): GroundRouteDirection | undefined {
+    point(from, 'from'); point(to, 'to');
+    const distance = to.x - from.x;
+    finite(distance, 'horizontal distance');
+    return distance < 0 ? -1 : distance > 0 ? 1 : undefined;
+}
+
+/** L-UGV asks for a lift before reversing its last committed drive; other bodies retain the slope rule. */
+export function cargoAirliftReason(from: CargoRoutePoint, to: CargoRoutePoint, vehicle: string,
+    direction?: GroundRouteDirection, maxSlope = GROUND_ROUTE_MAX_SLOPE): CargoAirliftReason | undefined {
+    const steep = needsCargoAirlift(from, to, maxSlope);
+    if (direction !== undefined && direction !== -1 && direction !== 1) { throw new RangeError('Cargo route direction must be -1 or 1.'); }
+    const next = groundRouteDirection(from, to);
+    if (vehicle === 'lugv' && direction !== undefined && next !== undefined && next !== direction) { return 'turn'; }
+    return steep ? 'slope' : undefined;
+}
+
 /** Keep an authored side-entry or exit height where a ground vehicle can drive to it. */
 export function clampGroundRoutePoint(anchor: CargoRoutePoint, requested: CargoRoutePoint,
     maxSlope = GROUND_ROUTE_MAX_SLOPE): CargoRoutePoint {
@@ -90,12 +113,16 @@ export function computeCargoRoute(options: CargoRouteOptions): CargoRouteState {
         finite(bounds.right - bounds.left, 'bounds width');
         if (bounds.left > bounds.right) { throw new RangeError('Cargo route bounds are reversed.'); }
     }
-    const requiresAir = needsCargoAirlift(from, to, options.maxSlope);
+    if (options.carryReason !== undefined && options.carryReason !== 'turn' && options.carryReason !== 'slope') {
+        throw new RangeError('Cargo route carry reason must be slope or turn.');
+    }
+    const steep = needsCargoAirlift(from, to, options.maxSlope);
+    const reason = options.carryReason ?? (steep ? 'slope' : undefined), requiresAir = reason !== undefined;
     const progress = clamp(options.progress, 0, 1);
     function state(phase: CargoRoutePhase, ground: CargoRoutePoint, air: CargoRoutePoint, groundCarried = false): CargoRouteState {
         const cargo = add(ground, cargoOffset);
         point(ground, 'ground position'); point(air, 'air position'); point(cargo, 'cargo position');
-        return { phase, ground, air, cargo, groundCarried, requiresAir };
+        return { phase, ground, air, cargo, groundCarried, requiresAir, reason };
     }
     if (!requiresAir) {
         return state(progress === 1 ? 'arrived' : 'drive', interpolate(from, to, progress), copy(airFrom));
@@ -107,10 +134,10 @@ export function computeCargoRoute(options: CargoRouteOptions): CargoRouteState {
     if (!direction) {
         direction = Math.sign(airFrom.x - from.x) || (bounds && from.x > bounds.left + (bounds.right - bounds.left) / 2 ? -1 : 1);
     }
-    const run = horizontal ? Math.min(desiredRun, Math.abs(horizontal) / 3) : desiredRun;
-    const pickup = { x: boundedX(from.x + direction * run), y: from.y };
+    const run = reason === 'turn' ? 0 : horizontal ? Math.min(desiredRun, Math.abs(horizontal) / 3) : desiredRun;
+    const pickup = reason === 'turn' ? copy(from) : { x: boundedX(from.x + direction * run), y: from.y };
     // A vertical journey uses one short side lane for both approach and final drive.
-    const landing = { x: horizontal ? boundedX(to.x - direction * run) : pickup.x, y: to.y };
+    const landing = reason === 'turn' ? copy(to) : { x: horizontal ? boundedX(to.x - direction * run) : pickup.x, y: to.y };
     const clearance = Math.max(CARGO_ROUTE_POLICY.minimumLiftClearance, run / 2, Math.abs(airOffset.y) / 2);
     const cruiseY = Math.min(pickup.y, landing.y) - clearance;
     const lifted = { x: pickup.x, y: cruiseY }, crossed = { x: landing.x, y: cruiseY };

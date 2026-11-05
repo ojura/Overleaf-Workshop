@@ -228,6 +228,14 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
                     onCapacityAvailable: onRobotCapacityAvailable,
                     onReplacementComplete: finishReplacement,
                     documentOffset: () => documentColumn?.offsetX ?? 0,
+                    documentSize: () => {
+                        const current = viewer.currentPageNumber;
+                        const id = visible.includes(current) ? current : visible[Math.floor(visible.length / 2)];
+                        const view = pageView(id ?? current);
+                        const content = cachedPageProjection(view)?.content ?? view?.viewport;
+                        return content?.width > 0 && content.height > 0
+                            ? { width: content.width, height: content.height } : undefined;
+                    },
                     registerDocumentLayer: layer => documentColumn?.registerLayer(layer) ?? (() => {}),
                 });
             }
@@ -267,13 +275,18 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         return stored.currentProjection;
     }
 
+    function cachedPageProjection(view: any, projection = nativeProjection(view)): PdfPageProjection | undefined {
+        const cached = view && pageProjections.get(view);
+        return cached && cached.hasCanvas === !!view.canvas && cached.viewport === view.viewport
+            && cached.nativeProjection === projection && cached.transform === view.canvas?.style.transform ? cached.page : undefined;
+    }
+
     function pageProjection(view: any): PdfPageProjection | undefined {
         if (!view?.div || !view.viewport) { return; }
         const canvas: HTMLCanvasElement | undefined = view.canvas ?? undefined;
         const projection = nativeProjection(view), viewport = view.viewport, transform = canvas?.style.transform;
-        const cached = pageProjections.get(view);
-        if (cached && cached.hasCanvas === !!canvas && cached.viewport === viewport
-            && cached.nativeProjection === projection && cached.transform === transform) { return cached.page; }
+        const cached = cachedPageProjection(view, projection);
+        if (cached) { return cached; }
         const clip = { x: 0, y: 0, width: view.div.clientWidth, height: view.div.clientHeight };
         if (!(clip.width > 0 && clip.height > 0 && viewport.width > 0 && viewport.height > 0)) { return; }
         let page: PdfPageProjection = { content: { x: 0, y: 0, width: viewport.width, height: viewport.height }, clip };

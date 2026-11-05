@@ -302,10 +302,10 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         return { seed: 16, encounterRandom: () => draws.shift() ?? 0.99 };
     };
 
-    function coarsePhoto(options: Record<string, unknown> = {}) {
+    function coarsePhoto(options: Record<string, unknown> = {}, pageSize = { width: 465, height: 661 }) {
         const f = fixture({ maxActors: 2, ...options }); f.desktop();
         const page = f.page(99); page.canvas.width = 135; page.canvas.height = 192;
-        page.pageElement.rect = { left: 40, top: 60, width: 465, height: 661 };
+        page.pageElement.rect = { left: 40, top: 60, ...pageSize };
         const delivery = { ...page, kind: 'preview' as const,
             imageRegions: [{ id: 'p99-photo', x: 0.1, y: 0.2, width: 0.6, height: 0.4 }] };
         f.api.setVisiblePages([99]); assert.strictEqual(f.api.offer(delivery), 'started');
@@ -322,6 +322,33 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             composedPath: () => [f.container], preventDefault() { assert.fail('robot interaction must not consume PDF input'); },
             stopPropagation() { assert.fail('robot interaction must not consume PDF input'); } };
         (type === 'pointerup' ? f.window : f.container).emit(type, event);
+    }
+
+    function stagedLugv(carrier: 'owned' | 'new' | 'unavailable' | 'overbudget' = 'owned') {
+        const f = fixture({ maxActors: 4, encounterRandom: () => 0.99 }); f.desktop(1, 1280, 1000);
+        const held = new Set<string>(), releases: string[] = [], reservations: string[] = [];
+        let staging = true;
+        const groundDock = { x: 1200, y: 280, scale: 0.7 }, airDock = { x: 1100, y: 90, scale: 0.7 };
+        f.api.setDispatchOrigin({ reserve(vehicle: string) {
+            if (held.has(vehicle) || vehicle !== 'lugv' && (vehicle !== 'quad' || carrier === 'unavailable' || staging && carrier !== 'owned')) { return; }
+            held.add(vehicle); reservations.push(vehicle);
+            return vehicle === 'lugv' ? groundDock : { ...airDock, scale: carrier === 'overbudget' ? 100 : airDock.scale };
+        }, destination: (vehicle: string) => vehicle === 'lugv' ? groundDock : airDock,
+        release(vehicle: string) { assert.ok(held.delete(vehicle), 'one owner releases ' + vehicle); releases.push(vehicle); } });
+        const page = f.page(99); page.pageElement.rect = { left: 40, top: 60, width: 1000, height: 800 };
+        f.api.setVisibleWork([work([page], ['preparing'])]); f.tick(1600);
+        const actor = f.api.snapshot().advance[0].actors.find((value: any) => value.vehicle === 'lugv');
+        assert.ok(actor, 'the real advance crew has the L-UGV body');
+        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
+        const start = point(sprite);
+        staging = false;
+        const delivery = (dx: number) => {
+            const bodyScale = actor.spriteScale / module.DOCUMENT_ROBOT_LIMITS.spriteScale;
+            const center = { x: start.x + dx + 29 * bodyScale, y: start.y - 25 * bodyScale };
+            return { ...page, imageRegions: [{ id: 'lugv-photo', x: (center.x - 40) / 1000 - 0.1,
+                y: (center.y - 60) / 800 - 0.08, width: 0.2, height: 0.16 }] };
+        };
+        return { f, page, actor, sprite, start, delivery, held, releases, reservations };
     }
 
     it('acknowledges hover and a click during a loaded delivery without changing its cargo or deadline', () => {
@@ -542,9 +569,13 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                     && canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
                 if (cargo) {
                     const a = point(sprite), c = point(cargo);
-                    assert.ok(Math.abs(c.x - a.x - (actor.vehicle === 'lugv' ? 87 : 0)) < 0.08);
-                    assert.ok(Math.abs(c.y - a.y - (actor.vehicle === 'lugv' ? -75 : 102)) < 0.08,
-                        'each actual photo stays attached while one loaded robot assists the other');
+                    // Ground routes keep their admitted carrying offset while a borrowed
+                    // body changes size; aerial solo offsets follow the displayed size.
+                    const scale = actor.vehicle === 'lugv' ? actor.spriteScale / 1.92 : parseFloat(sprite.style.width) / 128 / 1.92;
+                    assert.ok(Math.abs(c.x - a.x - (actor.vehicle === 'lugv' ? 87 : 0) * scale) < 0.08,
+                        JSON.stringify({ vehicle: actor.vehicle, cargo: c, body: a, scale, spriteScale: actor.spriteScale, phase: payload.progress }));
+                    assert.ok(Math.abs(c.y - a.y - (actor.vehicle === 'lugv' ? -75 : 102) * scale) < 0.08,
+                        'each cargo offset stays with its delivery group while one loaded robot assists the other');
                 }
             }
             if (actors.some((actor: any) => actor.vehicle === 'lugv' && actor.carried)) {
@@ -552,7 +583,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                     && canvas.className === 'pdfDocumentRobotVehicle')!) }));
                 const g = points.find((value: any) => value.actor.vehicle === 'lugv')!.point;
                 const a = points.find((value: any) => value.actor.vehicle === 'quad')!.point;
-                assert.ok(Math.abs(a.x - g.x) < 0.08 && Math.abs(a.y - g.y + 38.6 * 1.92) < 0.08,
+                const groundActor = actors.find((actor: any) => actor.vehicle === 'lugv')!;
+                const groundSprite = f.owned.find(canvas => canvas.dataset.courier === String(groundActor.id)
+                    && canvas.className === 'pdfDocumentRobotVehicle')!;
+                const scale = parseFloat(groundSprite.style.width) / 128;
+                assert.ok(Math.abs(a.x - g.x) < 0.08 && Math.abs(a.y - g.y + 38.6 * scale) < 0.08,
                     'spacing preserves the shared rescue attachment');
             }
         }
@@ -643,6 +678,30 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.dispose(); assert.strictEqual(released, 1);
     });
 
+    it('captures one page size for a column actor without scaling it by the visible spread union', () => {
+        let documentSize = { width: 640, height: 900 };
+        const f = fixture({ maxActors: 1, documentSize: () => documentSize }); f.desktop();
+        const page = f.page(); f.api.setVisiblePages([1]);
+        const motion = { id: 1, fromX: 0, toX: -120, startedAt: f.now, durationMs: 2500,
+            reason: 'dock', dock: 'right', bounds: { x: 40, y: 60, width: 1280, height: 1800 } };
+        f.api.setColumnTransition(motion); f.tick(500);
+        const before = f.api.snapshot().columnPull;
+        assert.deepStrictEqual(before.documentSize, documentSize);
+        assert.ok(Math.abs(before.spriteScale - 1.92) < 1e-12, 'a second visible row does not enlarge this forklift');
+        documentSize = { width: 2560, height: 3600 };
+        f.api.setColumnTransition({ ...motion, bounds: { ...motion.bounds, width: 1500 } }); f.tick(400);
+        const after = f.api.snapshot().columnPull;
+        assert.strictEqual(after.actor, before.actor);
+        assert.strictEqual(after.startedAt, before.startedAt);
+        assert.strictEqual(after.deadline, before.deadline);
+        assert.strictEqual(after.spriteScale, before.spriteScale, 'same-leg contact updates retain the admitted page factor');
+        assert.deepStrictEqual(after.documentSize, before.documentSize);
+        f.api.setColumnTransition(undefined); f.finish();
+        assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+        assert.strictEqual(f.callbacks.size, 0);
+        assert.deepStrictEqual([page.canvas.width, page.canvas.height], [4320, 6480]);
+    });
+
     it('lets Navines pull the shifting document edge with one finite actor and no cargo copy', () => {
         let offset = 0, transit: Element | undefined;
         const f = fixture({ maxActors: 1, documentOffset: () => offset,
@@ -669,7 +728,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             assert.ok(state);
             if (state.phase === 'pull') {
                 const target = module.ROBOT_FORKLIFT_ATTACHMENT.pull.right;
-                const handX = point(sprite).x + target.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * f.api.snapshot().spriteScale;
+                const handX = point(sprite).x + target.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * f.api.snapshot().columnPull.spriteScale;
                 assert.ok(Math.abs(handX - (250 + offset)) < 0.05, 'the manipulator follows the actual moving page edge');
             }
         }
@@ -708,7 +767,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.tick(0);
         const current = f.api.snapshot();
         const hand = module.ROBOT_FORKLIFT_ATTACHMENT.pull.right;
-        const handX = point(sprite).x + hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * current.spriteScale;
+        const handX = point(sprite).x + hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * current.columnPull.spriteScale;
         assert.ok(Math.abs(handX - 130) < 0.05, 'the return starts at the final translated edge, not the preceding paint');
         assert.strictEqual(current.columnPull.phase, 'return');
         assert.strictEqual(current.columnPull.deadline, actor.deadline, 'deferring paint preserves the original finish deadline');
@@ -732,7 +791,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.actor))!;
             const start = point(sprite), hand = module.ROBOT_FORKLIFT_ATTACHMENT.pull[toX < 0 ? 'right' : 'left'];
             const edge = toX < 0 ? 250 : 650;
-            const attachment = hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * initial.spriteScale;
+            const attachment = hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * initial.columnPull.spriteScale;
             let previous = 0;
             for (const elapsed of [250, 450, timing.approachMs, 900, 1400,
                 timing.approachMs + timing.haulMs, timing.columnDurationMs - 50, timing.columnDurationMs]) {
@@ -795,7 +854,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             assert.strictEqual(Number(sprite.style.opacity), opacity, 'retarget preserves current visibility');
             f.tick(34);
             const hand = module.ROBOT_FORKLIFT_ATTACHMENT.pull.right;
-            const target = 250 + offset - hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * f.api.snapshot().spriteScale;
+            const target = 250 + offset - hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * f.api.snapshot().columnPull.spriteScale;
             const amount = module.motionLabEase(module.motionLabColumnElapsed(34, next.durationMs)
                 / module.MOTION_LAB_CHOREOGRAPHY.approachMs);
             assert.ok(Math.abs(point(sprite).x - (displayed.x + (target - displayed.x) * amount)) < 0.05,
@@ -836,7 +895,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         page.pageElement.rect.left += 40;
         f.api.setColumnTransition(contact); f.frame();
         const hand = module.ROBOT_FORKLIFT_ATTACHMENT.pull.right;
-        const attachment = hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * f.api.snapshot().spriteScale;
+        const attachment = hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * f.api.snapshot().columnPull.spriteScale;
         assert.ok(Math.abs(point(sprite).x + attachment - (290 + offset)) < 0.05,
             'same-ID geometry keeps the parked manipulator at the actual page edge');
         assert.strictEqual(f.api.snapshot().columnPull.startedAt, motion.startedAt);
@@ -868,7 +927,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const current = f.api.snapshot(), hand = module.ROBOT_FORKLIFT_ATTACHMENT.pull.right;
         assert.deepStrictEqual([current.columnPull.actor, current.columnPull.startedAt, current.columnPull.phase],
             [initial.actor, initial.startedAt, 'pull']);
-        assert.ok(Math.abs(point(sprite).x + hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * current.spriteScale - 220) < 0.05,
+        assert.ok(Math.abs(point(sprite).x + hand.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * current.columnPull.spriteScale - 220) < 0.05,
             'viewport contact updates are used by the existing haul');
         f.api.cancelColumnMotion();
         assert.strictEqual(sprite.zeroWrites, 1);
@@ -948,7 +1007,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.ok(state.pages[0].payloads.some((payload: any) => payload.motion.x > 0), 'ordinary loaded traffic still receives spacing');
         const sprite = f.owned.find(canvas => canvas.dataset.courier === String(pull.actor))!;
         const target = module.ROBOT_FORKLIFT_ATTACHMENT.pull.right;
-        assert.ok(Math.abs(point(sprite).x + target.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * state.spriteScale - 210) < 0.05,
+        assert.ok(Math.abs(point(sprite).x + target.x * module.ROBOT_FORKLIFT_ATTACHMENT.scale * state.columnPull.spriteScale - 210) < 0.05,
             'spacing never detaches the manipulator from the moving page edge');
         f.finish(); assert.strictEqual(f.callbacks.size + f.api.snapshot().retainedBytes, 0);
     });
@@ -1021,7 +1080,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('refinement refuses an over-budget copy even when replacing the old raster would fit afterward', () => {
-        const { f, source } = coarsePhoto({ device: 'mobile', maxCargoBytes: 230000 });
+        const { f, source } = coarsePhoto({ device: 'mobile', maxCargoBytes: 230000 }, { width: 320, height: 450 });
         const old = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
         assert.deepStrictEqual([old.width, old.height], [81, 77]);
         assert.ok(240 * 227 * 4 < 230000 && 240 * 227 * 4 + old.width * old.height * 4 > 230000);
@@ -1590,6 +1649,84 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.deepStrictEqual([page.canvas.width, page.canvas.height], [135, 192]);
         assert.strictEqual(page.canvas.copies.length, 0, 'the PDF-owned source is never erased or repainted');
         f.finish();
+    });
+
+    it('fades only the landing shadow on the existing settle clock after releasing the photo raster', () => {
+        const { f, page } = coarsePhoto({ maxActors: 1, encounterRandom: () => 0.99 });
+        f.tick(200);
+        const before = f.api.snapshot().pages[0].payloads[0];
+        const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
+        const allocated = f.owned.length;
+        const landedAt = before.deadline * 0.62, fadeMs = module.MOTION_LAB_CHOREOGRAPHY.settleMs;
+        f.scroll(70, 200);
+        f.tick(landedAt + 1 - f.now);
+        const shadow = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotLandingShadow')!;
+        assert.ok(shadow, 'the landed photo keeps only its brief shadow');
+        assert.strictEqual(shadow instanceof Canvas, false);
+        assert.strictEqual(shadow.style.boxShadow, cargo.style.boxShadow);
+        assert.strictEqual(shadow.style.pointerEvents, 'none');
+        assert.strictEqual(shadow.attributes.get('aria-hidden'), 'true');
+        assert.ok(Number(shadow.style.opacity) > 0.99);
+        assert.deepStrictEqual([shadow.style.width, shadow.style.height].map(parseFloat), [0.6 * 465, 0.4 * 661]);
+        const shown = point(shadow as Canvas);
+        assert.ok(Math.abs(shown.x - (page.pageElement.rect.left + 0.4 * 465)) < 1e-4,
+            'the landed shadow uses the actual CSS page origin after horizontal clipping');
+        assert.ok(Math.abs(shown.y - (page.pageElement.rect.top + 0.4 * 661)) < 1e-4,
+            'scrolling cannot replace the CSS page origin with a normalized visible fraction');
+        const after = f.api.snapshot().pages[0].payloads[0];
+        assert.strictEqual(after.deadline, before.deadline); assert.deepStrictEqual(after.helpers, before.helpers);
+        assert.strictEqual(after.deposited, true);
+        assert.strictEqual(f.api.snapshot().cargoBytes + f.api.snapshot().activePayloads + f.api.snapshot().activeArrivalCovers, 0);
+        assert.strictEqual(cargo.zeroWrites, 1); assert.strictEqual(f.owned.length, allocated);
+        assert.deepStrictEqual([page.canvas.width, page.canvas.height, page.canvas.copies.length], [135, 192, 0]);
+        assert.strictEqual(page.canvas.style.opacity, undefined, 'the native photograph remains opaque');
+        f.tick(landedAt + fadeMs / 2 - f.now);
+        assert.ok(Math.abs(Number(shadow.style.opacity) - 0.5) < 1e-8, 'the shadow fades while the photograph stays sharp');
+        f.tick(landedAt + fadeMs - f.now);
+        assert.strictEqual(shadow.parentNode, null);
+        assert.strictEqual(f.api.snapshot().pages[0].payloads[0].deadline, before.deadline);
+        f.finish();
+        assert.strictEqual(f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+        assert.strictEqual(cargo.zeroWrites, 1);
+    });
+
+    it('removes a landing shadow immediately on every hard cancellation or reader reveal', () => {
+        for (const ending of ['input', 'offscreen', 'hide', 'reduce', 'disable', 'reset', 'replacement', 'dispose']) {
+            const { f, page, source } = coarsePhoto({ maxActors: 1, encounterRandom: () => 0.99 });
+            f.tick(200);
+            const before = f.api.snapshot().pages[0].payloads[0];
+            f.tick(before.deadline * 0.62 + 1 - f.now);
+            const shadow = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotLandingShadow')!;
+            assert.ok(shadow, ending + ' starts with a landed shadow');
+            if (ending === 'input') { f.api.revealArrivals(); }
+            else if (ending === 'offscreen') { f.api.setVisiblePages([]); }
+            else if (ending === 'hide') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+            else if (ending === 'reduce') { f.media.matches = true; f.media.emit('change'); }
+            else if (ending === 'disable') { f.api.setEnabled(false); }
+            else if (ending === 'replacement') { f.api.retireDocument([page], 'new-edition'); }
+            else { f.api[ending](); }
+            assert.strictEqual(shadow.parentNode, null, ending);
+            assert.strictEqual(f.api.refine(source()), 0, 'a retired photo cannot recreate its shadow');
+            f.finish();
+            assert.strictEqual(sceneNodes(f.container).filter(node => node.className === 'pdfDocumentRobotLandingShadow').length, 0);
+        }
+    });
+
+    it('does not extend a landing shadow when asynchronous refinement reaches a delayed deposit', () => {
+        for (const lateMs of [100, 201]) {
+            const { f, source } = coarsePhoto({ maxActors: 1, encounterRandom: () => 0.99 });
+            f.tick(200);
+            const before = f.api.snapshot().pages[0].payloads[0], landedAt = before.deadline * 0.62;
+            f.now = landedAt + lateMs;
+            assert.strictEqual(f.api.refine(source()), 0);
+            const shadow = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotLandingShadow');
+            assert.strictEqual(!!shadow, lateMs < module.MOTION_LAB_CHOREOGRAPHY.settleMs);
+            f.tick(101);
+            assert.strictEqual(shadow?.parentNode ?? null, null, 'the original deposit clock owns expiry');
+            assert.strictEqual(f.api.snapshot().pages[0].payloads[0].deadline, before.deadline);
+            f.finish();
+            assert.strictEqual(f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+        }
     });
 
     it('removes destination gaps on cancellation and never masks a rejected admission', () => {
@@ -2684,6 +2821,150 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.finish();
     });
 
+    it('chooses collage, whole-image and portion cargo from document zoom independently of DPR', () => {
+        const images = [
+            { id: 'photo-left', x: 0.04, y: 0.2, width: 0.44, height: 0.35 },
+            { id: 'photo-right', x: 0.50, y: 0.2, width: 0.44, height: 0.35 },
+        ];
+        const selected = new Map<number, unknown>();
+        for (const zoom of [0.5, 1, 1.5, 2, 3, 4]) {
+            for (const dpr of [1, 1.2, 2, 3]) {
+                const f = fixture({ maxActors: 4 }); f.desktop(dpr, 4000, 4000);
+                const page = f.page(99);
+                page.pageElement.rect = { left: 40, top: 60, width: 640 * zoom, height: 900 * zoom };
+                f.api.setVisiblePages([99]);
+                assert.strictEqual(f.api.offer({ ...page, imageRegions: images }), 'started');
+                const payloads = f.api.snapshot().pages[0].payloads;
+                if (zoom === 0.5) {
+                    assert.strictEqual(payloads.length, 1, 'a small tight collage has one raster owner rather than repeated members');
+                    for (const [key, expected] of Object.entries({ x: 0.04, y: 0.2, width: 0.90, height: 0.35 })) {
+                        assert.ok(Math.abs(payloads[0].target[key] - expected) < 1e-12);
+                    }
+                } else if (zoom <= 1.5) {
+                    assert.deepStrictEqual(payloads.map((value: any) => value.imageId).sort(), ['photo-left', 'photo-right']);
+                    for (const payload of payloads) {
+                        assert.deepStrictEqual(payload.target, { x: images.find(image => image.id === payload.imageId)!.x,
+                            y: 0.2, width: 0.44, height: 0.35 });
+                    }
+                } else {
+                    const edge = 400 * 1.35;
+                    assert.ok(payloads.length > 0);
+                    assert.ok(payloads.every((value: any) => value.target.width * 640 * zoom <= edge + 1e-8
+                        && value.target.height * 900 * zoom <= edge + 1e-8), 'magnified photos have bounded page-anchored portions');
+                }
+                const identity = payloads.map((value: any) => ({ imageId: value.imageId, target: value.target }));
+                if (dpr === 1) { selected.set(zoom, identity); }
+                else { assert.deepStrictEqual(identity, selected.get(zoom), 'DPR cannot repartition the same logical cargo'); }
+                assert.ok(f.api.snapshot().cargoBytes <= f.api.snapshot().maxCargoBytes);
+                f.finish();
+                assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+                assert.strictEqual(f.callbacks.size, 0);
+            }
+        }
+    });
+
+    it('scales document bodies modestly with page size and applies screen density once', () => {
+        for (const zoom of [0.5, 1, 1.5, 2, 3, 4]) {
+            for (const dpr of [1, 1.2, 2, 3]) {
+                const f = fixture({ maxActors: 1 }); f.desktop(dpr, 4000, 4000);
+                const page = f.page();
+                page.pageElement.rect = { left: 40, top: 60, width: 640 * zoom, height: 900 * zoom };
+                f.api.setVisiblePages([1]);
+                assert.strictEqual(f.api.offer({ ...page, imageRegions: [
+                    { id: 'small-photo', x: 0.1, y: 0.1, width: 0.15, height: 0.1 },
+                ] }), 'started');
+                f.tick(400);
+                const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width)!;
+                const factor = Math.max(0.8, Math.min(1.35, Math.sqrt(zoom)));
+                const expected = 128 * 1.92 * factor / Math.sqrt(dpr);
+                assert.ok(Math.abs(parseFloat(sprite.style.width) - expected) < 0.02,
+                    `zoom ${zoom} at DPR ${dpr} displays ${sprite.style.width}, expected ${expected}`);
+                assert.ok(sprite.width >= Math.ceil(expected * dpr - 1e-8), 'document growth retains adequate sprite pixels');
+                f.finish();
+                assert.strictEqual(f.callbacks.size, 0);
+            }
+        }
+    });
+
+    it('allocates compact physical sprite pixels within the existing joint byte limit', () => {
+        const f = fixture({ maxActors: 1, device: 'mobile' }); f.desktop(3, 700, 1000);
+        const page = f.page();
+        page.pageElement.rect = { left: 0, top: 32, width: 1280, height: 1800 };
+        f.api.setVisiblePages([1]);
+        assert.strictEqual(f.api.offer({ ...page, imageRegions: [
+            { id: 'phone-photo', x: 0.05, y: 0.05, width: 0.12, height: 0.12 },
+        ] }), 'started');
+        f.tick(400);
+        const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width)!;
+        assert.ok(sprite.width >= Math.ceil(parseFloat(sprite.style.width) * 3 - 0.02),
+            'compact backing must cover the admitted physical artwork size');
+        assert.ok(sprite.height >= Math.ceil(parseFloat(sprite.style.height) * 3 - 0.02));
+        const state = f.api.snapshot();
+        assert.strictEqual(state.maxSpriteBytes, 4 * 128 * 100 * 4);
+        assert.ok(state.spriteBytes <= state.maxSpriteBytes);
+        f.finish();
+        assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+    });
+
+    it('admits fewer sharp compact actors rather than exceeding their shared sprite budget', () => {
+        const leased = new Set<string>();
+        const f = fixture({ device: 'mobile' }); f.desktop(3, 4000, 4000);
+        f.api.setDispatchOrigin({ reserve(vehicle: string) {
+            if (leased.has(vehicle)) { return; }
+            leased.add(vehicle); return { x: 40, y: 100, scale: 0.2 };
+        }, destination: () => ({ x: 40, y: 100, scale: 0.2 }), release: (vehicle: string) => leased.delete(vehicle) });
+        const page = f.page(99);
+        page.pageElement.rect = { left: 40, top: 60, width: 2560, height: 3600 };
+        f.api.setVisiblePages([99]);
+        assert.strictEqual(f.api.offer({ ...page, imageRegions: [
+            { id: 'large-phone-photo', x: 0.2, y: 0.2, width: 0.5, height: 0.5 },
+        ] }), 'started');
+        const state = f.api.snapshot();
+        assert.strictEqual(state.maxActors, 4);
+        assert.strictEqual(state.activeActors, 1, 'two full-density sprites would exceed the existing 200 KiB ceiling');
+        assert.strictEqual(leased.size, 1, 'failed cooperative allocation returned its temporary reservation');
+        assert.ok(state.spriteBytes <= state.maxSpriteBytes);
+        f.tick(600);
+        const actor = f.api.snapshot().pages[0].actors[0];
+        const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width)!;
+        assert.ok(sprite.width >= Math.ceil(128 * actor.spriteScale * 3 - 1e-8));
+        f.finish();
+        assert.strictEqual(leased.size, 0);
+        assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+        assert.strictEqual(f.callbacks.size, 0);
+    });
+
+    it('keeps a partly visible giant photo portion and its owners stable through refinement and zoom cancellation', () => {
+        const f = fixture({ maxActors: 4 }); f.desktop(1.2);
+        const page = f.page(99);
+        page.pageElement.rect = { left: -700, top: -600, width: 2560, height: 3600 };
+        page.canvas.width = 160; page.canvas.height = 225;
+        const imageRegions = [{ id: 'giant-photo', x: 0.05, y: 0.05, width: 0.9, height: 0.9 }];
+        f.api.setVisiblePages([99]);
+        assert.strictEqual(f.api.offer({ ...page, kind: 'preview', imageRegions }), 'started');
+        const before = f.api.snapshot().pages[0].payloads;
+        assert.ok(before.every((value: any) => value.target.width * 2560 <= 540 + 1e-8
+            && value.target.height * 3600 <= 540 + 1e-8), 'a visible sliver cannot select the whole giant source');
+        f.tick(100);
+        const sharp = new Canvas(f.document); sharp.width = 640; sharp.height = 900;
+        assert.ok(f.api.refine({ ...page, canvas: sharp, imageRegions }) > 0);
+        const after = f.api.snapshot().pages[0].payloads;
+        for (let index = 0; index < before.length; index++) {
+            for (const key of ['id', 'imageId', 'target', 'helpers', 'deadline']) {
+                assert.deepStrictEqual(after[index][key], before[index][key], key + ' survives sharper pixels');
+            }
+            assert.ok(after[index].rasterWidth >= before[index].rasterWidth && after[index].rasterHeight >= before[index].rasterHeight);
+        }
+        assert.ok(f.api.snapshot().peakCargoBytes <= f.api.snapshot().maxCargoBytes);
+        f.api.setVisiblePages([]);
+        page.pageElement.rect = { left: 40, top: 60, width: 640, height: 900 };
+        f.api.setVisiblePages([99]);
+        assert.strictEqual(f.api.offer({ ...page, imageRegions }), 'skipped', 'zoom cannot replay handled cargo');
+        assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+        assert.strictEqual(f.api.snapshot().activeArrivalCovers, 0);
+        assert.strictEqual(f.callbacks.size, 0);
+    });
+
     it('prefers an actual image placement and carries its exact rendered crop cooperatively', () => {
         const f = fixture({ maxActors: 2 }); f.desktop();
         const page = f.page(99);
@@ -2799,6 +3080,229 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(cargo.zeroWrites, 1, 'shared cargo is released once after deposit');
         assert.strictEqual(f.api.snapshot().deliveredFragments, baseline + 1);
         assert.strictEqual(f.callbacks.size, 0);
+    });
+
+    it('promotes the staged L-UGV into a shallow turn lift without changing its crop owner or clock', () => {
+        for (const dx of [80, -80]) {
+            const { f, actor, sprite, start, delivery, held, reservations } = stagedLugv();
+            pointer(f, 'pointermove', { x: start.x - 10, y: start.y }); f.frame();
+            const reserved = reservations.length;
+            assert.strictEqual(f.api.offer(delivery(dx)), 'started');
+            const before = f.api.snapshot().pages[0].payloads[0], duration = before.deadline - f.now;
+            assert.ok(before.helpers.includes(actor.id), 'promotion keeps the actual staged body');
+            f.tick(duration * 0.62 * 0.2);
+            if (dx > 0) {
+                const stopped = point(sprite);
+                assert.ok(Math.hypot(stopped.x - start.x, stopped.y - start.y) < 0.04, 'L-UGV does not reverse before recruitment');
+            }
+            f.tick(duration * 0.62 * 0.4);
+            const current = f.api.snapshot().pages[0].payloads[0];
+            assert.strictEqual(current.routeState.requiresAir, dx > 0, 'committed travel, not gaze, determines a turn');
+            assert.strictEqual(current.routeState.groundCarried, dx > 0);
+            assert.strictEqual(current.routeState.reason, dx > 0 ? 'turn' : undefined);
+            if (dx > 0) {
+                const groundPoint = point(sprite), route = current.routeState;
+                assert.ok(Math.hypot(groundPoint.x - route.ground.x, groundPoint.y - route.ground.y) < 0.04);
+                const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
+                const pixels = point(cargo);
+                assert.ok(Math.hypot(pixels.x - route.cargo.x, pixels.y - route.cargo.y) < 0.04, 'the same photograph stays attached to the carried chassis');
+            }
+            assert.strictEqual(current.deadline, before.deadline); assert.deepStrictEqual(current.helpers, before.helpers);
+            assert.deepStrictEqual(current.target, before.target); assert.strictEqual(current.id, before.id);
+            assert.strictEqual(reservations.length, reserved, 'the owned staged aircraft is reused first');
+            let reverseReturn = false;
+            while (f.callbacks.size) {
+                f.frame();
+                const returning = f.api.snapshot().pages[0]?.payloads[0];
+                if (returning?.stage !== 'return') { continue; }
+                assert.strictEqual(returning.routeState.reason, 'turn', 'the same companion carries a committed reverse return');
+                reverseReturn ||= returning.routeState.groundCarried;
+                assert.deepStrictEqual(returning.helpers, before.helpers); assert.strictEqual(returning.deadline, before.deadline);
+            }
+            assert.ok(reverseReturn);
+            f.finish();
+            assert.strictEqual(held.size + f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+        }
+    });
+
+    it('retains the same staged L-UGV when a turn carrier is unavailable or exceeds the backing budget', () => {
+        for (const carrier of ['unavailable', 'overbudget'] as const) {
+            const { f, actor, delivery, held, reservations, releases } = stagedLugv(carrier);
+            assert.strictEqual(f.api.offer(delivery(80)), 'started');
+            const before = f.api.snapshot().pages[0].payloads[0];
+            assert.deepStrictEqual(before.helpers, [actor.id], 'failed assistance keeps the already-owned ground route');
+            assert.strictEqual(before.mode, 'solo');
+            if (carrier === 'overbudget') {
+                assert.ok(reservations.includes('quad'));
+                assert.strictEqual(releases.filter(value => value === 'quad').length, 1, 'failed physical allocation returns its lease');
+            }
+            const reserved = reservations.length;
+            while (f.callbacks.size && f.now < before.deadline * 0.75) { f.frame(); }
+            assert.strictEqual(reservations.length, reserved, 'a failed outbound preference is not retried per paint');
+            f.finish();
+            assert.strictEqual(held.size + f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+        }
+    });
+
+    it('lets an empty staged L-UGV recruit its owned aircraft for a finite reverse return', () => {
+        const { f, page, actor, sprite, start, held, reservations } = stagedLugv();
+        const reserved = reservations.length;
+        f.api.setVisibleWork([work([page], ['ready'])]);
+        f.tick(module.DOCUMENT_ROBOT_LIMITS.advance.returnMs * 0.2);
+        const stopped = point(sprite);
+        assert.ok(Math.hypot(stopped.x - start.x, stopped.y - start.y) < 0.04, 'empty L-UGV waits for its actual carrier');
+        f.tick(module.DOCUMENT_ROBOT_LIMITS.advance.returnMs * 0.4);
+        const state = f.api.snapshot().advance[0];
+        assert.strictEqual(state.returnCarry.ground, actor.id);
+        assert.strictEqual(state.returnCarry.reason, 'turn');
+        assert.strictEqual(state.returnCarry.route.groundCarried, true);
+        assert.strictEqual(reservations.length, reserved);
+        f.finish();
+        assert.strictEqual(held.size + f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+    });
+
+    it('reserves one real helper for an ordinary L-UGV reverse return without recreating delivered cargo', () => {
+        const f = fixture({ maxActors: 2, encounterRandom: () => 0.99 }); f.desktop(1, 1280, 1000);
+        const held = new Set<string>(), releases: string[] = [];
+        let airAvailable = false, airReservations = 0;
+        const groundDock = { x: 1100, y: 340, scale: 0.7 }, airDock = { x: 1100, y: 90, scale: 0.7 };
+        f.api.setDispatchOrigin({ reserve(vehicle: string) {
+            if (held.has(vehicle) || vehicle !== 'lugv' && (vehicle !== 'quad' || !airAvailable)) { return; }
+            held.add(vehicle); if (vehicle === 'quad') { airReservations++; }
+            return vehicle === 'lugv' ? groundDock : airDock;
+        }, destination: (vehicle: string) => vehicle === 'lugv' ? groundDock : airDock,
+        release(vehicle: string) { assert.ok(held.delete(vehicle)); releases.push(vehicle); } });
+        const page = f.page(99); page.pageElement.rect = { left: 40, top: 60, width: 1000, height: 800 };
+        f.api.setVisiblePages([99]);
+        assert.strictEqual(f.api.offer({ ...page, imageRegions: [{ id: 'solo-lugv', x: 0.4, y: 0.15, width: 0.2, height: 0.2 }] }), 'started');
+        const before = f.api.snapshot().pages[0].payloads[0];
+        assert.strictEqual(before.mode, 'solo'); assert.strictEqual(before.helpers.length, 1);
+        const copies = f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotCargo').length;
+        f.tick(before.deadline * 0.70); airAvailable = true;
+        let carried = false;
+        while (f.callbacks.size) {
+            f.frame();
+            const state = f.api.snapshot(), current = state.pages[0]?.payloads[0];
+            if (current?.stage !== 'return') { continue; }
+            assert.strictEqual(current.id, before.id); assert.strictEqual(current.deadline, before.deadline);
+            assert.deepStrictEqual(current.target, before.target); assert.strictEqual(current.helpers[0], before.helpers[0]);
+            assert.strictEqual(current.helpers.length, 2, 'one real helper joins the same finite owner');
+            assert.strictEqual(current.routeState.reason, 'turn');
+            carried ||= current.routeState.groundCarried;
+            if (current.routeState.groundCarried) {
+                for (const actor of state.pages[0].actors) {
+                    const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.dataset.courier === String(actor.id))!;
+                    const position = point(sprite), target = actor.vehicle === 'lugv' ? current.routeState.ground : current.routeState.air;
+                    assert.ok(Math.hypot(position.x - target.x, position.y - target.y) < 0.04, 'both real bodies keep the rigid carry attachment');
+                    assert.ok(sprite.width >= Math.floor(parseFloat(sprite.style.width)), 'the recruited body retains its physical raster quality');
+                }
+            }
+            assert.strictEqual(state.cargoBytes + state.activePayloads + state.activeArrivalCovers, 0);
+            assert.ok(state.activeActors <= state.maxActors && state.spriteBytes <= state.maxSpriteBytes);
+        }
+        assert.ok(carried); assert.strictEqual(airReservations, 1);
+        assert.strictEqual(releases.filter(value => value === 'quad').length, 1);
+        assert.strictEqual(f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotCargo').length, copies);
+        assert.strictEqual(held.size + f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+    });
+
+    it('releases every L-UGV carry helper and sling on hard termination without reviving a stale frame', () => {
+        for (const kind of ['payload', 'advance']) {
+            for (const ending of ['offscreen', 'hide', 'reduce', 'disable', 'reset', 'dispose']) {
+                const { f, page, delivery, held } = stagedLugv();
+                if (kind === 'payload') {
+                    assert.strictEqual(f.api.offer(delivery(80)), 'started');
+                    const payload = f.api.snapshot().pages[0].payloads[0];
+                    f.tick((payload.deadline - f.now) * 0.86);
+                    assert.strictEqual(f.api.snapshot().pages[0].payloads[0].routeState.groundCarried, true);
+                } else {
+                    f.api.setVisibleWork([work([page], ['ready'])]);
+                    f.tick(module.DOCUMENT_ROBOT_LIMITS.advance.returnMs * 0.5);
+                    assert.strictEqual(f.api.snapshot().advance[0].returnCarry.route.groundCarried, true);
+                }
+                const slings = sceneNodes(f.container).filter(node => node.className === 'pdfDocumentRobotSling');
+                assert.strictEqual(slings.length, 1);
+                const late = [...f.callbacks.values()], allocated = f.owned.length;
+                if (ending === 'offscreen') { f.api.setVisiblePages([]); }
+                else if (ending === 'hide') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+                else if (ending === 'reduce') { f.media.matches = true; f.media.emit('change'); }
+                else if (ending === 'disable') { f.api.setEnabled(false); }
+                else { f.api[ending](); }
+                for (const callback of late) { callback(f.now + 40); }
+                assert.strictEqual(f.owned.length, allocated);
+                assert.ok(slings.every(sling => !sling.parentNode));
+                assert.strictEqual(held.size + f.callbacks.size + f.api.snapshot().retainedBytes, 0, kind + ':' + ending);
+            }
+        }
+    });
+
+    it('transfers an interrupted empty carry to ready pixels without leaving its old sling owner', () => {
+        const { f, page, delivery, held } = stagedLugv();
+        f.api.setVisibleWork([work([page], ['ready'])]);
+        f.tick(module.DOCUMENT_ROBOT_LIMITS.advance.returnMs * 0.5);
+        const previous = f.api.snapshot().advance[0].returnCarry;
+        const sling = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotSling')!;
+        assert.ok(previous && sling);
+        f.api.setVisibleWork([work([page], ['preparing'])]);
+        assert.strictEqual(f.api.offer(delivery(80)), 'started');
+        assert.ok(!sling.parentNode, 'the former empty-return owner drops its hardware on promotion');
+        assert.ok(f.api.snapshot().advance.every((value: any) => !value.returnCarry));
+        const helpers = f.api.snapshot().pages[0].payloads.flatMap((value: any) => value.helpers);
+        assert.ok(helpers.includes(previous.ground));
+        f.finish();
+        assert.strictEqual(held.size + f.callbacks.size + f.api.snapshot().retainedBytes, 0);
+    });
+
+    it('ends an empty L-UGV carry as one owner if either body cannot be painted', () => {
+        for (const vehicle of ['lugv', 'quad']) {
+            const { f, page, held } = stagedLugv();
+            f.api.setVisibleWork([work([page], ['ready'])]);
+            f.tick(module.DOCUMENT_ROBOT_LIMITS.advance.returnMs * 0.5);
+            const current = f.api.snapshot().advance[0];
+            assert.strictEqual(current.returnCarry.route.groundCarried, true);
+            const body = current.actors.find((actor: any) => actor.vehicle === vehicle);
+            const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle'
+                && canvas.dataset.courier === String(body.id))!;
+            sprite.context.clearRect = () => { throw new Error('owned artwork failed'); };
+            pointer(f, 'pointermove', point(sprite)); f.frame();
+            assert.ok(f.api.snapshot().rejected > 0, 'the actual artwork paint reached its failure boundary');
+            assert.strictEqual(held.size + f.api.snapshot().retainedBytes, 0, 'the pair and its hardware retire together');
+            assert.strictEqual(sceneNodes(f.container).filter(node => node.className === 'pdfDocumentRobotSling').length, 0);
+            f.frame();
+            assert.strictEqual(f.callbacks.size, 0, 'the existing dirty paint settles without a return loop');
+        }
+    });
+
+    it('reuses a handoff aircraft from its completed pose for the L-UGV reverse return', () => {
+        const f = fixture({ maxActors: 2, encounterRandom: () => 0.99 }); f.desktop(1, 1280, 1000);
+        const held = new Set<string>();
+        const groundDock = { x: 1000, y: 380, scale: 0.7 }, airDock = { x: 1000, y: 90, scale: 0.7 };
+        f.api.setDispatchOrigin({ reserve(vehicle: string) {
+            if (!['lugv', 'quad'].includes(vehicle) || held.has(vehicle)) { return; }
+            held.add(vehicle); return vehicle === 'lugv' ? groundDock : airDock;
+        }, destination: (vehicle: string) => vehicle === 'lugv' ? groundDock : airDock,
+        release(vehicle: string) { assert.ok(held.delete(vehicle)); } });
+        let payload: any, started = 0;
+        for (let id = 1; id <= 20; id++) {
+            const page = f.page(id); page.pageElement.rect = { left: 40, top: 60, width: 1000, height: 800 };
+            f.api.setVisiblePages([id]); started = f.now;
+            f.api.offer({ ...page, imageRegions: [{ id: 'handoff-' + id, x: 0.4, y: 0.15, width: 0.2, height: 0.2 }] });
+            payload = f.api.snapshot().pages[0]?.payloads.find((value: any) => value.mode === 'handoff');
+            if (payload) { break; } f.finish();
+        }
+        assert.ok(payload, 'the real mode sequence admits a L-UGV handoff');
+        const duration = payload.deadline - started;
+        f.tick(started + duration * 0.70 - f.now);
+        const air = f.api.snapshot().pages[0].actors.find((value: any) => value.vehicle === 'quad');
+        const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.dataset.courier === String(air.id))!;
+        const before = point(sprite);
+        f.tick(started + duration * 0.76 - f.now);
+        const after = point(sprite);
+        assert.ok(Math.hypot(after.x - before.x, after.y - before.y) < 0.04, 'a completed handoff cannot jump back to its initial aerial offset');
+        const current = f.api.snapshot().pages[0].payloads[0];
+        assert.strictEqual(current.routeState.reason, 'turn');
+        assert.strictEqual(current.deadline, payload.deadline); assert.deepStrictEqual(current.helpers, payload.helpers);
+        f.finish(); assert.strictEqual(held.size + f.callbacks.size + f.api.snapshot().retainedBytes, 0);
     });
 
     it('recruits an aircraft to carry the L-UGV itself through a steep leg before its final ground drive', () => {
@@ -3172,9 +3676,10 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             for (let i = 0; i < 12; i++) { f.frame(); }
             const sprites = f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width);
             assert.strictEqual(sprites.length, 12);
-            const scale = 1.92 / Math.sqrt(dpr);
+            const documentScale = (465 * 661 / (640 * 900)) ** 0.25;
+            const scale = 1.92 * documentScale / Math.sqrt(dpr);
             for (const sprite of sprites) {
-                assert.ok(Math.abs(parseFloat(sprite.style.width) - 128 * scale) < 0.02, 'CSS size receives partial DPI compensation exactly once');
+                assert.ok(Math.abs(parseFloat(sprite.style.width) - 128 * scale) < 0.02, 'CSS size receives document growth and partial DPI compensation exactly once');
                 assert.deepStrictEqual([sprite.width, sprite.height], [Math.ceil(128 * scale * dpr), Math.ceil(100 * scale * dpr)]);
                 assert.ok(sprite.transforms.some(values => values[0] >= scale * dpr && values[3] >= scale * dpr), 'artwork is redrawn into display-resolution backing');
             }
@@ -3211,7 +3716,12 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             assert.strictEqual(state.maxCargoBytes, 512 * 1024);
             assert.strictEqual(state.maxSpriteBytes, 4 * 128 * 100 * 4);
             assert.ok(state.activeActors <= 4 && state.cargoBytes <= 512 * 1024 && state.spriteBytes <= state.maxSpriteBytes);
-            assert.ok(f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle').every(canvas => canvas.width === 128 && canvas.height === 100));
+            f.frame();
+            const actors = f.api.snapshot().pages.flatMap((page: any) => page.actors);
+            assert.ok(f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width).every(canvas => {
+                const scale = actors.find((actor: any) => String(actor.id) === canvas.dataset.courier)!.spriteScale;
+                return canvas.width >= Math.ceil(128 * scale * 3 - 1e-8) && canvas.height >= Math.ceil(100 * scale * 3 - 1e-8);
+            }), 'even staggered, not-yet-painted actors have backing for their admitted physical size');
         }
         const touchscreenDesktop = fixture();
         touchscreenDesktop.desktop();
@@ -3333,7 +3843,8 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const sprites = f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width);
         assert.ok(sprites.every(sprite => Math.abs(parseFloat(sprite.style.width) - 128 * 86 / 250 / Math.sqrt(2)) < 0.02));
         f.now += 700; f.frame();
-        assert.ok(sprites.every(sprite => Math.abs(parseFloat(sprite.style.width) - 128 * 1.92 / Math.sqrt(2)) < 0.02));
+        const documentScale = (465 * 661 / (640 * 900)) ** 0.25;
+        assert.ok(sprites.every(sprite => Math.abs(parseFloat(sprite.style.width) - 128 * 1.92 * documentScale / Math.sqrt(2)) < 0.02));
         f.finish();
         assert.ok(lab.snapshot().actors.every((actor: any) => !actor.outside));
         assert.strictEqual(f.api.snapshot().retainedBytes, 0);
@@ -3586,8 +4097,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.api.setVisiblePages([1]);
         const original = Canvas.prototype.getContext;
         Canvas.prototype.getContext = function () {
-            return this.width === module.ROBOT_ARTWORK_SIZE.width && this.height === module.ROBOT_ARTWORK_SIZE.height
-                ? null : original.call(this);
+            const context = original.call(this);
+            if (context && f.owned.includes(this)) {
+                context.clearRect = () => { throw new Error('artwork raster unavailable'); };
+            }
+            return context;
         };
         try { assert.strictEqual(f.api.deliver(page), false); }
         finally { Canvas.prototype.getContext = original; }
