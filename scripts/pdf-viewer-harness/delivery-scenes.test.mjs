@@ -15,6 +15,7 @@ test('reading images, layout and descriptor traffic remain separate from applica
     assert.equal(deliveryRequestCategory(root + 'reading/layout-sha.pdf'), 'reading-layout');
     assert.equal(deliveryRequestCategory(root + 'reading/image-sha.jpg'), 'reading-images');
     assert.equal(deliveryRequestCategory(root + 'reading/image-sha.bin'), 'reading-images');
+    assert.equal(deliveryRequestCategory('/reading-bridge'), 'reading-images');
     assert.equal(deliveryRequestCategory(root + 'previews/page-99.png'), 'previews');
     assert.equal(deliveryRequestCategory('/spomenar/app.js'), 'application');
 });

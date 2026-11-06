@@ -50,6 +50,12 @@ and partially received transfers, with separate totals for original PDF bytes, r
 reading images, reading manifest, raster previews and application assets. Completed transfer
 totals include response headers; `bodyBytes` counts received body data.
 
+The same observer can measure the maintained fixture server's actual PDF.js and Overleaf
+adapters. It binds their native viewer and event bus at application or host initialization.
+The Overleaf adapter receives the requested page and zoom through its native viewer; the
+full PDF.js viewer keeps its ordinary URL-fragment startup. Registered image reads through
+`/reading-bridge` count as reading-image traffic.
+
 The runner uses the same sparse native capture as the Motion Lab scenarios so an emulated
 background viewport continues rendering normally. Its result records the actual CSS viewport,
 DPR, frame cadence and capture acknowledgments. An optional PNG failure retains the timings

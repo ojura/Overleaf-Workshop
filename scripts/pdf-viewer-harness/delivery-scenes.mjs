@@ -35,7 +35,7 @@ const zoom = positive('zoom', 75, 1000), budgetMs = positive('budget-ms', 60000,
 const latency = options.get('latency-ms', 40), downloadKib = options.get('download-kib', 4096);
 if (latency < 0 || downloadKib <= 0) throw new Error('Latency must be nonnegative and throughput must be positive');
 url.hash = 'page=' + pages[0] + '&zoom=' + zoom;
-const settings = { origin: url.origin, pages, spread: { none: 0, odd: 1, even: 2 }[options.get('spread', 'odd')],
+const settings = { origin: url.origin, pages, zoom, spread: { none: 0, odd: 1, even: 2 }[options.get('spread', 'odd')],
     budgetMs, robots: options.get('robots', 'off') === 'on', finishOnRender: options.has('finish-on-render'), finishOnFinal: options.has('finish-on-final') };
 const requests = new Map(), failures = [];
 let connection, target, targetId, result, rendering, tabZoom;

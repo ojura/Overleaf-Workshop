@@ -8,14 +8,16 @@ function fixture() {
     const views = [1, 2].map(number => ({ number, redrawImages: () => true }));
     let finished = true, ready;
     const started = () => new Promise(resolve => { ready = resolve; });
+    const viewer = {
+        getPageView: index => views[index],
+        renderingQueue: { renderView: view => { queued.push(view.number); ready?.(); return true; } },
+        eventBus: { on: (_name, callback) => listeners.add(callback), off: (_name, callback) => listeners.delete(callback) },
+    };
     const context = vm.createContext({
         window: { __pdfDeliveryObservation: {
             snapshot: () => ({ finished }),
+            viewer: () => viewer,
             captureCanvases: () => { const value = { after: [...queued] }; captures.push(value); return value; },
-        }, PDFViewerApplication: {
-            pdfViewer: { getPageView: index => views[index] },
-            pdfRenderingQueue: { renderView: view => { queued.push(view.number); ready?.(); return true; } },
-            eventBus: { on: (_name, callback) => listeners.add(callback), off: (_name, callback) => listeners.delete(callback) },
         } },
         setTimeout: callback => { timers.add(callback); return callback; },
         clearTimeout: callback => timers.delete(callback),

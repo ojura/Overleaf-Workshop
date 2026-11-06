@@ -17,7 +17,7 @@ export function installDeliveryObservation(options) {
 
     const started = performance.now(), pages = new Map(options.pages.map(page => [page, { page, renders: [] }]));
     const errors = [], events = [], frameTimes = [];
-    let app, frame, timer, lastFrame, lastProbe = -Infinity, finished, finishedAt, waiting, sampledAt = 0;
+    let viewer, initializing = false, frame, timer, lastFrame, lastProbe = -Infinity, finished, finishedAt, waiting, sampledAt = 0;
     const scratch = document.createElement('canvas');
     scratch.width = scratch.height = 48;
     const context = scratch.getContext('2d', { willReadFrequently: true });
@@ -57,8 +57,7 @@ export function installDeliveryObservation(options) {
             && box.right <= Math.min(clip.right, innerWidth) + .5 && box.bottom <= Math.min(clip.bottom, innerHeight) + .5;
     };
     function observe() {
-        if (!app?.pdfViewer) return;
-        const viewer = app.pdfViewer;
+        if (!viewer) return;
         for (const [number, result] of pages) {
             const view = viewer.getPageView(number - 1);
             if (!view) continue;
@@ -123,9 +122,9 @@ export function installDeliveryObservation(options) {
             reader: state ? { visible: state.visible, visibleMissing: state.visibleMissing, idle: state.idle,
                 previewBytes: state.previewBytes, canvasBytes: state.canvasBytes, rangeCache: state.rangeCache,
                 previewSource: state.previewSource, performance: state.performance } : null,
-            document: { pages: app?.pdfDocument?.numPages ?? null, sourceUrl: app?.url ?? null,
-                fingerprints: app?.pdfDocument?.fingerprints ?? null,
-                nativeWorker: app?.pdfDocument?._transport?.messageHandler?.comObj instanceof Worker,
+            document: { pages: viewer?.pdfDocument?.numPages ?? null, sourceUrl: window.PDFViewerApplication?.url ?? null,
+                fingerprints: viewer?.pdfDocument?.fingerprints ?? null,
+                nativeWorker: viewer?.pdfDocument?._transport?.messageHandler?.comObj instanceof Worker,
                 notice: document.querySelector('#spomenarNotice[data-error]')?.textContent?.trim() ?? null } };
     }
     function finish(reason) {
@@ -133,27 +132,44 @@ export function installDeliveryObservation(options) {
         finishedAt = at();
         finished = reason;
         cancelAnimationFrame(frame); clearTimeout(timer);
+        removeStartupListeners();
         try { observe(); } catch (error) { errors.push({ at: at(), message: String(error) }); }
         waiting?.();
     }
-    document.addEventListener('webviewerloaded', event => {
-        if (event.detail?.source !== window) return;
-        app = window.PDFViewerApplication;
-        app.initializedPromise.then(() => {
-            app.eventBus.on('pagesinit', () => {
-                if (options.pages.some(page => page > app.pdfDocument.numPages)) {
+    function removeStartupListeners() {
+        document.removeEventListener('webviewerloaded', loaded);
+        document.removeEventListener('DOMContentLoaded', attach);
+        window.removeEventListener('message', attach);
+    }
+    function loaded(event) { if (event.detail?.source === window) attach(); }
+    function attach() {
+        if (viewer || initializing || finished) return;
+        const application = window.PDFViewerApplication, component = window.overleafViewer;
+        if (!application && !component) return;
+        initializing = true;
+        (application?.initializedPromise ?? Promise.resolve()).then(() => {
+            if (finished) return;
+            viewer = application?.pdfViewer ?? component?.wrapper?.viewer;
+            if (!viewer?.eventBus) throw new Error('Native delivery viewer is unavailable');
+            removeStartupListeners();
+            viewer.eventBus.on('pagesinit', () => {
+                if (options.pages.some(page => page > viewer.pdfDocument.numPages)) {
                     errors.push({ at: at(), message: 'A requested page is outside the loaded document' });
                     finish('page-range-error'); return;
                 }
-                app.pdfViewer.spreadMode = options.spread;
-                app.pdfViewer.pagesRotation = 0;
+                viewer.spreadMode = options.spread;
+                viewer.pagesRotation = 0;
+                if (component && !application) {
+                    if (Number.isFinite(options.zoom)) viewer.currentScaleValue = String(options.zoom / 100);
+                    viewer.currentPageNumber = options.pages[0];
+                }
                 window.pdfPrefetch?.setRobotsEnabled(options.robots);
                 mark('pages-init');
             });
-            app.eventBus.on('textlayerrendered', event => {
+            viewer.eventBus.on('textlayerrendered', event => {
                 if (pages.has(event.pageNumber)) mark('text-layer-rendered', event.pageNumber, { error: event.error ? String(event.error) : null });
             });
-            app.eventBus.on('pagerendered', event => {
+            viewer.eventBus.on('pagerendered', event => {
                 if (finished) return;
                 const result = pages.get(event.pageNumber);
                 if (!result) return;
@@ -166,12 +182,16 @@ export function installDeliveryObservation(options) {
                     requestAnimationFrame(() => requestAnimationFrame(() => finish('pages-rendered')));
                 }
                 if (options.finishOnFinal && [...pages.values()].every(page => page.renders.some(render => !render.cssTransform && !render.error
-                    && (!app.pdfDocument.hasExternalImages || render.imageStatus?.final && render.imageStatus.failed === 0)))) {
+                    && (!viewer.pdfDocument.hasExternalImages || render.imageStatus?.final && render.imageStatus.failed === 0)))) {
                     requestAnimationFrame(() => requestAnimationFrame(() => finish('final-images-rendered')));
                 }
             });
         }).catch(error => { errors.push({ at: at(), message: String(error) }); finish('initialization-error'); });
-    });
+    }
+    document.addEventListener('webviewerloaded', loaded);
+    document.addEventListener('DOMContentLoaded', attach);
+    // The Overleaf adapter exposes its actual wrapper before awaiting the host's initState.
+    window.addEventListener('message', attach);
     window.addEventListener('error', event => {
         if (errors.length < 128) errors.push({ at: at(), message: event.message });
     });
@@ -181,14 +201,14 @@ export function installDeliveryObservation(options) {
     frame = requestAnimationFrame(sampleFrame);
     timer = setTimeout(() => finish('measurement-budget'), options.budgetMs);
     window.__pdfDeliveryObservation = {
-        snapshot, finish,
+        snapshot, finish, viewer: () => viewer,
         captureCanvases() {
             const captures = [];
             let pixels = 0;
             for (const number of pages.keys()) {
-                const view = app?.pdfViewer?.getPageView(number - 1), canvas = view?.canvas;
+                const view = viewer?.getPageView(number - 1), canvas = view?.canvas;
                 if (!canvas?.width || !canvas.height || view.renderingState !== 3) throw new Error('Page ' + number + ' has not completed a native pass');
-                if (app.pdfDocument.hasExternalImages && (!view.paintedImageStatus?.final || view.paintedImageStatus.failed !== 0)) {
+                if (viewer.pdfDocument.hasExternalImages && (!view.paintedImageStatus?.final || view.paintedImageStatus.failed !== 0)) {
                     throw new Error('Page ' + number + ' has not painted final image quality');
                 }
                 pixels += canvas.width * canvas.height;
@@ -211,6 +231,7 @@ export function installDeliveryObservation(options) {
 }
 
 export function deliveryRequestCategory(pathname) {
+    if (pathname === '/reading-bridge') return 'reading-images';
     if (/\/reading\.json$/.test(pathname)) return 'reading-manifest';
     if (/\/reading\/[^/]+\.pdf$/i.test(pathname)) return 'reading-layout';
     if (/\/reading\/[^/]+$/.test(pathname)) return 'reading-images';
@@ -220,27 +241,28 @@ export function deliveryRequestCategory(pathname) {
 /** Repaint only after the measurement is frozen, through the native queue. This
  * isolates final canvas reproducibility without changing reported delivery time. */
 export async function repaintDeliveryPages(pages) {
-    const observation = window.__pdfDeliveryObservation, app = window.PDFViewerApplication;
+    const observation = window.__pdfDeliveryObservation;
     if (!observation?.snapshot().finished) throw new Error('Finish delivery measurement before a verification repaint');
+    const viewer = observation.viewer();
     observation.captureCanvases();
     for (const number of pages) {
-        const view = app.pdfViewer.getPageView(number - 1);
-        if (!view?.redrawImages || !app.pdfRenderingQueue) throw new Error('Native image replay is unavailable');
+        const view = viewer?.getPageView(number - 1);
+        if (!view?.redrawImages || !viewer.renderingQueue) throw new Error('Native image replay is unavailable');
         await new Promise((resolve, reject) => {
             let timer;
             const finish = error => {
-                clearTimeout(timer); app.eventBus.off('pagerendered', rendered);
+                clearTimeout(timer); viewer.eventBus.off('pagerendered', rendered);
                 if (error) reject(error); else resolve();
             };
             const rendered = event => {
                 if (event.source !== view || event.pageNumber !== number || event.isDetailView || event.cssTransform) return;
                 finish(event.error ? new Error(String(event.error)) : undefined);
             };
-            app.eventBus.on('pagerendered', rendered);
+            viewer.eventBus.on('pagerendered', rendered);
             // The native renderer may stop answering; ordinary completion follows its event.
             timer = setTimeout(() => finish(new Error('Native verification repaint did not complete')), 10000);
             try {
-                if (!view.redrawImages() || !app.pdfRenderingQueue.renderView(view)) throw new Error('Native queue refused the verification repaint');
+                if (!view.redrawImages() || !viewer.renderingQueue.renderView(view)) throw new Error('Native queue refused the verification repaint');
             } catch (error) { finish(error); }
         });
     }

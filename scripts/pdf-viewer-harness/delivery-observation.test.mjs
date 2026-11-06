@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { installDeliveryObservation } from './delivery-observation.mjs';
 
-async function observation() {
+async function observation(engine = 'pdfjs') {
     let now = 0, serial = 0, drawn;
-    const frames = new Map(), timers = new Map(), documentEvents = new Map(), pageEvents = new Map();
+    const frames = new Map(), timers = new Map(), documentEvents = new Map(), windowEvents = new Map(), pageEvents = new Map();
     const rectangle = { left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100 };
     const canvas = { isConnected: true, width: 100, height: 100, parentElement: null, ink: true,
         style: { display: 'block', visibility: 'visible', opacity: '1' },
@@ -31,6 +31,7 @@ async function observation() {
         clearTimeout: id => timers.delete(id),
         document: {
             addEventListener: (name, callback) => documentEvents.set(name, callback),
+            removeEventListener: name => documentEvents.delete(name),
             dispatch: (name, event) => documentEvents.get(name)?.(event),
             querySelector: () => null,
             createRange: () => ({ selectNodeContents() {}, getClientRects: () => [rectangle] }),
@@ -48,12 +49,20 @@ async function observation() {
             pdfViewer: { getPageView: index => index === 0 ? view : undefined, container: { getBoundingClientRect: () => rectangle } },
         },
         pdfPrefetch: { snapshot: () => ({}), setRobotsEnabled() {}, robotsEnabled: false },
-        addEventListener() {},
+        addEventListener: (name, callback) => windowEvents.set(name, callback),
+        removeEventListener: name => windowEvents.delete(name),
     });
     context.window = context;
+    const application = context.PDFViewerApplication, viewer = application.pdfViewer;
+    viewer.pdfDocument = application.pdfDocument; viewer.eventBus = application.eventBus;
+    if (engine === 'overleaf') {
+        delete context.PDFViewerApplication;
+        context.overleafViewer = { wrapper: { viewer, eventBus: viewer.eventBus } };
+    }
     vm.runInContext('(' + installDeliveryObservation.toString() + ')(' + JSON.stringify({ origin: 'https://reader.example', pages: [1],
-        spread: 0, budgetMs: 1000, robots: false }) + ')', context);
-    vm.runInContext("document.dispatch('webviewerloaded', {detail:{source:window}})", context);
+        spread: 0, budgetMs: 1000, robots: false, zoom: 75 }) + ')', context);
+    if (engine === 'pdfjs') vm.runInContext("document.dispatch('webviewerloaded', {detail:{source:window}})", context);
+    else windowEvents.get('message')?.({ data: { type: 'initState' } });
     await Promise.resolve();
     pageEvents.get('pagesinit')();
     const render = (at, status = view.paintedImageStatus) => {
@@ -63,7 +72,7 @@ async function observation() {
         view.paintedImageRevision = status.revision;
         pageEvents.get('pagerendered')({ pageNumber: 1, imageStatus: status, imageRevision: status.revision });
     };
-    return { context, view, canvas, localStorage, sessionStorage, render, frames, timers,
+    return { context, view, canvas, viewer, localStorage, sessionStorage, render, frames, timers, windowEvents,
         api: context.__pdfDeliveryObservation };
 }
 
@@ -80,6 +89,24 @@ test('measurement history is local to the tab while unrelated storage remains fu
     h.api.finish('test');
     assert.equal(h.frames.size, 0);
     assert.equal(h.timers.size, 0);
+});
+
+test('the Overleaf adapter uses its native viewer and host startup event for the same delivery milestones', async () => {
+    const h = await observation('overleaf');
+    assert.equal(h.context.PDFViewerApplication, undefined);
+    assert.equal(h.viewer.currentPageNumber, 1);
+    assert.equal(h.viewer.currentScaleValue, '0.75');
+    assert.equal(h.windowEvents.has('message'), false, 'startup listener is released after binding');
+    h.render(10);
+    assert.equal(h.api.snapshot().pages[0].firstSelectableTextMs, 10);
+    h.render(20, { pending: 0, completed: 2, failed: 0, revision: 2, total: 2, covered: 2, final: true });
+    const result = h.api.snapshot();
+    assert.equal(result.document.pages, 1);
+    assert.equal(result.pages[0].firstCompletePageImagePaintMs, 20);
+    assert.equal(result.pages[0].firstFinalPagePaintMs, 20);
+    assert.equal(h.api.captureCanvases()[0].width, 100);
+    assert.equal(h.api.viewer(), h.viewer);
+    h.api.finish('test');
 });
 
 test('text, usable photo coverage and final image quality are independent painted milestones', async () => {
