@@ -45,7 +45,7 @@ describe('reading state in both PDF viewer entry points', function () {
                 const modules: Record<string, string> = {
                     '../common/transport': 'export const generatePdfCachingTransportFactory = () => () => undefined;',
                     '@/features/pdf-preview/util/pdf-js-wrapper': 'export default globalThis.__readingFixture.Wrapper;',
-                    '../common/bridge': 'export const bridgeOutputsOf = () => {};',
+                    '../common/bridge': 'export const bridgeOutputsOf = () => {}; export function readReadingImage() { throw new Error("unexpected image read"); }',
                     '../common/banner': 'export const documentShown = () => {}, showLoadError = () => {}, showBuildState = () => {}, showState = () => {};',
                     '../common/worker': 'export const createWorkerPort = async () => globalThis.__readingFixture.worker();',
                     '../shims/pdf-js': 'export const documentParams = () => ({}), PDFJS = { GlobalWorkerOptions: {}, getDocument: () => globalThis.__readingFixture.task() };',
