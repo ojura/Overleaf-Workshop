@@ -12,7 +12,7 @@ const sha = (bytes: Uint8Array | string) => createHash('sha256').update(bytes).d
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value));
 const repo = path.resolve(__dirname, '..', '..');
 
-function fixture() {
+function fixture(chunkBytes = 6) {
     const pdf = new Uint8Array(Buffer.from('%PDF-1.7 reading fixture'));
     const raw = new Uint8Array([21, 22, 23, 24]);
     const progressive = new Uint8Array([255, 216, 3, 4, 5, 6, 7, 8, 9, 10, 255, 217]);
@@ -23,10 +23,10 @@ function fixture() {
                 width: 2, height: 2, encoding: 'original' },
             { id: 'x2', path: 'reading/x2.jpg', bytes: progressive.length, sha256: sha(progressive),
                 originalSha256: 'b'.repeat(64), width: 8, height: 8, components: 3, encoding: 'progressive-jpeg',
-                coefficientBytes: 768, chunks: [
-                    { offset: 0, bytes: 6, sha256: sha(progressive.slice(0, 6)), scan: 1 },
-                    { offset: 6, bytes: 6, sha256: sha(progressive.slice(6)), scan: 2 },
-                ] },
+                coefficientBytes: 768, chunks: Array.from({ length: progressive.length / chunkBytes }, (_, index) => ({
+                    offset: index * chunkBytes, bytes: chunkBytes,
+                    sha256: sha(progressive.subarray(index * chunkBytes, (index + 1) * chunkBytes)), scan: index + 1,
+                })) },
         ] };
     const manifestBytes = JSON.stringify(manifest);
     const descriptor = { identity: { sha256: manifest.source.sha256, size: manifest.source.size },
@@ -138,24 +138,24 @@ export { PdfPerformance } from ${JSON.stringify(path.join(repo, 'views/pdf-viewe
     });
 
     it('verifies host chunk responses and feeds the existing bandwidth and admission measurements once', async () => {
-        const f = fixture(), metrics = new api.PdfPerformance();
+        const f = fixture(4), metrics = new api.PdfPerformance();
         let release!: (value: any) => void, asked: any;
         const source = await open(f, { metrics, readImage: (value: any) => {
             asked = value; return new Promise(resolve => { release = resolve; });
         } });
         const before = metrics.snapshot();
         try {
-            const pending = source.externalImageSource.read({ id: 'x2', chunkIndex: 1, signal: new AbortController().signal });
-            assert.deepStrictEqual([asked.id, asked.chunkIndex, asked.signal.aborted], ['x2', 1, false]);
+            const pending = source.externalImageSource.read({ id: 'x2', chunkIndex: 1, chunkCount: 2, signal: new AbortController().signal });
+            assert.deepStrictEqual([asked.id, asked.chunkIndex, asked.chunkCount, asked.signal.aborted], ['x2', 1, 2, false]);
             assert.strictEqual(metrics.pendingFetchCount, 1);
             assert.strictEqual(f.calls.length, 2, 'image bytes use the registered host channel, not webview fetch');
-            release(new browser.Response(f.progressive.slice(6), { status: 206,
-                headers: { 'Content-Range': 'bytes 6-11/12', 'Content-Length': '6' } }));
-            assert.deepStrictEqual(await pending, f.progressive.slice(6));
+            release(new browser.Response(f.progressive.slice(4), { status: 206,
+                headers: { 'Content-Range': 'bytes 4-11/12', 'Content-Length': '8' } }));
+            assert.deepStrictEqual(await pending, f.progressive.slice(4));
             const after = metrics.snapshot();
-            assert.strictEqual(after.fetchBytes - before.fetchBytes, 6);
+            assert.strictEqual(after.fetchBytes - before.fetchBytes, 8);
             assert.strictEqual(after.fetchCount - before.fetchCount, 1);
-            assert.strictEqual(after.reading.imageBytes, 6);
+            assert.strictEqual(after.reading.imageBytes, 8);
             assert.strictEqual(after.reading.imageTransfers, 1);
             assert.ok(after.fetchLastDurationMs > 0);
             assert.ok(after.fetchMiBPerSecond > 0);
@@ -166,6 +166,53 @@ export { PdfPerformance } from ${JSON.stringify(path.join(repo, 'views/pdf-viewe
             await rejected;
             assert.strictEqual(metrics.snapshot().reading.failedTransfers, 1);
             assert.strictEqual(metrics.pendingFetchCount, 0);
+        } finally { source.dispose(); }
+    });
+
+    it('batches a verified scan tail into one exact transfer with one bandwidth measurement', async () => {
+        const f = fixture(4), metrics = new api.PdfPerformance(), source = await open(f, { metrics });
+        const signal = new AbortController().signal;
+        try {
+            await source.externalImageSource.read({ id: 'x2', chunkIndex: 0, signal });
+            const before = metrics.snapshot();
+            const tail = await source.externalImageSource.read({ id: 'x2', chunkIndex: 1, chunkCount: 2, signal });
+            assert.deepStrictEqual(tail, f.progressive.slice(4));
+            assert.deepStrictEqual(f.calls.slice(2).map(call => call.headers.Range), ['bytes=0-3', 'bytes=4-11']);
+            const after = metrics.snapshot();
+            assert.strictEqual(after.fetchBytes - before.fetchBytes, 8);
+            assert.strictEqual(after.fetchCount - before.fetchCount, 1);
+            assert.strictEqual(after.reading.imageTransfers - before.reading.imageTransfers, 1);
+            assert.strictEqual(after.pendingFetchCount, 0);
+            const transfer = after.events.filter((event: any) => event.type === 'reading-transfer').at(-1).data;
+            assert.deepStrictEqual([transfer.chunk, transfer.chunkCount, transfer.scan, transfer.lastScan], [1, 2, 2, 3]);
+        } finally { source.dispose(); }
+    });
+
+    it('rejects invalid batch counts and raw-image batching before transport admission', async () => {
+        const f = fixture(4), source = await open(f), signal = new AbortController().signal;
+        try {
+            for (const value of [
+                { id: 'x2', chunkIndex: 1, chunkCount: 0 }, { id: 'x2', chunkIndex: 1, chunkCount: -1 },
+                { id: 'x2', chunkIndex: 1, chunkCount: 1.5 }, { id: 'x2', chunkIndex: 1, chunkCount: '2' },
+                { id: 'x2', chunkIndex: 1, chunkCount: null }, { id: 'x2', chunkIndex: 2, chunkCount: 2 },
+                { id: 'x2', chunkIndex: 0, chunkCount: Number.MAX_SAFE_INTEGER },
+                { id: 'x1', chunkIndex: 0, chunkCount: 2 },
+            ]) { await assert.rejects(source.externalImageSource.read({ ...value, signal }), /Unknown/); }
+            assert.strictEqual(f.calls.length, 2);
+            assert.strictEqual(f.metrics.active, 0);
+        } finally { source.dispose(); }
+    });
+
+    it('verifies every constituent scan in a combined tail before exposing any bytes', async () => {
+        const f = fixture(4), source = await open(f), signal = new AbortController().signal;
+        try {
+            const damaged = f.progressive.slice(); damaged[9] ^= 1;
+            f.resources.set('reading/x2.jpg', damaged);
+            await assert.rejects(source.externalImageSource.read({ id: 'x2', chunkIndex: 1, chunkCount: 2, signal }), /digest/);
+            assert.strictEqual(f.calls.at(-1)?.headers.Range, 'bytes=4-11');
+            assert.strictEqual(f.metrics.bytes, Buffer.byteLength(JSON.stringify(f.manifest)) + f.pdf.length + 8);
+            assert.strictEqual(f.metrics.events.filter(event => event.type === 'reading-transfer' && event.data.kind === 'image').length, 0);
+            assert.strictEqual(f.metrics.active, 0);
         } finally { source.dispose(); }
     });
 
@@ -220,20 +267,21 @@ export { PdfPerformance } from ${JSON.stringify(path.join(repo, 'views/pdf-viewe
         }
     });
 
-    it('keeps an aborted transfer slot until its response settles and never starts its cancelled successor', async () => {
-        const f = fixture(); let release!: (value: any) => void, imageCalls = 0, firstSignal: AbortSignal | undefined;
+    it('keeps an aborted batch transfer slot until its response settles and never starts its cancelled successor', async () => {
+        const f = fixture(4); let release!: (value: any) => void, imageCalls = 0, firstSignal: AbortSignal | undefined;
         const source = await open(f, { concurrency: 1, fetch: async (url: string, options: any) => {
             if (!url.includes('/reading/x')) { return f.request(url, options); }
             imageCalls++; firstSignal = options.signal;
             return new Promise(resolve => { release = resolve; });
         } });
         const first = new AbortController(), second = new AbortController();
-        const p1 = source.externalImageSource.read({ id: 'x1', chunkIndex: 0, signal: first.signal });
+        const p1 = source.externalImageSource.read({ id: 'x2', chunkIndex: 1, chunkCount: 2, signal: first.signal });
         const p2 = source.externalImageSource.read({ id: 'x2', chunkIndex: 0, signal: second.signal });
         const rejected1 = assert.rejects(p1, { name: 'AbortError' }), rejected2 = assert.rejects(p2, { name: 'AbortError' });
         first.abort(); second.abort();
         assert.strictEqual(firstSignal?.aborted, true); assert.strictEqual(imageCalls, 1);
-        release(new browser.Response(f.raw));
+        release(new browser.Response(f.progressive.slice(4), { status: 206,
+            headers: { 'Content-Range': 'bytes 4-11/12', 'Content-Length': '8' } }));
         await Promise.all([rejected1, rejected2]);
         assert.strictEqual(imageCalls, 1); assert.strictEqual(f.metrics.active, 0);
         source.dispose();

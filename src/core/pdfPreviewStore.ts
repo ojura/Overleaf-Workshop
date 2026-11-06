@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'crypto';
 import { PdfCacheCompletionError, type PdfDiskCache } from './pdfDiskCache';
 import type { PdfOutput, PdfPreviewIdentity, PdfReadingDescriptor } from './viewerProtocol';
 import { PDF_PREVIEW_MANIFEST_BYTES } from './viewerProtocol';
-import { PDF_READING_LIMITS, validatePdfReadingManifest } from './pdfReadingManifest';
+import { PDF_READING_LIMITS, pdfReadingImageRange, validatePdfReadingManifest } from './pdfReadingManifest';
 
 const KEY = /^[a-f0-9]{64}$/;
 
@@ -78,7 +78,7 @@ export class PdfPreviewStore {
     /** Bind a reading publication to the SHA recorded by the existing exact-build export. */
     readingDescriptor(identity: PdfPreviewIdentity): Promise<(Omit<PdfReadingDescriptor, 'manifestUrl'> & {
         manifestPath: string;
-        readImage(id: string, chunkIndex: number, signal: AbortSignal): Promise<{ body: Uint8Array; offset: number; total: number }>;
+        readImage(id: string, chunkIndex: number, signal: AbortSignal, chunkCount?: number): Promise<{ body: Uint8Array; offset: number; total: number }>;
     }) | undefined> {
         const task = (async () => {
             const directory = this.directory(identity);
@@ -107,13 +107,12 @@ export class PdfPreviewStore {
             if (this.closed || !reading || !validated || validated.source.pageCount !== document.pageCount) { return; }
             const images = new Map(validated.images.map(image => [image.id, image]));
             return { identity: source, manifestPath, manifestRevision: createHash('sha256').update(reading.bytes).digest('hex'),
-                readImage: async (id: string, chunkIndex: number, signal: AbortSignal) => {
+                readImage: async (id: string, chunkIndex: number, signal: AbortSignal, chunkCount?: number) => {
                     const check = () => { if (this.closed || signal.aborted) { throw new Error('Reading image request stopped'); } };
                     check();
                     const image = images.get(id);
-                    if (!image || !Number.isSafeInteger(chunkIndex) || chunkIndex < 0) { throw new Error('Unknown registered reading image'); }
-                    const chunk = image.chunks?.[chunkIndex];
-                    if (image.chunks ? !chunk : chunkIndex !== 0) { throw new Error('Unknown registered reading image chunk'); }
+                    const selected = image && pdfReadingImageRange(image, chunkIndex, chunkCount);
+                    if (!image || !selected) { throw new Error('Unknown registered reading image chunks'); }
                     const filename = path.join(directory, image.path);
                     // Refuse symlinked parents as well as a symlinked final file.
                     if (await fs.promises.realpath(filename) !== filename) { throw new Error('Reading image paths must be regular local files'); }
@@ -124,7 +123,7 @@ export class PdfPreviewStore {
                             throw new Error('Registered reading image size or path changed');
                         }
                         check();
-                        const offset = chunk?.offset ?? 0, length = chunk?.bytes ?? image.bytes;
+                        const offset = selected.offset, length = selected.bytes;
                         const body = Buffer.allocUnsafe(length);
                         for (let received = 0; received < length;) {
                             check();
@@ -133,8 +132,12 @@ export class PdfPreviewStore {
                             received += result.bytesRead;
                         }
                         check();
-                        if (createHash('sha256').update(body).digest('hex') !== (chunk?.sha256 ?? image.sha256)) {
-                            throw new Error('Registered reading image chunk digest changed');
+                        for (const chunk of selected.chunks) {
+                            check();
+                            const start = chunk.offset - offset;
+                            if (createHash('sha256').update(body.subarray(start, start + chunk.bytes)).digest('hex') !== chunk.sha256) {
+                                throw new Error('Registered reading image chunk digest changed');
+                            }
                         }
                         return { body, offset, total: image.bytes };
                     } finally { await file.close(); }

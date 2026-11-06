@@ -125,18 +125,22 @@ describe('the PDF viewer\'s fetches through the extension', () => {
 
     it('serves only revision-authorized image chunks with exact range response metadata', async () => {
         const bridge = new PdfFetchBridge(() => false), revision = 'a'.repeat(64);
-        const asked: Array<[string, number]> = [];
-        bridge.setReading(revision, async (id, index) => {
-            asked.push([id, index]);
+        const asked: Array<[string, number, number | undefined]> = [];
+        bridge.setReading(revision, async (id, index, _signal, count) => {
+            asked.push([id, index, count]);
             return { body: new Uint8Array([7, 8, 9]), offset: 6, total: 12 };
         });
         try {
-            const response = await bridge.handleReading({ id: 1, manifestRevision: revision, imageId: 'x1', chunkIndex: 1 });
-            assert.deepStrictEqual(asked, [['x1', 1]]);
+            const response = await bridge.handleReading({ id: 1, manifestRevision: revision, imageId: 'x1', chunkIndex: 1, chunkCount: 2 });
+            assert.deepStrictEqual(asked, [['x1', 1, 2]]);
             assert.deepStrictEqual([response.status, response.body], [206, new Uint8Array([7, 8, 9])]);
             assert.deepStrictEqual(Object.fromEntries(response.headers), { 'content-type': 'application/octet-stream',
                 'content-length': '3', 'content-encoding': 'identity', 'content-range': 'bytes 6-8/12' });
             await assert.rejects(bridge.handleReading({ id: 2, manifestRevision: 'b'.repeat(64), imageId: 'x1', chunkIndex: 1 }), /not registered/);
+            for (const chunkCount of [0, -1, 1.5, 257, '2', null]) {
+                await assert.rejects(bridge.handleReading({ id: 2, manifestRevision: revision, imageId: 'x1', chunkIndex: 1,
+                    chunkCount: chunkCount as number }), /not registered/);
+            }
             assert.strictEqual(asked.length, 1);
             bridge.setReading(revision, async () => ({ body: new Uint8Array([1, 2]), offset: 0, total: 2 }));
             const whole = await bridge.handleReading({ id: 3, manifestRevision: revision, imageId: 'x2', chunkIndex: 0 });
