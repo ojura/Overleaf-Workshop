@@ -602,6 +602,165 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         return result;
     }
 
+    function externalImages(f: Fixture, id = 1) {
+        (f.pdf as any).hasExternalImages = true;
+        const page = f.pdf.page(id) as any, view = f.pages[id - 1] as any;
+        view.pdfPage = page;
+        const listeners = new Set<() => void>();
+        let redraws = 0, cancellations = 0;
+        let cancellation: Promise<void> | undefined;
+        page.imageRevision = 0;
+        page.imageStatus = { revision: 0, pending: 2, completed: 0, failed: 0, covered: 0, total: 2, final: false, discovered: true };
+        page.onImageRevision = (listener: () => void) => { listeners.add(listener); return () => listeners.delete(listener); };
+        page.cancelImageRefinement = () => { cancellations++; return cancellation ?? Promise.resolve(); };
+        view.redrawImages = () => { redraws++; view.renderingState = 0; };
+        const update = (revision: number, covered: number, final = false) => {
+            page.imageRevision = revision;
+            page.imageStatus = { revision, pending: final ? 0 : 2, completed: final ? 2 : 0, failed: 0, covered, total: 2, final, discovered: true };
+        };
+        return { page, view, listeners,
+            get redraws() { return redraws; }, get cancellations() { return cancellations; },
+            holdCancellation(value: Promise<void>) { cancellation = value; },
+            emit(revision: number, covered: number, final = false) { update(revision, covered, final); for (const listener of listeners) { listener(); } },
+            paint(revision: number, covered: number, final = false) {
+                update(revision, covered, final);
+                view.imagePassRevision = view.paintedImageRevision = revision;
+                view.imagePassStatus = view.paintedImageStatus = { ...page.imageStatus };
+                f.cachePage(id);
+            },
+        };
+    }
+
+    it('starts structural text passes directly while photograph requests are pending', async () => {
+        const f = fixture({ startPage: 1, pages: 2, initialNative: false });
+        externalImages(f);
+        const transfers = Array.from({ length: 12 }, () => fetches.begin());
+        await f.frame();
+        assert.strictEqual(f.choose(), f.pages[0], 'photo backpressure does not block small native text/layout');
+        assert.strictEqual(f.queue.renderView(f.pages[0]), true);
+        assert.strictEqual(f.pdf.renders.length, 0, 'no speculative raster pass starts the photographs ahead of text');
+        transfers.forEach(id => fetches.end(id));
+    });
+
+    it('coalesces native image revisions and keeps resources until final painted quality', async () => {
+        const f = fixture({ startPage: 1, pages: 2, initialNative: false, mobile: true });
+        const images = externalImages(f);
+        images.paint(0, 0); await f.frame();
+        assert.strictEqual(images.page.cleanupCalls, 0, 'a FINISHED text pass still owns pending image resources');
+        assert.strictEqual(f.controller.snapshot().previewPages, 0, 'placeholder photos cannot replace useful cached pixels');
+        images.emit(1, 1); images.emit(2, 2);
+        assert.strictEqual(f.callbacks.size, 1, 'all installed scans share the existing scheduled frame');
+        await f.frame();
+        assert.strictEqual(images.redraws, 1);
+        images.paint(2, 2); await f.frame();
+        assert.strictEqual(images.page.cleanupCalls, 0);
+        const covered = f.controller.snapshot().imagePages[0];
+        assert.strictEqual(covered.paintedStatus.covered, 2);
+        assert.ok(Number.isFinite(covered.firstCoverageAt));
+        images.emit(3, 2, true); await f.frame();
+        assert.strictEqual(images.redraws, 2);
+        images.paint(3, 2, true); await f.frame();
+        assert.ok(images.page.cleanupCalls > 0, 'the normal cleanup owner releases final native resources');
+        assert.strictEqual(f.controller.snapshot().imagePages[0].paintedStatus.final, true);
+        const resume = await f.controller.pauseImageRefinement();
+        resume(); await f.frame();
+        assert.strictEqual(images.cancellations, 0, 'finished image objects do not become restart work during a representation pause');
+        assert.strictEqual(images.redraws, 2);
+        await f.frame();
+        assert.strictEqual(f.callbacks.size, 0);
+        assert.strictEqual(f.controller.snapshot().idle, true);
+    });
+
+    it('measures ready-photo latency through first painted coverage without erasing it on later scans', async () => {
+        const f = fixture({ startPage: 1, pages: 1, initialNative: false });
+        const images = externalImages(f);
+        images.paint(0, 0); await f.frame();
+        assert.deepStrictEqual(f.controller.snapshot().visibleMissing, [1], 'sharp text alone does not advertise photo coverage ahead');
+        f.time += 2400;
+        images.emit(1, 2); await f.frame(); images.paint(1, 2); await f.frame();
+        const ready = f.controller.snapshot();
+        assert.deepStrictEqual(ready.visibleMissing, []);
+        assert.ok(ready.pageLatencyMs >= 2400, 'network and scan preparation belong to the readiness estimate');
+        assert.ok(ready.imagePages[0].coverageLatencyMs >= 2400);
+        images.emit(2, 2, true); await f.frame(); images.paint(2, 2, true); await f.frame();
+        assert.strictEqual(f.controller.snapshot().pageLatencyMs, ready.pageLatencyMs, 'short repaint passes do not erase the measured delivery horizon');
+    });
+
+    it('does not replay an already attempted partial pass behind a retained painted canvas', async () => {
+        const f = fixture({ startPage: 1, pages: 1, initialNative: false });
+        const images = externalImages(f);
+        images.paint(1, 2); await f.frame();
+        images.emit(2, 1);
+        images.view.imagePassRevision = 2;
+        images.view.imagePassStatus = { ...images.page.imageStatus };
+        await f.frame();
+        assert.strictEqual(images.redraws, 0, 'displayed and attempted revisions have different authority');
+        assert.strictEqual(images.view.paintedImageRevision, 1);
+        images.emit(3, 2); await f.frame();
+        assert.strictEqual(images.redraws, 1);
+    });
+
+    it('keeps an existing whole-page preview through a placeholder pass until painted photo coverage', async () => {
+        const f = fixture({ startPage: 1, pages: 1 });
+        await f.frame();
+        const images = externalImages(f);
+        images.paint(0, 0); await f.frame();
+        const preview = f.pages[0].div.children.find(child => child.className === 'pdfPrefetchPreview');
+        assert.ok(preview, 'a FINISHED placeholder pass must not remove the old useful preview');
+        images.paint(1, 2); await f.frame();
+        assert.strictEqual(f.pages[0].div.children.some(child => child.className === 'pdfPrefetchPreview'), false);
+        assert.ok(f.controller.snapshot().previewPages > 0, 'detached coarse coverage stays within the existing cache');
+    });
+
+    it('waits for old image-state cancellation before releasing an upgrade suspension lease', async () => {
+        const f = fixture({ startPage: 1, pages: 1, initialNative: false });
+        const images = externalImages(f);
+        images.paint(0, 0); await f.frame();
+        const canvas = images.view.canvas, ack = new Deferred<void>();
+        images.holdCancellation(ack.promise);
+        let released = false;
+        const waiting = f.controller.pauseImageRefinement().then((resume: () => void) => { released = true; return resume; });
+        await promisesSettled();
+        assert.strictEqual(images.cancellations, 1);
+        assert.strictEqual(released, false);
+        assert.strictEqual(f.choose(), null);
+        assert.strictEqual(images.view.canvas, canvas, 'the reader keeps its displayed backing');
+        ack.resolve();
+        const resume = await waiting;
+        resume(); resume(); await f.frame();
+        assert.strictEqual(images.redraws, 1, 'resume rebuilds a cancelled intent through the native queue');
+        assert.strictEqual(images.view.canvas, canvas);
+    });
+
+    it('cancels offscreen image work and rejects obsolete subscriptions after document replacement', async () => {
+        const f = fixture({ startPage: 1, pages: 2, initialNative: false });
+        const images = externalImages(f);
+        images.paint(0, 0); await f.frame();
+        const stale = [...images.listeners][0];
+        f.scrollBy(1000); await f.frame();
+        assert.strictEqual(images.cancellations, 1);
+        assert.strictEqual(images.listeners.size, 0);
+        f.scrollBy(-1000); await f.frame();
+        assert.strictEqual(images.redraws, 1, 'returning to a retained partial page restarts its cancelled intent');
+        f.replaceDocument(); await f.frame();
+        const callbacks = f.callbacks.size;
+        stale();
+        assert.strictEqual(f.callbacks.size, callbacks, 'a previous document cannot schedule a new revision');
+    });
+
+    it('returns to idle when an offscreen image cancellation acknowledgment releases the last owner', async () => {
+        const f = fixture({ startPage: 1, pages: 2, initialNative: false });
+        const leaving = externalImages(f), ready = externalImages(f, 2);
+        ready.paint(1, 2, true); leaving.paint(0, 0); await f.frame();
+        const ack = new Deferred<void>(); leaving.holdCancellation(ack.promise);
+        f.visibleIds = [2]; f.eventBus.emit('updateviewarea'); await f.frame();
+        assert.strictEqual(leaving.cancellations, 1);
+        assert.strictEqual(f.controller.snapshot().idle, false);
+        ack.resolve(); await promisesSettled();
+        assert.strictEqual(f.controller.snapshot().idle, true, 'the acknowledgment is the completion event; another user scroll is not required');
+        assert.strictEqual(f.callbacks.size, 0, 'a completed offscreen owner does not need a paint');
+    });
+
     it('supplies the current page content size without measuring a spread or rereading layout', async () => {
         let settings: any;
         const fleet = new DocumentRobots();

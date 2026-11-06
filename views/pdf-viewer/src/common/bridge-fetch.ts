@@ -4,11 +4,11 @@
  * which sends the request and posts the response back (src/core/pdfFetchBridge.ts); every
  * other URL, e.g. pdf.js's own resources, goes to the webview's fetch as before.
  */
-import type { HostMessage, ViewerMessage } from './protocol';
+import type { BridgeRequest, HostMessage, ReadingImageRequest, ViewerMessage } from './protocol';
 import { pdfPerformance } from './prefetch-performance';
 import { createBridgeResponse } from './bridge-response';
 
-interface Pending { resolve: (response: Response) => void, reject: (error: unknown) => void, started: number, cleanup: () => void }
+interface Pending { resolve: (response: Response) => void, reject: (error: unknown) => void, started: number, measured: boolean, cleanup: () => void }
 
 const NULL_BODY = new Set([101, 204, 205, 304]);
 
@@ -29,34 +29,29 @@ export function installBridgeFetch(post: (message: ViewerMessage) => void, bridg
         pending.delete(message.id);
         waiting.cleanup();
         if (message.type === 'fetchResponse') {
-            pdfPerformance.fetch(message.body?.byteLength ?? 0, performance.now() - waiting.started);
+            if (waiting.measured) { pdfPerformance.fetch(message.body?.byteLength ?? 0, performance.now() - waiting.started); }
             try {
                 waiting.resolve(createBridgeResponse(NULL_BODY.has(message.status) ? null : message.body, {
                     status: message.status, statusText: message.statusText, headers: message.headers,
                 }));
             } catch (error) { waiting.reject(error); }
         } else {
-            pdfPerformance.event('fetch-error');
+            if (waiting.measured) { pdfPerformance.event('fetch-error'); }
             waiting.reject(new TypeError(message.message)); // as fetch rejects on network errors
         }
     });
 
-    globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
-        const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-        const url = new URL(href, location.href);
-        if (!bridged(url)) { return nativeFetch(input, init); }
+    const send = (request: Omit<BridgeRequest, 'id'> | Omit<ReadingImageRequest, 'id'>, signal?: AbortSignal | null, measured = true) => {
         const id = next++;
-        const headers = [...new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)).entries()];
         return new Promise<Response>((resolve, reject) => {
-            const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
             const aborted = () => signal?.reason ?? new DOMException('The request was aborted.', 'AbortError');
             if (signal?.aborted) { reject(aborted()); return; }
-            const endFetch = pdfPerformance.beginFetch();
+            const endFetch = measured ? pdfPerformance.beginFetch() : () => {};
             const onAbort = () => {
                 const waiting = pending.get(id);
                 if (waiting && pending.delete(id)) {
                     waiting.cleanup();
-                    pdfPerformance.event('fetch-abort');
+                    if (measured) { pdfPerformance.event('fetch-abort'); }
                     post({ type: 'fetchAbort', page, id });
                     reject(aborted());
                 }
@@ -65,10 +60,11 @@ export function installBridgeFetch(post: (message: ViewerMessage) => void, bridg
                 signal?.removeEventListener('abort', onAbort);
                 endFetch();
             };
-            pending.set(id, { resolve, reject, started: performance.now(), cleanup });
+            pending.set(id, { resolve, reject, started: performance.now(), measured, cleanup });
             signal?.addEventListener('abort', onAbort, { once: true });
             try {
-                post({ type: 'fetch', page, id, url: url.href, method: init?.method ?? 'GET', headers });
+                if ('url' in request) { post({ type: 'fetch', page, id, ...request }); }
+                else { post({ type: 'readingFetch', page, id, ...request }); }
             } catch (error) {
                 pending.delete(id);
                 cleanup();
@@ -76,4 +72,14 @@ export function installBridgeFetch(post: (message: ViewerMessage) => void, bridg
             }
         });
     };
+    globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        const url = new URL(href, location.href);
+        if (!bridged(url)) { return nativeFetch(input, init); }
+        const headers = [...new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)).entries()];
+        return send({ url: url.href, method: init?.method ?? 'GET', headers },
+            init?.signal ?? (input instanceof Request ? input.signal : undefined));
+    };
+    // The verified reading loader measures its own delivered bytes and request lifetime.
+    return { readImage: (request: Omit<ReadingImageRequest, 'id'>, signal: AbortSignal) => send(request, signal, false) };
 }

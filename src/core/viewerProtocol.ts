@@ -113,6 +113,13 @@ export interface PdfPreviewDescriptor {
     manifestUrl: string;
 }
 
+/** An immutable reading representation of the original PDF selected by the host. */
+export interface PdfReadingDescriptor {
+    identity: { sha256: string; size: number };
+    manifestUrl: string;
+    manifestRevision: string;
+}
+
 /**
  * What happens to the project's build (src/core/projectBuilds.ts), as the viewers' line about it
  * shows it (views/pdf-viewer/src/common/banner.ts has the texts):
@@ -192,6 +199,14 @@ export interface BridgeResponse {
     body: Uint8Array;
 }
 
+/** A registered image chunk, never a caller-selected filesystem path or byte range. */
+export interface ReadingImageRequest {
+    id: number;
+    manifestRevision: string;
+    imageId: string;
+    chunkIndex: number;
+}
+
 /**
  * The host's messages to a page:
  *   initState     the document's saved viewer state, the color themes and the default modes; the
@@ -204,7 +219,7 @@ export interface BridgeResponse {
  */
 export type HostMessage =
     | { type: 'initState', content?: SavedState, colorThemes?: Record<string, ThemeColors>, defaults?: { scrollMode?: string, spreadMode?: string } }
-    | { type: 'load', output: PdfOutput, preview?: PdfPreviewDescriptor }
+    | { type: 'load', output: PdfOutput, preview?: PdfPreviewDescriptor, reading?: PdfReadingDescriptor }
     | { type: 'previewChanged', page: string, key: string }
     | { type: 'update', content: ArrayBuffer }
     | ({ type: 'buildState' } & BuildStatus)
@@ -241,4 +256,5 @@ export type ViewerMessage =
     /** Whether this shown build is quiet enough for the host's paced disk accumulation. */
     | { type: 'cacheActivity', page: string, build: string, idle: boolean }
     | ({ type: 'fetch', page: string } & BridgeRequest)
+    | ({ type: 'readingFetch', page: string } & ReadingImageRequest)
     | { type: 'fetchAbort', page: string, id: number };

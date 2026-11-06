@@ -59,6 +59,16 @@ describe('visible Spomenar publication updates', function () {
         assert.deepStrictEqual(publication.sitePublicationChange(old, { ...old, title: 'Novi naslov' }), { kind: 'metadata', newEdition: false });
     });
 
+    it('reopens a new reading representation of the same original without announcing an edition', () => {
+        const original = config(), reading = { ...original.previews, manifestUrl: 'https://book.test/previews/a/reading.json' };
+        const ready = { ...original, reading };
+        assert.deepStrictEqual(publication.sitePublicationChange(original, ready), { kind: 'reading', newEdition: false });
+        assert.deepStrictEqual(publication.sitePublicationChange(ready, { ...ready, reading: { ...reading, manifestRevision: '2'.repeat(64) } }),
+            { kind: 'reading', newEdition: false });
+        assert.deepStrictEqual(publication.sitePublicationChange(ready, original), { kind: 'reading', newEdition: false });
+        assert.strictEqual(publication.sitePublicationChange(ready, { ...ready }), undefined);
+    });
+
     it('pauses while hidden and discards a late hidden-generation response before resuming', async () => {
         const clock = new Clock(), document = new Visibility();
         let finish!: (value: unknown) => void, signal!: AbortSignal, calls = 0, applied = 0;

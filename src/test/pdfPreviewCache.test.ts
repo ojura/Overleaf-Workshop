@@ -117,10 +117,11 @@ describe('the shared graduated PDF preview cache', function () {
             const value = cache({ maxBytes: MIB });
             const original = canvas(396, 564);
             const projection = { width: 396, height: 564, pageToRaster: matrix };
-            assert.strictEqual(value.retain(1, original, new Set(), projection), true);
+            assert.strictEqual(value.retain(1, original, new Set(), projection, 7), true);
             assert.deepStrictEqual(value.get(1).projection, projection, 'retention keeps the producer mapping');
             assert.strictEqual(value.retain(2, canvas(), new Set([2])), true);
             const trail = value.get(1);
+            assert.strictEqual(trail.contentRevision, 7, 'trail resampling preserves the native content revision');
             assert.deepStrictEqual([trail.canvas.width, trail.canvas.height], [135, 192]);
             assert.deepStrictEqual(trail.projection.pageToRaster, matrix.map((component, index) =>
                 component * (index % 2 === 0 ? 135 / 396 : 192 / 564)));
@@ -130,6 +131,7 @@ describe('the shared graduated PDF preview cache', function () {
             assert.strictEqual(value.retain(1, canvas(512, 512), new Set([1, 2]),
                 { width: 512, height: 512, pageToRaster: [512, 0, 0, 512, 0, 0] }), false);
             assert.strictEqual(value.get(1).projection, retained, 'failed replacement preserves the previous projection');
+            assert.strictEqual(value.get(1).contentRevision, 7);
             balanced(value, MIB);
         }
     });

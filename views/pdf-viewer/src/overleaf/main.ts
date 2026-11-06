@@ -165,6 +165,7 @@ const documents = new Documents(wrapper, {
         storePosition();
         return prefetch.prepareReplacement(build ?? doc.fingerprints?.[0] ?? 'inline', signal);
     },
+    pauseRefinement: () => prefetch.pauseImageRefinement(),
     loaded(doc, build, preview) {
         shownBuild = build;
         documentShown(build);
@@ -260,7 +261,7 @@ if (init && !pageLifetime.signal.aborted) {
     toolbar.setOutlineOpen(outline.open);
 
     // the host sends these after 'initState'; host.ts keeps them until a handler is set
-    onMessage('load', message => documents.load(message.output, false, message.preview));
+    onMessage('load', message => documents.load(message.output, false, message.preview, message.reading));
     onMessage('update', (message) => documents.loadData(message.content));
     onMessage('buildState', (message) => showBuildState(message));
     onMessage('syncCode', (message) => {

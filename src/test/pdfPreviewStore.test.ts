@@ -53,6 +53,89 @@ describe('exact-build local PDF preview registration', () => {
         fs.renameSync(temporary, path.join(directory, 'manifest.json'));
     }
 
+    const reading = () => ({ version: 1, source: { sha256: 'c'.repeat(64), size: identity.size, pageCount: 1 },
+        pdf: { path: 'reading/document.pdf', sha256: 'd'.repeat(64), bytes: 100 }, images: [] });
+
+    it('binds structural source discovery to the registered original digest and exact manifest bytes', async () => {
+        await publish(manifest({ ...identity, sha256: 'c'.repeat(64) }));
+        const filename = path.join(store.directory(identity), 'reading.json');
+        const value = reading(), bytes = Buffer.from(JSON.stringify(value));
+        fs.writeFileSync(filename, bytes);
+        const registered = await store.readingDescriptor(identity);
+        assert.ok(registered);
+        const { readImage, ...descriptor } = registered;
+        assert.strictEqual(typeof readImage, 'function');
+        assert.deepStrictEqual(descriptor, {
+            identity: { sha256: 'c'.repeat(64), size: identity.size }, manifestPath: filename, manifestRevision: digest(bytes),
+        });
+        for (const change of ['digest', 'size', 'pages']) {
+            const wrong = reading();
+            if (change === 'digest') { wrong.source.sha256 = 'e'.repeat(64); }
+            if (change === 'size') { wrong.source.size++; }
+            if (change === 'pages') { wrong.source.pageCount++; }
+            fs.writeFileSync(filename, JSON.stringify(wrong));
+            assert.strictEqual(await store.readingDescriptor(identity), undefined, change);
+        }
+        fs.unlinkSync(filename);
+        const outside = path.join(base, 'reading.json'); fs.writeFileSync(outside, bytes);
+        fs.symlinkSync(outside, filename);
+        assert.strictEqual(await store.readingDescriptor(identity), undefined, 'linked manifests are never admitted');
+    });
+
+    it('reads only the registered scan and verifies its immutable bytes before delivery', async () => {
+        await publish(manifest({ ...identity, sha256: 'c'.repeat(64) }));
+        const bytes = new Uint8Array([255, 216, 3, 4, 5, 6, 7, 8, 9, 10, 255, 217]);
+        const directory = store.directory(identity), filename = path.join(directory, 'reading', 'x1.jpg');
+        fs.mkdirSync(path.dirname(filename)); fs.writeFileSync(filename, bytes);
+        const value = { ...reading(), images: [{ id: 'x1', path: 'reading/x1.jpg', bytes: bytes.length,
+            sha256: digest(bytes), originalSha256: 'e'.repeat(64), width: 8, height: 8, components: 3,
+            encoding: 'progressive-jpeg', coefficientBytes: 768, chunks: [
+                { offset: 0, bytes: 6, sha256: digest(bytes.slice(0, 6)), scan: 1 },
+                { offset: 6, bytes: 6, sha256: digest(bytes.slice(6)), scan: 2 },
+            ] }] };
+        fs.writeFileSync(path.join(directory, 'reading.json'), JSON.stringify(value));
+        const registered = (await store.readingDescriptor(identity))!;
+        const signal = new AbortController().signal;
+        const chunk = await registered.readImage('x1', 1, signal);
+        assert.deepStrictEqual(new Uint8Array(chunk.body), bytes.slice(6));
+        assert.deepStrictEqual([chunk.offset, chunk.total], [6, 12]);
+        await assert.rejects(registered.readImage('../x1', 0, signal), /Unknown/);
+        await assert.rejects(registered.readImage('x1', 2, signal), /Unknown/);
+        // A later manifest cannot alter the partition or hashes already authorized for this reader.
+        fs.writeFileSync(path.join(directory, 'reading.json'), JSON.stringify(reading()));
+        assert.deepStrictEqual(new Uint8Array((await registered.readImage('x1', 0, signal)).body), bytes.slice(0, 6));
+        const damaged = bytes.slice(); damaged[8] ^= 1; fs.writeFileSync(filename, damaged);
+        await assert.rejects(registered.readImage('x1', 1, signal), /digest/);
+        fs.unlinkSync(filename);
+        const outside = path.join(base, 'outside.jpg'); fs.writeFileSync(outside, bytes); fs.symlinkSync(outside, filename);
+        await assert.rejects(registered.readImage('x1', 0, signal), /regular local files/);
+        fs.unlinkSync(filename); fs.writeFileSync(filename, bytes);
+        const cancelled = new AbortController(); cancelled.abort();
+        await assert.rejects(registered.readImage('x1', 0, cancelled.signal), /stopped/);
+        store.dispose();
+        await assert.rejects(registered.readImage('x1', 0, signal), /stopped/);
+    });
+
+    it('observes same-edition structural publication and removal through the existing directory watcher', async () => {
+        await publish(manifest({ ...identity, sha256: 'c'.repeat(64) }));
+        let changes = 0;
+        store.watch(identity, () => { changes++; });
+        await store.settled();
+        assert.strictEqual(changes, 1);
+        assert.strictEqual(await store.readingDescriptor(identity), undefined);
+        const filename = path.join(store.directory(identity), 'reading.json');
+        fs.writeFileSync(filename, JSON.stringify(reading()));
+        const watcher = watchAt(store.directory(identity));
+        watcher.change('reading.json'); watcher.change('reading.json');
+        await store.settled();
+        assert.strictEqual(changes, 2);
+        assert.ok(await store.readingDescriptor(identity));
+        fs.unlinkSync(filename); watcher.change('reading.json');
+        await store.settled();
+        assert.strictEqual(changes, 3);
+        assert.strictEqual(await store.readingDescriptor(identity), undefined);
+    });
+
     it('finds a later atomic publication once and rejects a different key or size without polling', async () => {
         let changes = 0;
         const stop = store.watch(identity, () => { changes++; });

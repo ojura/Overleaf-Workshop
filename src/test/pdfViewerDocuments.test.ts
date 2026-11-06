@@ -26,6 +26,7 @@ describe('the Overleaf viewer\'s documents', function () {
     const nativeTimeout = globalThis.setTimeout;
     const nativeClearTimeout = globalThis.clearTimeout;
     let savedWarn: typeof console.warn, savedError: typeof console.error;
+    let readingEnvironment: any;
 
     function deferred<T>() {
         let resolve!: (value: T) => void, reject!: (reason: unknown) => void;
@@ -39,7 +40,7 @@ describe('the Overleaf viewer\'s documents', function () {
     interface FakeTask {
         promise: Promise<any>; doc: any; resolve(): void; reject(reason: unknown): void;
         started: ReturnType<typeof deferred<void>>;
-        destroy(): Promise<void>; destroys: number; destroyed: boolean; requests?: AbortController; abortedAtDestroy?: boolean;
+        destroy(): Promise<void>; destroys: number; destroyed: boolean; requests?: AbortController; abortedAtDestroy?: boolean; params?: any;
     }
     const tasks: FakeTask[] = [];
     function fakeTask(pending = false, name = 'task-' + tasks.length): FakeTask {
@@ -82,11 +83,13 @@ describe('the Overleaf viewer\'s documents', function () {
             acquireVsCodeApi: () => ({ postMessage() {}, getState() { return undefined; }, setState() {} }),
             Worker: FakeWorker,
             __pdfDocumentFixture: undefined,
+            __pdfReadingFixture: undefined,
             // pdf.worker.mjs, which the page starts from a blob
             fetch: async () => new (globalThis as any).Response('// pdf.worker.mjs'),
             // a PDF read whole
             pdfjsLib: { GlobalWorkerOptions: {}, ResponseException: class extends Error {}, getDocument: (params: any) => {
                 const task = planned.shift() ?? fakeTask();
+                task.params = params;
                 task.requests = rangeRequests.get(params.url);
                 task.started.resolve();
                 return task;
@@ -118,14 +121,23 @@ describe('the Overleaf viewer\'s documents', function () {
                 ? { contents: '', loader: 'css' }
                 : { contents: 'export const PDFViewer = undefined, EventBus = undefined, PDFLinkService = undefined, LinkTarget = {};', loader: 'js' });
         } };
-        await esbuild.build({ ...bundleOptions, plugins: [...bundleOptions.plugins, components], entryPoints: [entry], outfile: path.join(dir, 'documents.mjs') });
+        const readingInputs = { name: 'reading-document-inputs', setup(build: any) {
+            build.onResolve({ filter: /^\.\.\/common\/pdf-reading-(source|upgrade)$/ }, (args: any) =>
+                ({ path: args.path, namespace: 'reading-document-inputs' }));
+            build.onLoad({ filter: /.*/, namespace: 'reading-document-inputs' }, (args: any) => ({ loader: 'js',
+                contents: args.path.endsWith('source')
+                    ? 'export const openPdfReadingSource = (descriptor, options) => globalThis.__pdfReadingFixture.open(descriptor, options);'
+                    : 'export const preparePdfReadingUpgrade = (candidate, viewer, signal) => globalThis.__pdfReadingFixture.prepare(candidate, viewer, signal);',
+            }));
+        } };
+        await esbuild.build({ ...bundleOptions, plugins: [readingInputs, ...bundleOptions.plugins, components], entryPoints: [entry], outfile: path.join(dir, 'documents.mjs') });
         // Run the complete full-engine entry point and real host messages. Its app, artwork,
         // and browser-only controls are stand-ins; none replace its load/close control flow.
         const main = path.join(viewerRoot, 'src', 'pdfjs', 'main.ts');
         const entryModules: Record<string, string> = {
             '../common/transport': 'export const generatePdfCachingTransportFactory = () => () => undefined;',
             '@/features/pdf-preview/util/pdf-js-wrapper': 'export default class { get currentPosition() { return this.viewer.position; } scrollToPosition(value) { this.viewer.restored = value; } }',
-            '../common/bridge': 'export function bridgeOutputsOf() {}',
+            '../common/bridge': 'export function bridgeOutputsOf() {} export function readReadingImage() { throw new Error("unexpected image read"); }',
             '../common/banner': 'const f = globalThis.__pdfDocumentFixture; export const documentShown = build => f.shown(build), showLoadError = error => f.errors.push(error), showBuildState = () => {}, showState = (_state, detail) => f.errors.push(detail);',
             '../common/worker': 'export const createWorkerPort = async () => globalThis.__pdfDocumentFixture.worker();',
             '../common/pdf-prefetch': 'export const installPdfPrefetch = () => globalThis.__pdfDocumentFixture.prefetch;',
@@ -139,7 +151,7 @@ describe('the Overleaf viewer\'s documents', function () {
             build.onLoad({ filter: /.*/, namespace: 'full-document-environment' }, (args: any) => ({ contents: entryModules[args.path], loader: 'js' }));
         } };
         fullAppEntry = path.join(dir, 'full-app.mjs');
-        await esbuild.build({ ...bundleOptions, plugins: [appEnvironment, ...bundleOptions.plugins], entryPoints: [main], outfile: fullAppEntry });
+        await esbuild.build({ ...bundleOptions, plugins: [appEnvironment, readingInputs, ...bundleOptions.plugins], entryPoints: [main], outfile: fullAppEntry });
         // esbuild's service process is not needed any more; another build starts it again
         await esbuild.stop();
         viewer = await importModule(path.join(dir, 'documents.mjs'));
@@ -148,6 +160,11 @@ describe('the Overleaf viewer\'s documents', function () {
     beforeEach(() => {
         savedWarn = console.warn; savedError = console.error;
         console.warn = console.error = () => {};
+        readingEnvironment = { sources: new Map<string, any>(),
+            open: async (descriptor: any) => readingEnvironment.sources.get(descriptor.manifestRevision),
+            prepare: async (candidate: any, pdfViewer: any, signal: AbortSignal) => readingEnvironment.preparing?.(candidate, pdfViewer, signal),
+        };
+        (globalThis as any).__pdfReadingFixture = readingEnvironment;
     });
 
     afterEach(async () => {
@@ -281,16 +298,16 @@ describe('the Overleaf viewer\'s documents', function () {
             };
         }
         const documents = new viewer.Documents(wrapper, hooks);
-        fixture = { documents, wrapper, pdfViewer, linkService, events, transitions, loaded, failed, element, pageListeners,
+        fixture = { documents, wrapper, pdfViewer, linkService, events, transitions, loaded, failed, element, pageListeners, hooks,
             pagesInit() { [...pageListeners].forEach(callback => callback()); },
-            load(build: string, pending = false, preview?: any) {
+            load(build: string, pending = false, preview?: any, reading?: any) {
                 const task = fakeTask(pending, build), returned = deferred<any>();
-                planned.push(task); returns.push(returned);
+                planned.push(task); if (!reading) { returns.push(returned); }
                 documents.load({
                     url: `https://dl.test/zone/d/project/p1/user/u1/build/${build}/output/output.pdf?enable_pdf_caching=true`,
                     downloadDomain: 'https://dl.test/zone/d', projectId: 'p1',
                     file: { path: 'output.pdf', url: `/project/p1/user/u1/build/${build}/output/output.pdf`, type: 'pdf', build, size: 1000 },
-                }, false, preview);
+                }, false, preview, reading);
                 return { task, async prepared() { const doc = await returned.promise; await endTurn(); return doc; } };
             },
         };
@@ -459,6 +476,42 @@ describe('the Overleaf viewer\'s documents', function () {
         assert.strictEqual(fixture.element.style.minHeight, '');
     });
 
+    function readingSource(letter = 'a', pageCount = 3) {
+        const descriptor = { identity: { sha256: 'a'.repeat(64), size: 1000 },
+            manifestUrl: 'https://webview.test/reading.json', manifestRevision: letter.repeat(64) };
+        const source = { data: new Uint8Array([1, 2, 3]), manifest: { source: { pageCount } },
+            externalImageSource: { images: [], read: async () => new Uint8Array() }, disposed: false,
+            dispose() { this.disposed = true; } };
+        readingEnvironment.sources.set(descriptor.manifestRevision, source);
+        return { descriptor, source };
+    }
+
+    it('upgrades the same Overleaf build only after acknowledged coverage and captures its current position without an edition scene', async () => {
+        const f = nativeFixture(), old = await initial(f, 'same');
+        const { descriptor, source } = readingSource();
+        const entered = deferred<void>(), covered = deferred<void>();
+        let suspended = false, resumes = 0;
+        f.hooks.pauseRefinement = async () => { suspended = true; return () => { resumes++; }; };
+        readingEnvironment.preparing = async (_candidate: any, current: any, signal: AbortSignal) => {
+            assert.strictEqual(suspended, true); assert.strictEqual(current.pdfDocument, old.doc);
+            assert.strictEqual(signal.aborted, false); entered.resolve(); await covered.promise;
+        };
+        const captured: number[] = [];
+        f.hooks.beforeLoad = () => captured.push(f.pdfViewer.position);
+        f.events.length = 0;
+        const next = f.load('same', false, undefined, descriptor);
+        await entered.promise;
+        assert.strictEqual(f.pdfViewer.pdfDocument, old.doc); assert.strictEqual(old.destroys, 0);
+        assert.strictEqual(next.task.params.externalImageSource, source.externalImageSource);
+        assert.strictEqual(next.task.params.data, source.data);
+        f.pdfViewer.position = 57; covered.resolve(); await f.documents.settled;
+        assert.strictEqual(captured.at(-1), 57); assert.strictEqual(resumes, 1);
+        assert.strictEqual(f.pdfViewer.pdfDocument, next.task.doc); assert.strictEqual(old.destroys, 1);
+        assert.ok(!f.events.some((event: string) => event.startsWith('scene:')));
+        assert.strictEqual(source.disposed, false);
+        await f.documents.dispose(); assert.strictEqual(source.disposed, true);
+    });
+
     it('releases the temporary page height and listener when an inline-data setter fails', async () => {
         const fixture = nativeFixture({ height: 600 });
         const previous = await initial(fixture);
@@ -526,6 +579,7 @@ describe('the Overleaf viewer\'s documents', function () {
                 shown(build: string) { events.push('shown:' + build); announcements.push({ build, doc: application.pdfDocument }); },
                 prefetch: {
                     dispose() {},
+                    async pauseImageRefinement() { f.pauses = (f.pauses ?? 0) + 1; return () => { f.resumes = (f.resumes ?? 0) + 1; }; },
                     prepareReplacement(build: string, signal: AbortSignal) {
                         events.push('scene:' + build);
                         f.preparing?.(build, signal);
@@ -534,10 +588,10 @@ describe('the Overleaf viewer\'s documents', function () {
                     },
                     setPreviewSource(preview: any, doc: any) { events.push('preview:' + doc.name); previews.push({ preview, doc }); },
                 },
-                load(build: string, pending = false, preview?: any) {
+                load(build: string, pending = false, preview?: any, reading?: any) {
                     const task = fakeTask(pending, build);
                     planned.push(task);
-                    const data = { type: 'load', preview, output: {
+                    const data = { type: 'load', preview, reading, output: {
                         url: `https://dl.test/zone/d/project/p1/user/u1/build/${build}/output/output.pdf?enable_pdf_caching=true`,
                         downloadDomain: 'https://dl.test/zone/d', projectId: 'p1',
                         file: { path: 'output.pdf', url: `/project/p1/user/u1/build/${build}/output/output.pdf`, type: 'pdf', build, size: 1000 },
@@ -588,6 +642,41 @@ describe('the Overleaf viewer\'s documents', function () {
             assert.strictEqual(f.pdfViewer.currentScaleValue, '2.5');
             assert.deepStrictEqual(f.events, ['scene:next', 'close:old', 'setter:next', 'shown:next', 'preview:next']);
             assert.strictEqual(FakeWorker.made[0].terminated, true);
+        });
+
+        it('keeps the full viewer on the old build until same-edition coverage and restores the latest reading state', async () => {
+            const f = await fixture(), old = f.load('same'); await old.settled(); f.events.length = 0;
+            const { descriptor, source } = readingSource();
+            const entered = deferred<void>(), covered = deferred<void>();
+            readingEnvironment.preparing = async (_candidate: any, current: any) => {
+                assert.strictEqual(f.pauses, 1); assert.strictEqual(current.pdfDocument, old.task.doc);
+                entered.resolve(); await covered.promise;
+            };
+            const next = f.load('same', false, undefined, descriptor); await entered.promise;
+            assert.strictEqual(old.task.destroys, 0); assert.strictEqual(f.application.pdfDocument, old.task.doc);
+            const position = { page: 2, offset: { left: 19, top: 241 } };
+            f.pdfViewer.position = position; f.pdfViewer.currentScaleValue = '1.6';
+            covered.resolve(); await next.settled();
+            assert.strictEqual(next.task.params.externalImageSource, source.externalImageSource);
+            assert.strictEqual(f.application.pdfDocument, next.task.doc); assert.strictEqual(f.resumes, 1);
+            assert.deepStrictEqual(f.pdfViewer.restored, position); assert.strictEqual(f.pdfViewer.currentScaleValue, '1.6');
+            assert.ok(!f.events.some((event: string) => event.startsWith('scene:')));
+            assert.strictEqual(source.disposed, false); f.hide(); await endTurn(); assert.strictEqual(source.disposed, true);
+        });
+
+        it('disposes a reading source rejected after partial native adoption and rejects page-count mismatches before adoption', async () => {
+            for (const wrongPages of [false, true]) {
+                const f = await fixture(), old = f.load('old'); await old.settled();
+                const { descriptor, source } = readingSource(wrongPages ? 'b' : 'a', wrongPages ? 4 : 3);
+                const next = f.load('next', true, undefined, descriptor);
+                await next.task.started.promise;
+                if (!wrongPages) { f.setterFailure = { doc: next.task.doc, error: new Error('native adoption rejected') }; }
+                next.task.resolve(); await next.settled();
+                assert.strictEqual(source.disposed, true); assert.strictEqual(next.task.destroys, 1);
+                assert.notStrictEqual(f.application.pdfDocument, next.task.doc);
+                if (wrongPages) { assert.strictEqual(f.application.pdfDocument, old.task.doc); assert.strictEqual(old.task.destroys, 0); }
+                f.hide(); await endTurn();
+            }
         });
 
         it('does not prepare a scene for a rejected or superseded candidate', async () => {
