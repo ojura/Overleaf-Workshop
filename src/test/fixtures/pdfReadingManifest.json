@@ -1,0 +1,1289 @@
+{
+  "identity": {
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "size": 5000
+  },
+  "cases": [
+    {
+      "name": "raw and complete progressive metadata",
+      "valid": true,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "two xrefs sharing identical verified partitions",
+      "valid": true,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          },
+          {
+            "id": "x3",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "optional original component count",
+      "valid": true,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original",
+            "components": 1
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "source digest array",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          ],
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "PDF digest array",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": [
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "image digest array",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": [
+              "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            ],
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "original digest array",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": [
+              "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            ],
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "chunk digest array",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": [
+                  "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                ],
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "scan numbering starts at one",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 2
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 3
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "scan numbering has no gaps",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 3
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "original encoding retains exact digest",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "PDF path is an image parent",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/document.pdf/image.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "image path is a PDF parent",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "earlier image path is a later parent",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x1.bin/child.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "later image path is an earlier parent",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "same asset conflicting verified partition",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          },
+          {
+            "id": "x3",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 5,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 5,
+                "bytes": 7,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "same asset conflicting chunk digest",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          },
+          {
+            "id": "x3",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "same asset conflicting encoding",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          },
+          {
+            "id": "x3",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "original"
+          }
+        ]
+      }
+    },
+    {
+      "name": "same asset conflicting content digest",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          },
+          {
+            "id": "x3",
+            "path": "reading/x2.jpg",
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "duplicate image identifier",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "reading/x1.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x1",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "escaping asset path",
+      "valid": false,
+      "manifest": {
+        "version": 1,
+        "source": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 5000,
+          "pageCount": 2
+        },
+        "pdf": {
+          "path": "reading/document.pdf",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 1000
+        },
+        "images": [
+          {
+            "id": "x1",
+            "path": "../image.bin",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "originalSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bytes": 4,
+            "width": 2,
+            "height": 2,
+            "encoding": "original"
+          },
+          {
+            "id": "x2",
+            "path": "reading/x2.jpg",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "originalSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bytes": 12,
+            "width": 8,
+            "height": 8,
+            "components": 3,
+            "encoding": "progressive-jpeg",
+            "coefficientBytes": 768,
+            "chunks": [
+              {
+                "offset": 0,
+                "bytes": 6,
+                "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "scan": 1
+              },
+              {
+                "offset": 6,
+                "bytes": 6,
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "scan": 2
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
