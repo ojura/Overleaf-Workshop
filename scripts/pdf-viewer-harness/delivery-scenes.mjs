@@ -14,7 +14,7 @@ import { scriptOptions } from '../lib/options.mjs';
 import { connectDaemon, evaluateHarness } from './scenario-connection.mjs';
 import { keepRendering } from './render-capture.mjs';
 import { normalizeTabZoom } from './per-tab-zoom.mjs';
-import { deliveryRequestCategory, installDeliveryObservation, repaintDeliveryPages, summarizeDeliveryNetwork } from './delivery-observation.mjs';
+import { deliveryRequestCategory, installDeliveryObservation, repaintDeliveryPages, startDeliveryRepaint, summarizeDeliveryNetwork } from './delivery-observation.mjs';
 
 const options = scriptOptions({ url: 'value', pages: 'value', spread: ['none', 'odd', 'even'], daemon: 'value',
     width: 'number', height: 'number', dpr: 'number', zoom: 'number', 'budget-ms': 'number',
@@ -111,10 +111,24 @@ try {
     for (const mode of ['canvases', 'repaint-canvases']) {
         if (!options.get(mode)) continue;
         const priorRequests = new Set(requests.keys());
-        const captures = await evaluateHarness(target, mode === 'canvases' ? 'window.__pdfDeliveryObservation.captureCanvases()'
-            : '(' + repaintDeliveryPages.toString() + ')(' + JSON.stringify(pages) + ',' + budgetMs + ')', { limitMs: budgetMs + 5000 });
-        if (mode === 'repaint-canvases') result.repaintNetwork = summarizeDeliveryNetwork([...requests.entries()]
-            .filter(([id]) => !priorRequests.has(id)).map(([_id, request]) => request));
+        let captures;
+        if (mode === 'canvases') captures = await evaluateHarness(target, 'window.__pdfDeliveryObservation.captureCanvases()');
+        else {
+            try {
+                await evaluateHarness(target, '(' + startDeliveryRepaint.toString() + ')('
+                    + JSON.stringify(pages) + ',' + budgetMs + ',(' + repaintDeliveryPages.toString() + '))');
+                let repaint;
+                do {
+                    repaint = await evaluateHarness(target, 'window.__pdfDeliveryRepaint.next()');
+                    if (interrupted) throw new Error('Verification repaint interrupted: ' + interrupted);
+                } while (!repaint.finished);
+                if (repaint.error) throw new Error(repaint.error);
+                captures = repaint.canvases;
+            } finally {
+                result.repaintNetwork = summarizeDeliveryNetwork([...requests.entries()]
+                    .filter(([id]) => !priorRequests.has(id)).map(([_id, request]) => request));
+            }
+        }
         const directory = path.resolve(options.get(mode));
         await fs.mkdir(directory, { recursive: true });
         const files = result[mode === 'canvases' ? 'canvasFiles' : 'repaintCanvasFiles'] = [];

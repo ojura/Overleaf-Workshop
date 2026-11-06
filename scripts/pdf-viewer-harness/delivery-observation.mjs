@@ -275,6 +275,27 @@ export async function repaintDeliveryPages(pages, budgetMs = 60000) {
     return observation.captureCanvases();
 }
 
+/** Keep each daemon request short enough to drain its bounded event buffer while
+ * the native repaint retains one overall deadline and one set of render owners. */
+export function startDeliveryRepaint(pages, budgetMs, repaint) {
+    let result = { finished: false };
+    const completion = Promise.resolve().then(() => repaint(pages, budgetMs)).then(
+        canvases => { result = { finished: true, canvases }; },
+        error => { result = { finished: true, error: String(error) }; },
+    );
+    window.__pdfDeliveryRepaint = {
+        async next() {
+            if (!result.finished) {
+                let timer;
+                try {
+                    await Promise.race([completion, new Promise(resolve => { timer = setTimeout(resolve, 500); })]);
+                } finally { clearTimeout(timer); }
+            }
+            return result;
+        },
+    };
+}
+
 export function summarizeDeliveryNetwork(requests) {
     const categories = {};
     for (const request of requests) {

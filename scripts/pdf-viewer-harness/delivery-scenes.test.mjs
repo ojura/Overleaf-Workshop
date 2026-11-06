@@ -55,7 +55,9 @@ for (const scenario of [
         else if (request.url === '/attach') result = { sessionId: 'measurement-session' };
         else if (body.method === 'Target.createTarget') result = { result: { targetId: 'measurement-target' } };
         else if (body.method === 'Runtime.evaluate' && body.params.expression.includes('repaintDeliveryPages')) {
-            result = { result: { exceptionDetails: { text: 'Injected native verification repaint failure' } } };
+            result = { result: { result: { type: 'undefined' } } };
+        } else if (body.method === 'Runtime.evaluate' && body.params.expression === 'window.__pdfDeliveryRepaint.next()') {
+            result = { result: { result: { type: 'object', value: { finished: true, error: 'Injected native verification repaint failure' } } } };
         } else if (body.method === 'Runtime.evaluate') result = { result: { result: { type: 'object', value: sample } } };
         else if (body.method === 'Page.startScreencast' && body.params.format === 'png') {
             response.statusCode = 500;
@@ -85,6 +87,7 @@ for (const scenario of [
     assert.ok(result.failures.some(failure => scenario.mode === 'screenshot'
         ? /screenshot/i.test(JSON.stringify(failure)) : scenario.mode === 'repaint' ? /repaint/i.test(JSON.stringify(failure))
             : failure.kind === (scenario.mode === 'final' ? 'completion' : 'viewport')));
+    if (scenario.mode === 'repaint') assert.deepEqual(result.repaintNetwork, {}, 'failed repaint retains its separate traffic accounting');
     assert.ok(calls.some(call => call.route === '/release' && call.sessionId === 'measurement-session'));
     assert.ok(calls.some(call => call.method === 'Target.detachFromTarget' && call.params.sessionId === 'measurement-session'));
     assert.ok(calls.some(call => call.method === 'Target.closeTarget' && call.params.targetId === 'measurement-target'));
