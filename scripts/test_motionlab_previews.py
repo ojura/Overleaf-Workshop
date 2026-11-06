@@ -426,6 +426,23 @@ class MotionLabPreviewsTest(unittest.TestCase):
                 self.rejected("--tiers", "192", *arguments, source=many)
                 self.assertFalse((self.output / "manifest.json").exists())
 
+    def test_raster_budget_is_independent_of_the_owned_reading_namespace(self):
+        self.complete("--pages", "1", "--tiers", "192")
+        reading = self.output / "reading"
+        reading.mkdir()
+        asset = reading / "owned-image.bin"
+        asset.write_bytes(b"x" * (2 * MIB))
+        metadata = self.output / "reading.json"
+        metadata.write_text('{"owned":"reading generator"}\n')
+        before = (source_state(asset), source_state(metadata))
+        self.complete("--pages", "1-2", "--tiers", "192,512", "--max-output-mib", "1")
+        self.assertEqual((source_state(asset), source_state(metadata)), before)
+        self.validate_manifest(selected=[1, 2])
+        ordinary = self.output / "unrelated.bin"
+        ordinary.write_bytes(b"y" * MIB)
+        result, _, detail = self.run_cli("--pages", "1-2", "--tiers", "192,512", "--max-output-mib", "1")
+        self.assertEqual(result.returncode, 3, detail)
+
     def test_quota_preserves_completed_manifest_and_counts_unrelated_files(self):
         self.complete("--pages", "1", "--tiers", "192")
         filler = self.output / "preexisting.bin"

@@ -909,6 +909,7 @@
     "test:unit": "tsc -p ./ && { mocha --ignore out/test/base.test.js \"out/test/**/*.test.js\"; mocha_status=$?; node --test out/test/base.test.js \"scripts/**/*.test.mjs\"; node_test_status=$?; exit $((mocha_status || node_test_status)); }",
     "test:pdf-viewer": "tsc -p ./ && mocha \"out/test/pdf*.test.js\" && npm run test:pdf-harness && npm run test:safari:offline",
     "test:pdf-harness": "node --test \"scripts/pdf-viewer-harness/*.test.mjs\"",
+    "test:spomenar:offline": "python3 -B -m unittest scripts.test_motionlab_previews scripts.test_motionlab_reading scripts.test_publish_spomenar_previews scripts.test_spomenar_watch scripts.test_spomenar_install -v",
     "test:safari:offline": "node --test scripts/pdf-viewer-harness/safari/*.test.mjs && python3 -B -m unittest discover -s scripts/pdf-viewer-harness/safari -p 'test_*.py'",
     "test:api": "tsc -p ./ && node --test out/test/base.test.js",
     "prepare": "husky install"

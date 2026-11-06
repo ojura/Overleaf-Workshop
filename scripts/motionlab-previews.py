@@ -411,7 +411,13 @@ async def invoke_worker(job, folder: Path, deadline: Deadline, timeout: float):
                     await process.wait()
 
 
-def directory_bytes(root: Path, deadline: Deadline) -> int:
+def reading_path(value: str) -> bool:
+    first = value.split("/", 1)[0]
+    return (first in ("reading", "reading.json", ".reading-state.json", ".motionlab-reading.lock")
+            or first.startswith((".reading-work-", ".reading-pending-")))
+
+
+def directory_bytes(root: Path, deadline: Deadline, *, exclude_reading=False) -> int:
     total, entries = 0, 0
     def unreadable(error):
         raise Failure(f"Could not count all existing output files: {error}") from error
@@ -426,7 +432,8 @@ def directory_bytes(root: Path, deadline: Deadline) -> int:
             if stat.S_ISLNK(value.st_mode):
                 raise Failure("The output directory must not contain symlinks")
             if stat.S_ISREG(value.st_mode):
-                total += value.st_size
+                if not exclude_reading or not reading_path(path.relative_to(root).as_posix()):
+                    total += value.st_size
             elif not stat.S_ISDIR(value.st_mode):
                 raise Failure("The output directory contains a nonregular entry")
     return total
@@ -434,6 +441,7 @@ def directory_bytes(root: Path, deadline: Deadline) -> int:
 
 def safe_asset_path(root: Path, value):
     if (not isinstance(value, str) or not SAFE_ASSET.fullmatch(value)
+            or reading_path(value)
             or any(part in ("", ".", "..") for part in value.split("/"))):
         raise Failure("Invalid existing preview asset path")
     result = root / value
@@ -524,7 +532,7 @@ class Publisher:
         self.root = root
         self.quota = quota
         self.deadline = deadline
-        self.used = directory_bytes(root, deadline)
+        self.used = directory_bytes(root, deadline, exclude_reading=True)
         if self.used > quota:
             raise LimitReached("output-limit")
         self.manifest = existing_manifest(root, identity, page_count, deadline)

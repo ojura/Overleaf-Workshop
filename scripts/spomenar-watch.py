@@ -36,6 +36,7 @@ _spec = importlib.util.spec_from_file_location("spomenar_publisher", SCRIPT_DIRE
 PUBLISHER = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(PUBLISHER)
 PRODUCER = PUBLISHER._protocol
+READING = PUBLISHER.READING
 MIB = PRODUCER.MIB
 HASH = PRODUCER.HASH
 
@@ -177,9 +178,14 @@ class Settings:
     max_published_versions: int = 3
     # Existing producer units: MiB, seconds, worker count, virtual address space.
     max_output_mib: int = 512
+    max_reading_output_mib: int = 2048
+    # Published raster, reading and metadata bytes across retained editions.
+    # Temporary generation is separately bounded by its phase's output budget.
+    max_derived_mib: int = 10240
     workers: int = 1
     max_worker_mib: int = 4096
     render_deadline_seconds: float = 600
+    reading_deadline_seconds: float = 3600
     job_timeout_seconds: float = 60
 
     @classmethod
@@ -217,11 +223,12 @@ class Settings:
         if not re.fullmatch(r"(?:/[A-Za-z0-9_-]+)+", self.preview_url_prefix):
             raise Failure("preview_url_prefix must contain safe absolute URL segments")
         for value in (self.poll_seconds, self.settle_seconds, self.retry_seconds, self.retirement_seconds,
-                      self.render_deadline_seconds, self.job_timeout_seconds):
+                      self.render_deadline_seconds, self.reading_deadline_seconds, self.job_timeout_seconds):
             if not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 < value <= 86400:
                 raise Failure("Service times must be finite positive seconds, at most one day")
         if (self.workers not in (1, 2) or not 128 <= self.max_worker_mib <= 16384
                 or not 1 <= self.max_output_mib <= 4096 or self.job_timeout_seconds > 3600
+                or not 1 <= self.max_reading_output_mib <= 65536 or not 1 <= self.max_derived_mib <= 65536
                 or not 1 <= self.max_published_versions <= 8
                 or not 1 <= self.max_snapshot_mib <= 65536):
             raise Failure("Invalid service resource budget")
@@ -344,6 +351,7 @@ class Watcher:
             fallback = read_json(self.settings.base_config)
             fallback["pdfUrl"] = self.settings.native_url
             fallback.pop("previews", None)
+            fallback.pop("reading", None)
             fallback["publicationGeneration"] = 0
             atomic_json(self.config_path, fallback)
         current = self.current()
@@ -447,7 +455,7 @@ class Watcher:
         self.save()
         emit("retired", sha256=sha)
 
-    def reserve(self, incoming_size=0, new_version=False):
+    def reserve(self, incoming_size=0, new_version=False, incoming_derived=0):
         """Grace yields to hard caps; current/candidate never yield."""
         protected = {self.current(), self.candidate}
         for sha, record in list(self.records.items()):
@@ -457,7 +465,10 @@ class Watcher:
             records = self.records
             published = sum(bool(record.get("publishedAt")) for record in records.values())
             size = sum(record["size"] for record in records.values()) + incoming_size
+            derived = sum(record.get("derivedBytes", self.settings.max_output_mib * MIB
+                                     if record.get("publishedAt") else 0) for record in records.values()) + incoming_derived
             pressure = (size > self.settings.max_snapshot_mib * MIB
+                        or derived > self.settings.max_derived_mib * MIB
                         or len(records) + int(new_version) > self.settings.max_published_versions + 1
                         or not new_version and published > self.settings.max_published_versions)
             eligible = sorted((sha for sha in records if sha not in protected),
@@ -588,6 +599,48 @@ class Watcher:
                  and set(PRODUCER.TIERS).issubset({max(asset["width"], asset["height"]) for asset in page["assets"]})}
         return payload, value, ready
 
+    def reading_manifest(self, directory, sha, *, verify_assets=False, expected_revision=None):
+        deadline = PUBLISHER.Deadline(self.settings.render_deadline_seconds if verify_assets else 10, self)
+        with PUBLISHER.directory(directory) as folder:
+            payload, value = PUBLISHER.snapshot_manifest(folder, deadline, "reading.json")
+            assets, asset_bytes = PUBLISHER.validate_reading(value, sha, self.settings.max_reading_output_mib * MIB)
+            record = self.records[sha]
+            if (value["source"]["size"] != record["size"]
+                    or value["source"]["pageCount"] != record["pageCount"]):
+                raise Failure("The reading representation differs from the retained PDF")
+            if expected_revision is not None and hashlib.sha256(payload).hexdigest() != expected_revision:
+                raise Failure("The reading manifest differs from its saved revision")
+            if verify_assets:
+                for asset in assets:
+                    with PUBLISHER.asset_parent(folder, asset["path"]) as (parent, name):
+                        with PUBLISHER.regular_file(parent, name) as (descriptor, before):
+                            PUBLISHER.checked_asset(descriptor, before, asset, deadline)
+        return payload, value, asset_bytes + len(payload)
+
+    def reading_ready(self, sha):
+        record = self.records[sha]
+        if record.get("readingVersion") != READING.VERSION:
+            return False
+        path = self.settings.preview_root / sha / "reading.json"
+        try:
+            fingerprint = identity(path)
+        except FileNotFoundError:
+            return False
+        if tuple(record.get("readingManifest", ())) != fingerprint:
+            revision = record.get("readingRevision")
+            if not isinstance(revision, str) or not HASH.fullmatch(revision):
+                raise Failure("The reading representation has no saved revision")
+            _, _, size = self.reading_manifest(path.parent, sha, verify_assets=True, expected_revision=revision)
+            if identity(path) != fingerprint:
+                raise Failure("The reading manifest changed during verification")
+            record.update(readingManifest=list(fingerprint), readingBytes=size, publicationPending=True)
+            self.save()
+        return True
+
+    def derived_bytes(self, sha):
+        return PRODUCER.directory_bytes(self.settings.preview_root / sha,
+                                        PUBLISHER.Deadline(self.settings.job_timeout_seconds, self))
+
     def work_directory(self, sha):
         path = self.settings.work_root / sha
         if path.is_symlink():
@@ -622,7 +675,7 @@ class Watcher:
                 for name in files:
                     if PUBLISHER_PENDING.fullmatch(name):
                         path = Path(directory) / name
-                        if identity(path)[2] > max(PRODUCER.MAX_ASSET_BYTES, PRODUCER.MAX_MANIFEST_BYTES):
+                        if identity(path)[2] > max(READING.MAX_IMAGE_BYTES, READING.MAX_PDF_BYTES, PRODUCER.MAX_MANIFEST_BYTES):
                             raise Failure("An abandoned publication exceeds its writer bound")
                         path.unlink()
 
@@ -695,6 +748,20 @@ class Watcher:
                                      if page <= record["pageCount"]] or [1]
             self.save()
         priority = ",".join(map(str, record["priorities"]))
+        if phase == "reading":
+            self.reserve(incoming_derived=settings.max_reading_output_mib * MIB)
+            arguments = [str(settings.python), "-B", str(SCRIPT_DIRECTORY / "motionlab-reading.py"),
+                         str(self.versions / sha / "book.pdf"), "--output", str(self.work_directory(sha)),
+                         "--max-output-mib", str(settings.max_reading_output_mib),
+                         "--max-worker-mib", str(settings.max_worker_mib),
+                         "--deadline-seconds", str(settings.reading_deadline_seconds),
+                         "--job-timeout-seconds", str(settings.job_timeout_seconds)]
+            self.child = self.spawn(arguments)
+            self.child_phase = phase
+            self.status(phase, sha, total=record["pageCount"])
+            emit("render-start", sha256=sha, phase=phase)
+            return
+        self.reserve(incoming_derived=settings.max_output_mib * MIB)
         arguments = [str(settings.python), "-B", str(SCRIPT_DIRECTORY / "motionlab-previews.py"),
                      str(self.versions / sha / "book.pdf"), "--output", str(self.work_directory(sha)),
                      "--priority-pages", priority, "--workers", str(settings.workers),
@@ -722,6 +789,28 @@ class Watcher:
             PUBLISHER.publish(args, cancellation=self)
         self.commit(sha, source, full)
 
+    def publish_reading(self, sha, source, generated):
+        self.assert_current(source)
+        payload, value, size = self.reading_manifest(generated, sha)
+        self.reserve(incoming_derived=size)
+        self.status("publishing-reading", sha)
+        self.clear_publisher_staging(sha)
+        args = PUBLISHER.parser().parse_args([str(generated), "--reading", "--web-root", str(self.settings.preview_root),
+                                              "--sha256", sha, "--max-assets-mib", str(self.settings.max_reading_output_mib),
+                                              "--deadline-seconds", str(self.settings.render_deadline_seconds)])
+        with open(os.devnull, "w") as output, contextlib.redirect_stdout(output):
+            PUBLISHER.publish(args, cancellation=self)
+        self.assert_current(source)
+        public = self.settings.preview_root / sha
+        published, _, published_size = self.reading_manifest(public, sha)
+        if published != payload or published_size != size:
+            raise Failure("The published reading snapshot differs from the selected generation")
+        self.records[sha].update(readingVersion=value["version"], readingManifest=list(identity(public / "reading.json")),
+                                 readingRevision=hashlib.sha256(payload).hexdigest(), readingBytes=size,
+                                 derivedBytes=self.derived_bytes(sha), publicationPending=True)
+        self.save()
+        self.commit(sha, source, full=True)
+
     def commit(self, sha, source, full):
         """Bind the PDF, atlas revision and observed HTTP validator in one file."""
         payload, manifest, ready = self.manifest(self.settings.preview_root / sha, sha)
@@ -740,9 +829,16 @@ class Watcher:
             "sha256": sha, "size": record["size"],
             "validator": {"header": "ETag", "value": transport["etag"]},
             "manifestRevision": hashlib.sha256(payload).hexdigest()})
+        if self.reading_ready(sha):
+            update["reading"] = {"manifestUrl": f"{self.settings.preview_url_prefix}/{sha}/reading.json",
+                "manifestRevision": record["readingRevision"], "sha256": sha, "size": record["size"],
+                "validator": dict(update["previews"]["validator"])}
+        else:
+            update.pop("reading", None)
         record.update(full=full, pageCount=manifest["document"]["pageCount"],
                       publishedAt=self.wall_time(), manifest=list(identity(self.settings.preview_root / sha / "manifest.json")),
-                      manifestRevision=update["previews"]["manifestRevision"], publicationPending=True)
+                      manifestRevision=update["previews"]["manifestRevision"],
+                      derivedBytes=self.derived_bytes(sha), publicationPending=True)
         record.pop("retryAt", None)
         record.pop("failures", None)
         # Write recoverable edition metadata before the single public commit.
@@ -758,7 +854,7 @@ class Watcher:
         emit("published", sha256=sha, full=full, configGeneration=update.get("publicationGeneration", 0))
         if full:
             work = self.settings.work_root / sha
-            if work.exists():
+            if work.exists() and ("reading" in update or not (work / READING.STATE).exists()):
                 self.remove_directory(work)
         self.reserve()
 
@@ -773,6 +869,8 @@ class Watcher:
         if len(ready) != value["document"]["pageCount"]:
             return False
         self.publish(sha, source, directory, full=True)
+        if (directory / "reading.json").is_file():
+            self.publish_reading(sha, source, directory)
         return True
 
     def advance(self, sha, source):
@@ -781,10 +879,17 @@ class Watcher:
             return
         self.verify_edition(sha)
         if record.get("full"):
+            reading_ready = self.reading_ready(sha)
             if self.current() == sha and not record.get("publicationPending"):
                 self.status("ready", sha, record["pageCount"], record["pageCount"])
             else:
                 self.commit(sha, source, full=True)
+            if not reading_ready:
+                work = self.settings.work_root / sha
+                if (work / "reading.json").is_file():
+                    self.publish_reading(sha, source, work)
+                else:
+                    self.launch(sha, "reading")
             return
         if self.adopt(sha, source):
             return
@@ -845,7 +950,10 @@ class Watcher:
                     raise ChildStuck("The renderer was killed; restart clears its entire cgroup")
                 if code:
                     raise Failure(f"The {phase} producer exited with status {code}")
-                self.publish(sha, source, self.settings.work_root / sha, full=phase == "full")
+                if phase == "reading":
+                    self.publish_reading(sha, source, self.settings.work_root / sha)
+                else:
+                    self.publish(sha, source, self.settings.work_root / sha, full=phase == "full")
                 if phase == "priority":
                     self.launch(sha, "full")
             else:

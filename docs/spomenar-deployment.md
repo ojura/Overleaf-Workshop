@@ -3,7 +3,8 @@
 The public reader is served at [cloud.larics.fer.hr/spomenar/](https://cloud.larics.fer.hr/spomenar/).
 Viewer assets and published books have separate lifetimes. The publication service turns the
 existing [Nextcloud public share](https://cloud.larics.fer.hr/nextcloud/s/spomenar-2026) into immutable
-PDF editions at `/spomenar-versions/<SHA>/book.pdf`, with matching preview atlases. Its root-owned
+PDF editions at `/spomenar-versions/<SHA>/book.pdf`, with matching preview atlases
+and independent text/layout plus encoded-image reading representations. Its root-owned
 catalog supplies the live configuration and remains outside the replaceable viewer directory.
 
 ## Build and deploy
@@ -67,7 +68,11 @@ them and reloads the restored configuration. A successful reload commits activat
 backup cleanup or final reporting can fail while the new site remains active, so inspect the
 served site and command's failure stage before assuming a nonzero result rolled it back.
 Normal success removes the old assets and local/remote staging. The catalog, immutable PDFs and
-atlas store remain outside this asset replacement.
+derived-asset store remain outside this asset replacement. A publication-producer
+upgrade is a separate operation: follow the service guide's
+[existing-edition migration](spomenar-watch.md#upgrading-an-existing-edition) to
+install its coherent Python/C/format bundle and restart the watcher. That restart
+lets the current unchanged book acquire a missing reading representation.
 
 ## PDF delivery and updates
 
@@ -80,6 +85,7 @@ The single source for public locations is `scripts/spomenar-watch.nginx.conf`:
 | `/spomenar/status.json` | Small publication progress record through the same link. |
 | `/spomenar-versions/<SHA>/book.pdf` | Static immutable PDF from the retained edition. |
 | `/spomenar/previews/<SHA>/manifest.json` and its relative assets | Matching published preview atlas. |
+| `/spomenar/previews/<SHA>/reading.json` and `reading/` assets | Verified structural PDF and progressive/original encoded image streams. |
 | `/spomenar-previews` and paths below it | Explicit 404 for the direct storage namespace. |
 
 Static nginx PDF delivery uses sendfile, HEAD, identity transfer, ETag, byte ranges and If-Range.
@@ -89,7 +95,7 @@ caching so removal of the shared public link withdraws subsequent requests toget
 Nextcloud remains the authority for the source node and public access. The service polls that
 authority, follows renames and moves, waits for a changed source to settle, and creates a
 copy-on-write PDF snapshot under its SHA. It publishes priority-page previews, then the full
-atlas, with atomic configuration and manifest updates. Preview identity includes the exact
+atlas and the reading representation, with atomic configuration and manifest updates. Each identity includes the exact
 source digest, byte length and observed static HTTP validator. A fuller manifest can replace
 an earlier checkpoint while the current PDF stays open.
 
@@ -127,8 +133,7 @@ site to check workers, CSP, page links, touch controls and visible page readines
 The focused suites are:
 
 ```sh
-python3 -B -m unittest scripts/test_spomenar_install.py -v
-python3 -B -m unittest scripts/test_spomenar_watch.py -v
+npm run test:spomenar:offline
 ```
 
 Installer cases exercise bounded native preflight, invalid ranges and validators, closing a
@@ -139,6 +144,7 @@ nginx commands.
 
 The watch suite owns the actual nginx static-route fixture. It checks HEAD, Range, If-Range,
 same-second JSON replacement, the direct-storage deny, and withdrawal through the shared link.
-It also covers source snapshots, priority/full publication, restart recovery, stale jobs,
-backoff and retention. See the publication guide's [focused checks](spomenar-watch.md#focused-checks)
+It also covers source snapshots, priority/full/reading publication, unchanged-edition
+migration, restart recovery, stale jobs, backoff and separate derived-asset retention.
+See the publication guide's [focused checks](spomenar-watch.md#focused-checks)
 for the optional Btrfs fixture settings.

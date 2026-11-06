@@ -12,5 +12,9 @@
   "renderer_user": "juraj",
   "nextcloud_user": "www-data",
   "adopt_atlas": "/home/juraj/.cache/larics-motionlab/public-36d99a2-3UknX45m/atlas",
-  "priority_pages": [99, 100]
+  "priority_pages": [99, 100],
+  "max_output_mib": 512,
+  "max_reading_output_mib": 2048,
+  "max_derived_mib": 10240,
+  "reading_deadline_seconds": 3600
 }

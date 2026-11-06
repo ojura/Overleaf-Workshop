@@ -48,6 +48,8 @@ The published configuration identifies the immutable PDF and retains the reader'
 
 The catalog also binds the matching preview manifest at `/spomenar/previews/<source-sha256>/manifest.json` to the PDF's digest, byte length and observed HTTP validator. A publication generation identifies a committed configuration; a separate manifest revision lets a fuller atlas replace an earlier checkpoint while the same PDF stays open. See [automatic publication](spomenar-watch.md#publication-files-and-public-access) for the complete configuration and public progress fields. Configuration and status remain separate from the replaceable viewer files.
 
+An optional sibling `reading.json` binds a small structural PDF and independently verified image streams to that same original edition. Native PDF operators preserve text, vectors, clipping, masks and paint order while photographs arrive in progressive scans. The original `pdfUrl` remains the download identity. See [independent layout and progressive photographs](motionlab-reading.md) for generation, color/scan verification, fallback and quotas.
+
 ## PDF endpoint
 
 Production serves each edition directly at `/spomenar-versions/<source-sha256>/book.pdf`. Static nginx delivery provides HEAD, ordinary byte ranges and If-Range against that immutable file. The PDF endpoint must:
@@ -60,7 +62,7 @@ Production serves each edition directly at `/spomenar-versions/<source-sha256>/b
 
 The publication service checks the stable Nextcloud share, waits for a changed source to settle, and snapshots its local PDF into an immutable edition. Nextcloud remains the authority for source discovery and public access. Renames and moves follow the shared node; reader byte requests use the published static file. A new edition and its matching preview identity become current through one atomic catalog update. Revocation removes the catalog's public link at the next service poll, withdrawing subsequent PDF, preview, configuration and status requests together.
 
-The service prepares priority-page previews first, then completes the remaining atlas. A fuller atlas updates its manifest revision without replacing the PDF. Retained editions let an existing reader finish its current load while publication advances; their count and storage limits can eventually retire an old version, at which point that reader needs to reload the current edition. The [publication guide](spomenar-watch.md) defines recovery, retention and withdrawal behavior.
+The service prepares priority-page previews first, completes the remaining atlas, then generates the independent reading representation. Each completed manifest receives its own revision without replacing the original PDF. An upgraded service also fills a missing reading representation for the unchanged current edition. Retained editions let an existing reader finish its current load while publication advances; their count and storage limits can eventually retire an old version, at which point that reader needs to reload the current edition. The [publication guide](spomenar-watch.md) defines recovery, retention and withdrawal behavior.
 
 `http-range.ts` fetches the first 128 KiB, then only the ranges requested by PDF.js. It validates the response headers before reading the body and enforces the declared byte count while streaming. A full-file HTTP 200 response is cancelled before buffering. A changed length or validator ends the current load and shows a retry action. Retry uses the viewer's saved position.
 
@@ -84,7 +86,7 @@ The supplied standards document shows the negative mark on dark backgrounds and 
 
 ## Verification
 
-The [Safari validation runbook](safari-validation.md) defines the physical iPhone checks, short delivery and reversal scenarios, manual gestures, and the complete 600-second endurance run. `npm run test:safari:offline` checks that harness without contacting a device; `npm run test:pdf-viewer` includes it with the PDF regression suites.
+The [Safari validation runbook](safari-validation.md) defines the physical iPhone checks, short delivery and reversal scenarios, manual gestures, and an extended workload with a selected duration. A 600-second budget is one supported example; validation still requires the complete workload requested for that capture. `npm run test:safari:offline` checks that harness without contacting a device; `npm run test:pdf-viewer` includes it with the PDF regression suites.
 
 The focused suite covers exact ranges, cancelling whole-file responses, invalid headers and body lengths, changed documents, cancellation accounting, validators, same-origin configuration, shared links, and the exported viewer controls and relative assets.
 

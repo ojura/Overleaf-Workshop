@@ -73,6 +73,25 @@ def atlas(path, sha, size, *, pages=(1, 2, 3), count=3):
     return value
 
 
+def reading_assets(path, sha, size, *, count=3):
+    path.mkdir(parents=True, exist_ok=True)
+    assets = path / "reading"
+    assets.mkdir(exist_ok=True)
+    pdf = b"%PDF-1.4\nowned structural fixture\n"
+    image = b"\x11\x22\x33"
+    def asset(data, suffix):
+        digest = checksum(data)
+        relative = f"reading/{digest}.{suffix}"
+        (path / relative).write_bytes(data)
+        return {"path": relative, "sha256": digest, "bytes": len(data)}
+    value = {"version": 1, "source": {"sha256": sha, "size": size, "pageCount": count},
+             "pdf": asset(pdf, "pdf"), "images": [{**asset(image, "bin"), "id": "x7",
+                 "originalSha256": checksum(image), "width": 1, "height": 1,
+                 "encoding": "original", "fallbackReason": "original-filter"}]}
+    WATCH.atomic_json(path / "reading.json", value)
+    return value
+
+
 class FakeChild:
     def __init__(self):
         self.returncode = None
@@ -170,17 +189,134 @@ class WatcherTest(unittest.TestCase):
         self.watcher.tick()
         return sha
 
-    def adopt_current(self, payload=None):
+    def adopt_current(self, payload=None, *, reading=True):
         if payload is not None:
             self.source.write_bytes(payload)
         sha = checksum(self.source.read_bytes())
         if self.seed.exists():
             shutil.rmtree(self.seed)
         atlas(self.seed, sha, self.source.stat().st_size)
+        if reading:
+            reading_assets(self.seed, sha, self.source.stat().st_size)
         self.watcher.settings = replace(self.watcher.settings, adopt_atlas=self.seed)
         self.settle()
         self.assertEqual(self.watcher.current(), sha, self.output.getvalue())
         return sha
+
+    def test_current_completed_edition_adds_reading_without_changing_source_or_atlas(self):
+        sha = self.adopt_current(reading=False)
+        before = self.watcher.current_config()
+        source_before = WATCH.identity(self.source)
+        clones = self.clone_mock.call_count
+        self.watcher.tick()
+        self.assertEqual(self.watcher.child_phase, "reading", self.output.getvalue())
+        self.assertEqual(self.watcher.current_config(), before)
+        work = self.settings.work_root / sha
+        value = reading_assets(work, sha, self.source.stat().st_size)
+        self.watcher.child.returncode = 0
+        self.watcher.tick()
+        after = self.watcher.current_config()
+        self.assertEqual(after["pdfUrl"], before["pdfUrl"])
+        self.assertEqual(after["previews"], before["previews"])
+        self.assertEqual(after["reading"]["validator"], before["previews"]["validator"])
+        self.assertEqual(after["reading"]["sha256"], sha)
+        self.assertEqual(after["reading"]["manifestRevision"], checksum((self.settings.preview_root / sha / "reading.json").read_bytes()))
+        self.assertEqual(after["publicationGeneration"], before["publicationGeneration"] + 1)
+        self.assertGreater(self.watcher.records[sha]["readingBytes"], sum(item["bytes"] for item in [value["pdf"], *value["images"]]))
+        self.assertIsNone(self.watcher.child)
+        self.assertEqual(WATCH.identity(self.source), source_before)
+        self.assertEqual(self.clone_mock.call_count, clones)
+        self.assertFalse(work.exists())
+        self.watcher.close()
+        self.watcher = self.make_watcher()
+        with mock.patch.object(WATCH.PUBLISHER, "publish", side_effect=AssertionError("unexpected republish")), \
+                mock.patch.object(WATCH.hashlib, "sha256", side_effect=AssertionError("unexpected rehash")):
+            self.settle()
+        self.assertFalse(self.watcher.launched)
+
+    def test_reading_source_change_during_publication_keeps_existing_catalog(self):
+        sha = self.adopt_current(reading=False)
+        self.watcher.tick()
+        self.assertEqual(self.watcher.child_phase, "reading")
+        reading_assets(self.settings.work_root / sha, sha, self.source.stat().st_size)
+        before = self.watcher.config_path.read_bytes()
+        publish = WATCH.PUBLISHER.publish
+        def replace_after_publish(*args, **kwargs):
+            result = publish(*args, **kwargs)
+            self.source.write_bytes(b"%PDF-1.4\nnewer source during reading publication\n")
+            return result
+        self.watcher.child.returncode = 0
+        with mock.patch.object(WATCH.PUBLISHER, "publish", side_effect=replace_after_publish):
+            self.watcher.tick()
+        self.assertEqual(self.watcher.config_path.read_bytes(), before)
+        self.assertIsNone(self.watcher.child)
+        self.assertIsNone(self.watcher.candidate)
+
+    def test_reading_upgrade_and_interrupted_catalog_commit_resume_same_edition(self):
+        sha = self.adopt_current()
+        before = self.watcher.current_config()
+        self.watcher.records[sha]["readingVersion"] = 0
+        self.watcher.save()
+        self.watcher.tick()
+        self.assertEqual(self.watcher.child_phase, "reading")
+        self.assertEqual(self.watcher.current_config(), before)
+        reading_assets(self.settings.work_root / sha, sha, self.source.stat().st_size)
+        self.watcher.child.returncode = 0
+        writer = WATCH.atomic_json
+        def fail_config(path, value, *args, **kwargs):
+            if Path(path) == self.watcher.config_path:
+                raise OSError("reading catalog interrupted")
+            return writer(path, value, *args, **kwargs)
+        # Force an observed transport revision so this commits a changed catalog.
+        with mock.patch.object(WATCH, "http_pdf", return_value={"size": self.source.stat().st_size, "etag": '"reading-upgrade"'}), \
+                mock.patch.object(WATCH, "atomic_json", side_effect=fail_config):
+            self.watcher.tick()
+        self.assertEqual(self.watcher.current_config(), before)
+        self.assertTrue(self.watcher.records[sha]["publicationPending"])
+        self.watcher.close()
+        self.watcher = self.make_watcher()
+        self.clock[0] += self.settings.retry_seconds
+        with mock.patch.object(WATCH.PUBLISHER, "publish", side_effect=AssertionError("verified representation republished")):
+            self.settle()
+        self.assertFalse(self.watcher.records[sha].get("publicationPending"))
+        self.assertFalse(self.watcher.launched)
+        self.assertEqual(self.watcher.records[sha]["readingVersion"], WATCH.READING.VERSION)
+
+    def test_reading_restore_rejects_changed_chunk_or_asset_before_new_catalog(self):
+        sha = self.adopt_current()
+        folder = self.settings.preview_root / sha
+        manifest = WATCH.read_json(folder / "reading.json")
+        image = folder / manifest["images"][0]["path"]
+        image.write_bytes(b"\x33\x22\x11")
+        replace_fixture_file(folder / "reading.json")
+        before = self.watcher.config_path.read_bytes()
+        self.watcher.tick()
+        self.assertEqual(self.watcher.config_path.read_bytes(), before)
+        self.assertGreater(self.watcher.records[sha]["retryAt"], self.watcher.wall_time())
+        self.assertFalse(self.watcher.launched)
+
+    def test_new_edition_never_inherits_the_previous_reading_descriptor(self):
+        self.adopt_current()
+        self.watcher.settings = replace(self.watcher.settings, adopt_atlas=None)
+        self.source.write_bytes(b"%PDF-1.4\na new edition with no reading assets yet\n")
+        self.settle()
+        self.finish(pages=(2, 3))
+        self.assertNotIn("reading", self.watcher.current_config())
+
+    def test_derived_retention_evicts_only_unprotected_old_editions(self):
+        first = self.adopt_current()
+        second = self.adopt_current(b"%PDF-1.4\nsecond source\n")
+        third = self.adopt_current(b"%PDF-1.4\nthird source\n")
+        self.watcher.settings = replace(self.watcher.settings, max_derived_mib=1)
+        self.watcher.records[first]["derivedBytes"] = 500000
+        self.watcher.records[second]["derivedBytes"] = 500000
+        self.watcher.records[third]["derivedBytes"] = 500000
+        self.watcher.reserve(incoming_derived=400000)
+        self.assertEqual(set(self.watcher.records), {third})
+        self.assertFalse((self.settings.preview_root / first).exists())
+        self.assertFalse((self.settings.preview_root / second).exists())
+        with self.assertRaisesRegex(WATCH.Failure, "retention budget"):
+            self.watcher.reserve(incoming_derived=600000)
 
     def test_bootstrap_is_native_and_catalog_lives_outside_site(self):
         config = self.watcher.current_config()
@@ -591,6 +727,12 @@ class WatcherTest(unittest.TestCase):
         self.assertEqual(self.watcher.child.wait(timeout=30), 0)
         self.watcher.tick()
         self.assertIsNone(self.watcher.child)
+        self.watcher.tick()
+        self.assertEqual(self.watcher.child_phase, "reading", self.output.getvalue())
+        self.assertEqual(self.watcher.child.wait(timeout=30), 0)
+        self.watcher.tick()
+        self.assertIsNone(self.watcher.child)
+        self.assertIn("reading", self.watcher.current_config())
         status = WATCH.read_json(self.watcher.catalog / "status.json")
         self.assertEqual((status["phase"], status["readyPages"]), ("ready", 3), self.output.getvalue())
 
