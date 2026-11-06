@@ -268,7 +268,10 @@ export async function repaintDeliveryPages(pages, budgetMs = 60000) {
             // The native renderer may stop answering; ordinary completion follows its event.
             timer = setTimeout(() => finish(new Error('Native verification repaint did not complete')), Math.max(1, deadline - performance.now()));
             try {
-                if (!view.redrawImages() || !viewer.renderingQueue.renderView(view)) throw new Error('Native queue refused the verification repaint');
+                if (!view.redrawImages()) throw new Error('Native queue refused the verification repaint');
+                // The guarded queue may first prepare a cold page asynchronously. Its own
+                // completion wakes rendering; only the actual final-page event completes us.
+                viewer.renderingQueue.renderView(view);
             } catch (error) { finish(error); }
         });
     }

@@ -26,7 +26,7 @@ function fixture(externalImages = false) {
     });
     const run = pages => vm.runInContext('(' + repaintDeliveryPages.toString() + ')(' + JSON.stringify(pages) + ')', context);
     const emit = event => { for (const callback of [...listeners]) callback(event); };
-    return { run, views, emit, listeners, timers, queued, captures, started, unfinish: () => { finished = false; } };
+    return { run, views, viewer, emit, listeners, timers, queued, captures, started, unfinish: () => { finished = false; } };
 }
 
 test('verification repaint waits for each exact native page and leaves the measurement frozen', async () => {
@@ -61,6 +61,19 @@ test('verification repaint waits for final new image pixels when cleanup retaine
     assert.equal(h.captures.length, 1, 'attempted pixels must also be the displayed revision');
     h.emit({ source: view, pageNumber: 1, imageRevision: 68, imagePassRevision: 68,
         imageStatus: { final: true, failed: 0 }, imagePassStatus: { final: true, failed: 0 } });
+    await pending;
+    assert.equal(h.captures.length, 2);
+    assert.equal(h.listeners.size, 0); assert.equal(h.timers.size, 0);
+});
+
+test('verification repaint waits for the guarded queue to finish asynchronous cold preparation', async () => {
+    const h = fixture(), view = h.views[0];
+    h.viewer.renderingQueue.renderView = candidate => { assert.equal(candidate, view); return false; };
+    const pending = h.run([1]);
+    void pending.catch(() => {});
+    assert.equal(h.listeners.size, 1, 'a deferred queue admission keeps its exact-page completion listener');
+    assert.equal(h.captures.length, 1);
+    h.emit({ source: view, pageNumber: 1 });
     await pending;
     assert.equal(h.captures.length, 2);
     assert.equal(h.listeners.size, 0); assert.equal(h.timers.size, 0);
