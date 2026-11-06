@@ -4,7 +4,7 @@ Slipstream is the shared viewer, predictive loading, and cache layer behind both
 
 ## Reading position and page lifetime
 
-Both extension engines use [reading-state.ts](../views/pdf-viewer/src/common/reading-state.ts) to capture the actual visible page, its PDF coordinates and zoom on the existing scroll and view-update events. A raw scroll can arrive before PDF.js updates its current page number, so capture uses the first visible page's geometry. Restoration suppresses intermediate captures and publishes the completed view. The page updates its VS Code state and sends the same snapshot immediately.
+Both extension engines use [reading-state.ts](../views/pdf-viewer/src/common/reading-state.ts) to capture the actual visible page, its PDF coordinates and zoom on the existing scroll and view-update events. A raw scroll can arrive before PDF.js updates its current page number, so capture uses the first visible page's geometry. Restoration uses the same PDF coordinates, including signed offsets within page margins, suppresses intermediate captures and publishes the completed view. The page updates its VS Code state and sends the same snapshot immediately.
 
 [PdfViewState](../src/core/pdfViewState.ts) coalesces durable storage in the extension host. Received state remains available to a replacement page while an earlier storage write is pending. Writes execute in order against the current saved-state map, and hiding, switching or closing the viewer flushes the state the host already received. Ready and state messages name the current page; a replaced page cannot overwrite the new view. Delayed HTML generation also checks that its page still owns the panel before assigning the result.
 

@@ -15,7 +15,7 @@ import { Outline } from './outline';
 import { Toolbar } from './toolbar';
 import { listenForWheelZoom, listenForZoomKeys } from './zoom';
 import { PDF_VIEWER_POLICY } from '../common/viewer-policy';
-import { installReadingState, visibleReadingPosition } from '../common/reading-state';
+import { installReadingState, restoreReadingPosition, visibleReadingPosition } from '../common/reading-state';
 import { untilAborted } from '../common/document-lifecycle';
 import '../common/icons.css';
 import './viewer.css';
@@ -85,7 +85,7 @@ function restorePosition() {
     reading.restore(() => {
         const position = savedState().position;
         if (position && position.page < wrapper.viewer.pagesCount) {
-            wrapper.scrollToPosition(position, scale as any);
+            restoreReadingPosition(wrapper.viewer, position, scale);
         } else {
             wrapper.viewer.currentScaleValue = scale;
         }

@@ -482,8 +482,13 @@ describe('the Overleaf viewer\'s documents', function () {
             const options = new Map<string, unknown>();
             const pdfViewer = {
                 pdfDocument: undefined as any, position: { page: 1, offset: { left: 0, top: 0 } }, restored: undefined as any,
+                restoreNegativeOffset: false,
                 currentScaleValue: '1.25', container: { addEventListener() {}, removeEventListener() {} },
                 viewer: { style: { minHeight: '' }, classList: { add() {} }, getBoundingClientRect: () => ({ height: f?.height ?? 0 }) },
+                scrollPageIntoView({ pageNumber, destArray, allowNegativeOffset }: any) {
+                    this.restored = { page: pageNumber - 1, offset: { left: destArray[2], top: destArray[3] } };
+                    this.restoreNegativeOffset = allowNegativeOffset;
+                },
             };
             let f: any;
             const application: any = {
@@ -578,7 +583,8 @@ describe('the Overleaf viewer\'s documents', function () {
             };
             next.task.resolve(); await next.settled();
             assert.strictEqual(captured, true);
-            assert.strictEqual(f.pdfViewer.restored, position);
+            assert.deepStrictEqual(f.pdfViewer.restored, position);
+            assert.strictEqual(f.pdfViewer.restoreNegativeOffset, true);
             assert.strictEqual(f.pdfViewer.currentScaleValue, '2.5');
             assert.deepStrictEqual(f.events, ['scene:next', 'close:old', 'setter:next', 'shown:next', 'preview:next']);
             assert.strictEqual(FakeWorker.made[0].terminated, true);

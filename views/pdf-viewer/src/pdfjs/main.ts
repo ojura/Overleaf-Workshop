@@ -30,7 +30,7 @@ import { hostPdfPreviewSource } from '../common/pdf-preview-bridge';
 import { documentParams, PDFJS } from '../shims/pdf-js';
 import { PDF_VIEWER_POLICY } from '../common/viewer-policy';
 import { untilAborted, waitForDocumentOperation, waitForPdfJsApplication } from '../common/document-lifecycle';
-import { installReadingState, visibleReadingPosition } from '../common/reading-state';
+import { installReadingState, restoreReadingPosition, visibleReadingPosition } from '../common/reading-state';
 import '../common/icons.css';
 import './viewer.css';
 
@@ -374,7 +374,7 @@ function onPagesInit() {
     a.pdfViewer.currentScaleValue = view?.scale ?? 'page-width';
     if (view?.position) {
         try {
-            wrapperOf(a).scrollToPosition(view.position);
+            restoreReadingPosition(a.pdfViewer, view.position);
         } catch {
             // a position past the end of a shorter build
         }

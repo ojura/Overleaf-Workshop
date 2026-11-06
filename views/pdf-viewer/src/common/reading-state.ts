@@ -21,6 +21,15 @@ export function visibleReadingPosition(viewer: any): Position | undefined {
     return { page: first.id - 1, offset: { left, top }, pageSize: { width, height } };
 }
 
+/** Restore the measured PDF point, including offsets within the page's surrounding margin. */
+export function restoreReadingPosition(viewer: any, position: Position, scale: string | null = null) {
+    viewer.scrollPageIntoView({
+        pageNumber: position.page + 1,
+        destArray: [null, { name: 'XYZ' }, position.offset.left, position.offset.top, scale],
+        allowNegativeOffset: true,
+    });
+}
+
 /** Both adapters publish reading changes immediately. The host owns durable-write coalescing. */
 export function installReadingState(options: {
     container: HTMLElement;

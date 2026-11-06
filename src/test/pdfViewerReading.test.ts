@@ -82,16 +82,16 @@ describe('reading state in both PDF viewer entry points', function () {
     });
     after(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
-    async function fixture(engine: string, delayed = false) {
+    async function fixture(engine: string, delayed = false, initialPosition?: any) {
         const window = new Events() as any, document = new Events() as any, parentDocument = new Events();
-        const container = new Events() as any, bus = new Events(), booted = deferred(), initialized = deferred();
+        const container = new Events() as any, bus = new Events(), booted = deferred(), initialized = deferred(), shown = deferred();
         const posts: any[] = [], writes: any[] = [], timers = new Map<number, { callback: () => void, delay: number }>();
         let timerId = 0;
-        const initial = { position: { page: 2, offset: { left: 9, top: 35 }, pageSize: { width: 600, height: 800 } }, scale: '1.5', motionLabMeasurementsOpen: true };
+        const initial = { position: initialPosition ?? { page: 2, offset: { left: 9, top: 35 }, pageSize: { width: 600, height: 800 } }, scale: '1.5', motionLabMeasurementsOpen: true };
         const pages = { style: {}, classList: { add() {} }, getBoundingClientRect: () => ({ height: 800 }) };
         container.querySelectorAll = () => [];
         container.querySelector = () => pages;
-        const view = {
+        const view: any = {
             position: copy(initial.position), currentScaleValue: initial.scale, currentScale: 1.5, currentPageNumber: 3,
             pagesCount: 12, pdfDocument: undefined as any, container, viewer: pages, linkService: {}, update() {},
         };
@@ -101,17 +101,30 @@ describe('reading state in both PDF viewer entry points', function () {
             worker: () => { f.workers++; return { terminate() {} }; },
             prefetch: { dispose() {}, setPreviewSource() {}, prepareReplacement() {} },
         };
+        view.scrollPageIntoView = ({ pageNumber, destArray, allowNegativeOffset = false }: any) => {
+            view.position = { page: pageNumber - 1, offset: { left: destArray[2], top: destArray[3] }, pageSize: copy(initial.position.pageSize) };
+            if (f.marginGeometry) {
+                const left = destArray[2], top = 800 - destArray[3];
+                container.scrollLeft = 20 + (allowNegativeOffset ? left : Math.max(0, left));
+                container.scrollTop = 8 + (allowNegativeOffset ? top : Math.max(0, top));
+            }
+            container.dispatch('scroll');
+        };
         const application: any = {
             pdfViewer: view, eventBus: bus, initializedPromise: initialized.promise, pdfDocument: undefined,
             updateZoom() {}, setTitleUsingUrl() {}, secondaryToolbar: { close() {} },
             async close() { application.pdfDocument = view.pdfDocument = undefined; },
-            load(doc: any) { application.pdfDocument = view.pdfDocument = doc; bus.dispatch('pagesinit'); },
+            load(doc: any) { application.pdfDocument = view.pdfDocument = doc; bus.dispatch('pagesinit'); shown.resolve(); },
         };
         class Wrapper {
             viewer = view; container = container; eventBus = bus;
             get currentPosition() { return this.viewer.position; }
             isVisible() { return container.offsetParent !== null; }
-            scrollToPosition(position: any) { this.viewer.position = copy(position); container.dispatch('scroll'); }
+            scrollToPosition(position: any) {
+                view.scrollPageIntoView({ pageNumber: position.page + 1, destArray: [null, { name: 'XYZ' }, position.offset.left, position.offset.top, null] });
+                // The upstream wrapper snaps the first page's entire margin band to zero.
+                if (f.marginGeometry && container.scrollTop <= 8) { container.scrollTop = 0; }
+            }
             updateOnResize() { f.resizeCalls++; }
         }
         f.Wrapper = Wrapper; f.application = application;
@@ -143,10 +156,35 @@ describe('reading state in both PDF viewer entry points', function () {
         await importModule(entries.get(engine)! + '?reading=' + (++sequence));
         if (!delayed) { await booted.promise; }
         f.loaded = () => { application.pdfDocument = view.pdfDocument = { numPages: 12 }; bus.dispatch('pagesinit'); };
+        f.load = async () => {
+            if (engine === 'overleaf') { f.loaded(); }
+            else { window.dispatch('message', { data: { type: 'update', content: new ArrayBuffer(1) } }); await shown.promise; }
+        };
         return f;
     }
 
     for (const engine of ['pdfjs', 'overleaf']) {
+        it(engine + ' restores exact offsets within the first page margin and below it', async () => {
+            for (const top of [8, 4, 0, 12]) {
+                const left = 7;
+                const position = { page: 0, offset: { left: left - 20, top: 800 - (top - 8) }, pageSize: { width: 600, height: 800 } };
+                const f = await fixture(engine, false, position);
+                try {
+                    f.marginGeometry = true;
+                    f.container.scrollTop = 0; f.container.scrollLeft = 0;
+                    f.container.getBoundingClientRect = () => ({ left: 0, top: 0 });
+                    f.view._getVisiblePages = () => ({ first: { id: 1, view: {
+                        div: { getBoundingClientRect: () => ({ left: 20 - f.container.scrollLeft, top: 8 - f.container.scrollTop }) },
+                        viewport: { viewBox: [0, 0, 600, 800], convertToPdfPoint: (x: number, y: number) => [x, 800 - y] },
+                    } } });
+                    await f.load();
+                    assert.strictEqual(f.container.scrollTop, top, 'restoration must preserve the saved offset inside the page margin');
+                    assert.strictEqual(f.container.scrollLeft, left, 'the measured negative PDF offset preserves horizontal position');
+                    assert.deepStrictEqual(f.writes.at(-1)?.position, position, 'the restored view must publish the same PDF position');
+                } finally { f.window.dispatch('pagehide', { persisted: false }); f.timers.clear(); }
+            }
+        });
+
         it(engine + ' publishes the final scroll before a quick close without waiting for a timer', async () => {
             const f = await fixture(engine); f.loaded();
             const position = { page: 8, offset: { left: 17, top: 260 }, pageSize: { width: 600, height: 800 } };
