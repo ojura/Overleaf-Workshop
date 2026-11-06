@@ -263,7 +263,8 @@ describe('production progressive JPEG decoding', function () {
         assert.strictEqual(manager.stats().externalImageCoefficientBytes, 0);
         assert.strictEqual(manager.stats().externalImageEncodedBytes, 0);
         assert.strictEqual(manager.stats().externalImageReservedBytes, 0);
-        assert.strictEqual(manager.stats().externalImageEntropyCalls, fixture.chunks.length * 2);
+        assert.strictEqual(manager.stats().externalImageEntropyCalls, 2,
+            'complete authenticated tails use the native final decoder without repeating their entropy work');
     });
 
     it('batches later scans after every ready image has first coverage with full input space reserved', async () => {
@@ -278,7 +279,7 @@ describe('production progressive JPEG decoding', function () {
         const last = chunks[chunks.length - 1];
         last.bytes = bytes.length - last.offset;
         last.sha256 = createHash('sha256').update(bytes.subarray(last.offset)).digest('hex');
-        const firstCovered = deferred(), secondRead = deferred(), releaseSecond = deferred(), finished = deferred();
+        const firstCovered = deferred(), lateCovered = deferred(), secondRead = deferred(), releaseSecond = deferred(), finished = deferred();
         void finished.promise.catch(() => {});
         const reads: { id: string; chunkIndex: number; chunkCount: number }[] = [];
         const installed = new Map<string, number>();
@@ -296,6 +297,8 @@ describe('production progressive JPEG decoding', function () {
                     if (request.chunkIndex) {
                         assert.strictEqual(manager.groups.get(request.id).decoder.inputCapacity, bytes.length,
                             'the complete input allocation precedes receipt of the later-scan buffer');
+                        assert.strictEqual(manager.groups.get(request.id).decoder.coefficientBytes, 20_480 / 64,
+                            'the incomplete first-scan state remains compact while the complete tail is fetched');
                     }
                     return new ReadableStream({ async start(controller) {
                         if (request.id === 'x2' && !request.chunkIndex) { secondRead.resolve(); await releaseSecond.promise; }
@@ -308,33 +311,38 @@ describe('production progressive JPEG decoding', function () {
                     if (prior !== undefined) { manager.releaseRasters([prior]); }
                     installed.set(revision.id, revision.rasterId);
                     if (!revision.final && revision.id === 'x1') { firstCovered.resolve(); }
+                    if (!revision.final && revision.id === 'x1-late') { lateCovered.resolve(); }
                     if (revision.final) {
                         assert.deepStrictEqual(revision.image.data, reference(original, 37, 25));
-                        if (++completed === 2) { finished.resolve(); }
+                        if (++completed === 3) { finished.resolve(); }
                     }
                     return true;
                 },
             },
         });
         try {
-            for (const id of ['x1', 'x2']) {
-                manager.add({ id, objId: id, pageIndex: 0, epoch: 1, cacheKey: 'display', width: 96, height: 64,
+            const enlist = (id: string, objId = id) =>
+                manager.add({ id, objId, pageIndex: 0, epoch: 1, cacheKey: 'display', width: 96, height: 64,
                     outputPixels: 37 * 25, progressive: true,
                     render: async ({ decoder: state, bytes: input, final }: any) => ({ width: 37, height: 25, kind: 2,
                         data: final ? reference(input, 37, 25) : state.render({ width: 37, height: 25 }) }),
                 });
-            }
+            for (const id of ['x1', 'x2']) { enlist(id); }
             manager.startPage(0, 1);
             const firstTask = manager.groups.get('x1').task;
             await Promise.all([firstCovered.promise, secondRead.promise, firstTask]);
             assert.deepStrictEqual(reads, [{ id: 'x1', chunkIndex: 0, chunkCount: 1 }, { id: 'x2', chunkIndex: 0, chunkCount: 1 }],
                 'a free decode slot waits for the remaining first scan instead of starting a large tail');
+            const late = enlist('x1', 'x1-late');
+            await Promise.all([lateCovered.promise, late.task]);
+            assert.strictEqual(reads.length, 2, 'a late subscriber receives retained coarse pixels without starting a tail ahead of another first scan');
             releaseSecond.resolve();
             await finished.promise;
             await Promise.allSettled(manager.tasks);
             assert.strictEqual(reads.length, 4);
             assert.deepStrictEqual(reads.slice(2).map(value => value.chunkCount), [chunks.length - 1, chunks.length - 1]);
-            assert.strictEqual(manager.stats().externalImageEntropyCalls, chunks.length * 2);
+            assert.strictEqual(manager.stats().externalImageEntropyCalls, 2);
+            assert.strictEqual(manager.stats().externalImageFinalDecodes, 3);
             assert.strictEqual(manager.stats().externalImageBytesReceived, bytes.length * 2);
             assert.ok(manager.stats().externalImagePeakReservedBytes <= manager.stats().externalImageBudgetBytes);
         } finally { releaseSecond.resolve(); await manager.close(); }
@@ -380,7 +388,7 @@ describe('production progressive JPEG decoding', function () {
         } finally { await manager.close(); }
     });
 
-    it('releases a transferred partial raster when cancellation precedes its acknowledgement', async () => {
+    it('releases a transferred final raster when cancellation precedes its acknowledgement', async () => {
         const transferred = deferred<void>(), acknowledge = deferred<boolean>();
         let publications = 0;
         const manager = new worker.ExternalImages({
@@ -398,7 +406,7 @@ describe('production progressive JPEG decoding', function () {
                 },
                 async sendWithPromise(_name: string, revision: any) {
                     assert.strictEqual(revision.failed, false);
-                    assert.strictEqual(revision.final, false);
+                    assert.strictEqual(revision.final, publications === 1);
                     if (++publications === 2) { transferred.resolve(); return acknowledge.promise; }
                     return true;
                 },
@@ -407,13 +415,15 @@ describe('production progressive JPEG decoding', function () {
         try {
             manager.add({ id: 'x1', objId: 'image1', pageIndex: 0, epoch: 1, cacheKey: 'display',
                 width: 96, height: 64, outputPixels: 37 * 25, progressive: true,
-                render: async ({ decoder: state }: any) => ({ width: 37, height: 25, kind: 2,
-                    data: state.render({ width: 37, height: 25 }) }),
+                render: async ({ decoder: state, bytes, final }: any) => ({ width: 37, height: 25, kind: 2,
+                    data: final ? reference(bytes, 37, 25) : state.render({ width: 37, height: 25 }) }),
             });
             manager.startPage(0, 1);
             await transferred.promise;
-            assert.strictEqual(manager.stats().externalImagePartialRasterBytes, 2 * 37 * 25 * 3,
-                'the installed raster and the unacknowledged transfer both remain owned');
+            assert.strictEqual(manager.stats().externalImagePartialRasterBytes, 37 * 25 * 3,
+                'the installed partial raster remains owned');
+            assert.strictEqual(manager.stats().externalImageNativeRasterBytes, 37 * 25 * 3,
+                'the unacknowledged native final transfer remains owned');
             let released = false;
             const cancellation = manager.cancelPage(0, 1).then(() => { released = true; });
             await Promise.resolve();

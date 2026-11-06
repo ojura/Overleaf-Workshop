@@ -154,7 +154,8 @@ describe('native external-image PDF passes', function () {
             assert.deepStrictEqual(final.pixels(), reference.pixels(), 'the complete native operator list retains transform, clip, text and foreground vector order');
             assert.deepStrictEqual(reads, [0, 1], 'the native bridge reads first coverage and one verified tail without the original image body');
             const stats = await value.document.getRangeCacheStats();
-            assert.strictEqual(stats.externalImageEntropyCalls, fixture.chunks.length);
+            assert.strictEqual(stats.externalImageEntropyCalls, 1,
+                'incomplete input decodes its first scan; the complete verified tail goes directly to native final decoding');
             assert.strictEqual(stats.externalImageFinalDecodes, 1);
             await value.page.cancelImageRefinement();
             const clean = await value.document.getRangeCacheStats();
