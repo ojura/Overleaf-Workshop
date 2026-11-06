@@ -44,6 +44,10 @@
     };
     const loadMessage = (build) => ({ type: 'load', output: builds[build] });
     async function handle(message) {
+        if (message?.type === 'ready' || message?.type === 'saveState') {
+            const page = JSON.parse(document.getElementById('viewer-config').textContent).page;
+            if (message.page !== page) { return; }
+        }
         switch (message?.type) {
             case 'ready':
                 log('ready');

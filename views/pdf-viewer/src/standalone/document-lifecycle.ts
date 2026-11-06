@@ -1,7 +1,8 @@
 import { captureSiteView, type SiteView } from './document-load';
+import { PDF_VIEWER_POLICY } from '../common/viewer-policy';
 
-// Match the extension's worker teardown allowance. A worker may never answer Terminate.
-export const SITE_DOCUMENT_DESTROY_TIMEOUT_MS = 10_000;
+/** Kept for callers of the site lifecycle; the policy is shared with both extension engines. */
+export const SITE_DOCUMENT_DESTROY_TIMEOUT_MS = PDF_VIEWER_POLICY.destroyTimeoutMs;
 
 interface Options {
     viewHash(): string;

@@ -76,8 +76,37 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
     private _path?: string;
     private _history?: HistoryRecord;
 
-    constructor(private readonly vfs: VirtualFileSystem) {
-        setInterval(this.refresh.bind(this), 30*1000);
+    private visible = false;
+    private disposed = false;
+    private timer?: NodeJS.Timeout;
+
+    constructor(private readonly vfs: VirtualFileSystem) {}
+
+    setVisible(visible: boolean) {
+        this.visible = visible;
+        clearTimeout(this.timer); this.timer = undefined;
+        if (visible && !this.disposed) { this.scheduleAgeRefresh(); }
+    }
+
+    private scheduleAgeRefresh() {
+        if (!this.visible || this.disposed || this.timer) { return; }
+        const timer = setTimeout(() => {
+            if (this.timer !== timer) { return; }
+            this.timer = undefined;
+            if (!this.visible || this.disposed) { return; }
+            this.refresh();
+            this.scheduleAgeRefresh();
+        }, 30000);
+        this.timer = timer; timer.unref();
+    }
+
+    invalidate() { this._history = undefined; }
+
+    dispose() {
+        this.disposed = true;
+        clearTimeout(this.timer); this.timer = undefined;
+        this._history = undefined;
+        this._onDidChangeTreeData.dispose();
     }
 
     private _onDidChangeTreeData: vscode.EventEmitter<HistoryItem | undefined | void> = new vscode.EventEmitter<HistoryItem | undefined | void>();
@@ -85,10 +114,11 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
     readonly onDidChangeTreeData: vscode.Event<HistoryItem | undefined | void> = this._onDidChangeTreeData.event;
 
     refresh(): void {
-        this._onDidChangeTreeData.fire();
+        if (!this.disposed) { this._onDidChangeTreeData.fire(); }
     }
 
     async refreshData(path?:string, force:boolean=false) {
+        if (this.disposed) { return; }
         this._path = path;
         if (force) {
             this._history = undefined;
@@ -199,7 +229,7 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
         });
     }
 
-    get triggers() {
+    get triggers(): vscode.Disposable[] {
         return [
             vscode.workspace.registerTextDocumentContentProvider(`${ROOT_NAME}-diff`, this),
             // register commands
@@ -310,11 +340,13 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
             return Promise.resolve(this._history);
         }
 
+        const history = this._history;
         const updates = await this.vfs.getUpdates(before);
+        if (this.disposed || this._history !== history) { return history; }
         this._history.before = updates?.nextBeforeTimestamp;
         
         // parse updates
-        if (updates?.updates) {
+        if (updates?.updates.length) {
             this._history.currentVersion = updates.updates[0].toV;
             // iterate all `toV`
             for (const update of updates.updates) {
@@ -355,46 +387,63 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
 export class HistoryViewProvider {
     private treeDataProvider: HistoryDataProvider;
     private historyView: vscode.TreeView<HistoryItem>;
+    private pathParts?: string[];
+    private disposed = false;
 
-    constructor(vfs: VirtualFileSystem) {
+    constructor(private readonly vfs: VirtualFileSystem) {
         const treeDataProvider = new HistoryDataProvider(vfs);
         this.historyView = vscode.window.createTreeView(`${ROOT_NAME}.projectHistory`, {treeDataProvider});
         this.treeDataProvider = treeDataProvider;
+        treeDataProvider.setVisible(this.historyView.visible);
         this.updateView();
     }
 
     updateView(pathParts?: string[]) {
+        if (this.disposed) { return Promise.resolve(); }
+        this.pathParts = pathParts;
         this.historyView.description = pathParts?.at(-1);
-        this.treeDataProvider.refreshData( pathParts?.join('/') );
+        if (!this.historyView.visible) { return Promise.resolve(); }
+        return this.treeDataProvider.refreshData(pathParts?.join('/')).catch(error => console.warn('Overleaf history refresh failed:', error));
     }
 
-    get triggers() {
+    private sameProject(uri: vscode.Uri) {
+        return uri.authority === this.vfs.origin.authority && uri.query === this.vfs.origin.query;
+    }
+
+    dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this.treeDataProvider.dispose();
+        this.historyView.dispose();
+    }
+
+    get triggers(): vscode.Disposable[] {
         return [
-            // register tree view
+            this,
             ...this.treeDataProvider.triggers,
-            // register commands
-            vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.clearSelection`, async() => {
-                this.updateView(undefined);
+            this.historyView.onDidChangeVisibility(({visible}) => {
+                this.treeDataProvider.setVisible(visible);
+                if (visible) { this.treeDataProvider.invalidate(); return this.updateView(this.pathParts); }
             }),
-            vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.revealHistoryView`, async() => {
-                vscode.commands.executeCommand(`${ROOT_NAME}.projectHistory.focus`);
+            vscode.window.onDidChangeWindowState(({focused}) => {
+                if (focused && this.historyView.visible) { this.treeDataProvider.invalidate(); return this.updateView(this.pathParts); }
             }),
-            // on vfs file open
-            EventBus.on('fileWillOpenEvent', async ({uri}) => {
-                setTimeout(() => {
-                    // filter noise read events
-                    const activeTextUri = vscode.window.activeTextEditor?.document.uri;
-                    if (activeTextUri && activeTextUri.path!==uri.path) { return; }
-                    if (!activeTextUri && vscode.workspace.textDocuments.map(d=>d.uri.path).includes(uri.path)) { return; }
-
-                    // filter output folder
-                    const {pathParts} = parseUri(uri);
-                    if (pathParts[0]===OUTPUT_FOLDER_NAME) { return; }
-
-                    this.updateView( pathParts );
-                }, 100);
+            EventBus.on('projectStateChangedEvent', ({uri, kind}) => {
+                if (this.sameProject(uri) && (kind === 'files' || kind === 'joined')) {
+                    this.treeDataProvider.invalidate();
+                    return this.updateView(this.pathParts);
+                }
             }),
-            //FIXME: on "file://" uri open
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.clearSelection`, () => this.updateView()),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.revealHistoryView`, () =>
+                vscode.commands.executeCommand(`${ROOT_NAME}.projectHistory.focus`)),
+            // The active editor event is the actual selection boundary; file reads are not.
+            vscode.window.onDidChangeActiveTextEditor(editor => {
+                const uri = editor?.document.uri;
+                if (!uri || uri.scheme !== ROOT_NAME || !this.sameProject(uri)) { return; }
+                const {pathParts} = parseUri(uri);
+                if (pathParts[0] !== OUTPUT_FOLDER_NAME) { return this.updateView(pathParts); }
+            }),
         ];
     }
 }

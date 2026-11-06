@@ -49,6 +49,7 @@ type PdfViewPersist = {
 type PdfViewPersistMap = {[uri: string]: PdfViewPersist};
 
 export class GlobalStateManager {
+    private static readonly projectRequests = new WeakMap<vscode.ExtensionContext, Map<string, symbol>>();
 
     static getServers(context:vscode.ExtensionContext): {server:ServerPersist, api:BaseAPI}[] {
         const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
@@ -167,47 +168,48 @@ export class GlobalStateManager {
     }
 
     static async fetchServerProjects(context:vscode.ExtensionContext, api:BaseAPI, name:string): Promise<ProjectPersist[]> {
-        const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
-        const server   = persists[name];
-
-        if (server.login!==undefined) {
-            let res = await api.getProjectsJson(server.login.identity);
-            if (res.type!=='success') {
-                // fallback to `userProjectsJson`
-                res = await api.userProjectsJson(server.login.identity);
-            }
-            if (res.type==='success' && res.projects!==undefined) {
-                Object.values(res.projects).forEach(project => {
-                    project.userId = (server.login as any).userId;
-                });
-                const projects = res.projects.map(project => {
-                    const existProject = server.login?.projects?.find(p => p.id===project.id);
-                    // merge existing scm
-                    if (existProject) {
-                        project.scm = existProject.scm;
-                    }
-                    return project;
-                });
-                server.login.projects = projects;
-                context.globalState.update(keyServerPersists, persists);
-                return projects;
-            } else {
-                // regex match for cookie expired
-                const cookieExpireRegex = /^302/;
-                if (res.message && cookieExpireRegex.test(res.message)) {
-                    vscode.window.showErrorMessage(vscode.l10n.t('Cookie Expired. Please Re-Login'));
-                    return Promise.reject();
-                }
-                if (res.message!==undefined) {
-                    vscode.window.showErrorMessage(res.message);
-                }
-                return [];
-            }
-        } else {
-            return [];
+        const initial = context.globalState.get<ServerPersistMap>(keyServerPersists, {})[name];
+        const login = initial?.login;
+        if (!login) { return []; }
+        let owners = this.projectRequests.get(context);
+        if (!owners) { owners = new Map(); this.projectRequests.set(context, owners); }
+        const request = Symbol();
+        owners.set(name, request);
+        const current = () => {
+            const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
+            const server = persists[name];
+            // A response belongs to the account/session that requested it, including
+            // when a new login uses the same user ID after the former session ended.
+            if (!server?.login || server.url !== initial.url || server.login.userId !== login.userId ||
+                server.login.identity.cookies !== login.identity.cookies ||
+                server.login.identity.csrfToken !== login.identity.csrfToken) { return undefined; }
+            return {persists, server, login: server.login};
+        };
+        let res = await api.getProjectsJson(login.identity);
+        if (!current() || owners.get(name) !== request) { return current()?.login.projects ?? []; }
+        if (res.type !== 'success') {
+            res = await api.userProjectsJson(login.identity);
         }
+        const latest = current();
+        if (!latest || owners.get(name) !== request) { return latest?.login.projects ?? []; }
+        if (res.type === 'success' && res.projects !== undefined) {
+            const projects = res.projects.map(project => ({
+                ...project,
+                userId: login.userId,
+                // Settings may have changed while the list was loading.
+                scm: latest.login.projects?.find(previous => previous.id === project.id)?.scm,
+            }));
+            latest.login.projects = projects;
+            await context.globalState.update(keyServerPersists, latest.persists);
+            return projects;
+        }
+        if (res.message && /^302/.test(res.message)) {
+            vscode.window.showErrorMessage(vscode.l10n.t('Cookie Expired. Please Re-Login'));
+            return Promise.reject();
+        }
+        if (res.message !== undefined) { vscode.window.showErrorMessage(res.message); }
+        return [];
     }
-
     static authenticate(context:vscode.ExtensionContext, name:string) {
         const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
         const server   = persists[name];
@@ -279,7 +281,7 @@ export class GlobalStateManager {
             delete persists[minUri];
         }
 
-        context.globalState.update(keyPdfViewPersists, persists);
+        return context.globalState.update(keyPdfViewPersists, persists);
     }
 
 }

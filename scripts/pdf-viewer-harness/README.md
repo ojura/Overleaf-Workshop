@@ -1,9 +1,9 @@
 # PDF viewer test harness
 
 These scripts test the extension's two PDF viewers in `views/pdf-viewer/`, the pdfjs viewer and
-the Overleaf viewer. The scripts in this folder and in `probes/` run a viewer page in headless
-Chrome, against a local server that stands in for Overleaf and for VS Code. The scripts in `ide/`
-drive the viewers in a test instance of Antigravity on a virtual display.
+the Overleaf viewer. The headless scripts run a viewer page against a local server that stands
+in for Overleaf and VS Code. The Motion Lab scenarios reuse an existing Chromium connection.
+The scripts in `ide/` drive the viewers in a test instance of Antigravity on a virtual display.
 
 `safari/` preserves the physical iPhone Safari suite used on 4 and 5 November 2026. Its
 [runbook](../../docs/safari-validation.md) covers the retained Inspector connection, source
@@ -11,8 +11,86 @@ verification, short delivery and reversal scenarios, real gesture observation, a
 of continuous motion with native memory, CPU and network recording. Runtime receipts and
 pairing material stay in an explicitly supplied folder outside the checkout.
 
-Run its device-free regression checks with `npm run test:safari:offline`, or run the combined
-PDF checks with `npm run test:pdf-viewer`. Live commands remain inert without `--execute`.
+Run the desktop harness's offline checks with `npm run test:pdf-harness` and the Safari checks
+with `npm run test:safari:offline`. `npm run test:pdf-viewer` runs both groups alongside the PDF
+source tests. Safari live commands remain inert without `--execute`.
+
+## Motion Lab checks in an existing Chromium session
+
+`zoom-matrix.mjs` runs the recovered browser scenarios through one connection and one supplied
+test target. It uses `scripts/lib/devtools.mjs` for an explicitly supplied isolated browser
+profile, or `scenario-connection.mjs` for the existing CDP daemon. With the daemon, it prepares
+the page for animation, releases its preparation and detaches its work session when the run
+ends. The shared daemon keeps running.
+
+The fixture server must already serve the generated book and the built viewer pages. Supply
+its origin, the exact target created for testing, the book directory from `make_book.py`, and
+a results folder outside the checkout. Before invoking the runner, navigate that target to
+`<origin>/page?engine=pdfjs&doc=validation-bootstrap`. The target must have the supplied origin
+and `/page` pathname; an `about:blank` target is rejected. The runner does not start a browser
+or fixture server.
+
+```sh
+node scripts/pdf-viewer-harness/zoom-matrix.mjs \
+  --execute --id controls-run --work /tmp/overleaf-browser-checks \
+  --ext ./views/pdf-viewer --book /path/to/generated/book \
+  --origin 'http://127.0.0.1:<fixture-port>' --target '<owned-page-id>' \
+  --daemon-url http://127.0.0.1:7799 --scenario controls
+```
+
+Replace the book, origin and target placeholders with the current fixture values. Omit
+`--execute` to print the selected cases. The default matrix contains 50 engine/zoom/DPR cells;
+the mutually exclusive `--small-only`, `--representative-only` and `--compact-only` options
+select matrix cases when rechecking a particular failure. `--engine` selects an engine for
+every scenario. `--operations` requires operation snapshots and admission counters for the
+matrix, text-strip and entry-strip scenarios; fields that are present are always checked.
+The controls, content and DOM scenarios perform their own checks. `--profile-cpu` adds Chromium
+call-tree sampling and before/after performance metrics around every selected scenario.
+
+| Scenario | Checks |
+|---|---|
+| `matrix` | Both engines' zoom, DPR, document scale, actor density and operation decisions |
+| `text-strip` | Text strips through the current document renderer |
+| `entry-strip` | Delivery at a page's entering edge when its pixels are already cached |
+| `controls` | Real shadow hit regions, trusted keys during a haul, coalesced column changes, viewport resize and idle counters |
+| `content` | Disclosure persistence, delayed host initialization, intrinsic panel height and resizing with native input |
+| `dom` | Browser paint order, scrolling ink, annotation isolation and native response-byte ownership |
+
+`panel-probe.mjs` captures and restores panel state for these scenarios. It waits for the
+disclosure event before restoring geometry and releases native input after failures.
+Viewport and DPR changes use target-local emulation, leaving the shared browser window's
+bounds intact. The caller closes the test target and stops its fixture server after the run.
+
+An existing browser can retain zoom for the local fixture host. The runner requires the actual
+CSS viewport and DPR to match each selected case before sampling. Supply
+`--zoom-helper-target <existing-state-reader-bridge-target-id>` to normalize an owned test tab
+through the already installed browser state reader. Obtain the exact target ID from the current
+daemon target inventory; the helper must be its existing `chrome-extension://.../bridge.html`
+target. This option does not install an extension or change its permissions.
+
+The helper maps the supplied page target to its exact tab through `chrome.debugger.getTargets`,
+saves its original zoom settings and factor, and uses automatic zoom with `scope: "per-tab"`
+and factor 1. Browser navigation resets zoom settings, so the runner serializes normalization
+after document commitment and awaits matching native metrics at each document initialization.
+Helper context loss and zoom API errors fail the run. Cleanup restores the original settings
+before detaching;
+when the original scope was per-origin it reads the current inherited factor without writing
+the saved factor over another user's change. The caller then closes the owned tab.
+
+Daemon screenshots use one full-size native PNG screencast frame. The capture owner drains
+and acknowledges a frame timestamped after that phase starts, checks its native viewport,
+and restores sparse encoding in `finally`. This avoids concurrent video and still-image
+requests on a fully quiet background view. Saved PNG dimensions must match the measured
+CSS viewport, including compact high-DPR cases. Direct browser connections use a bounded native
+`Page.captureScreenshot` request with an explicit viewport clip and inverse-DPR scale.
+
+Runs through the daemon hold a native 1 × 1 JPEG screencast so Chromium keeps an emulated
+background view rendering at its normal cadence. They encode only every 10,000th frame,
+acknowledge the frames on the same work session, refresh capture after committed navigation,
+and stop capture before detaching. This adds native capture overhead to CPU measurements;
+the results record capture dimensions, frame and acknowledgment counts, managed readiness,
+and observed native frame timestamps. The runner keeps the daemon's focus registration
+throughout navigation and activates only its own newly committed renderer view.
 
 ## What the headless harness runs
 
@@ -65,7 +143,7 @@ request and as a plain page at 40 ms, and writes a table of the results.
 | `pdfjs-same-build-zoom.mjs` | pdfjs viewer: the build in view stays when the host sends it again; zoom steps of 1.25 |
 | `switch-button.mjs` | the button to the other viewer, and the message it sends the host |
 | `theme-colors.mjs` | the pixel colors of each color theme on the page of `theme_book.py` |
-| `toolbar-shots.mjs` | the toolbar at pane widths from 1400 to 220 px, with the pdfjs viewer's find bar and tools menu, and what reaches past the edge |
+| `toolbar-shots.mjs` | the toolbar at requested widths from 1400 to 220 px, reporting measured pane width and overflow, with the pdfjs viewer's find bar and tools menu |
 | `live.mjs` | a real build from a saved compile response (see below) |
 
 What the scripts know about the two viewer pages is in `viewers.mjs`, for the headless scripts and
@@ -94,12 +172,12 @@ node scripts/pdf-viewer-harness/compare.mjs
 node scripts/pdf-viewer-harness/probes/theme-colors.mjs --engine overleaf
 ```
 
-Every script takes `--ext DIR` for another `views/pdf-viewer` folder, such as another checkout's,
+The headless scripts take `--ext DIR` for another `views/pdf-viewer` folder, such as another checkout's,
 and `--port N` for the server, which otherwise takes a port that is free when the script starts,
 so that scripts can run at the same time, also two runs of one script. The usage of each script is
 in its first comment.
 
-Each script starts its own server and Chrome, with a new Chrome profile and an empty piece cache,
+Each headless script starts its own server and Chrome, with a new Chrome profile and an empty piece cache,
 and stops both when it ends, also after Ctrl+C or a timeout. When a SIGKILL ends the script, the
 kernel kills the server and Chrome, which run under `setpriv --pdeathsig KILL`; their profile and
 piece cache then stay in the work folder. Chrome picks a free DevTools port
@@ -116,7 +194,7 @@ folder:
 - `shots/`, the screenshots, and `compare/`, the results of `compare.mjs`;
 - the Chrome profiles and piece caches of the scripts that are running.
 
-The work folder can be deleted at any time.
+Delete a work folder after every script using it has stopped.
 
 ### A real build
 
@@ -159,7 +237,7 @@ scripts/hidden-ide.sh stop
 | `drive-build.mjs` | reopens `output.pdf`; loading in ranges, jumps, and with `--theme-page N` the dark theme on page N |
 | `drive-switch.mjs` | on the open `output.pdf`: the viewer setting and each viewer's switch button |
 | `timeline.mjs` | reopens `output.pdf` and records the host's messages, pdf.js's events and the page's state |
-| `toolbar-shots.mjs` | screenshots of both toolbars at window widths from 1440 px down to a 220 px pane, and what reaches past the edge |
+| `toolbar-shots.mjs` | screenshots of both toolbars at requested window widths, reporting the measured pane width and elements past its edge |
 | `find-image-page.mjs` | lists pages with images, for the theme checks |
 | `probe-page-colors.mjs` | page N in the default and the dark theme: changed colored pixels and drawing operators |
 | `snap-page.mjs` | page N in the default and the dark theme as PNGs, for a look by eye |

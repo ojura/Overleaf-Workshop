@@ -13,6 +13,7 @@ import { PdfPreviewExportError, PdfPreviewStore } from './pdfPreviewStore';
 import { completeViewerPage, isBuildPath } from './pdfViewerPages';
 import { DEFAULT_PDF_VIEWER_ENGINE, HostMessage, isPdfViewerEngine, pdfjsReleaseOf, PdfOutput, PdfPreviewDescriptor, PdfViewerEngine, ViewerMessage } from './viewerProtocol';
 import { errorMessage } from '../utils/errorMessage';
+import { PdfViewState } from './pdfViewState';
 
 export class PdfDocument implements vscode.CustomDocument {
     /** the PDF read whole: a PDF that is not the project's build, or a build that the download domain does not serve */
@@ -121,13 +122,20 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
     /** One disk budget for all builds' incremental ranges and reusable content pieces. */
     private readonly pieces: PieceCache;
     private readonly previews: PdfPreviewStore;
+    private readonly viewState: PdfViewState;
     /** the open viewers, which a change of overleaf-workshop.pdfViewer.engine reloads */
     private readonly editors = new Set<{ doc: PdfDocument, panel: vscode.WebviewPanel, render: () => Promise<void>, dispose: () => void }>();
+    private engineGeneration = 0;
     /** the folder of pdf.js's release in views/pdf-viewer/, from the extension's package.json */
     private readonly pdfjsRelease: string;
 
     constructor(private readonly context:vscode.ExtensionContext) {
         this.context = context;
+        this.viewState = new PdfViewState({
+            read: uri => GlobalStateManager.getPdfViewPersist(context, uri),
+            write: (uri, state) => GlobalStateManager.updatePdfViewPersist(context, uri, state),
+            failed: error => console.warn('PDF viewer state could not be saved:', error),
+        });
         this.pdfjsRelease = pdfjsReleaseOf(context.extension.packageJSON);
         const sizeMB = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer').get<number>('pieceCacheSizeMB', PDF_DISK_POLICY.defaultMaxBytes / (1024 * 1024));
         this.pieces = new PieceCache(path.join(context.globalStorageUri.fsPath, 'pdf-pieces'), Math.max(0, sizeMB) * 1024 * 1024, { fetchRange: PdfFetchBridge.fetchRange });
@@ -172,11 +180,12 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
 
     /** Show the open PDFs in the viewer that the setting now picks; their pages reload. */
     private async applyEngine() {
-        const engine = this.engine();
+        const generation = ++this.engineGeneration, engine = this.engine();
         for (const editor of this.editors) {
-            if (await editor.doc.setEngine(engine)) {
-                await editor.render();
-            }
+            if (generation !== this.engineGeneration) { return; }
+            const changed = await editor.doc.setEngine(engine);
+            if (generation !== this.engineGeneration) { return; }
+            if (changed) { await editor.render(); }
         }
     }
 
@@ -246,16 +255,17 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         // its own, under the page's ID: the page numbers its requests from 1, so the requests of a
         // page that a new page replaced, as after a switch of the viewer, are stopped, and their
         // answers do not reach the new page.
-        const newBridge = () => {
+        const newBridge = (page = randomUUID()) => {
             const fetches = new PdfFetchBridge(
                 (url) => doc.output!==undefined && outputsOf(doc.output.downloadDomain, doc.output.projectId)(url),
                 this.pieces,
                 { buildSize: () => doc.output?.file.size, output: doc.output },
             );
             fetches.setActivity(webviewPanel.visible, false);
-            return { page: randomUUID(), fetches };
+            return { page, fetches };
         };
         let bridge = newBridge();
+        let renderGeneration = 0;
 
         const listeners: Array<() => void> = [];
         // Accumulation events are coalesced to at most one report a second, without polling.
@@ -305,16 +315,21 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             panel: webviewPanel,
             render: async () => {
                 if (panelDisposed) { return; }
+                const generation = ++renderGeneration, page = randomUUID();
+                const html = await this.getViewerPage(webviewPanel.webview, doc.engine, page);
+                if (panelDisposed || generation !== renderGeneration) { return; }
+                // The displayed page keeps its state and fetch authority while the template loads.
+                void this.viewState.flush(doc.uri.toString());
                 clearPreviewWatch();
                 bridge.fetches.dispose();
                 cacheIdle = false;
-                bridge = newBridge();
-                const html = await this.getViewerPage(webviewPanel.webview, doc.engine, bridge.page);
-                if (!panelDisposed) { webviewPanel.webview.html = html; }
+                bridge = newBridge(page);
+                webviewPanel.webview.html = html;
             },
             dispose: () => {
                 if (panelDisposed) { return; }
                 panelDisposed = true;
+                void this.viewState.flush(doc.uri.toString());
                 clearPreviewWatch();
                 progressDirty = false;
                 if (progressTimer) { clearTimeout(progressTimer); progressTimer = undefined; }
@@ -334,6 +349,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
 
         // register event listeners
         const viewState = webviewPanel.onDidChangeViewState((e) => {
+            if (!e.webviewPanel.visible) { void this.viewState.flush(doc.uri.toString()); }
             if (e.webviewPanel.active && doc.isProjectFile) {
                 EventBus.fire('fileWillOpenEvent', {uri: doc.uri});
             }
@@ -342,6 +358,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         });
         listeners.push(() => viewState.dispose());
         const messages = webviewPanel.webview.onDidReceiveMessage((e: ViewerMessage) => {
+            if (panelDisposed) { return; }
             switch (e.type) {
                 case 'syncPdf':
                     if (doc.isProjectFile) {
@@ -349,7 +366,9 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     }
                     break;
                 case 'saveState':
-                    GlobalStateManager.updatePdfViewPersist(this.context, doc.uri.toString(), e.content);
+                    if (e.page === bridge.page && e.content && typeof e.content === 'object') {
+                        this.viewState.save(doc.uri.toString(), e.content);
+                    }
                     break;
                 case 'fetch': {
                     // a request of a page that the panel no longer shows is not sent
@@ -398,7 +417,8 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     void this.switchViewer(e.engine);
                     break;
                 case 'ready':
-                    const state = GlobalStateManager.getPdfViewPersist(this.context, doc.uri.toString());
+                    if (e.page !== bridge.page) { break; }
+                    const state = this.viewState.read(doc.uri.toString());
                     const config = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer');
                     const colorThemes = config.get('themes', undefined);
                     const defaults = {
@@ -429,7 +449,9 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
     public get triggers(): vscode.Disposable[] {
         return [
             { dispose: () => {
+                this.engineGeneration++;
                 for (const editor of this.editors) { editor.dispose(); }
+                void this.viewState.dispose();
                 this.previews.dispose();
                 void this.pieces.dispose();
             } },

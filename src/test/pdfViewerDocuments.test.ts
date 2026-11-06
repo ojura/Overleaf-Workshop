@@ -24,6 +24,7 @@ describe('the Overleaf viewer\'s documents', function () {
     const transitionResults: Promise<void>[] = [];
     const destroyTimers = new Set<ReturnType<typeof setTimeout>>();
     const nativeTimeout = globalThis.setTimeout;
+    const nativeClearTimeout = globalThis.clearTimeout;
     let savedWarn: typeof console.warn, savedError: typeof console.error;
 
     function deferred<T>() {
@@ -38,16 +39,17 @@ describe('the Overleaf viewer\'s documents', function () {
     interface FakeTask {
         promise: Promise<any>; doc: any; resolve(): void; reject(reason: unknown): void;
         started: ReturnType<typeof deferred<void>>;
-        destroy(): Promise<void>; destroys: number; requests?: AbortController; abortedAtDestroy?: boolean;
+        destroy(): Promise<void>; destroys: number; destroyed: boolean; requests?: AbortController; abortedAtDestroy?: boolean;
     }
     const tasks: FakeTask[] = [];
     function fakeTask(pending = false, name = 'task-' + tasks.length): FakeTask {
         const result = deferred<any>();
         const task: FakeTask = {
-            promise: result.promise, doc: undefined, started: deferred<void>(), destroys: 0,
+            promise: result.promise, doc: undefined, started: deferred<void>(), destroys: 0, destroyed: false,
             resolve() { result.resolve(task.doc); }, reject: result.reject,
             destroy() {
                 task.destroys++;
+                task.destroyed = true;
                 task.abortedAtDestroy = task.requests?.signal.aborted;
                 return Promise.resolve();
             },
@@ -94,6 +96,7 @@ describe('the Overleaf viewer\'s documents', function () {
                 if (delay === 10_000) { destroyTimers.add(timer); }
                 return timer;
             },
+            clearTimeout: (timer: ReturnType<typeof setTimeout>) => { destroyTimers.delete(timer); nativeClearTimeout(timer); },
         });
         for (const [name, value] of Object.entries(globals)) {
             saved[name] = Object.getOwnPropertyDescriptor(globalThis, name);
@@ -211,6 +214,7 @@ describe('the Overleaf viewer\'s documents', function () {
         await FakeWorker.made[0].stopped;
         assert.deepStrictEqual(FakeWorker.made.map(w => w.terminated), [true, false], 'its worker is stopped, the new document\'s runs');
         assert.deepStrictEqual(errors, []);
+        assert.strictEqual(destroyTimers.size, 0, 'successful destruction releases its ten-second fallback timer');
     });
 
     function nativeFixture(options: { height?: number, beforeSwap?: false | ((doc: any, build: string | undefined, signal: AbortSignal, fixture: any) => (() => void) | undefined) } = {}) {
@@ -478,14 +482,20 @@ describe('the Overleaf viewer\'s documents', function () {
             const options = new Map<string, unknown>();
             const pdfViewer = {
                 pdfDocument: undefined as any, position: { page: 1, offset: { left: 0, top: 0 } }, restored: undefined as any,
-                currentScaleValue: '1.25', container: { addEventListener() {} },
+                restoreNegativeOffset: false,
+                currentScaleValue: '1.25', container: { addEventListener() {}, removeEventListener() {} },
                 viewer: { style: { minHeight: '' }, classList: { add() {} }, getBoundingClientRect: () => ({ height: f?.height ?? 0 }) },
+                scrollPageIntoView({ pageNumber, destArray, allowNegativeOffset }: any) {
+                    this.restored = { page: pageNumber - 1, offset: { left: destArray[2], top: destArray[3] } };
+                    this.restoreNegativeOffset = allowNegativeOffset;
+                },
             };
             let f: any;
             const application: any = {
                 initializedPromise: Promise.resolve(), pdfDocument: undefined, pdfLoadingTask: undefined, pdfViewer,
                 eventBus: {
                     on(name: string, callback: (event: any) => void) { bus.set(name, [...(bus.get(name) ?? []), callback]); },
+                    off(name: string, callback: (event: any) => void) { bus.set(name, (bus.get(name) ?? []).filter(value => value !== callback)); },
                     dispatch(name: string, event: any) { bus.get(name)?.forEach(callback => callback(event)); },
                 },
                 async close() {
@@ -496,6 +506,8 @@ describe('the Overleaf viewer\'s documents', function () {
                     this.pdfDocument = pdfViewer.pdfDocument = undefined;
                     this.pdfLoadingTask = undefined;
                     if (old) { await old.destroy(); }
+                    f.closeStarted?.();
+                    if (f.closeGate) { await f.closeGate.promise; }
                 },
                 load(doc: any) {
                     assert.strictEqual(this, application);
@@ -509,9 +521,11 @@ describe('the Overleaf viewer\'s documents', function () {
                 setTitleUsingUrl() {},
             };
             f = { events, errors, announcements, previews, application, pdfViewer,
+                hide() { for (const callback of [...(listeners.get('pagehide') ?? [])]) { callback({ persisted: false }); } },
                 worker: () => new FakeWorker(),
                 shown(build: string) { events.push('shown:' + build); announcements.push({ build, doc: application.pdfDocument }); },
                 prefetch: {
+                    dispose() {},
                     prepareReplacement(build: string, signal: AbortSignal) {
                         events.push('scene:' + build);
                         f.preparing?.(build, signal);
@@ -537,8 +551,9 @@ describe('the Overleaf viewer\'s documents', function () {
                 PDFViewerApplication: application,
                 PDFViewerApplicationOptions: { set: (key: string, value: unknown) => options.set(key, value), get: (key: string) => options.get(key) },
                 addEventListener(name: string, callback: (event: any) => void) { listeners.set(name, [...(listeners.get(name) ?? []), callback]); },
+                removeEventListener(name: string, callback: (event: any) => void) { listeners.set(name, (listeners.get(name) ?? []).filter(value => value !== callback)); },
             };
-            (globalThis as any).document = { ...(globals.document as object), addEventListener() {} };
+            (globalThis as any).document = { ...(globals.document as object), addEventListener() {}, removeEventListener() {} };
             await importModule(fullAppEntry + '?fixture=' + (++fullAppSequence));
             await endTurn();
             return f;
@@ -568,7 +583,8 @@ describe('the Overleaf viewer\'s documents', function () {
             };
             next.task.resolve(); await next.settled();
             assert.strictEqual(captured, true);
-            assert.strictEqual(f.pdfViewer.restored, position);
+            assert.deepStrictEqual(f.pdfViewer.restored, position);
+            assert.strictEqual(f.pdfViewer.restoreNegativeOffset, true);
             assert.strictEqual(f.pdfViewer.currentScaleValue, '2.5');
             assert.deepStrictEqual(f.events, ['scene:next', 'close:old', 'setter:next', 'shown:next', 'preview:next']);
             assert.strictEqual(FakeWorker.made[0].terminated, true);
@@ -649,6 +665,23 @@ describe('the Overleaf viewer\'s documents', function () {
             assert.strictEqual(f.pdfViewer.viewer.style.minHeight, '');
             assert.strictEqual(f.announcements.length, 1); assert.strictEqual(f.previews.length, 1);
             assert.deepStrictEqual(f.errors, [failure]);
+        });
+
+        it('closes a candidate whose adoption is waiting for the old app close', async () => {
+            const f = await fixture(), old = f.load('old'); await old.settled();
+            const closing = deferred<void>(), gate = deferred<void>();
+            f.closeStarted = closing.resolve; f.closeGate = gate;
+            const next = f.load('next');
+            await closing.promise;
+            try {
+                f.hide();
+                assert.strictEqual(next.task.destroys, 1, 'the page owns the prepared candidate throughout app.close');
+            } finally { gate.resolve(); await next.settled(); }
+            assert.ok(!f.events.includes('setter:next'));
+            assert.strictEqual(old.task.destroys, 1, 'the app-owned destruction is not repeated at page close');
+            await Promise.all(FakeWorker.made.map(worker => worker.stopped));
+            assert.ok(FakeWorker.made.every(worker => worker.terminated));
+            assert.strictEqual(destroyTimers.size, 0);
         });
     });
 });

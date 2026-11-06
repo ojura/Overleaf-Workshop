@@ -625,8 +625,8 @@ export class CompileManager {
         }
     }
 
-    async setCompiler() {
-        const uri = await CompileManager.check();
+    async setCompiler(target?: vscode.Uri) {
+        const uri = await CompileManager.check(target);
         const vfs = uri && await this.vfsm.prefetch(uri);
         const currentCompiler = vfs?.getCompiler();
         const compilers = vfs?.getAllCompilers();
@@ -640,12 +640,12 @@ export class CompileManager {
             canPickMany: false,
             placeHolder: vscode.l10n.t('Select Compiler'),
         }).then(async (option) => {
-            option && await vfs?.updateSettings({ compiler: option.description }) && this.compile(true);
+            option && await vfs?.updateSettings({ compiler: option.description }) && this.compile(true, false, uri);
         });
     }
 
-    async setRootDoc() {
-        const uri = await CompileManager.check();
+    async setRootDoc(target?: vscode.Uri) {
+        const uri = await CompileManager.check(target);
         const vfs = uri && await this.vfsm.prefetch(uri);
         const currentRootDoc = vfs?.getRootDocName();
         const rootDocs = vfs?.getValidMainDocs();
@@ -659,12 +659,12 @@ export class CompileManager {
             canPickMany: false,
             placeHolder: vscode.l10n.t('Select Main Document'),
         }).then(async (option) => {
-            option && await vfs?.updateSettings({ rootDocId: option.id }) && this.compile(true);
+            option && await vfs?.updateSettings({ rootDocId: option.id }) && this.compile(true, false, uri);
         });
     }
 
-    async compileSettings() {
-        const uri = await CompileManager.check();
+    async compileSettings(target?: vscode.Uri) {
+        const uri = await CompileManager.check(target);
         const vfs = uri && await this.vfsm.prefetch(uri);
         const currentCompiler = vfs?.getCompiler();
         const currentRootDoc = vfs?.getRootDocName();
@@ -686,24 +686,24 @@ export class CompileManager {
         const setting = await vscode.window.showQuickPick(settingItems);
         switch (setting?.label) {
             case vscode.l10n.t('Setting: Compiler'):
-                this.setCompiler();
+                this.setCompiler(uri);
                 break;
             case vscode.l10n.t('Setting: Main Document'):
-                this.setRootDoc();
+                this.setRootDoc(uri);
                 break;
             case vscode.l10n.t('Stop compilation'):
                 this.stopCompile();
                 break;
             case vscode.l10n.t('Recompile from Scratch'):
-                this.compile(true, true);
+                this.compile(true, true, uri);
                 break;
             case vscode.l10n.t('Compile Mode'):
                 windowCompileSettings.draft = !windowCompileSettings.draft;
-                this.compileSettings();
+                this.compileSettings(uri);
                 break;
             case vscode.l10n.t('Compile Error Handling'):
                 windowCompileSettings.stopOnFirstError = !windowCompileSettings.stopOnFirstError;
-                this.compileSettings();
+                this.compileSettings(uri);
                 break;
             default:
                 break;
@@ -746,11 +746,11 @@ export class CompileManager {
                     return this.compile(false, false, uri);
                 }
             }),
-            EventBus.on('compilerUpdateEvent', () => {
-                this.compile(true);
+            EventBus.on('compilerUpdateEvent', ({uri}) => {
+                this.compile(true, false, uri);
             }),
-            EventBus.on('rootDocUpdateEvent', () => {
-                this.compile(true);
+            EventBus.on('rootDocUpdateEvent', ({uri}) => {
+                this.compile(true, false, uri);
             }),
             // register diagnostics triggers
             ...this.diagnosticProvider.triggers,

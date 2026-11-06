@@ -1,5 +1,5 @@
-// Screenshots of a viewer's toolbar at pane widths from 1400 px down to 220 px, the narrowest
-// editor pane VS Code allows, with the toolbar's elements that reach past the pane's right edge.
+// Screenshots of a viewer's toolbar at requested fixture widths from 1400 px down to 220 px,
+// reporting the measured pane width and the toolbar's elements past its right edge.
 // In the pdfjs viewer it also opens the find bar and the tools menu at each width and lists their
 // elements past the edge. The book has --pages pages (default 456), since the page count's digits
 // take room in the toolbar.
@@ -35,6 +35,7 @@ try {
         await page.send('Emulation.setDeviceMetricsOverride', { width, height: 500, deviceScaleFactor: 1, mobile: false });
         if (width !== shownWidth && !(await page.evaluate('window.__resized'))) { console.log(`${width} px: the page did not report a resize within 5 s`); }
         shownWidth = width;
+        const paneWidth = await page.evaluate('document.documentElement.clientWidth');
         const results = { toolbar: await past(TOOLBAR[engine]) };
         await page.screenshot(path.join(outDir, `${engine}-${width}.png`));
         if (engine === 'pdfjs') {
@@ -48,7 +49,7 @@ try {
             }
         }
         problems += Object.values(results).reduce((n, list) => n + list.length, 0);
-        console.log(`${width} px: past the right edge: ${Object.entries(results).map(([name, list]) => `${name} ${JSON.stringify(list)}`).join(', ')}`);
+        console.log(`requested ${width} px, pane ${paneWidth} px: past the right edge: ${Object.entries(results).map(([name, list]) => `${name} ${JSON.stringify(list)}`).join(', ')}`);
     }
     console.log(`screenshots in ${outDir}`);
 } finally {

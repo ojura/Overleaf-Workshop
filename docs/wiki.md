@@ -74,7 +74,7 @@ To logout from a server, hover on the logged-in server in the hosts list, then c
 
 ### Refresh Project List
 
-After login to a server, the project list will be automatically loaded, together with your email address displayed aside. If there is any external change (not via the extension) to the project list, you can hover on the server, then click the `Refresh Project List` button to refresh the whole project list.
+After login, the project list loads automatically, with your email address beside the server name. It refreshes when the project view becomes visible, when the window regains focus while that view is visible, and when an open project reports a name or access change. You can also hover on the server and click `Refresh Project List`. A late response from an earlier refresh or login cannot replace the current list or its local replica registrations.
 
 ![screenshot-refresh-project-list](assets/screenshot-refresh-project-list.png)
 
@@ -111,7 +111,7 @@ Trashed-.->Deleted
 
 ### Rename Project
 
-Right click on a project to rename it. The project name should be unique in the server.
+Right click on a project to rename it. The project name should be unique in the server. A rename reported by an open project updates its displayed name without changing the URIs of open documents. Access changes refresh the project list; a rejoin adopts the server's current permissions. If the server revokes access, the connection and its project views stop, while unsaved editor buffers remain available to copy.
 
 ### Project Tag Management
 To create a new tag, right click on the server and select `Create New Tag` in the context menu.
@@ -193,6 +193,8 @@ The default output folder is `.output` in the project root directory, which hold
 
 The compiled PDF `output.pdf` is also located in the output folder. You can double click the PDF file to open it, or use the shortcut <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> to open the compiled PDF directly on the right side of the editor.
 
+`overleaf-workshop.compileOnSave.enabled` controls automatic compilation on save. In a remote workspace, document edits from other sessions and source-file additions, removals, moves and renames mark the project as changed, including documents that have not been opened here. The next automatic compile check includes those changes. Output-file refreshes do not mark source work as changed. Following an existing server build remains separate from requesting a new compile.
+
 #### Compiler Diagnostics
 
 When the compile fails or succeeds with warnings, the compiler diagnostics will be displayed in the editor with colored squiggles. You can hover on the squiggles to see the detailed information.
@@ -211,7 +213,7 @@ The default compiler is `pdflatex`, which can be changed via clicking the compil
 
 You can change the main document via clicking the compiler name in the status bar and select "**Setting: Main Document**" to alter the main document.
 
-The change of the main document will not affect the setting for other collaborators in current session, unless they reload the project. This is a desired behavior in the Overleaf web editor, and we keep it in the extension as well.
+Choosing a main document changes this session and saves the project's default for a later join. Other open sessions retain their current main document until they rejoin or reload, matching the Overleaf web editor. Compiler and spelling-language broadcasts apply immediately to the project that sent them. A compiler or main-document picker stays associated with the project where it opened, even if you switch editors before choosing. See the [live protocol references](webapi.md#live-project-state) for the upstream behavior.
 
 ### Preview Document
 
@@ -254,6 +256,8 @@ When you open a `.tex` file, the document outline will be displayed in the "Outl
 
 #### Auto Completion
 
+Package metadata and project commands are cached per project. Metadata broadcasts, source-file changes, saves and rejoining invalidate the relevant cache; the next completion request reads current metadata and commands. A response for an older cache revision cannot replace newer results.
+
 #### Spell Check
 
 The spell check feature is provided via the Overleaf server. The spell check is performed in the background, and the unknown words are underlined with a blue squiggle. You can use the shortcut <kbd>Ctrl</kbd>+<kbd>.</kbd> to view the suggestions, or directly add the word to the dictionary.
@@ -261,6 +265,8 @@ The spell check feature is provided via the Overleaf server. The spell check is 
 ![screenshots-spell-check-suggestions](assets/screenshot-spell-check-suggestions.png)
 
 The spell check can be configured via clicking the spell check button on the title bar. You can turn off or change the language of the spell check. The learned words are also managed here.
+
+Learned words belong to the server account and are shared across its open projects. A successful learn or unlearn refreshes both learned-word and suggestion caches. Overleaf does not broadcast account dictionary edits, so the extension checks the current dictionary when the window regains focus, the project rejoins, or spelling settings open. Older responses cannot undo a local learn or unlearn. Language changes invalidate only the affected project's spelling results.
 
 ![screenshots-spell-check](assets/screenshot-spell-check.png)
 
@@ -279,6 +285,8 @@ When there are other collaborators (or your other login sessions) online, the co
 The online collaborators information is displayed on the status bar. The item icon shows the number of online collaborators, and the color represents the latest active collaborator.
 You can hover on the item like below to see the detailed information of the online collaborators, and click the text like `@xxx` to cite the collaborator [in the chat view](#chat-with-collaborators), or click the text like `main.tex#L1` to jump to the exact position of the collaborator. 
 
+Collaborator events update the status and cursors. Relative activity labels schedule only their next visible change. Rejoining or closing the project disposes the previous listeners and timers, and a late cursor lookup cannot overwrite a newer position.
+
 #### Chat with Collaborators
 
 The chat view is located at the primary sidebar of the VS Code window by default. You can type in the input box at the bottom of the chat view and press <kbd>Enter</kbd> to send the message.
@@ -287,9 +295,13 @@ The chat view is located at the primary sidebar of the VS Code window by default
 
 You can also click the "dialog"-like button to reply to a message. The detailed usage is elaborated in [Advance Chat Message](#advance-chat-message).
 
+The chat view applies new-message, edit and delete notifications. It refreshes its recent history when shown and after rejoining, preserving notifications that arrive during the request. Repeated message IDs do not duplicate messages or unread counts. The alternative connection refreshes one bounded recent-message snapshot, including edits and deletions. A reply remains visible if its original parent is deleted.
+
 #### Project History View
 
 The project history view is located at the primary sidebar of the VS Code window by default. You can view the history of changes of specific file when you open it in the editor. You can also click the "Clear Selection" button on the history view title bar to view the history of the whole project.
+
+Source changes, rejoining and returning to the window invalidate history. While the history view is visible, a timer refreshes its relative-age labels; hiding or disposing it cancels that timer. Results from an obsolete request cannot refill its cache.
 
 ![screenshot-project-history](assets/screenshot-project-history.png)
 

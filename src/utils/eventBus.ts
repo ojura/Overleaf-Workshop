@@ -5,14 +5,17 @@ import type { CompileOutcome } from '../core/projectBuilds';
 import type { BuildStatus } from '../core/viewerProtocol';
 import { StatusInfo } from '../scm';
 
+export type ProjectChangeKind = 'joined' | 'files' | 'metadata' | 'settings' | 'dictionary' | 'name' | 'access';
+
 export type Events = {
     'fileWillOpenEvent': {uri: vscode.Uri},
     'pdfWillOpenEvent': {uri: vscode.Uri, doc:PdfDocument, webviewPanel:vscode.WebviewPanel},
-    'spellCheckLanguageUpdateEvent': {language:string},
-    'compilerUpdateEvent': {compiler:string},
-    'rootDocUpdateEvent': {rootDocId:string},
+    'spellCheckLanguageUpdateEvent': {language:string, uri?:vscode.Uri},
+    'compilerUpdateEvent': {compiler:string, uri?:vscode.Uri},
+    'rootDocUpdateEvent': {rootDocId:string, uri?:vscode.Uri},
+    /** A server or local change invalidated data owned by this project/account. */
+    'projectStateChangedEvent': {uri:vscode.Uri, kind:ProjectChangeKind},
     'scmStatusChangeEvent': {status:StatusInfo},
-    'socketioConnectedEvent': {publicId:string},
     /**
      * the build in use of the project at `uri` changed (VirtualFileSystem.builds): to this
      * window's compile, or to another client's from Overleaf's cache when `fromCache`

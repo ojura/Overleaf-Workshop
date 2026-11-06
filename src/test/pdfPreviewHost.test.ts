@@ -110,7 +110,7 @@ class Panel {
     }
     onDidDispose = this.closing.event;
     onDidChangeViewState = this.changes.event;
-    send(message: any) { this.receive(message); }
+    send(message: any) { this.receive({ page: this.html.slice('<html>'.length, -'</html>'.length), ...message }); }
     close() { this.closing.fire(); }
     nextPage() { return new Promise<void>(resolve => { const stop = this.pages.event(() => { stop.dispose(); resolve(); }); }); }
 }

@@ -17,7 +17,7 @@ import { bridgeOutputsOf } from '../common/bridge';
 import { config } from '../common/config';
 import { documentShown, showBuildState, showLoadError, showState } from '../common/banner';
 import { errorMessage } from '../common/errorMessage';
-import { onMessage, post, ready, savedState, saveState, hostMeasurementsPreference } from '../common/host';
+import { onMessage, post, ready, savedState, saveState, hostMeasurementsPreference, disposeHost } from '../common/host';
 import type { InitState } from '../common/host';
 import { toPdfFile } from '../common/output';
 import type { PdfOutput, PdfPreviewDescriptor, Position, SyncBox } from '../common/protocol';
@@ -28,21 +28,34 @@ import { createWorkerPort } from '../common/worker';
 import { installPdfPrefetch } from '../common/pdf-prefetch';
 import { hostPdfPreviewSource } from '../common/pdf-preview-bridge';
 import { documentParams, PDFJS } from '../shims/pdf-js';
+import { PDF_VIEWER_POLICY } from '../common/viewer-policy';
+import { untilAborted, waitForDocumentOperation, waitForPdfJsApplication } from '../common/document-lifecycle';
+import { installReadingState, restoreReadingPosition, visibleReadingPosition } from '../common/reading-state';
 import '../common/icons.css';
 import './viewer.css';
 
 const CHUNK_SIZE = 128 * 1024; // PDFJSWrapper's
 let previewController: ReturnType<typeof installPdfPrefetch> | undefined;
-/** the zoom step of Overleaf's zoom buttons and keys (pdf-js-viewer.tsx); pdf.js's own is about 1.1 */
-const ZOOM_STEP = 1.25;
-const ScrollMode: Record<string, number> = { vertical: 0, horizontal: 1, wrapped: 2, page: 3 };
-const SpreadMode: Record<string, number> = { none: 0, odd: 1, even: 2 };
+const scrollModes: Record<string, number> = { vertical: 0, horizontal: 1, wrapped: 2, page: 3 };
+const spreadModes: Record<string, number> = { none: 0, odd: 1, even: 2 };
 
 const app = (): any => (window as any).PDFViewerApplication;
 let shownBuild: string | undefined;
 
 forwardKeysToVsCode();
-setOptionsWhenTheAppStarts();
+const pageLifetime = new AbortController();
+const initialized = waitForPdfJsApplication(configureApplication, pageLifetime.signal);
+let reading: ReturnType<typeof installReadingState> | undefined;
+window.addEventListener('pagehide', event => {
+    if (event.persisted) { reading?.capture(); return; }
+    reading?.dispose();
+    disposeHost();
+    pageLifetime.abort();
+    for (const job of jobs) { stop(job); }
+    inFlight = undefined;
+    if (shown) { shown.abort.abort(); destroy(shown.task, shown.worker); shown = undefined; }
+    previewController?.dispose();
+});
 
 /** what the zoom keys with Ctrl/Cmd do to the page viewer, as in Overleaf's viewer */
 function zoomKey(event: KeyboardEvent): ((viewer: any) => void) | undefined {
@@ -72,6 +85,7 @@ function zoomKey(event: KeyboardEvent): ((viewer: any) => void) | undefined {
  */
 function forwardKeysToVsCode() {
     window.addEventListener('keydown', (event: KeyboardEvent) => {
+        if (pageLifetime.signal.aborted) { return; }
         if (!(event.ctrlKey || event.metaKey) || event.altKey) { return; }
         const zoom = zoomKey(event);
         if (zoom) {
@@ -96,46 +110,35 @@ function forwardKeysToVsCode() {
  * The event goes to the parent frame's document when the page may reach it, as in a VS Code
  * webview, and to this page's document otherwise.
  */
-function setOptionsWhenTheAppStarts() {
-    let done = false;
-    const onLoaded = (event: Event) => {
-        if (done || (event as CustomEvent).detail?.source !== window) { return; }
-        done = true;
-        // The extension host saves the PDF, since the viewer may have only parts of it. The app
-        // binds its handlers when it starts, so the method changes now.
-        app().downloadOrSave = async () => post({ type: 'download' });
-        // The zoom buttons, the app's zoom keys and the ones above step by Overleaf's factor. The
-        // wheel and pinch zoom call updateZoom themselves, so they keep pdf.js's own steps.
-        app().zoomIn = () => app().updateZoom(null, ZOOM_STEP);
-        app().zoomOut = () => app().updateZoom(null, 1 / ZOOM_STEP);
-        const options = (window as any).PDFViewerApplicationOptions;
-        const set = (values: Record<string, unknown>) => Object.entries(values).forEach(([name, value]) => options.set(name, value));
-        set({
-            // the settings in this page's local storage would override the ones below
-            disablePreferences: true,
-            // pdf.js's sample PDF
-            defaultUrl: '',
-            // this script restores the view; the app's view history and the PDF's own initial
-            // view would undo that
-            viewOnLoad: 1,
-            defaultZoomValue: '',
-            sidebarViewOnLoad: 0,
-            enableScripting: false,
-            // PDFJSWrapper's: annotations without forms, no annotation editing, large canvases
-            annotationMode: 1,
-            annotationEditorMode: -1,
-            maxCanvasPixels: 8192 * 8192,
-            imageResourcesPath: config.pdfjs.imageResourcesPath,
-            workerSrc: `${config.pdfjs.build}pdf.worker.mjs`,
-            ...documentParams(),
-        });
-    };
-    document.addEventListener('webviewerloaded', onLoaded);
-    try {
-        parent.document.addEventListener('webviewerloaded', onLoaded);
-    } catch {
-        // the parent frame is another origin's
-    }
+function configureApplication(application: any) {
+    // The extension host saves the PDF, since the viewer may have only parts of it. The app
+    // binds its handlers when it starts, so the method changes now.
+    application.downloadOrSave = async () => post({ type: 'download' });
+    // The zoom buttons, the app's zoom keys and the ones above step by Overleaf's factor. The
+    // wheel and pinch zoom call updateZoom themselves, so they keep pdf.js's own steps.
+    application.zoomIn = () => application.updateZoom(null, PDF_VIEWER_POLICY.zoomStep);
+    application.zoomOut = () => application.updateZoom(null, 1 / PDF_VIEWER_POLICY.zoomStep);
+    const options = (window as any).PDFViewerApplicationOptions;
+    const set = (values: Record<string, unknown>) => Object.entries(values).forEach(([name, value]) => options.set(name, value));
+    set({
+        // the settings in this page's local storage would override the ones below
+        disablePreferences: true,
+        // pdf.js's sample PDF
+        defaultUrl: '',
+        // this script restores the view; the app's view history and the PDF's own initial
+        // view would undo that
+        viewOnLoad: 1,
+        defaultZoomValue: '',
+        sidebarViewOnLoad: 0,
+        enableScripting: false,
+        // PDFJSWrapper's: annotations without forms, no annotation editing, large canvases
+        annotationMode: 1,
+        annotationEditorMode: -1,
+        maxCanvasPixels: 8192 * 8192,
+        imageResourcesPath: config.pdfjs.imageResourcesPath,
+        workerSrc: `${config.pdfjs.build}pdf.worker.mjs`,
+        ...documentParams(),
+    });
 }
 
 /**
@@ -162,11 +165,6 @@ let findAllowed = false;
 /** a forward search that came while a document was loading: drawn once its pages are set up */
 let pendingBoxes: SyncBox[] | undefined;
 
-const initialized = new Promise<void>((resolve) => {
-    const wait = () => app()?.initializedPromise ? app().initializedPromise.then(resolve) : setTimeout(wait, 10);
-    wait();
-});
-
 /**
  * A load of a document. Each document gets a worker of its own, which stops once the document is
  * destroyed: with one shared worker, pdf.js refuses a load while a destroy is still running
@@ -178,16 +176,19 @@ interface Job {
     worker?: Worker;
 }
 
-/** how long a document may take to be destroyed before its worker is stopped anyway */
-const DESTROY_TIMEOUT_MS = 10_000;
 let queue: Promise<void> = Promise.resolve();
 let inFlight: Job | undefined;
+/** Includes the adoption interval after a prepared job leaves the replaceable loading slot. */
+const jobs = new Set<Job>();
 /** the document that the app shows */
-let shown: { task: any, worker: Worker, doc: any } | undefined;
+let shown: { task: any, worker: Worker, doc: any, abort: AbortController } | undefined;
+const destroyed = new WeakSet<object>();
 
 function destroy(task: any, worker?: Worker) {
-    const timeout = new Promise(resolve => setTimeout(resolve, DESTROY_TIMEOUT_MS));
-    Promise.race([task.destroy(), timeout])
+    if (destroyed.has(task)) { return; }
+    destroyed.add(task);
+    if (task.destroyed) { worker?.terminate(); return; }
+    waitForDocumentOperation(() => task.destroy())
         .catch(error => console.warn('pdf viewer: destroying a document:', error))
         .finally(() => worker?.terminate());
 }
@@ -207,10 +208,7 @@ function stop(job: Job) {
 
 /** Resolves with what `promise` gives, or with undefined once the job is stopped. */
 function untilStopped<T>(job: Job, promise: Promise<T>): Promise<T | undefined> {
-    return Promise.race([
-        promise,
-        new Promise<undefined>(resolve => job.abort.signal.addEventListener('abort', () => resolve(undefined), { once: true })),
-    ]);
+    return untilAborted(job.abort.signal, promise);
 }
 
 /**
@@ -221,20 +219,22 @@ function untilStopped<T>(job: Job, promise: Promise<T>): Promise<T | undefined> 
 interface Source { output?: PdfOutput; data?: ArrayBuffer; preview?: PdfPreviewDescriptor }
 
 function show(source: Source) {
+    if (pageLifetime.signal.aborted) { return; }
     if (source.output && !inFlight && app()?.pdfDocument && rangeLoaded?.file.build === source.output.file.build) { return; }
     if (inFlight) { stop(inFlight); }
     const job: Job = { abort: new AbortController() };
+    jobs.add(job);
     inFlight = job;
     queue = queue
         .then(() => load(source, job))
         .catch((error) => console.error('pdf viewer:', error))
-        .finally(() => { if (inFlight === job) { inFlight = undefined; } });
+        .finally(() => { jobs.delete(job); if (inFlight === job) { inFlight = undefined; } });
 }
 
 async function load(source: Source, job: Job) {
     if (job.abort.signal.aborted) { return; }
-    await initialized;
-    const a = app();
+    const a = await untilStopped(job, initialized);
+    if (!a || pageLifetime.signal.aborted || job.abort.signal.aborted) { return; }
     const worker = await createWorkerPort();
     if (job.abort.signal.aborted) {
         worker.terminate();
@@ -280,8 +280,9 @@ async function load(source: Source, job: Job) {
     if (!doc) { return; }
     // Capture after preparation: the reader may have moved while ranges arrived.
     const view = a.pdfDocument
-        ? { position: positionOf(a), scale: a.pdfViewer.currentScaleValue }
+        ? { position: positionOf(a) ?? savedState().position, scale: a.pdfViewer.currentScaleValue }
         : { position: savedState().position, scale: savedState().scale };
+    reading?.capture();
     committing = true;
     // from here on a newer load waits for this one and then replaces it, rather than stopping it
     if (inFlight === job) { inFlight = undefined; }
@@ -310,7 +311,8 @@ async function load(source: Source, job: Job) {
         catch { /* Optional artwork cannot prevent useful document pixels. */ }
     }
     try {
-        await Promise.race([a.close(), new Promise(resolve => setTimeout(resolve, DESTROY_TIMEOUT_MS))]);
+        await waitForDocumentOperation(() => a.close());
+        if (pageLifetime.signal.aborted) { destroy(task, worker); releaseDetachedOld(); return; }
         a.pdfLoadingTask = task;
         if (url) { a.setTitleUsingUrl(url, url); }
         a.load(doc);
@@ -321,7 +323,7 @@ async function load(source: Source, job: Job) {
         if (a.pdfLoadingTask === task) {
             // load assigns the app's document before it calls the page viewer. A setter
             // failure can therefore leave a partially adopted document that close must clear.
-            try { await Promise.race([a.close(), new Promise(resolve => setTimeout(resolve, DESTROY_TIMEOUT_MS))]); }
+            try { await waitForDocumentOperation(() => a.close()); }
             catch (closeError) { console.warn('pdf viewer: closing a failed document:', closeError); }
             finally { worker.terminate(); }
         } else {
@@ -332,7 +334,7 @@ async function load(source: Source, job: Job) {
         return;
     }
     releaseDetachedOld();
-    shown = { task, worker, doc };
+    shown = { task, worker, doc, abort: job.abort };
     shownBuild = source.output?.file.build;
     findAllowed = false;
     rangeLoaded = source.output;
@@ -341,8 +343,9 @@ async function load(source: Source, job: Job) {
 }
 
 function positionOf(a: any): Position | undefined {
+    if (a.pdfViewer.container.offsetParent === null) { return undefined; }
     try {
-        return wrapperOf(a).currentPosition;
+        return visibleReadingPosition(a.pdfViewer) ?? wrapperOf(a).currentPosition;
     } catch {
         return undefined;
     }
@@ -353,8 +356,8 @@ function setModesForNextLoad() {
     const state = savedState();
     const defaults = initState?.defaults;
     const options = (window as any).PDFViewerApplicationOptions;
-    options.set('scrollModeOnLoad', state.scrollMode ?? ScrollMode[defaults?.scrollMode?.toLowerCase() ?? ''] ?? 0);
-    options.set('spreadModeOnLoad', state.spreadMode ?? SpreadMode[defaults?.spreadMode?.toLowerCase() ?? ''] ?? 0);
+    options.set('scrollModeOnLoad', state.scrollMode ?? scrollModes[defaults?.scrollMode?.toLowerCase() ?? ''] ?? 0);
+    options.set('spreadModeOnLoad', state.spreadMode ?? spreadModes[defaults?.spreadMode?.toLowerCase() ?? ''] ?? 0);
     options.set('sidebarViewOnLoad', state.sidebarView ?? 0);
 }
 
@@ -362,7 +365,6 @@ function setModesForNextLoad() {
 function onPagesInit() {
     const a = app();
     const view = restore;
-    restore = undefined;
     (a.pdfViewer.viewer as HTMLElement).style.minHeight = '';
     const options = (window as any).PDFViewerApplicationOptions;
     // the same modes as the app sets later, so that it then changes nothing
@@ -372,7 +374,7 @@ function onPagesInit() {
     a.pdfViewer.currentScaleValue = view?.scale ?? 'page-width';
     if (view?.position) {
         try {
-            wrapperOf(a).scrollToPosition(view.position);
+            restoreReadingPosition(a.pdfViewer, view.position);
         } catch {
             // a position past the end of a shorter build
         }
@@ -381,16 +383,8 @@ function onPagesInit() {
         showHighlights(a.pdfViewer, pendingBoxes);
         pendingBoxes = undefined;
     }
-}
-
-let saveTimer: number | undefined;
-function saveViewSoon() {
-    window.clearTimeout(saveTimer);
-    saveTimer = window.setTimeout(() => {
-        const a = app();
-        if (!a.pdfDocument || restore) { return; }
-        saveState({ position: positionOf(a), scale: a.pdfViewer.currentScaleValue });
-    }, 500);
+    restore = undefined;
+    reading?.capture();
 }
 
 /**
@@ -458,7 +452,7 @@ function addToolbarButtons(a: any) {
     // shows the PDF in the Overleaf viewer, at the same place: the host sets the viewer setting
     // and reloads the page with the other viewer, which starts from the saved view
     onClick(['switchViewerButton', 'secondarySwitchViewer'], () => {
-        if (a.pdfDocument) { saveState({ position: positionOf(a), scale: a.pdfViewer.currentScaleValue }); }
+        reading?.capture();
         post({ type: 'switchViewer', engine: 'overleaf' });
     });
     showTheme();
@@ -478,8 +472,8 @@ async function start() {
         }
     });
 
-    await initialized;
-    const a = app();
+    const a = await initialized;
+    if (!a || pageLifetime.signal.aborted) { return; }
     const prefetch = installPdfPrefetch(a.pdfViewer, {
         diagnosticsToolbar: document.getElementById('toolbarViewerRight')!,
         diagnosticsToolbarBefore: document.getElementById('secondaryToolbarToggle')!,
@@ -498,21 +492,27 @@ async function start() {
     (a.pdfViewer.viewer as HTMLElement).classList.add('removePageBorders');
     const wrapper = () => wrapperOf(a);
     listenForDoubleClick(a.eventBus, (event, canvas, page) => wrapper().clickPosition(event, canvas, page));
-    a.eventBus.on('pagesinit', onPagesInit);
-    a.pdfViewer.container.addEventListener('scroll', saveViewSoon);
-    a.eventBus.on('scalechanging', saveViewSoon);
+    reading = installReadingState({
+        container: a.pdfViewer.container, eventBus: a.eventBus,
+        current: () => a.pdfDocument && !restore && !pageLifetime.signal.aborted
+            ? { position: positionOf(a), scale: String(a.pdfViewer.currentScaleValue) } : undefined,
+        save: saveState,
+    });
+    a.eventBus.on('pagesinit', () => { if (!pageLifetime.signal.aborted) { reading!.restore(onPagesInit); } });
     a.eventBus.on('scrollmodechanged', ({ mode }: { mode: number }) => saveState({ scrollMode: mode }));
     a.eventBus.on('spreadmodechanged', ({ mode }: { mode: number }) => saveState({ spreadMode: mode }));
     a.eventBus.on('sidebarviewchanged', ({ view }: { view: number }) => saveState({ sidebarView: view }));
     a.eventBus.on('documenterror', ({ message }: { message: string }) => showState('failed', message));
     askBeforeFind(a);
 
-    initState = await ready();
+    initState = await untilAborted(pageLifetime.signal, ready());
+    if (!initState || pageLifetime.signal.aborted) { return; }
     themes = themesFrom(initState);
     addToolbarButtons(a);
 }
 
 start().catch((error) => {
+    if (pageLifetime.signal.aborted) { return; }
     console.error('pdf viewer:', error);
     showState('failed', errorMessage(error));
 });

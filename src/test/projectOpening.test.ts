@@ -46,6 +46,9 @@ class Picker {
 
 function setup() {
     const picker = new Picker();
+    const viewVisibility = new Emitter();
+    const windowState = new Emitter();
+    const tree = {visible: false, disposed: false, onDidChangeVisibility: viewVisibility.event, dispose() { this.disposed = true; }};
     const persists: Record<string, any> = {};
     const valid = new Set<string>();
     const calls: {command: string; args: any[]}[] = [];
@@ -59,6 +62,7 @@ function setup() {
         pickerCalls: 0,
         warningAnswer: 'Yes' as string | undefined,
         workspaceFolders: [] as {uri: Uri}[],
+        projects: [{id:'selected',name:'Selected',userId:'u'}, {id:'archived',name:'Archived',userId:'u',archived:true}] as any[],
         validate: async (folder: Uri, _project: Uri) => valid.has(folder.fsPath),
         create: async (vfs: unknown, parent: Uri) => {
             created.push({vfs, parent});
@@ -75,10 +79,7 @@ function setup() {
         },
         updateServerProjectSCMPersist: (_context: unknown, _server: string, _project: string, key: string) => state.remove(key),
         getServers: () => ({server: {api, server: {name: 'www.overleaf.com', login: {username: 'user'}}}}),
-        fetchServerProjects: async () => [
-            {id: 'selected', name: 'Selected', userId: 'u'},
-            {id: 'archived', name: 'Archived', userId: 'u', archived: true},
-        ],
+        fetchServerProjects: async () => state.projects,
         authenticate: async () => ({}),
     });
     const replica = strict('local replica opening API', {
@@ -99,6 +100,8 @@ function setup() {
         workspace: {get workspaceFolders() { return state.workspaceFolders; }},
         window: strict('project opening window', {
             registerTreeDataProvider: () => ({dispose() {}}),
+            createTreeView: () => tree,
+            onDidChangeWindowState: windowState.event,
             createQuickPick: () => { state.pickerCalls++; return picker; },
             showOpenDialog: async () => { state.dialogCalls++; return state.folder ? [state.folder] : undefined; },
             showErrorMessage: async (message: string) => { errors.push(message); },
@@ -116,7 +119,10 @@ function setup() {
             },
         }),
     });
-    const {ProjectManagerProvider} = loadWithVscode(mock, () => require('../core/projectManagerProvider'), {
+    const {ProjectManagerProvider, EventBus} = loadWithVscode(mock, () => ({
+        ProjectManagerProvider: require('../core/projectManagerProvider').ProjectManagerProvider,
+        EventBus: require('../utils/eventBus').EventBus,
+    }), {
         '../consts': {ROOT_NAME: 'overleaf-workshop'},
         '../api/base': {},
         '../api/gitBridge': {},
@@ -127,7 +133,8 @@ function setup() {
         '../sandbox/projectInfo': {},
     });
     const provider = new ProjectManagerProvider({});
-    provider.triggers;
+    const subscriptions = provider.triggers;
+    cleanups.push(() => subscriptions.forEach((subscription:any) => subscription.dispose()));
     const project = {uri: projectUri, label: 'Selected'};
     function addReplica(key: string, folder: string, options: {valid?: boolean; legacyPath?: boolean} = {}) {
         persists[key] = {enabled: true, label: 'Local Replica', baseUri: options.legacyPath ? folder : Uri.file(folder).toString(), settings: {}};
@@ -139,10 +146,35 @@ function setup() {
         return handler(project);
     };
     const opened = () => calls.filter(call => call.command === 'vscode.openFolder').map(call => [call.args[0].toString(), call.args[1]]);
-    return {provider, project, state, picker, persists, calls, errors, created, selectedVfs, addReplica, invoke, opened};
+    return {provider, project, state, picker, persists, calls, errors, created, selectedVfs, addReplica, invoke, opened,
+        tree, viewVisibility, windowState, EventBus, subscriptions};
 }
 
+const cleanups: Array<() => void> = [];
 describe('local-first project opening', () => {
+    afterEach(() => cleanups.splice(0).forEach(cleanup => cleanup()));
+    it('refreshes project names, membership and lists when the view is shown, refocused or notified', async () => {
+        const h = setup(); let changes = 0;
+        const listener = h.provider.onDidChangeTreeData(() => { changes++; });
+        try {
+            h.tree.visible = true; h.viewVisibility.fire({visible:true});
+            assert.strictEqual(changes, 1);
+            const [server] = await h.provider.getChildren();
+            h.state.projects = [{id:'selected',name:'Renamed',userId:'u'}, {id:'new',name:'New invitation',userId:'u'}];
+            h.EventBus.fire('projectStateChangedEvent', {uri:Uri.parse(projectUri),kind:'name'});
+            const projects = await h.provider.getChildren(server);
+            assert.deepStrictEqual(projects.map((project:any) => project.label), ['Renamed','New invitation']);
+            assert.strictEqual(changes, 2);
+            h.windowState.fire({focused:true}); assert.strictEqual(changes, 3);
+            h.tree.visible = false; h.viewVisibility.fire({visible:false});
+            h.windowState.fire({focused:true});
+            h.EventBus.fire('projectStateChangedEvent', {uri:Uri.parse(projectUri),kind:'access'});
+            assert.strictEqual(changes, 3, 'hidden project lists do not refetch on each notification');
+            h.subscriptions.forEach((subscription:any) => subscription.dispose());
+            h.tree.visible = true; h.viewVisibility.fire({visible:true}); h.windowState.fire({focused:true});
+            assert.strictEqual(changes, 3); assert.strictEqual(h.tree.disposed, true);
+        } finally { listener.dispose(); }
+    });
     for (const [command, newWindow] of [['openProjectInCurrentWindow', false], ['openProjectInNewWindow', true]] as const) {
         it(`${command} reuses the sole matching replica directly`, async () => {
             const h = setup();

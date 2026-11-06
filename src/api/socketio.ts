@@ -1,7 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import { Identity, BaseAPI, ProjectMessageResponseSchema } from './base';
 import { FileEntity, DocumentEntity, FileRefEntity, FileType, FolderEntity, ProjectEntity } from '../core/remoteFileSystemProvider';
-import { EventBus } from '../utils/eventBus';
 import { SocketIOAlt } from './socketioAlt';
 import { decodePackedUtf8 } from './packedUtf8';
 import type { TrackChangesState } from '../utils/docUpdate';
@@ -103,6 +102,13 @@ export interface EventsHandler {
     onClientDisconnected?: (id:string) => void,
     //
     onReceivedMessage?: (message:ProjectMessageResponseSchema) => void,
+    onMessageEdited?: (message: { messageId: string; userId: string; content: string }) => void,
+    onMessageDeleted?: (message: { messageId: string; userId: string }) => void,
+    onMessagesRefreshed?: (messages: ProjectMessageResponseSchema[]) => void,
+    onMetadataUpdated?: (metadata: { docId: string; meta: unknown }) => void,
+    onProjectNameUpdated?: (name: string) => void,
+    onProjectAccessChanged?: (change?: {newAccessLevel?: string}) => void,
+    onProjectAccessRevoked?: () => void,
     //
     onSpellCheckLanguageUpdated?: (language:string) => void,
     onCompilerUpdated?: (compiler:string) => void,
@@ -126,9 +132,9 @@ export class SocketIOAPI {
     private record?: Promise<ProjectEntity>;
     /** resolves `record` once the current connection's joinProjectResponse arrives (scheme v2) */
     private recordWaiter?: (project: ProjectEntity) => void;
-    private _handlers: Array<EventsHandler> = [];
-    /** Track EventBus listeners for cleanup to prevent MaxListenersExceededWarning */
-    private _eventBusCleanups: Array<()=>void> = [];
+    private disposed = false;
+    private readonly pending = new Set<() => void>();
+    private readonly registrations = new Set<{ handlers: EventsHandler; active: boolean; cleanups: Array<() => void> }>();
 
     private socket?: any;
     private emit: any;
@@ -144,8 +150,8 @@ export class SocketIOAPI {
     }
 
     init() {
-        // Clean up old EventBus listeners before creating new socket
-        this._cleanupEventBusListeners();
+        if (this.disposed) { throw new Error('The project connection is disposed.'); }
+        for (const registration of this.registrations) { registration.cleanups.splice(0).forEach(cleanup => cleanup()); }
 
         // CRITICAL: Properly disconnect old socket before creating a new one.
         // Without this, the old TCP connection is abandoned but still alive. When the
@@ -187,36 +193,35 @@ export class SocketIOAPI {
             // Bind the call to the socket it is emitted on: init() may swap this.socket
             // out from under an in-flight call, and that call can never be acknowledged.
             const socket = this.socket;
-            let timer: NodeJS.Timeout;
-            const timeoutPromise = new Promise((_, reject) => {
-                timer = setTimeout(() => {
-                    reject(new EmitTimeoutError(event, SocketIOAPI.emitTimeoutMs));
-                    // No answer means the connection is gone, even when socket.io still takes it
-                    // for open; unless this socket has been replaced meanwhile.
-                    if (socket===this.socket) {
+            if (this.disposed) { return Promise.reject(new Error('The project connection is closed.')); }
+            return new Promise((resolve, reject) => {
+                let settled = false;
+                const finish = (error?: unknown, data?: any[]) => {
+                    if (settled) { return; }
+                    settled = true;
+                    clearTimeout(timer);
+                    this.pending.delete(cancel);
+                    if (error) { reject(error); } else { resolve(data); }
+                };
+                const cancel = () => finish(new Error('The project connection is closed.'));
+                const timer = setTimeout(() => {
+                    if (settled) { return; }
+                    finish(new EmitTimeoutError(event, SocketIOAPI.emitTimeoutMs));
+                    if (!this.disposed && socket === this.socket) {
                         this.onConnectionProblem?.(`'${event}' got no answer within ${SocketIOAPI.emitTimeoutMs} ms`);
                     }
                 }, SocketIOAPI.emitTimeoutMs);
+                this.pending.add(cancel);
+                try {
+                    socket.emit(event, ...args, (err:any, ...data:any[]) => finish(err ? new EmitRefusedError(event, err) : undefined, data));
+                } catch (error) { finish(error); }
             });
-            const waitPromise = new Promise((resolve, reject) => {
-                socket.emit(event, ...args, (err:any, ...data:any[]) => {
-                    // Clear the timer as soon as the ack lands, otherwise every single
-                    // emit leaks a live timer for the whole timeout window.
-                    clearTimeout(timer);
-                    if (err) {
-                        reject(new EmitRefusedError(event, err));
-                    } else {
-                        resolve(data);
-                    }
-                });
-            });
-            return Promise.race([waitPromise, timeoutPromise]);
         };
         this.emit = require('util').promisify(this.socket.emit).bind(this.socket);
         // resume handlers
         this.initInternalHandlers();
         // Re-register existing event handlers on the new socket
-        this.resumeEventHandlers(this._handlers);
+        for (const registration of this.registrations) { this.bindHandlers(registration); }
         // Track which scheme this socket was created with
         this._socketInitScheme = this.scheme;
     }
@@ -224,14 +229,6 @@ export class SocketIOAPI {
     /** Returns true if the socket needs re-initialization (scheme changed, or socket was never init'd) */
     get needsReinit(): boolean {
         return this._socketInitScheme !== this.scheme || !this.socket;
-    }
-
-    /** Clean up any accumulated EventBus listeners */
-    private _cleanupEventBusListeners() {
-        for (const cleanup of this._eventBusCleanups) {
-            try { cleanup(); } catch {}
-        }
-        this._eventBusCleanups = [];
     }
 
     private initInternalHandlers() {
@@ -279,7 +276,7 @@ export class SocketIOAPI {
             this.socket.on('joinProjectResponse', (res:any) => {
                 const publicId = res.publicId as string;
                 const project = res.project as ProjectEntity;
-                EventBus.fire('socketioConnectedEvent', {publicId});
+                project.permissionsLevel = res.permissionsLevel;
                 if (this.recordWaiter) {
                     this.recordWaiter(project);
                     this.recordWaiter = undefined;
@@ -302,7 +299,7 @@ export class SocketIOAPI {
     }
 
     get handlers() {
-        return this._handlers;
+        return [...this.registrations].map(registration => registration.handlers);
     }
 
     get isUsingAlternativeConnectionScheme() {
@@ -317,111 +314,82 @@ export class SocketIOAPI {
         }
     }
 
-    resumeEventHandlers(handlers: Array<EventsHandler>) {
-        this._handlers = [];
-        handlers.forEach((handler) => {
-            this.updateEventHandlers(handler);
-        });
+    /** Each subscriber owns its listeners, including their replacement-socket bindings. */
+    updateEventHandlers(handlers: EventsHandler): { dispose(): void } {
+        const registration = { handlers, active: !this.disposed, cleanups: [] as Array<() => void> };
+        if (registration.active) {
+            this.registrations.add(registration);
+            this.bindHandlers(registration);
+        }
+        return { dispose: () => {
+            registration.active = false;
+            registration.cleanups.splice(0).forEach(cleanup => cleanup());
+            this.registrations.delete(registration);
+        } };
     }
 
-    updateEventHandlers(handlers: EventsHandler) {
-        this._handlers.push(handlers);
-        Object.values(handlers).forEach((handler) => {
-            switch (handler) {
-                case handlers.onFileCreated:
-                    this.socket.on('reciveNewDoc', (parentFolderId:string, doc:DocumentEntity) => {
-                        handler(parentFolderId, 'doc', doc);
-                    });
-                    this.socket.on('reciveNewFile', (parentFolderId:string, file:FileRefEntity) => {
-                        handler(parentFolderId, 'file', file);
-                    });
-                    this.socket.on('reciveNewFolder', (parentFolderId:string, folder:FolderEntity) => {
-                        handler(parentFolderId, 'folder', folder);
-                    });
-                    break;
-                case handlers.onFileRenamed:
-                    this.socket.on('reciveEntityRename', (entityId:string, newName:string) => {
-                        handler(entityId, newName);
-                    });
-                    break;
-                case handlers.onFileRemoved:
-                    this.socket.on('removeEntity', (entityId:string) => {
-                        handler(entityId);
-                    });
-                    break;
-                case handlers.onFileMoved:
-                    this.socket.on('reciveEntityMove', (entityId:string, folderId:string) => {
-                        handler(entityId, folderId);
-                    });
-                    break;
-                case handlers.onFileChanged:
-                    this.socket.on('otUpdateApplied', (update: UpdateSchema) => {
-                        handler(update);
-                    });
-                    break;
-                case handlers.onUpdateError:
-                    // Sent to the connections that joined the doc, or for an update too large
-                    // to queue to its sender, which real-time then disconnects; `message` names
-                    // the doc (DocumentUpdaterController, WebsocketController.applyOtUpdate).
-                    this.socket.on('otUpdateError', (error:any, message?:{doc_id?: string}) => {
-                        handler(message?.doc_id, errorMessage(error));
-                    });
-                    break;
-                case handlers.onDisconnected:
-                    this.socket.on('disconnect', () => {
-                        handler();
-                    });
-                    break;
-                case handlers.onConnectionAccepted:
-                    this.socket.on('connectionAccepted', (_:any, publicId:any) => {
-                        handler(publicId);
-                    });
-                    // Track EventBus listener via Disposable for cleanup to prevent MaxListenersExceededWarning
-                    const eventBusDisposable = EventBus.on('socketioConnectedEvent', (arg:{publicId:string}) => {
-                        handler(arg.publicId);
-                    });
-                    this._eventBusCleanups.push(() => eventBusDisposable.dispose());
-                    break;
-                case handlers.onClientUpdated:
-                    this.socket.on('clientTracking.clientUpdated', (user:UpdateUserSchema) => {
-                        handler(user);
-                    });
-                    break;
-                case handlers.onClientDisconnected:
-                    this.socket.on('clientTracking.clientDisconnected', (id:string) => {
-                        handler(id);
-                    });
-                    break;
-                case handlers.onReceivedMessage:
-                    this.socket.on('new-chat-message', (message:ProjectMessageResponseSchema) => {
-                        handler(message);
-                    });
-                    break;
-                case handlers.onSpellCheckLanguageUpdated:
-                    this.socket.on('spellCheckLanguageUpdated', (language:string) => {
-                        handler(language);
-                    });
-                    break;
-                case handlers.onCompilerUpdated:
-                    this.socket.on('compilerUpdated', (compiler:string) => {
-                        handler(compiler);
-                    });
-                    break;
-                case handlers.onRootDocUpdated:
-                    this.socket.on('rootDocUpdated', (rootDocId:string) => {
-                        handler(rootDocId);
-                    });
-                    break;
-                case handlers.onTrackChangesToggled:
-                    // the whole new trackChangesState: false, true, or {userId: true, ...}
-                    this.socket.on('toggle-track-changes', (state:TrackChangesState) => {
-                        handler(state);
-                    });
-                    break;
-                default:
-                    break;
-            }
-        });
+    private bindHandlers(registration: { handlers: EventsHandler; active: boolean; cleanups: Array<() => void> }) {
+        const socket = this.socket;
+        const handlers = registration.handlers;
+        const listen = (event: string, callback: (...args: any[]) => void) => {
+            const listener = (...args: any[]) => {
+                if (registration.active && !this.disposed && socket === this.socket) { callback(...args); }
+            };
+            socket.on(event, listener);
+            registration.cleanups.push(() => socket.removeListener?.(event, listener));
+        };
+        if (handlers.onFileCreated) {
+            listen('reciveNewDoc', (parent: string, doc: DocumentEntity) => handlers.onFileCreated!(parent, 'doc', doc));
+            listen('reciveNewFile', (parent: string, file: FileRefEntity) => handlers.onFileCreated!(parent, 'file', file));
+            listen('reciveNewFolder', (parent: string, folder: FolderEntity) => handlers.onFileCreated!(parent, 'folder', folder));
+        }
+        const direct: Array<[string, keyof EventsHandler]> = [
+            ['reciveEntityRename', 'onFileRenamed'], ['removeEntity', 'onFileRemoved'],
+            ['reciveEntityMove', 'onFileMoved'], ['otUpdateApplied', 'onFileChanged'],
+            ['disconnect', 'onDisconnected'], ['clientTracking.clientUpdated', 'onClientUpdated'],
+            ['clientTracking.clientDisconnected', 'onClientDisconnected'],
+            ['new-chat-message', 'onReceivedMessage'], ['edit-global-message', 'onMessageEdited'],
+            ['delete-global-message', 'onMessageDeleted'], ['chat-messages-refreshed', 'onMessagesRefreshed'],
+            ['broadcastDocMeta', 'onMetadataUpdated'], ['projectNameUpdated', 'onProjectNameUpdated'],
+            ['project:access:revoked', 'onProjectAccessRevoked'],
+            ['project:publicAccessLevel:changed', 'onProjectAccessChanged'],
+            ['project:collaboratorAccessLevel:changed', 'onProjectAccessChanged'],
+            ['project:membership:changed', 'onProjectAccessChanged'],
+            ['spellCheckLanguageUpdated', 'onSpellCheckLanguageUpdated'],
+            ['compilerUpdated', 'onCompilerUpdated'], ['rootDocUpdated', 'onRootDocUpdated'],
+            ['toggle-track-changes', 'onTrackChangesToggled'],
+        ];
+        for (const [event, name] of direct) {
+            const handler = handlers[name];
+            if (handler) { listen(event, handler as (...args: any[]) => void); }
+        }
+        if (handlers.onUpdateError) {
+            listen('otUpdateError', (error: unknown, message?: { doc_id?: string }) =>
+                handlers.onUpdateError!(message?.doc_id, errorMessage(error)));
+        }
+        if (handlers.onConnectionAccepted) {
+            listen('connectionAccepted', (_: unknown, publicId: string) => handlers.onConnectionAccepted!(publicId));
+            // v2 joins belong to this socket. A global bus would notify other projects too.
+            listen('joinProjectResponse', (response: { publicId?: string }) => {
+                if (this.scheme === 'v2' && typeof response.publicId === 'string') {
+                    handlers.onConnectionAccepted!(response.publicId);
+                }
+            });
+        }
+    }
+
+    dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this.onConnectionProblem = undefined;
+        for (const cancel of [...this.pending]) { cancel(); }
+        for (const registration of this.registrations) {
+            registration.active = false;
+            registration.cleanups.splice(0).forEach(cleanup => cleanup());
+        }
+        this.registrations.clear();
+        this.socket?.removeAllListeners?.();
+        this.socket?.disconnect();
     }
 
     get unSyncFileChanges(): number {
@@ -443,8 +411,12 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async joinProject(project_id:string): Promise<ProjectEntity> {
+        if (this.disposed) { throw new Error('The project connection is closed.'); }
         let timer: NodeJS.Timeout | undefined;
+        let cancel!: () => void;
         const timeoutPromise: Promise<ProjectEntity> = new Promise((_, reject) => {
+            cancel = () => reject(new Error('The project connection is closed.'));
+            this.pending.add(cancel);
             timer = setTimeout(() => {
                 reject(new Error(`joining the project got no answer within ${SocketIOAPI.joinTimeoutMs} ms`));
             }, SocketIOAPI.joinTimeoutMs);
@@ -453,36 +425,45 @@ export class SocketIOAPI {
             return await this.joinProjectOnce(project_id, timeoutPromise);
         } finally {
             clearTimeout(timer);
+            this.pending.delete(cancel);
         }
     }
 
     private joinProjectOnce(project_id:string, timeoutPromise: Promise<ProjectEntity>): Promise<ProjectEntity> {
+        const socket = this.socket;
+        const cleanups: Array<() => void> = [];
+        const listen = (event:string, handler:(...args:any[])=>void) => {
+            socket.on(event, handler);
+            cleanups.push(() => socket.removeListener?.(event, handler));
+        };
+        const raced = (promises: Promise<any>[]) => Promise.race(promises).finally(() => cleanups.forEach(cleanup => cleanup()));
         switch(this.scheme) {
             case 'Alt':
             case 'v1':
                 const joinPromise = this.emit('joinProject', {project_id})
                 .then((returns:[ProjectEntity, string, number]) => {
                     const [project, permissionsLevel, protocolVersion] = returns;
+                    if (permissionsLevel !== undefined) { project.permissionsLevel = permissionsLevel; }
                     this.record = Promise.resolve(project);
                     return project;
                 });
                 const rejectPromise = new Promise((_, reject) => {
-                    this.socket.on('connectionRejected', (err:any) => {
+                    listen('connectionRejected', (err:any) => {
                         // Only fall back to v2 if we haven't already tried it;
                         // otherwise let the outer retry logic handle backoff
                         this.scheme = 'v2';
                         reject(err.message);
                     });
                 });
-                return Promise.race([joinPromise, rejectPromise, timeoutPromise]);
+                return raced([joinPromise, rejectPromise, timeoutPromise]);
             case 'v2': {
                 // fail at once when this connection cannot be made, instead of at the timeout
                 const failed = new Promise<ProjectEntity>((_, reject) => {
-                    this.socket.on('connectionRejected', (err:any) => reject(new Error(`the connection was rejected: ${errorMessage(err)}`)));
-                    this.socket.on('connect_failed', () => reject(new Error('the connection could not be made')));
-                    this.socket.on('error', (err:any) => reject(new Error(`socket error: ${errorMessage(err)}`)));
+                    listen('connectionRejected', (err:any) => reject(new Error(`the connection was rejected: ${errorMessage(err)}`)));
+                    listen('connect_failed', () => reject(new Error('the connection could not be made')));
+                    listen('error', (err:any) => reject(new Error(`socket error: ${errorMessage(err)}`)));
                 });
-                return Promise.race([this.record!, timeoutPromise, failed]);
+                return raced([this.record!, timeoutPromise, failed]);
             }
         }
     }

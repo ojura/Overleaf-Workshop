@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as os from 'os';
 import { ROOT_NAME } from '../consts';
-import { BaseAPI, GitTokenInfo, Identity, ProjectTagsResponseSchema } from '../api/base';
+import { BaseAPI, GitTokenInfo, Identity, ProjectPersist, ProjectTagsResponseSchema } from '../api/base';
 import { checkGitToken, formatGitTokenStatus, gitTokenStatus, knownGitBridgeUrl } from '../api/gitBridge';
 import { GitTokenPersist, GlobalStateManager } from '../utils/globalStateManager';
 import { VirtualFileSystem, parseUri } from './remoteFileSystemProvider';
@@ -9,6 +9,7 @@ import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 import { OverleafClient } from '../sandbox/client';
 import { formatProjectInfo, gatherProjectInfo } from '../sandbox/projectInfo';
 import { errorMessage } from '../utils/errorMessage';
+import { EventBus } from '../utils/eventBus';
 
 class DataItem extends vscode.TreeItem {
     constructor(
@@ -58,15 +59,17 @@ class ProjectItem extends DataItem {
         readonly pid: string,
         readonly label: string,
         readonly status: 'normal' | 'archived' | 'trashed',
+        readonly accessLevel?: ProjectPersist['accessLevel'],
     ) {
         const _label = status==='normal' ? label : `[${status}] ${label}`;
         super(_label, vscode.TreeItemCollapsibleState.None);
         this.tooltip = _label;
+        if (accessLevel === 'readOnly') { this.description = vscode.l10n.t('Read-only'); }
         this.setStatus(status);
     }
 
     static clone(project: ProjectItem) {
-        return new ProjectItem(project.api, project.uri, project.parent, project.pid, project.label, project.status);
+        return new ProjectItem(project.api, project.uri, project.parent, project.pid, project.label, project.status, project.accessLevel);
     }
 
     setStatus(status:'normal' | 'archived' | 'trashed') {
@@ -92,6 +95,8 @@ class ProjectItem extends DataItem {
 }
 
 export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem> {
+    private view?: vscode.TreeView<DataItem>;
+    private disposed = false;
     constructor(
         private context:vscode.ExtensionContext) {
         this.context = context;
@@ -102,7 +107,15 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
     readonly onDidChangeTreeData: vscode.Event<DataItem | undefined | void> = this._onDidChangeTreeData.event;
 
     refresh(): void {
-        this._onDidChangeTreeData.fire();
+        if (!this.disposed) { this._onDidChangeTreeData.fire(); }
+    }
+
+    dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this.view?.dispose();
+        this.infoChannel?.dispose();
+        this._onDidChangeTreeData.dispose();
     }
 
     getTreeItem(element: DataItem): vscode.TreeItem {
@@ -110,10 +123,12 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
     }
 
     getChildren(element?: DataItem): Thenable<DataItem[]> {
+        if (this.disposed) { return Promise.resolve([]); }
         if (element) {
             if (element instanceof ServerItem) {
                 return GlobalStateManager.fetchServerProjects(this.context, element.api, element.name)
                 .catch(() => {
+                    if (this.disposed) { return []; }
                     // Direct logout if cookie expired; the account's git token stays valid
                     GlobalStateManager.logoutServer(this.context, element.api, element.name, true)
                     .then(success => {
@@ -124,6 +139,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
                     return Promise.reject();
                 })
                 .then(projects => {
+                    if (this.disposed) { return {projects: [], tags: []}; }
                     return GlobalStateManager.authenticate(this.context, element.name)
                     .then(identity => element.api.getAllTags(identity))
                     .then(res => 
@@ -134,13 +150,14 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
                     });
                 })
                 .then(({projects, tags}) => {
+                    if (this.disposed) { return []; }
                     const allTags:{name:string, tid:string}[] = [];
                     // get project items
                     const normalProjects = [], trashedProjects = [], archivedProjects = [];
                     for (const project of projects) {
                         const uri = `${ROOT_NAME}://${element.name}/${encodeURIComponent(project.name)}?user=${project.userId}&project=${project.id}`;
                         const status = project.archived ? 'archived' : project.trashed ? 'trashed' : 'normal';
-                        const item = new ProjectItem(element.api, uri, element, project.id, project.name, status);
+                        const item = new ProjectItem(element.api, uri, element, project.id, project.name, status, project.accessLevel);
                         switch (status) {
                             case 'normal': normalProjects.push(item); break;
                             case 'archived': archivedProjects.push(item); break;
@@ -842,10 +859,17 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         }
     }
 
-    get triggers() {
+    get triggers(): vscode.Disposable[] {
+        this.view ??= vscode.window.createTreeView(`${ROOT_NAME}.projectManager`, {treeDataProvider: this});
         return [
-            // register tree data provider
-            vscode.window.registerTreeDataProvider(`${ROOT_NAME}.projectManager`, this),
+            this,
+            this.view.onDidChangeVisibility(event => { if (event.visible) { this.refresh(); } }),
+            vscode.window.onDidChangeWindowState(event => {
+                if (event.focused && this.view?.visible) { this.refresh(); }
+            }),
+            EventBus.on('projectStateChangedEvent', ({kind}) => {
+                if (this.view?.visible && (kind === 'name' || kind === 'access' || kind === 'joined')) { this.refresh(); }
+            }),
             // register server-related commands
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.addServer`, () => {
                 this.addServer();

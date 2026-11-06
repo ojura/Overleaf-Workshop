@@ -332,7 +332,7 @@ const { VirtualFileSystem, PdfDocument, PdfViewEditorProvider, CompileManager, L
     '../utils/globalStateManager': {
         GlobalStateManager: {
             authenticate: async () => identity,
-            initSocketIOAPI: () => ({ api: new BaseAPI(world.overleaf.base), socket: {} }),
+            initSocketIOAPI: () => ({ api: new BaseAPI(world.overleaf.base), socket: { dispose() {} } }),
             getPdfViewPersist: () => undefined,
             updatePdfViewPersist: () => {},
         },
@@ -470,7 +470,8 @@ describe('the build in use, from Overleaf to the window', function () {
         const doc = await provider.openCustomDocument(buildUri);
         const panel = new Panel();
         await provider.resolveCustomEditor(doc, panel);
-        panel.send({ type: 'ready' });
+        const page = JSON.parse(/<script[^>]*id="viewer-config"[^>]*>(.*?)<\/script>/.exec(panel.webview.html)![1]).page;
+        panel.send({ type: 'ready', page });
         return { doc, panel };
     }
 

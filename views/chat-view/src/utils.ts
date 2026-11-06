@@ -97,12 +97,16 @@ export class MessageTree {
     ) {}
 
     update(messages: Message[]) {
+        this.messages.value = [];
+        this.rootMap = {};
+        this.unreadRecord.value = [];
         messages.forEach(message => {
-            this.pushMessage(message);
+            this.pushMessage({...message}, message.newMessage);
         });
     }
 
     pushMessage(message: Message, newMessage:boolean=false) {
+        if (this.rootMap[message.id] !== undefined) { return; }
         // update unread record
         newMessage = newMessage && (message.user.id !== this.userId);
         message.newMessage = newMessage;
@@ -120,9 +124,10 @@ export class MessageTree {
             // insert into root's replies
             const rootId = this.rootMap[messageId];
             const rootMessage = this.messages.value.find(m => m.id===rootId);
-            rootMessage?.replies && rootMessage.replies.push(message);
+            if (rootMessage?.replies) { rootMessage.replies.push(message); }
+            else { message.replies = []; this.messages.value.push(message); }
             // update rootMap
-            this.rootMap[message.id] = rootId;
+            this.rootMap[message.id] = rootId ?? message.id;
         } else {
             // update message
             message.replies = [];

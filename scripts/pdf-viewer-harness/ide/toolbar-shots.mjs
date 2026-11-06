@@ -1,13 +1,13 @@
-// Screenshots of the PDF viewers' toolbars in the hidden IDE (ide.mjs) at several window widths,
-// down to a pane of 220 px, the narrowest editor pane VS Code allows. It opens a PDF with Quick
-// Open in the viewer the setting picks, closes the side bars and the panel so that the PDF's pane
+// Screenshots of the PDF viewers' toolbars in the hidden IDE (ide.mjs) at requested window widths.
+// It opens a PDF with Quick Open in the viewer the setting picks, closes the side bars and panel
+// so that the PDF's pane
 // follows the window's width, and for each width lays the window's page out at that width
 // (Emulation.setDeviceMetricsOverride, as hidden-ide.sh's screenshot does). It saves the top 40 px
 // of the pane and lists the toolbar's elements that reach past the pane's right edge; in the pdfjs
 // viewer also those of the find bar and the tools menu. Then it switches to the other viewer with
 // its button, does the same, and switches back. It exits with 1 when an element reaches past.
 //   node ide/toolbar-shots.mjs --pdf <path> [--widths 1440,1085,900,760,600,450,340,262] [--out DIR]
-// With the side bars closed the pane is 42 px narrower than the window. --out defaults to
+// Each screenshot reports the measured pane width in the current IDE layout. --out defaults to
 // shots/ide-toolbars in the work folder (common.mjs). Like drive-local-pdf.mjs, it associates *.pdf
 // with the extension's viewer while it runs; it also restores the viewer setting, which the
 // switch buttons write.

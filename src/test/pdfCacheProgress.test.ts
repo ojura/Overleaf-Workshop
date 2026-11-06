@@ -69,7 +69,7 @@ const { PdfViewEditorProvider } = loadWithVscode(vscode, () => require('../core/
     './remoteFileSystemProvider': { parseUri: () => ({ pathParts: [] }) },
     '../utils/eventBus': { EventBus: { fire() {} } },
     '../utils/globalStateManager': { GlobalStateManager: { getPdfViewPersist: () => ({}), updatePdfViewPersist() {} } },
-    './pdfViewerPages': { completeViewerPage: () => '<html>viewer</html>', isBuildPath: () => false },
+    './pdfViewerPages': { completeViewerPage: (_template: string, options: any) => '<html>' + options.page + '</html>', isBuildPath: () => false },
     './pdfFetchBridge': {
         PieceCache: FakeCache,
         outputsOf: () => () => true,
@@ -114,7 +114,7 @@ describe('host disk progress delivery', () => {
         try {
             await provider.resolveCustomEditor(doc, panel);
             const cache = FakeCache.current;
-            receive({ type: 'ready' });
+            receive({ type: 'ready', page: panel.webview.html.slice('<html>'.length, -'</html>'.length) });
             timers.advance(1000);
             assert.strictEqual(cache.reads.length, 1);
             // Simulate a disk queue blocked for twenty seconds while many cache events arrive.
