@@ -2733,7 +2733,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         pending.id = requestFrame(at => {
             if (frame !== pending) { return; }
             frame = undefined;
-            if (disposed || !enabled || hidden() || media.matches) { return; }
+            if (disposed || !enabled || hidden()) { return; }
+            // The query can change before its event reaches this listener.
+            if (media.matches) { motionChanged(); return; }
             if (at - lastPaint + 0.01 >= 1000 / DOCUMENT_ROBOT_LIMITS.maxFps) {
                 paint(at, true);
             }

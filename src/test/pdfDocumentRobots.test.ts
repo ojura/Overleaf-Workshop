@@ -4642,6 +4642,63 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         }
     });
 
+    for (const activity of ['cargo', 'waiting'] as const) {
+        it('reconciles reduced motion observed by an owned frame before the change event for ' + activity, () => {
+            const f = fixture({ maxActors: 2 });
+            const held = new Set<string>(), reserved: string[] = [], returned: string[] = [];
+            const dock = { x: 650, y: 90, scale: 0.4 };
+            f.api.setDispatchOrigin({ reserve(vehicle: string) {
+                if (held.has(vehicle)) { return; }
+                held.add(vehicle); reserved.push(vehicle); return dock;
+            }, destination: () => dock, release(vehicle: string) {
+                assert.ok(held.delete(vehicle), 'each borrowed actor has one release owner'); returned.push(vehicle);
+            } });
+            const page = f.page(99);
+            if (activity === 'cargo') {
+                f.api.setVisiblePages([99]);
+                assert.strictEqual(f.api.offer(page), 'started');
+                assert.ok(f.api.snapshot().pages[0].payloads.some((payload: any) => payload.arrivalCovered));
+            } else { f.api.setVisibleWork([work([page], ['preparing'])]); }
+            const before = f.api.snapshot();
+            assert.ok(before.activeActors > 0 && before.retainedBytes > 0);
+            assert.strictEqual(f.callbacks.size, 1, 'an owned animation frame is pending');
+            const pending = [...f.callbacks.values()];
+            const bitmaps = f.owned.filter(canvas => canvas.width * canvas.height > 0)
+                .map(canvas => ({ canvas, zeroWrites: canvas.zeroWrites }));
+
+            f.media.matches = true;
+            f.frame();
+            const cancelled = f.api.snapshot();
+            assert.strictEqual(cancelled.activeActors, 0, 'the observed policy releases moving actors before event delivery');
+            assert.strictEqual(cancelled.activeEpisodes, 0);
+            assert.strictEqual(cancelled.retainedBytes, 0);
+            assert.strictEqual(cancelled.scheduled, false);
+            assert.strictEqual(f.callbacks.size, 0);
+            assert.ok(bitmaps.every(({ canvas, zeroWrites }) => canvas.width * canvas.height === 0
+                && canvas.zeroWrites === zeroWrites + 1), 'every retained raster and sprite is released once');
+            assert.deepStrictEqual([...returned].sort(), [...reserved].sort());
+            assert.strictEqual(held.size, 0);
+            const statusText = () => sceneNodes(f.container).filter(node => node.className === 'pdfDocumentRobotWorkStatus'
+                && node.style.opacity === '1').map(node => node.textContent);
+            if (activity === 'waiting') {
+                assert.ok(statusText().some(text => text.includes('Preparing page 88')), 'static preparation status survives cancellation');
+                assert.strictEqual(f.api.hasHandled(99), false);
+            }
+            const text = statusText();
+            f.media.emit('change');
+            for (const callback of pending) { callback(f.now + 10000); }
+            const settled = f.api.snapshot();
+            assert.strictEqual(settled.cancelledEpisodes, cancelled.cancelledEpisodes);
+            assert.strictEqual(settled.retainedBytes, 0);
+            assert.deepStrictEqual([...returned].sort(), [...reserved].sort());
+            assert.ok(bitmaps.every(({ canvas, zeroWrites }) => canvas.zeroWrites === zeroWrites + 1));
+            assert.deepStrictEqual(statusText(), text);
+            f.frame();
+            assert.strictEqual(f.api.snapshot().frames, settled.frames, 'the later event and stale frame leave no animation loop');
+            assert.strictEqual(f.callbacks.size + f.timers.size, 0);
+        });
+    }
+
     it('skips moving cargo for reduced motion and releases active effects immediately when hidden or disabled', () => {
         const f = fixture();
         const page = f.page();
