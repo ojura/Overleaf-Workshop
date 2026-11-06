@@ -332,7 +332,7 @@ const { VirtualFileSystem, PdfDocument, PdfViewEditorProvider, CompileManager, L
     '../utils/globalStateManager': {
         GlobalStateManager: {
             authenticate: async () => identity,
-            initSocketIOAPI: () => ({ api: new BaseAPI(world.overleaf.base), socket: {} }),
+            initSocketIOAPI: () => ({ api: new BaseAPI(world.overleaf.base), socket: { dispose() {} } }),
             getPdfViewPersist: () => undefined,
             updatePdfViewPersist: () => {},
         },

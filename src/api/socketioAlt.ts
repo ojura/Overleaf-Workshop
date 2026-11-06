@@ -47,24 +47,35 @@ type ListenEventsSupport = {
     'clientTracking.clientUpdated': {user:UpdateUserSchema},
     'clientTracking.clientDisconnected': {publicId:string},
     // (periodically) via `getMessages`
-    'new-chat-message': {message:ProjectMessageResponseSchema},    
+    'new-chat-message': {message:ProjectMessageResponseSchema},
+    'chat-messages-refreshed': ProjectMessageResponseSchema[],
 };
 
 class SyncTimer {
     private timer?: NodeJS.Timeout;
+    private stopped = false;
 
     constructor(
         private _interval: number,
         private readonly _callback: () => Promise<void>,
     ) {
-        this._callback().then(() => this.trigger());
+        void this.run();
     }
 
-    private trigger() {
-        this.timer = setTimeout(async () => {
-            await this._callback();
-            this.trigger();
-        }, this._interval);
+    private async run() {
+        try {
+            if (!this.stopped) { await this._callback(); }
+        } catch (error) {
+            if (!this.stopped) { console.error('Overleaf alternative refresh failed', error); }
+        } finally {
+            if (!this.stopped) {
+                this.timer = setTimeout(() => {
+                    this.timer = undefined;
+                    void this.run();
+                }, this._interval);
+                this.timer.unref?.();
+            }
+        }
     }
 
     set interval(value: number) {
@@ -72,7 +83,8 @@ class SyncTimer {
     }
 
     stop() {
-        this.timer && clearTimeout(this.timer);
+        this.stopped = true;
+        if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
     }
 }
 
@@ -80,6 +92,8 @@ export class SocketIOAlt {
     private _vfs?: VirtualFileSystem;
     private _eventEmitter = new EventEmitter();
     private watchConfigurationsDisposable;
+    private disposed = false;
+    private connectionTimer?: NodeJS.Timeout;
 
     private vfsRefreshTask: SyncTimer;
     private vfsLocalVersion?: number;
@@ -87,7 +101,7 @@ export class SocketIOAlt {
     private connectedUsers: UpdateUserSchema[] = [];
 
     private msgRefreshTask: SyncTimer;
-    private msgCache?: string[];
+    private msgCache?: Set<string>;
 
     constructor(
                 private readonly url:string,
@@ -96,11 +110,18 @@ export class SocketIOAlt {
                 private readonly projectId:string,
                 private readonly record: Promise<ProjectEntity>,
     ) {
-        setTimeout(async () => {
-            this._eventEmitter.emit('connect');
-            this._eventEmitter.emit('connectionAccepted', undefined, '');
-            this._eventEmitter.emit('joinProjectResponse', '', await this.record);
+        this.connectionTimer = setTimeout(async () => {
+            this.connectionTimer = undefined;
+            try {
+                const project = await this.record;
+                this.publish('connect');
+                this.publish('connectionAccepted', undefined, '');
+                this.publish('joinProjectResponse', '', project);
+            } catch (error) {
+                this.publish('error', error);
+            }
         }, 10);
+        this.connectionTimer.unref?.();
 
         this.vfsRefreshTask = new SyncTimer(this.historyRefreshInterval, this.refreshVFS.bind(this));
         this.msgRefreshTask = new SyncTimer(this.messageRefreshInterval, this.refreshMessages.bind(this));
@@ -144,14 +165,18 @@ export class SocketIOAlt {
     }
 
     private async refreshVFS() {
+        if (this.disposed) { return; }
         const vfs = await this.vfs;
+        if (this.disposed) { return; }
         const latestVersion = await vfs.getCurrentVersion();
+        if (this.disposed) { return; }
         if (this.vfsLocalVersion===undefined) { this.vfsLocalVersion = latestVersion; }
         if (latestVersion===this.vfsLocalVersion) { return; }
 
         const activeUsers = [];
         const diffs = (await vfs.getFileTreeDiff(this.vfsLocalVersion, latestVersion))?.diff;
         for (const diff of diffs || []) {
+            if (this.disposed) { return; }
             if (diff.operation===undefined) { continue; }
 
             // resolve entityId
@@ -164,6 +189,7 @@ export class SocketIOAlt {
                 console.error(error);
             }
 
+            if (this.disposed) { return; }
             // handle vfs update
             switch (diff.operation) {
                 case 'added':
@@ -173,7 +199,7 @@ export class SocketIOAlt {
                         pathParts.slice(0, pathParts.length-1).join('/'),
                         pathParts[pathParts.length-1] ];
                     const parentFolderId = (await vfs._resolveUri(vfs.pathToUri(parentFolder))).fileId;
-                    this._eventEmitter.emit('reciveNewDoc', parentFolderId, {
+                    this.publish('reciveNewDoc', parentFolderId, {
                         _id: this.randomEntityId,
                         name,
                         type: 'doc',
@@ -182,7 +208,7 @@ export class SocketIOAlt {
                     break;
                 case 'removed':
                     if (entityId===undefined) { break; }
-                    this._eventEmitter.emit('removeEntity', entityId);
+                    this.publish('removeEntity', entityId);
                     break;
                 case 'renamed':
                     if (entityId===undefined) { break; }
@@ -197,9 +223,9 @@ export class SocketIOAlt {
                     // notify rename or move
                     if (oldParentPath!==newParentPath) {
                         const newParentFolderId = (await vfs._resolveUri(vfs.pathToUri(newParentPath))).fileId;
-                        this._eventEmitter.emit('reciveEntityMove', entityId, newParentFolderId);
+                        this.publish('reciveEntityMove', entityId, newParentFolderId);
                     } else {
-                        this._eventEmitter.emit('reciveEntityRename', entityId, newName);
+                        this.publish('reciveEntityRename', entityId, newName);
                     }
                     break;
                 case 'edited':
@@ -209,16 +235,20 @@ export class SocketIOAlt {
                     const _uri = vfs.pathToUri(pathname);
                     const _doc = vscode.workspace.textDocuments.find(doc => doc.uri.toString()===_uri.toString());
                     if (_doc && _doc.isDirty) { await _doc.save(); }
+                    if (this.disposed) { return; }
                     // generate patch and apply locally
                     const vfsLocalVersion = this.vfsLocalVersion!;
                     const dmp = new DiffMatchPatch();
                     const localContent = new TextDecoder().decode( await vfs.openFile(_uri) );
+                    if (this.disposed) { return; }
                     const baseRemoteContent = (await vfs.getFileDiff(pathname, vfsLocalVersion, vfsLocalVersion))?.diff[0].u;
+                    if (this.disposed) { return; }
                     const latestRemoteContent = (await vfs.getFileDiff(pathname, latestVersion, latestVersion))?.diff[0].u;
+                    if (this.disposed) { return; }
                     if (baseRemoteContent!==undefined && latestRemoteContent!==undefined) {
                         const patch = dmp.patch_make(baseRemoteContent, latestRemoteContent);
                         const [localContentPatched, _] = dmp.patch_apply(patch, localContent);
-                        this._eventEmitter.emit('otUpdateApplied', {
+                        this.publish('otUpdateApplied', {
                             doc: entityId,
                             v: (entity as DocumentEntity).version, //bypass update check
                             op: [
@@ -230,6 +260,7 @@ export class SocketIOAlt {
                     // fetch active users
                     let row = 0, column = 0;
                     const remoteDiffs = (await vfs.getFileDiff(pathname, vfsLocalVersion, latestVersion))?.diff;
+                    if (this.disposed) { return; }
                     for (const diff of remoteDiffs || []) {
                         const end_ts = diff.meta?.end_ts || Date.now();
                         const diffText = (diff?.i || diff?.u || '').split('\n');
@@ -259,13 +290,13 @@ export class SocketIOAlt {
         }
         // notify user update/disconnected
         activeUsers.forEach(user => {
-            this._eventEmitter.emit('clientTracking.clientUpdated', user);
+            this.publish('clientTracking.clientUpdated', user);
         });
         this.connectedUsers = this.connectedUsers.filter(user => {
             const DisconnectionTimeout = vscode.workspace.getConfiguration(ROOT_NAME).get<number>(keyInactiveTimeout, 180) * 1000;//ms
             const isDisconnected = Date.now() - (user.last_updated_at||Date.now()) > DisconnectionTimeout;
             if (isDisconnected) {
-                this._eventEmitter.emit('clientTracking.clientDisconnected', user.id);
+                this.publish('clientTracking.clientDisconnected', user.id);
             }
             return !isDisconnected;
         });
@@ -274,32 +305,18 @@ export class SocketIOAlt {
     }
 
     private async refreshMessages() {
-        if (this.msgCache===undefined) {
-            this.msgCache = (await this.api.getMessages(this.identity, this.projectId)).messages?.map(m => m.id);
-        } else {
-            let fetchNum = 2;
-            let lastOldMessageId:string|undefined;
-            let newMessages:ProjectMessageResponseSchema[]|undefined;
-            // fetch messages until the last old message is found
-            do {
-                newMessages = (await this.api.getMessages(this.identity, this.projectId, fetchNum)).messages;
-                const newMessageIds = newMessages?.map(m => m.id);
-                lastOldMessageId = newMessageIds?.find(id => this.msgCache?.includes(id));
-                if (lastOldMessageId===undefined) {
-                    fetchNum += 2;
-                    continue;
-                } else {
-                    this.msgCache = newMessageIds;
-                    break;
-                }
-            } while(true);
-            // notify new messages
-            const lastOldMessageIndex = newMessages?.findIndex(m => m.id===lastOldMessageId);
-            if (lastOldMessageIndex!==undefined && lastOldMessageIndex!==-1) {
-                const notifyMessages = newMessages?.slice(0, lastOldMessageIndex);
-                notifyMessages?.reverse().forEach(m => this._eventEmitter.emit('new-chat-message', m));
-            }
+        if (this.disposed) { return; }
+        // Reconcile the same bounded window used by the chat view. Searching for a
+        // formerly known ID never terminates when those messages have been deleted.
+        const messages = (await this.api.getMessages(this.identity, this.projectId, 50)).messages;
+        if (this.disposed || !messages) { return; }
+        const previous = this.msgCache;
+        this.msgCache = new Set(messages.map(message => message.id));
+        if (previous) {
+            [...messages].reverse().filter(message => !previous.has(message.id))
+                .forEach(message => this.publish('new-chat-message', message));
         }
+        this.publish('chat-messages-refreshed', messages);
     }
 
     get unSyncedChanges(): number {
@@ -327,9 +344,9 @@ export class SocketIOAlt {
                     const fileEntity = (await this.api.uploadFile(this.identity, this.projectId, parentFolderId, filename, fileContent)).entity!;
                     // update local entityId
                     if (fileEntity._type==='doc') {
-                        this._eventEmitter.emit('reciveNewDoc', parentFolderId, fileEntity);
+                        this.publish('reciveNewDoc', parentFolderId, fileEntity);
                     } else if (fileEntity._type==='file') {
-                        this._eventEmitter.emit('reciveNewFile', parentFolderId, fileEntity);
+                        this.publish('reciveNewFile', parentFolderId, fileEntity);
                     }
                     delete this.localChangesPath[path];
                 } catch (error) {
@@ -345,15 +362,20 @@ export class SocketIOAlt {
     }
 
     disconnect() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        if (this.connectionTimer) { clearTimeout(this.connectionTimer); this.connectionTimer = undefined; }
         this.watchConfigurationsDisposable.dispose();
         this.vfsRefreshTask.stop();
         this.msgRefreshTask.stop();
         this._eventEmitter.emit('disconnect');
+        this._eventEmitter.removeAllListeners();
     }
 
     emit(event: string, ...parameters: any): void {
         const args = parameters.slice(0, parameters.length - 1);
         const callback: EmitCallbackType = parameters[parameters.length - 1];
+        if (this.disposed) { callback(new Error('Alternative connection is closed')); return; }
 
         switch (event as keyof EmitEventsSupport) {
             case 'joinProject':
@@ -406,7 +428,19 @@ export class SocketIOAlt {
         }
     }
 
+    private publish(event: string, ...args: any[]) {
+        if (!this.disposed) { this._eventEmitter.emit(event, ...args); }
+    }
+
     on<T extends keyof ListenEventsSupport>(event: T, handler: (arg: ListenEventsSupport[T]) => void): void {
-        this._eventEmitter.on(event, handler);
+        if (!this.disposed) { this._eventEmitter.on(event, handler); }
+    }
+
+    removeListener(event: string, handler: (...args: any[]) => void): void {
+        this._eventEmitter.removeListener(event, handler);
+    }
+
+    removeAllListeners(): void {
+        this._eventEmitter.removeAllListeners();
     }
 }

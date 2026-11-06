@@ -68,6 +68,9 @@ class FakeConnection {
         return this;
     }
     removeAllListeners() { this.handlers.clear(); }
+    removeListener(event: string, fn: (...args: any[]) => void) {
+        this.handlers.set(event, (this.handlers.get(event) ?? []).filter(listener => listener !== fn));
+    }
     disconnect() { this.closed = true; }
     emit = (event: string, ...args: any[]) => {
         const ack = typeof args[args.length - 1] === 'function' ? args.pop() : undefined;
@@ -255,6 +258,96 @@ describe('a lost connection to Overleaf', () => {
         await start(); // the v1 scheme was rejected, so the v2 socket is a new one
         assert.strictEqual(server.current.handlers.get('reciveNewFile')?.length, 1);
     });
+
+    it('marks unopened remote document edits and file-tree changes for the next automatic compile', async () => {
+        const { vfs } = await start();
+        let compiles = 0;
+        vfs.api.compile = async () => { compiles++; return { type: 'success', compile: { status: 'failure', outputFiles: [] } }; };
+        vfs.isDirty = false;
+        server.current.fire('otUpdateApplied', { doc: 'doc1', v: 1, op: [{ p: 0, i: 'remote ' }] });
+        assert.strictEqual(vfs.root.rootFolder[0].docs[0].remoteCache, undefined, 'the unopened document has no text cache');
+        await vfs.compile();
+        assert.strictEqual(compiles, 1, 'the real edit is not discarded with the absent text cache');
+        vfs.isDirty = false;
+        server.current.fire('reciveEntityRename', 'doc1', 'renamed.tex');
+        await vfs.compile();
+        assert.strictEqual(compiles, 2, 'a file-tree edit also invalidates the compiled source');
+    });
+
+    it('shares account dictionary changes across projects and ignores a pre-mutation settings response', async () => {
+        const {vfs:first} = await start();
+        const second = new VirtualFileSystem(context, new FakeUri('overleaf-workshop','www.overleaf.com','/Other','user=u1&project=p2'),()=>{});
+        vfss.push(second); await second.init();
+        let resolve!: (value:any)=>void; let began!: ()=>void;
+        const started = new Promise<void>(done=>{began=done;});
+        const old = new Promise<any>(done=>{resolve=done;});
+        second.api.getProjectSettings = () => { began(); return old; };
+        first.api.spellingControllerLearn = async () => ({type:'success'});
+        first.api.spellingControllerUnlearn = async () => ({type:'success'});
+        const refreshing = second.refreshSettings(); await started;
+        assert.strictEqual(await first.spellLearn('sharedword'),true);
+        assert.deepStrictEqual(second.getDictionary(),['sharedword']);
+        resolve({type:'success',settings:{learnedWords:[],languages:[],compilers:[]}}); await refreshing;
+        assert.deepStrictEqual(second.getDictionary(),['sharedword']);
+        await first.spellUnlearn('sharedword');
+        assert.deepStrictEqual(second.getDictionary(),[]);
+    });
+
+    it('keeps renamed project routing stable, updates access state and stops on revocation', async () => {
+        const {vfs,docUri} = await start();
+        const original = docUri.toString();
+        server.current.fire('projectNameUpdated','Renamed elsewhere');
+        assert.strictEqual(vfs.projectName,'Renamed elsewhere');
+        assert.strictEqual(vfs.pathToUri('main.tex').toString(),original);
+        server.current.fire('project:publicAccessLevel:changed',{newAccessLevel:'tokenBased'});
+        assert.strictEqual(vfs.root.publicAccessLevel,'tokenBased');
+        server.current.fire('project:access:revoked');
+        assert.strictEqual(vfs.connected,false);
+        assert.strictEqual(server.current.closed,true);
+        await assert.rejects(vfs.init(),/revoked|closed/);
+    });
+
+    it('keeps this session main document until rejoin while adopting compiler and language events', async () => {
+        const {vfs} = await start();
+        server.current.fire('rootDocUpdated','another-main');
+        assert.strictEqual(vfs.root.rootDoc_id,'doc1');
+        server.current.fire('compilerUpdated','xelatex');
+        server.current.fire('spellCheckLanguageUpdated','fr');
+        assert.strictEqual(vfs.root.compiler,'xelatex');
+        assert.strictEqual(vfs.root.spellCheckLanguage,'fr');
+        const tree = server.tree.bind(server);
+        server.tree = () => ({...tree(),rootDoc_id:'another-main'});
+        server.drop(true); server.reachable = true;
+        await vfs.init();
+        assert.strictEqual(vfs.root.rootDoc_id,'another-main');
+    });
+
+    it('does not apply a settings response to a replacement or disposed project session', async () => {
+        for (const end of ['rejoin','dispose']) {
+            const {vfs} = await start();
+            let answer!: (value:any)=>void; let began!: ()=>void;
+            const started = new Promise<void>(resolve=>{began=resolve;});
+            const response = new Promise<any>(resolve=>{answer=resolve;});
+            vfs.api.updateProjectSettings = () => { began(); return response; };
+            const pending = vfs.updateSettings({compiler:'obsolete',spellCheckLanguage:'fr',rootDocId:'old-choice'});
+            try {
+                await started;
+                if (end === 'rejoin') {
+                    server.drop(true); server.reachable = true; await vfs.init();
+                } else { vfs.dispose(); }
+                answer({type:'success'});
+                assert.strictEqual(await pending,false);
+                if (end === 'rejoin') {
+                    assert.strictEqual(vfs.root.compiler,'pdflatex');
+                    assert.strictEqual(vfs.root.rootDoc_id,'doc1');
+                }
+            } finally {
+                answer({type:'success'});
+                await pending.catch(()=>{});
+                vfs.dispose();
+            }
+        }
+    });
 });
 
 describe('SocketIOAPI', () => {
@@ -306,5 +399,66 @@ describe('SocketIOAPI', () => {
         server.current.alive = false;
         await assert.rejects(socket.getConnectedUsers(), /timed out/);
         assert.deepStrictEqual(problems, ['\'clientTracking.getConnectedUsers\' got no answer within 100 ms']);
+    });
+
+    it('removes session listeners permanently, including across a replacement socket', async () => {
+        const { socket } = await joined();
+        const seen: string[] = [];
+        const owned = socket.updateEventHandlers({ onReceivedMessage: (message: any) => seen.push(message.id) });
+        server.current.fire('new-chat-message', { id: 'first' });
+        assert.deepStrictEqual(seen, ['first']);
+        assert.ok(owned && typeof owned.dispose === 'function', 'the subscriber owns an unsubscribe handle');
+        owned.dispose();
+        server.current.fire('new-chat-message', { id: 'late' });
+        socket.init();
+        await socket.joinProject('p1');
+        server.current.fire('new-chat-message', { id: 'new-connection' });
+        assert.deepStrictEqual(seen, ['first']);
+        socket.dispose();
+    });
+
+    it('settles pending socket calls and releases their timers as soon as the owner is disposed', async () => {
+        const {socket} = await joined();
+        const timers = new Map<object,()=>void>();
+        const original = {setTimeout,clearTimeout};
+        (globalThis as any).setTimeout = (callback:()=>void) => { const id={}; timers.set(id,callback); return id; };
+        (globalThis as any).clearTimeout = (id:object) => { if (!timers.delete(id)) { original.clearTimeout(id as NodeJS.Timeout); } };
+        let observed: unknown; let pending: Promise<unknown> | undefined;
+        try {
+            server.current.alive = false;
+            pending = socket.getConnectedUsers().catch((error:unknown)=>{observed=error;});
+            socket.dispose(); await tick();
+            assert.match(String(observed),/closed|disposed/);
+            assert.strictEqual(timers.size,0);
+        } finally {
+            [...timers.values()].forEach(callback=>callback());
+            await pending;
+            Object.assign(globalThis,original);
+            socket.dispose();
+        }
+    });
+
+    it('delivers the supported metadata, chat and project events and current join permissions', async () => {
+        const { socket, project } = await joined();
+        const seen: unknown[] = [];
+        const handlers = socket.updateEventHandlers({
+            onMessageEdited: (message: any) => seen.push(['edit', message]),
+            onMessageDeleted: (message: any) => seen.push(['delete', message]),
+            onMetadataUpdated: (metadata: any) => seen.push(['metadata', metadata]),
+            onProjectNameUpdated: (name: string) => seen.push(['name', name]),
+            onProjectAccessRevoked: () => seen.push(['revoked']),
+        });
+        server.current.fire('edit-global-message', { messageId: 'm1', userId: 'u1', content: 'fixed' });
+        server.current.fire('delete-global-message', { messageId: 'm2', userId: 'u1' });
+        server.current.fire('broadcastDocMeta', { docId: 'doc1', meta: { packages: {} } });
+        server.current.fire('projectNameUpdated', 'Renamed');
+        server.current.fire('project:access:revoked');
+        assert.deepStrictEqual(seen, [
+            ['edit', { messageId: 'm1', userId: 'u1', content: 'fixed' }],
+            ['delete', { messageId: 'm2', userId: 'u1' }],
+            ['metadata', { docId: 'doc1', meta: { packages: {} } }], ['name', 'Renamed'], ['revoked'],
+        ]);
+        assert.strictEqual(project.permissionsLevel, 'owner');
+        handlers.dispose(); socket.dispose();
     });
 });
