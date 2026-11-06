@@ -1,9 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import vm from 'node:vm';
+import { pdfjsReleaseFolder } from '../viewer-protocol.mjs';
 import { installDeliveryObservation } from './delivery-observation.mjs';
 
-async function observation(engine = 'pdfjs') {
+const nativeViewer = fs.readFileSync(new URL('../../views/pdf-viewer/' + pdfjsReleaseFolder + '/web/viewer.mjs', import.meta.url), 'utf8');
+const initialViewStart = nativeViewer.indexOf('  setInitialView(storedHash, {');
+const initialViewEnd = nativeViewer.indexOf('\n  _cleanup()', initialViewStart);
+assert.ok(initialViewStart >= 0 && initialViewEnd > initialViewStart, 'use the pinned native application initial-view method');
+const nativeInitialView = nativeViewer.slice(initialViewStart, initialViewEnd);
+
+async function observation(engine = 'pdfjs', { pages = [1], spread = 0, zoom = 75, deferInitialView = false } = {}) {
     let now = 0, serial = 0, drawn;
     const frames = new Map(), timers = new Map(), documentEvents = new Map(), windowEvents = new Map(), pageEvents = new Map();
     const rectangle = { left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100 };
@@ -42,10 +50,15 @@ async function observation(engine = 'pdfjs') {
                     return { data };
                 } }) }),
         },
+        isValidRotation: value => Number.isInteger(value) && value % 90 === 0,
+        isValidScrollMode: value => Number.isInteger(value) && value >= 0 && value <= 3,
+        isValidSpreadMode: value => Number.isInteger(value) && value >= 0 && value <= 2,
+        ['DEFAULT_SCALE_VALUE']: 'auto',
         PDFViewerApplication: {
             initializedPromise: Promise.resolve(),
-            pdfDocument: { numPages: 1, hasExternalImages: true },
-            eventBus: { on: (name, callback) => pageEvents.set(name, callback) },
+            pdfDocument: { numPages: Math.max(...pages), hasExternalImages: true },
+            eventBus: { on: (name, callback) => pageEvents.set(name, callback),
+                off: (name, callback) => { if (pageEvents.get(name) === callback) { pageEvents.delete(name); } } },
             pdfViewer: { getPageView: index => index === 0 ? view : undefined, container: { getBoundingClientRect: () => rectangle } },
         },
         pdfPrefetch: { snapshot: () => ({}), setRobotsEnabled() {}, robotsEnabled: false },
@@ -55,16 +68,32 @@ async function observation(engine = 'pdfjs') {
     context.window = context;
     const application = context.PDFViewerApplication, viewer = application.pdfViewer;
     viewer.pdfDocument = application.pdfDocument; viewer.eventBus = application.eventBus;
+    application.pdfLinkService = { setHash(hash) {
+        const params = new URLSearchParams(hash);
+        viewer.currentPageNumber = Number(params.get('page'));
+        viewer.currentScaleValue = String(Number(params.get('zoom')) / 100);
+    } };
+    application.setInitialView = vm.runInContext('({' + nativeInitialView + '}).setInitialView', context);
+    const restoreInitialView = ({ page = 1, zoom = 125, spread = 0 } = {}) => {
+        // The extension restores its host position at pagesinit. The native app then
+        // applies its on-load modes and bookmark before dispatching documentinit.
+        viewer.currentPageNumber = page; viewer.currentScaleValue = String(zoom / 100);
+        viewer.spreadMode = spread;
+        application.initialBookmark = 'page=' + page + '&zoom=' + zoom;
+        application.setInitialView(null, { spreadMode: spread, scrollMode: 0 });
+        pageEvents.get('documentinit')?.({ source: application });
+    };
     if (engine === 'overleaf') {
         delete context.PDFViewerApplication;
         context.overleafViewer = { wrapper: { viewer, eventBus: viewer.eventBus } };
     }
-    vm.runInContext('(' + installDeliveryObservation.toString() + ')(' + JSON.stringify({ origin: 'https://reader.example', pages: [1],
-        spread: 0, budgetMs: 1000, robots: false, zoom: 75 }) + ')', context);
+    vm.runInContext('(' + installDeliveryObservation.toString() + ')(' + JSON.stringify({ origin: 'https://reader.example', pages,
+        spread, budgetMs: 1000, robots: false, zoom }) + ')', context);
     if (engine === 'pdfjs') vm.runInContext("document.dispatch('webviewerloaded', {detail:{source:window}})", context);
     else windowEvents.get('message')?.({ data: { type: 'initState' } });
     await Promise.resolve();
     pageEvents.get('pagesinit')();
+    if (engine === 'pdfjs' && !deferInitialView) { restoreInitialView(); }
     const render = (at, status = view.paintedImageStatus) => {
         now = at;
         status = { discovered: true, ...status };
@@ -72,9 +101,31 @@ async function observation(engine = 'pdfjs') {
         view.paintedImageRevision = status.revision;
         pageEvents.get('pagerendered')({ pageNumber: 1, imageStatus: status, imageRevision: status.revision });
     };
-    return { context, view, canvas, viewer, localStorage, sessionStorage, render, frames, timers, windowEvents,
+    return { context, view, canvas, viewer, localStorage, sessionStorage, render, frames, timers, windowEvents, pageEvents, restoreInitialView,
         api: context.__pdfDeliveryObservation };
 }
+
+test('requested PDF.js spread and pages survive native default and host restoration', async () => {
+    const h = await observation('pdfjs', { pages: [99, 100], spread: 1, zoom: 75, deferInitialView: true });
+    h.restoreInitialView({ page: 7, zoom: 125, spread: 0 });
+    assert.equal(h.viewer.spreadMode, 1, 'apply the requested spread after native setInitialView');
+    assert.equal(h.viewer.currentPageNumber, 99, 'the requested first page follows restored host position');
+    assert.equal(h.viewer.currentScaleValue, '0.75');
+    assert.equal(h.pageEvents.has('documentinit'), false, 'one completion releases the layout listener');
+    h.api.finish('test');
+    assert.equal(h.frames.size, 0); assert.equal(h.timers.size, 0);
+});
+
+test('finishing before native initialization leaves later host layout untouched', async () => {
+    const h = await observation('pdfjs', { pages: [99, 100], spread: 1, zoom: 75, deferInitialView: true });
+    h.api.finish('cancelled');
+    h.restoreInitialView({ page: 7, zoom: 125, spread: 0 });
+    assert.equal(h.viewer.spreadMode, 0);
+    assert.equal(h.viewer.currentPageNumber, 7);
+    assert.equal(h.viewer.currentScaleValue, '1.25');
+    assert.equal(h.pageEvents.has('documentinit'), false);
+    assert.equal(h.frames.size, 0); assert.equal(h.timers.size, 0);
+});
 
 test('measurement history is local to the tab while unrelated storage remains functional', async () => {
     const h = await observation();

@@ -18,6 +18,7 @@ export function installDeliveryObservation(options) {
     const started = performance.now(), pages = new Map(options.pages.map(page => [page, { page, renders: [] }]));
     const errors = [], events = [], frameTimes = [];
     let viewer, initializing = false, frame, timer, lastFrame, lastProbe = -Infinity, finished, finishedAt, waiting, sampledAt = 0;
+    let removeInitialViewListener;
     const scratch = document.createElement('canvas');
     scratch.width = scratch.height = 48;
     const context = scratch.getContext('2d', { willReadFrequently: true });
@@ -115,6 +116,7 @@ export function installDeliveryObservation(options) {
         const sorted = [...frameTimes].sort((a, b) => a - b);
         return { timeOrigin: performance.timeOrigin, started, elapsedMs: at(), finished,
             viewport: { width: innerWidth, height: innerHeight, dpr: devicePixelRatio }, robotsEnabled: window.pdfPrefetch?.robotsEnabled,
+            layout: viewer ? { page: viewer.currentPageNumber, spread: viewer.spreadMode, scale: viewer.currentScaleValue, rotation: viewer.pagesRotation } : null,
             pages: [...pages.values()].map(value => ({ ...value, renders: [...value.renders] })),
             events: [...events], errors: [...errors],
             frames: { count: sorted.length, p95Ms: sorted[Math.floor((sorted.length - 1) * .95)] ?? null,
@@ -133,6 +135,7 @@ export function installDeliveryObservation(options) {
         finished = reason;
         cancelAnimationFrame(frame); clearTimeout(timer);
         removeStartupListeners();
+        removeInitialViewListener?.();
         try { observe(); } catch (error) { errors.push({ at: at(), message: String(error) }); }
         waiting?.();
     }
@@ -152,17 +155,32 @@ export function installDeliveryObservation(options) {
             viewer = application?.pdfViewer ?? component?.wrapper?.viewer;
             if (!viewer?.eventBus) throw new Error('Native delivery viewer is unavailable');
             removeStartupListeners();
+            const applyInitialView = () => {
+                if (finished) { return; }
+                viewer.spreadMode = options.spread;
+                viewer.pagesRotation = 0;
+                if (Number.isFinite(options.zoom)) { viewer.currentScaleValue = String(options.zoom / 100); }
+                viewer.currentPageNumber = options.pages[0];
+                mark('view-initialized', viewer.currentPageNumber, { spread: viewer.spreadMode, scale: viewer.currentScaleValue });
+            };
+            if (application) {
+                // The full app restores host/default modes after pagesinit. Its native
+                // documentinit event follows setInitialView, so apply the requested view then.
+                const initialized = event => {
+                    if (event.source !== application) { return; }
+                    removeInitialViewListener();
+                    applyInitialView();
+                };
+                removeInitialViewListener = () => viewer.eventBus.off('documentinit', initialized);
+                viewer.eventBus.on('documentinit', initialized);
+            }
             viewer.eventBus.on('pagesinit', () => {
+                if (finished) { return; }
                 if (options.pages.some(page => page > viewer.pdfDocument.numPages)) {
                     errors.push({ at: at(), message: 'A requested page is outside the loaded document' });
                     finish('page-range-error'); return;
                 }
-                viewer.spreadMode = options.spread;
-                viewer.pagesRotation = 0;
-                if (component && !application) {
-                    if (Number.isFinite(options.zoom)) viewer.currentScaleValue = String(options.zoom / 100);
-                    viewer.currentPageNumber = options.pages[0];
-                }
+                if (!application) { applyInitialView(); }
                 window.pdfPrefetch?.setRobotsEnabled(options.robots);
                 mark('pages-init');
             });
