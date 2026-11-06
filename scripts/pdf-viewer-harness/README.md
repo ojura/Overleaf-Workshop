@@ -40,8 +40,12 @@ rendering. `--robots on` includes the delivery effects; pixel observations then 
 content canvases beneath any delivery covers. The default fixed duration measures total
 transfer and subsequent prefetch as well as first content. `--finish-on-render` ends after
 each selected page has completed a native pass. `--finish-on-final` instead waits for final
-image quality. Progressive results record the first painted photo, complete usable-photo
-coverage after operator discovery, and final native quality separately. The output keeps failed
+image quality. Progressive results record the first native page pass containing image data,
+complete page image coverage after operator discovery, and final native quality separately.
+These are page-wide composition milestones; an image may be outside the visible crop. Each
+milestone records `pageFullyVisible`, so whole-spread image comparisons can require the entire
+selected canvas to be visible. Visible content pixels and selectable text have separate timings.
+The output keeps failed
 and partially received transfers, with separate totals for original PDF bytes, reading layout,
 reading images, reading manifest, raster previews and application assets. Completed transfer
 totals include response headers; `bodyBytes` counts received body data.
@@ -49,7 +53,10 @@ totals include response headers; `bodyBytes` counts received body data.
 The runner uses the same sparse native capture as the Motion Lab scenarios so an emulated
 background viewport continues rendering normally. Its result records the actual CSS viewport,
 DPR, frame cadence and capture acknowledgments. An optional PNG failure retains the timings
-and network result and makes the command fail. Use the same edition, viewport, network
+and network result and makes the command fail. An unexpected CSS viewport or DPR also fails.
+For a local staging origin with remembered browser zoom, supply the existing helper's exact
+`--zoom-helper-target` as described below; the runner changes and restores only its owned tab.
+Use the same edition, viewport, network
 conditions, robot setting and duration for before/after comparisons.
 
 `--canvases /absolute/path/page-canvases` also saves the selected native page canvases as PNGs

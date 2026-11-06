@@ -50,6 +50,12 @@ export function installDeliveryObservation(options) {
         }
         return false;
     };
+    const fullyPresented = (canvas, container) => {
+        if (!presented(canvas, container)) return false;
+        const box = canvas.getBoundingClientRect(), clip = container.getBoundingClientRect();
+        return box.left >= Math.max(clip.left, 0) - .5 && box.top >= Math.max(clip.top, 0) - .5
+            && box.right <= Math.min(clip.right, innerWidth) + .5 && box.bottom <= Math.min(clip.bottom, innerHeight) + .5;
+    };
     function observe() {
         if (!app?.pdfViewer) return;
         const viewer = app.pdfViewer;
@@ -59,6 +65,7 @@ export function installDeliveryObservation(options) {
             const preview = view.div.querySelector(':scope > canvas.pdfPrefetchPreview');
             const previewPixels = hasPixels(preview, viewer.container);
             const nativePixels = hasPixels(view.canvas, viewer.container);
+            const pageFullyVisible = fullyPresented(view.canvas, viewer.container);
             const imageStatus = view.paintedImageStatus;
             if (previewPixels && result.firstPreviewMs === undefined) {
                 result.firstPreviewMs = at(); mark('preview-pixels', number);
@@ -68,14 +75,14 @@ export function installDeliveryObservation(options) {
             }
             if ((previewPixels || nativePixels) && result.firstPixelsMs === undefined) result.firstPixelsMs = at();
             if (nativePixels && imageStatus) {
-                if (imageStatus.covered > 0 && result.firstImagePixelsMs === undefined) {
-                    result.firstImagePixelsMs = at(); mark('image-pixels', number, { ...imageStatus });
+                if (imageStatus.covered > 0 && result.firstPageImagePaintMs === undefined) {
+                    result.firstPageImagePaintMs = at(); mark('page-image-paint', number, { ...imageStatus, pageFullyVisible });
                 }
-                if (imageStatus.discovered && imageStatus.total > 0 && imageStatus.covered === imageStatus.total && result.firstCompleteImageCoverageMs === undefined) {
-                    result.firstCompleteImageCoverageMs = at(); mark('complete-image-coverage', number, { ...imageStatus });
+                if (imageStatus.discovered && imageStatus.total > 0 && imageStatus.covered === imageStatus.total && result.firstCompletePageImagePaintMs === undefined) {
+                    result.firstCompletePageImagePaintMs = at(); mark('complete-page-image-paint', number, { ...imageStatus, pageFullyVisible });
                 }
-                if (imageStatus.final && imageStatus.failed === 0 && result.firstFinalQualityMs === undefined) {
-                    result.firstFinalQualityMs = at(); mark('final-image-quality', number, { ...imageStatus });
+                if (imageStatus.final && imageStatus.failed === 0 && result.firstFinalPagePaintMs === undefined) {
+                    result.firstFinalPagePaintMs = at(); mark('final-page-paint', number, { ...imageStatus, pageFullyVisible });
                 }
             }
             const spans = [...view.div.querySelectorAll('.textLayer span')].filter(node => node.textContent?.trim());
@@ -90,7 +97,7 @@ export function installDeliveryObservation(options) {
             }
             Object.assign(result, { textCharacters, renderingState: view.renderingState,
                 nativePresented: presented(view.canvas, viewer.container), previewPresented: presented(preview, viewer.container),
-                nativePixels, previewPixels, nativeWidth: view.canvas?.width ?? 0, nativeHeight: view.canvas?.height ?? 0,
+                nativePixels, previewPixels, pageFullyVisible, nativeWidth: view.canvas?.width ?? 0, nativeHeight: view.canvas?.height ?? 0,
                 paintedImageRevision: view.paintedImageRevision ?? null, paintedImageStatus: imageStatus ? { ...imageStatus } : null });
         }
     }

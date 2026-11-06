@@ -34,11 +34,13 @@ test('byte accounting uses the completed transfer once and retains cancelled par
 for (const scenario of [
     { name: 'a failed optional screenshot retains measured pages and closes the owned target', mode: 'screenshot' },
     { name: 'a final-quality deadline keeps its partial measurement and fails the requested completion', mode: 'final' },
+    { name: 'an unexpected CSS viewport or browser zoom fails the comparison and retains its observation', mode: 'viewport' },
 ]) test(scenario.name, async t => {
     const calls = [];
     const sample = { finished: 'measurement-budget', elapsedMs: 60000,
         pages: [{ page: 99, firstPixelsMs: 300, firstSelectableTextMs: 1200 }],
-        frames: { count: 100, p95Ms: 17 }, viewport: { width: 1400, height: 1000 }, document: { pages: 460, notice: null }, errors: [] };
+        frames: { count: 100, p95Ms: 17 }, viewport: { width: 1400, height: 1000, dpr: 1 }, document: { pages: 460, notice: null }, errors: [] };
+    if (scenario.mode === 'viewport') sample.viewport = { width: 1120, height: 800, dpr: 1.25 };
     const server = http.createServer(async (request, response) => {
         const chunks = [];
         for await (const chunk of request) chunks.push(chunk);
@@ -65,7 +67,7 @@ for (const scenario of [
     const child = spawn(process.execPath, [fileURLToPath(new URL('./delivery-scenes.mjs', import.meta.url)),
         '--daemon', 'http://127.0.0.1:' + server.address().port, '--url', 'https://reader.example/book/',
         '--pages', '99', '--json', destination,
-        ...(scenario.mode === 'screenshot' ? ['--screenshot', path.join(directory, 'view.png')] : ['--finish-on-final'])],
+        ...(scenario.mode === 'screenshot' ? ['--screenshot', path.join(directory, 'view.png')] : scenario.mode === 'final' ? ['--finish-on-final'] : [])],
     { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     child.stdout.on('data', data => { stdout += data; });
@@ -75,7 +77,7 @@ for (const scenario of [
     const result = JSON.parse(await fs.readFile(destination, 'utf8'));
     assert.deepEqual(result.observation?.pages, sample.pages, stdout);
     assert.ok(result.failures.some(failure => scenario.mode === 'screenshot'
-        ? /screenshot/i.test(JSON.stringify(failure)) : failure.kind === 'completion'));
+        ? /screenshot/i.test(JSON.stringify(failure)) : failure.kind === (scenario.mode === 'final' ? 'completion' : 'viewport')));
     assert.ok(calls.some(call => call.route === '/release' && call.sessionId === 'measurement-session'));
     assert.ok(calls.some(call => call.method === 'Target.detachFromTarget' && call.params.sessionId === 'measurement-session'));
     assert.ok(calls.some(call => call.method === 'Target.closeTarget' && call.params.targetId === 'measurement-target'));

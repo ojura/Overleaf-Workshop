@@ -88,18 +88,18 @@ test('text, usable photo coverage and final image quality are independent painte
     let page = h.api.snapshot().pages[0];
     assert.equal(page.firstSelectableTextMs, 10);
     assert.equal(page.firstNativePixelsMs, 10);
-    assert.equal(page.firstImagePixelsMs, undefined);
+    assert.equal(page.firstPageImagePaintMs, undefined);
     assert.throws(() => h.api.captureCanvases(), /final image quality/);
     h.render(20, { pending: 2, completed: 0, failed: 0, revision: 1, total: 2, covered: 1, final: false });
     h.render(30, { pending: 2, completed: 0, failed: 0, revision: 2, total: 2, covered: 2, final: false });
     page = h.api.snapshot().pages[0];
-    assert.equal(page.firstImagePixelsMs, 20);
-    assert.equal(page.firstCompleteImageCoverageMs, 30);
-    assert.equal(page.firstFinalQualityMs, undefined);
+    assert.equal(page.firstPageImagePaintMs, 20);
+    assert.equal(page.firstCompletePageImagePaintMs, 30);
+    assert.equal(page.firstFinalPagePaintMs, undefined);
     assert.throws(() => h.api.captureCanvases(), /final image quality/);
     h.render(40, { pending: 0, completed: 2, failed: 0, revision: 3, total: 2, covered: 2, final: true });
     page = h.api.snapshot().pages[0];
-    assert.equal(page.firstFinalQualityMs, 40);
+    assert.equal(page.firstFinalPagePaintMs, 40);
     assert.equal(page.renders[0].imageStatus.covered, 0);
     assert.equal(h.api.captureCanvases()[0].width, 100);
     h.api.finish('test');
@@ -111,10 +111,10 @@ test('text, usable photo coverage and final image quality are independent painte
 test('complete photo coverage requires completed operator discovery', async () => {
     const h = await observation();
     h.render(10, { pending: 1, completed: 0, failed: 0, revision: 1, total: 1, covered: 1, final: false, discovered: false });
-    assert.equal(h.api.snapshot().pages[0].firstImagePixelsMs, 10);
-    assert.equal(h.api.snapshot().pages[0].firstCompleteImageCoverageMs, undefined);
+    assert.equal(h.api.snapshot().pages[0].firstPageImagePaintMs, 10);
+    assert.equal(h.api.snapshot().pages[0].firstCompletePageImagePaintMs, undefined);
     h.render(20, { pending: 2, completed: 0, failed: 0, revision: 2, total: 2, covered: 2, final: false, discovered: true });
-    assert.equal(h.api.snapshot().pages[0].firstCompleteImageCoverageMs, 20);
+    assert.equal(h.api.snapshot().pages[0].firstCompletePageImagePaintMs, 20);
     h.api.finish('test');
 });
 
@@ -132,6 +132,25 @@ test('allocated, disconnected and hidden image canvases do not count as displaye
     assert.equal(h.api.snapshot().pages[0].firstPixelsMs, undefined);
     h.canvas.style.visibility = 'visible';
     h.render(40, status);
-    assert.equal(h.api.snapshot().pages[0].firstImagePixelsMs, 40);
+    assert.equal(h.api.snapshot().pages[0].firstPageImagePaintMs, 40);
+    h.api.finish('test');
+});
+
+test('page-wide image milestones retain whether the whole page was actually visible', async () => {
+    const h = await observation();
+    const whole = h.canvas.getBoundingClientRect();
+    h.canvas.getBoundingClientRect = () => ({ ...whole, bottom: 200, height: 200 });
+    h.render(10, { pending: 0, completed: 2, failed: 0, revision: 1, total: 2, covered: 2, final: true });
+    let result = h.api.snapshot();
+    assert.equal(result.pages[0].pageFullyVisible, false);
+    const milestones = result.events.filter(event => event.type.endsWith('paint'));
+    assert.equal(milestones.length, 3);
+    assert.ok(milestones.every(event => event.pageFullyVisible === false));
+    h.canvas.getBoundingClientRect = () => whole;
+    h.render(20, { pending: 0, completed: 2, failed: 0, revision: 2, total: 2, covered: 2, final: true });
+    result = h.api.snapshot();
+    assert.equal(result.pages[0].pageFullyVisible, true);
+    assert.equal(result.pages[0].firstPageImagePaintMs, 10);
+    assert.ok(result.events.filter(event => event.type.endsWith('paint')).every(event => event.pageFullyVisible === false));
     h.api.finish('test');
 });
