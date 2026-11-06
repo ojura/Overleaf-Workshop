@@ -96,10 +96,11 @@ describe('native external-image PDF passes', function () {
         }
         return images;
     }
-    function encoded(id: string, chunkIndex: number) {
+    function encoded(id: string, chunkIndex: number, chunkCount = 1) {
         if (id === 'x7') { return new Uint8Array(deflateSync(new Uint8Array([0, 90, 180, 255]))); }
-        const chunk = fixture.chunks[chunkIndex];
-        return progressive.slice(chunk.offset, chunk.offset + chunk.bytes);
+        const first = fixture.chunks[chunkIndex];
+        const last = fixture.chunks[chunkIndex + chunkCount - 1];
+        return progressive.slice(first.offset, last.offset + last.bytes);
     }
     class CanvasFactory {
         create(width: number, height: number) { const value = canvas.createCanvas(width, height); return { canvas: value, context: value.getContext('2d') }; }
@@ -126,7 +127,7 @@ describe('native external-image PDF passes', function () {
     it('paints native text and vector order before photo bytes, then refines the same clipped page to exact final pixels', async () => {
         const first = deferred(), rest = deferred();
         const reads: number[] = [];
-        const value = await open(async ({ id, chunkIndex }) => { reads.push(chunkIndex); await (chunkIndex ? rest.promise : first.promise); return encoded(id, chunkIndex); });
+        const value = await open(async ({ id, chunkIndex, chunkCount }) => { reads.push(chunkIndex); await (chunkIndex ? rest.promise : first.promise); return encoded(id, chunkIndex, chunkCount); });
         const originalDocument = await open();
         try {
             assert.strictEqual(value.document.hasExternalImages, true);
@@ -151,7 +152,7 @@ describe('native external-image PDF passes', function () {
             await Promise.all([final.task.promise, reference.task.promise]);
             assert.strictEqual(final.task.imageStatus.final, true);
             assert.deepStrictEqual(final.pixels(), reference.pixels(), 'the complete native operator list retains transform, clip, text and foreground vector order');
-            assert.strictEqual(reads.length, fixture.chunks.length, 'the original image body is never fetched alongside progressive chunks');
+            assert.deepStrictEqual(reads, [0, 1], 'the native bridge reads first coverage and one verified tail without the original image body');
             const stats = await value.document.getRangeCacheStats();
             assert.strictEqual(stats.externalImageEntropyCalls, fixture.chunks.length);
             assert.strictEqual(stats.externalImageFinalDecodes, 1);
@@ -164,10 +165,10 @@ describe('native external-image PDF passes', function () {
     it('reuses prepared coverage when a clipped candidate pass keeps the adopting viewport and output transform', async () => {
         const rest = deferred();
         const reads: number[] = [];
-        const value = await open(async ({ id, chunkIndex }) => {
+        const value = await open(async ({ id, chunkIndex, chunkCount }) => {
             reads.push(chunkIndex);
             if (chunkIndex) { await rest.promise; }
-            return encoded(id, chunkIndex);
+            return encoded(id, chunkIndex, chunkCount);
         });
         try {
             const viewport = value.page.getViewport({ scale: 2 });
@@ -196,7 +197,7 @@ describe('native external-image PDF passes', function () {
 
     it('keeps print unresolved until original-resolution native image completion', async () => {
         const ready = deferred(), release = deferred();
-        const value = await open(async ({ id, chunkIndex }) => { ready.resolve(); await release.promise; return encoded(id, chunkIndex); });
+        const value = await open(async ({ id, chunkIndex, chunkCount }) => { ready.resolve(); await release.promise; return encoded(id, chunkIndex, chunkCount); });
         try {
             const printed = render(value.page, 1, 'print');
             let completed = false;
@@ -211,7 +212,7 @@ describe('native external-image PDF passes', function () {
     });
 
     it('uses original filter and soft-mask semantics for unsupported incremental combinations', async () => {
-        const value = await open(async ({ id, chunkIndex }) => encoded(id, chunkIndex), true);
+        const value = await open(async ({ id, chunkIndex, chunkCount }) => encoded(id, chunkIndex, chunkCount), true);
         const reference = await open(undefined, true);
         try {
             const first = render(value.page); await first.task.promise;
@@ -226,11 +227,13 @@ describe('native external-image PDF passes', function () {
         } finally { await value.task.destroy(); await reference.task.destroy(); }
     });
 
-    it('acknowledges cancellation only after stream ownership releases and can rebuild the same displayed page', async () => {
+    for (const heldIndex of [0, 1]) {
+    it(`acknowledges cancellation of the ${heldIndex ? 'combined tail' : 'first scan'} before rebuilding the same displayed page`, async () => {
         const started = deferred();
-        let held = true, aborted = 0;
-        const value = await open(async ({ id, chunkIndex, signal }) => {
-            if (!held) { return encoded(id, chunkIndex); }
+        let held = true, aborted = 0, selectedCount = 0;
+        const value = await open(async ({ id, chunkIndex, chunkCount, signal }) => {
+            if (!held || chunkIndex !== heldIndex) { return encoded(id, chunkIndex, chunkCount); }
+            selectedCount = chunkCount;
             started.resolve();
             return new Promise<Uint8Array>((_resolve, reject) => {
                 signal.addEventListener('abort', () => { aborted++; reject(signal.reason); }, { once: true });
@@ -239,12 +242,15 @@ describe('native external-image PDF passes', function () {
         try {
             const initial = render(value.page); await initial.task.promise;
             await started.promise;
+            assert.strictEqual(selectedCount, heldIndex ? fixture.chunks.length - 1 : 1);
             await value.page.cancelImageRefinement();
             assert.strictEqual(aborted, 1);
             const empty = await value.document.getRangeCacheStats();
             assert.strictEqual(empty.externalImageReservedBytes, 0);
             assert.strictEqual(empty.externalImageEncodedBytes, 0);
             assert.strictEqual(empty.externalImageCoefficientBytes, 0);
+            assert.strictEqual(empty.externalImagePartialRasterBytes, 0);
+            assert.strictEqual(empty.externalImageNativeRasterBytes, 0);
             held = false;
             const next = render(value.page); await next.task.promise;
             await value.page.waitForImages({ final: true });
@@ -252,9 +258,10 @@ describe('native external-image PDF passes', function () {
             assert.strictEqual(final.task.imageStatus.final, true);
         } finally { await value.task.destroy(); }
     });
+    }
 
     it('rejects a corrupt verified scan without marking placeholder output final', async () => {
-        const value = await open(async ({ id, chunkIndex }) => { const bytes = encoded(id, chunkIndex); bytes[bytes.length - 1] ^= 1; return bytes; });
+        const value = await open(async ({ id, chunkIndex, chunkCount }) => { const bytes = encoded(id, chunkIndex, chunkCount); bytes[bytes.length - 1] ^= 1; return bytes; });
         try {
             const first = render(value.page); await first.task.promise;
             await assert.rejects(value.page.waitForImages({ final: true }), /failed to decode/);
@@ -269,7 +276,7 @@ describe('native external-image PDF passes', function () {
 
     it('reports an unresolved structural image identifier without leaving an unresolved drawing dependency', async () => {
         let reads = 0;
-        const value = await open(async ({ id, chunkIndex }) => { reads++; return encoded(id, chunkIndex); }, false, []);
+        const value = await open(async ({ id, chunkIndex, chunkCount }) => { reads++; return encoded(id, chunkIndex, chunkCount); }, false, []);
         try {
             await value.page.getOperatorList();
             assert.strictEqual(value.page.imageStatus.failed, 1);
@@ -324,8 +331,8 @@ describe('native external-image PDF passes', function () {
     it('finishes a shared Type3 image after its first page cancels and reuses it on the next page', async () => {
         const started = deferred(), release = deferred(), received = deferred<boolean>();
         const reads: number[] = [];
-        const value = await open(async ({ id, chunkIndex }) => {
-            reads.push(chunkIndex); started.resolve(); await release.promise; return encoded(id, chunkIndex);
+        const value = await open(async ({ id, chunkIndex, chunkCount }) => {
+            reads.push(chunkIndex); started.resolve(); await release.promise; return encoded(id, chunkIndex, chunkCount);
         }, false, metadata(), type3Pdf(true));
         const originalDocument = await open(undefined, false, metadata(), type3Pdf(false));
         const owner = value.page._externalImages, receive = owner.receive.bind(owner);
