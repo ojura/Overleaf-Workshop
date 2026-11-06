@@ -87,6 +87,57 @@ describe('mass-aware finite robot rescues', function () {
         assert.strictEqual(airborne.mass, 2);
     });
 
+    it('charges each casualty job once and debits a helper’s retained cargo before relocation', () => {
+        const options = { maxHelpers: 2, remainingMs: 3000, carriedGroup: ['lugv', 'hexapod'],
+            carriedCargo: [{ key: 'one-photo', mass: 1 }, { key: 'one-photo', mass: 1 }] };
+        const group = rescue.planRobotRescue(actor(0, 'lugv'), [actor(1, 'forklift')], options);
+        assert.strictEqual(group.kind, 'tow'); assert.strictEqual(group.mass, 4);
+        assert.strictEqual(group.operation.effort.phases[0].loads[0].demand, 4);
+        const empty = plan(actor(0, 'ekokomvoz'), [actor(1, 'rover')]);
+        assert.strictEqual(empty.kind, 'tow');
+        const loaded = plan(actor(0, 'ekokomvoz'), [{ ...actor(1, 'rover'),
+            commitments: [{ key: 'retained-photo', role: 'carry', load: 4.5 }] }]);
+        assert.strictEqual(loaded.kind, 'repair', 'the existing photograph retains its assigned share of the helper');
+        assert.strictEqual(rescue.planRobotRescue(actor(0, 'lugv'), [actor(1, 'forklift')], {
+            ...options, carriedCargo: [{ key: 'one-photo', mass: 1 }, { key: 'one-photo', mass: 2 }] }), undefined);
+    });
+
+    it('converts complete helper commitment windows over the actual rescue clock', () => {
+        const disabled = actor(0, 'lugv'), helper = actor(1, 'heavyquad');
+        const options = { maxHelpers: 1, remainingMs: 3000, startedAt: 100, operationKey: 'window-relocation' };
+        assert.strictEqual(rescue.planRobotRescue(disabled, [helper], options).kind, 'airlift');
+        const windows = (load: number) => [{ until: 500, commitments: [] },
+            { until: 1100, commitments: [{ key: 'handoff-photo', role: 'carry', load }] }];
+        const blocked = rescue.planRobotRescue(disabled, [{ ...helper, commitmentTimeline: windows(2.5) }], options);
+        assert.strictEqual(blocked.kind, 'repair', 'future assigned cargo is included before the rescue is admitted');
+        const available = rescue.planRobotRescue(disabled, [{ ...helper, commitmentTimeline: windows(1.5) }], options);
+        assert.strictEqual(available.kind, 'airlift');
+        const phases = available.operation.effort.phases;
+        assert.strictEqual(phases.length, 3);
+        assert.ok(Math.abs(phases[0].until - 400 / (2400 * 0.7)) < 1e-12);
+        assert.ok(Math.abs(phases[1].until - 1000 / (2400 * 0.7)) < 1e-12);
+        assert.strictEqual(phases[2].until, 1);
+        assert.ok(Math.abs(available.operation.effort.peakStrain - 2 / 3) < 1e-12);
+    });
+
+    it('gives an extreme positive-support tow the shared half-chance outcomes before repair fallback', () => {
+        for (const [seed, family] of [[150, 'expensive-success'], [1495, 'valiant-failure'], [4965, 'clean-triumph']] as const) {
+            const options = { maxHelpers: 1, remainingMs: 3000, startedAt: 40,
+                operationKey: 'job:bulky:relocation:ekokomvoz', seed, allowExceptional: true, target: { x: 22, y: 100 } };
+            const disabled = actor(1, 'ekokomvoz', 2, 100), helper = actor(2, 'lugv', 182, 100);
+            const value = rescue.planRobotRescue(disabled, [helper], options);
+            assert.strictEqual(value.kind, 'tow'); assert.strictEqual(value.operation.operatingMode, 'overreach');
+            assert.strictEqual(value.operation.effort.peakStrain, 10);
+            assert.strictEqual(value.operation.probabilities.fulfillment, 0.5);
+            assert.strictEqual(value.operation.outcome.family, family);
+            assert.deepStrictEqual(value.goal, { from: { x: 2, y: 100 }, target: { x: 22, y: 100 } });
+            const retry = rescue.planRobotRescue({ ...disabled, id: 81 }, [{ ...helper, id: 82 }], options);
+            assert.deepStrictEqual(retry.operation.decision, value.operation.decision);
+            assert.strictEqual(retry.operation.outcome.family, family);
+            assert.strictEqual(rescue.planRobotRescue(disabled, [helper], { ...options, allowExceptional: false }).kind, 'repair');
+        }
+    });
+
     it('rejects incomplete, malformed or oversized casualty groups instead of undercounting them', () => {
         const sparse = Array(2); sparse[0] = 'lugv';
         for (const group of [[], ['rover'], ['lugv', 'unknown'], sparse,

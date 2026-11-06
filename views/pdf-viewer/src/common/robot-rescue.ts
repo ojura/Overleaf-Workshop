@@ -1,26 +1,12 @@
 import type { RobotVehicle } from './prefetch-robots';
+import { ROBOT_CAPABILITIES, robotCapabilities, robotStructure, type RobotCapabilities } from './robot-structure';
+import { assessRobotOperation, commitRobotOperation, ROBOT_OPERATION_POLICY, type RobotCommitment, type RobotOperationSpec,
+    type RobotOperationPlan } from './robot-operations';
 
 export type RescueVehicle = RobotVehicle | 'ekokomvoz';
-interface Capability {
-    mobility: 'air' | 'ground';
-    mass: number;
-    lift: number;
-    tow: number;
-}
-
-/** Relative scene capabilities, deliberately without physical mass or payload units. */
-export const ROBOT_RESCUE_CAPABILITIES: Readonly<Record<RescueVehicle, Readonly<Capability>>> = Object.freeze({
-    quad: Object.freeze({ mobility: 'air', mass: 1, lift: 1, tow: 0 }),
-    heavyquad: Object.freeze({ mobility: 'air', mass: 3, lift: 3, tow: 0 }),
-    tiltwing: Object.freeze({ mobility: 'air', mass: 2, lift: 1, tow: 0 }),
-    rover: Object.freeze({ mobility: 'ground', mass: 9, lift: 0, tow: 10 }),
-    mecanum: Object.freeze({ mobility: 'ground', mass: 3, lift: 0, tow: 3 }),
-    forklift: Object.freeze({ mobility: 'ground', mass: 5, lift: 3, tow: 8 }),
-    hexapod: Object.freeze({ mobility: 'ground', mass: 2, lift: 0, tow: 2 }),
-    walker: Object.freeze({ mobility: 'ground', mass: 2, lift: 0, tow: 1 }),
-    lugv: Object.freeze({ mobility: 'ground', mass: 1, lift: 0, tow: 1 }),
-    ekokomvoz: Object.freeze({ mobility: 'ground', mass: 10, lift: 0, tow: 10 }),
-});
+type Capability = RobotCapabilities;
+/** Compatibility view of the shared, descriptor-derived capabilities. */
+export const ROBOT_RESCUE_CAPABILITIES = ROBOT_CAPABILITIES;
 
 export const ROBOT_RESCUE_POLICY = Object.freeze({
     maxHelpers: 2,
@@ -39,6 +25,10 @@ export interface RobotRescueActor {
     vehicle: RescueVehicle;
     x: number;
     y: number;
+    condition?: number;
+    commitments?: readonly RobotCommitment[];
+    /** Complete committed-load states with absolute end times, prepared by their existing activity owner. */
+    commitmentTimeline?: readonly { until: number; commitments: readonly RobotCommitment[] }[];
 }
 export interface RobotRescueOptions {
     maxHelpers: number;
@@ -46,6 +36,13 @@ export interface RobotRescueOptions {
     remainingMs: number;
     /** Complete rigid casualty group, including the disabled member. The caller excludes its members from helpers. */
     carriedGroup?: readonly RescueVehicle[];
+    /** Distinct attached jobs; repeated references from a cooperative casualty crew are charged once. */
+    carriedCargo?: readonly { key: string; mass: number }[];
+    operationKey?: string;
+    seed?: number;
+    startedAt?: number;
+    allowExceptional?: boolean;
+    target?: { x: number; y: number };
 }
 export interface RobotRescuePlan {
     kind: 'airlift' | 'tow' | 'repair';
@@ -57,22 +54,28 @@ export interface RobotRescuePlan {
     mass: number;
     capacity: number;
     enjoysAirlift: boolean;
+    operation?: RobotOperationPlan;
+    goal: { from: { x: number; y: number }; target: { x: number; y: number } };
 }
 
 function capability(vehicle: RescueVehicle): Readonly<Capability> | undefined {
-    return Object.prototype.hasOwnProperty.call(ROBOT_RESCUE_CAPABILITIES, vehicle)
-        ? ROBOT_RESCUE_CAPABILITIES[vehicle] : undefined;
+    return robotCapabilities(vehicle);
 }
 
 /** Shared by ordinary transport and rescue, so a scene cannot bypass the carrying hierarchy. */
-export function canCarryRobot(carrier: RescueVehicle, cargo: RescueVehicle): boolean {
-    const capacity = capability(carrier), load = capability(cargo);
-    return !!capacity && !!load && capacity.lift > 0 && capacity.lift >= load.mass;
+export function canCarryRobot(carrier: RescueVehicle, cargo: RescueVehicle, attachedCargo = 0,
+    commitments: readonly RobotCommitment[] = []): boolean {
+    return assessRobotOperation({ key: 'body-transport:' + carrier + ':' + cargo, goal: 'relocation', preferredCrew: 1,
+        phases: [{ id: 'lift', until: 1, loads: [{ id: 'body-and-cargo', role: 'lift', cargo: attachedCargo,
+            bodies: [cargo], supporters: [0] }] }] }, [{ id: 0, vehicle: carrier, commitments }]).normalAdmissible;
 }
 
 function valid(actor: RobotRescueActor): boolean {
     return !!actor && Number.isSafeInteger(actor.id) && actor.id >= 0 && !!capability(actor.vehicle)
         && Number.isFinite(actor.x) && Number.isFinite(actor.y)
+        && (actor.commitmentTimeline === undefined || Array.isArray(actor.commitmentTimeline)
+            && actor.commitmentTimeline.length <= ROBOT_OPERATION_POLICY.maxPhases && actor.commitmentTimeline.every((window, index, values) => !!window
+                && Number.isFinite(window.until) && (!index || window.until > values[index - 1].until) && Array.isArray(window.commitments)))
         && Math.abs(actor.x) <= Number.MAX_SAFE_INTEGER && Math.abs(actor.y) <= Number.MAX_SAFE_INTEGER;
 }
 
@@ -81,6 +84,7 @@ export function planRobotRescue(disabled: RobotRescueActor, available: readonly 
     options: RobotRescueOptions): RobotRescuePlan | undefined {
     if (!valid(disabled) || !Number.isFinite(options.remainingMs) || !Number.isSafeInteger(options.maxHelpers)
         || options.maxHelpers <= 0) { return; }
+    if (options.target && (!Number.isFinite(options.target.x) || !Number.isFinite(options.target.y))) { return; }
     const durationMs = Math.min(ROBOT_RESCUE_POLICY.maxDurationMs, options.remainingMs - ROBOT_RESCUE_POLICY.endMarginMs);
     if (durationMs < ROBOT_RESCUE_POLICY.minDurationMs) { return; }
     const group = options.carriedGroup === undefined ? [disabled.vehicle] : options.carriedGroup;
@@ -92,7 +96,14 @@ export function planRobotRescue(disabled: RobotRescueActor, available: readonly 
         if (!load) { return; }
         loads.push(load);
     }
-    const mass = loads.reduce((total, load) => total + load.mass, 0);
+    const cargo = new Map<string, number>();
+    if (!Array.isArray(options.carriedCargo ?? []) || (options.carriedCargo?.length ?? 0) > ROBOT_RESCUE_POLICY.maxCarriedGroup) { return; }
+    for (const value of options.carriedCargo ?? []) {
+        if (!value?.key || !Number.isFinite(value.mass) || value.mass < 0 || cargo.has(value.key) && cargo.get(value.key) !== value.mass) { return; }
+        cargo.set(value.key, value.mass);
+    }
+    const attachedCargo = [...cargo.values()].reduce((total, mass) => total + mass, 0);
+    const mass = loads.reduce((total, load) => total + load.mass, attachedCargo);
     const maxHelpers = Math.min(options.maxHelpers, ROBOT_RESCUE_POLICY.maxHelpers);
     const seen = new Set([disabled.id]);
     const candidates = available.slice(0, ROBOT_RESCUE_POLICY.maxCandidates).filter(actor => {
@@ -105,31 +116,65 @@ export function planRobotRescue(disabled: RobotRescueActor, available: readonly 
     const plan = (kind: RobotRescuePlan['kind'], helpers: readonly number[], capacity: number): RobotRescuePlan => ({
         kind, disabled: disabled.id, helpers: [...helpers], participantIds: [disabled.id, ...helpers],
         durationMs, phases: ROBOT_RESCUE_PHASES, mass, capacity,
-        enjoysAirlift: kind === 'airlift' && disabled.vehicle === 'lugv',
+        enjoysAirlift: kind === 'airlift' && (robotStructure(disabled.vehicle)?.personality.carrierAffinity ?? 0) > 0,
+        goal: { from: { x: disabled.x, y: disabled.y }, target: kind === 'repair' ? { x: disabled.x, y: disabled.y }
+            : options.target ? { ...options.target } : { x: disabled.x + 40, y: disabled.y } },
     });
 
-    // Every rigidly carried member must be grounded and fit the same aircraft's capacity.
-    if (loads.every(load => load.mobility === 'ground')) {
-        const aircraft = candidates.find(value => value.capability.mobility === 'air'
-            && value.capability.lift >= mass);
-        if (aircraft) { return plan('airlift', [aircraft.actor.id], aircraft.capability.lift); }
-    }
-
-    const ground = candidates.filter(value => value.capability.mobility === 'ground' && value.capability.tow > 0);
-    const single = ground.find(value => value.capability.tow >= mass);
-    if (single) { return plan('tow', [single.actor.id], single.capability.tow); }
-    if (maxHelpers >= 2) {
-        let best: { ids: number[]; capacity: number; distance: number } | undefined;
-        for (let first = 0; first < ground.length; first++) {
-            for (let second = first + 1; second < ground.length; second++) {
-                const a = ground[first], b = ground[second], capacity = a.capability.tow + b.capability.tow;
-                if (capacity < mass) { continue; }
-                const distance = a.distance + b.distance;
-                if (!best || distance < best.distance) { best = { ids: [a.actor.id, b.actor.id], capacity, distance }; }
+    const startedAt = options.startedAt ?? 0;
+    if (!Number.isFinite(startedAt)) { return; }
+    const proposals: Array<{ kind: 'airlift' | 'tow'; members: Array<RobotRescueActor & { commitmentWindows?: readonly { until: number; commitments: readonly RobotCommitment[] }[] }>;
+        spec: RobotOperationSpec;
+        assessment: ReturnType<typeof assessRobotOperation>; distance: number }> = [];
+    const add = (kind: 'airlift' | 'tow', members: RobotRescueActor[]) => {
+        const assessed = members.map(member => {
+            if (!member.commitmentTimeline) { return member; }
+            const windows: Array<{ until: number; commitments: readonly RobotCommitment[] }> = [];
+            for (const window of member.commitmentTimeline) {
+                if (window.until <= startedAt) { continue; }
+                const until = Math.min(1, (window.until - startedAt) / (durationMs * 0.70));
+                windows.push({ until, commitments: window.commitments });
+                if (until === 1) { break; }
             }
-        }
-        if (best) { return plan('tow', best.ids, best.capacity); }
+            if (windows.at(-1)?.until !== 1) { windows.push({ until: 1, commitments: [] }); }
+            return { ...member, commitments: undefined, commitmentWindows: windows };
+        });
+        const spec: RobotOperationSpec = { key: options.operationKey ?? 'relocation:' + disabled.vehicle + ':' + group.join(','),
+            goal: 'relocation', preferredCrew: 1, phases: [{ id: kind, until: 1, loads: [{ id: 'casualty',
+                role: kind === 'airlift' ? 'lift' : 'tow', attachment: kind === 'airlift' ? 'sling' : 'towline',
+                cargo: attachedCargo, bodies: group, supporters: members.map(member => member.id) }] }] };
+        const assessment = assessRobotOperation(spec, assessed);
+        if (assessment.compatible) { proposals.push({ kind, members: assessed, spec, assessment,
+            distance: members.reduce((total, member) => total + Math.hypot(member.x - disabled.x, member.y - disabled.y), 0) }); }
+    };
+    if (loads.every(load => load.mobility === 'ground')) {
+        for (const value of candidates.filter(value => value.capability.mobility === 'air')) { add('airlift', [value.actor]); }
     }
+    const ground = candidates.filter(value => value.capability.mobility === 'ground' && value.capability.tow > 0);
+    for (const value of ground) { add('tow', [value.actor]); }
+    if (maxHelpers >= 2) {
+        for (let a = 0; a < ground.length; a++) {
+            for (let b = a + 1; b < ground.length; b++) { add('tow', [ground[a].actor, ground[b].actor]); }
+        }
+    }
+    const normal = proposals.filter(value => value.assessment.normalAdmissible)
+        .sort((a, b) => Number(b.kind === 'airlift') - Number(a.kind === 'airlift')
+            || a.members.length - b.members.length || a.distance - b.distance);
+    const extraordinary = proposals.filter(value => !value.assessment.normalAdmissible)
+        .sort((a, b) => a.assessment.peakStrain - b.assessment.peakStrain || a.distance - b.distance);
+    const commit = (value: typeof proposals[number], shortage: boolean) => {
+        const decision = commitRobotOperation(value.spec, value.members, { seed: options.seed ?? 0, shortage,
+            allowExceptional: options.allowExceptional === true,
+            decisionKey: options.operationKey,
+            timing: { startedAt, workEnd: startedAt + durationMs * 0.70,
+                aftermathEnd: startedAt + durationMs * ROBOT_RESCUE_PHASES.assistEnd, deadline: startedAt + durationMs } });
+        return decision.plan ? { ...plan(value.kind, value.members.map(member => member.id), value.assessment.aggregateSupport),
+            operation: decision.plan } : undefined;
+    };
+    // A transport goal evaluates deliberate effort before its repair fallback. Normal crews ordinarily win.
+    const exceptional = extraordinary[0] && options.allowExceptional === true ? commit(extraordinary[0], !normal.length) : undefined;
+    if (exceptional) { return exceptional; }
+    if (normal[0]) { return commit(normal[0], false); }
 
     // A small crew can repair a bulky robot without pretending it can lift or tow it.
     return plan('repair', candidates.slice(0, maxHelpers).map(value => value.actor.id), 0);

@@ -1,6 +1,11 @@
 import { ROBOT_AIRLIFT_ATTACHMENT, type RobotVehicle } from './prefetch-robots';
 import { planRobotRescue, ROBOT_RESCUE_CAPABILITIES, ROBOT_RESCUE_POLICY, type RobotRescuePlan } from './robot-rescue';
 import { GROUND_ROUTE_MAX_SLOPE } from './robot-cargo-routes';
+import { robotActivityPhase, type RobotCommitment } from './robot-operations';
+
+/** Activity-owned lines share the renderer's existing readable caption owner and finite clock. */
+export const ROBOT_OPERATION_DIALOGUE = Object.freeze({ effort: 'Hiyaaaa!', triumph: 'Uspjelo je!',
+    expensive: 'Uspjelo je. Samo malo dima…', failure: 'Dobar pokušaj. Ekipa, oporavak!' });
 
 /** Rare document-traffic episodes. The renderer owns time, motion and all scheduling. */
 export const ROBOT_ENCOUNTER_POLICY = Object.freeze({
@@ -132,6 +137,12 @@ export interface RobotEncounterActor extends Point {
     opacity: number;
     vehicle?: RobotVehicle;
     scale?: number;
+    operationKey?: string;
+    commitments?: readonly RobotCommitment[];
+    commitmentTimeline?: readonly { until: number; commitments: readonly RobotCommitment[] }[];
+    cargo?: { key: string; mass: number };
+    /** A committed participant has this interval available again after its owned activity completes. */
+    activity?: { key: string; until: number };
 }
 export interface RobotEncounterReaction {
     x: number;
@@ -161,6 +172,8 @@ interface Incident {
     captionId: string;
     captionUntil: number;
     rescue?: RobotRescuePlan;
+    resolution?: { completion: 'fulfilled' | 'partial' | 'failed' | 'cancelled'; at: number; position: Point };
+    activityPhase?: 'work' | 'aftermath' | 'recovery' | 'complete';
 }
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
 const traffic = (actor: RobotEncounterActor) => actor.phase === 'advance' || actor.phase === 'return' || actor.phase === 'cargo';
@@ -185,8 +198,11 @@ export class RobotEncounters {
     private cooldownUntil = -Infinity;
     private attempts = 0;
     private counts = { bump: 0, nearMiss: 0, reunion: 0, success: 0 };
+    private lastAt = 0;
+    private lastRescue?: { key: string; completion: 'fulfilled' | 'partial' | 'failed' | 'cancelled'; at: number;
+        position: Point; target: Point; recovery: 'self' | 'assisted' | 'release'; complete: boolean };
 
-    constructor(private readonly random: () => number, private readonly maxActors: number) {}
+    constructor(private readonly random: () => number, private readonly maxActors: number, private readonly operationSeed = 0) {}
 
     private dialogue(kind: RobotEncounterKind): Dialogue | undefined {
         const candidates = ROBOT_ENCOUNTER_DIALOGUE.filter(value => value.kind === kind);
@@ -221,6 +237,7 @@ export class RobotEncounters {
         const groupSizes = new Map<number, number>();
         for (const actor of ownership) { if (actor.group !== undefined) { groupSizes.set(actor.group, (groupSizes.get(actor.group) ?? 0) + 1); } }
         const eligible = actors.filter(actor => actor.vehicle && (actor.phase === 'advance' || actor.phase === 'cargo')
+            && (!actor.activity || at >= actor.activity.until)
             && actor.remainingMs >= ROBOT_RESCUE_POLICY.minDurationMs + ROBOT_RESCUE_POLICY.endMarginMs
             && velocities.has(actor.id) && Math.hypot(velocities.get(actor.id)!.x, velocities.get(actor.id)!.y) >= policy.minSpeed);
         const disabled = eligible.find(actor => !this.rescueTried.has(actor.id));
@@ -236,11 +253,16 @@ export class RobotEncounters {
                 maxHelpers: ROBOT_RESCUE_POLICY.maxHelpers,
                 remainingMs: Math.min(...carriedGroup.map(actor => actor.remainingMs), ...candidates.map(actor => actor.remainingMs)),
                 carriedGroup: carriedGroup.map(actor => actor.vehicle!),
+                carriedCargo: carriedGroup.flatMap(actor => actor.cargo ? [actor.cargo] : []),
+                operationKey: (disabled.operationKey ?? 'scene:' + disabled.vehicle) + ':relocation:'
+                    + carriedGroup.map(actor => actor.vehicle).sort().join(','),
+                seed: this.operationSeed, startedAt: at, allowExceptional: true,
+                target: { x: disabled.x + Math.sign(velocities.get(disabled.id)!.x || 1) * disabled.radius * 2, y: disabled.y },
             });
         if (!plan) { return; }
         for (const actor of eligible) { this.rescueTried.add(actor.id); }
         this.rescueAttempts++; this.rescueAfter = at + policy.rescueAttemptIntervalMs;
-        if (this.random() >= policy.rescueChance) { return; }
+        if (plan.operation?.operatingMode !== 'overreach' && this.random() >= policy.rescueChance) { return; }
         const participantIds = [...plan.participantIds, ...carriedGroup.filter(actor => actor.id !== disabled.id).map(actor => actor.id)];
         const selected = participantIds.map(id => actors.find(actor => actor.id === id)!);
         const dialogue = plan.enjoysAirlift ? ROBOT_ENCOUNTER_DIALOGUE.find(value => value.id === 'rescue-lugv')!
@@ -252,7 +274,31 @@ export class RobotEncounters {
         this.rescues++; this.cooldownUntil = at + policy.cooldownMs;
     }
 
+    private resolveRescue(active: Incident, at: number, cancelled = false): void {
+        const plan = active.rescue;
+        if (!plan) { return; }
+        const workEnd = plan.operation?.timing.workEnd ?? active.started + plan.durationMs * plan.phases.assistEnd;
+        const elapsed = at >= workEnd;
+        if (!active.resolution && (cancelled || elapsed)) {
+            const completion = elapsed ? plan.operation?.outcome.completion ?? 'fulfilled' : 'cancelled';
+            const progress = elapsed ? plan.operation?.outcome.progress ?? 1 : 0;
+            active.resolution = { completion, at: elapsed ? workEnd : at, position: {
+                x: plan.goal.from.x + (plan.goal.target.x - plan.goal.from.x) * progress,
+                y: plan.goal.from.y + (plan.goal.target.y - plan.goal.from.y) * progress } };
+            this.lastRescue = { key: plan.operation?.key ?? active.captionId, ...active.resolution,
+                target: { ...plan.goal.target }, recovery: plan.operation?.outcome.recovery ?? 'self', complete: false };
+        }
+        active.activityPhase = plan.operation ? robotActivityPhase(plan.operation, at, !!active.resolution)
+            : at >= active.ends ? 'complete' : at >= workEnd ? 'recovery' : 'work';
+        if (active.resolution && this.lastRescue && (cancelled || active.activityPhase === 'complete')) {
+            // Work earns its recorded outcome before an owning event ends the remaining recovery.
+            if (cancelled && at < active.ends) { this.lastRescue.recovery = 'release'; }
+            active.activityPhase = 'complete'; this.lastRescue.complete = true;
+        }
+    }
+
     update(at: number, input: readonly RobotEncounterActor[], successfulDeposits: readonly (readonly number[])[] = []): Map<number, RobotEncounterReaction> {
+        this.lastAt = at;
         const policy = ROBOT_ENCOUNTER_POLICY;
         const ownership = input.slice(0, this.maxActors).filter(actor => Number.isFinite(actor.x + actor.y + actor.radius) && actor.radius > 0);
         const actors = ownership.filter(actor => actor.opacity > 0.2);
@@ -279,11 +325,13 @@ export class RobotEncounters {
             if (!a || !b || Math.hypot(a.x - b.x, a.y - b.y) > (a.radius + b.radius) * policy.rearmRadius) { this.approaches.delete(pair); }
         }
         let active = this.incident;
-        if (active && (at >= active.ends || active.ids.some(id => {
+        const interrupted = active && active.ids.some(id => {
             const actor = current.get(id);
             return !actor || (active!.kind === 'success' ? actor.phase !== 'deposit' && actor.phase !== 'return'
                 : active!.kind === 'rescue' ? actor.phase !== 'advance' && actor.phase !== 'cargo' : !traffic(actor));
-        }))) { this.incident = active = undefined; }
+        });
+        if (active) { this.resolveRescue(active, at, !!interrupted && at < active.ends); }
+        if (active && (at >= active.ends || interrupted)) { this.incident = active = undefined; }
         if (active?.armedUntil !== undefined) {
             const a = current.get(active.ids[0])!, b = current.get(active.ids[1])!;
             if (at > active.armedUntil) { this.incident = active = undefined; }
@@ -356,12 +404,14 @@ export class RobotEncounters {
             if (active.rescue) {
                 const plan = active.rescue, phase = plan.phases;
                 const casualty = current.get(plan.disabled)!, origin = active.origins[0];
+                const workEnd = plan.operation ? (plan.operation.timing.workEnd - active.started) / plan.durationMs : phase.assistEnd;
                 const lift = plan.kind === 'airlift' && progress >= phase.rendezvousEnd && progress < phase.assistEnd;
-                const helping = clamp((progress - phase.rendezvousEnd) / (phase.assistEnd - phase.rendezvousEnd), 0, 1);
-                const travel = helping * helping * (3 - 2 * helping);
+                const helping = clamp((progress - phase.rendezvousEnd) / (workEnd - phase.rendezvousEnd), 0, 1);
+                const travel = helping * helping * (3 - 2 * helping) * (plan.operation?.outcome.progress ?? 1);
                 const direction = active.origins[1].x >= origin.x ? 1 : -1;
-                const ground = { x: origin.x + (plan.kind === 'repair' ? 0 : direction * casualty.radius * 2 * travel),
-                    y: origin.y - (lift ? Math.sin(helping * Math.PI) * casualty.radius * 1.6 : 0) };
+                const ground = { x: plan.goal.from.x + (plan.goal.target.x - plan.goal.from.x) * travel,
+                    y: plan.goal.from.y + (plan.goal.target.y - plan.goal.from.y) * travel
+                        - (lift ? Math.sin(helping * Math.PI) * casualty.radius * 1.6 : 0) };
                 let target = ground;
                 const helper = plan.helpers.includes(actor.id);
                 if (helper) {
@@ -395,6 +445,14 @@ export class RobotEncounters {
                     badge = progress < phase.rendezvousEnd ? 'SOS' : null;
                     malfunction = progress < phase.sputterEnd * 0.55 ? 'sparks' : progress < phase.rendezvousEnd ? 'smoke' : undefined;
                 }
+                if (plan.operation?.operatingMode === 'overreach' && plan.operation.outcome.affectedActors.includes(actor.id)) {
+                    const consequence = progress >= workEnd && progress < phase.assistEnd;
+                    if (consequence) {
+                        expression = plan.operation.outcome.aftermath === 'none' ? 'pleased' : 'sheepish';
+                        activity = plan.operation.outcome.aftermath === 'none' ? 'celebrate' : 'stranded';
+                        malfunction = ['smoke', 'disabled'].includes(plan.operation.outcome.aftermath) ? 'smoke' : undefined;
+                    } else if (progress >= phase.assistEnd) { malfunction = undefined; activity = 'assist'; }
+                }
             } else if (active.kind === 'near-miss') {
                 if (index === 1) {
                     const doze = progress < 0.24 ? 1 : clamp((0.5 - progress) / 0.26, 0, 1);
@@ -420,32 +478,48 @@ export class RobotEncounters {
                 // A satisfied face may accompany the deposit; its handling pose stays intact until return.
                 if (actor.phase !== 'deposit') { activity = 'celebrate'; }
             }
+            const heroic = active.rescue?.operation?.operatingMode === 'overreach' && active.rescue.helpers[0] === actor.id;
+            const operation = active.rescue?.operation;
+            const heroicLine = operation && at >= operation.timing.workEnd
+                ? operation.outcome.family === 'valiant-failure' ? ROBOT_OPERATION_DIALOGUE.failure
+                    : operation.outcome.family === 'expensive-success' ? ROBOT_OPERATION_DIALOGUE.expensive : ROBOT_OPERATION_DIALOGUE.triumph
+                : ROBOT_OPERATION_DIALOGUE.effort;
             result.set(actor.id, { x, y, tilt, expression, activity, badge, carried, malfunction,
-                caption: active.dialogue.lines[index] ?? '', captionId: active.captionId, captionUntil: active.captionUntil,
+                caption: heroic ? heroicLine : active.dialogue.lines[index] ?? '',
+                captionId: heroic ? active.captionId + ':' + (at >= operation!.timing.workEnd ? 'result' : 'effort') : active.captionId,
+                captionUntil: heroic ? operation!.timing.deadline : active.captionUntil,
                 gesturePhase: Math.floor(progress * policy.gestureSteps),
                 look: other ? other.x < actor.x ? -1 : 1 : undefined });
         }
         return result;
     }
 
-    forget(id: number): void {
+    forget(id: number, at = this.lastAt): void {
+        this.lastAt = Math.max(this.lastAt, at);
         this.previous.delete(id);
         this.rescueTried.delete(id);
         for (const [pair, ids] of this.approaches) { if (ids.includes(id)) { this.approaches.delete(pair); } }
-        if (this.incident?.ids.includes(id)) { this.incident = undefined; }
+        if (this.incident?.ids.includes(id)) { this.resolveRescue(this.incident, this.lastAt, true); this.incident = undefined; }
     }
-    clear(): void { this.previous.clear(); this.approaches.clear(); this.rescueTried.clear(); this.incident = undefined; }
-    reset(): void {
-        this.clear(); this.attempts = 0; this.counts = { bump: 0, nearMiss: 0, reunion: 0, success: 0 };
+    clear(at = this.lastAt): void {
+        this.lastAt = Math.max(this.lastAt, at);
+        if (this.incident) { this.resolveRescue(this.incident, this.lastAt, true); }
+        this.previous.clear(); this.approaches.clear(); this.rescueTried.clear(); this.incident = undefined;
+    }
+    reset(at = this.lastAt): void {
+        this.clear(at); this.attempts = 0; this.counts = { bump: 0, nearMiss: 0, reunion: 0, success: 0 };
         this.trafficAfter = this.successAfter = this.rescueAfter = this.cooldownUntil = -Infinity;
         this.rescueAttempts = this.rescues = 0;
+        this.lastRescue = undefined;
     }
     snapshot() {
         const active = this.incident;
         return { attempts: this.attempts, counts: { ...this.counts }, rescueAttempts: this.rescueAttempts, rescues: this.rescues,
+            lastRescue: this.lastRescue ? { ...this.lastRescue, position: { ...this.lastRescue.position }, target: { ...this.lastRescue.target } } : undefined,
             trackedRescueActors: this.rescueTried.size, trackedActors: this.previous.size, trackedPairs: this.approaches.size,
             active: active ? { kind: active.kind, ids: [...active.ids], dialogue: active.dialogue.id,
                 started: active.started, ends: active.ends, confirmed: active.armedUntil === undefined,
-                rescue: active.rescue ? { ...active.rescue, helpers: [...active.rescue.helpers], participantIds: [...active.rescue.participantIds] } : undefined } : undefined };
+                rescue: active.rescue ? { ...active.rescue, helpers: [...active.rescue.helpers], participantIds: [...active.rescue.participantIds],
+                    state: active.activityPhase ?? 'work', resolution: active.resolution ? { ...active.resolution, position: { ...active.resolution.position } } : undefined } : undefined } : undefined };
     }
 }

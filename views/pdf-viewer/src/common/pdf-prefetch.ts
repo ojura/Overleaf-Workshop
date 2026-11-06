@@ -334,7 +334,11 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         try {
             const value = pixels(id);
             if (!value) { return; }
-            const result = documentRobots.offer(value);
+            // PDF.js can publish pixels before the scroll listener samples the new position.
+            const result = documentRobots.offer(value, {
+                moving: !layoutPending && (dynamics.direction !== 0 || position() !== lastPosition),
+                axis: horizontal() ? 'x' : 'y',
+            });
             if (result === 'busy') { robotCapacityBlocked = true; }
             else if (result === 'deferred') { deferredRobotPages.add(id); }
             else { pendingRobotPages.delete(id); }
@@ -703,6 +707,8 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         clearTimeout(settleTimer);
         settleTimer = undefined;
         dynamics.stop();
+        // A stationary partial view can become eligible without changing geometry.
+        deferredRobotPages.clear();
         schedule();
     }
 

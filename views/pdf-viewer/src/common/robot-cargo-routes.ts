@@ -1,3 +1,5 @@
+import { robotStructure } from './robot-structure';
+
 export interface CargoRoutePoint { x: number; y: number }
 
 /** Maximum vertical travel per horizontal pixel while a ground vehicle drives itself. */
@@ -78,13 +80,14 @@ export function groundRouteDirection(from: CargoRoutePoint, to: CargoRoutePoint)
     return distance < 0 ? -1 : distance > 0 ? 1 : undefined;
 }
 
-/** L-UGV asks for a lift before reversing its last committed drive; other bodies retain the slope rule. */
+/** Reverse aversion can motivate a carried turn; the route still derives direction from the committed drive. */
 export function cargoAirliftReason(from: CargoRoutePoint, to: CargoRoutePoint, vehicle: string,
     direction?: GroundRouteDirection, maxSlope = GROUND_ROUTE_MAX_SLOPE): CargoAirliftReason | undefined {
     const steep = needsCargoAirlift(from, to, maxSlope);
     if (direction !== undefined && direction !== -1 && direction !== 1) { throw new RangeError('Cargo route direction must be -1 or 1.'); }
     const next = groundRouteDirection(from, to);
-    if (vehicle === 'lugv' && direction !== undefined && next !== undefined && next !== direction) { return 'turn'; }
+    if ((robotStructure(vehicle)?.personality.reverseAversion ?? 0) > 0
+        && direction !== undefined && next !== undefined && next !== direction) { return 'turn'; }
     return steep ? 'slope' : undefined;
 }
 

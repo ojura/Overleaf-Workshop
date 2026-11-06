@@ -90,11 +90,14 @@ interface RobotDelivery {
     pageProjection?: { content: { x: number; y: number; width: number; height: number }; clip: { x: number; y: number; width: number; height: number } };
 }
 
+interface RobotAdmission { moving: boolean; axis: 'x' | 'y' }
+
 class DocumentRobots {
     enabled = true;
     readonly deliveries: RobotDelivery[] = [];
     readonly refinements: RobotDelivery[] = [];
     readonly offers: number[] = [];
+    readonly admissions: Array<{ pageNumber: number; admission?: RobotAdmission }> = [];
     readonly visibleCalls: number[][] = [];
     readonly workCalls: Array<Array<{ key: string; pages: Array<{ pageNumber: number; pageElement: Element; label?: string; state: string }> }>> = [];
     readonly enabledCalls: boolean[] = [];
@@ -129,8 +132,9 @@ class DocumentRobots {
         this.setVisiblePages(groups.flatMap(group => group.pages.map(page => page.pageNumber)));
     }
     hasHandled(id: number) { return this.handled.has(id); }
-    offer(value: RobotDelivery) {
+    offer(value: RobotDelivery, admission?: RobotAdmission) {
         this.offers.push(value.pageNumber);
+        this.admissions.push({ pageNumber: value.pageNumber, admission: admission && { ...admission } });
         if (!this.enabled || this.hasHandled(value.pageNumber)) { return 'skipped' as const; }
         if (this.deferred.has(value.pageNumber)) { return 'deferred' as const; }
         if (this.active.size >= this.maxActive) { this.blocked = true; return 'busy' as const; }
@@ -1628,6 +1632,81 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         await f.frame();
         assert.deepStrictEqual(robots.deliveries.map(delivery => delivery.pageNumber), [20], 'a larger intersection gets the original first-entry episode');
         assert.strictEqual(robots.hasHandled(20), true);
+    });
+
+    it('supplies the current motion and scroll axis for document entry admission', async () => {
+        for (const mode of ['vertical', 'horizontal', 'horizontal-rtl'] as const) {
+            const robots = new DocumentRobots();
+            const h = previewFixture({ pages: 1, startPage: 1, initialNative: false, autoPages: false }, robots);
+            const { f } = h, horizontal = mode !== 'vertical';
+            f.viewer.scrollMode = horizontal ? 1 : 0;
+            f.viewer._isContainerRtl = mode === 'horizontal-rtl';
+            const loader = h.bind();
+            await f.frame();
+            f.container.emit('wheel', { deltaY: horizontal ? 0 : 40, deltaX: horizontal ? 40 : 0, deltaMode: 0 });
+            assert.strictEqual(h.publish(loader, 1).accepted, true);
+            assert.deepStrictEqual(robots.admissions, [{ pageNumber: 1, admission: { moving: true, axis: horizontal ? 'x' : 'y' } }], mode);
+            f.dispose();
+        }
+    });
+
+    it('retries deferred document entry admission once when unchanged geometry settles', async () => {
+        const { f, robots } = robotFixture(true, { pages: 1, startPage: 1, initialNative: false, autoPages: false });
+        robots.deferred.add(1);
+        await f.frame();
+        f.container.emit('wheel', { deltaY: 120, deltaMode: 0 });
+        f.finishNative(1);
+        await f.frame();
+        assert.deepStrictEqual(robots.offers, [1]);
+        assert.strictEqual(robots.hasHandled(1), false);
+        for (let index = 0; index < 3; index++) { f.eventBus.emit('updateviewarea'); await f.frame(); }
+        assert.deepStrictEqual(robots.offers, [1], 'unchanged moving geometry does not repeat admission work');
+        const geometry = [f.container.scrollTop, f.container.scrollLeft, f.container.clientWidth, f.container.clientHeight];
+        robots.deferred.delete(1);
+        endGesture(f);
+        assert.strictEqual(f.callbacks.size, 1, 'the existing settle event requests one refresh');
+        await f.frame(0);
+        assert.deepStrictEqual(robots.deliveries.map(value => value.pageNumber), [1], 'a settled partial view receives its first episode');
+        assert.deepStrictEqual(robots.admissions[robots.admissions.length - 1].admission, { moving: false, axis: 'y' });
+        assert.deepStrictEqual([f.container.scrollTop, f.container.scrollLeft, f.container.clientWidth, f.container.clientHeight], geometry);
+        assert.strictEqual(f.callbacks.size, 0, 'settled admission does not own an idle frame');
+        f.eventBus.emit('updateviewarea'); await f.frame();
+        assert.deepStrictEqual(robots.offers, [1, 1], 'the accepted page is not admitted again');
+    });
+
+    it('recognizes pending scroll position before the listener for document entry admission', async () => {
+        for (const horizontal of [false, true]) {
+            const robots = new DocumentRobots();
+            const h = previewFixture({ pages: 1, startPage: 1, initialNative: false, autoPages: false }, robots);
+            const { f } = h;
+            f.viewer.scrollMode = horizontal ? 1 : 0;
+            const loader = h.bind();
+            await f.frame();
+            if (horizontal) { f.container.scrollLeft += 120; }
+            else { f.container.scrollTop += 120; }
+            f.eventBus.emit('updateviewarea');
+            await f.frame();
+            assert.strictEqual(f.controller.snapshot().direction, 0, 'the scroll listener has not sampled this movement yet');
+            assert.strictEqual(h.publish(loader, 1).accepted, true);
+            assert.deepStrictEqual(robots.admissions, [{ pageNumber: 1, admission: { moving: true, axis: horizontal ? 'x' : 'y' } }]);
+            f.container.emit('scroll');
+            assert.strictEqual(f.controller.snapshot().direction, 1, 'admission preserves the listener baseline');
+            f.dispose();
+        }
+    });
+
+    it('excludes layout compensation from document entry admission motion before its refresh', async () => {
+        const { f, robots } = robotFixture(true, { pages: 1, startPage: 1, initialNative: false, autoPages: false });
+        await f.frame();
+        f.container.emit('wheel', { deltaY: 120, deltaMode: 0 });
+        f.eventBus.emit('scalechanging');
+        f.container.scrollTop += 120;
+        f.finishNative(1);
+        assert.deepStrictEqual(robots.admissions, [{ pageNumber: 1, admission: { moving: false, axis: 'y' } }],
+            'pixels ready during the pending layout use the new stationary view');
+        assert.strictEqual(f.controller.snapshot().direction, 0);
+        await f.frame();
+        assert.deepStrictEqual(robots.offers, [1]);
     });
 
     for (const event of ['scroll', 'resize'] as const) {

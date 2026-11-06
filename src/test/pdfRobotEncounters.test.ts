@@ -256,4 +256,92 @@ describe('finite document robot encounters', function () {
         assert.notStrictEqual(clipped.model.snapshot().active?.rescue?.kind, 'airlift',
             'offscreen members still belong to the same rigid load and cannot disappear from capability accounting');
     });
+
+    it('admits relocation only inside each participant’s available activity interval', () => {
+        for (const busy of [1, 2]) {
+            const { model } = owner([0, 0]);
+            const crew = [actor(1, 0, 100, { phase: 'cargo', group: 10, vehicle: 'lugv', scale: 1, remainingMs: 3000 }),
+                actor(2, 180, 40, { phase: 'cargo', group: 20, vehicle: 'heavyquad', scale: 1, remainingMs: 3000 })]
+                .map(value => value.id === busy ? { ...value, activity: { key: 'owned-delivery', until: 900 } } : value);
+            model.update(0, crew); model.update(40, crew.map(value => ({ ...value, x: value.x + 2 })));
+            assert.strictEqual(model.snapshot().active?.rescue, undefined, 'another committed activity retains its movement and aftermath owner');
+            assert.strictEqual(model.snapshot().rescueAttempts, 0, 'unavailable intervals do not consume a narrative attempt');
+            model.update(920, crew.map(value => ({ ...value, x: value.x + 4 })));
+            model.update(960, crew.map(value => ({ ...value, x: value.x + 6 })));
+            assert.ok(model.snapshot().active?.rescue, 'the same participants can cooperate after the owned interval');
+        }
+    });
+
+    it('resolves a committed relocation goal before its finite aftermath and recovery', () => {
+        for (const [seed, family] of [[150, 'expensive-success'], [1495, 'valiant-failure'], [4965, 'clean-triumph']] as const) {
+            const model = new module.RobotEncounters(() => 0.99, 12, seed);
+            const crew = [actor(1, 0, 100, { vehicle: 'ekokomvoz', operationKey: 'job:bulky', remainingMs: 3000 }),
+                actor(2, 180, 100, { vehicle: 'lugv', remainingMs: 3000 })];
+            model.update(0, crew);
+            const moving = crew.map(value => ({ ...value, x: value.x + 2 }));
+            model.update(40, moving);
+            const admitted = model.snapshot().active;
+            assert.ok(admitted?.rescue, 'a committed heroic attempt does not pass through the unrelated six-percent incident gate');
+            const operation = admitted.rescue.operation;
+            assert.strictEqual(operation.outcome.family, family);
+            const deadline = admitted.ends;
+            const work = model.update(operation.timing.workEnd - 1, moving);
+            assert.strictEqual(work.get(2).malfunction, undefined, 'the volunteer’s consequence follows its work');
+            const resolved = model.update(operation.timing.workEnd + 1, moving);
+            const snapshot = model.snapshot(), result = snapshot.active.rescue.resolution;
+            assert.strictEqual(result.completion, operation.outcome.completion);
+            assert.strictEqual(snapshot.active.rescue.state, 'aftermath');
+            assert.strictEqual(result.at, operation.timing.workEnd);
+            const expected = 2 + 20 * operation.outcome.progress;
+            assert.ok(Math.abs(moving[0].x + resolved.get(1).x - expected) < 1e-9, 'displayed relocation reaches its recorded goal result');
+            assert.ok(Math.abs(result.position.x - expected) < 1e-9);
+            assert.strictEqual(resolved.get(2).malfunction, family === 'clean-triumph' ? undefined : 'smoke');
+            model.update(operation.timing.aftermathEnd + 1, moving);
+            assert.strictEqual(model.snapshot().active.rescue.state, 'recovery');
+            assert.strictEqual(model.snapshot().active.ends, deadline);
+            assert.strictEqual(model.update(deadline + 1, moving).size, 0);
+            assert.strictEqual(model.snapshot().active, undefined);
+            assert.strictEqual(model.snapshot().lastRescue.complete, true);
+            assert.strictEqual(model.snapshot().lastRescue.completion, operation.outcome.completion);
+            model.clear(); assert.strictEqual(model.snapshot().trackedActors, 0);
+        }
+    });
+
+    it('uses the owning event time to resolve elapsed relocation before cancellation', () => {
+        for (const phase of ['work', 'aftermath', 'expired']) {
+            const model = new module.RobotEncounters(() => 0.99, 12, 150);
+            const crew = [actor(1, 0, 100, { vehicle: 'ekokomvoz', operationKey: 'job:bulky', remainingMs: 3000 }),
+                actor(2, 180, 100, { vehicle: 'lugv', remainingMs: 3000 })];
+            model.update(0, crew); model.update(40, crew.map(value => ({ ...value, x: value.x + 2 })));
+            const active = model.snapshot().active, operation = active.rescue.operation;
+            const at = phase === 'work' ? operation.timing.workEnd - 1
+                : phase === 'aftermath' ? operation.timing.workEnd + 1 : operation.timing.deadline + 1;
+            if (phase === 'aftermath') { model.clear(at); } else { model.forget(2, at); }
+            const result = model.snapshot().lastRescue;
+            assert.strictEqual(result.completion, phase === 'work' ? 'cancelled' : operation.outcome.completion);
+            assert.strictEqual(result.at, phase === 'work' ? at : operation.timing.workEnd);
+            assert.strictEqual(result.complete, true);
+            assert.strictEqual(result.recovery, phase === 'expired' ? operation.outcome.recovery : 'release');
+            assert.strictEqual(model.snapshot().active, undefined);
+        }
+    });
+
+    it('resolves skipped relocation frames and cancellation without starting a fresh recovery clock', () => {
+        for (const cancel of [false, true]) {
+            const model = new module.RobotEncounters(() => 0.99, 12, 150);
+            const crew = [actor(1, 0, 100, { vehicle: 'ekokomvoz', operationKey: 'job:bulky', remainingMs: 3000 }),
+                actor(2, 180, 100, { vehicle: 'lugv', remainingMs: 3000 })];
+            model.update(0, crew); model.update(40, crew.map(value => ({ ...value, x: value.x + 2 })));
+            const active = model.snapshot().active;
+            assert.ok(active?.rescue.operation);
+            if (cancel) { model.forget(2); }
+            else { model.update(active.ends + 1000, crew); }
+            const result = model.snapshot().lastRescue;
+            assert.strictEqual(result.completion, cancel ? 'cancelled' : 'fulfilled');
+            assert.strictEqual(result.complete, true);
+            assert.strictEqual(result.recovery, cancel ? 'release' : active.rescue.operation.outcome.recovery);
+            assert.strictEqual(model.snapshot().active, undefined);
+            model.clear(); assert.strictEqual(model.snapshot().trackedActors + model.snapshot().trackedRescueActors, 0);
+        }
+    });
 });
