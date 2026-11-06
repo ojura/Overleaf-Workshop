@@ -12,6 +12,9 @@
     let hostState = syncJSON(`/state?doc=${encodeURIComponent(doc)}`);
     const builds = syncJSON('/builds');
     let currentBuild = new URLSearchParams(location.search).get('build') || 'a';
+    const config = JSON.parse(document.getElementById('viewer-config').textContent);
+    const pending = new Map();
+    let closed = false;
     const t0 = performance.now();
     const events = [];
     /** the probes waiting for an event of a type (harness.first) */
@@ -42,11 +45,41 @@
         acquired = true;
         return api;
     };
-    const loadMessage = (build) => ({ type: 'load', output: builds[build] });
+    const loadMessage = (build) => ({ type: 'load', output: builds[build], ...config.harness });
+    async function fetchMessage(message, reading = false) {
+        const controller = new AbortController();
+        pending.get(message.id)?.abort();
+        pending.set(message.id, controller);
+        try {
+            const res = await fetch(reading ? '/reading-bridge' : '/bridge', {
+                method: 'POST', body: JSON.stringify(message), signal: controller.signal,
+            });
+            if (closed || controller.signal.aborted) { return; }
+            const error = res.headers.get('x-bridge-error');
+            if (error) { throw new Error(decodeURIComponent(error)); }
+            if (res.ok === false) { throw new Error(`Harness host returned HTTP ${res.status}`); }
+            const meta = JSON.parse(res.headers.get('x-bridge'));
+            const body = new Uint8Array(await res.arrayBuffer());
+            if (!closed && !controller.signal.aborted) { deliver({ type: 'fetchResponse', ...meta, page: message.page, body }); }
+        } catch (error) {
+            if (!closed && !controller.signal.aborted) {
+                deliver({ type: 'fetchError', page: message.page, id: message.id, message: String(error?.message ?? error) });
+                log('fetchError', { message: String(error?.message ?? error) });
+            }
+        } finally { if (pending.get(message.id) === controller) { pending.delete(message.id); } }
+    }
+    const close = () => {
+        if (closed) { return; }
+        closed = true;
+        for (const controller of pending.values()) { controller.abort(); }
+        pending.clear();
+        void fetch('/page-close', { method: 'POST', body: JSON.stringify({ page: config.page }), keepalive: true }).catch(() => {});
+    };
+    window.addEventListener('pagehide', close, { once: true });
     async function handle(message) {
-        if (message?.type === 'ready' || message?.type === 'saveState') {
-            const page = JSON.parse(document.getElementById('viewer-config').textContent).page;
-            if (message.page !== page) { return; }
+        if (closed) { return; }
+        if (['ready', 'saveState', 'fetch', 'readingFetch', 'fetchAbort'].includes(message?.type)) {
+            if (message.page !== config.page) { return; }
         }
         switch (message?.type) {
             case 'ready':
@@ -63,25 +96,20 @@
             case 'fetch': {
                 const range = (message.headers || []).find(([name]) => name.toLowerCase() === 'range')?.[1];
                 log('fetch', { url: new URL(message.url).pathname.replace(/^.*\/(build|content)\//, '$1/'), range });
-                const res = await fetch('/bridge', { method: 'POST', body: JSON.stringify(message) });
-                const error = res.headers.get('x-bridge-error');
-                if (error) {
-                    deliver({ type: 'fetchError', page: message.page, id: message.id, message: decodeURIComponent(error) });
-                    log('fetchError', { message: decodeURIComponent(error) });
-                    break;
-                }
-                const meta = JSON.parse(res.headers.get('x-bridge'));
-                const body = new Uint8Array(await res.arrayBuffer());
-                // the answer names the page that asked, as the extension host's does
-                deliver({ type: 'fetchResponse', ...meta, page: message.page, body });
+                await fetchMessage(message);
                 break;
             }
+            case 'readingFetch':
+                log('readingFetch', { id: message.id, imageId: message.imageId, chunkIndex: message.chunkIndex, chunkCount: message.chunkCount ?? 1 });
+                await fetchMessage(message, true);
+                break;
             case 'buildGone':
             case 'buildShown':
                 log(message.type, { build: message.build });
                 break;
             case 'fetchAbort':
-                fetch('/bridge-abort', { method: 'POST', body: JSON.stringify({ id: message.id }) });
+                pending.get(message.id)?.abort();
+                void fetch('/bridge-abort', { method: 'POST', body: JSON.stringify({ page: message.page, id: message.id }), keepalive: true }).catch(() => {});
                 log('fetchAbort', { id: message.id });
                 break;
             case 'switchViewer':
@@ -100,6 +128,7 @@
     window.harness = {
         events,
         log,
+        close,
         builds,
         /** the host's 'load' after a new compile */
         load(build) { currentBuild = build; log('load', { build }); deliver(loadMessage(build)); },
