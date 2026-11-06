@@ -245,7 +245,7 @@
    saveDocument() {
      return this._transport.saveDocument();
    }
-@@ -11865,6 +11946,213 @@
+@@ -11865,6 +11946,231 @@
      return this._transport.getCalculationOrderIds();
    }
  }
@@ -329,6 +329,10 @@
 +    this.records.set(data.id, record);
 +    if (data.image) { (record.common ? this.page.commonObjs : this.page.objs).resolve(data.id, data.image); }
 +  }
++  releaseRasters(ids) {
++    ids = [...new Set(ids.filter(id => Number.isSafeInteger(id) && id > 0))];
++    if (ids.length) { this.page._transport.messageHandler.send("ReleaseExternalImageRasters", { ids }); }
++  }
 +  receive(data) {
 +    const record = this.records.get(data.id);
 +    const current = record?.common
@@ -349,12 +353,14 @@
 +    }
 +    const prior = this.pending.get(data.id);
 +    prior?.image?.bitmap?.close();
++    if (prior) { this.releaseRasters([prior.rasterId]); }
 +    this.pending.set(data.id, data);
 +    if (record.print || record.common || !(record.state.renderTasks?.size > 0)) { this.flush(record.state); }
 +    return true;
 +  }
 +  flush(state) {
 +    let changed = false;
++    const released = [];
 +    for (const [id, data] of this.pending) {
 +      const record = this.records.get(id);
 +      if (!record || record.state !== state) { continue; }
@@ -362,12 +368,15 @@
 +      this.pending.delete(id);
 +      const objects = record.common ? this.page.commonObjs : this.page.objs;
 +      objects.replace(id, data.image);
++      released.push(record.rasterId);
++      record.rasterId = data.rasterId;
 +      record.covered = true;
 +      record.final = data.final;
 +      record.scan = data.scan;
 +      this.revision++;
 +      changed = true;
 +    }
++    this.releaseRasters(released);
 +    if (changed && state && !state.externalImageCancelled) { this.notify(); }
 +  }
 +  begin(state) {
@@ -413,28 +422,37 @@
 +    if (state.externalImageCancelled) { return; }
 +    if (state === this.current) { this.lastStatus = this.status(state); this.current = null; }
 +    state.externalImageCancelled = true;
-+    const promise = this.page._transport.messageHandler.sendWithPromise("CancelExternalImages", {
-+      pageIndex: this.page._pageIndex, epoch: state.externalImageEpoch
-+    }).catch(() => {}).finally(() => this.cancellations.delete(promise));
-+    this.cancellations.add(promise);
++    const released = [];
 +    for (const [id, record] of this.records) {
 +      if (record.state !== state) { continue; }
 +      // Shared Type3 images finish under the document's common object lifetime.
 +      // Detach the canceled operator list while preserving the receiving identity.
 +      if (record.common) { record.state = null; continue; }
-+      this.pending.get(id)?.image?.bitmap?.close();
++      const pending = this.pending.get(id);
++      pending?.image?.bitmap?.close();
++      released.push(pending?.rasterId, record.rasterId);
 +      this.pending.delete(id);
 +      this.page.objs.release(id);
 +      this.records.delete(id);
 +    }
++    this.releaseRasters(released);
++    const promise = this.page._transport.messageHandler.sendWithPromise("CancelExternalImages", {
++      pageIndex: this.page._pageIndex, epoch: state.externalImageEpoch
++    }).catch(() => {}).finally(() => this.cancellations.delete(promise));
++    this.cancellations.add(promise);
 +  }
 +  clearCommon() {
++    const released = [];
 +    for (const [id, record] of this.records) {
 +      if (!record.common) { continue; }
-+      this.pending.get(id)?.image?.bitmap?.close();
++      const pending = this.pending.get(id);
++      pending?.image?.bitmap?.close();
++      released.push(pending?.rasterId, record.rasterId);
 +      this.pending.delete(id);
++      this.page.commonObjs.release(id);
 +      this.records.delete(id);
 +    }
++    this.releaseRasters(released);
 +  }
 +  cancel(includePrint = false) {
 +    for (const [key, state] of [...this.page._intentStates]) {
@@ -459,7 +477,7 @@
  class PDFPageProxy {
    #pendingCleanup = false;
    constructor(pageIndex, pageInfo, transport, pdfBug = false) {
-@@ -11876,6 +12164,7 @@
+@@ -11876,6 +12182,7 @@
      this.commonObjs = transport.commonObjs;
      this.objs = new PDFObjects();
      this._intentStates = new Map();
@@ -467,7 +485,7 @@
      this.destroyed = false;
    }
    get pageNumber() {
-@@ -11930,6 +12219,14 @@
+@@ -11930,6 +12237,14 @@
    async getXfa() {
      return this._transport._htmlForXfa?.children[this._pageIndex] || null;
    }
@@ -482,7 +500,7 @@
    render({
      canvasContext,
      viewport,
-@@ -11941,10 +12238,28 @@
+@@ -11941,10 +12256,28 @@
      annotationCanvasMap = null,
      pageColors = null,
      printAnnotationStorage = null,
@@ -512,7 +530,7 @@
      const {
        renderingIntent,
        cacheKey
-@@ -11953,7 +12268,11 @@
+@@ -11953,7 +12286,11 @@
      optionalContentConfigPromise ||= this._transport.getOptionalContentConfig(renderingIntent);
      let intentState = this._intentStates.get(cacheKey);
      if (!intentState) {
@@ -525,7 +543,7 @@
        this._intentStates.set(cacheKey, intentState);
      }
      if (intentState.streamReaderCancelTimeout) {
-@@ -11972,8 +12291,12 @@
+@@ -11972,8 +12309,12 @@
        this._stats?.time("Page Request");
        this._pumpOperatorList(intentArgs);
      }
@@ -538,7 +556,7 @@
        if (intentPrint) {
          this.#pendingCleanup = true;
        }
-@@ -12120,6 +12443,11 @@
+@@ -12120,6 +12461,11 @@
    _destroy() {
      this.destroyed = true;
      const waitOn = [];
@@ -550,7 +568,7 @@
      for (const intentState of this._intentStates.values()) {
        this._abortOperatorList({
          intentState,
-@@ -12158,6 +12486,7 @@
+@@ -12158,6 +12504,7 @@
          return false;
        }
      }
@@ -558,7 +576,7 @@
      this._intentStates.clear();
      this.objs.clear();
      this.#pendingCleanup = false;
-@@ -12177,11 +12506,13 @@
+@@ -12177,11 +12524,13 @@
        intentState.operatorList.argsArray.push(operatorListChunk.argsArray[i]);
      }
      intentState.operatorList.lastChunk = operatorListChunk.lastChunk;
@@ -572,7 +590,7 @@
        this.#tryCleanup();
      }
    }
-@@ -12189,21 +12520,27 @@
+@@ -12189,21 +12538,27 @@
      renderingIntent,
      cacheKey,
      annotationStorageSerializable,
@@ -603,7 +621,7 @@
      intentState.streamReader = reader;
      const pump = () => {
        reader.read().then(({
-@@ -12214,7 +12551,7 @@
+@@ -12214,7 +12569,7 @@
            intentState.streamReader = null;
            return;
          }
@@ -612,7 +630,7 @@
            return;
          }
          this._renderPageChunk(value, intentState);
-@@ -12563,6 +12900,7 @@
+@@ -12563,6 +12918,7 @@
      this.destroyed = false;
      this.destroyCapability = null;
      this._networkStream = networkStream;
@@ -620,7 +638,7 @@
      this._fullReader = null;
      this._lastProgress = null;
      this.downloadInfoCapability = Promise.withResolvers();
-@@ -12635,6 +12973,8 @@
+@@ -12635,6 +12991,8 @@
        return this.destroyCapability.promise;
      }
      this.destroyed = true;
@@ -629,7 +647,7 @@
      this.destroyCapability = Promise.withResolvers();
      this.#passwordCapability?.reject(new Error("Worker was destroyed during onPassword callback"));
      const waitOn = [];
-@@ -12857,6 +13197,32 @@
+@@ -12857,6 +13215,32 @@
        }
        return null;
      });
@@ -662,7 +680,7 @@
      messageHandler.on("obj", ([id, pageIndex, type, imageData]) => {
        if (this.destroyed) {
          return;
-@@ -12899,9 +13265,23 @@
+@@ -12899,9 +13283,23 @@
      });
    }
    getData() {
@@ -686,7 +704,7 @@
      if (this.annotationStorage.size <= 0) {
        warn("saveDocument called while `annotationStorage` is empty, " + "please use the getData-method instead.");
      }
-@@ -13005,6 +13385,13 @@
+@@ -13005,6 +13403,13 @@
      });
    }
    getStructTree(pageIndex) {
@@ -700,7 +718,7 @@
      return this.messageHandler.sendWithPromise("GetStructTree", {
        pageIndex
      });
-@@ -13047,6 +13434,7 @@
+@@ -13047,6 +13452,7 @@
          throw new Error(`startCleanup: Page ${page.pageNumber} is currently rendering.`);
        }
      }
@@ -708,7 +726,7 @@
      this.commonObjs.clear();
      if (!keepLoadedFonts) {
        this.fontLoader.clear();
-@@ -13095,6 +13483,17 @@
+@@ -13095,6 +13501,17 @@
      }
      delete this.#objs[objId];
      return true;
@@ -1251,7 +1269,7 @@
    }
  }
  function buildComponentData(frame, component) {
-@@ -5097,10 +5452,1033 @@
+@@ -5097,10 +5452,1042 @@
    }
  }
 
@@ -1826,6 +1844,7 @@
 +    this.pending = [];
 +    this.tasks = new Set();
 +    this.outputs = new Map();
++    this.outputSerial = 0;
 +    this.rasterBytes = this.nativeRasterBytes = this.nativeReservedBytes = this.peakNativeReservedBytes = 0;
 +    this.nativeInputBudget = budget.maxEncodedBytes * 2 * (Number.isFinite(queue.limit) ? queue.limit : 1);
 +    this.active = this.reservedBytes = this.peakReservedBytes = 0;
@@ -1914,8 +1933,9 @@
 +    let pixels = 0, retained = 0;
 +    for (const subscriber of group.subscribers.values()) {
 +      pixels += Math.min(subscriber.outputPixels, this.budget.maxOutputPixels);
-+      const output = this.outputs.get(subscriber.objId);
-+      if (output && !output.final) { retained += output.bytes; }
++    }
++    for (const output of this.outputs.values()) {
++      if (!output.final && group.subscribers.has(output.objId)) { retained += output.bytes; }
 +    }
 +    // Published partial rasters remain charged; this allowance owns their next
 +    // sampled output, bitmap construction and the bounded coefficient/input work.
@@ -1944,10 +1964,16 @@
 +  }
 +  _releaseOutput(id) {
 +    const output = this.outputs.get(id);
-+    if (!output) { return; }
++    if (!output) { return false; }
 +    if (output.final) { this.nativeRasterBytes -= output.bytes; }
 +    else { this.rasterBytes -= output.bytes; }
 +    this.outputs.delete(id);
++    return true;
++  }
++  releaseRasters(ids) {
++    let changed = false;
++    for (const id of ids) { changed = this._releaseOutput(id) || changed; }
++    if (changed) { this._pump(); }
 +  }
 +  _pump() {
 +    if (this.closed) { return; }
@@ -2057,27 +2083,28 @@
 +    if (!group.subscribers.has(subscriber.objId)) { image?.bitmap?.close(); return; }
 +    image.dataLen = image.bitmap ? image.width * image.height * 4 : image.data?.length || 0;
 +    const transfers = image.bitmap ? [image.bitmap] : image.data ? [image.data.buffer] : [];
++    const rasterId = ++this.outputSerial;
++    if (!final) {
++      if (image.dataLen > group.reserved) { image.bitmap?.close(); throw new Error("External image exceeded its reserved raster allowance"); }
++      this._reserve(group, group.reserved - image.dataLen);
++    }
++    // Receipt can leave an older image installed while this raster waits for the
++    // next native pass. Each publication stays charged until its actual release.
++    this.outputs.set(rasterId, { objId: subscriber.objId, bytes: image.dataLen, final,
++      pageIndex: subscriber.pageIndex, epoch: subscriber.epoch, common: subscriber.common });
++    if (final) { this.nativeRasterBytes += image.dataLen; }
++    else { this.rasterBytes += image.dataLen; }
++    this.peakReservedBytes = Math.max(this.peakReservedBytes, this.reservedBytes + this.rasterBytes);
 +    let accepted;
 +    subscriber.finalSent = final;
 +    try {
 +      accepted = await this.handler.sendWithPromise("ExternalImageRevision", {
 +        id: subscriber.objId, pageIndex: subscriber.pageIndex, epoch: subscriber.epoch,
-+        cacheKey: subscriber.cacheKey, common: subscriber.common, image, final, failed: false, scan: group.scan || 0,
++        cacheKey: subscriber.cacheKey, common: subscriber.common, image, rasterId, final, failed: false, scan: group.scan || 0,
 +      }, transfers);
-+    } catch (error) { image.bitmap?.close(); throw error; }
-+    if (!accepted) { group.subscribers.delete(subscriber.objId); return; }
++    } catch (error) { this._releaseOutput(rasterId); image.bitmap?.close(); throw error; }
++    if (!accepted) { this._releaseOutput(rasterId); group.subscribers.delete(subscriber.objId); return; }
 +    if (!this._alive(group) || !group.subscribers.has(subscriber.objId)) { return; }
-+    const previous = this.outputs.get(subscriber.objId);
-+    const addedPartial = final ? 0 : Math.max(0, image.dataLen - (previous && !previous.final ? previous.bytes : 0));
-+    // Transfer consumes the output allowance already reserved by this phase.
-+    if (addedPartial > group.reserved) { throw new Error("External image exceeded its reserved raster allowance"); }
-+    this._reserve(group, group.reserved - addedPartial);
-+    this._releaseOutput(subscriber.objId);
-+    this.outputs.set(subscriber.objId, { bytes: image.dataLen, final, pageIndex: subscriber.pageIndex,
-+      epoch: subscriber.epoch, common: subscriber.common });
-+    if (final) { this.nativeRasterBytes += image.dataLen; }
-+    else { this.rasterBytes += image.dataLen; }
-+    this.peakReservedBytes = Math.max(this.peakReservedBytes, this.reservedBytes + this.rasterBytes);
 +    if (!subscriber.covered) { this.totals.covered++; }
 +    subscriber.covered = true;
 +    subscriber.final = final;
@@ -2285,7 +2312,7 @@
 
  class JpegStream extends DecodeStream {
    static #isImageDecoderSupported = FeatureTest.isImageDecoderSupported;
-@@ -5190,36 +6568,66 @@
+@@ -5190,36 +6577,66 @@
    get canAsyncDecodeImageFromBuffer() {
      return this.stream.isAsync;
    }
@@ -2366,7 +2393,7 @@
        warn(`getTransferableImage - failed: "${reason}".`);
        return null;
      } finally {
-@@ -10220,7 +11628,17 @@
+@@ -10220,7 +11637,17 @@
      stream.dict = dict;
      return stream;
    }
@@ -2385,7 +2412,7 @@
      let filter = dict.get("F", "Filter");
      let params = dict.get("DP", "DecodeParms");
      if (filter instanceof Name) {
-@@ -29969,13 +31387,16 @@
+@@ -29969,13 +31396,16 @@
      }
      switch (filterName) {
        case "JPXDecode":
@@ -2409,7 +2436,7 @@
          this.jpxDecoderOptions = {
            numComponents: 0,
            isIndexedColormap: false,
-@@ -30127,9 +31548,12 @@
+@@ -30127,9 +31557,12 @@
      isInline = false,
      pdfFunctionFactory,
      globalColorSpaceCache,
@@ -2424,7 +2451,7 @@
      let smaskData = null;
      let maskData = null;
      const smask = image.dict.get("SMask");
-@@ -30145,6 +31569,18 @@
+@@ -30145,6 +31578,18 @@
          maskData = mask;
        } else {
          warn("Unsupported /Mask format.");
@@ -2443,7 +2470,7 @@
        }
      }
      return new PDFImage({
-@@ -30437,7 +31873,20 @@
+@@ -30437,7 +31882,20 @@
        buffer[i + 2] = (buffer[i + 2] - matteB) * k + matteB;
      }
    }
@@ -2465,7 +2492,7 @@
      const drawWidth = this.drawWidth;
      const drawHeight = this.drawHeight;
      const imgData = {
-@@ -30866,6 +32315,7 @@
+@@ -30866,6 +32324,7 @@
      this.options = options || DefaultPartialEvaluatorOptions;
      this.type3FontRefs = null;
      this._regionalImageCache = new RegionalImageCache();
@@ -2473,7 +2500,7 @@
      this._fetchBuiltInCMapBound = this.fetchBuiltInCMap.bind(this);
    }
    get _pdfFunctionFactory() {
-@@ -31026,6 +32476,10 @@
+@@ -31026,6 +32485,10 @@
    async buildFormXObject(resources, xobj, smask, operatorList, task, initialState, localColorSpaceCache) {
      const dict = xobj.dict;
      const matrix = lookupMatrix(dict.getArray("Matrix"), null);
@@ -2484,7 +2511,7 @@
      const bbox = lookupNormalRect(dict.getArray("BBox"), null);
      let optionalContent, groupOptions;
      if (dict.has("OC")) {
-@@ -31083,6 +32537,64 @@
+@@ -31083,6 +32546,64 @@
      }
      return this.handler.send("obj", [objId, this.pageIndex, "Image", imgData], transfers);
    }
@@ -2549,7 +2576,7 @@
    async buildPaintImageXObject({
      resources,
      image,
-@@ -31090,7 +32602,8 @@
+@@ -31090,7 +32611,8 @@
      operatorList,
      cacheKey,
      localImageCache,
@@ -2559,7 +2586,7 @@
    }) {
      const dict = image.dict;
      const imageRef = dict.objId;
-@@ -31100,6 +32613,18 @@
+@@ -31100,6 +32622,18 @@
        warn("Image dimensions are missing, or not numbers.");
        return;
      }
@@ -2578,7 +2605,7 @@
      const maxImageSize = this.options.maxImageSize;
      if (maxImageSize !== -1 && w * h > maxImageSize) {
        const msg = "Image exceeded maximum allowed size and was removed.";
-@@ -31114,6 +32639,11 @@
+@@ -31114,6 +32648,11 @@
        optionalContent = await this.parseMarkedContentProps(dict.get("OC"), resources);
      }
      const imageMask = dict.get("IM", "ImageMask") || false;
@@ -2590,7 +2617,7 @@
      let imgData, fn, args;
      if (imageMask) {
        const interpolate = dict.get("I", "Interpolate");
-@@ -31229,7 +32759,7 @@
+@@ -31229,7 +32768,7 @@
      if (this.parsingType3Font) {
        objId = `${this.idFactory.getDocId()}_type3_${objId}`;
      } else if (cacheKey && imageRef) {
@@ -2599,7 +2626,7 @@
        if (cacheGlobally) {
          assert(!isInline, "Cannot cache an inline image globally.");
          objId = `${this.idFactory.getDocId()}_${objId}`;
-@@ -31270,16 +32800,28 @@
+@@ -31270,16 +32809,28 @@
          }
        }
      }
@@ -2638,7 +2665,7 @@
        imgData.dataLen = imgData.bitmap ? imgData.width * imgData.height * 4 : imgData.data.length;
        imgData.ref = imageRef;
        if (cacheGlobally) {
-@@ -31287,6 +32829,7 @@
+@@ -31287,6 +32838,7 @@
        }
        return this._sendImgData(objId, imgData, cacheGlobally);
      }).catch(reason => {
@@ -2646,7 +2673,7 @@
        warn(`Unable to decode image "${objId}": "${reason}".`);
        if (imageRef) {
          this.globalImageCache.addDecodeFailed(imageRef);
-@@ -31302,7 +32845,8 @@
+@@ -31302,7 +32854,8 @@
          hasMask
        };
        localImageCache.set(cacheKey, imageRef, cacheData);
@@ -2656,7 +2683,7 @@
          this._regionalImageCache.set(null, imageRef, cacheData);
          if (cacheGlobally) {
            this.globalImageCache.setData(imageRef, {
-@@ -31385,7 +32929,8 @@
+@@ -31385,7 +32938,8 @@
        xref: this.xref,
        dictArray: [patternDict.get("Resources"), resources]
      });
@@ -2666,7 +2693,7 @@
        stream: pattern,
        task,
        resources: patternResources,
-@@ -31964,7 +33509,7 @@
+@@ -31964,7 +33518,7 @@
            case OPS.paintXObject:
              isValidName = args[0] instanceof Name;
              name = args[0].name;
@@ -2675,7 +2702,7 @@
                const localImage = localImageCache.getByName(name);
                if (localImage) {
                  addLocallyCachedImageOps(operatorList, localImage);
-@@ -31978,13 +33523,13 @@
+@@ -31978,13 +33532,13 @@
                }
                let xobj = xobjs.getRaw(name);
                if (xobj instanceof Ref) {
@@ -2691,7 +2718,7 @@
                  if (globalImage) {
                    operatorList.addDependency(globalImage.objId);
                    operatorList.addImageOps(globalImage.fn, globalImage.args, globalImage.optionalContent, globalImage.hasMask);
-@@ -32016,7 +33561,8 @@
+@@ -32016,7 +33570,8 @@
                    operatorList,
                    cacheKey: name,
                    localImageCache,
@@ -2701,7 +2728,7 @@
                  }).then(resolveXObject, rejectXObject);
                  return;
                } else if (type.name === "PS") {
-@@ -32045,7 +33591,7 @@
+@@ -32045,7 +33600,7 @@
              return;
            case OPS.endInlineImage:
              const cacheKey = args[0].cacheKey;
@@ -2710,7 +2737,7 @@
                const localImage = localImageCache.getByName(cacheKey);
                if (localImage) {
                  addLocallyCachedImageOps(operatorList, localImage);
-@@ -32060,7 +33606,8 @@
+@@ -32060,7 +33615,8 @@
                operatorList,
                cacheKey,
                localImageCache,
@@ -2720,7 +2747,7 @@
              }));
              return;
            case OPS.showText:
-@@ -33035,7 +34582,7 @@
+@@ -33035,7 +34591,7 @@
                    resolveXObject();
                    return;
                  }
@@ -2729,7 +2756,7 @@
                  if (globalImage) {
                    resolveXObject();
                    return;
-@@ -33731,7 +35278,7 @@
+@@ -33731,7 +35287,7 @@
        hash.update(`${firstChar}-${lastChar}`);
        if (toUnicode instanceof BaseStream) {
          const stream = toUnicode.str || toUnicode;
@@ -2738,7 +2765,7 @@
          hash.update(uint8array);
        } else if (toUnicode instanceof Name) {
          hash.update(toUnicode.name);
-@@ -54680,7 +56227,10 @@
+@@ -54680,7 +56236,10 @@
      intent,
      cacheKey,
      annotationStorage = null,
@@ -2750,7 +2777,7 @@
    }) {
      const contentStreamPromise = this.getContentStream();
      const resourcesPromise = this.loadResources(["ColorSpace", "ExtGState", "Font", "Pattern", "Properties", "Shading", "XObject"]);
-@@ -54695,7 +56245,8 @@
+@@ -54695,7 +56254,8 @@
        globalColorSpaceCache: this.globalColorSpaceCache,
        globalImageCache: this.globalImageCache,
        systemFontCache: this.systemFontCache,
@@ -2760,7 +2787,7 @@
      });
      const newAnnotsByPage = !this.xfaFactory ? getNewAnnotationsMap(annotationStorage) : null;
      const newAnnots = newAnnotsByPage?.get(this.pageIndex);
-@@ -55815,7 +57366,9 @@
+@@ -55815,7 +57375,9 @@
      enableXfa,
      evaluatorOptions,
      handler,
@@ -2771,7 +2798,7 @@
    }) {
      this._docBaseUrl = parseDocBaseUrl(docBaseUrl);
      this._docId = docId;
-@@ -55824,6 +57377,10 @@
+@@ -55824,6 +57386,10 @@
      evaluatorOptions.isOffscreenCanvasSupported &&= FeatureTest.isOffscreenCanvasSupported;
      evaluatorOptions.isImageDecoderSupported &&= FeatureTest.isImageDecoderSupported;
      this.evaluatorOptions = Object.freeze(evaluatorOptions);
@@ -2782,7 +2809,7 @@
      ImageResizer.setOptions(evaluatorOptions);
      JpegStream.setOptions(evaluatorOptions);
      const options = {
-@@ -55870,7 +57427,8 @@
+@@ -55870,7 +57436,8 @@
    serializeXfaData(annotationStorage) {
      return this.pdfDocument.serializeXfaData(annotationStorage);
    }
@@ -2792,7 +2819,7 @@
      return this.pdfDocument.cleanup(manuallyTriggered);
    }
    async ensure(obj, prop, args) {
-@@ -55912,7 +57470,7 @@
+@@ -55912,7 +57479,7 @@
    requestLoadedStream(noFetch = false) {
      return this._loadedStreamPromise;
    }
@@ -2801,7 +2828,7 @@
  }
  class NetworkPdfManager extends BasePdfManager {
    constructor(args) {
-@@ -55921,15 +57479,32 @@
+@@ -55921,15 +57488,32 @@
        msgHandler: args.handler,
        length: args.length,
        disableAutoFetch: args.disableAutoFetch,
@@ -2836,7 +2863,7 @@
        }
        return value;
      } catch (ex) {
-@@ -55937,7 +57512,7 @@
+@@ -55937,7 +57521,7 @@
          throw ex;
        }
        await this.requestRange(ex.begin, ex.end);
@@ -2845,7 +2872,7 @@
      }
    }
    requestRange(begin, end) {
-@@ -55952,6 +57527,8 @@
+@@ -55952,6 +57536,8 @@
      });
    }
    terminate(reason) {
@@ -2854,7 +2881,7 @@
      this.streamManager.abort(reason);
    }
  }
-@@ -56785,6 +58362,12 @@
+@@ -56785,6 +58371,12 @@
      this._rangeRequestReaders.push(reader);
      return reader;
    }
@@ -2867,7 +2894,7 @@
    cancelAllRequests(reason) {
      this._fullRequestReader?.cancel(reason);
      for (const reader of this._rangeRequestReaders.slice(0)) {
-@@ -56948,6 +58531,22 @@
+@@ -56948,6 +58540,22 @@
      }
      const workerHandlerName = docId + "_worker";
      let handler = new MessageHandler(workerHandlerName, docId, port);
@@ -2890,7 +2917,7 @@
      function ensureNotTerminated() {
        if (terminated) {
          throw new Error("Worker was terminated");
-@@ -56955,40 +58554,50 @@
+@@ -56955,40 +58563,50 @@
      }
      function startWorkerTask(task) {
        WorkerTasks.add(task);
@@ -2960,7 +2987,7 @@
      }) {
        const pdfManagerArgs = {
          source: null,
-@@ -57000,7 +58609,10 @@
+@@ -57000,7 +58618,10 @@
          handler,
          length,
          password,
@@ -2972,7 +2999,7 @@
        };
        if (data) {
          pdfManagerArgs.source = data;
-@@ -57127,7 +58739,7 @@
+@@ -57127,7 +58748,7 @@
          pdfManager = newPdfManager;
          pdfManager.requestLoadedStream(true).then(stream => {
            handler.send("DataLoaded", {
@@ -2981,7 +3008,7 @@
            });
          });
        }).then(pdfManagerReady, onFailure);
-@@ -57196,8 +58808,16 @@
+@@ -57196,8 +58817,16 @@
      handler.on("GetMarkInfo", function (data) {
        return pdfManager.ensureCatalog("markInfo");
      });
@@ -2999,7 +3026,7 @@
      });
      handler.on("GetAnnotations", function ({
        pageIndex,
-@@ -57301,10 +58921,10 @@
+@@ -57301,10 +58930,10 @@
        if (isPureXfa) {
          xfaData = refs[0];
          if (!xfaData) {
@@ -3012,7 +3039,7 @@
        }
        const needAppearances = acroFormRef && acroForm instanceof Dict && changes.values().some(ref => ref.needAppearances);
        const xfa = acroForm instanceof Dict && acroForm.get("XFA") || null;
-@@ -57346,7 +58966,7 @@
+@@ -57346,7 +58975,7 @@
          };
        }
        return incrementalUpdate({
@@ -3021,16 +3048,17 @@
          xrefInfo: newXrefInfo,
          changes,
          xref,
-@@ -57362,6 +58982,8 @@
+@@ -57362,6 +58991,9 @@
          xref.resetNewTemporaryRef();
        });
      });
 +    handler.on("StartExternalImages", ({ pageIndex, epoch }) => pdfManager.externalImages?.startPage(pageIndex, epoch));
 +    handler.on("CancelExternalImages", ({ pageIndex, epoch }) => pdfManager.externalImages?.cancelPage(pageIndex, epoch));
++    handler.on("ReleaseExternalImageRasters", ({ ids }) => pdfManager.externalImages?.releaseRasters(ids));
      handler.on("GetOperatorList", function (data, sink) {
        const pageIndex = data.pageIndex;
        pdfManager.getPage(pageIndex).then(function (page) {
-@@ -57375,7 +58997,10 @@
+@@ -57375,7 +59007,10 @@
            intent: data.intent,
            cacheKey: data.cacheKey,
            annotationStorage: data.annotationStorage,
