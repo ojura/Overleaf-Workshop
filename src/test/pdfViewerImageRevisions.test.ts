@@ -136,6 +136,7 @@ describe('native external-image PDF passes', function () {
             assert.strictEqual(pass.task.imageStatus.total, 1);
             assert.strictEqual(pass.task.imageStatus.covered, 0);
             assert.strictEqual(pass.task.imageStatus.final, false);
+            assert.ok(pass.task.imageIntent && Object.isFrozen(pass.task.imageIntent), 'a completed native pass carries its owned intent identity');
             const text = await value.page.getTextContent();
             assert.ok(text.items.some((item: any) => item.str === 'Native text first'));
             assert.ok(pass.pixels().some((n: number) => n < 200), 'text and vector operators paint during the first native pass');
@@ -145,12 +146,14 @@ describe('native external-image PDF passes', function () {
             await coarse.task.promise;
             assert.strictEqual(coarse.task.imageStatus.covered, 1);
             assert.strictEqual(coarse.task.imageStatus.final, false);
+            assert.strictEqual(coarse.task.imageIntent, pass.task.imageIntent);
             assert.notDeepStrictEqual(coarse.pixels(), pass.pixels());
             rest.resolve();
             await value.page.waitForImages({ final: true });
             const final = render(value.page), reference = render(originalDocument.page);
             await Promise.all([final.task.promise, reference.task.promise]);
             assert.strictEqual(final.task.imageStatus.final, true);
+            assert.strictEqual(final.task.imageIntent, pass.task.imageIntent);
             assert.deepStrictEqual(final.pixels(), reference.pixels(), 'the complete native operator list retains transform, clip, text and foreground vector order');
             assert.deepStrictEqual(reads, [0, 1], 'the native bridge reads first coverage and one verified tail without the original image body');
             const stats = await value.document.getRangeCacheStats();
@@ -254,6 +257,7 @@ describe('native external-image PDF passes', function () {
             assert.strictEqual(empty.externalImageNativeRasterBytes, 0);
             held = false;
             const next = render(value.page); await next.task.promise;
+            assert.notStrictEqual(next.task.imageIntent, initial.task.imageIntent, 'a cancelled intent cannot authorize replacement coverage');
             await value.page.waitForImages({ final: true });
             const final = render(value.page); await final.task.promise;
             assert.strictEqual(final.task.imageStatus.final, true);
