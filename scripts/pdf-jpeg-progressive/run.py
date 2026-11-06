@@ -139,12 +139,12 @@ def main():
     if args.check_negative_control:
         module = output / "pinned-incremental.mjs"
         text = module.read_text()
-        original = "blockData:component.blockData.slice()"
+        original = "quantizeAndInverse(component, getBlockBufferOffset(component, blockRow, blockCol), scratch, row, rowOffset);"
         if text.count(original) != 1:
             raise ValueError("Destructive-IDCT control no longer matches the helper")
         negative = output / "negative-incremental.mjs"
         try:
-            negative.write_text(text.replace(original, "blockData:component.blockData"))
+            negative.write_text(text.replace(original, "quantizeAndInverse(component, getBlockBufferOffset(component, blockRow, blockCol), scratch);"))
             failed = subprocess.run(node + ["--check-only", "--decoder", negative.name],
                                     text=True, capture_output=True, timeout=20, preexec_fn=limited)
             if failed.returncode == 0 or "IDCT mutated retained coefficients" not in failed.stderr:
