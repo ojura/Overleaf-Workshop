@@ -7,6 +7,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
 import { outputsOf, PdfFetchBridge, PieceCache } from '../core/pdfFetchBridge';
+import { PDF_READING_REQUEST_LIMITS } from '../core/viewerProtocol';
 
 const sha256 = (content: Uint8Array) => createHash('sha256').update(content).digest('hex');
 const pdf = new TextEncoder().encode('%PDF-1.7 ' + 'x'.repeat(5000));
@@ -144,22 +145,22 @@ describe('the PDF viewer\'s fetches through the extension', () => {
         } finally { bridge.dispose(); }
     });
 
-    it('retains cancelled image admission until its read settles and fences disposal', async () => {
+    it('retains cancelled image admission until its read settles and then admits the waiting replacement', async () => {
         const bridge = new PdfFetchBridge(() => false), revision = 'a'.repeat(64);
         const reads: Array<{ signal: AbortSignal; resolve(value: { body: Uint8Array; offset: number; total: number }): void }> = [];
         bridge.setReading(revision, (_id, _index, signal) => new Promise(resolve => reads.push({ signal, resolve })));
         const request = (id: number) => bridge.handleReading({ id, manifestRevision: revision, imageId: 'x1', chunkIndex: 0 });
         const pending = [1, 2, 3, 4].map(request);
         const rejected = assert.rejects(pending[0], /stopped/);
+        const next = request(5);
+        const stopping = [...pending.slice(1), next].map(value => assert.rejects(value, /stopped/));
         try {
-            await assert.rejects(request(5), /limit/);
+            assert.strictEqual(reads.length, 4);
             bridge.abort(1);
             assert.strictEqual(reads[0].signal.aborted, true);
-            await assert.rejects(request(5), /limit/, 'an aborted but unfinished disk read still occupies its slot');
+            assert.strictEqual(reads.length, 4, 'an aborted but unfinished disk read still occupies its slot');
             reads[0].resolve({ body: new Uint8Array([1]), offset: 0, total: 1 }); await rejected;
-            const next = request(5);
             assert.strictEqual(reads.length, 5);
-            const stopping = [...pending.slice(1), next].map(value => assert.rejects(value, /stopped/));
             bridge.dispose();
             assert.ok(reads.every(read => read.signal.aborted));
             for (const read of reads.slice(1)) { read.resolve({ body: new Uint8Array([1]), offset: 0, total: 1 }); }
@@ -168,7 +169,40 @@ describe('the PDF viewer\'s fetches through the extension', () => {
         } finally {
             bridge.dispose();
             for (const read of reads) { read.resolve({ body: new Uint8Array([1]), offset: 0, total: 1 }); }
-            await Promise.allSettled(pending);
+            await Promise.allSettled([...pending, next, rejected, ...stopping]);
+        }
+    });
+
+    it('bounds waiting image admission and cancels queued reads without opening files', async () => {
+        const bridge = new PdfFetchBridge(() => false), revision = 'a'.repeat(64);
+        const reads: Array<{ id: string; resolve(value: { body: Uint8Array; offset: number; total: number }): void }> = [];
+        bridge.setReading(revision, (id) => new Promise(resolve => reads.push({ id, resolve })));
+        const request = (id: number) => bridge.handleReading({ id, manifestRevision: revision, imageId: 'x' + id, chunkIndex: 0 });
+        const { active, queued } = PDF_READING_REQUEST_LIMITS;
+        const running = Array.from({ length: active }, (_, index) => request(index + 1));
+        const waiting = Array.from({ length: queued }, (_, index) => request(active + index + 1));
+        const stopped = [...running, ...waiting].map(value => assert.rejects(value, /stopped/));
+        const replacements: Promise<unknown>[] = [];
+        try {
+            await assert.rejects(request(active + queued + 1), /queue is full/);
+            assert.strictEqual(reads.length, active);
+            bridge.abort(active + 1);
+            await stopped[active];
+            const replacement = request(active + queued + 1);
+            replacements.push(assert.rejects(replacement, /stopped/));
+            await assert.rejects(request(active + queued + 2), /queue is full/, 'a cancelled queue entry frees exactly one place');
+            // Reusing an ID cancels its old queued request without cancelling the new owner.
+            const sameId = request(active + 2);
+            replacements.push(assert.rejects(sameId, /stopped/));
+            await stopped[active + 1];
+            bridge.dispose();
+            for (const read of reads) { read.resolve({ body: new Uint8Array([1]), offset: 0, total: 1 }); }
+            await Promise.all([...stopped, ...replacements]);
+            assert.strictEqual(reads.length, active, 'queued, cancelled and disposed work never reaches the registered file reader');
+        } finally {
+            bridge.dispose();
+            for (const read of reads) { read.resolve({ body: new Uint8Array([1]), offset: 0, total: 1 }); }
+            await Promise.allSettled([...running, ...waiting, ...stopped, ...replacements]);
         }
     });
 

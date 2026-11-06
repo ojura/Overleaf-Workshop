@@ -2,6 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { PdfFetchBridge } from '../core/pdfFetchBridge';
 
 // tsc turns import() into require(), which cannot load ES modules
 const importModule = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
@@ -93,6 +94,52 @@ export { pdfPerformance } from ${JSON.stringify(path.join(viewerRoot, 'src', 'co
         deliver({ type: 'fetchResponse', page: 'page-2', id: 3, status: 206, headers: [], body: new Uint8Array([9]) });
         assert.strictEqual(bridge.pdfPerformance.snapshot().fetchBytes, 1);
         assert.strictEqual(bridge.pdfPerformance.pendingFetchCount, 0);
+    });
+
+    it('waits for actual host disk ownership after immediate browser cancellation', async () => {
+        const host = new PdfFetchBridge(() => false), revision = 'a'.repeat(64);
+        const reads: Array<{ signal: AbortSignal; resolve(value: { body: Uint8Array; offset: number; total: number }): void }> = [];
+        const replies: Promise<void>[] = [];
+        let nextStarted!: () => void;
+        const started = new Promise<void>(resolve => { nextStarted = resolve; });
+        host.setReading(revision, (_id, _chunk, signal) => new Promise(resolve => {
+            reads.push({ signal, resolve }); if (reads.length === 5) { nextStarted(); }
+        }));
+        client = bridge.installBridgeFetch((message: any) => {
+            if (message.type === 'fetchAbort') { host.abort(message.id); return; }
+            replies.push(host.handleReading(message).then(
+                response => { deliver({ type: 'fetchResponse', page: message.page, ...response, body: response.body.slice() }); },
+                error => { deliver({ type: 'fetchError', page: message.page, id: message.id, message: error.message }); },
+            ));
+        }, () => false, 'page-2');
+        const request = (signal: AbortSignal): Promise<any> => client.readImage({ manifestRevision: revision, imageId: 'x1', chunkIndex: 0 }, signal);
+        const value = { body: new Uint8Array([7, 8]), offset: 0, total: 2 };
+        let healthy: Promise<any> | undefined;
+        try {
+            for (let index = 0; index < 4; index++) {
+                const controller = new AbortController();
+                const rejected = assert.rejects(request(controller.signal), { name: 'AbortError' });
+                controller.abort(); await rejected;
+            }
+            assert.strictEqual(reads.length, 4);
+            assert.ok(reads.every(read => read.signal.aborted));
+            let settled = false, failed: Error | undefined;
+            healthy = request(new AbortController().signal);
+            void healthy.then(() => { settled = true; }, (error: Error) => { settled = true; failed = error; });
+            await new Promise<void>(resolve => setImmediate(resolve));
+            assert.strictEqual(failed, undefined, 'a healthy replacement must wait instead of receiving a capacity error');
+            assert.strictEqual(settled, false, 'cancelled reads still own all four disk slots');
+            assert.strictEqual(reads.length, 4);
+            reads[0].resolve(value); await started;
+            assert.strictEqual(reads.length, 5);
+            reads[4].resolve(value);
+            assert.deepStrictEqual(new Uint8Array(await (await healthy).arrayBuffer()), value.body);
+            assert.strictEqual(bridge.pdfPerformance.snapshot().fetchBytes, 0, 'image transfer accounting remains with the reading loader');
+        } finally {
+            host.dispose();
+            for (const read of reads) { read.resolve(value); }
+            await Promise.all(replies); await healthy?.catch(() => {});
+        }
     });
 
     it('exposes already-delivered host bytes as a native stream without copying the binary payload', async () => {

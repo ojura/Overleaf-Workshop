@@ -6,6 +6,7 @@ import { Agent, fetch } from 'undici';
 import { cachedDownloadDomainUrl } from '../api/downloadDomain';
 import { PdfDiskCache, PdfCacheViewer, PdfFillRequest } from './pdfDiskCache';
 import type { BridgeRequest, BridgeResponse, PdfOutput, ReadingImageRequest } from './viewerProtocol';
+import { PDF_READING_REQUEST_LIMITS } from './viewerProtocol';
 
 // The old public name remains for the harness and callers that only use content pieces.
 export { PdfDiskCache as PieceCache } from './pdfDiskCache';
@@ -77,6 +78,7 @@ export class PdfFetchBridge {
     private readonly outputs: PdfOutput[] = [];
     private readonly readings = new Map<string, (id: string, chunk: number, signal: AbortSignal) => Promise<{ body: Uint8Array; offset: number; total: number }>>();
     private readonly readingRequests = new Set<AbortController>();
+    private readonly readingQueue: Array<{ start(): void; cancel(): void }> = [];
     private disposed = false;
 
     constructor(private readonly allowed: (url: URL) => boolean, private readonly cache?: PdfDiskCache, private readonly options: BridgeOptions = {}) {
@@ -147,17 +149,51 @@ export class PdfFetchBridge {
         while (this.readings.size > 4) { this.readings.delete(this.readings.keys().next().value!); }
     }
 
+    /** Browser cancellation is immediate, but an in-flight filesystem read retains
+     * its slot until it settles. Bounded replacements wait here instead of losing an image. */
+    private waitForReadingSlot(controller: AbortController): Promise<void> {
+        return new Promise((resolve, reject) => {
+            if (this.disposed || controller.signal.aborted) { reject(new Error('Reading image request stopped')); return; }
+            if (this.readingQueue.length >= PDF_READING_REQUEST_LIMITS.queued) { reject(new Error('Reading image request queue is full')); return; }
+            const job = {
+                start: () => {
+                    controller.signal.removeEventListener('abort', job.cancel);
+                    if (this.disposed || controller.signal.aborted) { reject(new Error('Reading image request stopped')); return; }
+                    this.readingRequests.add(controller);
+                    resolve();
+                },
+                cancel: () => {
+                    const index = this.readingQueue.indexOf(job);
+                    if (index >= 0) { this.readingQueue.splice(index, 1); }
+                    controller.signal.removeEventListener('abort', job.cancel);
+                    reject(new Error('Reading image request stopped'));
+                },
+            };
+            controller.signal.addEventListener('abort', job.cancel, { once: true });
+            this.readingQueue.push(job);
+        });
+    }
+
+    private releaseReadingSlot(controller: AbortController) {
+        if (!this.readingRequests.delete(controller)) { return; }
+        while (!this.disposed && this.readingRequests.size < PDF_READING_REQUEST_LIMITS.active && this.readingQueue.length) {
+            this.readingQueue.shift()!.start();
+        }
+    }
+
     async handleReading(request: ReadingImageRequest): Promise<BridgeResponse> {
         const read = this.readings.get(request.manifestRevision);
         if (this.disposed || !read || !Number.isSafeInteger(request.id) || request.id < 1
             || typeof request.imageId !== 'string' || !Number.isSafeInteger(request.chunkIndex) || request.chunkIndex < 0) {
             throw new Error('Reading image request is not registered for this viewer');
         }
-        if (this.readingRequests.size >= 4) { throw new Error('Reading image request limit reached'); }
         const controller = new AbortController();
         this.running.get(request.id)?.abort();
-        this.running.set(request.id, controller); this.readingRequests.add(controller);
+        this.running.set(request.id, controller);
         try {
+            if (this.readingRequests.size >= PDF_READING_REQUEST_LIMITS.active) { await this.waitForReadingSlot(controller); }
+            else { this.readingRequests.add(controller); }
+            if (controller.signal.aborted || this.disposed) { throw new Error('Reading image request stopped'); }
             const value = await read(request.imageId, request.chunkIndex, controller.signal);
             if (controller.signal.aborted || this.disposed) { throw new Error('Reading image request stopped'); }
             const partial = value.offset !== 0 || value.body.byteLength !== value.total;
@@ -167,7 +203,7 @@ export class PdfFetchBridge {
                         'bytes ' + value.offset + '-' + (value.offset + value.body.byteLength - 1) + '/' + value.total] as [string, string]] : [])] };
         } finally {
             if (this.running.get(request.id) === controller) { this.running.delete(request.id); }
-            this.readingRequests.delete(controller);
+            this.releaseReadingSlot(controller);
         }
     }
 
