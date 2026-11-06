@@ -123,6 +123,39 @@ class ReadingProductionTest(unittest.TestCase):
             document.xref_set_key(xref, "MotionLabImage", "null")
         return document
 
+    def completed_original_fallback(self):
+        """An earlier producer accepted the book but kept a JPEG with a trailer original."""
+        encoded = jpeg() + b"\r\n"
+        with fitz.open() as document:
+            page = document.new_page(width=240, height=180)
+            first = page.insert_image(fitz.Rect(10, 10, 110, 90), stream=encoded)
+            page.insert_image(fitz.Rect(120, 90, 230, 170), stream=jpeg(rgb=True))
+            document.save(self.source)
+        self.run_cli()
+        manifest = self.manifest()
+        # Construct the previous producer's completed representation independently
+        # of whether this checkout already supports source JPEG trailers.
+        asset = {"path": "reading/image-" + digest(encoded) + ".bin",
+                 "bytes": len(encoded), "sha256": digest(encoded)}
+        (self.output / asset["path"]).write_bytes(encoded)
+        identifier = "x" + str(first)
+        previous = next(image for image in manifest["images"] if image["id"] == identifier)
+        original = {**asset, "id": identifier, "originalSha256": digest(encoded),
+                    "width": previous["width"], "height": previous["height"], "components": 3,
+                    "encoding": "original", "fallbackReason": "jpeg-structure"}
+        manifest["images"] = [original if image["id"] == identifier else image for image in manifest["images"]]
+        READING.validate_manifest(manifest)
+        READING.atomic_json(self.output / "reading.json", manifest, READING.PROTOCOL.Deadline(10))
+        return manifest, identifier
+
+    def recording_verifier(self, calls):
+        tool = self.root / "record-refresh-verifier"
+        tool.write_text("#!" + sys.executable + "\nimport json,os,sys\n"
+                       "with open(" + repr(str(calls)) + ",'a') as out: out.write(json.dumps(sys.argv[4:])+'\\n')\n"
+                       "os.execv(" + repr(str(self.tool)) + ", [" + repr(str(self.tool)) + "]+sys.argv[1:])\n")
+        tool.chmod(0o700)
+        return tool
+
     def test_structure_preserves_text_geometry_paint_order_forms_and_masks(self):
         _, events = self.run_cli()
         manifest = self.manifest()
@@ -198,6 +231,138 @@ class ReadingProductionTest(unittest.TestCase):
             self.assertIn(b"Adobe", encoded)
             self.assertEqual(image["encoding"], "progressive-jpeg")
             self.assertEqual(original[0].get_pixmap().samples, restored[0].get_pixmap().samples)
+
+    def test_source_jpeg_trailers_keep_full_identity_and_lossless_native_pixels(self):
+        for name, trailer in (("crlf", b"\r\n"), ("embedded", b"\x00camera-metadata\x00" + jpeg(rgb=True))):
+            with self.subTest(trailer=name):
+                encoded = jpeg() + trailer
+                self.output = self.root / name
+                with fitz.open() as document:
+                    page = document.new_page(width=96, height=64)
+                    page.insert_image(page.rect, stream=encoded)
+                    document.save(self.source)
+                self.run_cli()
+                manifest = self.manifest()
+                image = manifest["images"][0]
+                self.assertEqual(image["encoding"], "progressive-jpeg")
+                self.assertEqual(image["originalSha256"], digest(encoded))
+                converted = (self.output / image["path"]).read_bytes()
+                frame = READING.jpeg_structure(converted)
+                self.assertEqual(sum(chunk["bytes"] for chunk in frame["chunks"]), len(converted))
+                with self.assertRaises(READING.Failure):
+                    READING.jpeg_structure(converted + trailer)
+                with fitz.open(self.source) as original, self.reconstruct(manifest) as restored:
+                    self.assertEqual(original[0].get_pixmap().samples, restored[0].get_pixmap().samples)
+
+    def test_refresh_reconsiders_original_fallback_and_reuses_verified_progressive_assets(self):
+        previous, identifier = self.completed_original_fallback()
+        old_assets = {asset["path"]: state(self.output / asset["path"])
+                      for asset in [previous["pdf"], *previous["images"]]}
+        original_manifest = (self.output / "reading.json").read_bytes()
+        _, events = self.run_cli()
+        self.assertTrue(events[-1]["reused"])
+        self.assertEqual((self.output / "reading.json").read_bytes(), original_manifest)
+        calls = self.root / "refresh-calls.jsonl"
+        _, events = self.run_cli("--refresh", "--jpeg-tool", str(self.recording_verifier(calls)))
+        refreshed = self.manifest()
+        self.assertFalse(events[-1]["reused"])
+        self.assertEqual(refreshed["source"], previous["source"])
+        image = next(image for image in refreshed["images"] if image["id"] == identifier)
+        old = next(image for image in previous["images"] if image["id"] == identifier)
+        self.assertEqual(image["encoding"], "progressive-jpeg")
+        self.assertEqual(image["originalSha256"], old["originalSha256"])
+        self.assertEqual(old_assets, {name: state(self.output / name) for name in old_assets})
+        self.assertEqual([json.loads(line) for line in calls.read_text().splitlines()],
+                         [["--early-dc"], ["--verify-only"]])
+        self.assertFalse((self.output / READING.STATE).exists())
+        with fitz.open(self.source) as original, self.reconstruct(refreshed) as restored:
+            self.assertEqual(original[0].get_pixmap().samples, restored[0].get_pixmap().samples)
+        # A crash can leave a checkpoint after the new manifest has committed.
+        # Entries from that older base must not replace completed refreshed ones.
+        (self.output / READING.STATE).write_text(json.dumps({
+            "version": previous["version"], "source": {key: previous["source"][key] for key in ("sha256", "size")},
+            "verifier": digest(VERIFIER.read_bytes() + READING.FORMAT_PATH.read_bytes()),
+            "baseManifest": digest(READING.json_bytes(previous)), "images": previous["images"]}))
+        calls.unlink()
+        self.run_cli("--refresh", "--jpeg-tool", str(self.recording_verifier(calls)))
+        self.assertEqual(self.manifest(), refreshed)
+        self.assertEqual([json.loads(line) for line in calls.read_text().splitlines()],
+                         [["--verify-only"], ["--verify-only"]])
+        self.assertFalse((self.output / READING.STATE).exists())
+
+    def test_refresh_quota_keeps_the_completed_manifest_and_all_owned_bytes(self):
+        previous, _ = self.completed_original_fallback()
+        payload = (self.output / "reading.json").read_bytes()
+        before = {asset["path"]: state(self.output / asset["path"])
+                  for asset in [previous["pdf"], *previous["images"]]}
+        quota = READING.owned_bytes(self.output, READING.PROTOCOL.Deadline(10))
+        result, events = self.run_cli("--refresh", "--max-output-mib", str(quota / READING.MIB), success=False)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertEqual(events[-1]["event"], "partial")
+        self.assertEqual((self.output / "reading.json").read_bytes(), payload)
+        self.assertEqual(before, {name: state(self.output / name) for name in before})
+        self.assertLessEqual(READING.owned_bytes(self.output, READING.PROTOCOL.Deadline(10)), quota)
+        READING.verify_manifest(self.output, previous, READING.PROTOCOL.Deadline(10), quota)
+        self.assertFalse(list(self.output.glob(".reading-work-*")))
+        self.assertFalse(list(self.output.rglob(".reading-pending-*")))
+
+    def test_interrupted_refresh_keeps_the_completed_representation_and_resumes_its_checkpoint(self):
+        previous, identifier = self.completed_original_fallback()
+        payload = (self.output / "reading.json").read_bytes()
+        before = {asset["path"]: state(self.output / asset["path"])
+                  for asset in [previous["pdf"], *previous["images"]]}
+        fifo = self.root / "refresh-ready"
+        os.mkfifo(fifo)
+        descriptor = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        calls = self.root / "interrupted-refresh-calls.jsonl"
+        tool = self.root / "pause-second-verification"
+        tool.write_text("#!" + sys.executable + "\nimport json,os,pathlib,signal,sys\n"
+                       "calls=pathlib.Path(" + repr(str(calls)) + ")\n"
+                       "count=len(calls.read_text().splitlines()) if calls.exists() else 0\n"
+                       "with calls.open('a') as out: out.write(json.dumps(sys.argv[4:])+'\\n')\n"
+                       "if count==1:\n"
+                       " with open(" + repr(str(fifo)) + ", 'w') as out: out.write(str(os.getpid()))\n"
+                       " signal.pause()\n"
+                       "os.execv(" + repr(str(self.tool)) + ", [" + repr(str(self.tool)) + "]+sys.argv[1:])\n")
+        tool.chmod(0o700)
+        process = subprocess.Popen([sys.executable, "-B", str(SCRIPT), str(self.source), "--output", str(self.output),
+                                    "--refresh", "--jpeg-tool", str(tool)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            ready = select.select([descriptor], [], [], 10)[0]
+            if not ready and process.poll() is not None:
+                stdout, stderr = process.communicate()
+                self.fail("Refresh exited before the native pause: " + (stdout + stderr).decode())
+            self.assertTrue(ready, "refresh did not reach its second native operation")
+            native_pid = int(os.read(descriptor, 4096))
+            checkpoint = json.loads((self.output / READING.STATE).read_text())
+            self.assertEqual([image["id"] for image in checkpoint["images"]], [identifier])
+            completed = checkpoint["images"][0]
+            completed_state = state(self.output / completed["path"])
+            self.assertEqual(completed["encoding"], "progressive-jpeg")
+            self.assertEqual((self.output / "reading.json").read_bytes(), payload)
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 143, stdout + stderr)
+            native = Path(f"/proc/{native_pid}/stat")
+            if native.exists():
+                self.assertEqual(native.read_text().split(") ", 1)[1].split()[0], "Z")
+            self.assertEqual(before, {name: state(self.output / name) for name in before})
+            self.assertEqual((self.output / "reading.json").read_bytes(), payload)
+            READING.verify_manifest(self.output, previous, READING.PROTOCOL.Deadline(10), 64 * READING.MIB)
+            self.assertFalse(list(self.output.glob(".reading-work-*")))
+            self.run_cli()
+            self.assertEqual((self.output / "reading.json").read_bytes(), payload)
+            resumed_calls = self.root / "resumed-refresh-calls.jsonl"
+            self.run_cli("--refresh", "--jpeg-tool", str(self.recording_verifier(resumed_calls)))
+            self.assertEqual([json.loads(line) for line in resumed_calls.read_text().splitlines()], [["--verify-only"]])
+            self.assertEqual(state(self.output / completed["path"]), completed_state)
+            self.assertEqual(next(image for image in self.manifest()["images"] if image["id"] == identifier)["encoding"], "progressive-jpeg")
+            self.assertFalse((self.output / READING.STATE).exists())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5)
+            os.close(descriptor)
 
     def test_initial_dc_precision_uses_quantizers_with_a_two_level_component_bound(self):
         for quality, expected_al in ((100, 4), (95, 3), (90, 2), (75, 1), (40, 0)):

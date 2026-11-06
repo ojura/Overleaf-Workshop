@@ -200,8 +200,13 @@ def verify_manifest(root, value, deadline, quota):
     return total
 
 
-def jpeg_structure(data):
-    """Read markers without decoding pixels; scan chunks include their next marker."""
+def jpeg_structure(data, *, allow_trailing=False):
+    """Read one JPEG; generated scan chunks include their next marker.
+
+    A PDF's original DCT stream may contain camera metadata, padding or another
+    image after EOI. Native decoding ends at that EOI. Generated assets instead
+    require EOI to end the file so their verified scan table covers every byte.
+    """
     if data[:2] != b"\xff\xd8":
         raise Failure("JPEG has no SOI marker")
     position, scan, frame, chunks, start = 2, 0, None, [], 0
@@ -217,7 +222,7 @@ def jpeg_structure(data):
         marker = data[position]
         position += 1
         if marker == 0xD9:
-            if position != len(data) or frame is None or not chunks:
+            if (position != len(data) and not allow_trailing) or frame is None or not chunks:
                 raise Failure("JPEG end or trailing bytes are invalid")
             return {**frame, "chunks": chunks, "scans": scan, "colorMarkers": color_markers}
         if marker in (0, 0xD8) or 0xD0 <= marker <= 0xD7:
@@ -426,6 +431,46 @@ def checked_progressive(encoded, original):
     return converted
 
 
+def reusable_images(root, job):
+    """Resume a checkpoint against the completed manifest it is refreshing."""
+    cached, recheck = {}, set()
+    revision = job.get("refresh_revision")
+    if revision is not None:
+        completed = PROTOCOL.read_json(root / "reading.json", MAX_MANIFEST_BYTES)
+        if sha(json_bytes(completed)) != revision:
+            raise Failure("The completed reading manifest changed before refresh")
+        validate_manifest(completed, job["identity"]["sha256"], job["quota"])
+        for image in completed["images"]:
+            cached[image["id"]] = image
+            if image["encoding"] == "progressive-jpeg":
+                recheck.add(image["id"])
+    state_path = root / STATE
+    if state_path.exists():
+        saved = PROTOCOL.read_json(state_path, MAX_MANIFEST_BYTES)
+        if (saved.get("version") != VERSION or saved.get("source") != job["identity"]
+                or not isinstance(saved.get("verifier"), str) or not HASH.fullmatch(saved["verifier"])
+                or not isinstance(saved.get("images"), list)
+                or saved.get("baseManifest") is not None and (not isinstance(saved["baseManifest"], str)
+                    or not HASH.fullmatch(saved["baseManifest"]))):
+            raise Failure("Partial reading work belongs to a different source or producer")
+        # A crash after manifest replacement can leave the previous checkpoint.
+        # Its old base must not overwrite the newly completed representation.
+        if saved.get("baseManifest") != revision:
+            return cached, recheck
+        seen = set()
+        for image in saved["images"]:
+            validate_image(image)
+            identifier = image["id"]
+            if identifier in seen:
+                raise Failure("Duplicate partial reading image")
+            seen.add(identifier)
+            cached[identifier] = image
+            recheck.discard(identifier)
+            if image["encoding"] == "progressive-jpeg" and saved["verifier"] != job["verifier"]:
+                recheck.add(identifier)
+    return cached, recheck
+
+
 def prepare(job):
     import fitz
     source, root, staging = Path(job["source"]), Path(job["output"]), Path(job["staging"])
@@ -433,20 +478,7 @@ def prepare(job):
     output = Output(root, job["quota"], deadline)
     PROTOCOL.check_source(source, job["fingerprint"])
     images, inventory = [], []
-    cached, changed_verifier = {}, False
-    state_path = root / STATE
-    if state_path.exists():
-        saved = PROTOCOL.read_json(state_path, MAX_MANIFEST_BYTES)
-        if (saved.get("version") != VERSION or saved.get("source") != job["identity"]
-                or not isinstance(saved.get("verifier"), str) or not HASH.fullmatch(saved["verifier"])
-                or not isinstance(saved.get("images"), list)):
-            raise Failure("Partial reading work belongs to a different source or producer")
-        changed_verifier = saved["verifier"] != job["verifier"]
-        for image in saved["images"]:
-            validate_image(image)
-            if image["id"] in cached:
-                raise Failure("Duplicate partial reading image")
-            cached[image["id"]] = image
+    cached, recheck = reusable_images(root, job)
     with source.open("rb") as source_stream, fitz.open(source) as document:
         if not document.is_pdf or document.needs_pass or not 0 < document.page_count <= MAX_PAGES:
             raise Failure("The reading source must be an unencrypted PDF with a bounded page count")
@@ -474,7 +506,7 @@ def prepare(job):
             is_jpeg = keys.get("Filter") == ("name", "/DCTDecode")
             if is_jpeg:
                 try:
-                    frame = jpeg_structure(encoded)
+                    frame = jpeg_structure(encoded, allow_trailing=True)
                     reason = progressive_reason(frame)
                     if (frame["width"], frame["height"]) != (width, height):
                         reason = "jpeg-dimensions"
@@ -487,13 +519,22 @@ def prepare(job):
                 if (image["originalSha256"], image["width"], image["height"]) != (original_sha, width, height):
                     raise Failure("Partial reading image differs from the exact source")
                 verified_asset(root, image, deadline, image.get("chunks"))
-                if changed_verifier and image["encoding"] == "progressive-jpeg":
+                if identifier in recheck:
                     original_file = staging / "input.jpg"
                     original_file.write_bytes(encoded)
                     verify_jpeg(job, original_file, root / image["path"], deadline, transcode=False)
                     checked_progressive((root / image["path"]).read_bytes(), frame)
                     original_file.unlink()
-            else:
+                if image["encoding"] == "original":
+                    if reason is None:
+                        image = None
+                    else:
+                        image = {**image, "fallbackReason": reason}
+                        if frame:
+                            image["components"] = frame["components"]
+                        else:
+                            image.pop("components", None)
+            if image is None:
                 if reason is None:
                     original_file, progressive_file = staging / "input.jpg", staging / "progressive.jpg"
                     original_file.write_bytes(encoded)
@@ -520,7 +561,8 @@ def prepare(job):
             document.xref_set_key(xref, MARKER, "(" + identifier + ")")
             PROTOCOL.check_source(source, job["fingerprint"], source_stream.fileno())
             output.metadata(STATE, {"version": VERSION, "source": job["identity"],
-                                    "verifier": job["verifier"], "images": images})
+                                    "verifier": job["verifier"], "baseManifest": job.get("refresh_revision"),
+                                    "images": images})
         layout = document.tobytes(garbage=0, deflate=False, no_new_id=True)
         pdf = output.asset(layout, "layout", "pdf", MAX_PDF_BYTES)
         manifest = {"version": VERSION, "source": {**job["identity"], "pageCount": document.page_count},
@@ -648,6 +690,7 @@ async def run(args):
             if receipt and (receipt["sha256"], receipt["size"]) != (digest, expected[2]):
                 raise Failure("The reading source differs from its exact export receipt")
             manifest_path = root / "reading.json"
+            refresh_revision = None
             if manifest_path.exists() or manifest_path.is_symlink():
                 value = PROTOCOL.read_json(manifest_path, MAX_MANIFEST_BYTES)
                 if {key: value.get("source", {}).get(key) for key in identity} != identity:
@@ -655,9 +698,11 @@ async def run(args):
                 total = verify_manifest(root, value, deadline, quota)
                 Output(root, quota, deadline)
                 PROTOCOL.check_source(source, expected, stream.fileno())
-                PROTOCOL.emit("complete", manifest=str(manifest_path), source=value["source"], pdfBytes=value["pdf"]["bytes"],
-                              assetBytes=total, coverage=coverage(value["images"]), reused=True)
-                return 0
+                if not args.refresh:
+                    PROTOCOL.emit("complete", manifest=str(manifest_path), source=value["source"], pdfBytes=value["pdf"]["bytes"],
+                                  assetBytes=total, coverage=coverage(value["images"]), reused=True)
+                    return 0
+                refresh_revision = sha(json_bytes(value))
             # Only this generator's exact staging names are removed under its lock.
             for old in root.glob(STAGING + "*"):
                 if old.is_symlink() or not old.is_dir():
@@ -669,7 +714,8 @@ async def run(args):
             PROTOCOL.emit("start", source=identity, output=str(root), maxOutputBytes=quota)
             result = await invoke({"source": str(source), "output": str(root), "staging": str(staging),
                 "fingerprint": expected, "identity": identity, "tool": str(tool), "verifier": verifier,
-                "quota": quota, "memory_mib": args.max_worker_mib, "job_timeout": args.job_timeout_seconds}, deadline)
+                "refresh_revision": refresh_revision, "quota": quota, "memory_mib": args.max_worker_mib,
+                "job_timeout": args.job_timeout_seconds}, deadline)
             PROTOCOL.check_source(source, expected, stream.fileno())
             value = result["manifest"]
             if {key: value.get("source", {}).get(key) for key in identity} != identity:
@@ -705,6 +751,8 @@ def parser():
     result.add_argument("--output", help="Directory shared with an optional raster manifest")
     result.add_argument("--source-receipt", help="Existing exact-build PDF export receipt")
     result.add_argument("--document-key", help="Checked against the existing export receipt when supplied")
+    result.add_argument("--refresh", action="store_true",
+                        help="Reconsider completed original-image fallbacks while preserving the current manifest until completion")
     result.add_argument("--jpeg-tool", help="Prebuilt maintained coefficients.c verifier; otherwise compile it once")
     result.add_argument("--max-output-mib", type=PROTOCOL.finite_positive, default=2048,
                         help="Reading assets and metadata only, separate from raster preview bytes")
