@@ -1,0 +1,27 @@
+{
+    "version": 1,
+    "syntax": {
+        "sha256": "^[a-f0-9]{64}$",
+        "imageId": "^x[1-9][0-9]{0,9}$",
+        "pathSegment": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "limits": {
+        "manifestBytes": 4194304,
+        "sourceBytes": 4294967296,
+        "pages": 10000,
+        "images": 32768,
+        "pdfBytes": 33554432,
+        "assetBytes": 67108864,
+        "dimension": 65535,
+        "pixels": 268435456,
+        "progressivePixels": 16777216,
+        "coefficientBytes": 67108864,
+        "coefficientElementBytes": 2,
+        "chunks": 256,
+        "components": 32,
+        "progressiveComponents": 3,
+        "progressivePrecision": 8,
+        "pathLength": 512,
+        "fallbackReasonLength": 256
+    }
+}
