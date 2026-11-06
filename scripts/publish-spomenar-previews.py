@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish one verified preview-manifest snapshot into its public SHA namespace."""
+"""Publish one verified preview or reading manifest into its public SHA namespace."""
 from __future__ import annotations
 
 import argparse
@@ -24,6 +24,10 @@ _spec = importlib.util.spec_from_file_location(
     "motionlab_preview_protocol", Path(__file__).resolve().with_name("motionlab-previews.py"))
 _protocol = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_protocol)
+_reading_spec = importlib.util.spec_from_file_location(
+    "motionlab_reading_protocol", Path(__file__).resolve().with_name("motionlab-reading.py"))
+READING = importlib.util.module_from_spec(_reading_spec)
+_reading_spec.loader.exec_module(READING)
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -85,6 +89,7 @@ def finite_number(value):
 
 def canonical_asset(value):
     return (isinstance(value, str) and _protocol.SAFE_ASSET.fullmatch(value) is not None
+            and not _protocol.reading_path(value)
             and all(part not in ("", ".", "..") for part in value.split("/"))
             and value.split("/")[0] != "manifest.json")
 
@@ -151,6 +156,13 @@ def validate_manifest(value, expected_sha, byte_budget):
         if any("/".join(parts[:length]) in paths for length in range(1, len(parts))):
             raise Failure("Preview asset paths conflict as files and directories")
     return assets, total_bytes
+
+
+def validate_reading(value, expected_sha, byte_budget):
+    try:
+        return READING.validate_manifest(value, expected_sha, byte_budget)
+    except READING.Failure as error:
+        raise Failure(str(error)) from error
 
 
 def absolute_directory(value, require_absolute=False):
@@ -248,8 +260,8 @@ def bounded_integer(value):
     return int(value)
 
 
-def snapshot_manifest(source, deadline):
-    with regular_file(source, "manifest.json") as (descriptor, before):
+def snapshot_manifest(source, deadline, name="manifest.json"):
+    with regular_file(source, name) as (descriptor, before):
         if not 0 < before.st_size <= _protocol.MAX_MANIFEST_BYTES:
             raise Failure("The manifest is empty or exceeds its byte limit")
         pieces, remaining = [], before.st_size
@@ -285,12 +297,30 @@ def checked_asset(descriptor, before, asset, deadline, output=None):
         raise Failure(f"Asset byte count differs: {asset['path']}")
     digest = hashlib.sha256()
     remaining = asset["bytes"]
+    chunks = asset.get("chunks")
+    chunk_index, chunk_bytes = 0, 0
+    chunk_digest = hashlib.sha256()
     while remaining:
         deadline.remaining()
         block = os.read(descriptor, min(_protocol.MIB, remaining))
         if not block:
             raise Failure(f"Asset ended before its advertised size: {asset['path']}")
         digest.update(block)
+        if chunks:
+            cursor = 0
+            while cursor < len(block):
+                if chunk_index >= len(chunks):
+                    raise Failure("Reading asset exceeds its verified chunk partition")
+                take = min(len(block) - cursor, chunks[chunk_index]["bytes"] - chunk_bytes)
+                chunk_digest.update(block[cursor:cursor + take])
+                cursor += take
+                chunk_bytes += take
+                if chunk_bytes == chunks[chunk_index]["bytes"]:
+                    if chunk_digest.hexdigest() != chunks[chunk_index]["sha256"]:
+                        raise Failure("Reading asset scan checksum differs")
+                    chunk_index += 1
+                    chunk_bytes = 0
+                    chunk_digest = hashlib.sha256()
         if output is not None:
             write_all(output, block, deadline)
         remaining -= len(block)
@@ -298,6 +328,8 @@ def checked_asset(descriptor, before, asset, deadline, output=None):
         raise Failure(f"Asset changed while it was read: {asset['path']}")
     if digest.hexdigest() != asset["sha256"]:
         raise Failure(f"Asset checksum differs: {asset['path']}")
+    if chunks and chunk_index != len(chunks):
+        raise Failure("Reading asset ended before its verified chunk partition")
 
 
 @contextlib.contextmanager
@@ -352,9 +384,9 @@ def copy_asset(source_root, namespace, asset, deadline):
                 return True
 
 
-def replace_manifest(namespace, payload, deadline):
+def replace_manifest(namespace, payload, deadline, destination="manifest.json"):
     try:
-        info = os.stat("manifest.json", dir_fd=namespace, follow_symlinks=False)
+        info = os.stat(destination, dir_fd=namespace, follow_symlinks=False)
         if not stat.S_ISREG(info.st_mode):
             raise Failure("The destination manifest is not a regular file")
     except FileNotFoundError:
@@ -364,7 +396,7 @@ def replace_manifest(namespace, payload, deadline):
         public_mode(descriptor)
         os.fsync(descriptor)
         deadline.remaining()
-        os.replace(name, "manifest.json", src_dir_fd=namespace, dst_dir_fd=namespace)
+        os.replace(name, destination, src_dir_fd=namespace, dst_dir_fd=namespace)
     os.fsync(namespace)
 
 
@@ -374,7 +406,8 @@ def publish(args, cancellation=None):
     expected = args.sha256.lower()
     if not _protocol.HASH.fullmatch(expected):
         raise Failure("--sha256 must be a complete 64-character SHA-256")
-    if args.max_assets_mib > 1024 * 1024 or args.deadline_seconds > 86400:
+    asset_budget = args.max_assets_mib if args.max_assets_mib is not None else (2048 if args.reading else 512)
+    if asset_budget > 1024 * 1024 or args.deadline_seconds > 86400:
         raise Failure("The asset budget is at most 1048576 MiB and deadline at most 86400 seconds")
     source_path = absolute_directory(args.generated_directory)
     web_path = absolute_directory(args.web_root, require_absolute=True)
@@ -383,9 +416,11 @@ def publish(args, cancellation=None):
             or namespace_path in source_path.parents):
         raise Failure("The generated directory and publication destination must be separate")
     deadline = Deadline(args.deadline_seconds, cancellation)
+    manifest_name = "reading.json" if args.reading else "manifest.json"
+    validate = validate_reading if args.reading else validate_manifest
     with directory(source_path) as source:
-        payload, value = snapshot_manifest(source, deadline)
-        assets, total_bytes = validate_manifest(value, expected, int(args.max_assets_mib * _protocol.MIB))
+        payload, value = snapshot_manifest(source, deadline, manifest_name)
+        assets, total_bytes = validate(value, expected, int(asset_budget * _protocol.MIB))
         deadline.remaining()
         with directory(web_path, create=True) as web:
             if directory_identity(source) == directory_identity(web):
@@ -420,8 +455,8 @@ def publish(args, cancellation=None):
                         reused += int(not changed)
                         emit("asset", path=asset["path"], bytes=asset["bytes"], copied=changed)
                     deadline.remaining()
-                    replace_manifest(namespace, payload, deadline)
-                    emit("complete", namespace=str(namespace_path), manifest=str(namespace_path / "manifest.json"),
+                    replace_manifest(namespace, payload, deadline, manifest_name)
+                    emit("complete", namespace=str(namespace_path), manifest=str(namespace_path / manifest_name),
                          sha256=expected, assets=len(assets), copiedAssets=copied, reusedAssets=reused,
                          assetBytes=total_bytes, manifestBytes=len(payload))
                 finally:
@@ -433,11 +468,12 @@ def publish(args, cancellation=None):
 
 def parser():
     result = Parser(description=__doc__)
-    result.add_argument("generated_directory", help="Directory containing the generated manifest.json and assets")
+    result.add_argument("generated_directory", help="Directory containing the generated manifest and assets")
+    result.add_argument("--reading", action="store_true", help="Publish reading.json and its verified structural PDF and encoded images")
     result.add_argument("--web-root", required=True, help="Explicit absolute destination, for example /var/www/html/spomenar-previews")
     result.add_argument("--sha256", required=True, help="Expected source PDF SHA; the lowercase digest names the public namespace")
-    result.add_argument("--max-assets-mib", type=_protocol.finite_positive, default=512,
-                        help="Maximum sum of referenced asset bytes in the captured manifest")
+    result.add_argument("--max-assets-mib", type=_protocol.finite_positive,
+                        help="Maximum referenced asset bytes in MiB (preview default 512; reading default 2048)")
     result.add_argument("--deadline-seconds", type=_protocol.finite_positive, default=120,
                         help="Whole publication deadline; the previous manifest remains until the final replace")
     return result

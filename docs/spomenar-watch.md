@@ -2,10 +2,10 @@
 
 `scripts/spomenar-watch.py` watches one stable public Nextcloud share. It resolves
 the current local file, waits for changes to settle, creates an immutable Btrfs
-reflink, and invokes the existing Motion Lab producer and atlas publisher. It
-uses the local PDF and delegates rendering to that producer.
+reflink, and invokes the Motion Lab raster and reading producers and their shared
+publisher. It uses the local PDF for both derived representations.
 
-The service, its two render phases, and native worker children belong to one
+The service, its sequential generation phases, and native worker children belong to one
 systemd cgroup. A private flock prevents two supervisors from owning the same
 state. The supervisor runs as root for publication; the PDF inspector and
 renderer run as `juraj`, and the Nextcloud metadata resolver runs as `www-data`.
@@ -46,12 +46,15 @@ existing readers from later in-place source edits.
 
 For a new SHA, the existing producer's bounded inspector supplies page count.
 Configured priority pages, initially 99 and 100, are clipped to the document; if
-none exist, page 1 is the priority. Two producer invocations run sequentially:
+none exist, page 1 is the priority. Three producer invocations run sequentially:
 
 1. The priority pages receive the normal 192, 512, 768 and 1536 pixel pyramid and
    image regions. The existing publisher validates and publishes that checkpoint.
 2. The full invocation resumes the same work directory and fills the remaining
    document. Its completed checkpoint replaces the atlas manifest atomically.
+3. The reading producer preserves the PDF's native text/layout/operator structure
+   and externalizes image streams. Verified progressive JPEG scans and exact
+   original-mode fallbacks are published before its completed `reading.json`.
 
 At most one invocation owns the job slot. Each publication checks the current
 share before asset publication and again before the config commit. A changed
@@ -61,7 +64,8 @@ can remain as retained data, but it cannot become the config's current edition.
 The producer and publisher perform source hashing, enforce parser limits, define
 preview geometry and manifests, validate assets, resume interrupted rendering,
 and publish assets atomically. Their command interfaces are described in
-[motionlab-previews.md](motionlab-previews.md). The supervisor's `inspect_pages`
+[motionlab-previews.md](motionlab-previews.md) and
+[motionlab-reading.md](motionlab-reading.md). The supervisor's `inspect_pages`
 function calls the producer's internal inspector to determine page count.
 
 ## Publication files and public access
@@ -77,6 +81,8 @@ The root-owned publication catalog is outside the replaceable viewer site:
 | `catalog/previews` | Root-owned link to `/var/www/html/spomenar-previews` |
 | `public` | Root-owned link to `catalog`; removing it withdraws public access |
 | `/var/www/html/spomenar-previews/<SHA>/manifest.json` | Existing publisher's atomic atlas manifest |
+| `/var/www/html/spomenar-previews/<SHA>/reading.json` | Atomic source-bound reading manifest |
+| `/var/www/html/spomenar-previews/<SHA>/reading/` | Immutable structural PDF and encoded image assets |
 | `/var/lib/spomenar-watch/state.json` | Private source identities and recovery records |
 | `/var/cache/spomenar-watch/<SHA>/` | Producer's resumable work directory |
 
@@ -107,6 +113,13 @@ edition fields together:
     "size": 1608358464,
     "validator": { "header": "ETag", "value": "\"observed-static-nginx-etag\"" },
     "manifestRevision": "<64-character-manifest-SHA>"
+  },
+  "reading": {
+    "manifestUrl": "/spomenar/previews/<64-character-source-SHA>/reading.json",
+    "sha256": "<64-character-source-SHA>",
+    "size": 1608358464,
+    "validator": { "header": "ETag", "value": "\"observed-static-nginx-etag\"" },
+    "manifestRevision": "<64-character-reading-manifest-SHA>"
   }
 }
 ```
@@ -115,12 +128,16 @@ The example placeholders are descriptive. Production fields contain actual
 hashes and the validator observed from HEAD plus a 16-byte conditional range on
 the immutable PDF URL. A full-atlas update can change `manifestRevision` without
 changing PDF identity. Readers can refresh the preview atlas while keeping the
-current PDF open.
+current PDF open. The optional reading binding appears only after the complete
+reading representation verifies. It uses the same original PDF identity and
+HTTP validator, with its own manifest byte digest. A new source never inherits
+the preceding edition's reading binding.
 
 Status has exactly `phase`, `versionSha`, `publishedSha`, `readyPages`,
 `totalPages`, and `configGeneration`. Ready pages have every configured pyramid
 tier. Phases include `waiting`, `settling`, `snapshotting`, `priority`, `full`,
-`publishing`, `ready`, `retrying`, `unavailable`, and `withdrawn`. Public status
+`reading`, `publishing`, `publishing-reading`, `ready`, `retrying`, `unavailable`,
+and `withdrawn`. Public status
 contains only these publication fields.
 
 The two small JSON locations disable nginx ETags and If-Modified-Since handling.
@@ -134,7 +151,9 @@ open-file caching so removing the public link takes effect on subsequent request
 
 The state record is committed before the public config. On restart, the public
 config identifies the currently advertised edition. Completed immutable records
-skip generation, while incomplete manifests resume the missing phase. Recorded
+skip completed phases, while incomplete manifests resume the missing phase.
+A missing or older reading-format version starts reading generation even when
+the source and full raster atlas are unchanged. Recorded
 filesystem metadata avoids repeated content checks. If that metadata changes,
 the service verifies the PDF hash and the completed manifest and assets before
 refreshing the recorded metadata. A persistent pending-publication flag keeps
@@ -160,34 +179,48 @@ Current and candidate editions are protected. A fourth update therefore proceeds
 without waiting a day. Old version URLs have a finite lifetime; an old open tab
 may need to reload after its edition is retired.
 
-Each retained atlas is capped at 512 MiB, and each matching producer work
-directory has the same cap. With four retained records, the conservative bound
-is 8 GiB of logical PDFs plus 2 GiB of published assets and 2 GiB of work assets,
-with bounded manifests/metadata in addition. Completed work directories are
-removed after publication. Btrfs sharing usually makes physical PDF allocation
-smaller; the cap deliberately counts full logical sizes. Existing unrelated
-preview namespaces are not deleted by this service.
+Each retained atlas has a 512 MiB raster budget. Reading assets and their metadata
+have a separate 2 GiB output budget; atomic metadata replacement charges the old
+and temporary new bytes together. `max_derived_mib`, default 10,240 MiB, bounds
+actual published raster, reading and metadata bytes across retained editions.
+Generation reserves room under this aggregate bound before starting, and
+publication accounts the resulting namespace. Retention can remove an old
+unprotected edition to make room, while current/candidate editions stay protected.
+
+Resumable work has the same per-phase budgets, separate from published assets.
+With at most four records, the conservative work allowance is 10 GiB plus bounded
+native scratch, alongside the 10 GiB published-derived cap and 8 GiB logical-PDF
+cap. Completed work is removed after publication. Btrfs sharing usually makes
+physical PDF allocation smaller; the PDF cap counts full logical sizes. Existing
+unrelated preview namespaces are not deleted by this service.
 
 The service unit limits the whole cgroup to one CPU, 2 GiB of memory, and
 32 tasks. The default renderer uses one worker and its existing 4 GiB virtual
-address-space limit, 60-second native job timeout, 600-second invocation deadline,
-and 512 MiB output limit. A terminated or wedged generator causes supervisor exit
+address-space limit and 60-second native job timeout. Raster invocation has a
+600-second deadline and 512 MiB output limit; reading invocation has a 3,600-second
+deadline and 2 GiB output limit. These are configurable production-processing
+budgets. A terminated or wedged generator causes supervisor exit
 so systemd cleans the entire cgroup before restarting and launching another job.
 
 ## Installation and initial adoption
 
 Use the existing authenticated root deployment channel.
 
-1. Install the four adjacent scripts, root-owned and not writable by the render
+1. Install the five adjacent scripts, root-owned and not writable by the render
    user, into `/usr/local/lib/spomenar-watch/`: `spomenar-watch.py`,
    `spomenar-share-source.php`, `motionlab-previews.py`, and
-   `publish-spomenar-previews.py`.
+   `publish-spomenar-previews.py`, plus `motionlab-reading.py`. Install the exact
+   `src/core/pdfReadingFormat.json` from the same revision there as
+   `pdfReadingFormat.json`, and `scripts/pdf-jpeg-progressive/coefficients.c` under
+   its `pdf-jpeg-progressive/` subdirectory. The installed producer loads that
+   shared format file and compiles the maintained verifier in its owned work area.
 2. Create `/etc/spomenar-watch/`. Copy `spomenar-watch.example.json` to
    `config.json`, and seed `base-config.json` from the intended public site's
    title, filename and source URL. The supervisor rewrites its initial PDF URL to
-   native DAV and strips any stale preview binding. Keep these settings root-owned.
+   native DAV and strips any stale preview/reading binding. Keep these settings root-owned.
 3. Check the existing renderer interpreter in the settings can import Pillow and
-   PyMuPDF as the configured render user. The Steffy runtime already supplies them.
+   PyMuPDF as the configured render user, and that `cc` can link libjpeg with its
+   installed development headers. The Steffy runtime already supplies these.
 4. Bootstrap before enabling nginx aliases or starting the daemon:
 
    ```sh
@@ -217,7 +250,61 @@ Use the existing authenticated root deployment channel.
    has every page/tier, and uses the existing publisher. Since the current public
    assets already match, it validates and reuses them without another JPEG copy
    or renderer run. Confirm the config's static URL, source size, manifest SHA and
-   observed static validator, then check a small conditional range.
+   observed static validator, then check a small conditional range. A complete
+   sibling reading representation is adopted through the same verified publisher;
+   otherwise the service generates it in the next phase.
+
+## Upgrading an existing edition
+
+Viewer-only deployment preserves the catalog and does not restart this service.
+A producer/service upgrade must load the matching Python, C and format sources:
+
+1. Validate `npm run test:spomenar:offline` on the exact source revision. Stage the
+   five scripts, verifier source and format JSON listed above through the existing
+   authenticated deployment channel. Keep their relative installed locations and
+   root ownership; install the dependencies before replacing the supervisor.
+2. Stop `spomenar-watch.service` before replacing its producer bundle or adopting
+   precomputed work. This closes its single owned job and leaves the last public
+   catalog and assets available. Replace the installed files from one revision.
+
+   From the reviewed checkout or an identically structured staging bundle, run
+   through that authenticated root channel:
+
+   ```sh
+   systemctl stop spomenar-watch.service
+   install -d -o root -g root -m 0755 /usr/local/lib/spomenar-watch/pdf-jpeg-progressive
+   install -o root -g root -m 0644 src/core/pdfReadingFormat.json /usr/local/lib/spomenar-watch/pdfReadingFormat.json
+   install -o root -g root -m 0644 scripts/pdf-jpeg-progressive/coefficients.c /usr/local/lib/spomenar-watch/pdf-jpeg-progressive/coefficients.c
+   install -o root -g root -m 0644 scripts/motionlab-previews.py scripts/motionlab-reading.py scripts/publish-spomenar-previews.py scripts/spomenar-share-source.php scripts/spomenar-watch.py /usr/local/lib/spomenar-watch/
+   ```
+
+3. Optionally place a completed, source-verified staging result into
+   `/var/cache/spomenar-watch/<original-PDF-SHA>/` as the configured render user.
+   Transfer only its `reading.json` and `reading/` assets, preserving the immutable
+   names. Do not overwrite existing resumable work: first reconcile its source
+   and writer lock. The service revalidates the source, asset and scan hashes
+   before publishing this staged result. Without precomputed work it generates
+   the representation itself.
+4. Start `spomenar-watch.service`. The unchanged current edition's missing or
+   outdated reading record schedules only the reading phase; its original PDF,
+   raster atlas and prior catalog remain in service. The completed representation
+   commits through the existing publisher, followed by one atomic catalog update.
+
+   ```sh
+   systemctl start spomenar-watch.service
+   systemctl status --no-pager spomenar-watch.service
+   ```
+5. Check the journal and public status, then read `config.json`. Confirm that
+   original `pdfUrl`, SHA and size stayed fixed, `reading.manifestRevision` hashes
+   the actual published `reading.json`, and its structural PDF and assets pass
+   their declared hashes. Check a small conditional range on the unchanged
+   original PDF. Deploy the compatible viewer/worker through the separate viewer
+   deployment command and validate text, photographs and final native composition.
+
+The production run can be prepared in an isolated directory before this upgrade,
+using the existing immutable source file. Generation alone changes no catalog,
+watcher setting or live publication. The original source fingerprint, exact code
+hashes, output manifest and verification receipt accompany that staged handoff.
 
 Later site deployments must retain the fixed alias include and the root-owned
 catalog. The seed file is used only when no catalog config exists; it is not a
@@ -231,10 +318,11 @@ later uninstall, then validate nginx and reload it.
 ## Focused checks
 
 ```sh
-python3 -B -m unittest scripts/test_spomenar_watch.py -v
+npm run test:spomenar:offline
 ```
 
-The suite uses tiny owned files, the real existing publisher, and the real
+The gate includes producer, preview, publisher, watcher and installer suites. It
+uses tiny owned files, the real existing publisher, and the real
 producer when PyMuPDF is available. Its nginx test starts a private Unix-socket
 fixture, verifies Range/HEAD/If-Range and JSON updates, then closes every route
 by removing the public link without reloading nginx. On Steffy, explicitly enable the

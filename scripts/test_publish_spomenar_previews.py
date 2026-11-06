@@ -453,6 +453,72 @@ class PublishSpomenarPreviewsTest(unittest.TestCase):
         self.complete(environment={"PYTHONPATH": str(blocked)})
         self.assert_published()
 
+    def reading_manifest(self):
+        def asset(data, suffix):
+            checksum = digest(data)
+            relative = f"reading/{checksum}.{suffix}"
+            target = self.generated / relative
+            target.parent.mkdir(exist_ok=True)
+            target.write_bytes(data)
+            return {"path": relative, "bytes": len(data), "sha256": checksum}
+        data = b"\xff\xd8first-complete-scan\xff\xc4second-complete-scan\xff\xd9"
+        split = data.index(b"second")
+        image = {**asset(data, "jpg"), "id": "x17", "originalSha256": digest(b"original jpeg"),
+                 "width": 96, "height": 64, "components": 3, "encoding": "progressive-jpeg",
+                 "coefficientBytes": 24704, "chunks": [
+                     {"offset": 0, "bytes": split, "sha256": digest(data[:split]), "scan": 1},
+                     {"offset": split, "bytes": len(data) - split, "sha256": digest(data[split:]), "scan": 2}]}
+        value = {"version": 1, "source": {"sha256": self.sha, "size": 12345, "pageCount": 2},
+                 "pdf": asset(b"%PDF-1.7\nsmall structural document\n", "pdf"), "images": [image]}
+        payload = (json.dumps(value) + "\n").encode()
+        (self.generated / "reading.json").write_bytes(payload)
+        return value, payload
+
+    def test_reading_publication_preserves_atlas_and_commits_verified_snapshot_last(self):
+        self.complete()
+        value, payload = self.reading_manifest()
+        spec = importlib.util.spec_from_file_location("reading_publication_snapshot", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        observed = []
+        def emit(event, **fields):
+            if event == "asset":
+                self.assertFalse((self.namespace / "reading.json").exists())
+                self.assertEqual((self.namespace / "manifest.json").read_bytes(), self.original)
+                observed.append(fields["path"])
+                (self.generated / "reading.json").write_text('{"replaced":true}')
+        with mock.patch.object(module, "emit", side_effect=emit):
+            self.assertEqual(module.main(self.arguments("--reading")), 0)
+        self.assertEqual(len(observed), 2)
+        self.assertEqual((self.namespace / "reading.json").read_bytes(), payload)
+        for asset in [value["pdf"], *value["images"]]:
+            self.assertEqual((self.namespace / asset["path"]).read_bytes(),
+                             (self.generated / asset["path"]).read_bytes())
+        self.assertEqual((self.namespace / "manifest.json").read_bytes(), self.original)
+
+    def test_reading_chunk_checksum_failure_does_not_replace_previous_manifest(self):
+        value, payload = self.reading_manifest()
+        self.complete("--reading")
+        value["images"][0]["chunks"][0]["sha256"] = "0" * 64
+        (self.generated / "reading.json").write_text(json.dumps(value))
+        self.rejected("--reading")
+        self.assertEqual((self.namespace / "reading.json").read_bytes(), payload)
+        self.assertFalse(list(self.namespace.rglob(".publish-*.tmp")))
+
+    def test_reading_source_partition_and_budget_reject_before_publication(self):
+        value, _ = self.reading_manifest()
+        for mutation in (lambda v: v["source"].update(sha256="0" * 64),
+                         lambda v: v["images"][0]["chunks"][1].update(offset=1)):
+            changed = copy.deepcopy(value)
+            mutation(changed)
+            (self.generated / "reading.json").write_text(json.dumps(changed))
+            self.rejected("--reading")
+            self.assertFalse(self.namespace.exists())
+        self.reading_manifest()
+        total = value["pdf"]["bytes"] + value["images"][0]["bytes"]
+        self.rejected("--reading", "--max-assets-mib", str((total - 1) / MIB))
+        self.assertFalse(self.namespace.exists())
+
     def test_input_manifest_snapshot_stays_original_and_is_published_last(self):
         spec = importlib.util.spec_from_file_location("spomenar_publisher_snapshot_test", SCRIPT)
         module = importlib.util.module_from_spec(spec)

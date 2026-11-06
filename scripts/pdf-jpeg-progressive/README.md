@@ -37,13 +37,23 @@ progressive JPEG, independent coefficient dump, generated private decoder,
 parser diff, scan boundaries in config.json, logs, summary.json, and optional
 PPM images. Existing output directories are rejected.
 
-The C tool checks every DCT coefficient, quantization table and component sampling
+The C tool checks every DCT coefficient, referenced component quantization table and component sampling
 parameter after transcoding. The JS probe checks final RGB equality against the
 original, intermediate equality against complete-prefix decoding, a split marker
 that must wait for another received byte, cancellation, truncated input and
 allocation caps. The optional negative control deliberately makes IDCT overwrite
 retained coefficients, requires the invariant to fail, and then checks the
 restored implementation.
+
+The production [reading producer](../../docs/motionlab-reading.md) reuses this C
+verifier with `--early-dc`. That explicit mode chooses initial DC precision from
+the actual quantizers and refines every omitted bit later; the experiment's
+four-argument invocation retains the default scan sequence. Both modes preserve
+component/color interpretation and the original APP/COM markers.
+`--verify-only` performs the same bounded comparison on an already encoded pair
+without transcoding or replacing the output. It permits the production producer
+to revalidate cached assets after a verifier update. Unused DQT slots may be
+omitted; an altered table used by an image component fails verification.
 
 Results separate entropy time, preview IDCT/conversion time, total pipeline
 wall/CPU time, first-pixel received bytes and process peak RSS. Prefix decoding
@@ -62,8 +72,9 @@ heap limit is 512 MiB, and subprocess wall time is bounded.
 The guarded extraction in prepare.py is the only PDF.js compatibility adapter.
 It checks version 5.1.91 and the expected parser/entropy source fragments. The
 experiment handles this ordinary 8-bit JPEG path; DNL height reparsing and
-truncated-image recovery deliberately fail. It has no production worker, viewer,
-build or publication integration.
+truncated-image recovery deliberately fail. Its generated private decoder stays
+an opt-in comparison tool. The production reader uses the maintained shared
+worker and source-bound reading representation described in the linked guide.
 
 Keep image bytes, generated modules and measurements outside Git. Maintained
 source here is sufficient to reproduce the experiment against another explicit
