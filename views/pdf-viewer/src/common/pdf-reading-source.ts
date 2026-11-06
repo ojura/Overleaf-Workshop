@@ -1,5 +1,5 @@
 import { PDF_READING_LIMITS, PDF_READING_DIGEST, validatePdfReadingManifest, type PdfReadingManifest, type PdfReadingImage } from '../../../../src/core/pdfReadingManifest';
-import type { PdfReadingDescriptor } from './protocol';
+import { PDF_READING_REQUEST_LIMITS, type PdfReadingDescriptor } from './protocol';
 import { pdfPerformance } from './prefetch-performance';
 import { pdfCachePolicy } from './scroll-prefetch';
 
@@ -45,7 +45,7 @@ export async function openPdfReadingSource(descriptor: PdfReadingDescriptor, opt
     const base = new URL('./', manifestUrl), request = options.fetch ?? globalThis.fetch.bind(globalThis);
     const metrics = options.metrics ?? pdfPerformance;
     const concurrency = options.concurrency ?? pdfCachePolicy().imageDecodeConcurrency;
-    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4) { throw new Error('Invalid reading request concurrency.'); }
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > PDF_READING_REQUEST_LIMITS.active) { throw new Error('Invalid reading request concurrency.'); }
     const active = new Set<AbortController>();
     const queue: Array<{ start(): void; cancel(): void }> = [];
     let disposed = false;
@@ -149,7 +149,7 @@ export async function openPdfReadingSource(descriptor: PdfReadingDescriptor, opt
                 if (!image || !Number.isSafeInteger(value.chunkIndex) || value.chunkIndex < 0) { throw new Error('Unknown reading image request.'); }
                 const chunk = image.chunks?.[value.chunkIndex];
                 if (image.chunks ? !chunk : value.chunkIndex !== 0) { throw new Error('Unknown reading image chunk.'); }
-                if (queue.length >= 64) { throw new Error('Reading image request queue is full.'); }
+                if (queue.length >= PDF_READING_REQUEST_LIMITS.queued) { throw new Error('Reading image request queue is full.'); }
                 return new Promise((resolve, reject) => {
                     const controller = new AbortController();
                     const cancel = () => {

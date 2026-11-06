@@ -199,6 +199,10 @@ export interface BridgeResponse {
     body: Uint8Array;
 }
 
+/** Shared upper bounds; device policy may admit fewer browser reads. Cancelled disk
+ * I/O retains an active slot until completion, while queued entries own no byte buffers. */
+export const PDF_READING_REQUEST_LIMITS = Object.freeze({ active: 4, queued: 64 });
+
 /** A registered image chunk, never a caller-selected filesystem path or byte range. */
 export interface ReadingImageRequest {
     id: number;
