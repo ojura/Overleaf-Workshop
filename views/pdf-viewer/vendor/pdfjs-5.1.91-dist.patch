@@ -245,7 +245,7 @@
    saveDocument() {
      return this._transport.saveDocument();
    }
-@@ -11865,6 +11946,198 @@
+@@ -11865,6 +11946,213 @@
      return this._transport.getCalculationOrderIds();
    }
  }
@@ -322,25 +322,29 @@
 +  }
 +  register(data) {
 +    const state = this.state(data);
-+    if (!state || this.page.destroyed) { data.image?.bitmap?.close(); return; }
-+    const record = { state, imageId: data.imageId, common: data.common, print: data.print,
++    if ((!state && !data.common) || this.page.destroyed) { data.image?.bitmap?.close(); return; }
++    const record = { state: state || null, epoch: data.epoch, cacheKey: data.cacheKey,
++      imageId: data.imageId, common: data.common, print: data.print,
 +      covered: false, final: false, failed: false };
 +    this.records.set(data.id, record);
 +    if (data.image) { (record.common ? this.page.commonObjs : this.page.objs).resolve(data.id, data.image); }
 +  }
 +  receive(data) {
 +    const record = this.records.get(data.id);
-+    if (!record || !this.state(data) || this.page.destroyed) { data.image?.bitmap?.close(); return false; }
++    const current = record?.common
++      ? data.common && record.epoch === data.epoch && record.cacheKey === data.cacheKey
++      : !data.common && this.state(data);
++    if (!record || !current || this.page.destroyed) { data.image?.bitmap?.close(); return false; }
 +    if (data.failed) {
 +      record.failed = true;
 +      record.final = false;
 +      this.revision++;
 +      record.message = data.message || "External image failed";
 +      if (record.print || record.common) {
-+        for (const task of [...(record.state.renderTasks || [])]) { task.cancel(new Error(record.message)); }
++        for (const task of [...(record.state?.renderTasks || [])]) { task.cancel(new Error(record.message)); }
 +        (record.common ? this.page.commonObjs : this.page.objs).resolve(data.id, null);
 +      }
-+      this.notify();
++      if (record.state && !record.state.externalImageCancelled) { this.notify(); }
 +      return true;
 +    }
 +    const prior = this.pending.get(data.id);
@@ -364,7 +368,7 @@
 +      this.revision++;
 +      changed = true;
 +    }
-+    if (changed) { this.notify(); }
++    if (changed && state && !state.externalImageCancelled) { this.notify(); }
 +  }
 +  begin(state) {
 +    if (!state.externalImagePrint) { this.current = state; }
@@ -415,9 +419,20 @@
 +    this.cancellations.add(promise);
 +    for (const [id, record] of this.records) {
 +      if (record.state !== state) { continue; }
++      // Shared Type3 images finish under the document's common object lifetime.
++      // Detach the canceled operator list while preserving the receiving identity.
++      if (record.common) { record.state = null; continue; }
 +      this.pending.get(id)?.image?.bitmap?.close();
 +      this.pending.delete(id);
-+      if (!record.common) { this.page.objs.release(id); }
++      this.page.objs.release(id);
++      this.records.delete(id);
++    }
++  }
++  clearCommon() {
++    for (const [id, record] of this.records) {
++      if (!record.common) { continue; }
++      this.pending.get(id)?.image?.bitmap?.close();
++      this.pending.delete(id);
 +      this.records.delete(id);
 +    }
 +  }
@@ -444,7 +459,7 @@
  class PDFPageProxy {
    #pendingCleanup = false;
    constructor(pageIndex, pageInfo, transport, pdfBug = false) {
-@@ -11876,6 +12149,7 @@
+@@ -11876,6 +12164,7 @@
      this.commonObjs = transport.commonObjs;
      this.objs = new PDFObjects();
      this._intentStates = new Map();
@@ -452,7 +467,7 @@
      this.destroyed = false;
    }
    get pageNumber() {
-@@ -11930,6 +12204,14 @@
+@@ -11930,6 +12219,14 @@
    async getXfa() {
      return this._transport._htmlForXfa?.children[this._pageIndex] || null;
    }
@@ -467,7 +482,7 @@
    render({
      canvasContext,
      viewport,
-@@ -11941,10 +12223,28 @@
+@@ -11941,10 +12238,28 @@
      annotationCanvasMap = null,
      pageColors = null,
      printAnnotationStorage = null,
@@ -497,7 +512,7 @@
      const {
        renderingIntent,
        cacheKey
-@@ -11953,7 +12253,11 @@
+@@ -11953,7 +12268,11 @@
      optionalContentConfigPromise ||= this._transport.getOptionalContentConfig(renderingIntent);
      let intentState = this._intentStates.get(cacheKey);
      if (!intentState) {
@@ -510,7 +525,7 @@
        this._intentStates.set(cacheKey, intentState);
      }
      if (intentState.streamReaderCancelTimeout) {
-@@ -11972,8 +12276,12 @@
+@@ -11972,8 +12291,12 @@
        this._stats?.time("Page Request");
        this._pumpOperatorList(intentArgs);
      }
@@ -523,15 +538,19 @@
        if (intentPrint) {
          this.#pendingCleanup = true;
        }
-@@ -12120,6 +12428,7 @@
+@@ -12120,6 +12443,11 @@
    _destroy() {
      this.destroyed = true;
      const waitOn = [];
-+    if (this._externalImages) { waitOn.push(this._externalImages.cancel(true)); this._externalImages.listeners.clear(); }
++    if (this._externalImages) {
++      waitOn.push(this._externalImages.cancel(true));
++      this._externalImages.clearCommon();
++      this._externalImages.listeners.clear();
++    }
      for (const intentState of this._intentStates.values()) {
        this._abortOperatorList({
          intentState,
-@@ -12158,6 +12467,7 @@
+@@ -12158,6 +12486,7 @@
          return false;
        }
      }
@@ -539,7 +558,7 @@
      this._intentStates.clear();
      this.objs.clear();
      this.#pendingCleanup = false;
-@@ -12177,11 +12487,13 @@
+@@ -12177,11 +12506,13 @@
        intentState.operatorList.argsArray.push(operatorListChunk.argsArray[i]);
      }
      intentState.operatorList.lastChunk = operatorListChunk.lastChunk;
@@ -553,7 +572,7 @@
        this.#tryCleanup();
      }
    }
-@@ -12189,21 +12501,27 @@
+@@ -12189,21 +12520,27 @@
      renderingIntent,
      cacheKey,
      annotationStorageSerializable,
@@ -584,7 +603,7 @@
      intentState.streamReader = reader;
      const pump = () => {
        reader.read().then(({
-@@ -12214,7 +12532,7 @@
+@@ -12214,7 +12551,7 @@
            intentState.streamReader = null;
            return;
          }
@@ -593,7 +612,7 @@
            return;
          }
          this._renderPageChunk(value, intentState);
-@@ -12563,6 +12881,7 @@
+@@ -12563,6 +12900,7 @@
      this.destroyed = false;
      this.destroyCapability = null;
      this._networkStream = networkStream;
@@ -601,7 +620,7 @@
      this._fullReader = null;
      this._lastProgress = null;
      this.downloadInfoCapability = Promise.withResolvers();
-@@ -12635,6 +12954,8 @@
+@@ -12635,6 +12973,8 @@
        return this.destroyCapability.promise;
      }
      this.destroyed = true;
@@ -610,7 +629,7 @@
      this.destroyCapability = Promise.withResolvers();
      this.#passwordCapability?.reject(new Error("Worker was destroyed during onPassword callback"));
      const waitOn = [];
-@@ -12857,6 +13178,32 @@
+@@ -12857,6 +13197,32 @@
        }
        return null;
      });
@@ -643,7 +662,7 @@
      messageHandler.on("obj", ([id, pageIndex, type, imageData]) => {
        if (this.destroyed) {
          return;
-@@ -12899,9 +13246,23 @@
+@@ -12899,9 +13265,23 @@
      });
    }
    getData() {
@@ -667,7 +686,7 @@
      if (this.annotationStorage.size <= 0) {
        warn("saveDocument called while `annotationStorage` is empty, " + "please use the getData-method instead.");
      }
-@@ -13005,6 +13366,13 @@
+@@ -13005,6 +13385,13 @@
      });
    }
    getStructTree(pageIndex) {
@@ -681,7 +700,15 @@
      return this.messageHandler.sendWithPromise("GetStructTree", {
        pageIndex
      });
-@@ -13095,6 +13463,17 @@
+@@ -13047,6 +13434,7 @@
+         throw new Error(`startCleanup: Page ${page.pageNumber} is currently rendering.`);
+       }
+     }
++    for (const page of this.#pageCache.values()) { page._externalImages?.clearCommon(); }
+     this.commonObjs.clear();
+     if (!keepLoadedFonts) {
+       this.fontLoader.clear();
+@@ -13095,6 +13483,17 @@
      }
      delete this.#objs[objId];
      return true;
