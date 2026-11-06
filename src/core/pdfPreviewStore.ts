@@ -1,9 +1,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { PdfCacheCompletionError, type PdfDiskCache } from './pdfDiskCache';
-import type { PdfOutput, PdfPreviewIdentity } from './viewerProtocol';
+import type { PdfOutput, PdfPreviewIdentity, PdfReadingDescriptor } from './viewerProtocol';
 import { PDF_PREVIEW_MANIFEST_BYTES } from './viewerProtocol';
+import { PDF_READING_LIMITS, validatePdfReadingManifest } from './pdfReadingManifest';
 
 const KEY = /^[a-f0-9]{64}$/;
 
@@ -53,6 +54,78 @@ export class PdfPreviewStore {
 
     manifestPath(identity: PdfPreviewIdentity): string {
         return path.join(this.directory(identity), 'manifest.json');
+    }
+
+    /** Bind a reading publication to the SHA recorded by the existing exact-build export. */
+    readingDescriptor(identity: PdfPreviewIdentity): Promise<(Omit<PdfReadingDescriptor, 'manifestUrl'> & {
+        manifestPath: string;
+        readImage(id: string, chunkIndex: number, signal: AbortSignal): Promise<{ body: Uint8Array; offset: number; total: number }>;
+    }) | undefined> {
+        const task = (async () => {
+            const directory = this.directory(identity);
+            const folder = await fs.promises.lstat(directory).catch(() => undefined);
+            if (this.closed || !folder?.isDirectory() || folder.isSymbolicLink()) { return; }
+            const read = async (filename: string, limit: number) => {
+                const handle = await fs.promises.open(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0)).catch(() => undefined);
+                if (!handle) { return; }
+                try {
+                    const stat = await handle.stat();
+                    if (this.closed || !stat.isFile() || stat.size > limit) { return; }
+                    const bytes = Buffer.alloc(stat.size);
+                    const result = await handle.read(bytes, 0, bytes.length, 0);
+                    if (this.closed || result.bytesRead !== bytes.length) { return; }
+                    return { bytes, value: JSON.parse(bytes.toString('utf8')) };
+                } finally { await handle.close(); }
+            };
+            const preview = await read(this.manifestPath(identity), PDF_PREVIEW_MANIFEST_BYTES);
+            const document = preview?.value?.document;
+            if (preview?.value?.version !== 1 || document?.key !== identity.key || document.size !== identity.size
+                || typeof document.sha256 !== 'string' || !KEY.test(document.sha256)
+                || identity.sha256 && document.sha256 !== identity.sha256) { return; }
+            const source = { sha256: document.sha256, size: identity.size };
+            const manifestPath = path.join(directory, 'reading.json');
+            const reading = await read(manifestPath, PDF_READING_LIMITS.manifestBytes);
+            const validated = reading && validatePdfReadingManifest(reading.value, source);
+            if (this.closed || !reading || !validated || validated.source.pageCount !== document.pageCount) { return; }
+            const images = new Map(validated.images.map(image => [image.id, image]));
+            return { identity: source, manifestPath, manifestRevision: createHash('sha256').update(reading.bytes).digest('hex'),
+                readImage: async (id: string, chunkIndex: number, signal: AbortSignal) => {
+                    const check = () => { if (this.closed || signal.aborted) { throw new Error('Reading image request stopped'); } };
+                    check();
+                    const image = images.get(id);
+                    if (!image || !Number.isSafeInteger(chunkIndex) || chunkIndex < 0) { throw new Error('Unknown registered reading image'); }
+                    const chunk = image.chunks?.[chunkIndex];
+                    if (image.chunks ? !chunk : chunkIndex !== 0) { throw new Error('Unknown registered reading image chunk'); }
+                    const filename = path.join(directory, image.path);
+                    // Refuse symlinked parents as well as a symlinked final file.
+                    if (await fs.promises.realpath(filename) !== filename) { throw new Error('Reading image paths must be regular local files'); }
+                    check();
+                    const file = await fs.promises.open(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+                    try {
+                        const stat = await file.stat();
+                        if (!stat.isFile() || stat.size !== image.bytes || await fs.promises.realpath(filename) !== filename) {
+                            throw new Error('Registered reading image size or path changed');
+                        }
+                        check();
+                        const offset = chunk?.offset ?? 0, length = chunk?.bytes ?? image.bytes;
+                        const body = Buffer.allocUnsafe(length);
+                        for (let received = 0; received < length;) {
+                            check();
+                            const result = await file.read(body, received, Math.min(256 * 1024, length - received), offset + received);
+                            if (!result.bytesRead) { throw new Error('Registered reading image chunk is incomplete'); }
+                            received += result.bytesRead;
+                        }
+                        check();
+                        if (createHash('sha256').update(body).digest('hex') !== (chunk?.sha256 ?? image.sha256)) {
+                            throw new Error('Registered reading image chunk digest changed');
+                        }
+                        return { body, offset, total: image.bytes };
+                    } finally { await file.close(); }
+                } };
+        })().catch(() => undefined);
+        const pending = task.then(() => {}).finally(() => { this.pending.delete(pending); });
+        this.pending.add(pending);
+        return task;
     }
 
     private current(entry: Subscription): boolean {
@@ -125,7 +198,7 @@ export class PdfPreviewStore {
         if (!entry.watcher) {
             try {
                 entry.watcher = fs.watch(directory, { persistent: false }, (_event, filename) => {
-                    if (!filename || filename.toString() === 'manifest.json') { this.check(entry); }
+                    if (!filename || ['manifest.json', 'reading.json'].includes(filename.toString())) { this.check(entry); }
                 });
                 entry.watcher.on('error', () => {
                     entry.watcher?.close(); entry.watcher = undefined;
@@ -135,7 +208,10 @@ export class PdfPreviewStore {
         const filename = this.manifestPath(entry.identity);
         const link = await fs.promises.lstat(filename).catch(() => undefined);
         if (!this.current(entry) || !link?.isFile() || link.isSymbolicLink() || link.size > PDF_PREVIEW_MANIFEST_BYTES) { return; }
-        const signature = [link.dev, link.ino, link.size, link.mtimeMs].join(':');
+        const reading = await fs.promises.lstat(path.join(directory, 'reading.json')).catch(() => undefined);
+        if (!this.current(entry)) { return; }
+        const signature = [link.dev, link.ino, link.size, link.mtimeMs,
+            ...(reading?.isFile() && !reading.isSymbolicLink() ? [reading.dev, reading.ino, reading.size, reading.mtimeMs] : [])].join(':');
         if (signature === entry.signature) { return; }
         const handle = await fs.promises.open(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0)).catch(() => undefined);
         if (!handle) { return; }

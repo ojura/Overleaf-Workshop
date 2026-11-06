@@ -29,6 +29,7 @@ class FakeCache {
 class FakePreviews extends PdfPreviewStore {
     static current: FakePreviews;
     static exporter: ((...args: Parameters<PdfPreviewStore['exportSource']>) => ReturnType<PdfPreviewStore['exportSource']>) | undefined;
+    static reading: ((identity: PdfPreviewIdentity) => ReturnType<PdfPreviewStore['readingDescriptor']>) | undefined;
     readonly watched: Array<{ identity: PdfPreviewIdentity, callback: () => void, stopped: boolean }> = [];
     wasDisposed = false;
     constructor(root: string) { super(root); FakePreviews.current = this; }
@@ -38,6 +39,7 @@ class FakePreviews extends PdfPreviewStore {
         return () => { record.stopped = true; };
     }
     override dispose() { this.wasDisposed = true; super.dispose(); }
+    override readingDescriptor(identity: PdfPreviewIdentity) { return FakePreviews.reading?.(identity) ?? Promise.resolve(undefined); }
     override exportSource(...args: Parameters<PdfPreviewStore['exportSource']>) {
         if (!FakePreviews.exporter) { throw new Error('The test did not configure an export.'); }
         return FakePreviews.exporter(...args);
@@ -51,6 +53,8 @@ const world = {
     progress: [] as Array<{ message?: string, increment?: number }>,
     notifications: [] as string[],
     errors: [] as string[],
+    registeredReadings: [] as Array<{ revision: string; read: unknown }>,
+    imageRequests: [] as any[],
 };
 const vscode = strict('preview host vscode', {
     Uri, EventEmitter: Emitter, ProgressLocation: { Notification: 15 },
@@ -83,7 +87,14 @@ const { PdfViewEditorProvider } = loadWithVscode(vscode, () => require('../core/
     './pdfPreviewStore': { PdfPreviewStore: FakePreviews, PdfPreviewExportError },
     './pdfFetchBridge': {
         PieceCache: FakeCache, outputsOf: () => () => true,
-        PdfFetchBridge: class { static fetchRange() {} setOutput() {} setActivity() {} dispose() {} },
+        PdfFetchBridge: class {
+            static fetchRange() {} setOutput() {} setActivity() {} dispose() {}
+            setReading(revision: string, read: unknown) { world.registeredReadings.push({ revision, read }); }
+            async handleReading(request: any) {
+                world.imageRequests.push(request);
+                return { id: request.id, status: 206, statusText: 'Partial Content', headers: [], body: new Uint8Array([1, 2]) };
+            }
+        },
     },
 });
 
@@ -91,6 +102,7 @@ class Panel {
     active = true;
     visible = true;
     readonly posted: any[] = [];
+    readonly postedEvents = new Emitter<any>();
     readonly resources: Uri[] = [];
     readonly changes = new Emitter<{ webviewPanel: Panel }>();
     readonly closing = new Emitter<void>();
@@ -100,7 +112,7 @@ class Panel {
     readonly webview = {
         options: {} as any,
         asWebviewUri: (uri: Uri) => { this.resources.push(uri); return { toString: () => 'https://webview.test' + uri.path }; },
-        postMessage: async (message: any) => { this.posted.push(message); return true; },
+        postMessage: async (message: any) => { this.posted.push(message); this.postedEvents.fire(message); return true; },
         onDidReceiveMessage: (callback: (message: any) => void) => { this.receive = callback; return disposable; },
         get html() { return ''; },
         set html(_value: string) {},
@@ -113,13 +125,17 @@ class Panel {
     send(message: any) { this.receive({ page: this.html.slice('<html>'.length, -'</html>'.length), ...message }); }
     close() { this.closing.fire(); }
     nextPage() { return new Promise<void>(resolve => { const stop = this.pages.event(() => { stop.dispose(); resolve(); }); }); }
+    nextMessage(type: string) { return new Promise<any>(resolve => { const stop = this.postedEvents.event(message => {
+        if (message.type === type) { stop.dispose(); resolve(message); }
+    }); }); }
 }
 
 describe('host preview binding lifecycle', () => {
     let provider: any, panel: Panel, doc: any, changes: Emitter<void>, triggers: Array<{ dispose(): void }>;
     beforeEach(async () => {
         world.engine = 'pdfjs'; world.commands.clear(); world.settings = new Emitter(); FakeCache.invalid = false;
-        world.cancellation = new Emitter(); world.progress = []; world.notifications = []; world.errors = []; FakePreviews.exporter = undefined;
+        world.cancellation = new Emitter(); world.progress = []; world.notifications = []; world.errors = []; FakePreviews.exporter = undefined; FakePreviews.reading = undefined;
+        world.registeredReadings = []; world.imageRequests = [];
         // Desktop profiles expose vscode-userdata storage URIs; the Node preview store serves file URIs.
         provider = new PdfViewEditorProvider({ globalStorageUri: new Uri('/preview-test-storage', 'vscode-userdata'), extensionUri: Uri.file('/extension'),
             extension: { packageJSON: { devDependencies: { 'pdfjs-dist': '5.1.91' } } } });
@@ -135,8 +151,9 @@ describe('host preview binding lifecycle', () => {
 
     it('binds descriptors and notifications to the exact output and current engine page', async () => {
         const previews = FakePreviews.current;
+        const loaded = panel.nextMessage('load');
         panel.send({ type: 'ready' });
-        const load = panel.posted.find(message => message.type === 'load');
+        const load = await loaded;
         assert.deepStrictEqual(load.preview.identity, { key: 'a'.repeat(64), size: 1024 });
         assert.strictEqual(load.preview.manifestUrl, 'https://webview.test/preview-test-storage/pdf-previews/' + 'a'.repeat(64) + '/manifest.json');
         assert.deepStrictEqual(panel.webview.options.localResourceRoots.map((uri: Uri) => uri.path), ['/extension', '/preview-test-storage/pdf-previews']);
@@ -192,11 +209,66 @@ describe('host preview binding lifecycle', () => {
         assert.strictEqual(previews.wasDisposed, true);
     });
 
-    it('does not expose a descriptor for a path outside the canonical key namespace', () => {
+    it('does not expose a descriptor for a path outside the canonical key namespace', async () => {
         FakeCache.invalid = true;
+        const loaded = panel.nextMessage('load');
         panel.send({ type: 'ready' });
-        assert.strictEqual(panel.posted.find(message => message.type === 'load').preview, undefined);
+        assert.strictEqual((await loaded).preview, undefined);
         assert.strictEqual(FakePreviews.current.watched.length, 0);
+    });
+
+    it('selects a registered reading source before loading and discards superseded descriptor reads', async () => {
+        const requests: Array<{ identity: PdfPreviewIdentity; resolve(value: any): void }> = [];
+        FakePreviews.reading = identity => new Promise(resolve => requests.push({ identity, resolve }));
+        panel.send({ type: 'ready' });
+        assert.strictEqual(panel.posted.some(message => message.type === 'load'), false);
+        const descriptor = (sha: string, revision: string) => ({ identity: { sha256: sha.repeat(64), size: 1024 },
+            manifestPath: '/preview-test-storage/pdf-previews/' + 'a'.repeat(64) + '/reading.json', manifestRevision: revision.repeat(64) });
+        FakePreviews.current.watched[0].callback();
+        const loaded = panel.nextMessage('load');
+        requests[1].resolve(descriptor('c', 'd'));
+        const message = await loaded;
+        assert.strictEqual(message.reading.identity.sha256, 'c'.repeat(64));
+        assert.ok(message.reading.manifestUrl.endsWith('/reading.json'));
+        requests[0].resolve(descriptor('a', 'b'));
+        await Promise.resolve();
+        assert.strictEqual(panel.posted.filter(message => message.type === 'load').length, 1);
+        assert.strictEqual(message.output, doc.output);
+    });
+
+    it('registers image transport before publication and accepts requests only from its current page', async () => {
+        const revision = 'd'.repeat(64), readImage = async () => ({ body: new Uint8Array([1, 2]), offset: 0, total: 2 });
+        FakePreviews.reading = async () => ({ identity: { sha256: 'c'.repeat(64), size: 1024 },
+            manifestPath: '/preview-test-storage/pdf-previews/' + 'a'.repeat(64) + '/reading.json',
+            manifestRevision: revision, readImage });
+        const loaded = panel.nextMessage('load'); panel.send({ type: 'ready' });
+        const message = await loaded;
+        assert.deepStrictEqual(world.registeredReadings, [{ revision, read: readImage }]);
+        assert.strictEqual(message.reading.readImage, undefined, 'host closures never enter webview configuration');
+        panel.send({ type: 'readingFetch', page: 'obsolete-page', id: 1, manifestRevision: revision, imageId: 'x1', chunkIndex: 0 });
+        assert.strictEqual(world.imageRequests.length, 0);
+        const answered = panel.nextMessage('fetchResponse');
+        panel.send({ type: 'readingFetch', id: 2, manifestRevision: revision, imageId: 'x1', chunkIndex: 0 });
+        const response = await answered;
+        assert.strictEqual(response.page, panel.webview.html.slice('<html>'.length, -'</html>'.length));
+        assert.strictEqual(response.id, 2);
+        assert.deepStrictEqual(response.body, new Uint8Array([1, 2]));
+        assert.strictEqual(world.imageRequests.length, 1);
+    });
+
+    it('does not deliver a reading descriptor after its output or webview is replaced', async () => {
+        const requests: Array<(value: any) => void> = [];
+        FakePreviews.reading = () => new Promise(resolve => requests.push(resolve));
+        panel.send({ type: 'ready' });
+        doc.output = { file: { build: 'b', size: 2048 } }; changes.fire();
+        const loaded = panel.nextMessage('load');
+        requests[1](undefined);
+        assert.strictEqual((await loaded).output.file.build, 'b');
+        requests[0](undefined); await Promise.resolve();
+        assert.strictEqual(panel.posted.filter(message => message.type === 'load').length, 1);
+        panel.send({ type: 'ready' });
+        panel.close(); requests[2](undefined); await Promise.resolve();
+        assert.strictEqual(panel.posted.filter(message => message.type === 'load').length, 1);
     });
 
     it('reports missing-byte completion and file writing as distinct export phases', async () => {

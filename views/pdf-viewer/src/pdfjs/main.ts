@@ -13,14 +13,14 @@
 // keep this import first: it sets Overleaf's caching flags before the loader's modules run
 import { generatePdfCachingTransportFactory } from '../common/transport';
 import PDFJSWrapper from '@/features/pdf-preview/util/pdf-js-wrapper';
-import { bridgeOutputsOf } from '../common/bridge';
+import { bridgeOutputsOf, readReadingImage } from '../common/bridge';
 import { config } from '../common/config';
 import { documentShown, showBuildState, showLoadError, showState } from '../common/banner';
 import { errorMessage } from '../common/errorMessage';
 import { onMessage, post, ready, savedState, saveState, hostMeasurementsPreference, disposeHost } from '../common/host';
 import type { InitState } from '../common/host';
 import { toPdfFile } from '../common/output';
-import type { PdfOutput, PdfPreviewDescriptor, Position, SyncBox } from '../common/protocol';
+import type { PdfOutput, PdfPreviewDescriptor, PdfReadingDescriptor, Position, SyncBox } from '../common/protocol';
 import { goToCode, listenForDoubleClick, showHighlights } from '../common/synctex';
 import { applyTheme, themesFrom } from '../common/theme';
 import type { Theme } from '../common/theme';
@@ -31,6 +31,8 @@ import { documentParams, PDFJS } from '../shims/pdf-js';
 import { PDF_VIEWER_POLICY } from '../common/viewer-policy';
 import { untilAborted, waitForDocumentOperation, waitForPdfJsApplication } from '../common/document-lifecycle';
 import { installReadingState, restoreReadingPosition, visibleReadingPosition } from '../common/reading-state';
+import { openPdfReadingSource, type PdfReadingSource } from '../common/pdf-reading-source';
+import { preparePdfReadingUpgrade } from '../common/pdf-reading-upgrade';
 import '../common/icons.css';
 import './viewer.css';
 
@@ -41,6 +43,7 @@ const spreadModes: Record<string, number> = { none: 0, odd: 1, even: 2 };
 
 const app = (): any => (window as any).PDFViewerApplication;
 let shownBuild: string | undefined;
+let shownReadingRevision: string | undefined;
 
 forwardKeysToVsCode();
 const pageLifetime = new AbortController();
@@ -174,6 +177,7 @@ interface Job {
     abort: AbortController;
     task?: any;
     worker?: Worker;
+    readingSource?: PdfReadingSource;
 }
 
 let queue: Promise<void> = Promise.resolve();
@@ -183,8 +187,11 @@ const jobs = new Set<Job>();
 /** the document that the app shows */
 let shown: { task: any, worker: Worker, doc: any, abort: AbortController } | undefined;
 const destroyed = new WeakSet<object>();
+const readingSources = new WeakMap<object, PdfReadingSource>();
 
 function destroy(task: any, worker?: Worker) {
+    readingSources.get(task)?.dispose();
+    readingSources.delete(task);
     if (destroyed.has(task)) { return; }
     destroyed.add(task);
     if (task.destroyed) { worker?.terminate(); return; }
@@ -199,6 +206,7 @@ function destroy(task: any, worker?: Worker) {
  */
 function stop(job: Job) {
     job.abort.abort();
+    job.readingSource?.dispose();
     if (job.task) {
         destroy(job.task, job.worker);
     } else {
@@ -216,11 +224,12 @@ function untilStopped<T>(job: Job, promise: Promise<T>): Promise<T | undefined> 
  * build again when the PDF's tab becomes active, and a build that is in view already stays as it
  * is, as in the Overleaf viewer.
  */
-interface Source { output?: PdfOutput; data?: ArrayBuffer; preview?: PdfPreviewDescriptor }
+interface Source { output?: PdfOutput; data?: ArrayBuffer; preview?: PdfPreviewDescriptor; reading?: PdfReadingDescriptor }
 
 function show(source: Source) {
     if (pageLifetime.signal.aborted) { return; }
-    if (source.output && !inFlight && app()?.pdfDocument && rangeLoaded?.file.build === source.output.file.build) { return; }
+    if (source.output && !inFlight && app()?.pdfDocument && rangeLoaded?.file.build === source.output.file.build
+        && source.reading?.manifestRevision === shownReadingRevision) { return; }
     if (inFlight) { stop(inFlight); }
     const job: Job = { abort: new AbortController() };
     jobs.add(job);
@@ -245,39 +254,64 @@ async function load(source: Source, job: Job) {
     let params: Record<string, unknown>;
     let url: string | undefined;
     let committing = false;
-    if (source.output) {
-        bridgeOutputsOf(source.output);
-        const file = toPdfFile(source.output);
-        url = file.url;
-        const range = factory({
-            url, pdfFile: file.pdfFile, abortController: job.abort,
-            handleFetchError: (error) => {
-                if (job.abort.signal.aborted) { return; }
-                showLoadError(error, source.output?.file.build);
-                // before the document is shown, pdf.js would wait for the missing data for good
-                if (!committing) { stop(job); }
-            },
-        });
-        // as PDFJSWrapper.loadDocument: one chunk for a small PDF
-        const size = file.pdfFile.size;
-        params = { url, range, rangeChunkSize: size < 2 * CHUNK_SIZE ? size : CHUNK_SIZE };
-    } else {
-        params = { data: new Uint8Array(source.data!) };
+    try {
+        if (source.reading) {
+            job.readingSource = await openPdfReadingSource(source.reading, { signal: job.abort.signal,
+                readImage: ({ id, chunkIndex, signal }) => readReadingImage(source.reading!.manifestRevision, id, chunkIndex, signal) });
+            if (!job.readingSource) { throw new Error('The registered reading publication is unavailable.'); }
+            params = { data: job.readingSource.data, externalImageSource: job.readingSource.externalImageSource };
+            url = source.output && toPdfFile(source.output).url;
+        } else if (source.output) {
+            bridgeOutputsOf(source.output);
+            const file = toPdfFile(source.output);
+            url = file.url;
+            const range = factory({
+                url, pdfFile: file.pdfFile, abortController: job.abort,
+                handleFetchError: (error) => {
+                    if (job.abort.signal.aborted) { return; }
+                    showLoadError(error, source.output?.file.build);
+                    // before the document is shown, pdf.js would wait for the missing data for good
+                    if (!committing) { stop(job); }
+                },
+            });
+            // as PDFJSWrapper.loadDocument: one chunk for a small PDF
+            const size = file.pdfFile.size;
+            params = { url, range, rangeChunkSize: size < 2 * CHUNK_SIZE ? size : CHUNK_SIZE };
+        } else {
+            params = { data: new Uint8Array(source.data!) };
+        }
+    } catch (error) {
+        const aborted = job.abort.signal.aborted;
+        stop(job);
+        if (!aborted) { showLoadError(error, source.output?.file.build); }
+        return;
     }
 
     // getDocument reads the worker from here
     PDFJS.GlobalWorkerOptions.workerPort = worker;
-    const task = PDFJS.getDocument({ ...documentParams(), ...params });
+    let task: any;
+    try { task = PDFJS.getDocument({ ...documentParams(), ...params }); }
+    catch (error) { job.readingSource?.dispose(); worker.terminate(); showLoadError(error, source.output?.file.build); return; }
     job.task = task;
-    let doc: any;
+    if (job.readingSource) { readingSources.set(task, job.readingSource); }
+    let doc: any, resume: (() => void) | undefined;
+    const representationOnly = !!source.output && source.output.file.build === shownBuild;
     try {
         doc = await untilStopped(job, task.promise);
+        if (doc && job.readingSource && doc.numPages !== job.readingSource.manifest.source.pageCount) {
+            throw new Error('The reading PDF page count differs from its publication.');
+        }
+        if (doc && representationOnly && job.readingSource) {
+            resume = await previewController?.pauseImageRefinement();
+            await preparePdfReadingUpgrade(doc, a.pdfViewer, job.abort.signal);
+        }
     } catch (error: any) {
+        resume?.();
         destroy(task, worker);
         if (!job.abort.signal.aborted) { showLoadError(error, source.output?.file.build); }
         return;
     }
-    if (!doc) { return; }
+    if (!doc || job.abort.signal.aborted) { resume?.(); destroy(task, worker); return; }
     // Capture after preparation: the reader may have moved while ranges arrived.
     const view = a.pdfDocument
         ? { position: positionOf(a) ?? savedState().position, scale: a.pdfViewer.currentScaleValue }
@@ -301,18 +335,20 @@ async function load(source: Source, job: Job) {
         // close can detach the document before its task destruction rejects. Keep an
         // owner that is still live in the app, and release one that has left it.
         if (old && shown === old && a.pdfLoadingTask !== old.task && a.pdfDocument !== old.doc) {
+            readingSources.get(old.task)?.dispose();
+            readingSources.delete(old.task);
             old.worker.terminate();
             shown = undefined;
         }
     };
     let cancelReplacement: (() => void) | undefined;
-    if (a.pdfDocument) {
+    if (a.pdfDocument && !representationOnly) {
         try { cancelReplacement = previewController?.prepareReplacement(source.output?.file.build ?? doc.fingerprints?.[0] ?? 'inline', job.abort.signal); }
         catch { /* Optional artwork cannot prevent useful document pixels. */ }
     }
     try {
         await waitForDocumentOperation(() => a.close());
-        if (pageLifetime.signal.aborted) { destroy(task, worker); releaseDetachedOld(); return; }
+        if (pageLifetime.signal.aborted) { destroy(task, worker); releaseDetachedOld(); resume?.(); return; }
         a.pdfLoadingTask = task;
         if (url) { a.setTitleUsingUrl(url, url); }
         a.load(doc);
@@ -325,17 +361,24 @@ async function load(source: Source, job: Job) {
             // failure can therefore leave a partially adopted document that close must clear.
             try { await waitForDocumentOperation(() => a.close()); }
             catch (closeError) { console.warn('pdf viewer: closing a failed document:', closeError); }
-            finally { worker.terminate(); }
+            finally {
+                readingSources.get(task)?.dispose();
+                readingSources.delete(task);
+                worker.terminate();
+            }
         } else {
             destroy(task, worker);
         }
         releaseDetachedOld();
+        resume?.();
         showLoadError(error, source.output?.file.build);
         return;
     }
     releaseDetachedOld();
+    resume?.();
     shown = { task, worker, doc, abort: job.abort };
     shownBuild = source.output?.file.build;
+    shownReadingRevision = source.reading?.manifestRevision;
     findAllowed = false;
     rangeLoaded = source.output;
     documentShown(shownBuild);
@@ -395,7 +438,7 @@ function askBeforeFind(a: any) {
     const dispatch = a.eventBus.dispatch.bind(a.eventBus);
     let asking = false;
     a.eventBus.dispatch = (name: string, data: any) => {
-        if (name !== 'find' || !rangeLoaded || findAllowed) { return dispatch(name, data); }
+        if (name !== 'find' || !rangeLoaded || a.pdfDocument?.hasExternalImages || findAllowed) { return dispatch(name, data); }
         if (asking) { return; }
         asking = true;
         const megabytes = Math.round((rangeLoaded.file.size ?? 0) / 1e6);
@@ -459,7 +502,7 @@ function addToolbarButtons(a: any) {
 }
 
 async function start() {
-    onMessage('load', message => show({ output: message.output, preview: message.preview }));
+    onMessage('load', message => show({ output: message.output, preview: message.preview, reading: message.reading }));
     onMessage('update', (message: { content: ArrayBuffer }) => show({ data: message.content }));
     onMessage('buildState', (message) => showBuildState(message));
     onMessage('syncCode', (message: { content: SyncBox[] }) => {

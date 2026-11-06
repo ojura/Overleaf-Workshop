@@ -234,6 +234,8 @@ describe('shared PDF scroll prefetch policy', function () {
         assert.strictEqual(desktop.pruneOffscreen, false);
         assert.deepStrictEqual(policy.pdfDocumentCacheOptions({ userAgent: 'desktop' }), {
             rangeCacheBytes: 128 * 1024 * 1024, adaptiveImageDecoding: true, imageDecodeConcurrency: 2,
+            externalImageBudget: { maxActiveBytes: 192 * 1024 * 1024, maxEncodedBytes: 32 * 1024 * 1024,
+                maxCoefficientBytes: 64 * 1024 * 1024, maxOutputPixels: 48 * 1024 * 1024 },
         });
         assert.deepStrictEqual([
             desktop.limits.maxConcurrentPrepares, desktop.limits.maxPreparedPages, desktop.limits.maxRenderedPages,
@@ -251,6 +253,8 @@ describe('shared PDF scroll prefetch policy', function () {
             assert.strictEqual(mobile.pruneOffscreen, true);
             assert.deepStrictEqual(policy.pdfDocumentCacheOptions(device), {
                 rangeCacheBytes: 32 * 1024 * 1024, adaptiveImageDecoding: true, imageDecodeConcurrency: 1,
+                externalImageBudget: { maxActiveBytes: 64 * 1024 * 1024, maxEncodedBytes: 32 * 1024 * 1024,
+                    maxCoefficientBytes: 64 * 1024 * 1024, maxOutputPixels: 12 * 1024 * 1024 },
             });
             assert.ok(Object.isFrozen(mobile) && Object.isFrozen(mobile.limits));
             for (const name of ['maxPreparedPages', 'maxConcurrentPrepares', 'maxRenderedPages', 'maxCanvasBytes', 'maxPreviewBytes', 'previewMaxDimension', 'trailPreviewMaxDimension']) {

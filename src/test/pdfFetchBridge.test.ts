@@ -122,6 +122,56 @@ describe('the PDF viewer\'s fetches through the extension', () => {
         } finally { server.close(); }
     });
 
+    it('serves only revision-authorized image chunks with exact range response metadata', async () => {
+        const bridge = new PdfFetchBridge(() => false), revision = 'a'.repeat(64);
+        const asked: Array<[string, number]> = [];
+        bridge.setReading(revision, async (id, index) => {
+            asked.push([id, index]);
+            return { body: new Uint8Array([7, 8, 9]), offset: 6, total: 12 };
+        });
+        try {
+            const response = await bridge.handleReading({ id: 1, manifestRevision: revision, imageId: 'x1', chunkIndex: 1 });
+            assert.deepStrictEqual(asked, [['x1', 1]]);
+            assert.deepStrictEqual([response.status, response.body], [206, new Uint8Array([7, 8, 9])]);
+            assert.deepStrictEqual(Object.fromEntries(response.headers), { 'content-type': 'application/octet-stream',
+                'content-length': '3', 'content-encoding': 'identity', 'content-range': 'bytes 6-8/12' });
+            await assert.rejects(bridge.handleReading({ id: 2, manifestRevision: 'b'.repeat(64), imageId: 'x1', chunkIndex: 1 }), /not registered/);
+            assert.strictEqual(asked.length, 1);
+            bridge.setReading(revision, async () => ({ body: new Uint8Array([1, 2]), offset: 0, total: 2 }));
+            const whole = await bridge.handleReading({ id: 3, manifestRevision: revision, imageId: 'x2', chunkIndex: 0 });
+            assert.strictEqual(whole.status, 200);
+            assert.strictEqual(whole.headers.some(([name]) => name === 'content-range'), false);
+        } finally { bridge.dispose(); }
+    });
+
+    it('retains cancelled image admission until its read settles and fences disposal', async () => {
+        const bridge = new PdfFetchBridge(() => false), revision = 'a'.repeat(64);
+        const reads: Array<{ signal: AbortSignal; resolve(value: { body: Uint8Array; offset: number; total: number }): void }> = [];
+        bridge.setReading(revision, (_id, _index, signal) => new Promise(resolve => reads.push({ signal, resolve })));
+        const request = (id: number) => bridge.handleReading({ id, manifestRevision: revision, imageId: 'x1', chunkIndex: 0 });
+        const pending = [1, 2, 3, 4].map(request);
+        const rejected = assert.rejects(pending[0], /stopped/);
+        try {
+            await assert.rejects(request(5), /limit/);
+            bridge.abort(1);
+            assert.strictEqual(reads[0].signal.aborted, true);
+            await assert.rejects(request(5), /limit/, 'an aborted but unfinished disk read still occupies its slot');
+            reads[0].resolve({ body: new Uint8Array([1]), offset: 0, total: 1 }); await rejected;
+            const next = request(5);
+            assert.strictEqual(reads.length, 5);
+            const stopping = [...pending.slice(1), next].map(value => assert.rejects(value, /stopped/));
+            bridge.dispose();
+            assert.ok(reads.every(read => read.signal.aborted));
+            for (const read of reads.slice(1)) { read.resolve({ body: new Uint8Array([1]), offset: 0, total: 1 }); }
+            await Promise.all(stopping);
+            await assert.rejects(request(6), /not registered/);
+        } finally {
+            bridge.dispose();
+            for (const read of reads) { read.resolve({ body: new Uint8Array([1]), offset: 0, total: 1 }); }
+            await Promise.allSettled(pending);
+        }
+    });
+
     it('stops a request that the viewer no longer needs', async () => {
         const server = await serve(2000);
         try {

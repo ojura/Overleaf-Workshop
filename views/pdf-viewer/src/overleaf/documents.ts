@@ -1,17 +1,21 @@
 import type PDFJSWrapper from '@/features/pdf-preview/util/pdf-js-wrapper';
 import { PDFJS, documentParams, loadingTasks } from '../shims/pdf-js';
-import { bridgeOutputsOf } from '../common/bridge';
+import { bridgeOutputsOf, readReadingImage } from '../common/bridge';
 import { toPdfFile } from '../common/output';
-import type { PdfOutput, PdfPreviewDescriptor } from '../common/protocol';
+import type { PdfOutput, PdfPreviewDescriptor, PdfReadingDescriptor } from '../common/protocol';
 import { createWorkerPort } from '../common/worker';
 import { holdDocumentHeight } from '../common/document-height';
 import { untilAborted, waitForDocumentOperation } from '../common/document-lifecycle';
+import { openPdfReadingSource, type PdfReadingSource } from '../common/pdf-reading-source';
+import { preparePdfReadingUpgrade } from '../common/pdf-reading-upgrade';
 
 export interface DocumentHooks {
     /** a load is about to replace the shown document: save what depends on it */
     beforeLoad(): void;
     /** The validated proxy is being installed now, including a deferred native view transition. */
     beforeSwap?(doc: any, build: string | undefined, signal: AbortSignal): (() => void) | undefined;
+    /** Keep painted pixels while the candidate owns image preparation. */
+    pauseRefinement?(): Promise<() => void>;
     /** `doc`, of build `build` or read whole, is shown */
     loaded(doc: any, build: string | undefined, preview?: PdfPreviewDescriptor): void;
     /** the load of build `build`, or of a PDF read whole, failed; `aborted` when a newer load stopped it */
@@ -28,6 +32,7 @@ interface Job {
     adopted: Promise<Adoption>;
     adopt(result: Adoption): void;
     shown: boolean;
+    readingSource?: PdfReadingSource;
 }
 
 /** What the page ends together with a document it loaded. */
@@ -37,6 +42,7 @@ interface Owned {
     job: Job;
     signal: AbortSignal;
     build?: string;
+    representationOnly?: boolean;
     /** the abort controller of the document's range requests (Overleaf's transport), for a build loaded in ranges */
     requests?: AbortController;
 }
@@ -71,6 +77,7 @@ export class Documents {
     private inFlight?: Job;
     /** the build shown, unless the shown document was read whole */
     private shownBuild?: string;
+    private shownReadingRevision?: string;
     /** the worker and the range requests of each document's loading task */
     private readonly owned = new Map<any, Owned>();
     /** Deferred callbacks may still hold a proxy after its task was destroyed. */
@@ -90,7 +97,7 @@ export class Documents {
                 throw new DOMException('The document load was cancelled.', 'AbortError');
             }
             let cancel: (() => void) | undefined;
-            if (doc && viewer.pdfDocument && doc !== viewer.pdfDocument && owned) {
+            if (doc && viewer.pdfDocument && doc !== viewer.pdfDocument && owned && !owned.representationOnly) {
                 try { cancel = hooks.beforeSwap?.(doc, owned.build, owned.signal); }
                 catch { /* Optional scene preparation cannot prevent useful document pixels. */ }
             }
@@ -128,9 +135,10 @@ export class Documents {
     }
 
     /** Load the build `output` in ranges, unless it is the build shown already. */
-    load(output: PdfOutput, force = false, preview?: PdfPreviewDescriptor) {
-        if (!force && !this.inFlight && output.file.build === this.shownBuild) { return; }
-        this.enqueue(job => this.loadOutput(output, job, preview));
+    load(output: PdfOutput, force = false, preview?: PdfPreviewDescriptor, reading?: PdfReadingDescriptor) {
+        if (!force && !this.inFlight && output.file.build === this.shownBuild
+            && reading?.manifestRevision === this.shownReadingRevision) { return; }
+        this.enqueue(job => this.loadOutput(output, job, preview, reading));
     }
 
     /** Load a PDF read whole. */
@@ -159,6 +167,7 @@ export class Documents {
         this.owned.delete(task);
         this.retired.add(task);
         owned?.requests?.abort();
+        owned?.job.readingSource?.dispose();
         const destroying = waitForDocumentOperation(() => task.destroy())
             .catch(error => console.warn('pdf viewer: destroying a document:', error))
             .finally(() => { owned?.worker.terminate(); this.destroying.delete(destroying); });
@@ -190,7 +199,19 @@ export class Documents {
         return port;
     }
 
-    private async loadOutput(output: PdfOutput, job: Job, preview?: PdfPreviewDescriptor) {
+    private async loadOutput(output: PdfOutput, job: Job, preview?: PdfPreviewDescriptor, reading?: PdfReadingDescriptor) {
+        if (reading) {
+            try {
+                job.readingSource = await openPdfReadingSource(reading, { signal: job.abort.signal,
+                    readImage: ({ id, chunkIndex, signal }) => readReadingImage(reading.manifestRevision, id, chunkIndex, signal) });
+                if (!job.readingSource) { throw new Error('The registered reading publication is unavailable.'); }
+                await this.loadBytes(job.readingSource.data, job, { output, preview, reading });
+            } catch (error) {
+                job.readingSource?.dispose();
+                this.hooks.failed(error, job.abort.signal.aborted, output.file.build);
+            }
+            return;
+        }
         const port = await this.prepare(job);
         if (!port) { return; }
         bridgeOutputsOf(output);
@@ -211,7 +232,8 @@ export class Documents {
         });
         // loadDocument has created the task before its first await
         job.task = [...loadingTasks].find(task => !before.has(task));
-        if (job.task) { this.owned.set(job.task, { worker: port, job, signal: job.abort.signal, build: output.file.build, requests: job.abort }); } else { port.terminate(); }
+        if (job.task) { this.owned.set(job.task, { worker: port, job, signal: job.abort.signal, build: output.file.build,
+            representationOnly: this.shownBuild === output.file.build, requests: job.abort }); } else { port.terminate(); }
         let doc: any;
         try {
             doc = await this.untilAborted(job, loading);
@@ -232,6 +254,7 @@ export class Documents {
             return;
         }
         this.shownBuild = output.file.build;
+        this.shownReadingRevision = undefined;
         this.destroyAllBut(doc);
         this.hooks.loaded(doc, output.file.build, preview);
     }
@@ -239,33 +262,51 @@ export class Documents {
     /** End `job` now: stop its requests and destroy its document. */
     private stop(job: Job) {
         job.abort.abort();
+        job.readingSource?.dispose();
         if (job.task) { this.destroy(job.task); }
     }
 
-    private async loadBytes(data: ArrayBuffer, job: Job) {
+    private async loadBytes(data: ArrayBuffer | Uint8Array, job: Job,
+        source?: { output: PdfOutput; preview?: PdfPreviewDescriptor; reading: PdfReadingDescriptor }) {
         const port = await this.prepare(job);
-        if (!port) { return; }
+        if (!port) { job.readingSource?.dispose(); return; }
         // the wrapper loads URLs only; a PDF read whole is set the way loadDocument sets one
-        const task = PDFJS.getDocument({ data, ...documentParams() });
-        loadingTasks.add(task);
-        this.owned.set(task, { worker: port, job, signal: job.abort.signal });
-        job.task = task;
-        let doc: any;
+        let task: any, doc: any, resume: (() => void) | undefined;
+        const representationOnly = !!source && source.output.file.build === this.shownBuild;
         try {
+            task = PDFJS.getDocument({ data, ...documentParams(),
+                ...(job.readingSource ? { externalImageSource: job.readingSource.externalImageSource } : {}) });
+            loadingTasks.add(task);
+            this.owned.set(task, { worker: port, job, signal: job.abort.signal, build: source?.output.file.build, representationOnly });
+            job.task = task;
             doc = await this.untilAborted(job, task.promise);
-            if (doc) { this.setDocument(doc); }
+            if (doc && source && doc.numPages !== job.readingSource?.manifest.source.pageCount) {
+                throw new Error('The reading PDF page count differs from its publication.');
+            }
+            if (doc && representationOnly) {
+                resume = await this.hooks.pauseRefinement?.();
+                await preparePdfReadingUpgrade(doc, this.wrapper.viewer, job.abort.signal);
+            }
+            if (doc && !job.abort.signal.aborted) {
+                if (representationOnly) { this.hooks.beforeLoad(); }
+                this.setDocument(doc);
+            }
+            else { doc = undefined; }
         } catch (error) {
-            this.destroy(task);
-            this.hooks.failed(error, job.abort.signal.aborted, undefined);
+            if (task) { this.destroy(task); } else { job.readingSource?.dispose(); port.terminate(); }
+            this.hooks.failed(error, job.abort.signal.aborted, source?.output.file.build);
             return;
+        } finally {
+            resume?.();
         }
         if (!doc) {
             this.destroy(task);
             return;
         }
-        this.shownBuild = undefined;
+        this.shownBuild = source?.output.file.build;
+        this.shownReadingRevision = source?.reading.manifestRevision;
         this.destroyAllBut(doc);
-        this.hooks.loaded(doc, undefined);
+        this.hooks.loaded(doc, this.shownBuild, source?.preview);
     }
 
     /** PDFJSWrapper.loadDocument's swap (pdf-js-wrapper.ts:89-106), for a document it did not load. */

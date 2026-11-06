@@ -86,8 +86,15 @@ export function pdfCachePolicy(device: ReaderDevice = typeof navigator === 'unde
 
 /** Pass the same device policy to every PDF.js document-loading entry point. */
 export function pdfDocumentCacheOptions(device?: ReaderDevice) {
-    const { rangeCacheBytes, adaptiveImageDecoding, imageDecodeConcurrency } = pdfCachePolicy(device);
-    return { rangeCacheBytes, adaptiveImageDecoding, imageDecodeConcurrency };
+    const policy = pdfCachePolicy(device);
+    const { rangeCacheBytes, adaptiveImageDecoding, imageDecodeConcurrency } = policy;
+    return { rangeCacheBytes, adaptiveImageDecoding, imageDecodeConcurrency,
+        externalImageBudget: {
+            maxActiveBytes: (policy.name === 'mobile' ? 64 : 192) * 1024 * 1024,
+            maxEncodedBytes: 32 * 1024 * 1024,
+            maxCoefficientBytes: 64 * 1024 * 1024,
+            maxOutputPixels: policy.limits.maxCanvasBytes / RGBA_BYTES_PER_PIXEL,
+        } };
 }
 
 /** Keep sidecar input decoding within its edge limit and the retained RGBA raster byte budget. */

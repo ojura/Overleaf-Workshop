@@ -103,6 +103,8 @@ export interface DocumentRobotDelivery {
     pageElement: HTMLElement;
     canvas: HTMLCanvasElement;
     kind: 'preview' | 'page';
+    /** Monotone native image-content revision; dimensions may stay equal between scans. */
+    contentRevision?: number;
     imageRegions?: readonly DocumentRobotImageRegion[];
     rasterProjection?: PdfRasterProjection;
     pageProjection?: PdfPageProjection;
@@ -152,6 +154,7 @@ interface Payload {
     deposited: boolean;
     handedOff: boolean;
     refinements: number;
+    contentRevision: number;
     refinementAttempt?: string;
     cleanerShown?: boolean;
     routeState?: CargoRouteState;
@@ -787,7 +790,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 : random.range(DOCUMENT_ROBOT_LIMITS.minDurationMs, DOCUMENT_ROBOT_LIMITS.maxDurationMs)
                     * (mode === 'solo' ? 1 : DOCUMENT_ROBOT_LIMITS.cooperative.durationScale),
             bytes: 0, helpers: [], progress: 0, stage: mode === 'solo' ? 'carry' : 'rendezvous',
-            deposited: false, handedOff: false, refinements: 0,
+            deposited: false, handedOff: false, refinements: 0, contentRevision: 0,
         };
     }
 
@@ -828,6 +831,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             for (const payload of episode.payloads) { paintArrival(payload, episode.pageProjection, episode.displayRasterProjection); }
         }
         const policy = pagePresentation(presentation(), episode.pageProjection?.content ?? episode.pageSize);
+        const revision = Number.isSafeInteger(value.contentRevision) && value.contentRevision! >= 0 ? value.contentRevision! : 0;
         let count = 0;
         for (const payload of episode.payloads) {
             retireUncovered(payload, episode.element);
@@ -835,9 +839,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             if (!previous || !previous.parentNode || now() >= payload.started + payload.delay + payload.duration * RETURN_START) { continue; }
             const size = rasterSize(value.canvas, payload.crop, payload.mode, policy, value.rasterProjection);
             if (!size) { continue; }
-            const key = size.width + 'x' + size.height;
-            if (size.width < previous.width || size.height < previous.height
-                || size.width === previous.width && size.height === previous.height || payload.refinementAttempt === key
+            const key = size.width + 'x' + size.height + ':' + revision;
+            if (revision < payload.contentRevision || size.width < previous.width || size.height < previous.height
+                || size.width === previous.width && size.height === previous.height && revision <= payload.contentRevision || payload.refinementAttempt === key
                 || cargoBytes + size.bytes > policy.maxCargoBytes) { continue; }
             payload.refinementAttempt = key;
             let next: HTMLCanvasElement | undefined, committed = false;
@@ -858,7 +862,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 }
                 previous.replaceWith(next);
                 const oldBytes = payload.bytes;
-                payload.canvas = next; payload.bytes = size.bytes; payload.refinements++;
+                payload.canvas = next; payload.bytes = size.bytes; payload.refinements++; payload.contentRevision = revision;
                 committed = true; next = undefined;
                 stats.refinements++; count++;
                 beginCleaner(payload, episode.page, policy);
@@ -3148,6 +3152,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 for (const actor of payload.helpers) { used.add(actor.vehicle); }
             }
         }
+        for (const payload of payloads) {
+            payload.contentRevision = Number.isSafeInteger(value.contentRevision) && value.contentRevision! >= 0 ? value.contentRevision! : 0;
+        }
         for (const actor of staged) { releaseActor(actor.body); }
         if (!payloads.length) {
             if (resourcesRejected) { stats.rejected++; return 'deferred'; }
@@ -3337,7 +3344,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                     payloads: episode.payloads.map(payload => ({ id: payload.id, mode: payload.mode, ground: payload.ground, imageId: payload.crop.imageId,
                         operation: operationSnapshot(payload),
                         cropKind: payload.crop.kind ?? 'fragment', imageIds: payload.crop.imageIds,
-                        deadline: payload.started + payload.delay + payload.duration, refinements: payload.refinements,
+                        deadline: payload.started + payload.delay + payload.duration, refinements: payload.refinements, contentRevision: payload.contentRevision,
                         arrivalCovered: !!payload.cover?.parentNode, refinementPending: !!payload.underlay,
                         refinementProgress: cleaner?.payload === payload ? ease(cleaner.phase) : 1,
                         rasterWidth: payload.canvas?.width ?? 0, rasterHeight: payload.canvas?.height ?? 0,

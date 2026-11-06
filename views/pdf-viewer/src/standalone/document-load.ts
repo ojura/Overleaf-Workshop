@@ -1,5 +1,6 @@
 import { openHttpPdfRange } from './http-range';
-import { sitePreviewDescriptor, type SiteConfig } from './config';
+import { sitePreviewDescriptor, siteReadingDescriptor, type SiteConfig } from './config';
+import { openPdfReadingSource, type PdfReadingSource } from '../common/pdf-reading-source';
 
 interface PrepareOptions {
     signal: AbortSignal;
@@ -8,6 +9,7 @@ interface PrepareOptions {
     onError(error: Error): void;
     onProgress?(progress: { loaded: number; total: number }): void;
     openRange?: typeof openHttpPdfRange;
+    openReading?: typeof openPdfReadingSource;
 }
 
 /** Prepare a replacement while the current viewer still owns its document and pixels. */
@@ -15,6 +17,9 @@ export async function prepareSiteDocument(pdfjs: any, config: SiteConfig, option
     let source: Awaited<ReturnType<typeof openHttpPdfRange>> | undefined;
     let task: any;
     let worker: any;
+    let reading: PdfReadingSource | undefined;
+    let sourceAborted = false;
+    function abortSource() { if (source && !sourceAborted) { sourceAborted = true; source.abort(); } }
     let destroyed = false;
     let rejectLoad!: (error: Error) => void;
     // PDF.js can leave its load promise pending after transport destruction. Cancellation
@@ -25,7 +30,8 @@ export async function prepareSiteDocument(pdfjs: any, config: SiteConfig, option
         if (destroyed) { return; }
         destroyed = true;
         options.signal.removeEventListener('abort', abort);
-        source?.abort();
+        abortSource();
+        reading?.dispose();
         try { if (task) { void task.destroy().catch(() => {}); } }
         finally { worker?.destroy(); }
     }
@@ -44,16 +50,26 @@ export async function prepareSiteDocument(pdfjs: any, config: SiteConfig, option
         if (options.requirePreviewIdentity && config.previews && !sitePreviewDescriptor(config, source)) {
             throw new Error('Objavljena knjiga ne odgovara svojoj konfiguraciji. Pokušat ću ponovno.');
         }
+        const descriptor = siteReadingDescriptor(config, source);
+        if (config.reading && !descriptor) { throw new Error('Objavljena knjiga ne odgovara svojoj konfiguraciji. Pokušat ću ponovno.'); }
+        if (descriptor) {
+            reading = await (options.openReading ?? openPdfReadingSource)(descriptor, { signal: options.signal });
+            if (options.signal.aborted) { reading?.dispose(); throw new DOMException('PDF load stopped.', 'AbortError'); }
+            if (!reading) { throw new Error('Objavljena verzija za čitanje nije dostupna. Pokušat ću ponovno.'); }
+            abortSource();
+        }
         // Explicit ownership lets cancellation and the bounded close fallback stop this
         // candidate's worker even if its transport never answers the destroy request.
         worker = new pdfjs.PDFWorker();
-        task = pdfjs.getDocument({ ...options.apiParams, ...source.documentParams, worker });
+        task = pdfjs.getDocument({ ...options.apiParams, ...(reading
+            ? { data: reading.data, externalImageSource: reading.externalImageSource } : source.documentParams), worker });
         task.onProgress = options.onProgress;
         task.onPassword = () => rejectLoad(new Error('Objavljena knjiga traži lozinku.'));
         const document = await Promise.race([task.promise, stopped]);
+        if (reading && document.numPages !== reading.manifest.source.pageCount) { throw new Error('Reading PDF page count does not match its source.'); }
         await Promise.race([document.getPage(1), stopped]);
         if (options.signal.aborted) { throw new DOMException('PDF load stopped.', 'AbortError'); }
-        return { source, task, document, destroy };
+        return { source, task, document, reading, destroy };
     } catch (error) {
         destroy();
         throw error;

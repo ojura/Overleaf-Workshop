@@ -228,17 +228,32 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             if (doc.output) {
                 const output = doc.output, asked = bridge, generation = previewGeneration;
                 let preview: PdfPreviewDescriptor | undefined;
+                let readingRequest: Promise<Awaited<ReturnType<PdfPreviewStore['readingDescriptor']>>> | undefined;
+                let readingRead = 0;
+                const current = () => !panelDisposed && generation === previewGeneration && asked === bridge && output === doc.output;
+                const publish = async () => {
+                    const read = ++readingRead;
+                    const registered = await readingRequest;
+                    if (!current() || read !== readingRead) { return; }
+                    if (registered) { asked.fetches.setReading(registered.manifestRevision, registered.readImage); }
+                    const reading = registered ? { identity: registered.identity, manifestRevision: registered.manifestRevision,
+                        manifestUrl: webviewPanel.webview.asWebviewUri(vscode.Uri.file(registered.manifestPath)).toString() } : undefined;
+                    post({ type: 'load', output, preview, reading });
+                };
                 try {
                     const identity = this.pieces.previewIdentity(output);
                     const manifest = this.previews.manifestPath(identity);
                     preview = { identity, manifestUrl: webviewPanel.webview.asWebviewUri(vscode.Uri.file(manifest)).toString() };
+                    readingRequest = this.previews.readingDescriptor(identity);
                     stopPreview = this.previews.watch(identity, () => {
-                        if (!panelDisposed && generation === previewGeneration && asked === bridge && output === doc.output) {
+                        if (current()) {
                             post({ type: 'previewChanged', page: asked.page, key: identity.key });
+                            readingRequest = this.previews.readingDescriptor(identity);
+                            void publish();
                         }
                     });
                 } catch { /* A build without an exact range identity has no registered preview source. */ }
-                post({type:'load', output, preview});
+                void publish();
             } else if (doc.cache.buffer.byteLength !== 0) {
                 post({type:'update', content:doc.cache.buffer as ArrayBuffer});
             }
@@ -370,14 +385,15 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                         this.viewState.save(doc.uri.toString(), e.content);
                     }
                     break;
-                case 'fetch': {
+                case 'fetch':
+                case 'readingFetch': {
                     // a request of a page that the panel no longer shows is not sent
                     const asked = bridge;
                     if (e.page !== asked.page) { break; }
                     const answer = (message: HostMessage) => {
                         if (asked === bridge) { post(message); }
                     };
-                    asked.fetches.handle(e).then(
+                    (e.type === 'readingFetch' ? asked.fetches.handleReading(e) : asked.fetches.handle(e)).then(
                         (res) => answer({type:'fetchResponse', page: asked.page, ...res}),
                         (error) => answer({type:'fetchError', page: asked.page, id:e.id, message:errorMessage(error)}),
                     );

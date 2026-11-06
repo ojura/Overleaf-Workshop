@@ -1,20 +1,21 @@
 import type { SiteConfig } from './config';
 
 export interface SitePublicationChange {
-    kind: 'document' | 'previews' | 'metadata';
+    kind: 'document' | 'reading' | 'previews' | 'metadata';
     newEdition: boolean;
 }
 
 /** A larger atlas for the same PDF must not close the reader or replay its page deliveries. */
 export function sitePublicationChange(previous: SiteConfig, next: SiteConfig): SitePublicationChange | undefined {
-    const before = previous.previews, after = next.previews;
+    const before = previous.reading ?? previous.previews, after = next.reading ?? next.previews;
     const changedBytes = !!before && !!after && (before.sha256 !== after.sha256 || before.size !== after.size);
     const changedValidator = !!before && !!after && (before.validator.header !== after.validator.header
         || before.validator.value !== after.validator.value);
     if (previous.pdfUrl !== next.pdfUrl || changedBytes || changedValidator) {
         return { kind: 'document', newEdition: changedBytes || !before || !after };
     }
-    if (JSON.stringify(before) !== JSON.stringify(after)) { return { kind: 'previews', newEdition: false }; }
+    if (JSON.stringify(previous.reading) !== JSON.stringify(next.reading)) { return { kind: 'reading', newEdition: false }; }
+    if (JSON.stringify(previous.previews) !== JSON.stringify(next.previews)) { return { kind: 'previews', newEdition: false }; }
     if (previous.title !== next.title || previous.filename !== next.filename || previous.sourceUrl !== next.sourceUrl) {
         return { kind: 'metadata', newEdition: false };
     }

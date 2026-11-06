@@ -2,6 +2,7 @@ import { installPdfPrefetch } from '../common/pdf-prefetch';
 import { pdfCachePolicy, pdfDocumentCacheOptions } from '../common/scroll-prefetch';
 import { pageLink, readSiteConfig, sitePreviewDescriptor, type SiteConfig } from './config';
 import { captureSiteView, prepareSiteDocument } from './document-load';
+import { preparePdfReadingUpgrade } from '../common/pdf-reading-upgrade';
 import { createSiteDocumentLifecycle } from './document-lifecycle';
 import { watchSitePublication } from './publication';
 import { httpPdfPreviewSource } from '../common/pdf-preview-http';
@@ -197,7 +198,7 @@ async function start() {
         notice('PDF se nije učitao. ' + message, true);
     });
 
-    async function openBook(value: SiteConfig, newEdition = false, automatic = false) {
+    async function openBook(value: SiteConfig, newEdition = false, automatic = false, representationOnly = false) {
         const current = ++attempt;
         loading?.abort();
         loading = new AbortController();
@@ -206,6 +207,7 @@ async function start() {
         let prepared: Awaited<ReturnType<typeof prepareSiteDocument>> | undefined;
         let cancelReplacement: (() => void) | undefined;
         let committed = false;
+        let resume: (() => void) | undefined;
         const timeout = window.setTimeout(() => controller.abort(), 60_000);
         if (!automatic) { elements.share.disabled = true; notice('Učitavam spomenar…'); }
         try {
@@ -223,13 +225,17 @@ async function start() {
                     void documentLifecycle.close(prepared).catch((reason: unknown) => console.error('spomenar: close', reason));
                 },
             });
+            if (representationOnly && prepared.reading && app.pdfDocument) {
+                resume = await prefetch.pauseImageRefinement();
+                await preparePdfReadingUpgrade(prepared.document, app.pdfViewer, signal);
+            }
             if (signal.aborted || current !== attempt || automatic && !canCommit()) { return false; }
             const view = app.pdfDocument ? captureSiteView(app, new URL(currentLink).hash, prepared.document.numPages) : undefined;
             const previous = book;
             const preview = sitePreviewDescriptor(value, prepared.source);
             automaticLoad = false;
             window.clearTimeout(timeout);
-            if (view) {
+            if (view && !representationOnly) {
                 const identity = preview?.identity.key ?? JSON.stringify([value.pdfUrl, prepared.source.length,
                     prepared.source.validator, value.publicationGeneration ?? 0]);
                 cancelReplacement = prefetch.prepareReplacement(identity, signal);
@@ -248,7 +254,7 @@ async function start() {
             elements.download.title = 'Preuzmi cijeli PDF (' + (next.source.length / 1e9).toLocaleString('hr', { maximumFractionDigits: 2 }) + ' GB)';
             prefetch.setPreviewSource(preview ? httpPdfPreviewSource(preview) : undefined, next.document);
             pdfPerformance.event('publication-open', { edition: newEdition, generation: value.publicationGeneration ?? 0,
-                pages: next.document.numPages, bytes: next.source.length });
+                pages: next.document.numPages, bytes: next.source.length, representationOnly, reading: !!next.reading });
             if (newEdition) { notice('Nova knjiga je stigla. Ekipa, na posao!', false, true); }
             return true;
         } catch (error) {
@@ -259,6 +265,7 @@ async function start() {
         } finally {
             window.clearTimeout(timeout);
             if (!committed) { cancelReplacement?.(); prepared?.destroy(); }
+            resume?.();
             if (loading === controller) { loading = undefined; automaticLoad = false; }
         }
     }
@@ -270,6 +277,7 @@ async function start() {
         current: () => settings!, read: readSettings, canApply: () => !loading && canCommit(),
         async apply(value, change) {
             if (change.kind === 'document') { return openBook(value, change.newEdition, true); }
+            if (change.kind === 'reading') { return openBook(value, false, true, true); }
             if (change.kind === 'previews' && book) {
                 const preview = sitePreviewDescriptor(value, book.source);
                 prefetch.setPreviewSource(preview ? httpPdfPreviewSource(preview) : undefined, book.document);

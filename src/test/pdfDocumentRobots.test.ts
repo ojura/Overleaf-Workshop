@@ -1349,6 +1349,26 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes, 0);
     });
 
+    it('refines equal-size progressive photo content once per revision without changing the frozen job', () => {
+        const { f, source } = coarsePhoto(); f.tick(100);
+        const before = f.api.snapshot().pages[0].payloads[0];
+        const next = { ...source(135, 192), contentRevision: 1 };
+        assert.strictEqual(f.api.refine(next), 1);
+        const after = f.api.snapshot().pages[0].payloads[0];
+        assert.deepStrictEqual([after.id, after.target, after.deadline, after.helpers, after.operation],
+            [before.id, before.target, before.deadline, before.helpers, before.operation]);
+        assert.deepStrictEqual([after.rasterWidth, after.rasterHeight], [before.rasterWidth, before.rasterHeight]);
+        assert.strictEqual(after.contentRevision, 1);
+        const allocated = f.owned.length;
+        assert.strictEqual(f.api.refine(next), 0, 'the same scan cannot allocate or restart a cleaner');
+        assert.strictEqual(f.api.refine({ ...source(), contentRevision: 0 }), 0, 'older content cannot replace a newer scan');
+        assert.strictEqual(f.owned.length, allocated);
+        assert.strictEqual(f.api.refine({ ...next, contentRevision: 2 }), 1);
+        f.finish();
+        assert.strictEqual(f.api.refine({ ...next, contentRevision: 3 }), 0, 'late scans cannot resurrect a retired payload');
+        assert.strictEqual(f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+    });
+
     it('refinement charges old and new rasters together and rolls back a failed copy without repeated allocations', () => {
         const { f, source } = coarsePhoto();
         const payload = f.api.snapshot().pages[0].payloads[0];

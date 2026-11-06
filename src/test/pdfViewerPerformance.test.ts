@@ -55,7 +55,7 @@ describe('PDF prefetch performance measurements', function () {
 
     function contentFixture(options: { storage?: Map<string, string>; storageFails?: boolean;
         preference?: { whenReady?(): Promise<void>; read(): boolean | undefined; write(open: boolean): void | Promise<void> };
-        visible?: boolean; onOpen?: () => void } = {}) {
+        visible?: boolean; onOpen?: () => void; rangeCache?: Record<string, number> } = {}) {
         const listeners = new Map<string, Set<() => void>>();
         const timers = new Map<number, () => void>();
         const storage = options.storage ?? new Map<string, string>();
@@ -110,7 +110,7 @@ describe('PDF prefetch performance measurements', function () {
                     if (!nodes.has(selector)) { nodes.set(selector, new ElementNode(selector)); }
                     return nodes.get(selector)!;
                 };
-                const fields = ['margin', 'status'].map(name => {
+                const fields = ['margin', 'status', 'reading-images'].map(name => {
                     const node = lookup('[data-field="' + name + '"]'); node.dataset.field = name; return node;
                 });
                 return this.shadow = { innerHTML: '', querySelector: lookup, querySelectorAll: () => fields };
@@ -156,7 +156,7 @@ describe('PDF prefetch performance measurements', function () {
             direction: 0, velocityPxPerMs: 0, accelerationPxPerMs2: 0, pageLatencyMs: 0,
             preloadPx: 0, readyDistancePx: 0, safetySeconds: null, bufferSeconds: null,
             visible: [], renderAhead: [], prepared: [], pending: [], failed: [],
-            previewPages: 0, previewBytes: 0, canvasBytes: 0,
+            previewPages: 0, previewBytes: 0, canvasBytes: 0, rangeCache: options.rangeCache,
         }), { measurementsPreference: options.preference, onOpen: options.onOpen });
         return { diagnostics, storage, reads, writes, refreshes, heights, observers, timers,
             get host() { return host; }, get panelOptions() { return panelOptions; },
@@ -363,6 +363,44 @@ describe('PDF prefetch performance measurements', function () {
         assert.strictEqual(snapshot.events.at(-1).data.page, capacity + 7);
         assert.ok(snapshot.events.every((event: any, index: number, events: any[]) =>
             index === 0 || event.sequence > events[index - 1].sequence));
+    });
+
+    it('shows partial-state and final-native ownership from the existing worker snapshot', () => {
+        const mib = 1024 * 1024;
+        const rangeCache = { externalImageBudgetBytes: 64 * mib, externalImageReservedBytes: 6 * mib,
+            externalImagePartialRasterBytes: mib, externalImageNativeRasterBytes: 7 * mib,
+            externalImageActive: 1, externalImageQueued: 3, externalImagePaused: 2 };
+        const fixture = contentFixture({ visible: true, rangeCache });
+        try {
+            fixture.diagnostics.setEnabled(true);
+            const text = fixture.node('[data-field="reading-images"]').textContent;
+            assert.match(text, /1 active; 3 queued; 2 paused/);
+            assert.match(text, /64 MiB incremental state/);
+            assert.match(text, /MiB partial pixels/);
+            assert.match(text, /MiB final native pixels/);
+            assert.strictEqual(fixture.timers.size, 1, 'the existing visible-panel timer owns all diagnostics');
+            fixture.diagnostics.setEnabled(false);
+            assert.strictEqual(fixture.timers.size, 0);
+        } finally { fixture.dispose(); }
+    });
+
+    it('retains reading bytes and native pass costs across event-ring rollover and clears them on reset', () => {
+        const recorder = new performanceModule.PdfPerformance(() => 10);
+        recorder.event('reading-transfer', { kind: 'manifest', bytes: 100 });
+        recorder.event('reading-transfer', { kind: 'pdf', bytes: 300 });
+        recorder.event('reading-transfer', { kind: 'image', bytes: 500 });
+        recorder.event('reading-transfer-error', { kind: 'image', bytes: 200, cancelled: true });
+        recorder.event('image-pass', { ms: 3, firstCoverage: true, firstFinal: false });
+        recorder.event('image-pass', { ms: 5, firstCoverage: false, firstFinal: true });
+        for (let i = 0; i < performanceModule.PERFORMANCE_LIMITS.eventCapacity; i++) { recorder.event('frame'); }
+        const value = recorder.snapshot().reading;
+        assert.deepStrictEqual(value, { manifestBytes: 100, pdfBytes: 300, imageBytes: 700,
+            imageTransfers: 2, failedTransfers: 1, passes: 2, coveredPages: 1, finalPages: 1, passTotalMs: 8, passMaxMs: 5 });
+        value.imageBytes = 0;
+        assert.strictEqual(recorder.snapshot().reading.imageBytes, 700);
+        assert.ok(recorder.snapshot().events.every((event: any) => event.type === 'frame'));
+        recorder.reset();
+        assert.ok(Object.values(recorder.snapshot().reading).every(value => value === 0));
     });
 
     it('copies event data so callers cannot rewrite recorded measurements', () => {

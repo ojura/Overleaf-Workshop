@@ -255,6 +255,22 @@ describe('the standalone PDF range source', function () {
             assert.strictEqual(invalid.pdfUrl, base + 'book.pdf');
         }
     });
+
+    it('binds an optional structural reading source without changing the original download URL', () => {
+        const base = 'https://reader.test/book/', sha256 = 'a'.repeat(64), revision = 'b'.repeat(64);
+        const reading = { manifestUrl: './previews/a/reading.json', manifestRevision: revision, size: 5000, sha256,
+            validator: { header: 'ETag', value: '"book-a"' } };
+        const config = configModule.readSiteConfig({ pdfUrl: './book.pdf', title: 'Book', filename: 'book.pdf', reading }, base);
+        assert.strictEqual(config.reading?.manifestUrl, base + 'previews/a/reading.json');
+        assert.strictEqual(config.pdfUrl, base + 'book.pdf');
+        assert.deepStrictEqual(configModule.siteReadingDescriptor(config, { length: 5000, validator: reading.validator }), {
+            identity: { sha256, size: 5000 }, manifestUrl: base + 'previews/a/reading.json', manifestRevision: revision,
+        });
+        assert.strictEqual(configModule.siteReadingDescriptor(config, { length: 5000,
+            validator: { header: 'ETag', value: '"changed"' } }), undefined);
+        assert.strictEqual(configModule.readSiteConfig({ pdfUrl: './book.pdf', title: 'Book', filename: 'book.pdf',
+            reading: { ...reading, manifestRevision: 'unverified' } }, base).reading, undefined);
+    });
 });
 
 describe('the standalone website export', function () {
