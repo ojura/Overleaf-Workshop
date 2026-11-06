@@ -5,12 +5,19 @@ import * as os from 'os';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
 import { ReadableStream } from 'stream/web';
+import { createHash } from 'crypto';
 
 const importModule = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
 const repo = path.resolve(__dirname, '..', '..');
 const fixture = JSON.parse(fs.readFileSync(path.join(repo, 'src/test/fixtures/progressive-jpeg.json'), 'utf8'));
 const progressive = new Uint8Array(Buffer.from(fixture.progressive, 'base64'));
 const original = new Uint8Array(Buffer.from(fixture.original, 'base64'));
+
+function encodedRange(request: { chunkIndex: number; chunkCount?: number }, bytes = progressive, chunks = fixture.chunks) {
+    const first = chunks[request.chunkIndex];
+    const last = chunks[request.chunkIndex + (request.chunkCount ?? 1) - 1];
+    return bytes.slice(first.offset, last.offset + last.bytes);
+}
 
 function deferred<T = void>() {
     let resolve!: (value: T) => void, reject!: (error: Error) => void;
@@ -219,11 +226,10 @@ describe('production progressive JPEG decoding', function () {
             queue: { limit: 1, run: (run: () => Promise<void>) => Promise.resolve().then(run) },
             handler: {
                 send() {},
-                sendWithStream(_name: string, request: { id: string; chunkIndex: number }) {
+                sendWithStream(_name: string, request: { id: string; chunkIndex: number; chunkCount?: number }) {
                     reads.push(`${request.id}:${request.chunkIndex}`);
-                    const chunk = fixture.chunks[request.chunkIndex];
                     return new ReadableStream({ start(controller) {
-                        controller.enqueue(progressive.slice(chunk.offset, chunk.offset + chunk.bytes));
+                        controller.enqueue(encodedRange(request));
                         controller.close();
                     } });
                 },
@@ -249,7 +255,7 @@ describe('production progressive JPEG decoding', function () {
             manager.startPage(0, 1);
             await finished.promise;
             assert.deepStrictEqual(reads.slice(0, 2), ['x1:0', 'x2:0']);
-            assert.strictEqual(reads.length, fixture.chunks.length * 2);
+            assert.strictEqual(reads.length, 4, 'each image reads its first scan and one contiguous verified tail');
             for (const value of revisions.filter(value => value.final)) {
                 assert.deepStrictEqual(value.image.data, reference(original, 37, 25));
             }
@@ -258,6 +264,120 @@ describe('production progressive JPEG decoding', function () {
         assert.strictEqual(manager.stats().externalImageEncodedBytes, 0);
         assert.strictEqual(manager.stats().externalImageReservedBytes, 0);
         assert.strictEqual(manager.stats().externalImageEntropyCalls, fixture.chunks.length * 2);
+    });
+
+    it('batches later scans after every ready image has first coverage with full input space reserved', async () => {
+        const comment = new Uint8Array(65_537);
+        comment.set([255, 254, 255, 255]);
+        const bytes = new Uint8Array(progressive.length + comment.length * 2);
+        bytes.set(progressive.subarray(0, -2));
+        bytes.set(comment, progressive.length - 2);
+        bytes.set(comment, progressive.length - 2 + comment.length);
+        bytes.set([255, 217], bytes.length - 2);
+        const chunks = fixture.chunks.map((chunk: any) => ({ ...chunk }));
+        const last = chunks[chunks.length - 1];
+        last.bytes = bytes.length - last.offset;
+        last.sha256 = createHash('sha256').update(bytes.subarray(last.offset)).digest('hex');
+        const firstCovered = deferred(), secondRead = deferred(), releaseSecond = deferred(), finished = deferred();
+        void finished.promise.catch(() => {});
+        const reads: { id: string; chunkIndex: number; chunkCount: number }[] = [];
+        const installed = new Map<string, number>();
+        let completed = 0;
+        const manager = new worker.ExternalImages({
+            metadata: ['x1', 'x2'].map(id => ({ id, sha256: createHash('sha256').update(bytes).digest('hex'),
+                originalSha256: fixture.originalSha256, bytes: bytes.length, width: 96, height: 64, components: 3,
+                coefficientBytes: 20_480, encoding: 'progressive-jpeg', chunks })),
+            budget: { maxActiveBytes: 2 << 20, maxEncodedBytes: 1 << 20, maxCoefficientBytes: 1 << 20, maxOutputPixels: 6144 },
+            queue: { limit: 2, run: (run: () => Promise<void>) => Promise.resolve().then(run) },
+            handler: {
+                send() {},
+                sendWithStream(_name: string, request: { id: string; chunkIndex: number; chunkCount?: number }) {
+                    reads.push({ ...request, chunkCount: request.chunkCount ?? 1 });
+                    if (request.chunkIndex) {
+                        assert.strictEqual(manager.groups.get(request.id).decoder.inputCapacity, bytes.length,
+                            'the complete input allocation precedes receipt of the later-scan buffer');
+                    }
+                    return new ReadableStream({ async start(controller) {
+                        if (request.id === 'x2' && !request.chunkIndex) { secondRead.resolve(); await releaseSecond.promise; }
+                        controller.enqueue(encodedRange(request, bytes, chunks)); controller.close();
+                    } });
+                },
+                async sendWithPromise(_name: string, revision: any) {
+                    if (revision.failed) { finished.reject(new Error(revision.message)); }
+                    const prior = installed.get(revision.id);
+                    if (prior !== undefined) { manager.releaseRasters([prior]); }
+                    installed.set(revision.id, revision.rasterId);
+                    if (!revision.final && revision.id === 'x1') { firstCovered.resolve(); }
+                    if (revision.final) {
+                        assert.deepStrictEqual(revision.image.data, reference(original, 37, 25));
+                        if (++completed === 2) { finished.resolve(); }
+                    }
+                    return true;
+                },
+            },
+        });
+        try {
+            for (const id of ['x1', 'x2']) {
+                manager.add({ id, objId: id, pageIndex: 0, epoch: 1, cacheKey: 'display', width: 96, height: 64,
+                    outputPixels: 37 * 25, progressive: true,
+                    render: async ({ decoder: state, bytes: input, final }: any) => ({ width: 37, height: 25, kind: 2,
+                        data: final ? reference(input, 37, 25) : state.render({ width: 37, height: 25 }) }),
+                });
+            }
+            manager.startPage(0, 1);
+            const firstTask = manager.groups.get('x1').task;
+            await Promise.all([firstCovered.promise, secondRead.promise, firstTask]);
+            assert.deepStrictEqual(reads, [{ id: 'x1', chunkIndex: 0, chunkCount: 1 }, { id: 'x2', chunkIndex: 0, chunkCount: 1 }],
+                'a free decode slot waits for the remaining first scan instead of starting a large tail');
+            releaseSecond.resolve();
+            await finished.promise;
+            await Promise.allSettled(manager.tasks);
+            assert.strictEqual(reads.length, 4);
+            assert.deepStrictEqual(reads.slice(2).map(value => value.chunkCount), [chunks.length - 1, chunks.length - 1]);
+            assert.strictEqual(manager.stats().externalImageEntropyCalls, chunks.length * 2);
+            assert.strictEqual(manager.stats().externalImageBytesReceived, bytes.length * 2);
+            assert.ok(manager.stats().externalImagePeakReservedBytes <= manager.stats().externalImageBudgetBytes);
+        } finally { releaseSecond.resolve(); await manager.close(); }
+        for (const field of ['externalImageEncodedBytes', 'externalImageCoefficientBytes', 'externalImageReservedBytes',
+            'externalImagePartialRasterBytes', 'externalImageNativeRasterBytes']) { assert.strictEqual(manager.stats()[field], 0, field); }
+    });
+
+    it('verifies every member of a combined scan tail before consuming its entropy', async () => {
+        const failed = deferred();
+        const reads: number[] = [];
+        const manager = new worker.ExternalImages({
+            metadata: [{ id: 'x1', sha256: fixture.sha256, originalSha256: fixture.originalSha256, bytes: progressive.length,
+                width: 96, height: 64, components: 3, coefficientBytes: 20_480, encoding: 'progressive-jpeg', chunks: fixture.chunks }],
+            budget: { maxActiveBytes: 1 << 20, maxEncodedBytes: 1 << 20, maxCoefficientBytes: 1 << 20, maxOutputPixels: 6144 },
+            queue: { limit: 1, run: (run: () => Promise<void>) => Promise.resolve().then(run) },
+            handler: {
+                send() {},
+                sendWithStream(_name: string, request: { chunkIndex: number; chunkCount?: number }) {
+                    reads.push(request.chunkCount ?? 1);
+                    const data = encodedRange(request);
+                    const corrupt = fixture.chunks[2].offset - fixture.chunks[request.chunkIndex].offset;
+                    if (corrupt >= 0 && corrupt < data.length) { data[corrupt] ^= 1; }
+                    return new ReadableStream({ start(controller) { controller.enqueue(data); controller.close(); } });
+                },
+                async sendWithPromise(_name: string, revision: any) {
+                    if (revision.failed) { assert.match(revision.message, /digest differs/); failed.resolve(); }
+                    return true;
+                },
+            },
+        });
+        try {
+            manager.add({ id: 'x1', objId: 'x1', pageIndex: 0, epoch: 1, cacheKey: 'display', width: 96, height: 64,
+                outputPixels: 37 * 25, progressive: true,
+                render: async ({ decoder: state }: any) => ({ width: 37, height: 25, kind: 2, data: state.render({ width: 37, height: 25 }) }),
+            });
+            manager.startPage(0, 1);
+            await failed.promise;
+            await Promise.allSettled(manager.tasks);
+            assert.deepStrictEqual(reads, [1, fixture.chunks.length - 1]);
+            assert.strictEqual(manager.stats().externalImageEntropyCalls, 1, 'a corrupt tail never advances the verified first-scan state');
+            assert.strictEqual(manager.stats().externalImageCompleted, 0);
+            assert.strictEqual(manager.stats().externalImageFailed, 1);
+        } finally { await manager.close(); }
     });
 
     it('releases a transferred partial raster when cancellation precedes its acknowledgement', async () => {
@@ -271,10 +391,9 @@ describe('production progressive JPEG decoding', function () {
             queue: { limit: 1, run: (run: () => Promise<void>) => Promise.resolve().then(run) },
             handler: {
                 send() {},
-                sendWithStream(_name: string, request: { chunkIndex: number }) {
-                    const chunk = fixture.chunks[request.chunkIndex];
+                sendWithStream(_name: string, request: { chunkIndex: number; chunkCount?: number }) {
                     return new ReadableStream({ start(controller) {
-                        controller.enqueue(progressive.slice(chunk.offset, chunk.offset + chunk.bytes)); controller.close();
+                        controller.enqueue(encodedRange(request)); controller.close();
                     } });
                 },
                 async sendWithPromise(_name: string, revision: any) {
@@ -323,10 +442,9 @@ describe('production progressive JPEG decoding', function () {
             queue: { limit: 1, run: (run: () => Promise<void>) => Promise.resolve().then(run) },
             handler: {
                 send() {},
-                sendWithStream(_name: string, request: { chunkIndex: number }) {
-                    const chunk = fixture.chunks[request.chunkIndex];
+                sendWithStream(_name: string, request: { chunkIndex: number; chunkCount?: number }) {
                     return new ReadableStream({ start(controller) {
-                        controller.enqueue(progressive.slice(chunk.offset, chunk.offset + chunk.bytes)); controller.close();
+                        controller.enqueue(encodedRange(request)); controller.close();
                     } });
                 },
                 async sendWithPromise(_name: string, revision: any) {
@@ -366,10 +484,9 @@ describe('production progressive JPEG decoding', function () {
             queue: { limit: 1, run: (run: () => Promise<void>) => Promise.resolve().then(run) },
             handler: {
                 send() {},
-                sendWithStream(_name: string, request: { chunkIndex: number }) {
-                    const chunk = fixture.chunks[request.chunkIndex];
+                sendWithStream(_name: string, request: { chunkIndex: number; chunkCount?: number }) {
                     return new ReadableStream({ start(controller) {
-                        controller.enqueue(progressive.slice(chunk.offset, chunk.offset + chunk.bytes)); controller.close();
+                        controller.enqueue(encodedRange(request)); controller.close();
                     } });
                 },
                 async sendWithPromise(_name: string, revision: any) {
