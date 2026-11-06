@@ -160,15 +160,19 @@
    }
    cancelAllRequests(reason) {
      this._fullRequestReader?.cancel(reason);
-@@ -11464,6 +11521,7 @@
+@@ -11464,6 +11521,11 @@
    const password = src.password ?? null;
    const rangeTransport = src.range instanceof PDFDataRangeTransport ? src.range : null;
    const rangeChunkSize = Number.isInteger(src.rangeChunkSize) && src.rangeChunkSize > 0 ? src.rangeChunkSize : DEFAULT_RANGE_CHUNK_SIZE;
 +  const rangeCacheBytes = Number.isSafeInteger(src.rangeCacheBytes) && src.rangeCacheBytes > 0 ? src.rangeCacheBytes : 0;
++  const externalImageSource = src.externalImageSource || null;
++  if (externalImageSource && (!Array.isArray(externalImageSource.images) || typeof externalImageSource.read !== "function")) {
++    throw new TypeError("Invalid verified external image source");
++  }
    let worker = src.worker instanceof PDFWorker ? src.worker : null;
    const verbosity = src.verbosity;
    const docBaseUrl = typeof src.docBaseUrl === "string" && !isDataScheme(src.docBaseUrl) ? src.docBaseUrl : null;
-@@ -11481,6 +11539,9 @@
+@@ -11481,6 +11543,9 @@
    const isOffscreenCanvasSupported = typeof src.isOffscreenCanvasSupported === "boolean" ? src.isOffscreenCanvasSupported : !isNodeJS;
    const isImageDecoderSupported = typeof src.isImageDecoderSupported === "boolean" ? src.isImageDecoderSupported : !isNodeJS && (util_FeatureTest.platform.isFirefox || !globalThis.chrome);
    const canvasMaxAreaInBytes = Number.isInteger(src.canvasMaxAreaInBytes) ? src.canvasMaxAreaInBytes : -1;
@@ -178,7 +182,7 @@
    const disableFontFace = typeof src.disableFontFace === "boolean" ? src.disableFontFace : isNodeJS;
    const fontExtraProperties = src.fontExtraProperties === true;
    const enableXfa = src.enableXfa === true;
-@@ -11533,6 +11594,7 @@
+@@ -11533,9 +11598,12 @@
      password,
      disableAutoFetch,
      rangeChunkSize,
@@ -186,7 +190,12 @@
      length,
      docBaseUrl,
      enableXfa,
-@@ -11544,6 +11606,8 @@
++    externalImages: externalImageSource?.images || null,
++    externalImageBudget: externalImageSource ? src.externalImageBudget : null,
+     evaluatorOptions: {
+       maxImageSize,
+       disableFontFace,
+@@ -11544,6 +11612,8 @@
        isOffscreenCanvasSupported,
        isImageDecoderSupported,
        canvasMaxAreaInBytes,
@@ -195,15 +204,16 @@
        fontExtraProperties,
        useSystemFonts,
        useWasm,
-@@ -11555,6 +11619,7 @@
+@@ -11555,6 +11625,8 @@
      }
    };
    const transportParams = {
++    externalImageSource,
 +    adaptiveImageDecoding,
      ownerDocument,
      pdfBug,
      styleElement,
-@@ -11575,7 +11640,8 @@
+@@ -11575,7 +11647,8 @@
      if (rangeTransport) {
        networkStream = new PDFDataTransportStream(rangeTransport, {
          disableRange,
@@ -213,7 +223,7 @@
        });
      } else if (!data) {
        if (!url) {
-@@ -11600,6 +11666,7 @@
+@@ -11600,6 +11673,7 @@
          httpHeaders,
          withCredentials,
          rangeChunkSize,
@@ -221,10 +231,11 @@
          disableRange,
          disableStream
        });
-@@ -11834,6 +11901,12 @@
+@@ -11834,6 +11908,13 @@
    getData() {
      return this._transport.getData();
    }
++  get hasExternalImages() { return !!this._transport._params.externalImageSource; }
 +  getRangeCacheStats() {
 +    return this._transport.getRangeCacheStats();
 +  }
@@ -234,7 +245,7 @@
    saveDocument() {
      return this._transport.saveDocument();
    }
-@@ -11865,6 +11938,27 @@
+@@ -11865,6 +11946,198 @@
      return this._transport.getCalculationOrderIds();
    }
  }
@@ -259,20 +270,204 @@
 +  };
 +}
 +
++class PageImageRevisions {
++  constructor(page) {
++    this.page = page;
++    this.epoch = this.revision = 0;
++    this.records = new Map();
++    this.pending = new Map();
++    this.listeners = new Set();
++    this.waiters = new Set();
++    this.cancellations = new Set();
++    this.current = null;
++    this.lastStatus = null;
++  }
++  newIntent(state, key, intent) {
++    state.externalImageEpoch = ++this.epoch;
++    state.externalImageCacheKey = key;
++    state.externalImagePrint = !!(intent & RenderingIntentFlag.PRINT);
++    state.externalImageCancelled = false;
++    state.externalImageDiscovered = false;
++    if (!state.externalImagePrint && !this.current) { this.current = state; }
++  }
++  state(data) {
++    const state = this.page._intentStates.get(data.cacheKey);
++    return state && !state.externalImageCancelled && state.externalImageEpoch === data.epoch ? state : null;
++  }
++  status(state = this.current) {
++    if (!state) { return this.lastStatus || { revision: this.revision, total: 0, covered: 0, pending: 0, completed: 0, failed: 0, discovered: false, final: false }; }
++    let total = 0, covered = 0, completed = 0, failed = 0;
++    for (const record of this.records.values()) {
++      if (record.state !== state) { continue; }
++      total++;
++      covered += +record.covered;
++      completed += +record.final;
++      failed += +record.failed;
++    }
++    return { revision: this.revision, total, covered, completed, failed, pending: total - completed - failed,
++      discovered: !!state.externalImageDiscovered,
++      final: !!state.externalImageDiscovered && completed === total && failed === 0 };
++  }
++  subscribe(listener) {
++    if (typeof listener !== "function") { throw new TypeError("Image revision listener must be a function"); }
++    this.listeners.add(listener);
++    return () => this.listeners.delete(listener);
++  }
++  notify() {
++    const event = { revision: this.revision, status: this.status() };
++    for (const waiter of [...this.waiters]) { waiter(); }
++    for (const listener of [...this.listeners]) {
++      try { listener(event); } catch (error) { warn(`Image revision listener: ${error}`); }
++    }
++  }
++  register(data) {
++    const state = this.state(data);
++    if (!state || this.page.destroyed) { data.image?.bitmap?.close(); return; }
++    const record = { state, imageId: data.imageId, common: data.common, print: data.print,
++      covered: false, final: false, failed: false };
++    this.records.set(data.id, record);
++    if (data.image) { (record.common ? this.page.commonObjs : this.page.objs).resolve(data.id, data.image); }
++  }
++  receive(data) {
++    const record = this.records.get(data.id);
++    if (!record || !this.state(data) || this.page.destroyed) { data.image?.bitmap?.close(); return false; }
++    if (data.failed) {
++      record.failed = true;
++      record.final = false;
++      this.revision++;
++      record.message = data.message || "External image failed";
++      if (record.print || record.common) {
++        for (const task of [...(record.state.renderTasks || [])]) { task.cancel(new Error(record.message)); }
++        (record.common ? this.page.commonObjs : this.page.objs).resolve(data.id, null);
++      }
++      this.notify();
++      return true;
++    }
++    const prior = this.pending.get(data.id);
++    prior?.image?.bitmap?.close();
++    this.pending.set(data.id, data);
++    if (record.print || record.common || !(record.state.renderTasks?.size > 0)) { this.flush(record.state); }
++    return true;
++  }
++  flush(state) {
++    let changed = false;
++    for (const [id, data] of this.pending) {
++      const record = this.records.get(id);
++      if (!record || record.state !== state) { continue; }
++      if (!record.print && !record.common && state.renderTasks?.size > 0) { continue; }
++      this.pending.delete(id);
++      const objects = record.common ? this.page.commonObjs : this.page.objs;
++      objects.replace(id, data.image);
++      record.covered = true;
++      record.final = data.final;
++      record.scan = data.scan;
++      this.revision++;
++      changed = true;
++    }
++    if (changed) { this.notify(); }
++  }
++  begin(state) {
++    if (!state.externalImagePrint) { this.current = state; }
++    this.flush(state);
++  }
++  start(state = this.current) {
++    if (!state || state.externalImageCancelled || this.page.destroyed) { return; }
++    this.page._transport.messageHandler.send("StartExternalImages", {
++      pageIndex: this.page._pageIndex, epoch: state.externalImageEpoch
++    });
++  }
++  finish(state) {
++    if (state.externalImageCancelled) { return; }
++    this.flush(state);
++    this.start(state);
++  }
++  async wait({ final = true, signal } = {}) {
++    if (signal?.aborted) { throw signal.reason || new AbortException("Image readiness cancelled"); }
++    if (!this.current) { await this.page.getOperatorList(); }
++    const state = this.current;
++    if (!state) { return this.status(); }
++    this.start(state);
++    return new Promise((resolve, reject) => {
++      const finish = (error, status) => {
++        this.waiters.delete(check);
++        signal?.removeEventListener("abort", abort);
++        if (error) { reject(error); } else { resolve(status); }
++      };
++      const abort = () => finish(signal.reason || new AbortException("Image readiness cancelled"));
++      const check = () => {
++        if (this.page.destroyed || state.externalImageCancelled) { finish(new AbortException("Image readiness cancelled")); return; }
++        const status = this.status(state);
++        if (status.failed) { finish(new Error("A verified external image failed to decode")); }
++        else if (state.externalImageDiscovered && (final ? status.final : status.covered === status.total)) { finish(null, status); }
++      };
++      this.waiters.add(check);
++      signal?.addEventListener("abort", abort, { once: true });
++      check();
++    });
++  }
++  release(state) {
++    if (state.externalImageCancelled) { return; }
++    if (state === this.current) { this.lastStatus = this.status(state); this.current = null; }
++    state.externalImageCancelled = true;
++    const promise = this.page._transport.messageHandler.sendWithPromise("CancelExternalImages", {
++      pageIndex: this.page._pageIndex, epoch: state.externalImageEpoch
++    }).catch(() => {}).finally(() => this.cancellations.delete(promise));
++    this.cancellations.add(promise);
++    for (const [id, record] of this.records) {
++      if (record.state !== state) { continue; }
++      this.pending.get(id)?.image?.bitmap?.close();
++      this.pending.delete(id);
++      if (!record.common) { this.page.objs.release(id); }
++      this.records.delete(id);
++    }
++  }
++  cancel(includePrint = false) {
++    for (const [key, state] of [...this.page._intentStates]) {
++      if (state.externalImagePrint && !includePrint) { continue; }
++      if (state === this.current) { this.lastStatus = this.status(state); }
++      // Mark the intent before cancelling a render, since its completion callback is synchronous.
++      state.externalImageCancelled = true;
++      for (const task of [...(state.renderTasks || [])]) { task.cancel(); }
++      state.externalImageCancelled = false;
++      this.release(state);
++      state.streamReader?.cancel(new AbortException("External image intent cancelled")).catch(() => {});
++      state.streamReader = null;
++      if (state.streamReaderCancelTimeout) { clearTimeout(state.streamReaderCancelTimeout); state.streamReaderCancelTimeout = null; }
++      this.page._intentStates.delete(key);
++    }
++    // Wake explicit readiness waiters without publishing a new dirty image revision.
++    for (const waiter of [...this.waiters]) { waiter(); }
++    return Promise.allSettled(this.cancellations);
++  }
++}
++
  class PDFPageProxy {
    #pendingCleanup = false;
    constructor(pageIndex, pageInfo, transport, pdfBug = false) {
-@@ -11930,6 +12024,9 @@
+@@ -11876,6 +12149,7 @@
+     this.commonObjs = transport.commonObjs;
+     this.objs = new PDFObjects();
+     this._intentStates = new Map();
++    this._externalImages = transport._params.externalImageSource ? new PageImageRevisions(this) : null;
+     this.destroyed = false;
+   }
+   get pageNumber() {
+@@ -11930,6 +12204,14 @@
    async getXfa() {
      return this._transport._htmlForXfa?.children[this._pageIndex] || null;
    }
++  get imageRevision() { return this._externalImages?.revision || 0; }
++  get imageStatus() { return this._externalImages?.status() || { revision: 0, total: 0, covered: 0, pending: 0, completed: 0, failed: 0, discovered: true, final: true }; }
++  onImageRevision(listener) { return this._externalImages?.subscribe(listener) || (() => {}); }
++  waitForImages(options) { return this._externalImages?.wait(options) || Promise.resolve(this.imageStatus); }
++  cancelImageRefinement() { return this._externalImages?.cancel() || Promise.resolve(); }
 +  getImageDecodeHints({ viewport, transform = null, imageDecodeScale = 0, imageDecodeMaxDimension = 0 }) {
 +    return getImageDecodeHints(viewport, transform, imageDecodeScale, imageDecodeMaxDimension);
 +  }
    render({
      canvasContext,
      viewport,
-@@ -11941,10 +12038,28 @@
+@@ -11941,10 +12223,28 @@
      annotationCanvasMap = null,
      pageColors = null,
      printAnnotationStorage = null,
@@ -302,7 +497,7 @@
      const {
        renderingIntent,
        cacheKey
-@@ -11953,7 +12068,11 @@
+@@ -11953,7 +12253,11 @@
      optionalContentConfigPromise ||= this._transport.getOptionalContentConfig(renderingIntent);
      let intentState = this._intentStates.get(cacheKey);
      if (!intentState) {
@@ -315,7 +510,50 @@
        this._intentStates.set(cacheKey, intentState);
      }
      if (intentState.streamReaderCancelTimeout) {
-@@ -12189,7 +12308,9 @@
+@@ -11972,8 +12276,12 @@
+       this._stats?.time("Page Request");
+       this._pumpOperatorList(intentArgs);
+     }
++    this._externalImages?.begin(intentState);
+     const complete = error => {
++      internalRenderTask.task.imageStatus = this._externalImages?.status(intentState) || this.imageStatus;
++      internalRenderTask.task.imageRevision = internalRenderTask.task.imageStatus.revision;
+       intentState.renderTasks.delete(internalRenderTask);
++      if (!error) { this._externalImages?.finish(intentState); }
+       if (intentPrint) {
+         this.#pendingCleanup = true;
+       }
+@@ -12120,6 +12428,7 @@
+   _destroy() {
+     this.destroyed = true;
+     const waitOn = [];
++    if (this._externalImages) { waitOn.push(this._externalImages.cancel(true)); this._externalImages.listeners.clear(); }
+     for (const intentState of this._intentStates.values()) {
+       this._abortOperatorList({
+         intentState,
+@@ -12158,6 +12467,7 @@
+         return false;
+       }
+     }
++    for (const state of this._intentStates.values()) { this._externalImages?.release(state); }
+     this._intentStates.clear();
+     this.objs.clear();
+     this.#pendingCleanup = false;
+@@ -12177,11 +12487,13 @@
+       intentState.operatorList.argsArray.push(operatorListChunk.argsArray[i]);
+     }
+     intentState.operatorList.lastChunk = operatorListChunk.lastChunk;
++    if (operatorListChunk.lastChunk) { intentState.externalImageDiscovered = true; }
+     intentState.operatorList.separateAnnots = operatorListChunk.separateAnnots;
+     for (const internalRenderTask of intentState.renderTasks) {
+       internalRenderTask.operatorListChanged();
+     }
+     if (operatorListChunk.lastChunk) {
++      this._externalImages?.notify();
+       this.#tryCleanup();
+     }
+   }
+@@ -12189,21 +12501,27 @@
      renderingIntent,
      cacheKey,
      annotationStorageSerializable,
@@ -326,7 +564,13 @@
    }) {
      const {
        map,
-@@ -12200,7 +12321,9 @@
+       transfer
+     } = annotationStorageSerializable;
++    const intentState = this._intentStates.get(cacheKey);
++    this._externalImages?.newIntent(intentState, cacheKey, renderingIntent);
+     const readableStream = this._transport.messageHandler.sendWithStream("GetOperatorList", {
+       pageIndex: this._pageIndex,
++      externalImageEpoch: intentState.externalImageEpoch || 0,
        intent: renderingIntent,
        cacheKey,
        annotationStorage: map,
@@ -336,9 +580,77 @@
 +      imageDecodeMaxDimension
      }, transfer);
      const reader = readableStream.getReader();
-     const intentState = this._intentStates.get(cacheKey);
-@@ -12901,6 +13024,12 @@
+-    const intentState = this._intentStates.get(cacheKey);
+     intentState.streamReader = reader;
+     const pump = () => {
+       reader.read().then(({
+@@ -12214,7 +12532,7 @@
+           intentState.streamReader = null;
+           return;
+         }
+-        if (this._transport.destroyed) {
++        if (this._transport.destroyed || intentState.externalImageCancelled) {
+           return;
+         }
+         this._renderPageChunk(value, intentState);
+@@ -12563,6 +12881,7 @@
+     this.destroyed = false;
+     this.destroyCapability = null;
+     this._networkStream = networkStream;
++    this._externalImageRequests = new Set();
+     this._fullReader = null;
+     this._lastProgress = null;
+     this.downloadInfoCapability = Promise.withResolvers();
+@@ -12635,6 +12954,8 @@
+       return this.destroyCapability.promise;
+     }
+     this.destroyed = true;
++    for (const request of this._externalImageRequests) { request.abort(new AbortException("Document destroyed")); }
++    this._externalImageRequests.clear();
+     this.destroyCapability = Promise.withResolvers();
+     this.#passwordCapability?.reject(new Error("Worker was destroyed during onPassword callback"));
+     const waitOn = [];
+@@ -12857,6 +13178,32 @@
+       }
+       return null;
+     });
++    messageHandler.on("GetExternalImageChunk", (data, sink) => {
++      const source = this._params.externalImageSource;
++      if (this.destroyed || !source) { throw new AbortException("External image source unavailable"); }
++      const controller = new AbortController();
++      this._externalImageRequests.add(controller);
++      sink.onCancel = reason => { controller.abort(reason); };
++      Promise.resolve().then(() => source.read({ id: data.id, chunkIndex: data.chunkIndex, signal: controller.signal })).then(value => {
++        if (this.destroyed || controller.signal.aborted) { return; }
++        if (!(value instanceof Uint8Array)) { throw new Error("External image source must return owned bytes"); }
++        if (value.byteOffset || value.byteLength !== value.buffer.byteLength) { value = value.slice(); }
++        sink.enqueue(value, 1, [value.buffer]);
++        sink.close();
++      }).catch(error => {
++        if (!controller.signal.aborted && !this.destroyed) { sink.error(error instanceof Error ? error : new Error(String(error))); }
++      }).finally(() => this._externalImageRequests.delete(controller));
++    });
++    messageHandler.on("ExternalImagePending", data => {
++      const page = !this.destroyed && this.#pageCache.get(data.pageIndex);
++      if (!page?._externalImages) { data.image?.bitmap?.close(); return; }
++      page._externalImages.register(data);
++    });
++    messageHandler.on("ExternalImageRevision", data => {
++      const page = !this.destroyed && this.#pageCache.get(data.pageIndex);
++      if (!page?._externalImages) { data.image?.bitmap?.close(); return false; }
++      return page._externalImages.receive(data);
++    });
+     messageHandler.on("obj", ([id, pageIndex, type, imageData]) => {
+       if (this.destroyed) {
+         return;
+@@ -12899,9 +13246,23 @@
+     });
+   }
    getData() {
++    const source = this._params.externalImageSource;
++    if (source) {
++      return source.getOriginalData ? source.getOriginalData() : Promise.reject(new Error("Download requires the original PDF source"));
++    }
      return this.messageHandler.sendWithPromise("GetData", null);
    }
 +  getRangeCacheStats() {
@@ -348,9 +660,14 @@
 +    return this.messageHandler.sendWithPromise("TrimRangeCache", null);
 +  }
    saveDocument() {
++    if (this._params.externalImageSource) {
++      if (this.annotationStorage.size <= 0) { return this.getData(); }
++      return Promise.reject(new Error("Edited PDF export requires the original PDF document"));
++    }
      if (this.annotationStorage.size <= 0) {
        warn("saveDocument called while `annotationStorage` is empty, " + "please use the getData-method instead.");
-@@ -13005,6 +13134,13 @@
+     }
+@@ -13005,6 +13366,13 @@
      });
    }
    getStructTree(pageIndex) {
@@ -364,6 +681,24 @@
      return this.messageHandler.sendWithPromise("GetStructTree", {
        pageIndex
      });
+@@ -13095,6 +13463,17 @@
+     }
+     delete this.#objs[objId];
+     return true;
++  }
++  replace(objId, data) {
++    const obj = this.#ensureObj(objId);
++    if (obj.data !== data) { obj.data?.bitmap?.close(); }
++    obj.data = data;
++    obj.resolve();
++  }
++  release(objId) {
++    const obj = this.#objs[objId];
++    obj?.data?.bitmap?.close();
++    delete this.#objs[objId];
+   }
+   resolve(objId, data = null) {
+     const obj = this.#ensureObj(objId);
 --- a/build/pdf.worker.mjs
 +++ b/build/pdf.worker.mjs
 @@ -2898,11 +2898,190 @@
@@ -814,7 +1149,1116 @@
 
  const MIN_IMAGE_DIM = 2048;
  const MAX_IMAGE_DIM = 65537;
-@@ -5190,36 +5543,66 @@
+@@ -4061,7 +4414,7 @@
+ function getBlockBufferOffset(component, row, col) {
+   return 64 * ((component.blocksPerLine + 1) * row + col);
+ }
+-function decodeScan(data, offset, frame, components, resetInterval, spectralStart, spectralEnd, successivePrev, successive, parseDNLMarker = false) {
++function decodeScan(data, offset, frame, components, resetInterval, spectralStart, spectralEnd, successivePrev, successive, parseDNLMarker = false, strict = false) {
+   const mcusPerLine = frame.mcusPerLine;
+   const progressive = frame.progressive;
+   const startOffset = offset;
+@@ -4072,8 +4425,10 @@
+       bitsCount--;
+       return bitsData >> bitsCount & 1;
+     }
++    if (strict && offset >= data.length) { throw new JpegError("Entropy read beyond received bytes"); }
+     bitsData = data[offset++];
+     if (bitsData === 0xff) {
++      if (strict && offset >= data.length) { throw new JpegError("Marker read beyond received bytes"); }
+       const nextByte = data[offset++];
+       if (nextByte) {
+         if (nextByte === 0xdc && parseDNLMarker) {
+@@ -4329,7 +4684,7 @@
+   }
+   return offset - startOffset;
+ }
+-function quantizeAndInverse(component, blockBufferOffset, p) {
++function quantizeAndInverse(component, blockBufferOffset, p, output = component.blockData, outputOffset = blockBufferOffset) {
+   const qt = component.quantizationTable,
+     blockData = component.blockData;
+   let v0, v1, v2, v3, v4, v5, v6, v7;
+@@ -4421,14 +4776,14 @@
+       } else {
+         t = t + 2056 >> 4;
+       }
+-      blockData[blockBufferOffset + col] = t;
+-      blockData[blockBufferOffset + col + 8] = t;
+-      blockData[blockBufferOffset + col + 16] = t;
+-      blockData[blockBufferOffset + col + 24] = t;
+-      blockData[blockBufferOffset + col + 32] = t;
+-      blockData[blockBufferOffset + col + 40] = t;
+-      blockData[blockBufferOffset + col + 48] = t;
+-      blockData[blockBufferOffset + col + 56] = t;
++      output[outputOffset + col] = t;
++      output[outputOffset + col + 8] = t;
++      output[outputOffset + col + 16] = t;
++      output[outputOffset + col + 24] = t;
++      output[outputOffset + col + 32] = t;
++      output[outputOffset + col + 40] = t;
++      output[outputOffset + col + 48] = t;
++      output[outputOffset + col + 56] = t;
+       continue;
+     }
+     v0 = dctSqrt2 * p0 + 2048 >> 12;
+@@ -4522,14 +4877,14 @@
+     } else {
+       p7 >>= 4;
+     }
+-    blockData[blockBufferOffset + col] = p0;
+-    blockData[blockBufferOffset + col + 8] = p1;
+-    blockData[blockBufferOffset + col + 16] = p2;
+-    blockData[blockBufferOffset + col + 24] = p3;
+-    blockData[blockBufferOffset + col + 32] = p4;
+-    blockData[blockBufferOffset + col + 40] = p5;
+-    blockData[blockBufferOffset + col + 48] = p6;
+-    blockData[blockBufferOffset + col + 56] = p7;
++    output[outputOffset + col] = p0;
++    output[outputOffset + col + 8] = p1;
++    output[outputOffset + col + 16] = p2;
++    output[outputOffset + col + 24] = p3;
++    output[outputOffset + col + 32] = p4;
++    output[outputOffset + col + 40] = p5;
++    output[outputOffset + col + 48] = p6;
++    output[outputOffset + col + 56] = p7;
+   }
+ }
+ function buildComponentData(frame, component) {
+@@ -5097,10 +5452,1033 @@
+   }
+ }
+
++// Entropy coefficients remain immutable during display sampling. Only one sampled
++// block row and one 64-value IDCT workspace accompany the requested output.
++class IncrementalJpegImage extends JpegImage {
++  constructor({
++    encodedBytes = 0,
++    maxInputBytes = PDF_READING_FORMAT.limits.assetBytes,
++    maxPixels = PDF_READING_FORMAT.limits.progressivePixels,
++    maxCoefficientBytes = PDF_READING_FORMAT.limits.coefficientBytes,
++    expectedCoefficientBytes = 0,
++    expectedWidth = 0,
++    expectedHeight = 0,
++    signal,
++  } = {}) {
++    super();
++    for (const limit of [maxInputBytes, maxPixels, maxCoefficientBytes]) {
++      if (!Number.isSafeInteger(limit) || limit < 1) { throw new RangeError("Invalid JPEG allocation limit"); }
++    }
++    if (!Number.isSafeInteger(encodedBytes) || encodedBytes < 0 || encodedBytes > maxInputBytes) {
++      throw new RangeError("JPEG input limit");
++    }
++    this.limits = { maxInputBytes, maxPixels, maxCoefficientBytes };
++    this.expectedCoefficientBytes = expectedCoefficientBytes;
++    this.expectedWidth = expectedWidth;
++    this.expectedHeight = expectedHeight;
++    this._buffer = new Uint8Array(encodedBytes);
++    this._length = 0;
++    this._ended = this._closed = this._done = false;
++    this._frame = null;
++    this._quantizationTables = [];
++    this.components = [];
++    this.entropyCalls = this.entropyMs = this.renderMs = this.peakScratchBytes = 0;
++    this.peakAccountedBytes = this._buffer.byteLength;
++    this._iterator = this._parse();
++    this._signal = signal;
++    this._abort = () => this.cancel();
++    signal?.addEventListener("abort", this._abort, { once: true });
++    if (signal?.aborted) { this.cancel(); }
++  }
++  _check() {
++    if (this._closed) { throw new DOMException("Incremental JPEG canceled", "AbortError"); }
++  }
++  get coefficientBytes() {
++    return this._frame?.components.reduce((n, c) => n + (c.blockData?.byteLength || c.dcData?.byteLength || 0), 0) || 0;
++  }
++  get inputCapacity() { return this._buffer.byteLength; }
++  get receivedBytes() { return this._length; }
++  _account(extra = 0) {
++    this.peakAccountedBytes = Math.max(this.peakAccountedBytes, this.inputCapacity + this.coefficientBytes + extra);
++  }
++  push(chunk, { final = false } = {}) {
++    this._check();
++    try {
++      if (this._done || this._ended) { throw new Error("Input already ended"); }
++      if (!(chunk instanceof Uint8Array)) { throw new TypeError("Expected byte chunk"); }
++      const end = this._length + chunk.length;
++      if (end > this.limits.maxInputBytes) { throw new RangeError("JPEG input limit"); }
++      if (end > this._buffer.length) {
++        const capacity = Math.min(this.limits.maxInputBytes, Math.max(end, 65536, this._buffer.length * 2));
++        const replacement = new Uint8Array(capacity);
++        replacement.set(this._buffer.subarray(0, this._length));
++        this._account(capacity);
++        this._buffer = replacement;
++      }
++      this._buffer.set(chunk, this._length);
++      this._length = end;
++      this._ended = final;
++      this._account();
++    } catch (error) { this.cancel(); throw error; }
++  }
++  next() {
++    this._check();
++    if (this._compacted) { throw new Error("Expand JPEG coefficients before continuing entropy decoding"); }
++    if (this._done) { return { type: "done" }; }
++    try {
++      const result = this._iterator.next();
++      if (result.done) { this._done = true; }
++      return result.value;
++    } catch (error) { this.cancel(); throw error; }
++  }
++  _receivedView() {
++    if (this._viewLength === this._length && this._viewBuffer === this._buffer) { return this._view; }
++    const bytes = this._buffer.subarray(0, this._length);
++    this._viewBuffer = this._buffer;
++    this._viewLength = this._length;
++    this._view = new Proxy(bytes, { get(target, key) {
++      if (typeof key === "string" && /^-?\d+$/.test(key)) {
++        const index = Number(key);
++        if (index < 0 || index >= target.length) { throw new JpegError("Parser read beyond received bytes"); }
++      }
++      const value = Reflect.get(target, key, target);
++      return typeof value === "function" ? value.bind(target) : value;
++    } });
++    return this._view;
++  }
++  *_need(count) {
++    if (!Number.isSafeInteger(count) || count < 0 || count > this.limits.maxInputBytes) { throw new RangeError("JPEG input boundary"); }
++    this._check();
++    while (this._length < count) {
++      if (this._ended) { throw new JpegError("Truncated received JPEG"); }
++      yield { type: "need", minimum: count };
++      this._check();
++    }
++    return this._receivedView();
++  }
++  *_scan(start) {
++    let cursor = start;
++    for (;;) {
++      let data = yield* this._need(cursor + 1);
++      const marker = data.indexOf(255, cursor);
++      if (marker < 0) { cursor = data.length; continue; }
++      let after = marker + 1;
++      data = yield* this._need(after + 1);
++      while (data[after] === 255) { after++; data = yield* this._need(after + 1); }
++      const code = data[after];
++      if (code === 0 || code >= 208 && code <= 215) { cursor = after + 1; continue; }
++      return { data: data.subarray(0, after + 1), end: marker };
++    }
++  }
++  _validateFrame(frame) {
++    const { maxPixels, maxCoefficientBytes } = this.limits;
++    if (!frame.progressive || frame.precision !== PDF_READING_FORMAT.limits.progressivePrecision || !frame.scanLines || !frame.samplesPerLine || frame.samplesPerLine * frame.scanLines > maxPixels) {
++      throw new RangeError("JPEG pixel limit");
++    }
++    if (this.expectedWidth && this.expectedWidth !== frame.samplesPerLine || this.expectedHeight && this.expectedHeight !== frame.scanLines) {
++      throw new JpegError("JPEG dimensions differ from the published image");
++    }
++    if (!frame.components.length || frame.components.length !== PDF_READING_FORMAT.limits.progressiveComponents || frame.components.some(c => c.h < 1 || c.h > 4 || c.v < 1 || c.v > 4)) {
++      throw new RangeError("JPEG sampling limit");
++    }
++    const mx = Math.ceil(frame.samplesPerLine / 8 / frame.maxH);
++    const my = Math.ceil(frame.scanLines / 8 / frame.maxV);
++    const bytes = frame.components.reduce((n, c) => n + 64 * my * c.v * (mx * c.h + 1) * Int16Array.BYTES_PER_ELEMENT, 0);
++    if (bytes > maxCoefficientBytes) { throw new RangeError("JPEG coefficient limit"); }
++    if (this.expectedCoefficientBytes && bytes !== this.expectedCoefficientBytes) { throw new JpegError("JPEG coefficient allocation differs from the published image"); }
++  }
++  _getLinearizedBlockData(width, height, isSourcePDF = false) {
++    const frame = this._frame;
++    const count = frame.components.length;
++    const data = new Uint8ClampedArray(width * height * count);
++    const maxBlocks = Math.max(...frame.components.map(c => c.blocksPerLine));
++    const row = new Uint8Array(maxBlocks * 64);
++    const rows = new Int32Array(maxBlocks);
++    const scratch = new Int16Array(64);
++    const scratchBytes = row.byteLength + rows.byteLength + scratch.byteLength;
++    this.peakScratchBytes = Math.max(this.peakScratchBytes, scratchBytes);
++    this._account(data.byteLength + scratchBytes);
++    for (let c = 0; c < count; c++) {
++      const component = frame.components[c];
++      component.quantizationTable = this._quantizationTables[component.quantizationId];
++      const sx = component.h / frame.maxH * this.width / width;
++      const sy = component.v / frame.maxV * this.height / height;
++      rows.fill(-1);
++      for (let y = 0; y < height; y++) {
++        const sourceY = Math.floor(y * sy);
++        const blockRow = sourceY >> 3;
++        const innerY = (sourceY & 7) << 3;
++        let offset = (y * width) * count + c;
++        for (let x = 0; x < width; x++, offset += count) {
++          const sourceX = Math.floor(x * sx);
++          const blockCol = sourceX >> 3;
++          const rowOffset = blockCol * 64;
++          if (rows[blockCol] !== blockRow) {
++            quantizeAndInverse(component, getBlockBufferOffset(component, blockRow, blockCol), scratch, row, rowOffset);
++            rows[blockCol] = blockRow;
++          }
++          data[offset] = row[rowOffset + innerY + (sourceX & 7)];
++        }
++      }
++    }
++    let transform = this._decodeTransform;
++    if (!isSourcePDF && count === 4 && !transform) { transform = new Int32Array([-256, 255, -256, 255, -256, 255, -256, 255]); }
++    if (transform) {
++      for (let i = 0; i < data.length;) {
++        for (let c = 0; c < count; c++, i++) { data[i] = (data[i] * transform[c * 2] >> 8) + transform[c * 2 + 1]; }
++      }
++    }
++    return data;
++  }
++  render({ width, height, forceRGBA = false, forceRGB = true, isSourcePDF = true, decodeTransform = null, colorTransform = -1 }) {
++    this._check();
++    if (this._compacted) { throw new Error("Expand JPEG coefficients before rendering"); }
++    if (!this._frame || !this.entropyCalls) { throw new Error("No completed scan"); }
++    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width * height > this.limits.maxPixels) { throw new RangeError("Preview pixel limit"); }
++    const start = performance.now();
++    this._decodeTransform = decodeTransform;
++    this._colorTransform = colorTransform;
++    this.components = this._frame.components.map(component => ({ index: component.index }));
++    try {
++      this._account(width * height * (this.numComponents + (forceRGBA ? 4 : forceRGB && this.numComponents === 1 ? 3 : 0)));
++      return super.getData({ width, height, forceRGBA, forceRGB, isSourcePDF });
++    } finally {
++      this.components = [];
++      this.renderMs += performance.now() - start;
++    }
++  }
++  compact() {
++    this._check();
++    if (this._compacted) { return true; }
++    if (!this._canCompact) { return false; }
++    for (const component of this._frame.components) {
++      const dc = new Int16Array(component.blockData.length / 64);
++      this._account(dc.byteLength);
++      for (let i = 0; i < dc.length; i++) { dc[i] = component.blockData[i * 64]; }
++      component.coefficientLength = component.blockData.length;
++      component.dcData = dc;
++      component.blockData = null;
++    }
++    this._compacted = true;
++    return true;
++  }
++  expand() {
++    this._check();
++    if (!this._compacted) { return; }
++    for (const component of this._frame.components) {
++      const blockData = new Int16Array(component.coefficientLength);
++      this._account(blockData.byteLength);
++      for (let i = 0; i < component.dcData.length; i++) { blockData[i * 64] = component.dcData[i]; }
++      component.blockData = blockData;
++      component.dcData = null;
++    }
++    this._compacted = false;
++  }
++  takeReceivedBytes() {
++    const bytes = this._buffer.subarray(0, this._length);
++    this.cancel();
++    return bytes;
++  }
++  takeBytes() {
++    this._check();
++    if (!this._ended) { throw new Error("JPEG input is incomplete"); }
++    const bytes = this._buffer.subarray(0, this._length);
++    this._buffer = new Uint8Array(0);
++    this.cancel();
++    return bytes;
++  }
++  cancel() {
++    if (this._closed) { return; }
++    this._closed = true;
++    this._iterator.return();
++    this._buffer = new Uint8Array(0);
++    this._length = 0;
++    this._frame = null;
++    this._quantizationTables = [];
++    this.components = [];
++    this._view = this._viewBuffer = null;
++    this._viewLength = -1;
++    this._signal?.removeEventListener("abort", this._abort);
++  }
++  *_parse() {
++    let data;
++    const dnlScanLines = null;
++    let offset = 0;
++    let jfif = null;
++    let adobe = null;
++    let frame, resetInterval;
++    let numSOSMarkers = 0;
++    const quantizationTables = [];
++    const huffmanTablesAC = [],
++      huffmanTablesDC = [];
++    data = yield* this._need(offset + 2);
++    let fileMarker = readUint16(data, offset);
++    offset += 2;
++    if (fileMarker !== 0xffd8) {
++      throw new JpegError("SOI not found");
++    }
++    data = yield* this._need(offset + 2);
++    fileMarker = readUint16(data, offset);
++    offset += 2;
++    markerLoop: while (fileMarker !== 0xffd9) {
++      if (fileMarker !== 0xffff) {
++            data = yield* this._need(offset + 2);
++            const length = readUint16(data, offset);
++            if (length < 2) { throw new JpegError("Invalid segment length"); }
++            data = yield* this._need(offset + length + 2);
++          }
++          let i, j, l;
++      switch (fileMarker) {
++        case 0xffe0:
++        case 0xffe1:
++        case 0xffe2:
++        case 0xffe3:
++        case 0xffe4:
++        case 0xffe5:
++        case 0xffe6:
++        case 0xffe7:
++        case 0xffe8:
++        case 0xffe9:
++        case 0xffea:
++        case 0xffeb:
++        case 0xffec:
++        case 0xffed:
++        case 0xffee:
++        case 0xffef:
++        case 0xfffe:
++          const {
++            appData,
++            newOffset
++          } = readDataBlock(data, offset);
++          offset = newOffset;
++          if (fileMarker === 0xffe0) {
++            if (appData[0] === 0x4a && appData[1] === 0x46 && appData[2] === 0x49 && appData[3] === 0x46 && appData[4] === 0) {
++              jfif = {
++                version: {
++                  major: appData[5],
++                  minor: appData[6]
++                },
++                densityUnits: appData[7],
++                xDensity: appData[8] << 8 | appData[9],
++                yDensity: appData[10] << 8 | appData[11],
++                thumbWidth: appData[12],
++                thumbHeight: appData[13],
++                thumbData: appData.subarray(14, 14 + 3 * appData[12] * appData[13])
++              };
++            }
++          }
++          if (fileMarker === 0xffee) {
++            if (appData[0] === 0x41 && appData[1] === 0x64 && appData[2] === 0x6f && appData[3] === 0x62 && appData[4] === 0x65) {
++              adobe = {
++                version: appData[5] << 8 | appData[6],
++                flags0: appData[7] << 8 | appData[8],
++                flags1: appData[9] << 8 | appData[10],
++                transformCode: appData[11]
++              };
++            }
++          }
++          break;
++        case 0xffdb:
++          const quantizationTablesLength = readUint16(data, offset);
++          offset += 2;
++          const quantizationTablesEnd = quantizationTablesLength + offset - 2;
++          let z;
++          while (offset < quantizationTablesEnd) {
++            const quantizationTableSpec = data[offset++];
++            const tableData = new Uint16Array(64);
++            if (quantizationTableSpec >> 4 === 0) {
++              for (j = 0; j < 64; j++) {
++                z = dctZigZag[j];
++                tableData[z] = data[offset++];
++              }
++            } else if (quantizationTableSpec >> 4 === 1) {
++              for (j = 0; j < 64; j++) {
++                z = dctZigZag[j];
++                tableData[z] = readUint16(data, offset);
++                offset += 2;
++              }
++            } else {
++              throw new JpegError("DQT - invalid table spec");
++            }
++            quantizationTables[quantizationTableSpec & 15] = tableData;
++          }
++          break;
++        case 0xffc0:
++        case 0xffc1:
++        case 0xffc2:
++          if (frame) {
++            throw new JpegError("Only single frame JPEGs supported");
++          }
++          offset += 2;
++          frame = {};
++          frame.extended = fileMarker === 0xffc1;
++          frame.progressive = fileMarker === 0xffc2;
++          frame.precision = data[offset++];
++          const sofScanLines = readUint16(data, offset);
++          offset += 2;
++          frame.scanLines = dnlScanLines || sofScanLines;
++          frame.samplesPerLine = readUint16(data, offset);
++          offset += 2;
++          frame.components = [];
++          frame.componentIds = {};
++          const componentsCount = data[offset++];
++          let maxH = 0,
++            maxV = 0;
++          for (i = 0; i < componentsCount; i++) {
++            const componentId = data[offset];
++            const h = data[offset + 1] >> 4;
++            const v = data[offset + 1] & 15;
++            if (maxH < h) {
++              maxH = h;
++            }
++            if (maxV < v) {
++              maxV = v;
++            }
++            const qId = data[offset + 2];
++            l = frame.components.push({
++              h,
++              v,
++              quantizationId: qId,
++              quantizationTable: null
++            });
++            frame.componentIds[componentId] = l - 1;
++            offset += 3;
++          }
++          frame.maxH = maxH;
++          frame.maxV = maxV;
++          this._validateFrame(frame);
++          prepareComponents(frame);
++          this._frame = frame;
++          this._account();
++          break;
++        case 0xffc4:
++          const huffmanLength = readUint16(data, offset);
++          offset += 2;
++          for (i = 2; i < huffmanLength;) {
++            const huffmanTableSpec = data[offset++];
++            const codeLengths = new Uint8Array(16);
++            let codeLengthSum = 0;
++            for (j = 0; j < 16; j++, offset++) {
++              codeLengthSum += codeLengths[j] = data[offset];
++            }
++            const huffmanValues = new Uint8Array(codeLengthSum);
++            for (j = 0; j < codeLengthSum; j++, offset++) {
++              huffmanValues[j] = data[offset];
++            }
++            i += 17 + codeLengthSum;
++            (huffmanTableSpec >> 4 === 0 ? huffmanTablesDC : huffmanTablesAC)[huffmanTableSpec & 15] = buildHuffmanTable(codeLengths, huffmanValues);
++          }
++          break;
++        case 0xffdd:
++          offset += 2;
++          resetInterval = readUint16(data, offset);
++          offset += 2;
++          break;
++        case 0xffda:
++          ++numSOSMarkers;
++          const parseDNLMarker = false;
++          offset += 2;
++          const selectorsCount = data[offset++],
++            components = [];
++          for (i = 0; i < selectorsCount; i++) {
++            const index = data[offset++];
++            const componentIndex = frame.componentIds[index];
++            const component = frame.components[componentIndex];
++            component.index = index;
++            const tableSpec = data[offset++];
++            component.huffmanTableDC = huffmanTablesDC[tableSpec >> 4];
++            component.huffmanTableAC = huffmanTablesAC[tableSpec & 15];
++            components.push(component);
++          }
++          const spectralStart = data[offset++],
++            spectralEnd = data[offset++],
++            successiveApproximation = data[offset++];
++          const available = yield* this._scan(offset);
++              data = available.data;
++              const entropyStarted = performance.now();
++              this.entropyCalls++;
++              try {
++                const processed = decodeScan(data, offset, frame, components, resetInterval, spectralStart, spectralEnd, successiveApproximation >> 4, successiveApproximation & 15, parseDNLMarker, true);
++            offset += processed;
++                if (offset !== available.end) { throw new JpegError("Entropy boundary differs"); }
++                this.entropyMs += performance.now() - entropyStarted;
++                this.width = frame.samplesPerLine;
++                this.height = frame.scanLines;
++                this.jfif = jfif; this.adobe = adobe;
++                this.numComponents = frame.components.length;
++                this._quantizationTables = quantizationTables;
++                this._canCompact = numSOSMarkers === 1 && spectralStart === 0 && spectralEnd === 0 && components.length === frame.components.length;
++                yield { type: "scan", scan: numSOSMarkers, received: this._length,
++                  boundary: available.end, entropyMs: this.entropyMs,
++                  coefficientsBytes: this.coefficientBytes };
++          } catch (ex) {
++            throw ex;
++          }
++          break;
++        case 0xffdc:
++          throw new JpegError("DNL is not supported by the progressive stream");
++        case 0xffff:
++          if (data[offset] !== 0xff) {
++            offset--;
++          }
++          break;
++        default:
++          const nextFileMarker = findNextFileMarker(data, offset - 2, offset - 3);
++          if (nextFileMarker?.invalid) {
++            warn("JpegImage.parse - unexpected data, current marker is: " + nextFileMarker.invalid);
++            offset = nextFileMarker.offset;
++            break;
++          }
++          if (!nextFileMarker || offset >= data.length - 1) {
++            warn("JpegImage.parse - reached the end of the image data " + "without finding an EOI marker (0xFFD9).");
++            break markerLoop;
++          }
++          throw new JpegError("JpegImage.parse - unknown marker: " + fileMarker.toString(16));
++      }
++      data = yield* this._need(offset + 2);
++      fileMarker = readUint16(data, offset);
++      offset += 2;
++    }
++    if (!frame) {
++      throw new JpegError("JpegImage.parse - no frame data found.");
++    }
++    return { type: "done", scans: numSOSMarkers, received: this._length };
++      }
++
++}
++
+ ;// ./src/core/jpeg_stream.js
+
+
+
++
++// The format object is inserted from src/core/pdfReadingFormat.json by vendor setup.
++const PDF_READING_FORMAT = null; // PDF_READING_FORMAT_INPUT
++
++function externalImageMetadata(values) {
++  const { limits, syntax } = PDF_READING_FORMAT;
++  const integer = (n, max) => Number.isSafeInteger(n) && n > 0 && n <= max;
++  const hash = new RegExp(syntax.sha256), id = new RegExp(syntax.imageId);
++  if (!Array.isArray(values) || values.length > limits.images) { throw new FormatError("Invalid external image metadata"); }
++  const images = new Map();
++  for (const value of values) {
++    if (!value || typeof value.id !== "string" || !id.test(value.id) || images.has(value.id)
++        || typeof value.sha256 !== "string" || !hash.test(value.sha256)
++        || typeof value.originalSha256 !== "string" || !hash.test(value.originalSha256) || !integer(value.bytes, limits.assetBytes)
++        || !integer(value.width, limits.dimension) || !integer(value.height, limits.dimension)
++        || value.width * value.height > limits.pixels
++        || value.encoding !== "original" && value.encoding !== "progressive-jpeg") {
++      throw new FormatError("Invalid external image identity or dimensions");
++    }
++    const image = { id: value.id, sha256: value.sha256, originalSha256: value.originalSha256,
++      bytes: value.bytes, width: value.width, height: value.height, encoding: value.encoding };
++    if (value.encoding === "progressive-jpeg") {
++      if (value.components !== limits.progressiveComponents || value.width * value.height > limits.progressivePixels
++          || !integer(value.coefficientBytes, limits.coefficientBytes)
++          || value.coefficientBytes % limits.coefficientElementBytes
++          || !Array.isArray(value.chunks) || !value.chunks.length || value.chunks.length > limits.chunks) {
++        throw new FormatError("Invalid progressive JPEG allocation metadata");
++      }
++      let offset = 0, scan = 0;
++      image.chunks = value.chunks.map(chunk => {
++        if (chunk.offset !== offset || !integer(chunk.bytes, image.bytes) || !hash.test(chunk.sha256)
++            || !integer(chunk.scan, limits.chunks) || chunk.scan <= scan) {
++          throw new FormatError("Invalid progressive JPEG chunk");
++        }
++        offset += chunk.bytes;
++        scan = chunk.scan;
++        if (offset > image.bytes) { throw new FormatError("Progressive JPEG chunk exceeds its image"); }
++        return { offset: chunk.offset, bytes: chunk.bytes, sha256: chunk.sha256, scan };
++      });
++      if (offset !== image.bytes) { throw new FormatError("Progressive JPEG chunks do not cover the image"); }
++      image.coefficientBytes = value.coefficientBytes;
++      image.components = value.components;
++    } else {
++      if (image.sha256 !== image.originalSha256 || value.chunks !== undefined || value.coefficientBytes !== undefined) {
++        throw new FormatError("Original image bytes must retain their identity");
++      }
++      image.chunks = [{ offset: 0, bytes: image.bytes, sha256: image.sha256, scan: 0 }];
++    }
++    images.set(image.id, image);
++  }
++  return images;
++}
++
++async function externalImageDigest(bytes) {
++  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
++  return Array.from(hash, n => n.toString(16).padStart(2, "0")).join("");
++}
++
++class ExternalImageManager {
++  constructor({ metadata, budget, handler, queue }) {
++    this.images = externalImageMetadata(metadata);
++    for (const key of ["maxActiveBytes", "maxEncodedBytes", "maxCoefficientBytes", "maxOutputPixels"]) {
++      if (!Number.isSafeInteger(budget?.[key]) || budget[key] < 1) { throw new FormatError(`Invalid external image budget ${key}`); }
++    }
++    this.budget = Object.freeze({ ...budget });
++    this.handler = handler;
++    this.queue = queue;
++    this.groups = new Map();
++    this.readyPages = new Set();
++    this.pending = [];
++    this.tasks = new Set();
++    this.outputs = new Map();
++    this.rasterBytes = this.nativeRasterBytes = this.nativeReservedBytes = this.peakNativeReservedBytes = 0;
++    this.nativeInputBudget = budget.maxEncodedBytes * 2 * (Number.isFinite(queue.limit) ? queue.limit : 1);
++    this.active = this.reservedBytes = this.peakReservedBytes = 0;
++    this.closed = false;
++    this.totals = { completed: 0, failed: 0, cancelled: 0, bytesReceived: 0, firstScans: 0,
++      revisions: 0, covered: 0, entropyCalls: 0, entropyMs: 0, idctMs: 0, finalDecodes: 0, finalDecodeMs: 0, finalRasterBytes: 0, largestFinalRasterBytes: 0, fallbacks: 0 };
++    this.fallbackReasons = Object.create(null);
++  }
++  metadata(id) {
++    const value = this.images.get(id);
++    if (!value) { throw new FormatError(`Unknown external image ${id}`); }
++    if (value.bytes > this.budget.maxEncodedBytes) { throw new FormatError(`External image ${id} exceeds the input budget`); }
++    return value;
++  }
++  _pageKey(pageIndex, epoch) { return `${pageIndex}:${epoch}`; }
++  _ready(subscriber) { return subscriber.print || subscriber.common || this.readyPages.has(this._pageKey(subscriber.pageIndex, subscriber.epoch)); }
++  _alive(group) { return !this.closed && !group.controller.signal.aborted && group.subscribers.size > 0; }
++  _check(group) {
++    if (!this._alive(group)) { throw new AbortException("External image activity cancelled"); }
++  }
++  add(subscriber) {
++    let metadata;
++    try {
++      metadata = this.metadata(subscriber.id);
++      if (metadata.width !== subscriber.width || metadata.height !== subscriber.height) { throw new FormatError("External image dimensions differ from the PDF dictionary"); }
++    } catch (error) {
++      this._sendPending(subscriber);
++      this.totals.failed++;
++      this.handler.sendWithPromise("ExternalImageRevision", { id: subscriber.objId, pageIndex: subscriber.pageIndex,
++        epoch: subscriber.epoch, cacheKey: subscriber.cacheKey, common: subscriber.common,
++        image: null, final: false, failed: true, message: String(error.message || error), scan: 0 }).catch(() => {});
++      return null;
++    }
++    let group = this.groups.get(metadata.id);
++    if (!group) {
++      group = { metadata, subscribers: new Map(), controller: new AbortController(), decoder: null,
++        bytes: null, chunkIndex: 0, phase: "first", active: false, queued: false, reserved: 0,
++        dependencies: new Map(), dependencyBytes: 0, nativeReserved: 0, reportedEntropy: 0, reportedEntropyMs: 0, reportedIdctMs: 0 };
++      this.groups.set(metadata.id, group);
++    }
++    subscriber.covered = subscriber.final = false;
++    group.subscribers.set(subscriber.objId, subscriber);
++    this._sendPending(subscriber);
++    this._enqueue(group);
++    return group;
++  }
++  _sendPending(subscriber) {
++    const placeholder = subscriber.print || subscriber.common ? null : subscriber.mask
++      ? { width: 1, height: 1, data: new Uint8Array([255]), interpolate: false }
++      : { width: 1, height: 1, data: new Uint8ClampedArray(4), kind: ImageKind.RGBA_32BPP, interpolate: false };
++    this.handler.send("ExternalImagePending", { id: subscriber.objId, imageId: subscriber.id,
++      pageIndex: subscriber.pageIndex, epoch: subscriber.epoch, cacheKey: subscriber.cacheKey,
++      print: subscriber.print, common: subscriber.common, image: placeholder });
++  }
++  startPage(pageIndex, epoch) {
++    this.readyPages.add(this._pageKey(pageIndex, epoch));
++    for (const group of this.groups.values()) {
++      if ([...group.subscribers.values()].some(s => s.pageIndex === pageIndex && s.epoch === epoch)) { this._enqueue(group); }
++    }
++  }
++  _enqueue(group) {
++    if (!group.active && !group.queued && this._alive(group) && [...group.subscribers.values()].some(s => this._ready(s))) {
++      group.queued = true;
++      this.pending.push(group);
++    }
++    this._pump();
++  }
++  _fallback(group, reason) {
++    if (!group.fallback) {
++      group.fallback = reason;
++      this.totals.fallbacks++;
++      this.fallbackReasons[reason] = (this.fallbackReasons[reason] || 0) + 1;
++    }
++    group.phase = "full";
++  }
++  _reservation(group) {
++    const { metadata } = group;
++    if (group.phase === "first") {
++      if (metadata.encoding !== "progressive-jpeg") { this._fallback(group, "original-encoding"); }
++      else if (![...group.subscribers.values()].some(s => s.progressive && !s.print)) { this._fallback(group, "native-color-or-print"); }
++      else if (metadata.coefficientBytes > this.budget.maxCoefficientBytes) { this._fallback(group, "coefficient-budget"); }
++    }
++    if (group.phase === "full") { return (group.decoder?.inputCapacity || 0) + (group.decoder?.coefficientBytes || 0); }
++    const firstCapacity = Math.min(metadata.bytes, Math.max(65536, metadata.chunks[0].bytes));
++    const encoded = group.phase === "first" ? firstCapacity * 2 : metadata.bytes * 2;
++    let pixels = 0, retained = 0;
++    for (const subscriber of group.subscribers.values()) {
++      pixels += Math.min(subscriber.outputPixels, this.budget.maxOutputPixels);
++      const output = this.outputs.get(subscriber.objId);
++      if (output && !output.final) { retained += output.bytes; }
++    }
++    // Published partial rasters remain charged; this allowance owns their next
++    // sampled output, bitmap construction and the bounded coefficient/input work.
++    const bytes = metadata.coefficientBytes + encoded + Math.max(0, pixels * 12 - retained)
++      + metadata.width * 12 + 65536;
++    if (bytes + retained > this.budget.maxActiveBytes) {
++      this._fallback(group, "state-budget");
++      return (group.decoder?.inputCapacity || 0) + (group.decoder?.coefficientBytes || 0);
++    }
++    return bytes;
++  }
++  _reserve(group, bytes) {
++    const next = this.reservedBytes + bytes - group.reserved;
++    if (next + this.rasterBytes > this.budget.maxActiveBytes) { return false; }
++    this.reservedBytes = next;
++    group.reserved = bytes;
++    this.peakReservedBytes = Math.max(this.peakReservedBytes, next + this.rasterBytes);
++    return true;
++  }
++  _reserveNative(group, bytes) {
++    const next = this.nativeReservedBytes + bytes - group.nativeReserved;
++    if (next > this.nativeInputBudget) { throw new FormatError("Native image input exceeds the serialized decode budget"); }
++    this.nativeReservedBytes = next;
++    group.nativeReserved = bytes;
++    this.peakNativeReservedBytes = Math.max(this.peakNativeReservedBytes, next);
++  }
++  _releaseOutput(id) {
++    const output = this.outputs.get(id);
++    if (!output) { return; }
++    if (output.final) { this.nativeRasterBytes -= output.bytes; }
++    else { this.rasterBytes -= output.bytes; }
++    this.outputs.delete(id);
++  }
++  _pump() {
++    if (this.closed) { return; }
++    // Every admitted visible image gets its first pixels before a later scan is preferred.
++    this.pending.sort((a, b) => Number([...a.subscribers.values()].every(s => s.covered || s.print))
++      - Number([...b.subscribers.values()].every(s => s.covered || s.print)));
++    const concurrency = Number.isFinite(this.queue.limit) ? this.queue.limit : 1;
++    while (this.active < concurrency && this.pending.length) {
++      let index = -1;
++      for (let i = 0; i < this.pending.length; i++) {
++        const group = this.pending[i];
++        const bytes = this._reservation(group);
++        if (bytes > this.budget.maxActiveBytes) {
++          this.pending.splice(i--, 1);
++          group.queued = false;
++          this._fail(group, new Error("External image input exceeds the active memory budget"));
++          continue;
++        }
++        if (this.reservedBytes + this.rasterBytes + bytes - group.reserved <= this.budget.maxActiveBytes) { index = i; break; }
++      }
++      if (index < 0) {
++        if (this.active) { return; }
++        // Final native decoding uses the existing serialized path after dropping
++        // coefficients. It can finish even when this page's partial rasters fill
++        // the progressive-state budget, then replaces those rasters atomically.
++        index = this.pending.findIndex(group => group.phase === "refine");
++        if (index < 0) { index = 0; }
++        this._fallback(this.pending[index], "shared-state-budget");
++      }
++      const [group] = this.pending.splice(index, 1);
++      group.queued = false;
++      if (!this._alive(group)) { this._release(group); continue; }
++      if (!this._reserve(group, this._reservation(group))) { throw new Error("External image reservation changed during admission"); }
++      group.active = true;
++      this.active++;
++      const task = this.queue.run(() => this._runPhase(group)).catch(error => this._fail(group, error)).finally(() => {
++        this._recordDecoder(group);
++        group.active = false;
++        this.active--;
++        if (!this._alive(group) || group.finished) { this._release(group); }
++        else {
++          const retained = (group.decoder?.inputCapacity || group.bytes?.byteLength || 0)
++            + (group.decoder?.coefficientBytes || 0) + group.dependencyBytes + 65536;
++          this._reserve(group, retained);
++          this._enqueue(group);
++        }
++        this._pump();
++        this.tasks.delete(task);
++      });
++      group.task = task;
++      this.tasks.add(task);
++    }
++  }
++  async _readChunk(group, metadata, index) {
++    this._check(group);
++    const chunk = metadata.chunks[index];
++    if (!chunk) { throw new FormatError("Unknown external image chunk"); }
++    const reader = this.handler.sendWithStream("GetExternalImageChunk", { id: metadata.id, chunkIndex: index }).getReader();
++    let complete = false, cancellation;
++    const abort = () => { cancellation ||= reader.cancel(new AbortException("External image request cancelled")).catch(() => {}); };
++    group.controller.signal.addEventListener("abort", abort, { once: true });
++    try {
++      const { value, done } = await reader.read();
++      this._check(group);
++      if (done || !(value instanceof Uint8Array) || value.byteLength !== chunk.bytes) { throw new FormatError("External image chunk length differs"); }
++      const end = await reader.read();
++      if (!end.done) { throw new FormatError("External image request returned extra chunks"); }
++      complete = true;
++      if (await externalImageDigest(value) !== chunk.sha256) { throw new FormatError("External image chunk digest differs"); }
++      this._check(group);
++      this.totals.bytesReceived += value.byteLength;
++      return value;
++    } finally {
++      group.controller.signal.removeEventListener("abort", abort);
++      if (!complete) { abort(); await cancellation; }
++      reader.releaseLock();
++    }
++  }
++  _recordDecoder(group) {
++    const decoder = group.decoder;
++    if (!decoder) { return; }
++    this.totals.entropyCalls += decoder.entropyCalls - group.reportedEntropy;
++    this.totals.entropyMs += decoder.entropyMs - group.reportedEntropyMs;
++    this.totals.idctMs += decoder.renderMs - group.reportedIdctMs;
++    group.reportedEntropy = decoder.entropyCalls;
++    group.reportedEntropyMs = decoder.entropyMs;
++    group.reportedIdctMs = decoder.renderMs;
++  }
++  async _consume(group) {
++    const { metadata, decoder } = group;
++    const index = group.chunkIndex;
++    const bytes = await this._readChunk(group, metadata, index);
++    const last = index === metadata.chunks.length - 1;
++    decoder.push(bytes, { final: last });
++    let scan = 0;
++    for (;;) {
++      const event = decoder.next();
++      if (event.type === "need" || event.type === "done") { break; }
++      scan = event.scan;
++    }
++    if (scan !== metadata.chunks[index].scan) { throw new FormatError("External JPEG scan differs from its chunk metadata"); }
++    group.chunkIndex++;
++    group.scan = scan;
++  }
++  async _publish(group, subscriber, image, final) {
++    if (!this._alive(group)) { image?.bitmap?.close(); this._check(group); }
++    if (!group.subscribers.has(subscriber.objId)) { image?.bitmap?.close(); return; }
++    image.dataLen = image.bitmap ? image.width * image.height * 4 : image.data?.length || 0;
++    const transfers = image.bitmap ? [image.bitmap] : image.data ? [image.data.buffer] : [];
++    let accepted;
++    subscriber.finalSent = final;
++    try {
++      accepted = await this.handler.sendWithPromise("ExternalImageRevision", {
++        id: subscriber.objId, pageIndex: subscriber.pageIndex, epoch: subscriber.epoch,
++        cacheKey: subscriber.cacheKey, common: subscriber.common, image, final, failed: false, scan: group.scan || 0,
++      }, transfers);
++    } catch (error) { image.bitmap?.close(); throw error; }
++    if (!accepted) { group.subscribers.delete(subscriber.objId); return; }
++    if (!this._alive(group) || !group.subscribers.has(subscriber.objId)) { return; }
++    const previous = this.outputs.get(subscriber.objId);
++    const addedPartial = final ? 0 : Math.max(0, image.dataLen - (previous && !previous.final ? previous.bytes : 0));
++    // Transfer consumes the output allowance already reserved by this phase.
++    if (addedPartial > group.reserved) { throw new Error("External image exceeded its reserved raster allowance"); }
++    this._reserve(group, group.reserved - addedPartial);
++    this._releaseOutput(subscriber.objId);
++    this.outputs.set(subscriber.objId, { bytes: image.dataLen, final, pageIndex: subscriber.pageIndex,
++      epoch: subscriber.epoch, common: subscriber.common });
++    if (final) { this.nativeRasterBytes += image.dataLen; }
++    else { this.rasterBytes += image.dataLen; }
++    this.peakReservedBytes = Math.max(this.peakReservedBytes, this.reservedBytes + this.rasterBytes);
++    if (!subscriber.covered) { this.totals.covered++; }
++    subscriber.covered = true;
++    subscriber.final = final;
++    this.totals.revisions++;
++  }
++  async _preview(group, uncoveredOnly = false) {
++    for (const subscriber of group.subscribers.values()) {
++      if (!subscriber.progressive || subscriber.print || uncoveredOnly && subscriber.covered) { continue; }
++      this._check(group);
++      const reserved = this._reservation(group);
++      if (group.phase === "full") { return; }
++      if (!this._reserve(group, reserved)) { this._fallback(group, "raster-state-budget"); return; }
++      const image = await subscriber.render({ decoder: group.decoder, final: false, group,
++        maxPixels: this.budget.maxOutputPixels });
++      await this._publish(group, subscriber, image, false);
++    }
++  }
++  async _runPhase(group) {
++    this._check(group);
++    const { metadata } = group;
++    if (group.phase === "first") {
++      group.decoder = new IncrementalJpegImage({ maxInputBytes: metadata.bytes,
++        maxPixels: PDF_READING_FORMAT.limits.progressivePixels,
++        maxCoefficientBytes: this.budget.maxCoefficientBytes, expectedCoefficientBytes: metadata.coefficientBytes,
++        expectedWidth: metadata.width, expectedHeight: metadata.height, signal: group.controller.signal });
++      await this._consume(group);
++      await this._preview(group);
++      this.totals.firstScans++;
++      if (group.phase !== "full") {
++        if (group.chunkIndex < metadata.chunks.length && group.decoder.compact()) {
++          group.phase = "refine";
++          return;
++        }
++        group.phase = "refine";
++      }
++    }
++    if (group.phase === "refine") {
++      group.decoder.expand();
++      await this._preview(group, true);
++      const middle = Math.ceil(metadata.chunks.length / 2);
++      while (group.phase === "refine" && group.chunkIndex < metadata.chunks.length) {
++        await this._consume(group);
++        if (group.chunkIndex === middle && group.chunkIndex < metadata.chunks.length) { await this._preview(group); }
++      }
++    }
++    if (group.phase === "refine") {
++      this._recordDecoder(group);
++      this._reserveNative(group, metadata.bytes * 2);
++      group.bytes = group.decoder.takeBytes();
++      group.decoder = null;
++      this._reserve(group, 0);
++    } else {
++      this._recordDecoder(group);
++      this._reserveNative(group, metadata.bytes * 2);
++      let prefix = group.decoder?.takeReceivedBytes();
++      group.decoder = null;
++      group.bytes = new Uint8Array(metadata.bytes);
++      if (prefix) { group.bytes.set(prefix); prefix = null; }
++      this._reserve(group, 0);
++      while (group.chunkIndex < metadata.chunks.length) {
++        const index = group.chunkIndex;
++        const bytes = await this._readChunk(group, metadata, index);
++        group.bytes.set(bytes, metadata.chunks[index].offset);
++        group.chunkIndex++;
++      }
++    }
++    if (await externalImageDigest(group.bytes) !== metadata.sha256) { throw new FormatError("External image digest differs"); }
++    for (const subscriber of group.subscribers.values()) {
++      if (subscriber.final) { continue; }
++      this._check(group);
++      const start = performance.now();
++      const image = await subscriber.render({ bytes: group.bytes, final: true, group });
++      this.totals.finalDecodeMs += performance.now() - start;
++      this.totals.finalDecodes++;
++      const rasterBytes = image.bitmap ? image.width * image.height * 4 : image.data?.byteLength || 0;
++      this.totals.finalRasterBytes += rasterBytes;
++      this.totals.largestFinalRasterBytes = Math.max(this.totals.largestFinalRasterBytes, rasterBytes);
++      if (!this._alive(group)) { image?.bitmap?.close(); this._check(group); }
++      await this._publish(group, subscriber, image, true);
++    }
++    group.finished = true;
++    this.totals.completed++;
++  }
++  async resolve(stream, group, suppliedBytes = null) {
++    if (!stream?.externalImageId) { return stream; }
++    const metadata = this.metadata(stream.externalImageId);
++    let bytes = suppliedBytes;
++    if (!bytes) {
++      let pending = group.dependencies.get(metadata.id);
++      if (!pending) {
++        const extra = metadata.bytes * 2;
++        this._reserveNative(group, group.nativeReserved + extra);
++        group.dependencyBytes += extra;
++        pending = (async () => {
++          const data = new Uint8Array(metadata.bytes);
++          for (let i = 0; i < metadata.chunks.length; i++) { data.set(await this._readChunk(group, metadata, i), metadata.chunks[i].offset); }
++          if (await externalImageDigest(data) !== metadata.sha256) { throw new FormatError("External mask digest differs"); }
++          return data;
++        })();
++        group.dependencies.set(metadata.id, pending);
++      }
++      bytes = await pending;
++    }
++    this._check(group);
++    const raw = new Stream(bytes);
++    raw.dict = stream.dict;
++    const parser = { xref: stream.dict.xref, makeFilter: Parser.prototype.makeFilter };
++    const decoded = Parser.prototype.filter.call(parser, raw, stream.dict, bytes.length, true);
++    decoded.dict = stream.dict;
++    return decoded;
++  }
++  _fail(group, error) {
++    if (group.finished) { return; }
++    group.finished = true;
++    if (group.controller.signal.aborted || this.closed || error instanceof AbortException) { return; }
++    this.totals.failed++;
++    warn(`External image ${group.metadata.id}: ${error}`);
++    for (const subscriber of group.subscribers.values()) {
++      this.handler.sendWithPromise("ExternalImageRevision", { id: subscriber.objId,
++        pageIndex: subscriber.pageIndex, epoch: subscriber.epoch, cacheKey: subscriber.cacheKey, common: subscriber.common,
++        image: null, final: false, failed: true, message: String(error.message || error), scan: group.scan || 0 }).catch(() => {});
++    }
++    if (!group.active) { this._release(group); }
++  }
++  _release(group) {
++    this._recordDecoder(group);
++    group.controller.abort();
++    group.decoder?.cancel();
++    group.decoder = group.bytes = null;
++    group.dependencies.clear();
++    group.dependencyBytes = 0;
++    this.reservedBytes -= group.reserved;
++    this.nativeReservedBytes -= group.nativeReserved;
++    group.reserved = group.nativeReserved = 0;
++    group.subscribers.clear();
++    if (this.groups.get(group.metadata.id) === group) { this.groups.delete(group.metadata.id); }
++    this.pending = this.pending.filter(value => value !== group);
++  }
++  cancelPage(pageIndex, epoch) {
++    this.readyPages.delete(this._pageKey(pageIndex, epoch));
++    const wait = [];
++    for (const [id, output] of this.outputs) {
++      if (!output.common && output.pageIndex === pageIndex && output.epoch === epoch) { this._releaseOutput(id); }
++    }
++    for (const group of this.groups.values()) {
++      for (const [id, subscriber] of group.subscribers) {
++        if (!subscriber.common && subscriber.pageIndex === pageIndex && subscriber.epoch === epoch) { group.subscribers.delete(id); }
++      }
++      if (!group.subscribers.size) {
++        if (!group.finished) { this.totals.cancelled++; }
++        group.controller.abort();
++        if (!group.active) { this._release(group); }
++        else if (group.task) { wait.push(group.task); }
++      }
++    }
++    this._pump();
++    return Promise.allSettled(wait);
++  }
++  async clear() {
++    for (const group of this.groups.values()) {
++      if (!group.finished) { this.totals.cancelled++; }
++      group.subscribers.clear();
++      group.controller.abort();
++      if (!group.active) { this._release(group); }
++    }
++    this.pending.length = 0;
++    this.readyPages.clear();
++    await Promise.allSettled(this.tasks);
++    // Document cleanup clears both page and shared image objects on the main thread.
++    this.outputs.clear();
++    this.rasterBytes = this.nativeRasterBytes = 0;
++  }
++  close() {
++    if (this.closed) { return Promise.allSettled(this.tasks); }
++    this.closed = true;
++    this.outputs.clear();
++    this.rasterBytes = this.nativeRasterBytes = 0;
++    for (const group of this.groups.values()) {
++      if (!group.finished) { this.totals.cancelled++; }
++      group.controller.abort();
++      if (!group.active) { this._release(group); }
++    }
++    this.pending.length = 0;
++    this.readyPages.clear();
++    return Promise.allSettled(this.tasks);
++  }
++  stats() {
++    let encodedBytes = 0, coefficientBytes = 0, paused = 0;
++    for (const group of this.groups.values()) {
++      encodedBytes += group.decoder?.inputCapacity || group.bytes?.byteLength || 0;
++      coefficientBytes += group.decoder?.coefficientBytes || 0;
++      if (!group.active && group.decoder) { paused++; }
++    }
++    const result = { externalImageActive: this.active, externalImageQueued: this.pending.length,
++      externalImagePaused: paused, externalImageEncodedBytes: encodedBytes, externalImageCoefficientBytes: coefficientBytes,
++      externalImageReservedBytes: this.reservedBytes + this.rasterBytes, externalImagePeakReservedBytes: this.peakReservedBytes,
++      externalImagePartialRasterBytes: this.rasterBytes, externalImageNativeRasterBytes: this.nativeRasterBytes,
++      externalImageNativeInputBytes: this.nativeReservedBytes, externalImagePeakNativeInputBytes: this.peakNativeReservedBytes,
++      externalImageNativeInputBudgetBytes: this.nativeInputBudget,
++      externalImageBudgetBytes: this.budget.maxActiveBytes, externalImageFallbackReasons: { ...this.fallbackReasons } };
++    for (const [name, value] of Object.entries(this.totals)) { result[`externalImage${name[0].toUpperCase()}${name.slice(1)}`] = value; }
++    return result;
++  }
++}
+
+ class JpegStream extends DecodeStream {
+   static #isImageDecoderSupported = FeatureTest.isImageDecoderSupported;
+@@ -5190,36 +6568,66 @@
    get canAsyncDecodeImageFromBuffer() {
      return this.stream.isAsync;
    }
@@ -895,7 +2339,26 @@
        warn(`getTransferableImage - failed: "${reason}".`);
        return null;
      } finally {
-@@ -29969,13 +30352,16 @@
+@@ -10220,7 +11628,17 @@
+     stream.dict = dict;
+     return stream;
+   }
+-  filter(stream, dict, length) {
++  filter(stream, dict, length, external = false) {
++    if (!external && dict.has("MotionLabImage")) {
++      const id = dict.get("MotionLabImage");
++      if (typeof id !== "string" || !new RegExp(PDF_READING_FORMAT.syntax.imageId).test(id)) {
++        throw new FormatError("Invalid external image marker");
++      }
++      const placeholder = new Stream(new Uint8Array(0));
++      placeholder.dict = dict;
++      placeholder.externalImageId = id;
++      return placeholder;
++    }
+     let filter = dict.get("F", "Filter");
+     let params = dict.get("DP", "DecodeParms");
+     if (filter instanceof Name) {
+@@ -29969,13 +31387,16 @@
      }
      switch (filterName) {
        case "JPXDecode":
@@ -919,21 +2382,41 @@
          this.jpxDecoderOptions = {
            numComponents: 0,
            isIndexedColormap: false,
-@@ -30147,6 +30533,13 @@
+@@ -30127,9 +31548,12 @@
+     isInline = false,
+     pdfFunctionFactory,
+     globalColorSpaceCache,
+-    localColorSpaceCache
++    localColorSpaceCache,
++    externalImages = null,
++    externalGroup = null,
++    externalBytes = null
+   }) {
+-    const imageData = image;
++    let imageData = image;
+     let smaskData = null;
+     let maskData = null;
+     const smask = image.dict.get("SMask");
+@@ -30145,6 +31569,18 @@
+         maskData = mask;
+       } else {
          warn("Unsupported /Mask format.");
-       }
-     }
++      }
++    }
++    if (externalImages) {
++      imageData = await externalImages.resolve(imageData, externalGroup, externalBytes);
++      smaskData = await externalImages.resolve(smaskData, externalGroup);
++      maskData = await externalImages.resolve(maskData, externalGroup);
++    }
 +    // Incremental decoders must not advance state before an evicted range is refetched.
 +    for (const source of [imageData, smaskData, maskData]) {
 +      const streams = source instanceof BaseStream ? source.getBaseStreams() : null;
 +      for (const stream of streams || []) {
 +        stream.ensureRange(stream.start, stream.end);
-+      }
-+    }
+       }
+     }
      return new PDFImage({
-       xref,
-       res,
-@@ -30437,7 +30830,20 @@
+@@ -30437,7 +31873,20 @@
        buffer[i + 2] = (buffer[i + 2] - matteB) * k + matteB;
      }
    }
@@ -955,7 +2438,7 @@
      const drawWidth = this.drawWidth;
      const drawHeight = this.drawHeight;
      const imgData = {
-@@ -30866,6 +31272,7 @@
+@@ -30866,6 +32315,7 @@
      this.options = options || DefaultPartialEvaluatorOptions;
      this.type3FontRefs = null;
      this._regionalImageCache = new RegionalImageCache();
@@ -963,7 +2446,7 @@
      this._fetchBuiltInCMapBound = this.fetchBuiltInCMap.bind(this);
    }
    get _pdfFunctionFactory() {
-@@ -31026,6 +31433,10 @@
+@@ -31026,6 +32476,10 @@
    async buildFormXObject(resources, xobj, smask, operatorList, task, initialState, localColorSpaceCache) {
      const dict = xobj.dict;
      const matrix = lookupMatrix(dict.getArray("Matrix"), null);
@@ -974,7 +2457,72 @@
      const bbox = lookupNormalRect(dict.getArray("BBox"), null);
      let optionalContent, groupOptions;
      if (dict.has("OC")) {
-@@ -31090,7 +31501,8 @@
+@@ -31083,6 +32537,64 @@
+     }
+     return this.handler.send("obj", [objId, this.pageIndex, "Image", imgData], transfers);
+   }
++  buildExternalImage({ resources, image, isInline, operatorList, cacheKey,
++    localImageCache, localColorSpaceCache, resolution, adaptiveKey, optionalContent, imageMask, w, h }) {
++    const manager = this.xref.pdfManager.externalImages;
++    if (!manager) { throw new FormatError("This PDF requires its verified external image source"); }
++    const dict = image.dict;
++    const common = !!this.parsingType3Font;
++    const print = !!(this.options.externalImageIntent & RenderingIntentFlag.PRINT) || common;
++    const objId = `${common ? this.idFactory.getDocId() + "_type3_" : ""}img_${this.idFactory.createObjId()}`;
++    const interpolate = dict.get("I", "Interpolate") || false;
++    const hasMask = dict.has("SMask") || dict.has("Mask");
++    const fn = imageMask ? OPS.paintImageMaskXObject : OPS.paintImageXObject;
++    const args = imageMask ? [{ data: objId, width: w, height: h, interpolate, count: 1 }] : [objId, w, h];
++    operatorList.addDependency(objId);
++    operatorList.addImageOps(fn, args, optionalContent, hasMask);
++    const metadata = manager.images.get(image.externalImageId);
++    const filter = dict.get("F", "Filter");
++    const params = dict.get("DP", "DecodeParms");
++    const definition = !imageMask && !hasMask ? new PDFImage({ xref: this.xref, res: resources, image, isInline,
++      pdfFunctionFactory: this._pdfFunctionFactory, globalColorSpaceCache: this.globalColorSpaceCache, localColorSpaceCache }) : null;
++    const progressive = metadata?.encoding === "progressive-jpeg" && !print && definition?.colorSpace.name === "DeviceRGB"
++      && definition.bpc === 8 && filter instanceof Name && (filter.name === "DCTDecode" || filter.name === "DCT");
++    const target = resolution ? imageDecodeSize(w, h, resolution) : { width: w, height: h };
++    manager.add({ id: image.externalImageId, objId, pageIndex: this.pageIndex,
++      epoch: this.options.externalImageEpoch, cacheKey: this.options.externalImageCacheKey,
++      width: w, height: h, outputPixels: target.width * target.height,
++      progressive, print, common, mask: imageMask,
++      render: async ({ decoder, bytes, final, group, maxPixels }) => {
++        if (!final) {
++          const ratio = Math.min(1, Math.sqrt(maxPixels / (target.width * target.height)));
++          const width = Math.max(1, Math.floor(target.width * ratio));
++          const height = Math.max(1, Math.floor(target.height * ratio));
++          const jpeg = new JpegStream(new Stream(new Uint8Array(0)), 0, params);
++          jpeg.dict = dict;
++          jpeg.forceRGB = true;
++          const data = decoder.render({ width, height, ...jpeg.jpegOptions });
++          return { width, height, data, kind: ImageKind.RGB_24BPP, interpolate };
++        }
++        if (imageMask) {
++          const source = await manager.resolve(image, group, bytes);
++          return PDFImage.createRawMask({ imgArray: source.getBytes((w + 7 >> 3) * h), width: w, height: h,
++            imageIsFromDecodeStream: source instanceof DecodeStream, inverseDecode: dict.getArray("D", "Decode")?.[0] > 0, interpolate });
++        }
++        const imageObj = await PDFImage.buildImage({ xref: this.xref, res: resources, image, isInline,
++          pdfFunctionFactory: this._pdfFunctionFactory, globalColorSpaceCache: this.globalColorSpaceCache, localColorSpaceCache,
++          externalImages: manager, externalGroup: group, externalBytes: bytes });
++        const result = await imageObj.createImageData(false, this.options.isOffscreenCanvasSupported, print ? null : resolution);
++        this.xref.pdfManager.imageDecodeQueue?.record(!!result._nativeDecode, w * h, result.width * result.height);
++        delete result._nativeDecode;
++        result.ref = dict.objId;
++        return result;
++      }
++    });
++    if (cacheKey) {
++      const value = { objId, fn, args, optionalContent, hasMask };
++      localImageCache.set(cacheKey, dict.objId, value);
++      if (adaptiveKey) { this._adaptiveImageCache.set(adaptiveKey, value); }
++    }
++  }
+   async buildPaintImageXObject({
+     resources,
+     image,
+@@ -31090,7 +32602,8 @@
      operatorList,
      cacheKey,
      localImageCache,
@@ -984,12 +2532,10 @@
    }) {
      const dict = image.dict;
      const imageRef = dict.objId;
-@@ -31098,6 +31510,18 @@
-     const h = dict.get("H", "Height");
-     if (!(w && typeof w === "number") || !(h && typeof h === "number")) {
+@@ -31100,6 +32613,18 @@
        warn("Image dimensions are missing, or not numbers.");
-+      return;
-+    }
+       return;
+     }
 +    const resolution = this.options.imageDecodeMaxDimension && !this.parsingType3Font ? {
 +      scale: this.options.imageDecodeScale,
 +      maxDimension: this.options.imageDecodeMaxDimension,
@@ -1000,10 +2546,24 @@
 +    const cachedAdaptive = adaptiveKey && this._adaptiveImageCache.get(adaptiveKey);
 +    if (cachedAdaptive) {
 +      addLocallyCachedImageOps(operatorList, cachedAdaptive);
-       return;
-     }
++      return;
++    }
      const maxImageSize = this.options.maxImageSize;
-@@ -31229,7 +31653,7 @@
+     if (maxImageSize !== -1 && w * h > maxImageSize) {
+       const msg = "Image exceeded maximum allowed size and was removed.";
+@@ -31114,6 +32639,11 @@
+       optionalContent = await this.parseMarkedContentProps(dict.get("OC"), resources);
+     }
+     const imageMask = dict.get("IM", "ImageMask") || false;
++    if (image.externalImageId) {
++      this.buildExternalImage({ resources, image, isInline, operatorList, cacheKey,
++        localImageCache, localColorSpaceCache, resolution, adaptiveKey, optionalContent, imageMask, w, h });
++      return;
++    }
+     let imgData, fn, args;
+     if (imageMask) {
+       const interpolate = dict.get("I", "Interpolate");
+@@ -31229,7 +32759,7 @@
      if (this.parsingType3Font) {
        objId = `${this.idFactory.getDocId()}_type3_${objId}`;
      } else if (cacheKey && imageRef) {
@@ -1012,7 +2572,7 @@
        if (cacheGlobally) {
          assert(!isInline, "Cannot cache an inline image globally.");
          objId = `${this.idFactory.getDocId()}_${objId}`;
-@@ -31270,16 +31694,28 @@
+@@ -31270,16 +32800,28 @@
          }
        }
      }
@@ -1051,7 +2611,7 @@
        imgData.dataLen = imgData.bitmap ? imgData.width * imgData.height * 4 : imgData.data.length;
        imgData.ref = imageRef;
        if (cacheGlobally) {
-@@ -31287,6 +31723,7 @@
+@@ -31287,6 +32829,7 @@
        }
        return this._sendImgData(objId, imgData, cacheGlobally);
      }).catch(reason => {
@@ -1059,7 +2619,7 @@
        warn(`Unable to decode image "${objId}": "${reason}".`);
        if (imageRef) {
          this.globalImageCache.addDecodeFailed(imageRef);
-@@ -31302,7 +31739,8 @@
+@@ -31302,7 +32845,8 @@
          hasMask
        };
        localImageCache.set(cacheKey, imageRef, cacheData);
@@ -1069,7 +2629,7 @@
          this._regionalImageCache.set(null, imageRef, cacheData);
          if (cacheGlobally) {
            this.globalImageCache.setData(imageRef, {
-@@ -31385,7 +31823,8 @@
+@@ -31385,7 +32929,8 @@
        xref: this.xref,
        dictArray: [patternDict.get("Resources"), resources]
      });
@@ -1079,7 +2639,7 @@
        stream: pattern,
        task,
        resources: patternResources,
-@@ -31964,7 +32403,7 @@
+@@ -31964,7 +33509,7 @@
            case OPS.paintXObject:
              isValidName = args[0] instanceof Name;
              name = args[0].name;
@@ -1088,7 +2648,7 @@
                const localImage = localImageCache.getByName(name);
                if (localImage) {
                  addLocallyCachedImageOps(operatorList, localImage);
-@@ -31978,13 +32417,13 @@
+@@ -31978,13 +33523,13 @@
                }
                let xobj = xobjs.getRaw(name);
                if (xobj instanceof Ref) {
@@ -1104,7 +2664,7 @@
                  if (globalImage) {
                    operatorList.addDependency(globalImage.objId);
                    operatorList.addImageOps(globalImage.fn, globalImage.args, globalImage.optionalContent, globalImage.hasMask);
-@@ -32016,7 +32455,8 @@
+@@ -32016,7 +33561,8 @@
                    operatorList,
                    cacheKey: name,
                    localImageCache,
@@ -1114,7 +2674,7 @@
                  }).then(resolveXObject, rejectXObject);
                  return;
                } else if (type.name === "PS") {
-@@ -32045,7 +32485,7 @@
+@@ -32045,7 +33591,7 @@
              return;
            case OPS.endInlineImage:
              const cacheKey = args[0].cacheKey;
@@ -1123,7 +2683,7 @@
                const localImage = localImageCache.getByName(cacheKey);
                if (localImage) {
                  addLocallyCachedImageOps(operatorList, localImage);
-@@ -32060,7 +32500,8 @@
+@@ -32060,7 +33606,8 @@
                operatorList,
                cacheKey,
                localImageCache,
@@ -1133,7 +2693,7 @@
              }));
              return;
            case OPS.showText:
-@@ -33035,7 +33476,7 @@
+@@ -33035,7 +34582,7 @@
                    resolveXObject();
                    return;
                  }
@@ -1142,7 +2702,7 @@
                  if (globalImage) {
                    resolveXObject();
                    return;
-@@ -33731,7 +34172,7 @@
+@@ -33731,7 +35278,7 @@
        hash.update(`${firstChar}-${lastChar}`);
        if (toUnicode instanceof BaseStream) {
          const stream = toUnicode.str || toUnicode;
@@ -1151,46 +2711,70 @@
          hash.update(uint8array);
        } else if (toUnicode instanceof Name) {
          hash.update(toUnicode.name);
-@@ -54680,7 +55121,9 @@
+@@ -54680,7 +56227,10 @@
      intent,
      cacheKey,
      annotationStorage = null,
 -    modifiedIds = null
 +    modifiedIds = null,
 +    imageDecodeScale = 0,
-+    imageDecodeMaxDimension = 0
++    imageDecodeMaxDimension = 0,
++    externalImageEpoch = 0
    }) {
      const contentStreamPromise = this.getContentStream();
      const resourcesPromise = this.loadResources(["ColorSpace", "ExtGState", "Font", "Pattern", "Properties", "Shading", "XObject"]);
-@@ -54695,7 +55138,8 @@
+@@ -54695,7 +56245,8 @@
        globalColorSpaceCache: this.globalColorSpaceCache,
        globalImageCache: this.globalImageCache,
        systemFontCache: this.systemFontCache,
 -      options: this.evaluatorOptions
-+      options: imageDecodeMaxDimension > 0
-+        ? { ...this.evaluatorOptions, imageDecodeScale, imageDecodeMaxDimension } : this.evaluatorOptions
++      options: { ...this.evaluatorOptions, imageDecodeScale, imageDecodeMaxDimension,
++        externalImageEpoch, externalImageCacheKey: cacheKey, externalImageIntent: intent }
      });
      const newAnnotsByPage = !this.xfaFactory ? getNewAnnotationsMap(annotationStorage) : null;
      const newAnnots = newAnnotsByPage?.get(this.pageIndex);
-@@ -55824,6 +56268,8 @@
+@@ -55815,7 +57366,9 @@
+     enableXfa,
+     evaluatorOptions,
+     handler,
+-    password
++    password,
++    externalImages = null,
++    externalImageBudget = null
+   }) {
+     this._docBaseUrl = parseDocBaseUrl(docBaseUrl);
+     this._docId = docId;
+@@ -55824,6 +57377,10 @@
      evaluatorOptions.isOffscreenCanvasSupported &&= FeatureTest.isOffscreenCanvasSupported;
      evaluatorOptions.isImageDecoderSupported &&= FeatureTest.isImageDecoderSupported;
      this.evaluatorOptions = Object.freeze(evaluatorOptions);
-+    this.imageDecodeQueue = evaluatorOptions.adaptiveImageDecoding || evaluatorOptions.imageDecodeConcurrency > 0
-+      ? new ImageDecodeQueue(evaluatorOptions.imageDecodeConcurrency) : null;
++    this.imageDecodeQueue = evaluatorOptions.adaptiveImageDecoding || evaluatorOptions.imageDecodeConcurrency > 0 || externalImages
++      ? new ImageDecodeQueue(evaluatorOptions.imageDecodeConcurrency || (externalImages ? 1 : 0)) : null;
++    this.externalImages = externalImages ? new ExternalImageManager({ metadata: externalImages,
++      budget: externalImageBudget, handler, queue: this.imageDecodeQueue }) : null;
      ImageResizer.setOptions(evaluatorOptions);
      JpegStream.setOptions(evaluatorOptions);
      const options = {
-@@ -55912,7 +56358,7 @@
+@@ -55870,7 +57427,8 @@
+   serializeXfaData(annotationStorage) {
+     return this.pdfDocument.serializeXfaData(annotationStorage);
+   }
+-  cleanup(manuallyTriggered = false) {
++  async cleanup(manuallyTriggered = false) {
++    await this.externalImages?.clear();
+     return this.pdfDocument.cleanup(manuallyTriggered);
+   }
+   async ensure(obj, prop, args) {
+@@ -55912,7 +57470,7 @@
    requestLoadedStream(noFetch = false) {
      return this._loadedStreamPromise;
    }
 -  terminate(reason) {}
-+  terminate(reason) { this.imageDecodeQueue?.abort(reason); }
++  terminate(reason) { this.externalImages?.close(); this.imageDecodeQueue?.abort(reason); }
  }
  class NetworkPdfManager extends BasePdfManager {
    constructor(args) {
-@@ -55921,15 +56367,32 @@
+@@ -55921,15 +57479,32 @@
        msgHandler: args.handler,
        length: args.length,
        disableAutoFetch: args.disableAutoFetch,
@@ -1225,7 +2809,7 @@
        }
        return value;
      } catch (ex) {
-@@ -55937,7 +56400,7 @@
+@@ -55937,7 +57512,7 @@
          throw ex;
        }
        await this.requestRange(ex.begin, ex.end);
@@ -1234,15 +2818,16 @@
      }
    }
    requestRange(begin, end) {
-@@ -55952,6 +56415,7 @@
+@@ -55952,6 +57527,8 @@
      });
    }
    terminate(reason) {
++    this.externalImages?.close();
 +    this.imageDecodeQueue?.abort(reason);
      this.streamManager.abort(reason);
    }
  }
-@@ -56785,6 +57249,12 @@
+@@ -56785,6 +58362,12 @@
      this._rangeRequestReaders.push(reader);
      return reader;
    }
@@ -1255,7 +2840,7 @@
    cancelAllRequests(reason) {
      this._fullRequestReader?.cancel(reason);
      for (const reader of this._rangeRequestReaders.slice(0)) {
-@@ -56948,6 +57418,22 @@
+@@ -56948,6 +58531,22 @@
      }
      const workerHandlerName = docId + "_worker";
      let handler = new MessageHandler(workerHandlerName, docId, port);
@@ -1278,7 +2863,7 @@
      function ensureNotTerminated() {
        if (terminated) {
          throw new Error("Worker was terminated");
-@@ -56955,36 +57441,44 @@
+@@ -56955,40 +58554,50 @@
      }
      function startWorkerTask(task) {
        WorkerTasks.add(task);
@@ -1341,17 +2926,26 @@
        length,
        docBaseUrl,
        enableXfa,
-@@ -57000,7 +57494,8 @@
+-      evaluatorOptions
++      evaluatorOptions,
++      externalImages,
++      externalImageBudget
+     }) {
+       const pdfManagerArgs = {
+         source: null,
+@@ -57000,7 +58609,10 @@
          handler,
          length,
          password,
 -        rangeChunkSize
 +        rangeChunkSize,
-+        rangeCacheBytes
++        rangeCacheBytes,
++        externalImages,
++        externalImageBudget
        };
        if (data) {
          pdfManagerArgs.source = data;
-@@ -57127,7 +57622,7 @@
+@@ -57127,7 +58739,7 @@
          pdfManager = newPdfManager;
          pdfManager.requestLoadedStream(true).then(stream => {
            handler.send("DataLoaded", {
@@ -1360,17 +2954,17 @@
            });
          });
        }).then(pdfManagerReady, onFailure);
-@@ -57196,8 +57691,16 @@
+@@ -57196,8 +58808,16 @@
      handler.on("GetMarkInfo", function (data) {
        return pdfManager.ensureCatalog("markInfo");
      });
 +    handler.on("GetRangeCacheStats", function () {
 +      const stats = pdfManager.streamManager?.getRangeCacheStats() ?? null;
-+      return pdfManager.imageDecodeQueue ? { ...stats, ...pdfManager.imageDecodeQueue.stats() } : stats;
++      return pdfManager.imageDecodeQueue ? { ...stats, ...pdfManager.imageDecodeQueue.stats(), ...pdfManager.externalImages?.stats() } : stats;
 +    });
 +    handler.on("TrimRangeCache", function () {
 +      const stats = pdfManager.streamManager?.trimRangeCache() ?? null;
-+      return pdfManager.imageDecodeQueue ? { ...stats, ...pdfManager.imageDecodeQueue.stats() } : stats;
++      return pdfManager.imageDecodeQueue ? { ...stats, ...pdfManager.imageDecodeQueue.stats(), ...pdfManager.externalImages?.stats() } : stats;
 +    });
      handler.on("GetData", function (data) {
 -      return pdfManager.requestLoadedStream().then(stream => stream.bytes);
@@ -1378,7 +2972,7 @@
      });
      handler.on("GetAnnotations", function ({
        pageIndex,
-@@ -57301,10 +57804,10 @@
+@@ -57301,10 +58921,10 @@
        if (isPureXfa) {
          xfaData = refs[0];
          if (!xfaData) {
@@ -1391,7 +2985,7 @@
        }
        const needAppearances = acroFormRef && acroForm instanceof Dict && changes.values().some(ref => ref.needAppearances);
        const xfa = acroForm instanceof Dict && acroForm.get("XFA") || null;
-@@ -57346,7 +57849,7 @@
+@@ -57346,7 +58966,7 @@
          };
        }
        return incrementalUpdate({
@@ -1400,14 +2994,24 @@
          xrefInfo: newXrefInfo,
          changes,
          xref,
-@@ -57375,7 +57878,9 @@
+@@ -57362,6 +58982,8 @@
+         xref.resetNewTemporaryRef();
+       });
+     });
++    handler.on("StartExternalImages", ({ pageIndex, epoch }) => pdfManager.externalImages?.startPage(pageIndex, epoch));
++    handler.on("CancelExternalImages", ({ pageIndex, epoch }) => pdfManager.externalImages?.cancelPage(pageIndex, epoch));
+     handler.on("GetOperatorList", function (data, sink) {
+       const pageIndex = data.pageIndex;
+       pdfManager.getPage(pageIndex).then(function (page) {
+@@ -57375,7 +58997,10 @@
            intent: data.intent,
            cacheKey: data.cacheKey,
            annotationStorage: data.annotationStorage,
 -          modifiedIds: data.modifiedIds
 +          modifiedIds: data.modifiedIds,
 +          imageDecodeScale: data.imageDecodeScale,
-+          imageDecodeMaxDimension: data.imageDecodeMaxDimension
++          imageDecodeMaxDimension: data.imageDecodeMaxDimension,
++          externalImageEpoch: data.externalImageEpoch
          }).then(function (operatorListInfo) {
            finishWorkerTask(task);
            if (start) {

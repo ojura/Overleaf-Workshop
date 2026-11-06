@@ -18,6 +18,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, w
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { pdfjsRelease, pdfjsReleaseFolder, protocol, repo, viewerRoot } from './viewer-protocol.mjs';
+import { imageRevisionViewer } from './pdfjs-image-revisions.mjs';
 
 export { viewerRoot };
 const src = path.join(viewerRoot, 'src');
@@ -134,6 +135,9 @@ function wrapperDocumentCommit(source, file) {
 export const standIns = {
     name: 'overleaf-stand-ins',
     setup(build) {
+        build.onLoad({ filter: /[\\/]pdf_viewer\.mjs$/, namespace: 'file' }, (args) => ({
+            contents: imageRevisionViewer(readFileSync(args.path, 'utf8'), args.path), loader: 'js',
+        }));
         build.onResolve({ filter: /(error-reporter|event-tracking|pdf-js)$/ }, (args) => {
             const shim = shims[overleafModule(args)];
             return shim ? { path: path.join(src, 'shims', shim) } : undefined;

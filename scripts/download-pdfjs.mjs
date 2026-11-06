@@ -10,6 +10,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { pdfjsRelease, pdfjsVersion, repo } from './viewer-protocol.mjs';
+import { installImageRevisions } from './pdfjs-image-revisions.mjs';
 
 /** What to fetch and where it goes, for pdf.js `version` unpacked into `release`. */
 export function planOf(version = pdfjsVersion, release = pdfjsRelease) {
@@ -53,6 +54,7 @@ export function download(plan = planOf(), { output = 'inherit' } = {}) {
         run(`the download of ${plan.url}`, process.execPath, [downloadCli, '--extract', '--out', unpacked, plan.url], { output });
         // --forward: a patch that looks applied already fails rather than being reversed
         run(`applying ${name(plan.patch)}`, 'patch', ['-p1', '--forward', '--batch', '-i', plan.patch], { output, cwd: unpacked });
+        installImageRevisions(unpacked);
         // the earlier copy aside, the new one in, the earlier one away
         const earlier = `${unpacked}.earlier`;
         const replaced = existsSync(plan.release);
