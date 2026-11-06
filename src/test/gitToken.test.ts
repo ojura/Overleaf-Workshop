@@ -7,6 +7,7 @@ import { AddressInfo } from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { loadWithVscode } from './standIn';
+import { Cleanup } from './cleanup';
 
 // GlobalStateManager imports 'vscode', which only exists inside the extension host, and so do
 // the modules it imports. Stand in for anything they touch while they load, as download.test does.
@@ -112,17 +113,22 @@ describe('git token storage, next to the login', () => {
 });
 
 describe('the command-line tool reads the same storage', () => {
+    const cleanup = new Cleanup();
     const saved = process.env.OVERLEAF_LOGIN;
-    afterEach(() => { if (saved === undefined) { delete process.env.OVERLEAF_LOGIN; } else { process.env.OVERLEAF_LOGIN = saved; } });
+    afterEach(async () => {
+        if (saved === undefined) { delete process.env.OVERLEAF_LOGIN; } else { process.env.OVERLEAF_LOGIN = saved; }
+        await cleanup.undo();
+    });
 
     function stateDb(servers: any): string {
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ow-token-test-'));
+        const dir = cleanup.tempDir('ow-token-test-');
         const file = path.join(dir, 'state.vscdb');
         const { DatabaseSync } = require('node:sqlite');
         const db = new DatabaseSync(file);
-        db.exec('CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)');
-        db.prepare('INSERT INTO ItemTable (key, value) VALUES (?, ?)').run('iamhyc.overleaf-workshop', JSON.stringify({ 'overleaf-servers': servers }));
-        db.close();
+        try {
+            db.exec('CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)');
+            db.prepare('INSERT INTO ItemTable (key, value) VALUES (?, ?)').run('iamhyc.overleaf-workshop', JSON.stringify({ 'overleaf-servers': servers }));
+        } finally { db.close(); }
         return file;
     }
 

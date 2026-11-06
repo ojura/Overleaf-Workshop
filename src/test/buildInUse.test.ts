@@ -3,10 +3,10 @@ import * as assert from 'assert';
 import { EventEmitter as NodeEventEmitter, once } from 'events';
 import * as fs from 'fs';
 import * as http from 'http';
-import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
 import { loadWithVscode, strict } from './standIn';
+import { Cleanup } from './cleanup';
 
 /**
  * The project's build in use, from Overleaf to what the window shows: a VirtualFileSystem whose
@@ -391,6 +391,7 @@ class Panel {
 }
 
 describe('the build in use, from Overleaf to the window', function () {
+    const cleanup = new Cleanup();
     let overleaf: Overleaf;
     let vfs: any;
     let manager: any;
@@ -403,7 +404,14 @@ describe('the build in use, from Overleaf to the window', function () {
     const pathToUri = LocalReplicaSCMProvider.pathToUri;
 
     beforeEach(async () => {
+        cleanup.add(() => {
+            LocalReplicaSCMProvider.flushAll = flushAll;
+            LocalReplicaSCMProvider.readSettings = readSettings;
+            LocalReplicaSCMProvider.pathToUri = pathToUri;
+        });
+        scratch = cleanup.tempDir('build-in-use-');
         overleaf = new Overleaf();
+        cleanup.add(() => overleaf.close());
         await overleaf.start();
         world.overleaf = overleaf;
         world.shown = [];
@@ -417,29 +425,37 @@ describe('the build in use, from Overleaf to the window', function () {
         world.statusTexts = [];
         world.statusWaiters = [];
         world.buildsLog = [];
-        scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'build-in-use-'));
         vfs = new VirtualFileSystem({ globalState: { get: (_key: string, value: unknown) => value } }, projectUri, () => {});
+        cleanup.add(() => vfs.dispose());
         vfs.root = tree();
         world.vfs = vfs;
         LocalReplicaSCMProvider.flushAll = async () => {};
         LocalReplicaSCMProvider.readSettings = async () => undefined;
         manager = new CompileManager({ prefetch: async () => vfs });
         managerTriggers = manager.triggers;
+        managerTriggers.forEach(trigger => cleanup.add(() => trigger.dispose()));
         provider = new PdfViewEditorProvider({ globalStorageUri: Uri.file(path.join(scratch, 'storage')), extensionUri: Uri.file('/extension'), extension: { packageJSON } });
+        // Dispose the provider first, then wait for its cache I/O before removing storage.
+        cleanup.add(() => provider.pieces.settled());
+        cleanup.add(() => provider.previews.settled());
         providerTriggers = provider.triggers;
+        providerTriggers.forEach(trigger => cleanup.add(() => trigger.dispose()));
+        // the Problems view and the replica's logs of a build from the cache, which may still be read
+        cleanup.add(async () => { await manager.cachedBuildShown; });
     });
 
-    afterEach(async () => {
-        // the Problems view and the replica's logs of a build from the cache, which may still be read
+    afterEach(() => cleanup.undo());
+
+    it('releases storage and restores the replica methods after cached-build completion fails', async () => {
         await manager.cachedBuildShown;
-        managerTriggers.forEach(trigger => trigger.dispose());
-        providerTriggers.forEach(trigger => trigger.dispose());
-        vfs.dispose();
-        overleaf.close();
-        LocalReplicaSCMProvider.flushAll = flushAll;
-        LocalReplicaSCMProvider.readSettings = readSettings;
-        LocalReplicaSCMProvider.pathToUri = pathToUri;
-        fs.rmSync(scratch, { recursive: true, force: true });
+        provider.previews.watch({ key: 'a'.repeat(64), size: PDF.length }, () => {});
+        const failure = new Error('cached-build completion failed');
+        manager.cachedBuildShown = Promise.reject(failure);
+        await assert.rejects(cleanup.undo(), error => error === failure);
+        assert.strictEqual(fs.existsSync(scratch), false);
+        assert.strictEqual(LocalReplicaSCMProvider.flushAll, flushAll);
+        assert.strictEqual(LocalReplicaSCMProvider.readSettings, readSettings);
+        assert.strictEqual(LocalReplicaSCMProvider.pathToUri, pathToUri);
     });
 
     /** The end of the next compile in the window. */

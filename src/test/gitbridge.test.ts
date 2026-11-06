@@ -2,7 +2,6 @@
 import * as assert from 'assert';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import * as zlib from 'zlib';
 import { overleafCommitWithStart, checkResult, ConnectError, merge, ownFiles, rebase, startFromVersion } from '../gitbridge/connect';
@@ -12,10 +11,13 @@ import { answerFromFindings } from '../gitbridge/overleaf';
 import { gitDate, Repo } from '../gitbridge/plumbing';
 import { connectReplica, CONNECT_REF } from '../scm/replicaConnect';
 import { anchorBridge } from '../gitbridge/anchor';
+import { Cleanup } from './cleanup';
 
 /** a time in seconds that git reads as one: git takes small numbers for something else */
 const T = 1_700_000_000;
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'gitbridge-test-'));
+const cleanup = new Cleanup();
+const tmp = () => cleanup.tempDir('gitbridge-test-');
+afterEach(() => cleanup.undo());
 
 function newRepo(dir: string, bare = false): Repo {
     fs.mkdirSync(dir, { recursive: true });

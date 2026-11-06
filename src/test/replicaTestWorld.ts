@@ -7,6 +7,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { POINTER_FILE } from '../scm/replicaControl';
 import { loadWithVscode } from './standIn';
+import { Cleanup as ResourceCleanup } from './cleanup';
 
 /**
  * A place with a short path for the tests' socket folders: a socket's path must be short, and the
@@ -224,36 +225,7 @@ export function load(mock: any) {
  * What a test set up, undone after it in reverse order on every path, failures included: the test
  * adds each resource as it makes it, and afterEach calls `undo`.
  */
-export class Cleanup {
-    private steps: (() => void | Promise<void>)[] = [];
-
-    add(step: () => void | Promise<void>) { this.steps.push(step); }
-
-    /** Undo the step added last, now, e.g. to stop a replica before the next one starts. */
-    async undoLast() { await this.steps.pop()?.(); }
-
-    async undo() {
-        const steps = this.steps.reverse();
-        this.steps = [];
-        const errors: unknown[] = [];
-        for (const step of steps) {
-            try { await step(); } catch (error) { errors.push(error); }
-        }
-        if (errors.length) { throw errors[0]; }
-    }
-
-    tempDir(prefix: string, base = os.tmpdir()): string {
-        const dir = fs.mkdtempSync(path.join(base, prefix));
-        this.add(() => fs.rmSync(dir, { recursive: true, force: true }));
-        return dir;
-    }
-
-    setEnv(key: string, value: string) {
-        const saved = process.env[key];
-        process.env[key] = value;
-        this.add(() => { if (saved === undefined) { delete process.env[key]; } else { process.env[key] = saved; } });
-    }
-
+export class Cleanup extends ResourceCleanup {
     /** A socket folder and a trash of the test's own, so that the developer's stay untouched. */
     privateRuntime(): { runtime: string, data: string } {
         const runtime = this.tempDir('owr-', SHORT_TEMP);
