@@ -8,6 +8,25 @@ import { PDF_READING_LIMITS, validatePdfReadingManifest } from './pdfReadingMani
 
 const KEY = /^[a-f0-9]{64}$/;
 
+/** Open before inspecting the descriptor without waiting for a FIFO writer. A path
+ * lstat alone cannot protect the subsequent open from a file replacement race. */
+async function openBoundedRegularFile(filename: string, limit: number, current: () => boolean) {
+    const check = () => { if (!current()) { throw new Error('Local preview file request stopped'); } };
+    check();
+    const handle = await fs.promises.open(filename,
+        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+    try {
+        check();
+        const stat = await handle.stat();
+        check();
+        if (!stat.isFile() || stat.size > limit) { throw new Error('Local preview file must be a bounded regular file'); }
+        return { handle, stat };
+    } catch (error) {
+        await handle.close();
+        throw error;
+    }
+}
+
 interface Subscription {
     identity: PdfPreviewIdentity;
     listeners: Set<() => void>;
@@ -66,11 +85,10 @@ export class PdfPreviewStore {
             const folder = await fs.promises.lstat(directory).catch(() => undefined);
             if (this.closed || !folder?.isDirectory() || folder.isSymbolicLink()) { return; }
             const read = async (filename: string, limit: number) => {
-                const handle = await fs.promises.open(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0)).catch(() => undefined);
-                if (!handle) { return; }
+                const opened = await openBoundedRegularFile(filename, limit, () => !this.closed).catch(() => undefined);
+                if (!opened) { return; }
+                const { handle, stat } = opened;
                 try {
-                    const stat = await handle.stat();
-                    if (this.closed || !stat.isFile() || stat.size > limit) { return; }
                     const bytes = Buffer.alloc(stat.size);
                     const result = await handle.read(bytes, 0, bytes.length, 0);
                     if (this.closed || result.bytesRead !== bytes.length) { return; }
@@ -100,10 +118,9 @@ export class PdfPreviewStore {
                     // Refuse symlinked parents as well as a symlinked final file.
                     if (await fs.promises.realpath(filename) !== filename) { throw new Error('Reading image paths must be regular local files'); }
                     check();
-                    const file = await fs.promises.open(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+                    const { handle: file, stat } = await openBoundedRegularFile(filename, image.bytes, () => !this.closed && !signal.aborted);
                     try {
-                        const stat = await file.stat();
-                        if (!stat.isFile() || stat.size !== image.bytes || await fs.promises.realpath(filename) !== filename) {
+                        if (stat.size !== image.bytes || await fs.promises.realpath(filename) !== filename) {
                             throw new Error('Registered reading image size or path changed');
                         }
                         check();
@@ -213,12 +230,12 @@ export class PdfPreviewStore {
         const signature = [link.dev, link.ino, link.size, link.mtimeMs,
             ...(reading?.isFile() && !reading.isSymbolicLink() ? [reading.dev, reading.ino, reading.size, reading.mtimeMs] : [])].join(':');
         if (signature === entry.signature) { return; }
-        const handle = await fs.promises.open(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0)).catch(() => undefined);
-        if (!handle) { return; }
+        const opened = await openBoundedRegularFile(filename, PDF_PREVIEW_MANIFEST_BYTES, () => this.current(entry)).catch(() => undefined);
+        if (!opened) { return; }
+        const { handle, stat } = opened;
         let manifest: any;
         try {
-            const stat = await handle.stat();
-            if (!stat.isFile() || stat.size > PDF_PREVIEW_MANIFEST_BYTES || stat.ino !== link.ino || stat.dev !== link.dev) { return; }
+            if (stat.ino !== link.ino || stat.dev !== link.dev) { return; }
             const bytes = Buffer.alloc(stat.size);
             const read = await handle.read(bytes, 0, bytes.length, 0);
             if (read.bytesRead !== bytes.length || !this.current(entry)) { return; }

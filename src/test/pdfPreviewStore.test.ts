@@ -1,4 +1,5 @@
 import * as assert from 'assert';
+import { execFileSync, fork } from 'child_process';
 import { createHash } from 'crypto';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
@@ -114,6 +115,114 @@ describe('exact-build local PDF preview registration', () => {
         await assert.rejects(registered.readImage('x1', 0, cancelled.signal), /stopped/);
         store.dispose();
         await assert.rejects(registered.readImage('x1', 0, signal), /stopped/);
+    });
+
+    for (const target of ['manifest.json', 'reading.json', 'reading/x1.jpg']) {
+        it('rejects a no-writer FIFO at ' + target + ' without blocking discovery or image admission', async function () {
+            if (process.platform === 'win32') { this.skip(); }
+            this.timeout(7000);
+            await publish(manifest({ ...identity, sha256: 'c'.repeat(64) }));
+            const directory = store.directory(identity), filename = path.join(directory, target);
+            const bytes = Buffer.from([255, 216, 255, 217]);
+            fs.mkdirSync(path.join(directory, 'reading'));
+            fs.writeFileSync(path.join(directory, 'reading', 'x1.jpg'), bytes);
+            fs.writeFileSync(path.join(directory, 'reading.json'), JSON.stringify({ ...reading(), images: [{
+                id: 'x1', path: 'reading/x1.jpg', bytes: bytes.length, sha256: digest(bytes), originalSha256: digest(bytes),
+                width: 8, height: 8, components: 3, encoding: 'original',
+            }] }));
+            fs.unlinkSync(filename); execFileSync('mkfifo', [filename]);
+            assert.ok(fs.lstatSync(filename).isFIFO());
+            // A blocking open cannot be cancelled in Node. Isolate it so the regression's
+            // failure deadline can kill and reap only this child, including its libuv work.
+            const helper = path.join(base, 'fifo-reader.cjs');
+            fs.writeFileSync(helper, [
+                "const fs = require('fs');",
+                "const { PdfPreviewStore } = require(process.argv[2]);",
+                "const store = new PdfPreviewStore(process.argv[3]);",
+                "const identity = JSON.parse(process.argv[4]), filename = process.argv[5], image = process.argv[6] === 'image';",
+                "const originalOpen = fs.promises.open; let opened = 0, closed = 0;",
+                "fs.promises.open = async (...args) => {",
+                "  const tracked = String(args[0]) === filename; if (tracked) process.send({ type: 'opening' });",
+                "  const handle = await originalOpen(...args);",
+                "  if (tracked) { opened++; const close = handle.close.bind(handle); handle.close = async () => { await close(); closed++; }; }",
+                "  return handle;",
+                "};",
+                "(async () => {",
+                "  const registered = await store.readingDescriptor(identity); let rejected = !registered;",
+                "  if (image) { if (!registered) throw new Error('Image fixture was not registered');",
+                "    try { await registered.readImage('x1', 0, new AbortController().signal); } catch { rejected = true; } }",
+                "  store.dispose(); await store.settled(); process.send({ type: 'result', rejected, opened, closed }); process.disconnect();",
+                "})().catch(error => { store.dispose(); process.send({ type: 'failure', message: error.message }); process.disconnect(); process.exitCode = 1; });",
+            ].join('\n'));
+            const child = fork(helper, [require.resolve('../core/pdfPreviewStore'), root, JSON.stringify(identity), filename,
+                target.startsWith('reading/') ? 'image' : 'discovery'], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+            const closed = new Promise<void>(resolve => child.once('close', () => resolve()));
+            let timer: NodeJS.Timeout | undefined, stderr = '';
+            child.stderr!.on('data', value => { stderr += value; });
+            try {
+                const result = await new Promise<{ rejected: boolean; opened: number; closed: number }>((resolve, reject) => {
+                    timer = setTimeout(() => reject(new Error('FIFO child did not start: ' + stderr)), 5000);
+                    child.once('error', reject);
+                    child.once('exit', code => { if (code !== 0) { reject(new Error('FIFO child exited: ' + code + ' ' + stderr)); } });
+                    child.on('message', (message: any) => {
+                        if (message.type === 'opening') {
+                            clearTimeout(timer);
+                            timer = setTimeout(() => reject(new Error('No-writer FIFO blocked the file open: ' + target)), 1000);
+                        } else if (message.type === 'result') { resolve(message); }
+                        else if (message.type === 'failure') { reject(new Error(message.message)); }
+                    });
+                });
+                assert.deepStrictEqual(result, { type: 'result', rejected: true, opened: 1, closed: 1 });
+            } finally {
+                clearTimeout(timer);
+                if (child.exitCode === null) { child.kill('SIGKILL'); }
+                await closed;
+            }
+        });
+    }
+
+    it('closes late-opened reading files after cancellation or store disposal', async () => {
+        await publish(manifest({ ...identity, sha256: 'c'.repeat(64) }));
+        const directory = store.directory(identity), imagePath = path.join(directory, 'reading', 'x1.jpg');
+        const bytes = Buffer.from([255, 216, 255, 217]);
+        fs.mkdirSync(path.dirname(imagePath)); fs.writeFileSync(imagePath, bytes);
+        fs.writeFileSync(path.join(directory, 'reading.json'), JSON.stringify({ ...reading(), images: [{
+            id: 'x1', path: 'reading/x1.jpg', bytes: bytes.length, sha256: digest(bytes), originalSha256: digest(bytes),
+            width: 8, height: 8, components: 3, encoding: 'original',
+        }] }));
+        for (const operation of ['discovery', 'image']) {
+            for (const phase of ['open', 'stat']) {
+                const currentStore = new PdfPreviewStore(root), abort = new AbortController();
+                const registered = (await currentStore.readingDescriptor(identity))!;
+                const filename = operation === 'image' ? imagePath : path.join(directory, 'reading.json');
+                const entered = deferred(), release = deferred(), originalOpen = fs.promises.open;
+                let closes = 0, reads = 0;
+                fs.promises.open = (async (...args: Parameters<typeof originalOpen>) => {
+                    const handle = await originalOpen(...args);
+                    if (String(args[0]) === filename) {
+                        const close = handle.close.bind(handle), read = handle.read.bind(handle), stat = handle.stat.bind(handle);
+                        handle.close = async () => { await close(); closes++; };
+                        handle.read = ((...values: Parameters<typeof handle.read>) => { reads++; return read(...values); }) as typeof handle.read;
+                        if (phase === 'open') { entered.resolve(); await release.promise; }
+                        else { handle.stat = (async () => { const value = await stat(); entered.resolve(); await release.promise; return value; }) as typeof handle.stat; }
+                    }
+                    return handle;
+                }) as typeof originalOpen;
+                const pending = operation === 'image'
+                    ? assert.rejects(registered.readImage('x1', 0, abort.signal), /stopped/)
+                    : currentStore.readingDescriptor(identity).then(value => assert.strictEqual(value, undefined));
+                try {
+                    await entered.promise;
+                    if (operation === 'image') { abort.abort(); } else { currentStore.dispose(); }
+                    release.resolve(); await pending;
+                    assert.strictEqual(closes, 1, operation + '/' + phase + ' closes the acquired handle once');
+                    assert.strictEqual(reads, 0, operation + '/' + phase + ' stops before reading any file bytes');
+                } finally {
+                    release.resolve(); await pending.catch(() => {});
+                    fs.promises.open = originalOpen; currentStore.dispose(); await currentStore.settled();
+                }
+            }
+        }
     });
 
     it('observes same-edition structural publication and removal through the existing directory watcher', async () => {
