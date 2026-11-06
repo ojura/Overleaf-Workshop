@@ -38,6 +38,19 @@ export interface PdfReadingManifest {
     images: readonly PdfReadingImage[];
 }
 
+/** One contiguous selection from an already validated image partition. No caller
+ * supplies byte offsets, paths or digests; original encodings have one whole asset. */
+export function pdfReadingImageRange(image: PdfReadingImage, chunkIndex: number, chunkCount = 1):
+    { offset: number; bytes: number; chunks: readonly PdfReadingChunk[] } | undefined {
+    const available = image.chunks?.length ?? 1;
+    if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0 || !Number.isSafeInteger(chunkCount)
+        || chunkCount < 1 || chunkCount > available || chunkIndex > available - chunkCount) { return; }
+    const chunks = image.chunks?.slice(chunkIndex, chunkIndex + chunkCount)
+        ?? [{ offset: 0, bytes: image.bytes, sha256: image.sha256, scan: 0 }];
+    const first = chunks[0], last = chunks[chunks.length - 1];
+    return { offset: first.offset, bytes: last.offset + last.bytes - first.offset, chunks };
+}
+
 const digest = PDF_READING_DIGEST;
 const isDigest = (value: unknown): value is string => typeof value === 'string' && digest.test(value);
 const imageId = new RegExp(syntax.imageId), pathSegment = new RegExp(syntax.pathSegment);

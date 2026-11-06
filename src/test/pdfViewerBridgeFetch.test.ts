@@ -72,12 +72,12 @@ export { pdfPerformance } from ${JSON.stringify(path.join(viewerRoot, 'src', 'co
 
     it('shares request identity and cancellation for registered image reads without double counting loader measurements', async () => {
         const abort = new AbortController(), revision = 'a'.repeat(64);
-        const image = client.readImage({ manifestRevision: revision, imageId: 'x1', chunkIndex: 2 }, abort.signal);
+        const image = client.readImage({ manifestRevision: revision, imageId: 'x1', chunkIndex: 2, chunkCount: 3 }, abort.signal);
         const original = (globalThis as any).fetch('https://dl.test/project/p1/output.pdf');
         assert.deepStrictEqual(posted.map(message => [message.type, message.page, message.id]),
             [['readingFetch', 'page-2', 1], ['fetch', 'page-2', 2]]);
         assert.deepStrictEqual(posted[0], { type: 'readingFetch', page: 'page-2', id: 1,
-            manifestRevision: revision, imageId: 'x1', chunkIndex: 2 });
+            manifestRevision: revision, imageId: 'x1', chunkIndex: 2, chunkCount: 3 });
         assert.strictEqual(bridge.pdfPerformance.pendingFetchCount, 1, 'the reading loader owns its own request metric');
         deliver({ type: 'fetchResponse', page: 'old-page', id: 1, status: 206, headers: [], body: new Uint8Array([99]) });
         deliver({ type: 'fetchResponse', page: 'page-2', id: 1, status: 206,
@@ -102,7 +102,8 @@ export { pdfPerformance } from ${JSON.stringify(path.join(viewerRoot, 'src', 'co
         const replies: Promise<void>[] = [];
         let nextStarted!: () => void;
         const started = new Promise<void>(resolve => { nextStarted = resolve; });
-        host.setReading(revision, (_id, _chunk, signal) => new Promise(resolve => {
+        host.setReading(revision, (_id, _chunk, signal, count) => new Promise(resolve => {
+            assert.strictEqual(count, 2, 'the browser batch selection reaches the registered reader');
             reads.push({ signal, resolve }); if (reads.length === 5) { nextStarted(); }
         }));
         client = bridge.installBridgeFetch((message: any) => {
@@ -112,7 +113,7 @@ export { pdfPerformance } from ${JSON.stringify(path.join(viewerRoot, 'src', 'co
                 error => { deliver({ type: 'fetchError', page: message.page, id: message.id, message: error.message }); },
             ));
         }, () => false, 'page-2');
-        const request = (signal: AbortSignal): Promise<any> => client.readImage({ manifestRevision: revision, imageId: 'x1', chunkIndex: 0 }, signal);
+        const request = (signal: AbortSignal): Promise<any> => client.readImage({ manifestRevision: revision, imageId: 'x1', chunkIndex: 0, chunkCount: 2 }, signal);
         const value = { body: new Uint8Array([7, 8]), offset: 0, total: 2 };
         let healthy: Promise<any> | undefined;
         try {

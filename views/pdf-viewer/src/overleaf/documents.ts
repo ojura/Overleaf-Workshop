@@ -203,7 +203,7 @@ export class Documents {
         if (reading) {
             try {
                 job.readingSource = await openPdfReadingSource(reading, { signal: job.abort.signal,
-                    readImage: ({ id, chunkIndex, signal }) => readReadingImage(reading.manifestRevision, id, chunkIndex, signal) });
+                    readImage: ({ id, chunkIndex, signal, chunkCount }) => readReadingImage(reading.manifestRevision, id, chunkIndex, signal, chunkCount) });
                 if (!job.readingSource) { throw new Error('The registered reading publication is unavailable.'); }
                 await this.loadBytes(job.readingSource.data, job, { output, preview, reading });
             } catch (error) {

@@ -1,4 +1,4 @@
-import { PDF_READING_LIMITS, PDF_READING_DIGEST, validatePdfReadingManifest, type PdfReadingManifest, type PdfReadingImage } from '../../../../src/core/pdfReadingManifest';
+import { PDF_READING_LIMITS, PDF_READING_DIGEST, pdfReadingImageRange, validatePdfReadingManifest, type PdfReadingManifest, type PdfReadingImage, type PdfReadingChunk } from '../../../../src/core/pdfReadingManifest';
 import { PDF_READING_REQUEST_LIMITS, type PdfReadingDescriptor } from './protocol';
 import { pdfPerformance } from './prefetch-performance';
 import { pdfCachePolicy } from './scroll-prefetch';
@@ -18,6 +18,7 @@ interface Options {
 export interface ExternalImageRead {
     id: string;
     chunkIndex: number;
+    chunkCount?: number;
     signal: AbortSignal;
 }
 export type ExternalImageMetadata = Omit<PdfReadingImage, 'path' | 'fallbackReason'>;
@@ -66,7 +67,7 @@ export async function openPdfReadingSource(descriptor: PdfReadingDescriptor, opt
     if (options.signal.aborted) { dispose(); }
 
     async function receive(url: URL, signal: AbortSignal, kind: string, expected: number | undefined,
-        limit: number, sha256: string, range?: { offset: number; bytes: number; total: number },
+        limit: number, integrity: string | readonly PdfReadingChunk[], range?: { offset: number; bytes: number; total: number },
         fields: Record<string, number | string | boolean | null> = {}, provided?: () => Promise<Response>): Promise<Uint8Array | undefined> {
         current(signal);
         const finish = metrics.beginFetch(), started = performance.now();
@@ -111,7 +112,15 @@ export async function openPdfReadingSource(descriptor: PdfReadingDescriptor, opt
                 throw new Error('Reading resource ended before its declared length.');
             }
             const result = received === bytes.length ? bytes : bytes.slice(0, received);
-            if (await digest(result) !== sha256) { throw new Error('Reading resource digest does not match its publication.'); }
+            const checks = typeof integrity === 'string'
+                ? [{ offset: 0, bytes: result.length, sha256: integrity }] : integrity;
+            for (const check of checks) {
+                current(signal);
+                const offset = check.offset - (range?.offset ?? 0);
+                if (await digest(result.subarray(offset, offset + check.bytes)) !== check.sha256) {
+                    throw new Error('Reading resource digest does not match its publication.');
+                }
+            }
             current(signal);
             metrics.event('reading-transfer', { kind, bytes: received, durationMs: performance.now() - started, ...fields });
             return result;
@@ -146,9 +155,8 @@ export async function openPdfReadingSource(descriptor: PdfReadingDescriptor, opt
             try {
                 current(value.signal);
                 const image = images.get(value.id);
-                if (!image || !Number.isSafeInteger(value.chunkIndex) || value.chunkIndex < 0) { throw new Error('Unknown reading image request.'); }
-                const chunk = image.chunks?.[value.chunkIndex];
-                if (image.chunks ? !chunk : value.chunkIndex !== 0) { throw new Error('Unknown reading image chunk.'); }
+                const selected = image && pdfReadingImageRange(image, value.chunkIndex, value.chunkCount);
+                if (!image || !selected) { throw new Error('Unknown reading image chunks.'); }
                 if (queue.length >= PDF_READING_REQUEST_LIMITS.queued) { throw new Error('Reading image request queue is full.'); }
                 return new Promise((resolve, reject) => {
                     const controller = new AbortController();
@@ -166,12 +174,14 @@ export async function openPdfReadingSource(descriptor: PdfReadingDescriptor, opt
                         start() {
                             if (disposed || value.signal.aborted) { job.cancel(); pump(); return; }
                             active.add(controller);
-                            const range = chunk && (chunk.offset !== 0 || chunk.bytes !== image.bytes)
-                                ? { offset: chunk.offset, bytes: chunk.bytes, total: image.bytes } : undefined;
+                            const range = selected.offset !== 0 || selected.bytes !== image.bytes
+                                ? { offset: selected.offset, bytes: selected.bytes, total: image.bytes } : undefined;
                             void receive(new URL(image.path, base), controller.signal, 'image',
-                                chunk?.bytes ?? image.bytes, PDF_READING_LIMITS.assetBytes, chunk?.sha256 ?? image.sha256, range,
-                                { id: image.id, encoding: image.encoding, chunk: value.chunkIndex, scan: chunk?.scan ?? 0 },
-                                options.readImage ? () => options.readImage!({ id: image.id, chunkIndex: value.chunkIndex, signal: controller.signal }) : undefined)
+                                selected.bytes, PDF_READING_LIMITS.assetBytes, selected.chunks, range,
+                                { id: image.id, encoding: image.encoding, chunk: value.chunkIndex, chunkCount: selected.chunks.length,
+                                    scan: selected.chunks[0].scan, lastScan: selected.chunks[selected.chunks.length - 1].scan },
+                                options.readImage ? () => options.readImage!({ id: image.id, chunkIndex: value.chunkIndex,
+                                    chunkCount: selected.chunks.length, signal: controller.signal }) : undefined)
                                 .then(result => { current(value.signal); if (!result) { throw new Error('Reading image is unavailable.'); } resolve(result); })
                                 .catch(reject).finally(() => {
                                     value.signal.removeEventListener('abort', cancel);

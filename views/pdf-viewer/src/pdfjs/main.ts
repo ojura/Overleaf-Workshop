@@ -257,7 +257,7 @@ async function load(source: Source, job: Job) {
     try {
         if (source.reading) {
             job.readingSource = await openPdfReadingSource(source.reading, { signal: job.abort.signal,
-                readImage: ({ id, chunkIndex, signal }) => readReadingImage(source.reading!.manifestRevision, id, chunkIndex, signal) });
+                readImage: ({ id, chunkIndex, signal, chunkCount }) => readReadingImage(source.reading!.manifestRevision, id, chunkIndex, signal, chunkCount) });
             if (!job.readingSource) { throw new Error('The registered reading publication is unavailable.'); }
             params = { data: job.readingSource.data, externalImageSource: job.readingSource.externalImageSource };
             url = source.output && toPdfFile(source.output).url;

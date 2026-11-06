@@ -36,7 +36,7 @@ function ensureBridge() {
     return installed;
 }
 
-/** Local webview resources do not provide ranges; the host reads this registered chunk. */
-export function readReadingImage(manifestRevision: string, imageId: string, chunkIndex: number, signal: AbortSignal): Promise<Response> {
-    return ensureBridge().readImage({ manifestRevision, imageId, chunkIndex }, signal);
+/** Local webview resources do not provide ranges; the host reads registered chunks. */
+export function readReadingImage(manifestRevision: string, imageId: string, chunkIndex: number, signal: AbortSignal, chunkCount?: number): Promise<Response> {
+    return ensureBridge().readImage({ manifestRevision, imageId, chunkIndex, ...(chunkCount === undefined ? {} : { chunkCount }) }, signal);
 }

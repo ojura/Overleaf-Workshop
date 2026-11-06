@@ -7,6 +7,7 @@ import { cachedDownloadDomainUrl } from '../api/downloadDomain';
 import { PdfDiskCache, PdfCacheViewer, PdfFillRequest } from './pdfDiskCache';
 import type { BridgeRequest, BridgeResponse, PdfOutput, ReadingImageRequest } from './viewerProtocol';
 import { PDF_READING_REQUEST_LIMITS } from './viewerProtocol';
+import { PDF_READING_LIMITS } from './pdfReadingManifest';
 
 // The old public name remains for the harness and callers that only use content pieces.
 export { PdfDiskCache as PieceCache } from './pdfDiskCache';
@@ -76,7 +77,7 @@ export class PdfFetchBridge {
     private readonly viewer?: PdfCacheViewer;
     private output?: PdfOutput;
     private readonly outputs: PdfOutput[] = [];
-    private readonly readings = new Map<string, (id: string, chunk: number, signal: AbortSignal) => Promise<{ body: Uint8Array; offset: number; total: number }>>();
+    private readonly readings = new Map<string, (id: string, chunk: number, signal: AbortSignal, count?: number) => Promise<{ body: Uint8Array; offset: number; total: number }>>();
     private readonly readingRequests = new Set<AbortController>();
     private readonly readingQueue: Array<{ start(): void; cancel(): void }> = [];
     private disposed = false;
@@ -142,7 +143,7 @@ export class PdfFetchBridge {
     }
 
     /** Old displayed documents remain authorized while a prepared replacement is loading. */
-    setReading(revision: string, read: (id: string, chunk: number, signal: AbortSignal) => Promise<{ body: Uint8Array; offset: number; total: number }>): void {
+    setReading(revision: string, read: (id: string, chunk: number, signal: AbortSignal, count?: number) => Promise<{ body: Uint8Array; offset: number; total: number }>): void {
         if (this.disposed) { return; }
         this.readings.delete(revision);
         this.readings.set(revision, read);
@@ -184,7 +185,9 @@ export class PdfFetchBridge {
     async handleReading(request: ReadingImageRequest): Promise<BridgeResponse> {
         const read = this.readings.get(request.manifestRevision);
         if (this.disposed || !read || !Number.isSafeInteger(request.id) || request.id < 1
-            || typeof request.imageId !== 'string' || !Number.isSafeInteger(request.chunkIndex) || request.chunkIndex < 0) {
+            || typeof request.imageId !== 'string' || !Number.isSafeInteger(request.chunkIndex) || request.chunkIndex < 0
+            || request.chunkCount !== undefined && (!Number.isSafeInteger(request.chunkCount)
+                || request.chunkCount < 1 || request.chunkCount > PDF_READING_LIMITS.chunks)) {
             throw new Error('Reading image request is not registered for this viewer');
         }
         const controller = new AbortController();
@@ -194,7 +197,7 @@ export class PdfFetchBridge {
             if (this.readingRequests.size >= PDF_READING_REQUEST_LIMITS.active) { await this.waitForReadingSlot(controller); }
             else { this.readingRequests.add(controller); }
             if (controller.signal.aborted || this.disposed) { throw new Error('Reading image request stopped'); }
-            const value = await read(request.imageId, request.chunkIndex, controller.signal);
+            const value = await read(request.imageId, request.chunkIndex, controller.signal, request.chunkCount);
             if (controller.signal.aborted || this.disposed) { throw new Error('Reading image request stopped'); }
             const partial = value.offset !== 0 || value.body.byteLength !== value.total;
             return { id: request.id, status: partial ? 206 : 200, statusText: partial ? 'Partial Content' : 'OK', body: value.body,

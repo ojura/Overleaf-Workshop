@@ -203,12 +203,13 @@ export interface BridgeResponse {
  * I/O retains an active slot until completion, while queued entries own no byte buffers. */
 export const PDF_READING_REQUEST_LIMITS = Object.freeze({ active: 4, queued: 64 });
 
-/** A registered image chunk, never a caller-selected filesystem path or byte range. */
+/** Contiguous registered image chunks, never a caller-selected path or byte range. */
 export interface ReadingImageRequest {
     id: number;
     manifestRevision: string;
     imageId: string;
     chunkIndex: number;
+    chunkCount?: number;
 }
 
 /**

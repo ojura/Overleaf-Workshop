@@ -117,6 +117,30 @@ describe('exact-build local PDF preview registration', () => {
         await assert.rejects(registered.readImage('x1', 0, signal), /stopped/);
     });
 
+    it('reads a manifest-authorized scan batch and rejects a corrupt later scan', async () => {
+        await publish(manifest({ ...identity, sha256: 'c'.repeat(64) }));
+        const bytes = new Uint8Array([255, 216, 3, 4, 5, 6, 7, 8, 9, 10, 255, 217]);
+        const directory = store.directory(identity), filename = path.join(directory, 'reading', 'x1.jpg');
+        fs.mkdirSync(path.dirname(filename)); fs.writeFileSync(filename, bytes);
+        const value = { ...reading(), images: [{ id: 'x1', path: 'reading/x1.jpg', bytes: bytes.length,
+            sha256: digest(bytes), originalSha256: 'e'.repeat(64), width: 8, height: 8, components: 3,
+            encoding: 'progressive-jpeg', coefficientBytes: 768, chunks: [0, 4, 8].map((offset, index) => ({
+                offset, bytes: 4, sha256: digest(bytes.subarray(offset, offset + 4)), scan: index + 1,
+            })) }] };
+        fs.writeFileSync(path.join(directory, 'reading.json'), JSON.stringify(value));
+        const registered = (await store.readingDescriptor(identity))!, signal = new AbortController().signal;
+        const batch = await registered.readImage('x1', 1, signal, 2);
+        assert.deepStrictEqual(new Uint8Array(batch.body), bytes.slice(4));
+        assert.deepStrictEqual([batch.offset, batch.total], [4, 12]);
+        for (const count of [0, -1, 1.5, 3, '2', null]) {
+            await assert.rejects(registered.readImage('x1', 1, signal, count as number), /Unknown/);
+        }
+        const damaged = bytes.slice(); damaged[9] ^= 1; fs.writeFileSync(filename, damaged);
+        await assert.rejects(registered.readImage('x1', 1, signal, 2), /digest/);
+        const cancelled = new AbortController(); cancelled.abort();
+        await assert.rejects(registered.readImage('x1', 1, cancelled.signal, 2), /stopped/);
+    });
+
     for (const target of ['manifest.json', 'reading.json', 'reading/x1.jpg']) {
         it('rejects a no-writer FIFO at ' + target + ' without blocking discovery or image admission', async function () {
             if (process.platform === 'win32') { this.skip(); }
