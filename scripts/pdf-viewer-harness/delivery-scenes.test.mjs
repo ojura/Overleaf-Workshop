@@ -35,6 +35,7 @@ for (const scenario of [
     { name: 'a failed optional screenshot retains measured pages and closes the owned target', mode: 'screenshot' },
     { name: 'a final-quality deadline keeps its partial measurement and fails the requested completion', mode: 'final' },
     { name: 'an unexpected CSS viewport or browser zoom fails the comparison and retains its observation', mode: 'viewport' },
+    { name: 'a failed verification repaint retains measured pages and closes the owned target', mode: 'repaint' },
 ]) test(scenario.name, async t => {
     const calls = [];
     const sample = { finished: 'measurement-budget', elapsedMs: 60000,
@@ -52,7 +53,9 @@ for (const scenario of [
         else if (request.url.startsWith('/events?')) result = [];
         else if (request.url === '/attach') result = { sessionId: 'measurement-session' };
         else if (body.method === 'Target.createTarget') result = { result: { targetId: 'measurement-target' } };
-        else if (body.method === 'Runtime.evaluate') result = { result: { result: { type: 'object', value: sample } } };
+        else if (body.method === 'Runtime.evaluate' && body.params.expression.includes('repaintDeliveryPages')) {
+            result = { result: { exceptionDetails: { text: 'Injected native verification repaint failure' } } };
+        } else if (body.method === 'Runtime.evaluate') result = { result: { result: { type: 'object', value: sample } } };
         else if (body.method === 'Page.startScreencast' && body.params.format === 'png') {
             response.statusCode = 500;
             result = { error: { code: -32000, message: 'Injected screenshot failure' } };
@@ -67,7 +70,9 @@ for (const scenario of [
     const child = spawn(process.execPath, [fileURLToPath(new URL('./delivery-scenes.mjs', import.meta.url)),
         '--daemon', 'http://127.0.0.1:' + server.address().port, '--url', 'https://reader.example/book/',
         '--pages', '99', '--json', destination,
-        ...(scenario.mode === 'screenshot' ? ['--screenshot', path.join(directory, 'view.png')] : scenario.mode === 'final' ? ['--finish-on-final'] : [])],
+        ...(scenario.mode === 'screenshot' ? ['--screenshot', path.join(directory, 'view.png')]
+            : scenario.mode === 'final' ? ['--finish-on-final']
+            : scenario.mode === 'repaint' ? ['--repaint-canvases', path.join(directory, 'repeat')] : [])],
     { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     child.stdout.on('data', data => { stdout += data; });
@@ -77,7 +82,8 @@ for (const scenario of [
     const result = JSON.parse(await fs.readFile(destination, 'utf8'));
     assert.deepEqual(result.observation?.pages, sample.pages, stdout);
     assert.ok(result.failures.some(failure => scenario.mode === 'screenshot'
-        ? /screenshot/i.test(JSON.stringify(failure)) : failure.kind === (scenario.mode === 'final' ? 'completion' : 'viewport')));
+        ? /screenshot/i.test(JSON.stringify(failure)) : scenario.mode === 'repaint' ? /repaint/i.test(JSON.stringify(failure))
+            : failure.kind === (scenario.mode === 'final' ? 'completion' : 'viewport')));
     assert.ok(calls.some(call => call.route === '/release' && call.sessionId === 'measurement-session'));
     assert.ok(calls.some(call => call.method === 'Target.detachFromTarget' && call.params.sessionId === 'measurement-session'));
     assert.ok(calls.some(call => call.method === 'Target.closeTarget' && call.params.targetId === 'measurement-target'));

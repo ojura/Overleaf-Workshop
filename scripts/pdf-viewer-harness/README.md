@@ -64,6 +64,12 @@ at their actual backing resolution for final-pixel comparison. Each page must ha
 a native pass, and the combined capture is limited to 32 megapixels. A progressive page also
 must have painted final quality with every image decoded successfully before capture is accepted.
 
+`--repaint-canvases /absolute/path/repaint-canvases` requests one further native pass through
+the existing page queue after the delivery measurement has finished. It saves the resulting
+canvases separately and records any new network requests under `repaintNetwork`. This checks
+final canvas reproducibility without adding repaint work to the reported delivery timings.
+A native error or stalled completion fails the command while retaining the original measurement.
+
 ## Motion Lab checks in an existing Chromium session
 
 `zoom-matrix.mjs` runs the recovered browser scenarios through one connection and one supplied

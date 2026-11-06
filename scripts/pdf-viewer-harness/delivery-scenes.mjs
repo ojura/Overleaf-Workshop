@@ -3,7 +3,7 @@
 //   --pages 99,100 --spread odd --budget-ms 60000 --json /absolute/path/result.json
 // Optional: --daemon http://127.0.0.1:7799 --width 1400 --height 1000 --dpr 1 --zoom 75
 //   --download-kib 4096 --latency-ms 40 --robots off --finish-on-render --screenshot /absolute/path/view.png
-//   --canvases /absolute/path/page-canvases
+//   --canvases /absolute/path/page-canvases --repaint-canvases /absolute/path/repaint-canvases
 //   --zoom-helper-target <existing-state-reader-bridge-target-id>
 // Use --finish-on-final to wait for final image quality instead of the fixed measurement duration.
 // This uses the shared daemon, creates one regular background tab, isolates PDF.js history,
@@ -14,12 +14,12 @@ import { scriptOptions } from '../lib/options.mjs';
 import { connectDaemon, evaluateHarness } from './scenario-connection.mjs';
 import { keepRendering } from './render-capture.mjs';
 import { normalizeTabZoom } from './per-tab-zoom.mjs';
-import { deliveryRequestCategory, installDeliveryObservation, summarizeDeliveryNetwork } from './delivery-observation.mjs';
+import { deliveryRequestCategory, installDeliveryObservation, repaintDeliveryPages, summarizeDeliveryNetwork } from './delivery-observation.mjs';
 
 const options = scriptOptions({ url: 'value', pages: 'value', spread: ['none', 'odd', 'even'], daemon: 'value',
     width: 'number', height: 'number', dpr: 'number', zoom: 'number', 'budget-ms': 'number',
     'download-kib': 'number', 'latency-ms': 'number', robots: ['off', 'on'], 'finish-on-render': 'flag', 'finish-on-final': 'flag',
-    json: 'value', screenshot: 'value', canvases: 'value', 'zoom-helper-target': 'value' });
+    json: 'value', screenshot: 'value', canvases: 'value', 'repaint-canvases': 'value', 'zoom-helper-target': 'value' });
 if (options.has('finish-on-render') && options.has('finish-on-final')) throw new Error('Choose one rendering completion condition');
 const url = new URL(options.get('url', 'https://cloud.larics.fer.hr/spomenar/'));
 if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Use an explicit HTTP reader URL without credentials');
@@ -108,16 +108,21 @@ try {
     }
     if (sample.errors.length || sample.pages.some(page => page.renders?.some(render => render.error))
         || sample.document.notice || !sample.document.pages || interrupted) process.exitCode = 1;
-    if (options.get('canvases')) {
-        const captures = await evaluateHarness(target, 'window.__pdfDeliveryObservation.captureCanvases()');
-        const directory = path.resolve(options.get('canvases'));
+    for (const mode of ['canvases', 'repaint-canvases']) {
+        if (!options.get(mode)) continue;
+        const priorRequests = new Set(requests.keys());
+        const captures = await evaluateHarness(target, mode === 'canvases' ? 'window.__pdfDeliveryObservation.captureCanvases()'
+            : '(' + repaintDeliveryPages.toString() + ')(' + JSON.stringify(pages) + ')', { limitMs: 30000 });
+        if (mode === 'repaint-canvases') result.repaintNetwork = summarizeDeliveryNetwork([...requests.entries()]
+            .filter(([id]) => !priorRequests.has(id)).map(([_id, request]) => request));
+        const directory = path.resolve(options.get(mode));
         await fs.mkdir(directory, { recursive: true });
-        result.canvasFiles = [];
+        const files = result[mode === 'canvases' ? 'canvasFiles' : 'repaintCanvasFiles'] = [];
         for (const capture of captures) {
             if (!pages.includes(capture.page) || !capture.dataUrl.startsWith('data:image/png;base64,')) throw new Error('Invalid native canvas capture');
             const filename = path.join(directory, 'page-' + capture.page + '.png');
             await fs.writeFile(filename, Buffer.from(capture.dataUrl.slice('data:image/png;base64,'.length), 'base64'));
-            result.canvasFiles.push({ page: capture.page, width: capture.width, height: capture.height, filename });
+            files.push({ page: capture.page, width: capture.width, height: capture.height, filename });
         }
     }
     if (options.get('screenshot')) {

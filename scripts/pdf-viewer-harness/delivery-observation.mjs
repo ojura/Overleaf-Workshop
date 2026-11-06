@@ -217,6 +217,36 @@ export function deliveryRequestCategory(pathname) {
     return /\.pdf$/i.test(pathname) ? 'pdf' : /previews\//.test(pathname) ? 'previews' : 'application';
 }
 
+/** Repaint only after the measurement is frozen, through the native queue. This
+ * isolates final canvas reproducibility without changing reported delivery time. */
+export async function repaintDeliveryPages(pages) {
+    const observation = window.__pdfDeliveryObservation, app = window.PDFViewerApplication;
+    if (!observation?.snapshot().finished) throw new Error('Finish delivery measurement before a verification repaint');
+    observation.captureCanvases();
+    for (const number of pages) {
+        const view = app.pdfViewer.getPageView(number - 1);
+        if (!view?.redrawImages || !app.pdfRenderingQueue) throw new Error('Native image replay is unavailable');
+        await new Promise((resolve, reject) => {
+            let timer;
+            const finish = error => {
+                clearTimeout(timer); app.eventBus.off('pagerendered', rendered);
+                if (error) reject(error); else resolve();
+            };
+            const rendered = event => {
+                if (event.source !== view || event.pageNumber !== number || event.isDetailView || event.cssTransform) return;
+                finish(event.error ? new Error(String(event.error)) : undefined);
+            };
+            app.eventBus.on('pagerendered', rendered);
+            // The native renderer may stop answering; ordinary completion follows its event.
+            timer = setTimeout(() => finish(new Error('Native verification repaint did not complete')), 10000);
+            try {
+                if (!view.redrawImages() || !app.pdfRenderingQueue.renderView(view)) throw new Error('Native queue refused the verification repaint');
+            } catch (error) { finish(error); }
+        });
+    }
+    return observation.captureCanvases();
+}
+
 export function summarizeDeliveryNetwork(requests) {
     const categories = {};
     for (const request of requests) {
