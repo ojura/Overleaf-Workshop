@@ -45,18 +45,11 @@ describe('native external-image PDF passes', function () {
         if (directory) { fs.rmSync(directory, { recursive: true, force: true }); }
     });
 
-    function pdf(external: boolean, mask = false) {
-        const commands = 'q 10 8 74 48 re W n 80 12 -8 50 12 8 cm /Photo Do Q\n0 0 1 rg 25 15 14 18 re f\nBT /F1 10 Tf 4 70 Td (Native text first) Tj ET';
-        const stream = (dict: string, bytes: Uint8Array | string) => {
-            const data = typeof bytes === 'string' ? bytes : Buffer.from(bytes).toString('latin1');
-            return `<< ${dict} /Length ${Buffer.byteLength(data, 'latin1')} >>\nstream\n${data}\nendstream`;
-        };
-        const objects = ['', '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-            '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 110 85] /Resources << /XObject << /Photo 5 0 R >> /Font << /F1 6 0 R >> >> /Contents 4 0 R >>',
-            stream('', commands),
-            stream(`/Type /XObject /Subtype /Image /Width 96 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode ${mask ? '/SMask 7 0 R' : ''} ${external ? '/MotionLabImage (x5)' : ''}`, external ? '' : original),
-            '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'];
-        if (mask) { objects.push(stream(`/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode ${external ? '/MotionLabImage (x7)' : ''}`, external ? '' : deflateSync(new Uint8Array([0, 90, 180, 255])))); }
+    function stream(dict: string, bytes: Uint8Array | string) {
+        const data = typeof bytes === 'string' ? bytes : Buffer.from(bytes).toString('latin1');
+        return `<< ${dict} /Length ${Buffer.byteLength(data, 'latin1')} >>\nstream\n${data}\nendstream`;
+    }
+    function pdfBytes(objects: string[]) {
         let text = '%PDF-1.7\n';
         const offsets = [0];
         for (let id = 1; id < objects.length; id++) {
@@ -68,6 +61,25 @@ describe('native external-image PDF passes', function () {
         for (let id = 1; id < objects.length; id++) { text += String(offsets[id]).padStart(10, '0') + ' 00000 n \n'; }
         text += `trailer\n<< /Root 1 0 R /Size ${objects.length} >>\nstartxref\n${start}\n%%EOF\n`;
         return new Uint8Array(Buffer.from(text, 'latin1'));
+    }
+    function pdf(external: boolean, mask = false) {
+        const commands = 'q 10 8 74 48 re W n 80 12 -8 50 12 8 cm /Photo Do Q\n0 0 1 rg 25 15 14 18 re f\nBT /F1 10 Tf 4 70 Td (Native text first) Tj ET';
+        const objects = ['', '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+            '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 110 85] /Resources << /XObject << /Photo 5 0 R >> /Font << /F1 6 0 R >> >> /Contents 4 0 R >>',
+            stream('', commands),
+            stream(`/Type /XObject /Subtype /Image /Width 96 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode ${mask ? '/SMask 7 0 R' : ''} ${external ? '/MotionLabImage (x5)' : ''}`, external ? '' : original),
+            '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'];
+        if (mask) { objects.push(stream(`/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode ${external ? '/MotionLabImage (x7)' : ''}`, external ? '' : deflateSync(new Uint8Array([0, 90, 180, 255])))); }
+        return pdfBytes(objects);
+    }
+    function type3Pdf(external: boolean) {
+        const page = (content: number) => `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 110 85] /Resources << /Font << /F1 5 0 R >> >> /Contents ${content} 0 R >>`;
+        return pdfBytes(['', '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>',
+            page(6), page(7),
+            '<< /Type /Font /Subtype /Type3 /FontBBox [0 0 96 64] /FontMatrix [0.01 0 0 0.01 0 0] /CharProcs << /A 8 0 R >> /Encoding << /Type /Encoding /Differences [65 /A] >> /FirstChar 65 /LastChar 65 /Widths [100] /Resources << /XObject << /Photo 9 0 R >> >> >>',
+            stream('', 'BT /F1 80 Tf 10 15 Td (A) Tj ET'), stream('', 'BT /F1 80 Tf 10 15 Td (A) Tj ET'),
+            stream('', '100 0 d0 q 96 0 0 64 0 0 cm /Photo Do Q'),
+            stream(`/Type /XObject /Subtype /Image /Width 96 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode ${external ? '/MotionLabImage (x5)' : ''}`, external ? '' : original)]);
     }
 
     function metadata(mask = false) {
@@ -92,9 +104,9 @@ describe('native external-image PDF passes', function () {
         reset(value: any, width: number, height: number) { value.canvas.width = width; value.canvas.height = height; }
         destroy(value: any) { value.canvas.width = value.canvas.height = 0; value.canvas = value.context = null; }
     }
-    async function open(read?: (request: any) => Promise<Uint8Array>, mask = false, sourceMetadata = metadata(mask)) {
+    async function open(read?: (request: any) => Promise<Uint8Array>, mask = false, sourceMetadata = metadata(mask), data = pdf(!!read, mask)) {
         const source = read ? { images: sourceMetadata, read } : undefined;
-        const task = pdfjs.getDocument({ data: pdf(!!read, mask), externalImageSource: source,
+        const task = pdfjs.getDocument({ data, externalImageSource: source,
             externalImageBudget: { maxActiveBytes: 4 << 20, maxEncodedBytes: 1 << 20, maxCoefficientBytes: 1 << 20, maxOutputPixels: 6144 },
             adaptiveImageDecoding: true, imageDecodeConcurrency: 1, CanvasFactory,
             isOffscreenCanvasSupported: false, isImageDecoderSupported: false, isEvalSupported: false, useSystemFonts: false,
@@ -268,6 +280,85 @@ describe('native external-image PDF passes', function () {
             assert.strictEqual(pass.task.imageStatus.failed, 1);
             await assert.rejects(value.page.waitForImages({ final: true }), /failed to decode/);
         } finally { await value.task.destroy(); }
+    });
+
+    for (const registration of ['before', 'after']) {
+        it(`receives a common image registered ${registration} page cancellation until document cleanup`, async () => {
+            const closed: string[] = [];
+            const page: any = { _pageIndex: 0, _intentStates: new Map(), destroyed: false,
+                objs: new pdfjs.TestObjects(), commonObjs: new pdfjs.TestObjects(),
+                _transport: { messageHandler: { send() {}, sendWithPromise: () => Promise.resolve() } } };
+            const owner = new pdfjs.TestImageRevisions(page);
+            const state: any = { operatorList: { lastChunk: true }, renderTasks: new Set<any>() };
+            page._intentStates.set('display', state);
+            owner.newIntent(state, 'display', 2);
+            state.externalImageDiscovered = true;
+            owner.begin(state);
+            const identity = { id: 'g_type3_image', imageId: 'x5', pageIndex: 0,
+                epoch: state.externalImageEpoch, cacheKey: 'display', common: true, print: true };
+            if (registration === 'before') { owner.register({ ...identity, image: null }); }
+            const dependency = deferred<any>();
+            page.commonObjs.get(identity.id, dependency.resolve);
+            await owner.cancel();
+            if (registration === 'after') { owner.register({ ...identity, image: null }); }
+            let replay = 0;
+            owner.subscribe(() => { replay++; });
+            const image = { width: 1, height: 1, bitmap: { close: () => closed.push('installed') } };
+            assert.strictEqual(owner.receive({ ...identity, image, final: true, failed: false, scan: 1 }), true);
+            assert.strictEqual(await dependency.promise, image, 'a later font draw resolves the same document object');
+            assert.strictEqual(page.commonObjs.get(identity.id), image);
+            assert.strictEqual(owner.records.get(identity.id).state, null, 'the shared image does not retain a canceled operator list');
+            assert.strictEqual(replay, 0, 'a canceled page does not schedule another image pass');
+            assert.strictEqual(closed.length, 0);
+            owner.clearCommon();
+            page.commonObjs.clear();
+            assert.strictEqual(owner.records.size, 0);
+            assert.strictEqual(owner.receive({ ...identity, image: { width: 1, height: 1,
+                bitmap: { close: () => closed.push('late') } }, final: true, failed: false }), false);
+            assert.deepStrictEqual(closed, ['installed', 'late']);
+        });
+    }
+
+    it('finishes a shared Type3 image after its first page cancels and reuses it on the next page', async () => {
+        const started = deferred(), release = deferred(), received = deferred<boolean>();
+        const reads: number[] = [];
+        const value = await open(async ({ id, chunkIndex }) => {
+            reads.push(chunkIndex); started.resolve(); await release.promise; return encoded(id, chunkIndex);
+        }, false, metadata(), type3Pdf(true));
+        const originalDocument = await open(undefined, false, metadata(), type3Pdf(false));
+        const owner = value.page._externalImages, receive = owner.receive.bind(owner);
+        owner.receive = (data: any) => {
+            const accepted = receive(data);
+            if (data.common && data.final) { received.resolve(accepted); }
+            return accepted;
+        };
+        let second: ReturnType<typeof render> | undefined;
+        try {
+            const first = render(value.page);
+            const firstResult = first.task.promise.catch((error: Error) => error);
+            await started.promise;
+            await value.page.getOperatorList();
+            await value.page.cancelImageRefinement();
+            assert.strictEqual((await firstResult).name, 'RenderingCancelledException');
+            const laterPage = await value.document.getPage(2);
+            second = render(laterPage);
+            void second.task.promise.catch(() => {});
+            release.resolve();
+            assert.strictEqual(await received.promise, true, 'the document-owned Type3 result survives its originating page intent');
+            await second.task.promise;
+            const expected = render(await originalDocument.document.getPage(2));
+            await expected.task.promise;
+            assert.deepStrictEqual(second.pixels(), expected.pixels());
+            assert.strictEqual(reads.filter(index => index === 0).length, 1, 'the cached font retains the same image dependency');
+            await value.document.cleanup();
+            assert.strictEqual(owner.records.size, 0);
+            const stats = await value.document.getRangeCacheStats();
+            assert.strictEqual(stats.externalImageNativeRasterBytes, 0);
+            assert.strictEqual(stats.externalImageReservedBytes, 0);
+        } finally {
+            release.resolve(); second?.task.cancel();
+            await value.task.destroy(); await originalDocument.task.destroy();
+        }
     });
 
     it('holds one pending bitmap between passes and retains a failed outcome while installing its last useful pixels', async () => {
