@@ -1269,7 +1269,7 @@
    }
  }
  function buildComponentData(frame, component) {
-@@ -5097,10 +5452,1078 @@
+@@ -5097,10 +5452,1079 @@
    }
  }
 
@@ -1869,6 +1869,10 @@
 +  }
 +  _pageKey(pageIndex, epoch) { return `${pageIndex}:${epoch}`; }
 +  _ready(subscriber) { return subscriber.print || subscriber.common || this.readyPages.has(this._pageKey(subscriber.pageIndex, subscriber.epoch)); }
++  _needsCoverage() {
++    return [...this.groups.values()].some(group => !group.finished && this._alive(group)
++      && [...group.subscribers.values()].some(s => this._ready(s) && !s.covered && !s.print));
++  }
 +  _alive(group) { return !this.closed && !group.controller.signal.aborted && group.subscribers.size > 0; }
 +  _check(group) {
 +    if (!this._alive(group)) { throw new AbortException("External image activity cancelled"); }
@@ -1990,8 +1994,7 @@
 +      - Number([...b.subscribers.values()].every(s => s.covered || s.print)));
 +    const concurrency = Number.isFinite(this.queue.limit) ? this.queue.limit : 1;
 +    while (this.active < concurrency && this.pending.length) {
-+      const needsCoverage = [...this.groups.values()].some(group => !group.finished && this._alive(group)
-+        && [...group.subscribers.values()].some(s => this._ready(s) && !s.covered && !s.print));
++      const needsCoverage = this._needsCoverage();
 +      let index = -1;
 +      for (let i = 0; i < this.pending.length; i++) {
 +        const group = this.pending[i];
@@ -2084,10 +2087,10 @@
 +    group.reportedEntropyMs = decoder.entropyMs;
 +    group.reportedIdctMs = decoder.renderMs;
 +  }
-+  async _consume(group, suppliedBytes = null) {
++  async _consume(group) {
 +    const { metadata, decoder } = group;
 +    const index = group.chunkIndex;
-+    const bytes = suppliedBytes || await this._readChunks(group, metadata, index);
++    const bytes = await this._readChunks(group, metadata, index);
 +    const last = index === metadata.chunks.length - 1;
 +    decoder.push(bytes, { final: last });
 +    let scan = 0;
@@ -2164,25 +2167,22 @@
 +      }
 +    }
 +    if (group.phase === "refine") {
-+      group.decoder.expand();
-+      await this._preview(group, true);
-+      const middle = Math.ceil(metadata.chunks.length / 2);
++      if ([...group.subscribers.values()].some(s => s.progressive && !s.print && !s.covered)) {
++        group.decoder.expand();
++        await this._preview(group, true);
++        if (group.phase === "refine") { group.decoder.compact(); }
++      }
++      if ([...group.subscribers.values()].every(s => s.covered || s.print) && this._needsCoverage()) { return; }
 +      if (group.phase === "refine" && group.chunkIndex < metadata.chunks.length) {
 +        // Reserve the final input before receiving a tail, so appending its
 +        // verified scans never grows the input while that tail remains owned.
 +        group.decoder.reserveInput(metadata.bytes);
-+        const first = group.chunkIndex, offset = metadata.chunks[first].offset;
++        const first = group.chunkIndex;
 +        const tail = await this._readChunks(group, metadata, first, metadata.chunks.length - first);
-+        while (group.phase === "refine" && group.chunkIndex < metadata.chunks.length) {
-+          const chunk = metadata.chunks[group.chunkIndex];
-+          await this._consume(group, tail.subarray(chunk.offset - offset, chunk.offset - offset + chunk.bytes));
-+          if (group.chunkIndex === middle && group.chunkIndex < metadata.chunks.length) { await this._preview(group); }
-+        }
-+        if (group.chunkIndex < metadata.chunks.length) {
-+          // A later output-budget fallback can reuse the already verified tail.
-+          group.decoder.push(tail.subarray(metadata.chunks[group.chunkIndex].offset - offset), { final: true });
-+          group.chunkIndex = metadata.chunks.length;
-+        }
++        // The entire authenticated input is now available. The native final
++        // decoder owns its entropy work; replaying it in JS adds no earlier pixels.
++        group.decoder.push(tail, { final: true });
++        group.chunkIndex = metadata.chunks.length;
 +      }
 +    }
 +    if (group.phase === "refine") {
@@ -2219,6 +2219,7 @@
 +      this.totals.finalRasterBytes += rasterBytes;
 +      this.totals.largestFinalRasterBytes = Math.max(this.totals.largestFinalRasterBytes, rasterBytes);
 +      if (!this._alive(group)) { image?.bitmap?.close(); this._check(group); }
++      group.scan = metadata.chunks[metadata.chunks.length - 1].scan;
 +      await this._publish(group, subscriber, image, true);
 +    }
 +    group.finished = true;
@@ -2348,7 +2349,7 @@
 
  class JpegStream extends DecodeStream {
    static #isImageDecoderSupported = FeatureTest.isImageDecoderSupported;
-@@ -5190,36 +6613,66 @@
+@@ -5190,36 +6614,66 @@
    get canAsyncDecodeImageFromBuffer() {
      return this.stream.isAsync;
    }
@@ -2429,7 +2430,7 @@
        warn(`getTransferableImage - failed: "${reason}".`);
        return null;
      } finally {
-@@ -10220,7 +11673,17 @@
+@@ -10220,7 +11674,17 @@
      stream.dict = dict;
      return stream;
    }
@@ -2448,7 +2449,7 @@
      let filter = dict.get("F", "Filter");
      let params = dict.get("DP", "DecodeParms");
      if (filter instanceof Name) {
-@@ -29969,13 +31432,16 @@
+@@ -29969,13 +31433,16 @@
      }
      switch (filterName) {
        case "JPXDecode":
@@ -2472,7 +2473,7 @@
          this.jpxDecoderOptions = {
            numComponents: 0,
            isIndexedColormap: false,
-@@ -30127,9 +31593,12 @@
+@@ -30127,9 +31594,12 @@
      isInline = false,
      pdfFunctionFactory,
      globalColorSpaceCache,
@@ -2487,7 +2488,7 @@
      let smaskData = null;
      let maskData = null;
      const smask = image.dict.get("SMask");
-@@ -30145,6 +31614,18 @@
+@@ -30145,6 +31615,18 @@
          maskData = mask;
        } else {
          warn("Unsupported /Mask format.");
@@ -2506,7 +2507,7 @@
        }
      }
      return new PDFImage({
-@@ -30437,7 +31918,20 @@
+@@ -30437,7 +31919,20 @@
        buffer[i + 2] = (buffer[i + 2] - matteB) * k + matteB;
      }
    }
@@ -2528,7 +2529,7 @@
      const drawWidth = this.drawWidth;
      const drawHeight = this.drawHeight;
      const imgData = {
-@@ -30866,6 +32360,7 @@
+@@ -30866,6 +32361,7 @@
      this.options = options || DefaultPartialEvaluatorOptions;
      this.type3FontRefs = null;
      this._regionalImageCache = new RegionalImageCache();
@@ -2536,7 +2537,7 @@
      this._fetchBuiltInCMapBound = this.fetchBuiltInCMap.bind(this);
    }
    get _pdfFunctionFactory() {
-@@ -31026,6 +32521,10 @@
+@@ -31026,6 +32522,10 @@
    async buildFormXObject(resources, xobj, smask, operatorList, task, initialState, localColorSpaceCache) {
      const dict = xobj.dict;
      const matrix = lookupMatrix(dict.getArray("Matrix"), null);
@@ -2547,7 +2548,7 @@
      const bbox = lookupNormalRect(dict.getArray("BBox"), null);
      let optionalContent, groupOptions;
      if (dict.has("OC")) {
-@@ -31083,6 +32582,64 @@
+@@ -31083,6 +32583,64 @@
      }
      return this.handler.send("obj", [objId, this.pageIndex, "Image", imgData], transfers);
    }
@@ -2612,7 +2613,7 @@
    async buildPaintImageXObject({
      resources,
      image,
-@@ -31090,7 +32647,8 @@
+@@ -31090,7 +32648,8 @@
      operatorList,
      cacheKey,
      localImageCache,
@@ -2622,7 +2623,7 @@
    }) {
      const dict = image.dict;
      const imageRef = dict.objId;
-@@ -31100,6 +32658,18 @@
+@@ -31100,6 +32659,18 @@
        warn("Image dimensions are missing, or not numbers.");
        return;
      }
@@ -2641,7 +2642,7 @@
      const maxImageSize = this.options.maxImageSize;
      if (maxImageSize !== -1 && w * h > maxImageSize) {
        const msg = "Image exceeded maximum allowed size and was removed.";
-@@ -31114,6 +32684,11 @@
+@@ -31114,6 +32685,11 @@
        optionalContent = await this.parseMarkedContentProps(dict.get("OC"), resources);
      }
      const imageMask = dict.get("IM", "ImageMask") || false;
@@ -2653,7 +2654,7 @@
      let imgData, fn, args;
      if (imageMask) {
        const interpolate = dict.get("I", "Interpolate");
-@@ -31229,7 +32804,7 @@
+@@ -31229,7 +32805,7 @@
      if (this.parsingType3Font) {
        objId = `${this.idFactory.getDocId()}_type3_${objId}`;
      } else if (cacheKey && imageRef) {
@@ -2662,7 +2663,7 @@
        if (cacheGlobally) {
          assert(!isInline, "Cannot cache an inline image globally.");
          objId = `${this.idFactory.getDocId()}_${objId}`;
-@@ -31270,16 +32845,28 @@
+@@ -31270,16 +32846,28 @@
          }
        }
      }
@@ -2701,7 +2702,7 @@
        imgData.dataLen = imgData.bitmap ? imgData.width * imgData.height * 4 : imgData.data.length;
        imgData.ref = imageRef;
        if (cacheGlobally) {
-@@ -31287,6 +32874,7 @@
+@@ -31287,6 +32875,7 @@
        }
        return this._sendImgData(objId, imgData, cacheGlobally);
      }).catch(reason => {
@@ -2709,7 +2710,7 @@
        warn(`Unable to decode image "${objId}": "${reason}".`);
        if (imageRef) {
          this.globalImageCache.addDecodeFailed(imageRef);
-@@ -31302,7 +32890,8 @@
+@@ -31302,7 +32891,8 @@
          hasMask
        };
        localImageCache.set(cacheKey, imageRef, cacheData);
@@ -2719,7 +2720,7 @@
          this._regionalImageCache.set(null, imageRef, cacheData);
          if (cacheGlobally) {
            this.globalImageCache.setData(imageRef, {
-@@ -31385,7 +32974,8 @@
+@@ -31385,7 +32975,8 @@
        xref: this.xref,
        dictArray: [patternDict.get("Resources"), resources]
      });
@@ -2729,7 +2730,7 @@
        stream: pattern,
        task,
        resources: patternResources,
-@@ -31964,7 +33554,7 @@
+@@ -31964,7 +33555,7 @@
            case OPS.paintXObject:
              isValidName = args[0] instanceof Name;
              name = args[0].name;
@@ -2738,7 +2739,7 @@
                const localImage = localImageCache.getByName(name);
                if (localImage) {
                  addLocallyCachedImageOps(operatorList, localImage);
-@@ -31978,13 +33568,13 @@
+@@ -31978,13 +33569,13 @@
                }
                let xobj = xobjs.getRaw(name);
                if (xobj instanceof Ref) {
@@ -2754,7 +2755,7 @@
                  if (globalImage) {
                    operatorList.addDependency(globalImage.objId);
                    operatorList.addImageOps(globalImage.fn, globalImage.args, globalImage.optionalContent, globalImage.hasMask);
-@@ -32016,7 +33606,8 @@
+@@ -32016,7 +33607,8 @@
                    operatorList,
                    cacheKey: name,
                    localImageCache,
@@ -2764,7 +2765,7 @@
                  }).then(resolveXObject, rejectXObject);
                  return;
                } else if (type.name === "PS") {
-@@ -32045,7 +33636,7 @@
+@@ -32045,7 +33637,7 @@
              return;
            case OPS.endInlineImage:
              const cacheKey = args[0].cacheKey;
@@ -2773,7 +2774,7 @@
                const localImage = localImageCache.getByName(cacheKey);
                if (localImage) {
                  addLocallyCachedImageOps(operatorList, localImage);
-@@ -32060,7 +33651,8 @@
+@@ -32060,7 +33652,8 @@
                operatorList,
                cacheKey,
                localImageCache,
@@ -2783,7 +2784,7 @@
              }));
              return;
            case OPS.showText:
-@@ -33035,7 +34627,7 @@
+@@ -33035,7 +34628,7 @@
                    resolveXObject();
                    return;
                  }
@@ -2792,7 +2793,7 @@
                  if (globalImage) {
                    resolveXObject();
                    return;
-@@ -33731,7 +35323,7 @@
+@@ -33731,7 +35324,7 @@
        hash.update(`${firstChar}-${lastChar}`);
        if (toUnicode instanceof BaseStream) {
          const stream = toUnicode.str || toUnicode;
@@ -2801,7 +2802,7 @@
          hash.update(uint8array);
        } else if (toUnicode instanceof Name) {
          hash.update(toUnicode.name);
-@@ -54680,7 +56272,10 @@
+@@ -54680,7 +56273,10 @@
      intent,
      cacheKey,
      annotationStorage = null,
@@ -2813,7 +2814,7 @@
    }) {
      const contentStreamPromise = this.getContentStream();
      const resourcesPromise = this.loadResources(["ColorSpace", "ExtGState", "Font", "Pattern", "Properties", "Shading", "XObject"]);
-@@ -54695,7 +56290,8 @@
+@@ -54695,7 +56291,8 @@
        globalColorSpaceCache: this.globalColorSpaceCache,
        globalImageCache: this.globalImageCache,
        systemFontCache: this.systemFontCache,
@@ -2823,7 +2824,7 @@
      });
      const newAnnotsByPage = !this.xfaFactory ? getNewAnnotationsMap(annotationStorage) : null;
      const newAnnots = newAnnotsByPage?.get(this.pageIndex);
-@@ -55815,7 +57411,9 @@
+@@ -55815,7 +57412,9 @@
      enableXfa,
      evaluatorOptions,
      handler,
@@ -2834,7 +2835,7 @@
    }) {
      this._docBaseUrl = parseDocBaseUrl(docBaseUrl);
      this._docId = docId;
-@@ -55824,6 +57422,10 @@
+@@ -55824,6 +57423,10 @@
      evaluatorOptions.isOffscreenCanvasSupported &&= FeatureTest.isOffscreenCanvasSupported;
      evaluatorOptions.isImageDecoderSupported &&= FeatureTest.isImageDecoderSupported;
      this.evaluatorOptions = Object.freeze(evaluatorOptions);
@@ -2845,7 +2846,7 @@
      ImageResizer.setOptions(evaluatorOptions);
      JpegStream.setOptions(evaluatorOptions);
      const options = {
-@@ -55870,7 +57472,8 @@
+@@ -55870,7 +57473,8 @@
    serializeXfaData(annotationStorage) {
      return this.pdfDocument.serializeXfaData(annotationStorage);
    }
@@ -2855,7 +2856,7 @@
      return this.pdfDocument.cleanup(manuallyTriggered);
    }
    async ensure(obj, prop, args) {
-@@ -55912,7 +57515,7 @@
+@@ -55912,7 +57516,7 @@
    requestLoadedStream(noFetch = false) {
      return this._loadedStreamPromise;
    }
@@ -2864,7 +2865,7 @@
  }
  class NetworkPdfManager extends BasePdfManager {
    constructor(args) {
-@@ -55921,15 +57524,32 @@
+@@ -55921,15 +57525,32 @@
        msgHandler: args.handler,
        length: args.length,
        disableAutoFetch: args.disableAutoFetch,
@@ -2899,7 +2900,7 @@
        }
        return value;
      } catch (ex) {
-@@ -55937,7 +57557,7 @@
+@@ -55937,7 +57558,7 @@
          throw ex;
        }
        await this.requestRange(ex.begin, ex.end);
@@ -2908,7 +2909,7 @@
      }
    }
    requestRange(begin, end) {
-@@ -55952,6 +57572,8 @@
+@@ -55952,6 +57573,8 @@
      });
    }
    terminate(reason) {
@@ -2917,7 +2918,7 @@
      this.streamManager.abort(reason);
    }
  }
-@@ -56785,6 +58407,12 @@
+@@ -56785,6 +58408,12 @@
      this._rangeRequestReaders.push(reader);
      return reader;
    }
@@ -2930,7 +2931,7 @@
    cancelAllRequests(reason) {
      this._fullRequestReader?.cancel(reason);
      for (const reader of this._rangeRequestReaders.slice(0)) {
-@@ -56948,6 +58576,22 @@
+@@ -56948,6 +58577,22 @@
      }
      const workerHandlerName = docId + "_worker";
      let handler = new MessageHandler(workerHandlerName, docId, port);
@@ -2953,7 +2954,7 @@
      function ensureNotTerminated() {
        if (terminated) {
          throw new Error("Worker was terminated");
-@@ -56955,40 +58599,50 @@
+@@ -56955,40 +58600,50 @@
      }
      function startWorkerTask(task) {
        WorkerTasks.add(task);
@@ -3023,7 +3024,7 @@
      }) {
        const pdfManagerArgs = {
          source: null,
-@@ -57000,7 +58654,10 @@
+@@ -57000,7 +58655,10 @@
          handler,
          length,
          password,
@@ -3035,7 +3036,7 @@
        };
        if (data) {
          pdfManagerArgs.source = data;
-@@ -57127,7 +58784,7 @@
+@@ -57127,7 +58785,7 @@
          pdfManager = newPdfManager;
          pdfManager.requestLoadedStream(true).then(stream => {
            handler.send("DataLoaded", {
@@ -3044,7 +3045,7 @@
            });
          });
        }).then(pdfManagerReady, onFailure);
-@@ -57196,8 +58853,16 @@
+@@ -57196,8 +58854,16 @@
      handler.on("GetMarkInfo", function (data) {
        return pdfManager.ensureCatalog("markInfo");
      });
@@ -3062,7 +3063,7 @@
      });
      handler.on("GetAnnotations", function ({
        pageIndex,
-@@ -57301,10 +58966,10 @@
+@@ -57301,10 +58967,10 @@
        if (isPureXfa) {
          xfaData = refs[0];
          if (!xfaData) {
@@ -3075,7 +3076,7 @@
        }
        const needAppearances = acroFormRef && acroForm instanceof Dict && changes.values().some(ref => ref.needAppearances);
        const xfa = acroForm instanceof Dict && acroForm.get("XFA") || null;
-@@ -57346,7 +59011,7 @@
+@@ -57346,7 +59012,7 @@
          };
        }
        return incrementalUpdate({
@@ -3084,7 +3085,7 @@
          xrefInfo: newXrefInfo,
          changes,
          xref,
-@@ -57362,6 +59027,9 @@
+@@ -57362,6 +59028,9 @@
          xref.resetNewTemporaryRef();
        });
      });
@@ -3094,7 +3095,7 @@
      handler.on("GetOperatorList", function (data, sink) {
        const pageIndex = data.pageIndex;
        pdfManager.getPage(pageIndex).then(function (page) {
-@@ -57375,7 +59043,10 @@
+@@ -57375,7 +59044,10 @@
            intent: data.intent,
            cacheKey: data.cacheKey,
            annotationStorage: data.annotationStorage,
