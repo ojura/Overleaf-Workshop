@@ -7,13 +7,55 @@ The scripts in `ide/` drive the viewers in a test instance of Antigravity on a v
 
 `safari/` preserves the physical iPhone Safari suite used on 4 and 5 November 2026. Its
 [runbook](../../docs/safari-validation.md) covers the retained Inspector connection, source
-verification, short delivery and reversal scenarios, real gesture observation, and 600 seconds
-of continuous motion with native memory, CPU and network recording. Runtime receipts and
+verification, short delivery and reversal scenarios, real gesture observation, and a configurable
+continuous-motion workload with native memory, CPU and network recording. Runtime receipts and
 pairing material stay in an explicitly supplied folder outside the checkout.
 
 Run the desktop harness's offline checks with `npm run test:pdf-harness` and the Safari checks
 with `npm run test:safari:offline`. `npm run test:pdf-viewer` runs both groups alongside the PDF
 source tests. Safari live commands remain inert without `--execute`.
+
+## Spomenar delivery comparison
+
+`delivery-scenes.mjs` measures a cold reader URL in a new regular background tab through the
+existing CDP daemon. It records displayed content-canvas pixels, selectable text, native page
+render events, frame intervals, reader cache/performance snapshots and actual network bytes.
+It disables that tab's HTTP cache and service-worker interception, isolates the `pdfjs.history`
+storage key, and closes its capture, preparation, session and target when it finishes. The
+shared browser, daemon, saved reading position and other storage keys remain available.
+
+```sh
+node scripts/pdf-viewer-harness/delivery-scenes.mjs \
+  --url https://cloud.larics.fer.hr/spomenar/ \
+  --pages 99,100 --spread odd --zoom 75 \
+  --width 1400 --height 1000 --dpr 1 \
+  --download-kib 4096 --latency-ms 40 --budget-ms 60000 \
+  --json /absolute/path/delivery.json \
+  --screenshot /absolute/path/delivery.png
+```
+
+These are physical PDF page numbers. In the 460-page LARICS edition, pages 99 and 100 have
+printed labels 88 and 89. The default turns off robot animation to measure loading and
+rendering. `--robots on` includes the delivery effects; pixel observations then describe the
+content canvases beneath any delivery covers. The default fixed duration measures total
+transfer and subsequent prefetch as well as first content. `--finish-on-render` ends after
+each selected page has completed a native pass. `--finish-on-final` instead waits for final
+image quality. Progressive results record the first painted photo, complete usable-photo
+coverage after operator discovery, and final native quality separately. The output keeps failed
+and partially received transfers, with separate totals for original PDF bytes, reading layout,
+reading images, reading manifest, raster previews and application assets. Completed transfer
+totals include response headers; `bodyBytes` counts received body data.
+
+The runner uses the same sparse native capture as the Motion Lab scenarios so an emulated
+background viewport continues rendering normally. Its result records the actual CSS viewport,
+DPR, frame cadence and capture acknowledgments. An optional PNG failure retains the timings
+and network result and makes the command fail. Use the same edition, viewport, network
+conditions, robot setting and duration for before/after comparisons.
+
+`--canvases /absolute/path/page-canvases` also saves the selected native page canvases as PNGs
+at their actual backing resolution for final-pixel comparison. Each page must have completed
+a native pass, and the combined capture is limited to 32 megapixels. A progressive page also
+must have painted final quality with every image decoded successfully before capture is accepted.
 
 ## Motion Lab checks in an existing Chromium session
 
