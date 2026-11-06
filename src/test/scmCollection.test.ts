@@ -17,6 +17,7 @@ describe('the collection of a project\'s source controls', () => {
         static fails?: Error;
         /** the provider's check of a new replica's path */
         static validate: (uri: string) => Promise<unknown> = async uri => TestUri.parse(uri);
+        static start: () => Promise<Array<{dispose():void}>> = () => Promise.reject(failure);
         static validateBaseUri(uri: string) { return FailingReplica.validate(uri); }
         /** the input box for a new replica's path, where the user enters /replica and accepts */
         static get baseUriInputBox() {
@@ -30,7 +31,7 @@ describe('the collection of a project\'s source controls', () => {
         readonly settingItems = [];
         readonly status = { status: 'idle', message: '' };
         /** each access starts it, as the replica's own getter does */
-        get triggers(): Promise<never> { return Promise.reject(failure); }
+        get triggers(): Promise<Array<{dispose():void}>> { return FailingReplica.start(); }
     }
 
     /**
@@ -61,7 +62,7 @@ describe('the collection of a project\'s source controls', () => {
         const { SCMCollectionProvider } = loadWithVscode(vscode, () => require('../scm/scmCollectionProvider'), {
             './localReplicaSCM': { LocalReplicaSCMProvider: FailingReplica },
             // its refresh timer would keep the test's process alive
-            './historyViewProvider': { HistoryViewProvider: class {} },
+            './historyViewProvider': { HistoryViewProvider: class { dispose() {} } },
             '../utils/globalStateManager': {
                 GlobalStateManager: { getServerProjectSCMPersists: () => ({ replica: { label: 'Local Replica', baseUri: '/replica', enabled } }) },
             },
@@ -116,6 +117,22 @@ describe('the collection of a project\'s source controls', () => {
     afterEach(() => {
         FailingReplica.fails = undefined;
         FailingReplica.validate = async uri => TestUri.parse(uri);
+        FailingReplica.start = () => Promise.reject(failure);
+    });
+
+    it('releases a late replica start instead of installing it in a disposed project session', async () => {
+        let resolve!: (triggers:Array<{dispose():void}>) => void;
+        const late = new Promise<Array<{dispose():void}>>(done => { resolve = done; });
+        const {collection, notices} = collectionWith(false);
+        FailingReplica.start = () => late;
+        let released = 0;
+        const pending = (collection as any).createSCM(FailingReplica, TestUri.parse('/replica'));
+        collection.dispose();
+        resolve([{dispose:()=>{released++;}}]);
+        assert.strictEqual(await pending, undefined);
+        assert.strictEqual(released,1);
+        assert.strictEqual((collection as any).scms.length,0);
+        assert.deepStrictEqual(notices,[]);
     });
 
     it('shows only the provider\'s notice when the provider refuses the path of a new source control', async () => {

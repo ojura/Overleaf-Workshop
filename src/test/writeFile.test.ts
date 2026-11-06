@@ -1084,6 +1084,7 @@ describe('SocketIOAPI.applyOtUpdate', () => {
 describe('SocketIOAPI: how an emit ends', () => {
     it('tells a refusal in the callback from an emit that was not answered', async () => {
         const saved = SocketIOAPI.emitTimeoutMs;
+        let api: any;
         try {
             SocketIOAPI.emitTimeoutMs = 5;        // the emit's own limit, which this test is about
             const answers: Record<string, any> = {
@@ -1092,14 +1093,14 @@ describe('SocketIOAPI: how an emit ends', () => {
             };
             const raw = {
                 on() {},
+                disconnect() {},
+                removeAllListeners() {},
                 emit(event: string, ...args: any[]) {
                     const callback = args.pop();
                     if (answers[event]) { setImmediate(() => callback(answers[event])); }
                 },
             };
-            const api = Object.create(SocketIOAPI.prototype);
-            Object.assign(api, { scheme: 'v1', _handlers: [], _eventBusCleanups: [], api: { _initSocketV0: () => raw } });
-            api.init();
+            api = new SocketIOAPI('https://example.test/', { _initSocketV0: () => raw }, {}, 'p1');
             const refused = await api.emit('applyOtUpdate', 'doc1', {}).catch((error: any) => error);
             assert.ok(refused instanceof EmitRefusedError, String(refused));
             assert.deepStrictEqual(refused.answer, { message: 'not authorized' });
@@ -1109,6 +1110,7 @@ describe('SocketIOAPI: how an emit ends', () => {
             const unanswered = await api.emit('clientTracking.getConnectedUsers').catch((error: any) => error);
             assert.ok(unanswered instanceof EmitTimeoutError, String(unanswered));
         } finally {
+            api?.dispose();
             SocketIOAPI.emitTimeoutMs = saved;
         }
     });
@@ -1125,15 +1127,15 @@ describe('SocketIOAPI: the text of an error that the connection reports', () => 
 
 describe('SocketIOAPI: otUpdateError', () => {
     it('hands the error to the handler, with the document it names', () => {
-        const api = Object.create(SocketIOAPI.prototype);
-        api.socket = new EventEmitter();
-        api._handlers = [];
-        api._eventBusCleanups = [];
-        const got: any[] = [];
-        api.updateEventHandlers({ onUpdateError: (docId: string, error: string) => got.push([docId, error]) });
-        // as real-time sends it: the error, and the message from document-updater
-        api.socket.emit('otUpdateError', 'Delete component does not match', { project_id: 'p1', doc_id: 'doc1', error: 'Delete component does not match' });
-        assert.deepStrictEqual(got, [['doc1', 'Delete component does not match']]);
+        const socket = Object.assign(new EventEmitter(), {disconnect() {}});
+        const api = new SocketIOAPI('https://example.test/', { _initSocketV0: () => socket }, {}, 'p1');
+        try {
+            const got: any[] = [];
+            api.updateEventHandlers({ onUpdateError: (docId: string, error: string) => got.push([docId, error]) });
+            // as real-time sends it: the error, and the message from document-updater
+            socket.emit('otUpdateError', 'Delete component does not match', { project_id: 'p1', doc_id: 'doc1', error: 'Delete component does not match' });
+            assert.deepStrictEqual(got, [['doc1', 'Delete component does not match']]);
+        } finally { api.dispose(); }
     });
 });
 

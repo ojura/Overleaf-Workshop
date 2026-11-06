@@ -54,6 +54,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
     private readonly statusBarItem: vscode.StatusBarItem;
     private readonly statusListener: vscode.Disposable;
     private historyDataProvider: HistoryViewProvider;
+    private disposed = false;
 
     constructor(
         private readonly vfs: VirtualFileSystem,
@@ -61,7 +62,12 @@ export class SCMCollectionProvider extends vscode.Disposable {
     ) {
         // define the dispose behavior
         super(() => {
-            this.scms.forEach(scm => scm.triggers.forEach(t => t.dispose()));
+            if (this.disposed) { return; }
+            this.disposed = true;
+            this.scms.splice(0).forEach(scm => scm.triggers.forEach(t => t.dispose()));
+            this.historyDataProvider.dispose();
+            this.statusBarItem.dispose();
+            this.statusListener.dispose();
         });
 
         this.core = new CoreSCMProvider( vfs );
@@ -74,7 +80,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
     }
 
     private updateStatus() {
-        if (!this.statusBarItem) { return; }
+        if (this.disposed || !this.statusBarItem) { return; }
 
         let numPush = 0, numPull = 0;
         let tooltip = new vscode.MarkdownString(`**${vscode.l10n.t('Project Source Control')}**\n\n`);
@@ -139,6 +145,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
     }
 
     private async createSCM(scmProto: SupportedSCM, baseUri: vscode.Uri, newSCM=false, enabled=true) {
+        if (this.disposed) { return undefined; }
         const scm = new scmProto(this.vfs, baseUri);
         // insert into global state
         if (newSCM) {
@@ -151,7 +158,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
         }
         // insert into collection
         const triggers = enabled ? await this.start(scm) : [];
-        if (triggers===undefined) { return undefined; }
+        if (triggers===undefined || this.disposed) { return undefined; }
         this.scms.push({scm,enabled,triggers});
         this.updateStatus();
         return scm;
@@ -163,8 +170,11 @@ export class SCMCollectionProvider extends vscode.Disposable {
      * source control, Enable); the source control's log has the details.
      */
     private async start(scm: BaseSCM): Promise<vscode.Disposable[] | undefined> {
+        if (this.disposed) { return undefined; }
         try {
-            return await scm.triggers;
+            const triggers = await scm.triggers;
+            if (this.disposed) { triggers.forEach(trigger => trigger.dispose()); return undefined; }
+            return triggers;
         } catch (error) {
             this.creationFailed((scm.constructor as {label?: string}).label, error);
             return undefined;
@@ -173,10 +183,12 @@ export class SCMCollectionProvider extends vscode.Disposable {
 
     /** The notice that a source control `label` could not be made or started, with the reason. */
     private creationFailed(label: string | undefined, error: unknown) {
+        if (this.disposed) { return; }
         vscode.window.showErrorMessage(vscode.l10n.t('"{scm}" creation failed: {error}', {scm: label, error: errorMessage(error)}));
     }
 
     private removeSCM(item: SCMRecord) {
+        if (this.disposed) { return; }
         const index = this.scms.indexOf(item);
         if (index!==-1) {
             // remove from collection
@@ -210,7 +222,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
         // the provider's check shows why it refused a path, so its rejection is not shown again
         .then((uri) => scmProto.validateBaseUri(uri as string || '', this.vfs.projectName).catch(() => undefined))
         .then(async (baseUri) => {
-            if (!baseUri) { return; }
+            if (!baseUri || this.disposed) { return; }
             // Nobody waits for this promise when the quick pick starts it, so a failure to make the
             // source control is shown here; start() shows a failed start.
             try {
@@ -250,6 +262,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     this.scms[scmIndex].enabled = persist.enabled;
                     if (persist.enabled) {
                         const triggers = await this.start(scmItem.scm);
+                        if (this.disposed) { return; }
                         if (triggers===undefined) {
                             // it did not start, which start() has told: it stays disabled
                             persist.enabled = false;
@@ -284,9 +297,11 @@ export class SCMCollectionProvider extends vscode.Disposable {
      * is (`start`); without it, the user's choice would end without a word.
      */
     private async runAction(scm: BaseSCM, action: string, run: () => Promise<unknown>): Promise<void> {
+        if (this.disposed) { return; }
         try {
             await run();
         } catch (error) {
+            if (this.disposed) { return; }
             const label = (scm.constructor as {label?: string}).label;
             vscode.window.showErrorMessage(vscode.l10n.t('"{scm}": {action} failed: {error}', {scm: label, action, error: errorMessage(error)}));
         }

@@ -4,19 +4,25 @@ import { SnippetItemSchema } from '../api/base';
 import { fuzzyFilter, IntellisenseProvider } from '.';
 import { RemoteFileSystemProvider, VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import { TexDocumentSymbolProvider } from './texDocumentSymbolProvider';
+import { EventBus } from '../utils/eventBus';
 
 type SnippetItemMap = {[K:string]: SnippetItemSchema};
+type ProjectCompletions = { metadata: SnippetItemMap; commands: Map<string, SnippetItemMap> };
 type FilePathCompletionType = 'text' | 'image' | 'bib';
 
 export class CommandCompletionProvider extends IntellisenseProvider implements vscode.CompletionItemProvider {
     protected readonly contextPrefix = [['']];
     private constantData?: SnippetItemMap;
-    private customData: {
-        [K:string]: {
-            metadata: SnippetItemMap,
-            commands: Map<string, SnippetItemMap>,
-        }
-    } = {};
+    private constantsLoading?: Promise<void>;
+    private disposed = false;
+    private readonly customData = new Map<string, { revision: number; value?: ProjectCompletions; loading?: Promise<void> }>();
+
+    private key(uri: vscode.Uri) { return uri.authority + '?' + uri.query; }
+
+    private invalidate(uri: vscode.Uri) {
+        const cache = this.customData.get(this.key(uri));
+        if (cache) { cache.revision++; cache.value = undefined; }
+    }
 
     constructor(
         protected readonly vfsm: RemoteFileSystemProvider,
@@ -78,49 +84,56 @@ export class CommandCompletionProvider extends IntellisenseProvider implements v
 
     private async reloadCommands(uri: vscode.Uri): Promise<Map<string, SnippetItemMap>> {
         const vfs = await this.vfsm.prefetch(uri);
-        const rootFiles = await vfs.list(vfs.pathToUri('/'));
-
-        let commands: Map<string, SnippetItemMap> = new Map();
-        for (const [name, type] of rootFiles) {
-            if (type===vscode.FileType.File && name.endsWith('.tex')) {
-                const _commands = await this.loadCommands(vfs.pathToUri(name));
-                commands.set(name, _commands);
+        const commands = new Map<string, SnippetItemMap>();
+        const visit = async (path: string) => {
+            for (const [name, type] of await vfs.list(vfs.pathToUri(path))) {
+                const child = [path, name].filter(Boolean).join('/');
+                if (type === vscode.FileType.Directory && name !== OUTPUT_FOLDER_NAME) { await visit(child); }
+                else if (type === vscode.FileType.File && /\.(tex|sty|cls)$/i.test(name)) {
+                    commands.set(child, await this.loadCommands(vfs.pathToUri(child)));
+                }
             }
-        }
+        };
+        await visit('');
         return commands;
     }
 
-    private async load(uri: vscode.Uri, force: boolean = false) {
-        if (this.constantData===undefined) {
-            this.constantData = {};
-            const snippetsArray = await this.loadJson('data/latex/top-hundred-snippets.json') as any[];
-            for (const item of snippetsArray) {
-                const {caption,snippet,meta,score} = item;
-                this.constantData[caption] = {caption, snippet, meta, score};
+    private async load(uri: vscode.Uri): Promise<ProjectCompletions | undefined> {
+        if (!this.constantData) {
+            this.constantsLoading ??= this.loadJson('data/latex/top-hundred-snippets.json').then((items: SnippetItemSchema[]) => {
+                if (!this.disposed) { this.constantData = Object.fromEntries(items.map(item => [item.caption, item])); }
+            }).finally(() => { this.constantsLoading = undefined; });
+            await this.constantsLoading;
+        }
+        if (this.disposed) { return undefined; }
+        const key = this.key(uri);
+        let cache = this.customData.get(key);
+        if (!cache) { cache = { revision: 0 }; this.customData.set(key, cache); }
+        while (!this.disposed && !cache.value) {
+            if (!cache.loading) {
+                const revision = cache.revision;
+                const current = cache;
+                current.loading = Promise.all([this.loadMetadata(uri), this.reloadCommands(uri)]).then(([metadata, commands]) => {
+                    if (!this.disposed && current.revision === revision) { current.value = { metadata, commands }; }
+                }).finally(() => { current.loading = undefined; });
             }
+            await cache.loading;
         }
-
-        const {identifier} = parseUri(uri);
-        if (this.customData[identifier]===undefined || force) {
-            this.customData[identifier] = {
-                metadata: await this.loadMetadata(uri) || {},
-                commands: await this.reloadCommands(uri) || {},
-            };
-        }
+        return this.disposed ? undefined : cache.value;
     }
 
     private async getCompletionItems(uri:vscode.Uri, partial:string, wholeRange:vscode.Range): Promise<vscode.CompletionItem[]> {
-        await this.load(uri);
-        const {identifier} = parseUri(uri);
+        const data = await this.load(uri);
+        if (!data) { return []; }
 
         let commands:SnippetItemMap = {};
-        this.customData[identifier].commands.forEach((item) => {
+        data.commands.forEach((item) => {
             commands = {...item, ...commands};
         });
 
         const snippets = {
                     ...this.constantData,
-                    ...this.customData[identifier].metadata,
+                    ...data.metadata,
                     ...commands,
                 };
         return Object.entries(snippets)
@@ -147,14 +160,13 @@ export class CommandCompletionProvider extends IntellisenseProvider implements v
 
     get triggers(): vscode.Disposable[] {
         return [
+            new vscode.Disposable(() => { this.disposed = true; this.customData.clear(); }),
             vscode.languages.registerCompletionItemProvider(this.selector, this, '\\'),
-            // trigger on document save
-            vscode.workspace.onDidSaveTextDocument(async doc => {
-                if (doc.uri.scheme === ROOT_NAME && doc.uri.path.endsWith('.tex')) {
-                    const {identifier} = parseUri(doc.uri);
-                    const commands = await this.loadCommands(doc.uri);
-                    this.customData[identifier]?.commands.set(doc.uri.path, commands);
-                }
+            EventBus.on('projectStateChangedEvent', ({ uri, kind }) => {
+                if (kind === 'metadata' || kind === 'files' || kind === 'joined') { this.invalidate(uri); }
+            }),
+            vscode.workspace.onDidSaveTextDocument(doc => {
+                if (doc.uri.scheme === ROOT_NAME && /\.(tex|sty|cls)$/i.test(doc.uri.path)) { this.invalidate(doc.uri); }
             }),
         ];
     }

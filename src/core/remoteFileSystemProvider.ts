@@ -6,13 +6,13 @@ import { BaseAPI, COMPILERS, CompileRequest, CompileResponseSchema, EDITOR_ID, M
 import { cachedDownloadDomainUrl, downloadDomainUrl } from '../api/downloadDomain';
 import type { CompileRecord } from '../compile/outputFiles';
 import { windowCompileSettings } from '../compile/compileSettings';
-import { cachedBuild, CompileSettings, CompileStart, fromCache, isCompileStart, LatestAnswer, ownBuild, ProjectBuilds } from './projectBuilds';
+import { cachedBuild, CoalescedRuns, CompileSettings, CompileStart, fromCache, isCompileStart, LatestAnswer, ownBuild, ProjectBuilds } from './projectBuilds';
 import { EmitRefusedError, isMissingOpsRefusal, SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { applyOps, opsFor, overleafLineEndings, TrackChangesState, updateMeta } from '../utils/docUpdate';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { ClientManager } from '../collaboration/clientManager';
-import { EventBus } from '../utils/eventBus';
+import { EventBus, ProjectChangeKind } from '../utils/eventBus';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
 import { DownloadError, downloadInRanges, downloadWhole } from './pdfFetchBridge';
@@ -161,6 +161,8 @@ export interface FolderEntity extends FileEntity {
 export interface ProjectEntity {
     _id: string,
     name: string,
+    /** Effective permission of this connection, supplied with joinProjectResponse. */
+    permissionsLevel?: string,
     rootDoc_id: string,
     rootFolder: Array<FolderEntity>,
     publicAccessLevel: string, //"tokenBased"
@@ -223,7 +225,15 @@ function logBuilds(line: string) {
     buildsChannel.info(line);
 }
 
+interface AccountDictionary {
+    words: string[];
+    revision: number;
+    request: number;
+}
+
 export class VirtualFileSystem extends vscode.Disposable {
+    private static readonly dictionaries = new WeakMap<vscode.ExtensionContext, Map<string, AccountDictionary>>();
+    private readonly dictionary: AccountDictionary;
     private root?: ProjectEntity;
     private currentVersion?: number;
     private context: vscode.ExtensionContext;
@@ -297,6 +307,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     /** why the connection was lost again while a reconnect was still setting up the new one */
     private lostWhileJoining?: string;
     private disposed = false;
+    private accessRevoked = false;
+    private readonly settingsRefresh = new CoalescedRuns(() => this.readSettings());
     private retryConnection: number = 0;
     private retryTimer?: NodeJS.Timeout;
     /** Whether a "Reconnecting..." notification is currently shown */
@@ -328,13 +340,17 @@ export class VirtualFileSystem extends vscode.Disposable {
     private scmCollectionItem?: {collection: SCMCollectionProvider, triggers: vscode.Disposable[]};
 
     public readonly origin: vscode.Uri;
-    public readonly projectName: string;
+    /** The displayed name can change; existing file URIs keep their original routing path. */
+    get projectName(): string { return this.root?.name ?? this.previousRoot?.name ?? parseUri(this.origin).projectName; }
     public readonly serverName: string;
     public readonly projectId: string;
 
     constructor(context: vscode.ExtensionContext, uri: vscode.Uri, notify: (events:vscode.FileChangeEvent[])=>void) {
         // define the dispose behavior
         super(() => {
+            if (this.disposed) { return; }
+            this.disposed = true;
+            clearTimeout(this.retryTimer);
             // dispose all triggers of clientManager
             this.clientManagerItem?.triggers.forEach((trigger) => trigger.dispose());
             this.clientManagerItem = undefined;
@@ -346,21 +362,28 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.buildListeners.forEach(stop => stop());
             // the updates waiting for an answer end, with their timers
             this.answersLost('the project was closed');
-            this.disposed = true;
-            // disconnect socketio
-            // this.socket.disconnect();
+            this.socket.dispose();
         });
 
         const {userId,projectId,serverName,projectName} = parseUri(uri);
         this.serverName = serverName;
-        this.projectName = projectName;
+
         this.origin = uri.with({path: '/'+projectName});
         this.userId = userId;
         this.projectId = projectId;
         this.context = context;
+        let dictionaries = VirtualFileSystem.dictionaries.get(context);
+        if (!dictionaries) { dictionaries = new Map(); VirtualFileSystem.dictionaries.set(context, dictionaries); }
+        const account = `${serverName}/${userId}`;
+        this.dictionary = dictionaries.get(account) ?? {words: [], revision: 0, request: 0};
+        dictionaries.set(account, this.dictionary);
         this.notify = (events) => {
+            if (this.disposed) { return; }
             notify(events);
             this.changes.fire(events);
+            if (events.some(event => parseUri(event.uri).pathParts[0] !== OUTPUT_FOLDER_NAME)) {
+                this.projectChanged('files');
+            }
         };
 
         const res = GlobalStateManager.initSocketIOAPI(this.context, this.serverName, projectId);
@@ -403,6 +426,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async init() : Promise<ProjectEntity> {
+        if (this.disposed) { throw new Error(this.accessRevoked ? 'Access to this Overleaf project was revoked.' : 'The Overleaf project is closed.'); }
         if (this.root) {
             return Promise.resolve(this.root);
         }
@@ -431,6 +455,7 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     /** The first connection: a few attempts, then a message with Reload and Retry. */
     private get initializingPromise(): Promise<ProjectEntity> {
+        if (this.disposed) { return Promise.reject(new Error('The Overleaf project is closed.')); }
         const MAX_RETRIES = 5;
         const BASE_DELAY_MS = VirtualFileSystem.connectRetryBaseMs;
 
@@ -489,6 +514,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 await new Promise(resolve => setTimeout(resolve, delayMs));
             }
 
+            if (this.disposed) { throw new Error('The Overleaf project is closed.'); }
             // Only recreate the socket when the connection scheme has changed
             // (e.g., v1→v2 after connectionRejected). The new socket takes over the event
             // handlers registered so far, so they are registered once only.
@@ -507,6 +533,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             return this.socket.joinProject(this.projectId)
                 .then(project => this.joined(project))
                 .catch((err) => {
+                    if (this.disposed) { throw err; }
                     this.retryConnection += 1;
                     return this.initializingPromise;
                 });
@@ -517,6 +544,7 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     /** The project was joined on the current connection: take its tree, and set up what depends on it. */
     private async joined(project: ProjectEntity): Promise<ProjectEntity> {
+        if (this.disposed) { throw new Error('The Overleaf project is closed.'); }
         this.retryConnection = 0;
         this.reconnectingNotification = false;
         // The tree goes into use at once, so that the changes the server reports after the
@@ -528,13 +556,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.previousRoot = undefined;
         // the new tree has no output folder: list the build in use's files again
         this.listBuildOutputs();
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-        const settings = (await this.api.getProjectSettings(identity, this.projectId)).settings;
-        if (settings) {
-            project.settings = settings;
-        } else {
-            console.warn(`Overleaf Workshop: could not read the settings of ${this.projectName}; using ${previousSettings ? 'the previous ones' : 'the defaults'}`);
-        }
+        await this.refreshSettings();
+        if (this.disposed || this.root !== project) { return project; }
         this.joinedOnce = true;
         const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==ROOT_NAME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
         // Register: [collaboration] ClientManager on Statusbar
@@ -576,7 +599,36 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (adopted.length > 0) {
             this.notify(adopted.map(path => ({type: vscode.FileChangeType.Changed, uri: this.pathToUri(path)})));
         }
+        this.projectChanged('joined');
         return project;
+    }
+
+    private projectChanged(kind: ProjectChangeKind) {
+        if (!this.disposed) { EventBus.fire('projectStateChangedEvent', { uri: this.origin, kind }); }
+    }
+
+    /** Account dictionaries have no socket broadcast. Re-read at focus/rejoin or an explicit settings view. */
+    refreshSettings(): Promise<void> {
+        return this.disposed || !this.root ? Promise.resolve() : this.settingsRefresh.request();
+    }
+
+    private async readSettings() {
+        const project = this.root;
+        const revision = this.dictionary.revision;
+        if (!project || this.disposed) { return; }
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        if (this.disposed || this.root !== project) { return; }
+        const request = ++this.dictionary.request;
+        const settings = (await this.api.getProjectSettings(identity, this.projectId)).settings;
+        if (!settings || this.disposed || this.root !== project) { return; }
+        // Learned words belong to the account, not a project. A parallel project's older
+        // response or a pre-learn/unlearn response cannot replace the current account list.
+        const changed = revision === this.dictionary.revision && request === this.dictionary.request &&
+            JSON.stringify(this.dictionary.words) !== JSON.stringify(settings.learnedWords);
+        if (changed) { this.dictionary.words = [...settings.learnedWords]; }
+        settings.learnedWords = this.dictionary.words;
+        project.settings = settings;
+        if (changed) { this.projectChanged('dictionary'); }
     }
 
     /**
@@ -880,6 +932,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.reconnected = undefined;
             },
             onFileCreated: (parentFolderId:string, type:FileType, entity:FileEntity) => {
+                this.isDirty = true;
                 const res = this._resolveById(parentFolderId);
                 if (res) {
                     const {fileEntity,path} = res;
@@ -891,6 +944,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             },
             onFileRenamed: (entityId:string, newName:string) => {
+                this.isDirty = true;
                 const res = this._resolveById(entityId);
                 if (res) {
                     const {fileEntity} = res;
@@ -904,6 +958,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             },
             onFileRemoved: (entityId:string) => {
+                this.isDirty = true;
                 const res = this._resolveById(entityId);
                 if (res) {
                     const {parentFolder, fileType, fileEntity} = res;
@@ -914,6 +969,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             },
             onFileMoved: (entityId:string, folderId:string) => {
+                this.isDirty = true;
                 const oldPath = this._resolveById(entityId);
                 const newPath = this._resolveById(folderId);
                 // a move into the folder that holds it already changes nothing
@@ -941,6 +997,12 @@ export class VirtualFileSystem extends vscode.Disposable {
                     }
                     return;
                 }
+                // Successful ops are project-wide, including documents this client has not opened.
+                // Their absence from the text cache must not make the compiled project look clean.
+                if (update.op.length) {
+                    this.isDirty = true;
+                    this.projectChanged('files');
+                }
                 // While one of our updates waits for its answer, hold the ops of others back
                 // until the doc is settled (see settle).
                 if (doc.sync) {
@@ -960,21 +1022,35 @@ export class VirtualFileSystem extends vscode.Disposable {
             onSpellCheckLanguageUpdated: (language:string) => {
                 if (this.root) {
                     this.root.spellCheckLanguage = language;
-                    EventBus.fire('spellCheckLanguageUpdateEvent', {language});
+                    this.projectChanged('settings');
+                    EventBus.fire('spellCheckLanguageUpdateEvent', {language, uri: this.origin});
                 }
             },
             onCompilerUpdated: (compiler:string) => {
                 if (this.root) {
                     this.root.compiler = compiler;
-                    EventBus.fire('compilerUpdateEvent', {compiler});
+                    this.isDirty = true;
+                    this.projectChanged('settings');
+                    EventBus.fire('compilerUpdateEvent', {compiler, uri: this.origin});
                 }
             },
-            onRootDocUpdated: (rootDocId:string) => {
-                //NOTE: do not sync rootDocId
-                // if (this.root) {
-                //     this.root.rootDoc_id = rootDocId;
-                //     EventBus.fire('rootDocUpdateEvent', {rootDocId});
-                // }
+            onMetadataUpdated: () => this.projectChanged('metadata'),
+            onProjectNameUpdated: (name: string) => {
+                if (this.root && this.root.name !== name) { this.root.name = name; this.projectChanged('name'); }
+            },
+            onProjectAccessChanged: (change) => {
+                if (this.root && typeof change?.newAccessLevel === 'string') { this.root.publicAccessLevel = change.newAccessLevel; }
+                this.projectChanged('access');
+            },
+            onProjectAccessRevoked: () => {
+                this.accessRevoked = true;
+                this.projectChanged('access');
+                this.dispose();
+                vscode.window.showWarningMessage(vscode.l10n.t('Access to this Overleaf project was revoked. Unsaved editor content remains open.'));
+            },
+            onRootDocUpdated: () => {
+                // Like Overleaf's project-wide settings listener, keep this session's
+                // chosen main document. A fresh join adopts the saved project default.
             },
         });
     }
@@ -1019,7 +1095,7 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     async resolve(uri: vscode.Uri): Promise<File> {
         const {fileName, fileEntity, fileType} = await this._resolveUri(uri);
-        const readonly = fileEntity?.readonly ? vscode.FilePermission.Readonly : undefined;
+        const readonly = fileEntity?.readonly || this.root?.permissionsLevel === 'readOnly' ? vscode.FilePermission.Readonly : undefined;
         switch (fileType) {
             case undefined:
                 throw vscode.FileSystemError.FileNotFound(uri);
@@ -2209,7 +2285,9 @@ export class VirtualFileSystem extends vscode.Disposable {
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
         const res = await this.api.spellingControllerLearn(identity, this.userId, word);
         if (res.type==='success') {
-            this.root?.settings.learnedWords.push(word);
+            this.dictionary.revision++;
+            if (!this.dictionary.words.includes(word)) { this.dictionary.words.push(word); }
+            this.projectChanged('dictionary');
             return true;
         } else {
             return false;
@@ -2220,10 +2298,10 @@ export class VirtualFileSystem extends vscode.Disposable {
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
         const res = await this.api.spellingControllerUnlearn(identity, word);
         if (res.type==='success') {
-            const index = this.root?.settings.learnedWords.findIndex((w) => w===word);
-            if (index!==undefined && index>=0) {
-                this.root?.settings.learnedWords.splice(index, 1);
-            }
+            this.dictionary.revision++;
+            const index = this.dictionary.words.indexOf(word);
+            if (index >= 0) { this.dictionary.words.splice(index, 1); }
+            this.projectChanged('dictionary');
             return true;
         } else {
             return false;
@@ -2254,7 +2332,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     getDictionary() {
-        return this.root?.settings.learnedWords;
+        return this.dictionary.words;
     }
 
     getRootDocName() {
@@ -2277,19 +2355,26 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async updateSettings(setting: any) {
+        const project = this.root;
+        if (!project || this.disposed) { return false; }
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        if (this.disposed || this.root !== project) { return false; }
         const res = await this.api.updateProjectSettings(identity, this.projectId, setting);
+        if (this.disposed || this.root !== project) { return false; }
         if (res.type==='success') {
             const keys = Object.keys(setting);
             if (keys.includes('spellCheckLanguage')) {
-                this.root!.spellCheckLanguage = setting.spellCheckLanguage;
+                project.spellCheckLanguage = setting.spellCheckLanguage;
             }
             if (keys.includes('compiler')) {
-                this.root!.compiler = setting.compiler;
+                project.compiler = setting.compiler;
+                this.isDirty = true;
             }
             if (keys.includes('rootDocId')) {
-                this.root!.rootDoc_id = setting.rootDocId;
+                project.rootDoc_id = setting.rootDocId;
+                this.isDirty = true;
             }
+            this.projectChanged('settings');
         }
         return res.type==='success'? true : false;
     }
@@ -2492,6 +2577,18 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
 
     get triggers() {
         return [
+            new vscode.Disposable(() => {
+                Object.values(this.vfss).forEach(vfs => vfs.dispose());
+                this.vfss = {};
+                this._emitter.dispose();
+            }),
+            vscode.window.onDidChangeWindowState(({ focused }) => {
+                if (focused) {
+                    for (const vfs of Object.values(this.vfss)) {
+                        if (vfs.connected) { void vfs.refreshSettings().catch(error => console.warn('Overleaf settings refresh failed:', error)); }
+                    }
+                }
+            }),
             // register file system provider
             vscode.workspace.registerFileSystemProvider(ROOT_NAME, this, { isCaseSensitive: true }),
             // register commands

@@ -37,7 +37,7 @@ function projectTree(t: ReturnType<typeof world>, tree: any, VirtualFileSystem: 
     const asked: string[] = [];
     const rel = (uri: Uri) => uri.path.slice(t.vfs.origin.path.length);
     Object.assign(vfs, {
-        origin: t.vfs.origin, serverName: 'www.overleaf.com', projectName: 'project', projectId: 'p', userId: 'u',
+        origin: t.vfs.origin, serverName: 'www.overleaf.com', projectId: 'p', userId: 'u',
         joinedOnce: true, root: tree, connections: [],
         socket: { isUsingAlternativeConnectionScheme: false, updateEventHandlers(h: any) { Object.assign(handlers, h); } },
         notify: (events: any[]) => changes.fire(events),
