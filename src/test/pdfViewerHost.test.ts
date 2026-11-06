@@ -28,6 +28,7 @@ describe('PDF viewer host disclosure preference', function () {
             window: { addEventListener(name: string, callback: typeof receiver) {
                 assert.strictEqual(name, 'message'); receiver = callback;
             } },
+            document: { getElementById: () => ({ textContent: JSON.stringify({ page: 'host-test-page' }) }) },
             acquireVsCodeApi: () => {
                 acquired++;
                 return { getState: () => copy(previous), setState: (value: unknown) => writes.push(copy(value)),
@@ -47,28 +48,28 @@ describe('PDF viewer host disclosure preference', function () {
         assert.strictEqual(f.preference.read(), undefined);
         assert.deepStrictEqual(f.posts, []);
         const ready = f.preference.whenReady();
-        assert.deepStrictEqual(f.posts, [{ type: 'ready' }]);
+        assert.deepStrictEqual(f.posts, [{ type: 'ready', page: 'host-test-page' }]);
         assert.deepStrictEqual(f.writes, []);
         f.initialize({ motionLabMeasurementsOpen: true, scale: '1.5', sidebarView: 2 });
         await ready;
         assert.strictEqual(f.preference.read(), true);
         assert.deepStrictEqual(f.state(), { motionLabMeasurementsOpen: true, scale: '1.5', sidebarView: 2 });
         assert.deepStrictEqual(f.writes, []);
-        assert.deepStrictEqual(f.posts, [{ type: 'ready' }]);
+        assert.deepStrictEqual(f.posts, [{ type: 'ready', page: 'host-test-page' }]);
         assert.strictEqual(f.acquired(), 1);
     });
 
     it('persists an early real toggle only after merging the complete host reader state', async () => {
         const f = fixture();
         const pending = f.preference.write(false);
-        assert.deepStrictEqual(f.posts, [{ type: 'ready' }]);
+        assert.deepStrictEqual(f.posts, [{ type: 'ready', page: 'host-test-page' }]);
         assert.deepStrictEqual(f.writes, [], 'an early preference must not replace persisted state with a partial object');
         const position = { page: 8, offset: { top: 21, left: 5 }, pageSize: { width: 600, height: 800 } };
         f.initialize({ motionLabMeasurementsOpen: true, scale: '2', position, spreadMode: 1, colorTheme: 'Paper' });
         await pending;
         const expected = { motionLabMeasurementsOpen: false, scale: '2', position, spreadMode: 1, colorTheme: 'Paper' };
         assert.deepStrictEqual(f.writes, [expected]);
-        assert.deepStrictEqual(f.posts, [{ type: 'ready' }, { type: 'saveState', content: expected }]);
+        assert.deepStrictEqual(f.posts, [{ type: 'ready', page: 'host-test-page' }, { type: 'saveState', page: 'host-test-page', content: expected }]);
         assert.strictEqual(f.preference.read(), false);
     });
 

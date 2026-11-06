@@ -36,6 +36,25 @@ const world = {
     deleted: [] as string[],
     configListeners: [] as ((e: { affectsConfiguration(section: string): boolean }) => void)[],
 };
+const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value));
+
+class Storage {
+    readonly values = new Map<string, any>();
+    readonly writes: { value: any, finish: () => void, settled: Promise<void> }[] = [];
+    readonly waiting: (() => void)[] = [];
+    blocked = false;
+    get(key: string, fallback: any) { return copy(this.values.get(key) ?? fallback); }
+    update(key: string, value: any) {
+        let finish!: () => void;
+        const saved = copy(value);
+        const settled = new Promise<void>(resolve => { finish = () => { this.values.set(key, saved); resolve(); }; });
+        this.writes.push({ value: saved, finish, settled });
+        this.waiting.splice(0).forEach(resolve => resolve());
+        if (!this.blocked) { finish(); }
+        return settled;
+    }
+    nextWrite() { return new Promise<void>(resolve => this.waiting.push(resolve)); }
+}
 const vscodeMock = withStubs({
     Uri,
     Disposable: class { dispose() {} },
@@ -79,36 +98,185 @@ const [{ PdfViewEditorProvider }] = loadWithVscode(vscodeMock, () => [require('.
  */
 function panel() {
     const pages: string[] = [];
+    const received: any[] = [];
     const pageWaiters: Array<() => void> = [];
     let onMessage: (message: any) => void = () => {};
     let onDispose: () => void = () => {};
+    let onViewState: (event: any) => void = () => {};
     const webview = {
         options: {},
         set html(value: string) { pages.push(value); pageWaiters.splice(0).forEach(resolve => resolve()); },
         get html() { return pages.at(-1) ?? ''; },
         asWebviewUri: (uri: Uri) => uri,
-        postMessage: async () => true,
+        postMessage: async (message: any) => { received.push(copy(message)); return true; },
         onDidReceiveMessage: (listener: (message: any) => void) => { onMessage = listener; return { dispose() {} }; },
     };
     return {
-        pages,
+        pages, received,
+        page: () => JSON.parse(/<script[^>]*id="viewer-config"[^>]*>(.*?)<\/script>/.exec(webview.html)![1]).page,
         nextPage: () => new Promise<void>(resolve => pageWaiters.push(resolve)),
         send: (message: any) => onMessage(message),
         dispose: () => onDispose(),
-        webviewPanel: { webview, onDidDispose: (listener: () => void) => { onDispose = listener; return { dispose() {} }; }, onDidChangeViewState: () => ({ dispose() {} }) },
+        hide: () => onViewState({ webviewPanel: { active: false, visible: false } }),
+        webviewPanel: { webview, onDidDispose: (listener: () => void) => { onDispose = listener; return { dispose() {} }; },
+            onDidChangeViewState: (listener: (event: any) => void) => { onViewState = listener; return { dispose() {} }; } },
     };
 }
 const viewerOf = (page: string | undefined) => /the (\w+) viewer/.exec(page ?? '')?.[1];
 
 describe('the button that switches between the pdfjs and the overleaf viewer', () => {
     let provider: any;
+    let storage: Storage, triggers: { dispose(): void }[];
     beforeEach(() => {
         world.settings = { engine: 'pdfjs' };
         world.updates = [];
         world.configListeners = [];
         world.deleted = [];
-        provider = new PdfViewEditorProvider({ extensionUri: Uri.file('/ext'), globalStorageUri: Uri.file('/storage'), extension: { packageJSON } });
-        void provider.triggers;
+        storage = new Storage();
+        provider = new PdfViewEditorProvider({ extensionUri: Uri.file('/ext'), globalStorageUri: Uri.file('/storage'), extension: { packageJSON }, globalState: storage });
+        triggers = provider.triggers;
+    });
+    afterEach(async () => {
+        storage.blocked = false;
+        for (const write of storage.writes) { write.finish(); }
+        triggers.forEach(trigger => trigger.dispose());
+        await provider.viewState?.settled;
+        await provider.previews.settled();
+        await provider.pieces.dispose();
+    });
+
+    it('flushes the already-received final reading state when the panel closes', async () => {
+        const uri = Uri.file('/home/u/close.pdf'), doc = await provider.openCustomDocument(uri), editor = panel();
+        await provider.resolveCustomEditor(doc, editor.webviewPanel);
+        const state = { position: { page: 7, offset: { top: 41, left: 8 } }, scale: '2', motionLabMeasurementsOpen: true };
+        editor.send({ type: 'saveState', page: editor.page(), content: state });
+        assert.strictEqual(storage.writes.length, 0, 'durable writes are coalesced by the host while capture is immediate');
+        const started = storage.nextWrite();
+        editor.dispose();
+        await started;
+        await storage.writes.at(-1)!.settled;
+        assert.deepStrictEqual(storage.values.get('overleaf-pdf-viewers')[uri.toString()].state, state);
+    });
+
+    it('keeps the newest state available during navigation and rejects messages from the old page', async () => {
+        const uri = Uri.file('/home/u/switch.pdf'), doc = await provider.openCustomDocument(uri), editor = panel();
+        await provider.resolveCustomEditor(doc, editor.webviewPanel);
+        storage.blocked = true;
+        const oldPage = editor.page(), state = { position: { page: 9 }, scale: '3' };
+        editor.send({ type: 'saveState', page: oldPage, content: state });
+        const reloaded = editor.nextPage();
+        editor.send({ type: 'switchViewer', engine: 'overleaf' });
+        await reloaded;
+        assert.notStrictEqual(editor.page(), oldPage);
+        editor.send({ type: 'saveState', page: oldPage, content: { position: { page: 1 }, scale: '1' } });
+        editor.send({ type: 'ready', page: oldPage });
+        assert.strictEqual(editor.received.filter(message => message.type === 'initState').length, 0);
+        editor.send({ type: 'ready', page: editor.page() });
+        assert.deepStrictEqual(editor.received.find(message => message.type === 'initState')?.content, state);
+        editor.dispose();
+        for (const write of storage.writes) { write.finish(); }
+    });
+
+    it('accepts the displayed page state until its replacement HTML is committed', async () => {
+        const uri = Uri.file('/home/u/pending-template.pdf'), doc = await provider.openCustomDocument(uri), editor = panel();
+        await provider.resolveCustomEditor(doc, editor.webviewPanel);
+        storage.blocked = true;
+        const oldPage = editor.page(), first = { position: { page: 1 }, scale: '1' };
+        const firstStarted = storage.nextWrite();
+        editor.send({ type: 'saveState', page: oldPage, content: first });
+        editor.hide(); await firstStarted;
+        const owned = [...provider.editors][0] as any, original = provider.getViewerPage.bind(provider);
+        let release!: () => void;
+        const template = new Promise<void>(resolve => { release = resolve; });
+        provider.getViewerPage = async (...args: any[]) => { const html = await original(...args); await template; return html; };
+        const rendering = owned.render();
+        const final = { position: { page: 6, offset: { top: 73, left: 9 } }, scale: '2.5' };
+        try {
+            assert.strictEqual(editor.page(), oldPage, 'the old viewer is still displayed while its replacement loads');
+            editor.send({ type: 'saveState', page: oldPage, content: final });
+        } finally { release(); }
+        await rendering;
+        assert.notStrictEqual(editor.page(), oldPage);
+        editor.send({ type: 'ready', page: editor.page() });
+        assert.deepStrictEqual(editor.received.find(message => message.type === 'initState')?.content, final,
+            'replacement reads the last displayed state while durable storage is still pending');
+        assert.strictEqual(storage.writes.length, 1);
+        editor.send({ type: 'saveState', page: oldPage, content: first });
+        editor.send({ type: 'ready', page: oldPage });
+        assert.strictEqual(editor.received.filter(message => message.type === 'initState').length, 1);
+        assert.deepStrictEqual(provider.viewState.read(uri.toString()), final);
+    });
+
+    it('serializes a final close write behind an older pending storage update', async () => {
+        const uri = Uri.file('/home/u/ordered.pdf'), doc = await provider.openCustomDocument(uri), editor = panel();
+        await provider.resolveCustomEditor(doc, editor.webviewPanel);
+        storage.blocked = true;
+        const firstStarted = storage.nextWrite();
+        editor.send({ type: 'saveState', page: editor.page(), content: { position: { page: 1 } } });
+        editor.hide();
+        await firstStarted;
+        const final = { position: { page: 8 }, scale: '2.5' };
+        editor.send({ type: 'saveState', page: editor.page(), content: final });
+        editor.dispose();
+        assert.strictEqual(storage.writes.length, 1, 'the second durable update must wait for the first to settle');
+        const secondStarted = storage.nextWrite();
+        storage.writes[0].finish();
+        await secondStarted;
+        storage.writes[1].finish();
+        await storage.writes[1].settled;
+        assert.deepStrictEqual(storage.values.get('overleaf-pdf-viewers')[uri.toString()].state, final);
+    });
+
+    it('keeps a newer viewer page when an older page template finishes later', async () => {
+        const doc = await provider.openCustomDocument(Uri.file('/home/u/navigation.pdf')), editor = panel();
+        await provider.resolveCustomEditor(doc, editor.webviewPanel);
+        const owned = [...provider.editors][0] as any;
+        const original = provider.getViewerPage.bind(provider), gates: (() => void)[] = [];
+        provider.getViewerPage = async (...args: any[]) => {
+            let release!: () => void;
+            const wait = new Promise<void>(resolve => { release = resolve; }); gates.push(release);
+            const html = await original(...args); await wait; return html;
+        };
+        await doc.setEngine('overleaf');
+        const first = owned.render();
+        await doc.setEngine('pdfjs');
+        const second = owned.render();
+        gates[1](); await second;
+        const current = editor.page();
+        gates[0](); await first;
+        assert.strictEqual(editor.page(), current);
+        assert.strictEqual(viewerOf(editor.webviewPanel.webview.html), 'pdfjs');
+        assert.strictEqual(editor.pages.length, 2, 'a superseded template is never assigned to the live webview');
+    });
+
+    it('keeps the latest engine setting across two editors when an older render finishes last', async () => {
+        const first = panel(), second = panel();
+        const firstDoc = await provider.openCustomDocument(Uri.file('/home/u/first.pdf'));
+        const secondDoc = await provider.openCustomDocument(Uri.file('/home/u/second.pdf'));
+        await provider.resolveCustomEditor(firstDoc, first.webviewPanel);
+        await provider.resolveCustomEditor(secondDoc, second.webviewPanel);
+        const original = provider.getViewerPage.bind(provider);
+        let requested!: () => void, release!: () => void;
+        const started = new Promise<void>(resolve => { requested = resolve; });
+        const held = new Promise<void>(resolve => { release = resolve; });
+        provider.getViewerPage = async (...args: any[]) => {
+            const html = await original(...args);
+            if (args[0] === first.webviewPanel.webview && args[1] === 'overleaf') { requested(); await held; }
+            return html;
+        };
+        world.settings.engine = 'overleaf';
+        const older = provider.applyEngine();
+        await started;
+        try {
+            world.settings.engine = 'pdfjs';
+            await provider.applyEngine();
+        } finally { release(); }
+        await older;
+        assert.strictEqual(firstDoc.engine, 'pdfjs');
+        assert.strictEqual(secondDoc.engine, 'pdfjs');
+        assert.strictEqual(viewerOf(first.webviewPanel.webview.html), 'pdfjs');
+        assert.strictEqual(viewerOf(second.webviewPanel.webview.html), 'pdfjs');
+        assert.strictEqual(second.pages.length, 1, 'the obsolete configuration loop never replaces the second page');
     });
 
     it('sets the viewer as a user setting, and the open PDF reloads in that viewer', async () => {

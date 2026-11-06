@@ -470,7 +470,8 @@ describe('the build in use, from Overleaf to the window', function () {
         const doc = await provider.openCustomDocument(buildUri);
         const panel = new Panel();
         await provider.resolveCustomEditor(doc, panel);
-        panel.send({ type: 'ready' });
+        const page = JSON.parse(/<script[^>]*id="viewer-config"[^>]*>(.*?)<\/script>/.exec(panel.webview.html)![1]).page;
+        panel.send({ type: 'ready', page });
         return { doc, panel };
     }
 

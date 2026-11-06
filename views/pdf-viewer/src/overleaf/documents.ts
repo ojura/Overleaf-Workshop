@@ -5,6 +5,7 @@ import { toPdfFile } from '../common/output';
 import type { PdfOutput, PdfPreviewDescriptor } from '../common/protocol';
 import { createWorkerPort } from '../common/worker';
 import { holdDocumentHeight } from '../common/document-height';
+import { untilAborted, waitForDocumentOperation } from '../common/document-lifecycle';
 
 export interface DocumentHooks {
     /** a load is about to replace the shown document: save what depends on it */
@@ -40,9 +41,6 @@ interface Owned {
     requests?: AbortController;
 }
 
-/** how long a document may take to be destroyed before its worker is stopped anyway */
-const DESTROY_TIMEOUT_MS = 10_000;
-
 /**
  * Loads the host's documents into PDFJSWrapper one at a time, and destroys every document the
  * page no longer shows.
@@ -77,6 +75,8 @@ export class Documents {
     private readonly owned = new Map<any, Owned>();
     /** Deferred callbacks may still hold a proxy after its task was destroyed. */
     private readonly retired = new WeakSet<object>();
+    private disposed = false;
+    private readonly destroying = new Set<Promise<void>>();
 
     constructor(private readonly wrapper: PDFJSWrapper, private readonly hooks: DocumentHooks) {
         // loadDocument may return before its view-transition callback installs the
@@ -115,7 +115,16 @@ export class Documents {
 
     /** settles when the loads asked for so far have ended, shown, failed or overtaken */
     get settled(): Promise<void> {
-        return this.queue;
+        return this.queue.then(() => Promise.all([...this.destroying])).then(() => {});
+    }
+
+    dispose(): Promise<void> {
+        if (!this.disposed) {
+            this.disposed = true;
+            if (this.inFlight) { this.stop(this.inFlight); this.inFlight = undefined; }
+            for (const task of this.owned.keys()) { this.destroy(task); }
+        }
+        return this.settled;
     }
 
     /** Load the build `output` in ranges, unless it is the build shown already. */
@@ -130,6 +139,7 @@ export class Documents {
     }
 
     private enqueue(run: (job: Job) => Promise<void>) {
+        if (this.disposed) { return; }
         // a newer load overtakes the one in flight: stop its requests and destroy its document
         if (this.inFlight) { this.stop(this.inFlight); }
         let adopt!: (result: Adoption) => void;
@@ -149,10 +159,10 @@ export class Documents {
         this.owned.delete(task);
         this.retired.add(task);
         owned?.requests?.abort();
-        const timeout = new Promise(resolve => setTimeout(resolve, DESTROY_TIMEOUT_MS));
-        Promise.race([task.destroy(), timeout])
+        const destroying = waitForDocumentOperation(() => task.destroy())
             .catch(error => console.warn('pdf viewer: destroying a document:', error))
-            .finally(() => owned?.worker.terminate());
+            .finally(() => { owned?.worker.terminate(); this.destroying.delete(destroying); });
+        this.destroying.add(destroying);
     }
 
     /** Destroy every document but `shown`. */
@@ -164,19 +174,7 @@ export class Documents {
 
     /** Resolves with what `promise` gives, or with `undefined` once the job is aborted. */
     private untilAborted<T>(job: Job, promise: Promise<T>): Promise<T | undefined> {
-        return new Promise((resolve, reject) => {
-            const signal = job.abort.signal;
-            const aborted = () => { signal.removeEventListener('abort', aborted); resolve(undefined); };
-            signal.addEventListener('abort', aborted, { once: true });
-            if (signal.aborted) { aborted(); }
-            promise.then(value => {
-                signal.removeEventListener('abort', aborted);
-                resolve(signal.aborted ? undefined : value);
-            }, error => {
-                signal.removeEventListener('abort', aborted);
-                reject(error);
-            });
-        });
+        return untilAborted(job.abort.signal, promise);
     }
 
     /** Start the job's worker; false if the job was overtaken meanwhile. */

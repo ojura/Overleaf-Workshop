@@ -279,7 +279,7 @@ export class GlobalStateManager {
             delete persists[minUri];
         }
 
-        context.globalState.update(keyPdfViewPersists, persists);
+        return context.globalState.update(keyPdfViewPersists, persists);
     }
 
 }

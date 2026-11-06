@@ -5,6 +5,7 @@
  */
 import type { HostMessage, SavedState, ViewerMessage } from './protocol';
 import type { MotionLabMeasurementsPreference } from './prefetch-performance';
+import { config } from './config';
 
 /** the host's answer to 'ready' */
 export type InitState = Extract<HostMessage, { type: 'initState' }>;
@@ -16,8 +17,10 @@ declare function acquireVsCodeApi(): { postMessage(message: unknown): void, getS
 
 // acquireVsCodeApi may be called only once per page
 const vscode = acquireVsCodeApi();
+let disposed = false;
 
 export function post(message: ViewerMessage) {
+    if (disposed) { return; }
     vscode.postMessage(message);
 }
 
@@ -28,6 +31,7 @@ const handlers = new Map<string, (message: any) => void>();
 const early = new Map<string, any[]>();
 
 window.addEventListener('message', (event: MessageEvent) => {
+    if (disposed) { return; }
     const message = event.data;
     const type = message?.type;
     if (typeof type !== 'string' || BRIDGE_REPLIES.has(type)) { return; }
@@ -41,6 +45,7 @@ window.addEventListener('message', (event: MessageEvent) => {
 
 /** Handle the host's messages of `type`; one handler per type, the last one set wins. */
 export function onMessage<T extends Handled>(type: T, handler: (message: Extract<HostMessage, { type: T }>) => void) {
+    if (disposed) { return; }
     handlers.set(type, handler);
     const waiting = early.get(type);
     early.delete(type);
@@ -57,7 +62,7 @@ export function ready(): Promise<InitState> {
             state = { ...message.content, ...state };
             resolve(message);
         });
-        post({ type: 'ready' });
+        post({ type: 'ready', page: config.page });
     });
     return readyPromise;
 }
@@ -69,9 +74,17 @@ export function savedState(): SavedState {
 
 /** Change part of the document's saved viewer state. */
 export function saveState(partial: Partial<SavedState>) {
+    if (disposed) { return; }
     state = { ...state, ...partial };
     vscode.setState(state);
-    post({ type: 'saveState', content: state });
+    post({ type: 'saveState', page: config.page, content: state });
+}
+
+/** Called after the page's final synchronous capture; late callbacks have no message owner. */
+export function disposeHost() {
+    disposed = true;
+    handlers.clear();
+    early.clear();
 }
 
 /** Both extension viewers read disclosure state after initialization and preserve the full saved reader state on writes. */

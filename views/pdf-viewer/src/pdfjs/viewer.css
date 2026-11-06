@@ -9,8 +9,8 @@ body {
     padding: 0;
 }
 
-/* VS Code lets an editor pane narrow to 220 px. pdf.js's viewer keeps its page at least 350 px
-   wide (#mainContainer), which in a narrower pane puts the toolbar's right end past the pane's
+/* pdf.js's viewer keeps its page at least 350 px wide (#mainContainer), which in a narrower
+   editor pane puts the toolbar's right end past the pane's
    edge, with the tools menu that holds this viewer's own buttons below 750 px. So the page follows
    the pane, and in a narrow pane the page count goes first, as in the Overleaf viewer. */
 #mainContainer {

@@ -230,8 +230,8 @@ export type HostMessage =
  *   fetch, fetchAbort   the page's requests to Overleaf's download domain (bridge-fetch.ts)
  */
 export type ViewerMessage =
-    | { type: 'ready' }
-    | { type: 'saveState', content: SavedState }
+    | { type: 'ready', page: string }
+    | { type: 'saveState', page: string, content: SavedState }
     | { type: 'syncPdf', content: { page: number, h: number, v: number, identifier: string } }
     | { type: 'recompile' }
     | { type: 'buildGone', build: string }
