@@ -240,10 +240,11 @@ export function deliveryRequestCategory(pathname) {
 
 /** Repaint only after the measurement is frozen, through the native queue. This
  * isolates final canvas reproducibility without changing reported delivery time. */
-export async function repaintDeliveryPages(pages) {
+export async function repaintDeliveryPages(pages, budgetMs = 60000) {
     const observation = window.__pdfDeliveryObservation;
     if (!observation?.snapshot().finished) throw new Error('Finish delivery measurement before a verification repaint');
     const viewer = observation.viewer();
+    const deadline = performance.now() + budgetMs;
     observation.captureCanvases();
     for (const number of pages) {
         const view = viewer?.getPageView(number - 1);
@@ -256,11 +257,16 @@ export async function repaintDeliveryPages(pages) {
             };
             const rendered = event => {
                 if (event.source !== view || event.pageNumber !== number || event.isDetailView || event.cssTransform) return;
-                finish(event.error ? new Error(String(event.error)) : undefined);
+                if (event.error) { finish(new Error(String(event.error))); return; }
+                if (viewer.pdfDocument?.hasExternalImages) {
+                    if (event.imagePassStatus?.failed) { finish(new Error('Native verification repaint image failed')); return; }
+                    if (!event.imagePassStatus?.final || event.imagePassRevision !== event.imageRevision) return;
+                }
+                finish();
             };
             viewer.eventBus.on('pagerendered', rendered);
             // The native renderer may stop answering; ordinary completion follows its event.
-            timer = setTimeout(() => finish(new Error('Native verification repaint did not complete')), 10000);
+            timer = setTimeout(() => finish(new Error('Native verification repaint did not complete')), Math.max(1, deadline - performance.now()));
             try {
                 if (!view.redrawImages() || !viewer.renderingQueue.renderView(view)) throw new Error('Native queue refused the verification repaint');
             } catch (error) { finish(error); }

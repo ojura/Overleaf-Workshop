@@ -74,6 +74,9 @@ must have painted final quality with every image decoded successfully before cap
 the existing page queue after the delivery measurement has finished. It saves the resulting
 canvases separately and records any new network requests under `repaintNetwork`. This checks
 final canvas reproducibility without adding repaint work to the reported delivery timings.
+If the normal page cleanup already released image objects, the native renderer may fetch
+them again. Verification waits for that new pass's final pixels and matching displayed revision;
+a retained old canvas cannot satisfy it. The whole verification gets one further `--budget-ms`.
 A native error or stalled completion fails the command while retaining the original measurement.
 
 ## Motion Lab checks in an existing Chromium session

@@ -112,7 +112,7 @@ try {
         if (!options.get(mode)) continue;
         const priorRequests = new Set(requests.keys());
         const captures = await evaluateHarness(target, mode === 'canvases' ? 'window.__pdfDeliveryObservation.captureCanvases()'
-            : '(' + repaintDeliveryPages.toString() + ')(' + JSON.stringify(pages) + ')', { limitMs: 30000 });
+            : '(' + repaintDeliveryPages.toString() + ')(' + JSON.stringify(pages) + ',' + budgetMs + ')', { limitMs: budgetMs + 5000 });
         if (mode === 'repaint-canvases') result.repaintNetwork = summarizeDeliveryNetwork([...requests.entries()]
             .filter(([id]) => !priorRequests.has(id)).map(([_id, request]) => request));
         const directory = path.resolve(options.get(mode));

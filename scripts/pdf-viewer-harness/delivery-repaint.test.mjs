@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { repaintDeliveryPages } from './delivery-observation.mjs';
 
-function fixture() {
+function fixture(externalImages = false) {
     const listeners = new Set(), timers = new Set(), queued = [], captures = [];
     const views = [1, 2].map(number => ({ number, redrawImages: () => true }));
     let finished = true, ready;
     const started = () => new Promise(resolve => { ready = resolve; });
     const viewer = {
+        pdfDocument: { hasExternalImages: externalImages },
         getPageView: index => views[index],
         renderingQueue: { renderView: view => { queued.push(view.number); ready?.(); return true; } },
         eventBus: { on: (_name, callback) => listeners.add(callback), off: (_name, callback) => listeners.delete(callback) },
@@ -21,6 +22,7 @@ function fixture() {
         } },
         setTimeout: callback => { timers.add(callback); return callback; },
         clearTimeout: callback => timers.delete(callback),
+        performance: { now: () => 0 },
     });
     const run = pages => vm.runInContext('(' + repaintDeliveryPages.toString() + ')(' + JSON.stringify(pages) + ')', context);
     const emit = event => { for (const callback of [...listeners]) callback(event); };
@@ -42,6 +44,24 @@ test('verification repaint waits for each exact native page and leaves the measu
     assert.deepEqual(h.queued, [1, 2]);
     h.emit({ source: h.views[1], pageNumber: 2 });
     assert.deepEqual(await pending, { after: [1, 2] });
+    assert.equal(h.captures.length, 2);
+    assert.equal(h.listeners.size, 0); assert.equal(h.timers.size, 0);
+});
+
+test('verification repaint waits for final new image pixels when cleanup retained the previous canvas', async () => {
+    const h = fixture(true), view = h.views[0];
+    const pending = h.run([1]);
+    h.emit({ source: view, pageNumber: 1, imageRevision: 51, imagePassRevision: 51,
+        imageStatus: { final: true, failed: 0 }, imagePassStatus: { final: false, failed: 0 } });
+    await Promise.resolve();
+    assert.equal(h.captures.length, 1, 'the retained old final canvas is not a completed verification pass');
+    h.emit({ source: view, pageNumber: 1, imageRevision: 51, imagePassRevision: 68,
+        imageStatus: { final: true, failed: 0 }, imagePassStatus: { final: true, failed: 0 } });
+    await Promise.resolve();
+    assert.equal(h.captures.length, 1, 'attempted pixels must also be the displayed revision');
+    h.emit({ source: view, pageNumber: 1, imageRevision: 68, imagePassRevision: 68,
+        imageStatus: { final: true, failed: 0 }, imagePassStatus: { final: true, failed: 0 } });
+    await pending;
     assert.equal(h.captures.length, 2);
     assert.equal(h.listeners.size, 0); assert.equal(h.timers.size, 0);
 });
