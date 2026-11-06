@@ -10,7 +10,8 @@ import { formatProjectInfo, gatherProjectInfo } from './projectInfo';
 import { SandboxSafetyError } from './guard';
 import { LockTimeoutError } from './lock';
 import { describeFindings, describeRanges, exitStatusOf, pushCheck, RANGES_HELP } from './rangesCli';
-import { ControlAnswer, NoReplicaWindowError, ReplicaTimeoutError, requestReplica } from '../scm/replicaControl';
+import { ControlAnswer, NoReplicaWindowError, ReplicaCancelledError, ReplicaTimeoutError, requestReplica } from '../scm/replicaControl';
+import { reloadReplica, ReplicaReloadError } from '../scm/replicaReload';
 import { describe, ReplicaSync, SyncSummary } from '../scm/replicaSync';
 import { DEFAULT_IGNORE_PATTERNS, isReplicaOwnPath, REPLICA_SETTINGS_FILE } from '../scm/ignorePatterns';
 import { Repo } from '../gitbridge/plumbing';
@@ -50,6 +51,7 @@ usage:
   node out/sandbox/cli.js git-credential get|store|erase --server <name> --bridge <url>
   node out/sandbox/cli.js replica-sync   --replica <folder> [--timeout <s>] [--json]
   node out/sandbox/cli.js replica-status --replica <folder> [--json]
+  node out/sandbox/cli.js replica-reload --replica <folder> [--timeout <s>] [--json]
   node out/sandbox/cli.js replica-land   --replica <folder> [<commit>] [--from <repo>] [--push native|bridge] [--main <file>] [--no-compile] [--timeout <s>] [--json]
   node out/sandbox/cli.js replica-connect --replica <folder> --history <repo> [--ref <branch>] [--start-version <n>] [--not-own <glob>] [--pace <ms>] [--json]
   node out/sandbox/cli.js replica-bridge  --replica <folder> [--label <comment>] [--remote <name>] [--bridge <url>] [--json]
@@ -156,13 +158,22 @@ replica-sync    Asks the IDE window that keeps the replica in sync with Overleaf
 replica-status  Shows whether the window is connected to Overleaf, how it watches the
                 folder, what it synced in the last 10 minutes, and the replica's git state:
                 the checked-out commit and Overleaf's state (${OVERLEAF_REF}).
+replica-reload  Asks that replica's current host to reload its IDE window once, then waits
+                for a different extension host and its completed initial replica sync.
+                The answer includes both host identities, the new host's loaded local-build
+                stamp when present, and replica/git readiness. The IDE keeps its normal
+                unsaved-editor confirmation. An old host without this operation needs one
+                normal window reload after first installing a build that supports it.
 --timeout <s>   how long to wait for the window's answer; default 300
-Exit status of both: 0 in sync (replica-status: the window answered); 3 a file could not
+Exit status of replica-sync/status: 0 in sync (replica-status: the window answered); 3 a file could not
 be synced, has conflict markers, or waits for a deletion to be confirmed, listed; 4 an IDE
 window does not keep the folder in sync (the IDE is not running, or it has not opened the
 folder as a replica); 5 the window did not answer in time; 1 the tool failed, also when it
 cannot reach the window that keeps the folder in sync, e.g. as the socket's path is too
 long for the system (the message says why); 2 wrong arguments.
+replica-reload uses the same statuses, with 3 for rejected reload or incomplete readiness,
+and 130/143 when interrupted. Interrupting stops observation; an acknowledged IDE command
+is not repeated or undone. Command return alone never counts as a replacement host.
 
 replica-land    Lands <commit> of the replica's git repository in the project, then compiles
                 the project. The commit must descend from the checked-out commit, which
@@ -427,6 +438,40 @@ async function replicaCommand(command: 'replica-sync' | 'replica-status', folder
     return answer.ok ? 0 : 3;
 }
 
+async function replicaReloadCommand(folder: string, timeoutS: number, json: boolean): Promise<number> {
+    const cancellation = new AbortController();
+    let cancelledStatus = 130;
+    const interrupt = () => { cancellation.abort(); };
+    const terminate = () => { cancelledStatus = 143; cancellation.abort(); };
+    process.once('SIGINT', interrupt); process.once('SIGTERM', terminate);
+    try {
+        const report = await reloadReplica(folder, timeoutS * 1000, cancellation.signal);
+        if (json) { process.stdout.write(JSON.stringify(report, null, 2) + '\n'); }
+        else {
+            const git = report.readiness.git as { head?: string, overleaf?: string } | undefined;
+            process.stdout.write([
+                `${report.folder}: replacement extension host ${report.host.pid} acknowledged replica readiness`,
+                `host ${report.previousHost.id} -> ${report.host.id}`,
+                ...(report.host.build ? [`loaded build: ${report.host.build.label ?? report.host.build.commit} (${report.host.build.commit})`] : []),
+                ...(git ? [`git: HEAD ${git.head ?? 'none'}, ${OVERLEAF_REF} ${git.overleaf ?? 'none'}`] : []),
+            ].join('\n') + '\n');
+        }
+        return 0;
+    } catch (error) {
+        const message = errorMessage(error);
+        if (json) { process.stdout.write(JSON.stringify({ ok: false, error: message,
+            ...(error instanceof ReplicaReloadError && error.answer ? { readiness: error.answer } : {}) }, null, 2) + '\n'); }
+        else { log(message); }
+        if (error instanceof ReplicaCancelledError) { return cancelledStatus; }
+        if (error instanceof NoReplicaWindowError) { return 4; }
+        if (error instanceof ReplicaTimeoutError) { return 5; }
+        if (error instanceof ReplicaReloadError) { return 3; }
+        return 1;
+    } finally {
+        process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', terminate);
+    }
+}
+
 /** The paths the replica leaves out: its own folders, and its default ignore patterns; '/dir/name' */
 const replicaIgnored = (p: string) => isReplicaOwnPath(p) || DEFAULT_IGNORE_PATTERNS.some(g => minimatch(p, g, { dot: true }));
 
@@ -581,7 +626,7 @@ async function main(argv: string[]): Promise<number> {
     if (GIT_AND_INFO_COMMANDS.includes(command)) {
         return gitAndInfoCommand(command, values, flags, positional);
     }
-    if (!['init', 'status', 'compile', 'plan', 'ranges', 'push-check', 'replica-sync', 'replica-status', 'replica-land', 'replica-connect', 'replica-bridge'].includes(command)) { throw new UsageError(`unknown command ${command}`); }
+    if (!['init', 'status', 'compile', 'plan', 'ranges', 'push-check', 'replica-sync', 'replica-status', 'replica-reload', 'replica-land', 'replica-connect', 'replica-bridge'].includes(command)) { throw new UsageError(`unknown command ${command}`); }
     if (command === 'replica-connect' || command === 'replica-bridge') {
         if (!values.replica) { throw new UsageError('--replica is required'); }
         if (positional.length > 1) { throw new UsageError(`unexpected argument ${positional[1]}`); }
@@ -620,9 +665,10 @@ async function main(argv: string[]): Promise<number> {
         return exitStatusOf(result.findings);
     }
     if (!values.replica) { throw new UsageError('--replica is required'); }
-    if (command === 'replica-sync' || command === 'replica-status') {
+    if (command === 'replica-sync' || command === 'replica-status' || command === 'replica-reload') {
         const timeoutS = Number(values.timeout ?? 300);
-        if (!(timeoutS > 0)) { throw new UsageError('--timeout takes a number of seconds'); }
+        if (!(Number.isFinite(timeoutS) && timeoutS > 0)) { throw new UsageError('--timeout takes a positive finite number of seconds'); }
+        if (command === 'replica-reload') { return replicaReloadCommand(path.resolve(values.replica), timeoutS, flags.has('json')); }
         return await replicaCommand(command, path.resolve(values.replica), timeoutS, flags.has('json'));
     }
 

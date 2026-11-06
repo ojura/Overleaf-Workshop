@@ -371,6 +371,12 @@ interface Mode {
     remoteMove?: boolean,
 }
 
+interface FlushOptions {
+    skipRecentMs?: number, now?: number, record?: boolean, by?: 'tool' | 'user', approved?: ReadonlySet<string>, question?: Deletions,
+    /** a tool's request that the flush is a part of, e.g. a landing's (`ToolRequest`); a tool's flush makes its own otherwise */
+    request?: ToolRequest,
+}
+
 /** A mode that collects deletions. */
 function collecting(summary: SyncSummary, options: Partial<Pick<Mode, 'live' | 'tool' | 'request' | 'approved'>> = {}): Mode {
     return {deletions: 'collect', collected: {local: [], remote: []}, summary, ...options};
@@ -388,6 +394,8 @@ interface Slot {
     tail: Promise<void>,
     /** a reconcile that has not started yet; a new change joins it instead of queueing another */
     waiting?: Promise<void>,
+    /** most recent failure, until this path is reconciled successfully */
+    failure?: { error: string, recovery?: 'scan' | 'comparison' },
 }
 
 /** A three-way merge of one text, e.g. git's (the default). */
@@ -450,6 +458,7 @@ export class ReplicaSync {
     private saveTimer?: NodeJS.Timeout;
     private saving: Promise<void> = Promise.resolve();
     private fullSync?: Promise<SyncSummary>;
+    private comparisonGeneration = 0;
     private warnedConflicts = new Set<string>();
     /** reconciles scheduled and not finished */
     private active = 0;
@@ -550,6 +559,12 @@ export class ReplicaSync {
     get waitingFor(): string | undefined {
         return this.waitReason ?? this.lockWait?.stale;
     }
+
+    /** The comparison already owned by the sync, including catch-up after a Git wait. */
+    get currentComparison(): Promise<SyncSummary> | undefined { return this.fullSync; }
+
+    /** Changes when a comparison starts or finishes across a caller's other reads. */
+    get comparisonRevision(): number { return this.comparisonGeneration; }
 
     /**
      * The one check before the sync acts on the folder: every kind of sync, every deletion and
@@ -721,7 +736,13 @@ export class ReplicaSync {
      * starts, and again on request. Changes reported meanwhile are queued per file.
      */
     syncAll(): Promise<SyncSummary> {
-        this.fullSync ??= this.runSyncAll().finally(() => { this.fullSync = undefined; });
+        if (this.fullSync===undefined) {
+            this.comparisonGeneration++;
+            this.fullSync = this.runSyncAll().catch(error => {
+                this.noteFailure('/', error, emptySummary(), 'comparison');
+                throw error;
+            }).finally(() => { this.comparisonGeneration++; this.fullSync = undefined; });
+        }
         return this.fullSync;
     }
 
@@ -731,6 +752,7 @@ export class ReplicaSync {
     }
 
     private async runSyncAll(): Promise<SyncSummary> {
+        const failures = [...this.slots.values()].flatMap(slot => slot.failure ? [{slot, failure: slot.failure}] : []);
         this.cancelled = false;
         await this.load();
         const waiting = await this.mayAct();
@@ -780,6 +802,15 @@ export class ReplicaSync {
         }
         this.firstRunLocalOnly.clear();
         await this.saveNow();
+        if (!this.stopped && !this.cancelled && summary.notChecked===0 && summary.failed.length===0 && summary.waitingFor===undefined) {
+            // A complete comparison recovers aggregate folder/rename preparation too. A failure
+            // received during this comparison belongs to newer work and remains unresolved.
+            for (const {slot, failure} of failures) {
+                if (slot.failure===failure) { slot.failure = undefined; }
+            }
+        } else if (this.cancelled) {
+            this.noteFailure('/', new Error(`The full comparison was cancelled with ${summary.notChecked} files unchecked.`), summary, 'comparison');
+        }
         this.ui.log(`Sync finished: ${describe(summary)}.`);
         return summary;
     }
@@ -790,10 +821,15 @@ export class ReplicaSync {
             this.heldPaths.add(path);
             return;
         }
-        await this.load();
-        if (this.state.entries[path]!==undefined && await this.local.stat(path)===undefined) {
-            // a deletion: the creation of a renamed file is matched with it first
-            await new Promise(resolve => setTimeout(resolve, ReplicaSync.localDeleteDelayMs));
+        try {
+            await this.load();
+            if (this.state.entries[path]!==undefined && await this.local.stat(path)===undefined) {
+                // a deletion: the creation of a renamed file is matched with it first
+                await new Promise(resolve => setTimeout(resolve, ReplicaSync.localDeleteDelayMs));
+            }
+        } catch (error) {
+            this.noteFailure(path, error, emptySummary());
+            throw error;
         }
         return this.changed(path, false);
     }
@@ -871,7 +907,7 @@ export class ReplicaSync {
             await this.scheduleAll((await this.expand(to, true)).filter(p => !moved.has(p) && this.tracked(p)), mode);
         } catch (error) {
             // e.g. the folder is not the one the sync started with
-            mode.summary.failed.push({path: from, error: errorMessage(error)});
+            this.noteFailure(from, error, mode.summary);
             this.ui.log(`${from}: applying its rename to ${to} on Overleaf failed: ${errorMessage(error)}`);
         } finally {
             if (!waits && this.remoteMoves.get(from)===to) { this.remoteMoves.delete(from); }
@@ -915,15 +951,17 @@ export class ReplicaSync {
         if (this.stopped || path==='' || path==='/') { return; }
         await this.load();
         const mode = collecting(emptySummary(), {live: true});
+        const failure = this.slots.get(path)?.failure;
         try {
             // while the sync waits, the full sync after the wait takes this change in
             if (await this.mayAct()!==undefined) { return; }
             const paths = await this.expand(path, remote);
+            this.recoverFailure(path, failure);
             await this.scheduleAll(paths.filter(p => this.tracked(p)), mode);
             await this.applyDeletions(mode);
         } catch (error) {
             // e.g. Overleaf does not answer: the next full sync looks at the file again
-            mode.summary.failed.push({path, error: errorMessage(error)});
+            this.noteFailure(path, error, mode.summary);
             this.ui.log(`${path}: sync failed: ${errorMessage(error)}`);
         }
         this.scheduleSave();
@@ -968,11 +1006,22 @@ export class ReplicaSync {
      * saw open in the window (`questionOpened`): the answer names it, also when the user has
      * answered it since; without it, the answer names the question open at its end.
      */
-    async flush(scan: boolean, {skipRecentMs = 0, now = Date.now(), record = false, by, approved, question: seen, request: given}: {
-        skipRecentMs?: number, now?: number, record?: boolean, by?: 'tool' | 'user', approved?: ReadonlySet<string>, question?: Deletions,
-        /** a tool's request that the flush is a part of, e.g. a landing's (`ToolRequest`); a tool's flush makes its own otherwise */
-        request?: ToolRequest,
-    } = {}): Promise<SyncSummary> {
+    async flush(scan: boolean, options: FlushOptions = {}): Promise<SyncSummary> {
+        if (!scan) { return this.flushWork(false, options); }
+        const failure = this.slots.get('/')?.failure;
+        try {
+            const summary = await this.flushWork(true, options);
+            if (failure?.recovery==='scan' && summary.failed.length===0 && summary.waitingFor===undefined) {
+                this.recoverFailure('/', failure);
+            }
+            return summary;
+        } catch (error) {
+            this.noteFailure('/', error, emptySummary(), 'scan');
+            throw error;
+        }
+    }
+
+    private async flushWork(scan: boolean, {skipRecentMs = 0, now = Date.now(), record = false, by, approved, question: seen, request: given}: FlushOptions): Promise<SyncSummary> {
         await this.load();
         const request = by==='tool' ? given ?? {} : undefined;
         const summary = emptySummary();
@@ -1028,6 +1077,21 @@ export class ReplicaSync {
         } else {
             this.scheduleSave();
         }
+        return summary;
+    }
+
+    /** Current unresolved outcomes after queued work, without starting another folder scan. */
+    async readiness(): Promise<SyncSummary> {
+        const summary = await this.flush(false, {record: true, by: 'tool'});
+        for (const [path, slot] of this.slots) {
+            if (slot.failure!==undefined && !summary.failed.some(failure => failure.path===path)) {
+                summary.failed.push({path, error: slot.failure.error});
+            }
+        }
+        for (const [path, entry] of Object.entries(this.state.entries)) {
+            if (entry.conflict && !summary.conflicts.includes(path)) { summary.conflicts.push(path); }
+        }
+        summary.skippedDeletions = [...new Set([...summary.skippedDeletions, ...this.declined.local, ...this.declined.remote])];
         return summary;
     }
 
@@ -1114,6 +1178,18 @@ export class ReplicaSync {
         return slot;
     }
 
+    private noteFailure(path: string, error: unknown, summary: SyncSummary, recovery?: 'scan' | 'comparison') {
+        const message = errorMessage(error);
+        const slot = this.slotOf(path);
+        slot.failure = {error: message, recovery: slot.failure?.recovery==='comparison' ? 'comparison' : recovery};
+        summary.failed.push({path, error: message});
+    }
+
+    private recoverFailure(path: string, failure: Slot['failure']) {
+        const slot = this.slots.get(path);
+        if (slot && slot.failure===failure) { slot.failure = undefined; }
+    }
+
     /** Reconcile `path`, in its queue already; a failure goes into the summary and the log. */
     private async reconcileReported(path: string, mode: Mode): Promise<void> {
         await this.reported(path, mode, () => this.reconcile(path, mode));
@@ -1178,8 +1254,10 @@ export class ReplicaSync {
     private async reported(path: string, mode: Mode, work: () => Promise<void>): Promise<string | undefined> {
         try {
             for (;;) {
+                const failure = this.slots.get(path)?.failure;
                 try {
                     await work();
+                    this.recoverFailure(path, failure);
                     return undefined;
                 } catch (error) {
                     if (error instanceof StaleReadError) {
@@ -1194,7 +1272,7 @@ export class ReplicaSync {
                         mode.summary.waitingFor ??= error.reason;
                         return error.reason;
                     }
-                    mode.summary.failed.push({path, error: errorMessage(error)});
+                    this.noteFailure(path, error, mode.summary);
                     this.ui.log(`${path}: sync failed: ${errorMessage(error)}`);
                     return undefined;
                 }
@@ -1309,7 +1387,7 @@ export class ReplicaSync {
             }
         } catch (error) {
             // e.g. the folder is not the one the sync started with: the deletions not made yet wait
-            for (const path of open) { summary.failed.push({path, error: errorMessage(error)}); }
+            for (const path of open) { this.noteFailure(path, error, summary); }
             this.ui.log(`Deleting ${open.size} files failed: ${errorMessage(error)}`);
         }
     }
@@ -1414,6 +1492,9 @@ export class ReplicaSync {
         // answers; until then the next sync decides
         const disconnected = remote===undefined ? this.remote.disconnected() : undefined;
         if (disconnected) { throw disconnected; }
+        // A declined deletion applies only while that side is still missing.
+        if (remoteHash!==undefined || localHash===undefined) { this.declined.local.delete(path); }
+        if (localHash!==undefined || remoteHash===undefined) { this.declined.remote.delete(path); }
         if (localHash===undefined && remoteHash===undefined) {
             if (entry) {
                 delete this.state.entries[path];
@@ -1836,7 +1917,7 @@ export class ReplicaSync {
             await this.scheduleAll(paths, mode);
             await this.applyDeletions(mode);
         } catch (error) {
-            mode.summary.failed.push(...paths.map(path => ({path, error: errorMessage(error)})));
+            for (const path of paths) { this.noteFailure(path, error, mode.summary); }
         }
         this.scheduleSave();
         this.ui.liveResult(mode.summary);

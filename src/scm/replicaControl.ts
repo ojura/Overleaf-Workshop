@@ -23,9 +23,58 @@ import { REPLICA_FOLDER } from './ignorePatterns';
  *   {"op":"land","commit":"<id>"}
  *                    push a commit that descends from the checked-out one: fast-forward the
  *                    branch to it, upload what it changed and wait for Overleaf's acknowledgements
+ *   {"op":"host"}   this extension host's identity and reload support
+ *   {"op":"ready","folder":"<canonical path>","host":"<id>"}
+ *                    acknowledge this host's completed initial sync and queued work
+ *   {"op":"reload","folder":"<canonical path>","host":"<id>","id":"<request>"}
+ *                    acknowledge readiness, then request one window reload; a tool observes
+ *                    the replacement pointer and asks that different host for readiness
  */
-export type ControlRequest = { op: 'status' } | { op: 'sync' } | { op: 'land', commit: string };
+export type ControlRequest = { op: 'status' } | { op: 'sync' } | { op: 'land', commit: string }
+    | { op: 'host' }
+    | { op: 'ready', folder: string, host: string }
+    | { op: 'reload', folder: string, host: string, id: string };
 export type ControlAnswer = { ok: true, [key: string]: unknown } | { ok: false, error: string, [key: string]: unknown };
+
+export interface ReplicaHostIdentity {
+    id: string;
+    pid: number;
+    since: string;
+    build?: { commit: string, label?: string };
+}
+
+/** Read once in the extension host, so installing new files does not relabel a running host. */
+function installedBuild(): ReplicaHostIdentity['build'] {
+    try {
+        const value = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../.overleaf-workshop-build.json'), 'utf8'));
+        if (typeof value.commit === 'string' && /^[a-f0-9]{40}$/.test(value.commit)) {
+            return { commit: value.commit, ...(typeof value.label === 'string' ? { label: value.label } : {}) };
+        }
+    } catch { /* A development checkout or gallery install has no local build stamp. */ }
+    return undefined;
+}
+
+const extensionHost: ReplicaHostIdentity = Object.freeze({
+    id: crypto.randomUUID(), pid: process.pid, since: new Date().toISOString(), build: installedBuild(),
+});
+
+export function canonicalReplicaFolder(folder: string): string {
+    try { return fs.realpathSync(folder); } catch { return path.resolve(folder); }
+}
+
+interface ReloadRequest {
+    id: string;
+    state: 'preparing' | 'accepted' | 'requested' | 'submitted' | 'rejected' | 'cancelled';
+    error?: string;
+    answer: Promise<ControlAnswer>;
+    invoked: boolean;
+}
+
+export interface ReplicaControlOptions {
+    /** Defaults to the identity captured once by this extension host. */
+    host?: ReplicaHostIdentity;
+    reload?(): unknown;
+}
 
 /** The file in a replica's folder that names the socket of the window keeping the folder in sync. */
 export const POINTER_FILE = `${REPLICA_FOLDER}/control.json`;
@@ -124,6 +173,10 @@ export class ReplicaControlServer {
     private disposed = false;
     /** whether this server wrote the pointer file, with its socket or with why it cannot listen */
     private pointerWritten = false;
+    private readonly instance = crypto.randomUUID();
+    private readonly connections = new Set<net.Socket>();
+    private reloadRequest?: ReloadRequest;
+    readonly host: ReplicaHostIdentity;
 
     /**
      * @param folder the replica's folder
@@ -132,9 +185,10 @@ export class ReplicaControlServer {
      */
     constructor(
         private readonly folder: string,
-        private readonly handle: (request: ControlRequest) => Promise<ControlAnswer>,
+        private readonly handle: (request: ControlRequest, signal?: AbortSignal) => Promise<ControlAnswer>,
         private readonly log: (message: string) => void,
-    ) {}
+        private readonly options: ReplicaControlOptions = {},
+    ) { this.host = options.host ?? extensionHost; }
 
     /** Listen; the socket's path, or undefined when another window keeps this folder in sync or the socket cannot be used. */
     async start(): Promise<string | undefined> {
@@ -193,6 +247,9 @@ export class ReplicaControlServer {
     }
 
     private serve(connection: net.Socket) {
+        const lifetime = new AbortController();
+        this.connections.add(connection);
+        connection.once('close', () => { this.connections.delete(connection); lifetime.abort(); });
         let buffer = '';
         connection.setEncoding('utf8');
         connection.on('error', () => { /* the program went away */ });
@@ -202,34 +259,108 @@ export class ReplicaControlServer {
             while ((newline = buffer.indexOf('\n')) >= 0) {
                 const line = buffer.slice(0, newline).trim();
                 buffer = buffer.slice(newline + 1);
-                if (line) { void this.answer(connection, line); }
+                if (line) { void this.answer(connection, line, lifetime.signal); }
             }
         });
     }
 
-    private async answer(connection: net.Socket, line: string) {
+    private async answer(connection: net.Socket, line: string, signal?: AbortSignal) {
         let answer: ControlAnswer;
+        let reload: ReloadRequest | undefined;
         try {
             const request = JSON.parse(line);
-            answer = (request?.op === 'status' || request?.op === 'sync' || (request?.op === 'land' && typeof request.commit === 'string'))
-                ? await this.handle(request)
-                : { ok: false, error: `unknown request ${JSON.stringify(request?.op)}` };
+            const identity = { folder: canonicalReplicaFolder(this.folder), host: this.host };
+            if (request?.op === 'host') {
+                answer = { ok: true, ...identity, reloadSupported: !!this.options.reload };
+            } else if (request?.op === 'reload' || request?.op === 'ready') {
+                if (typeof request.folder !== 'string' || canonicalReplicaFolder(request.folder) !== identity.folder) {
+                    answer = { ok: false, error: 'The requested replica folder is not owned by this window.', ...identity };
+                } else if (request.host !== this.host.id) {
+                    answer = { ok: false, error: 'The requested extension host is obsolete.', ...identity };
+                } else if (request.op === 'ready') {
+                    const result = await this.handle(request, signal);
+                    answer = { ...result, ...identity, ready: result.ok };
+                } else if (!this.options.reload) {
+                    answer = { ok: false, error: 'This extension host does not support window reload.', ...identity };
+                } else if (typeof request.id !== 'string' || !/^[a-zA-Z0-9-]{1,100}$/.test(request.id)) {
+                    answer = { ok: false, error: 'A reload request identity is required.', ...identity };
+                } else {
+                    const current = this.reloadRequest;
+                    if (current && current.id !== request.id && ['preparing', 'accepted', 'requested'].includes(current.state)) {
+                        answer = { ok: false, error: 'Another window reload is already requested.', ...identity };
+                    } else {
+                        const record = current && current.id === request.id ? current : this.prepareReload(request, signal);
+                        reload = record;
+                        answer = await record.answer;
+                    }
+                }
+            } else {
+                answer = (request?.op === 'status' || request?.op === 'sync' || (request?.op === 'land' && typeof request.commit === 'string'))
+                    ? await this.handle(request)
+                    : { ok: false, error: `unknown request ${JSON.stringify(request?.op)}` };
+            }
         } catch (error: any) {
             answer = { ok: false, error: String(error?.message ?? error) };
         }
-        if (!connection.destroyed) { connection.write(JSON.stringify(answer) + '\n'); }
+        if (!connection.destroyed) {
+            connection.write(JSON.stringify(answer) + '\n', error => {
+                if (!reload || !answer.ok) { return; }
+                if (error && !reload.invoked && reload.state === 'accepted') {
+                    this.reloadState(reload, 'cancelled', 'The reload acknowledgement could not be written: ' + error.message);
+                } else if (!error) { this.invokeReload(reload); }
+            });
+        } else if (reload && !reload.invoked && reload.state === 'accepted') {
+            this.reloadState(reload, 'cancelled', 'The requester disconnected before reload was acknowledged.');
+        }
+    }
+
+    private prepareReload(request: Extract<ControlRequest, { op: 'reload' }>, signal?: AbortSignal): ReloadRequest {
+        const record: ReloadRequest = { id: request.id, state: 'preparing', invoked: false, answer: Promise.resolve({ ok: false, error: 'Reload preparation is pending.' }) };
+        this.reloadRequest = record;
+        record.answer = Promise.resolve().then(() => this.handle(request, signal)).then(result => {
+            if (this.disposed || this.reloadRequest !== record) { return { ok: false, error: 'The reload owner was replaced.' } as ControlAnswer; }
+            this.reloadState(record, result.ok ? 'accepted' : 'rejected', result.ok ? undefined : result.error);
+            return { ...result, folder: canonicalReplicaFolder(this.folder), host: this.host,
+                reload: { id: record.id, state: record.state } };
+        }, error => {
+            const message = String(error?.message ?? error);
+            this.reloadState(record, signal?.aborted ? 'cancelled' : 'rejected', message);
+            return { ok: false, error: message, folder: canonicalReplicaFolder(this.folder), host: this.host };
+        });
+        return record;
+    }
+
+    private invokeReload(record: ReloadRequest) {
+        if (this.disposed || this.reloadRequest !== record || record.invoked || record.state !== 'accepted') { return; }
+        record.invoked = true;
+        this.reloadState(record, 'requested');
+        Promise.resolve().then(() => this.options.reload!()).then(value => {
+            this.reloadState(record, value === false ? 'cancelled' : 'submitted', value === false ? 'The IDE cancelled the window reload.' : undefined);
+        }, error => this.reloadState(record, 'rejected', String(error?.message ?? error)));
+    }
+
+    private reloadState(record: ReloadRequest, state: ReloadRequest['state'], error?: string) {
+        if (this.disposed || this.reloadRequest !== record) { return; }
+        record.state = state; record.error = error;
+        if (this.socket) { this.writePointer({ socket: this.socket }, true); }
     }
 
     /** Name the socket in the folder, or why this window cannot listen, for the tools that look there. */
-    private writePointer(content: { socket: string } | { error: string }) {
+    private writePointer(content: { socket: string } | { error: string }, onlyOwned = false) {
         try {
             const file = path.join(this.folder, POINTER_FILE);
+            if (onlyOwned) {
+                try { if (JSON.parse(fs.readFileSync(file, 'utf8')).instance !== this.instance) { return; } }
+                catch { return; }
+            }
             fs.mkdirSync(path.dirname(file), { recursive: true });
             // a new file renamed over the old one, so that a tool reads all of it or the one before
             const tmp = `${file}.${process.pid}.tmp`;
             const processStart = processStartTime(process.pid);
             fs.writeFileSync(tmp, JSON.stringify({
                 ...content, pid: process.pid, ...(processStart === undefined ? {} : { processStart }), since: new Date().toISOString(),
+                instance: this.instance, host: this.host, folder: canonicalReplicaFolder(this.folder),
+                ...(this.reloadRequest ? { reload: { id: this.reloadRequest.id, state: this.reloadRequest.state, error: this.reloadRequest.error } } : {}),
             }, null, 4) + '\n');
             fs.renameSync(tmp, file);
             this.pointerWritten = true;
@@ -242,6 +373,7 @@ export class ReplicaControlServer {
         this.disposed = true;
         const socket = this.socket;
         this.server?.close();
+        for (const connection of this.connections) { connection.destroy(); }
         this.server = undefined;
         this.socket = undefined;
         if (socket !== undefined && process.platform !== 'win32') { fs.rmSync(socket, { force: true }); }
@@ -249,7 +381,7 @@ export class ReplicaControlServer {
         try {
             const file = path.join(this.folder, POINTER_FILE);
             const pointer = JSON.parse(fs.readFileSync(file, 'utf8'));
-            if (pointer.pid === process.pid && (pointer.socket === socket || typeof pointer.error === 'string')) { fs.rmSync(file, { force: true }); }
+            if (pointer.instance === this.instance) { fs.rmSync(file, { force: true }); }
         } catch { /* gone, or another window's */ }
     }
 }
@@ -264,6 +396,8 @@ export class NoReplicaWindowError extends Error {}
 export class ReplicaUnreachableError extends Error {}
 /** The window did not answer in time. */
 export class ReplicaTimeoutError extends Error {}
+/** The caller stopped waiting; an already acknowledged reload is not repeated or undone. */
+export class ReplicaCancelledError extends Error {}
 
 /** The socket a program should use for `folder`: the one the window named, else the computed one. */
 export function findReplicaSocket(folder: string): string {
@@ -327,7 +461,8 @@ function processStartTime(pid: number): number | undefined {
 }
 
 /** Send one request to the window that keeps `folder` in sync and wait for its answer. */
-export function requestReplica(folder: string, request: ControlRequest, timeoutMs: number): Promise<ControlAnswer> {
+export function requestReplica(folder: string, request: ControlRequest, timeoutMs: number, signal?: AbortSignal): Promise<ControlAnswer> {
+    if (signal?.aborted) { return Promise.reject(new ReplicaCancelledError('The replica request was cancelled.')); }
     let located: { socket: string, named: boolean };
     try {
         located = locateReplicaSocket(folder);
@@ -348,11 +483,13 @@ export function requestReplica(folder: string, request: ControlRequest, timeoutM
     return new Promise((resolve, reject) => {
         let buffer = '';
         let settled = false;
-        const finish = (fn: () => void) => { if (!settled) { settled = true; clearTimeout(timer); client.destroy(); fn(); } };
+        const finish = (fn: () => void) => { if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener('abort', cancel); client.destroy(); fn(); } };
         const client = net.connect(socket);
         const timer = setTimeout(() => finish(() => reject(new ReplicaTimeoutError(
             `the IDE window did not answer within ${Math.round(timeoutMs / 1000)} s (${socket})`))), timeoutMs);
         client.setEncoding('utf8');
+        const cancel = () => finish(() => reject(new ReplicaCancelledError('The replica request was cancelled.')));
+        signal?.addEventListener('abort', cancel, { once: true });
         client.once('connect', () => client.write(JSON.stringify(request) + '\n'));
         client.on('data', chunk => {
             buffer += chunk;

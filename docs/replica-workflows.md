@@ -35,6 +35,52 @@ do not start a compile. They pause while the window is unfocused, every PDF of t
 project is hidden, the project is disconnected, or this window is compiling it.
 Closing the project cancels its refresh lifecycle.
 
+## Reloading the replica's IDE window
+
+After installing an extension build, ask the window that owns the replica to reload and
+wait for its replacement extension host:
+
+```sh
+node out/sandbox/cli.js replica-reload --replica <folder> --timeout 120 --json
+```
+
+The command uses the existing private replica control socket. It checks the canonical
+folder and current host identity, waits for the current replica's initial comparison and
+queued synchronization to finish, then submits `workbench.action.reloadWindow` once. The
+IDE retains its normal unsaved-editor confirmation.
+
+The tool observes replacement of `.overleaf/control.json` through filesystem events. A
+different extension host must answer for that same folder, finish its initial comparison,
+drain complete received file events and report a live Overleaf connection. The wait includes
+event preparation before a path is queued, a comparison already catching up after a Git wait,
+and a deletion question that opens while it waits. Failed preparation or transfers, unchecked
+files after cancellation, conflicts and pending deletion confirmations prevent success.
+Readiness checks received-work revisions across its asynchronous Git snapshot and reads the
+sync owner's current outcomes. A successful path reconciliation clears the earlier failure it
+observed; a successful scan clears its preceding enumeration failure. A complete successful
+comparison also clears preceding folder and comparison failures. Newer failures remain for
+their own recovery, and declined deletions remain incomplete until resolved. This uses the
+existing synchronization lifecycle without requesting another full folder scan.
+
+The JSON receipt contains `previousHost`, `host`, `readiness` and `elapsedMs`. Each host has
+an instance ID, PID and start time; local installations also report the build commit and
+label captured when that host loaded. `readiness` includes the initial comparison, drained
+work, connection and Git state. A restarted control socket in the same host cannot satisfy
+the replacement check. Deployment scripts can compare `host.build.commit` with the commit
+they installed.
+
+One timeout covers preparation, host replacement and readiness. The command closes its
+watcher, sockets and cancellation listeners on completion or failure. Ctrl+C stops waiting;
+an already acknowledged IDE reload continues. The command never resubmits a timed-out
+reload. If the IDE rejects the command, its error is returned; if an unsaved-editor prompt
+keeps the old host alive, the replacement deadline expires.
+
+Exit status is `0` for an acknowledged ready replacement, `3` for rejection or incomplete
+readiness, `4` when no window owns the replica, `5` for timeout, `130`/`143` for interruption,
+`2` for invalid arguments and `1` for another failure. A host predating this operation needs
+one ordinary **Developer: Reload Window** after the first supporting build is installed;
+subsequent installs can use this command. The command does not install extension files.
+
 ## The repository
 
 The replica folder is the work tree of a repository of its own, with `.git` at the folder's

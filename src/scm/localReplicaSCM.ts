@@ -12,7 +12,7 @@ import {
 import { DEFAULT_IGNORE_PATTERNS, IgnoreMatcher, isReplicaOwnPath, REPLICA_CONFLICTS_FOLDER, REPLICA_SETTINGS_FILE, REPLICA_TEMPORARY_FOLDER } from './ignorePatterns';
 import * as localFs from './localFolderFs';
 import { LocalFolderWatcher } from './localFolderWatcher';
-import { ControlAnswer, ControlRequest, ReplicaControlServer } from './replicaControl';
+import { ControlAnswer, ControlRequest, ReplicaCancelledError, ReplicaControlServer } from './replicaControl';
 import { ReplicaModes, replicaModes } from './replicaModes';
 import { GitReplicaStore, OVERLEAF_REF, Person } from './replicaGit';
 import type { HistoryUpdate } from '../gitbridge/history';
@@ -21,7 +21,25 @@ import { errorMessage } from '../utils/errorMessage';
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 
 interface ReplicaProjectSettings { uri: string; [key: string]: unknown }
+type InitialSyncResult = { summary: SyncSummary } | { error: string };
 class InvalidReplicaSettingsError extends Error {}
+
+function checkControlRequest(signal?: AbortSignal) {
+    if (signal?.aborted) { throw new ReplicaCancelledError('The replica request was cancelled.'); }
+}
+
+/** Stop a tool's wait without cancelling synchronization owned by the replica. */
+async function waitForControl<T>(signal: AbortSignal | undefined, work: () => Promise<T>): Promise<T> {
+    checkControlRequest(signal);
+    if (!signal) { return work(); }
+    let cancel!: () => void;
+    const stopped = new Promise<never>((_resolve, reject) => {
+        cancel = () => reject(new ReplicaCancelledError('The replica request was cancelled.'));
+        signal.addEventListener('abort', cancel, { once: true });
+    });
+    try { return await Promise.race([work(), stopped]); }
+    finally { signal.removeEventListener('abort', cancel); }
+}
 
 /**
  * How often a replica that syncs the changes of other programs also scans its folder, in case a
@@ -62,14 +80,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private sync?: ReplicaSync;
     private store?: GitReplicaStore;
     private ready?: Promise<vscode.Disposable[]>;
-    private fullSync?: Promise<void>;
+    private fullSync?: Promise<InitialSyncResult>;
     private reportProgress?: (done: number, total: number) => void;
     private fullSyncRunning = false;
     /** a notice about files that failed to sync is open */
     private failureNoticeOpen = false;
     /** the status bar message that says why the sync waits (ReplicaSync.waitingFor) */
     private waitingMessage?: vscode.Disposable;
-    private running = 0;
+    /** Complete received events, including preparation before their per-path queues. */
+    private readonly liveWork = new Set<Promise<void>>();
+    private receivedRevision = 0;
     /** the IDE's watcher of the local folder, only where Node's watcher cannot watch it */
     private localWatcher?: vscode.FileSystemWatcher;
     /** what reports changes of the local folder: Node's watcher, or the IDE's */
@@ -722,26 +742,48 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     /** Keep the SCM status on push or pull while event-driven work runs. */
-    private track(status: 'push' | 'pull', message: string, work: Promise<void>) {
-        this.running += 1;
+    private track(status: 'push' | 'pull', message: string, work: Promise<void>): Promise<void> {
+        this.receivedRevision++;
         this.status = {status, message};
-        work.catch(error => log(`[${this.vfs.projectName}] ${message}: ${error}`)).finally(() => {
-            this.running -= 1;
-            if (this.running===0 && !this.fullSyncRunning) {
+        const owned = work.catch(error => log(`[${this.vfs.projectName}] ${message}: ${error}`)).finally(() => {
+            this.receivedRevision++;
+            this.liveWork.delete(owned);
+            if (this.liveWork.size===0 && !this.fullSyncRunning) {
                 this.status = {status: 'idle', message: ''};
             }
         });
+        this.liveWork.add(owned);
+        return owned;
+    }
+
+    /** Wait for received events, returning an intervening user question instead of waiting for its answer. */
+    private async receivedWork(signal?: AbortSignal): Promise<Deletions | undefined> {
+        const sync = this.sync!;
+        for (;;) {
+            checkControlRequest(signal);
+            if (sync.openQuestion) { return sync.openQuestion; }
+            const pending: Promise<unknown>[] = [...this.liveWork, ...(this.scanning ? [this.scanning] : [])];
+            if (sync.currentComparison) { pending.push(sync.currentComparison.catch(() => undefined)); }
+            if (pending.length===0) { return undefined; }
+            const question = sync.questionOpened();
+            try {
+                const opened = sync.openQuestion ?? await waitForControl(signal, () => Promise.race([
+                    question.opened, Promise.all(pending).then(() => undefined),
+                ]));
+                if (opened) { return opened; }
+            } finally { question.dispose(); }
+        }
     }
 
     /** Compare all files on both sides; changes on either side keep syncing whatever happens here. */
-    private syncAll(): Promise<void> {
+    private syncAll(): Promise<InitialSyncResult> {
         this.fullSync = this.runSyncAll();
         return this.fullSync;
     }
 
-    private async runSyncAll() {
+    private async runSyncAll(): Promise<InitialSyncResult> {
         const sync = this.sync;
-        if (sync===undefined) { return; }
+        if (sync===undefined) { return { error: 'This local replica has not started.' }; }
         const retry = vscode.l10n.t('Retry');
         this.fullSyncRunning = true;
         this.status = {status: 'pull', message: vscode.l10n.t('Syncing')};
@@ -766,6 +808,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 vscode.l10n.t('$(cloud) Overleaf: {count} files synced, {unchanged} unchanged', {count: changed, unchanged: summary.unchanged}), 10000);
             // not awaited: the sync is over even while the notification waits for an answer
             this.report(summary);
+            return { summary };
         } catch (error) {
             log(`[${this.vfs.projectName}] The sync failed: ${error}`);
             const message = vscode.l10n.t('The sync of "{folder}" with Overleaf failed: {error}. Changes on either side are still synced as they happen.',
@@ -773,10 +816,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             vscode.window.showWarningMessage(message, retry).then(choice => {
                 if (choice===retry) { this.syncAll(); }
             });
+            return { error: errorMessage(error) };
         } finally {
             this.reportProgress = undefined;
             this.fullSyncRunning = false;
-            if (this.running===0) {
+            if (this.liveWork.size===0) {
                 this.status = {status: 'idle', message: ''};
             }
         }
@@ -834,7 +878,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
      * before the full sync under way is done, e.g. the full sync's own question; undefined when
      * the full sync is done first. A tool waits for neither.
      */
-    private async questionComesFirst(): Promise<Deletions | undefined> {
+    private async questionComesFirst(signal?: AbortSignal): Promise<Deletions | undefined> {
+        checkControlRequest(signal);
         const sync = this.sync!;
         // a question open now comes first, whether or not the full sync is done
         const open = sync.openQuestion;
@@ -842,7 +887,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const question = sync.questionOpened();
         try {
             // when both have settled, Promise.race takes the first of the list: the question
-            return await Promise.race([question.opened, (this.fullSync ?? Promise.resolve()).then(() => undefined)]);
+            return await waitForControl(signal, () => Promise.race([question.opened, (this.fullSync ?? Promise.resolve()).then(() => undefined)]));
         } finally {
             question.dispose();
         }
@@ -904,10 +949,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     /** Look for files changed on disk that no event reported, unless a full sync or a scan runs. */
     private scanFolder(): Promise<void> | undefined {
         if (this.scanning || this.fullSyncRunning || this.sync===undefined) { return this.scanning; }
+        this.receivedRevision++;
         const sync = this.sync;
         this.scanning = sync.flush(true, {skipRecentMs: SCAN_SKIP_RECENT_MS})
             .then(() => {}, error => log(`[${this.vfs.projectName}] The scan of the folder failed: ${error}`))
-            .finally(() => { this.scanning = undefined; });
+            .finally(() => { this.receivedRevision++; this.scanning = undefined; });
         return this.scanning;
     }
 
@@ -970,11 +1016,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return {head, overleaf, branch, unmerged};
     }
 
-    /** Answer a tool's request on the control socket (src/scm/replicaControl.ts). */
-    private async answerTool(request: ControlRequest): Promise<ControlAnswer> {
+    private toolState() {
         const question = this.sync?.openQuestion;
         const waiting = this.sync?.waitingFor;
-        const state = {
+        return {
             folder: this.baseUri.fsPath,
             project: {id: this.vfs.projectId, name: this.vfs.projectName, server: this.vfs.serverName},
             connected: this.vfs.connected,
@@ -984,6 +1029,55 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             question: question && {...question, message: this.deletionsWaiting(question, true)},
             waiting: waiting && {reason: waiting, message: this.waitingText(waiting)},
         };
+    }
+
+    /** Initial sync and already queued work supply readiness without starting another folder scan. */
+    private async toolReady(signal?: AbortSignal): Promise<ControlAnswer> {
+        checkControlRequest(signal);
+        if (!this.ready || !this.sync) { return { ok: false, error: 'This local replica has not started.', ...this.toolState() }; }
+        await waitForControl(signal, () => this.ready!);
+        for (;;) {
+            const current = this.fullSync;
+            const question = await this.questionComesFirst(signal) ?? await this.receivedWork(signal);
+            if (question) { return { ok: false, error: this.deletionsWaiting(question, true), ...this.toolState() }; }
+            if (current !== this.fullSync) { continue; }
+            const initial = await waitForControl(signal, () => current ?? Promise.resolve(undefined));
+            if (!initial || 'error' in initial) {
+                return { ok: false, error: initial?.error ?? 'The initial replica sync has not run.', ...this.toolState() };
+            }
+            const initialProblems = this.syncProblems(initial.summary);
+            if (initial.summary.notChecked) { initialProblems.push(`The initial sync left ${initial.summary.notChecked} files unchecked.`); }
+            if (initialProblems.length) { return { ok: false, error: initialProblems.join('; '), ...this.toolState(), initialSync: initial.summary }; }
+            const receivedRevision = this.receivedRevision, comparisonRevision = this.sync.comparisonRevision;
+            checkControlRequest(signal);
+            const observing = this.sync.questionOpened();
+            let summary: SyncSummary;
+            try {
+                const outcome = await waitForControl(signal, () => Promise.race([
+                    observing.opened.then(question => ({question})),
+                    this.sync!.readiness().then(summary => ({summary})),
+                ]));
+                if ('question' in outcome) { return { ok: false, error: this.deletionsWaiting(outcome.question, true), ...this.toolState() }; }
+                summary = outcome.summary;
+            } finally { observing.dispose(); }
+            const git = await waitForControl(signal, () => this.gitState());
+            if (current !== this.fullSync || receivedRevision !== this.receivedRevision || comparisonRevision !== this.sync.comparisonRevision
+                || this.liveWork.size>0 || this.scanning || this.sync.currentComparison) { continue; }
+            for (const file of git?.unmerged ?? []) {
+                const path = '/' + file;
+                if (!summary.conflicts.includes(path)) { summary.conflicts.push(path); }
+            }
+            const problems = this.syncProblems(summary);
+            if (!this.vfs.connected) { problems.push('The replica is not connected to Overleaf.'); }
+            const result = { ...this.toolState(), initialSync: initial.summary, summary, git, recent: [...this.recent] };
+            return problems.length ? { ok: false, error: problems.join('; '), ...result } : { ok: true, ...result };
+        }
+    }
+
+    /** Answer a tool's request on the control socket (src/scm/replicaControl.ts). */
+    private async answerTool(request: ControlRequest, signal?: AbortSignal): Promise<ControlAnswer> {
+        if (request.op === 'ready' || request.op === 'reload') { return this.toolReady(signal); }
+        const state = this.toolState();
         if (request.op==='status') {
             return {ok: true, ...state, git: await this.gitState(), recent: [...this.recent]};
         }
@@ -1063,9 +1157,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
      * creations and removals sync, as with the IDE's watcher: a file that was synced before and
      * is still there was changed.
      */
-    private async localEvent(sync: ReplicaSync, path: string, syncOnFileChange: boolean, onLocal: (path: string) => void) {
+    private async localEvent(sync: ReplicaSync, path: string, syncOnFileChange: boolean, onLocal: (path: string) => Promise<void> | undefined) {
         if (syncOnFileChange) {
-            onLocal(path);
+            await onLocal(path);
             return;
         }
         let exists = true;
@@ -1073,10 +1167,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             await localFs.stat(vscode.Uri.joinPath(this.baseUri, path));
         } catch (error) {
             // a file that cannot be looked at goes to the sync, which reports why
-            if (!localFs.isMissing(error)) { onLocal(path); return; }
+            if (!localFs.isMissing(error)) { await onLocal(path); return; }
             exists = false;
         }
-        if (exists !== await sync.knows(path)) { onLocal(path); }
+        if (exists !== await sync.knows(path)) { await onLocal(path); }
     }
 
     private async initWatch() {
@@ -1142,10 +1236,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 void vscode.window.showInformationMessage(vscode.l10n.t('Overleaf Workshop: {0}', notice));
             }
         }
-        const onLocal = (path: string) => {
+        const localChange = (path: string) => {
             if (!isReplicaOwnPath(path)) {
-                this.track('push', path, sync.localChanged(path));
+                return sync.localChanged(path);
             }
+        };
+        const onLocal = (path: string) => {
+            const work = localChange(path);
+            if (work) { this.track('push', path, work); }
         };
         const onLocalUri = (uri: vscode.Uri) => {
             const path = this.localPath(uri);
@@ -1185,7 +1283,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // IDE's watcher only where Node's cannot watch the folder.
         const folderWatcher = new LocalFolderWatcher(
             this.baseUri.fsPath,
-            path => { void this.localEvent(sync, path, syncOnFileChange, onLocal); },
+            path => { this.track('push', path, this.localEvent(sync, path, syncOnFileChange, localChange)); },
             reason => {
                 log(`[${this.vfs.projectName}] Looking at the whole folder: ${reason}.`);
                 void this.scanFolder();
@@ -1199,7 +1297,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             let timer: NodeJS.Timeout | undefined;
             const gitWatcher = fs.watch(gitDir, {persistent: false}, () => {
                 clearTimeout(timer);
-                timer = setTimeout(() => { void sync.gitChanged(); }, LocalFolderWatcher.quietMs);
+                timer = setTimeout(() => { this.track('pull', 'Git state', sync.gitChanged()); }, LocalFolderWatcher.quietMs);
             });
             gitWatcher.on('error', error => {
                 log(`[${this.vfs.projectName}] Watching the git folder stopped (${error}); the sync checks git's state when it next acts.`);
@@ -1233,8 +1331,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
 
         // tools ask for a sync on the control socket
-        const control = new ReplicaControlServer(this.baseUri.fsPath, request => this.answerTool(request),
-                                                 message => log(`[${this.vfs.projectName}] ${message}`));
+        const control = new ReplicaControlServer(this.baseUri.fsPath, (request, signal) => this.answerTool(request, signal),
+                                                 message => log(`[${this.vfs.projectName}] ${message}`), {
+                                                     reload: () => vscode.commands.executeCommand('workbench.action.reloadWindow'),
+                                                 });
         void control.start();
         listeners.push(
             {dispose: () => control.dispose()},
