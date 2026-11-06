@@ -2,6 +2,12 @@ import type { RobotVehicle } from './prefetch-robots';
 
 export type RobotSupportRole = 'carry' | 'lift' | 'tow';
 export type RobotAttachment = 'deck' | 'sling' | 'fork' | 'towline';
+export const ROBOT_ENERGY_PROFILES = Object.freeze({
+    battery: Object.freeze({ source: 'battery', service: 'charge', serviceLabel: 'Charging' } as const),
+    petrol: Object.freeze({ source: 'petrol', service: 'refuel', serviceLabel: 'Refuelling' } as const),
+});
+export type RobotEnergyProfile = typeof ROBOT_ENERGY_PROFILES[keyof typeof ROBOT_ENERGY_PROFILES];
+export type RobotEnergyService = RobotEnergyProfile['service'];
 export interface RobotPersonality {
     teamPreference: number;
     independence: number;
@@ -17,6 +23,10 @@ export interface RobotStructure {
     traction: 'none' | 'wheels' | 'utilityWheels' | 'counterweightedWheels' | 'omni' | 'legs' | 'biped';
     liftMechanism: 'none' | 'rotor' | 'tiltRotor' | 'forks';
     attachments: readonly RobotAttachment[];
+    energy: RobotEnergyProfile;
+    /** Relative visual presence; mechanical capability and backing density are independent. */
+    presentationScale: number;
+    interactionCue?: string;
     personality: Readonly<RobotPersonality>;
 }
 export interface RobotCapabilities {
@@ -41,27 +51,35 @@ const personality = Object.freeze({ teamPreference: 1, independence: 1, emergenc
     reverseAversion: 0, carrierAffinity: 0 });
 function describe(mass: number, mobility: RobotStructure['mobility'], traction: RobotStructure['traction'],
     liftMechanism: RobotStructure['liftMechanism'], attachments: readonly RobotAttachment[],
-    traits: Partial<RobotPersonality> = {}): Readonly<RobotStructure> {
+    options: { personality?: Partial<RobotPersonality>; energy?: keyof typeof ROBOT_ENERGY_PROFILES;
+        presentationScale?: number; interactionCue?: string } = {}): Readonly<RobotStructure> {
     return Object.freeze({ mass, mobility, chassis: mobility === 'air' ? 'airframe' : 'loadBearing', traction, liftMechanism,
-        attachments: Object.freeze([...attachments]), personality: Object.freeze({ ...personality, ...traits }) });
+        attachments: Object.freeze([...attachments]), energy: ROBOT_ENERGY_PROFILES[options.energy ?? 'battery'],
+        presentationScale: options.presentationScale ?? 1, interactionCue: options.interactionCue,
+        personality: Object.freeze({ ...personality, ...options.personality }) });
 }
 
 /** Structural and personality descriptions are authored here; operation planners consume derived affordances. */
 export const ROBOT_STRUCTURES: Readonly<Record<RobotVehicle, Readonly<RobotStructure>>> = Object.freeze({
     quad: describe(1, 'air', 'none', 'rotor', ['sling']),
-    heavyquad: describe(3, 'air', 'none', 'rotor', ['sling']),
+    heavyquad: describe(3, 'air', 'none', 'rotor', ['sling'], { energy: 'petrol', presentationScale: 2.5,
+        interactionCue: 'Četiri benzinska motora. Jedna sličica.' }),
     tiltwing: describe(2, 'air', 'none', 'tiltRotor', ['sling']),
     rover: describe(9, 'ground', 'utilityWheels', 'none', ['deck', 'towline', 'sling']),
     mecanum: describe(3, 'ground', 'omni', 'none', ['deck', 'towline', 'sling']),
     forklift: describe(5, 'ground', 'counterweightedWheels', 'forks', ['deck', 'fork', 'towline', 'sling']),
     hexapod: describe(2, 'ground', 'legs', 'none', ['deck', 'towline', 'sling']),
     walker: describe(2, 'ground', 'biped', 'none', ['deck', 'towline', 'sling']),
-    lugv: describe(1, 'ground', 'wheels', 'none', ['deck', 'towline', 'sling'], { reverseAversion: 1, carrierAffinity: 1 }),
+    lugv: describe(1, 'ground', 'wheels', 'none', ['deck', 'towline', 'sling'], { personality: { reverseAversion: 1, carrierAffinity: 1 } }),
     ekokomvoz: describe(10, 'ground', 'wheels', 'none', ['deck', 'towline', 'sling']),
 });
 
 export function robotStructure(vehicle: string): Readonly<RobotStructure> | undefined {
     return Object.prototype.hasOwnProperty.call(ROBOT_STRUCTURES, vehicle) ? ROBOT_STRUCTURES[vehicle as RobotVehicle] : undefined;
+}
+
+export function robotPresentationScale(vehicle: string): number {
+    return robotStructure(vehicle)?.presentationScale ?? 1;
 }
 
 function capabilities(structure: Readonly<RobotStructure>): Readonly<RobotCapabilities> {

@@ -38,9 +38,10 @@ class RobotElement {
     rectReads = 0;
     isConnected = true;
     readonly texts: Array<{ text: string; x: number; y: number; font: string; color: string }> = [];
+    readonly scales: number[][] = [];
     readonly context = new Proxy({ fillText: (text: string, x: number, y: number) => {
         this.texts.push({ text, x, y, font: this.context.font, color: this.context.fillStyle });
-    } } as Record<string, any>, {
+    }, scale: (...values: number[]) => this.scales.push(values) } as Record<string, any>, {
         get(target, key: string) {
             if (key in target) { return target[key]; }
             if (key === 'createLinearGradient' || key === 'createRadialGradient') { return () => ({ addColorStop() {} }); }
@@ -256,7 +257,15 @@ describe('the procedural PDF robot fleet', function () {
             assert.strictEqual(runtime.callbacks.size, 0, 'a resized parked fleet returns to sleep');
             assert.strictEqual(runtime.canvases.length, allocations, 'backing surfaces are reused');
             assert.ok(runtime.canvases.slice(2).every(body => body.width >= Math.ceil(128 * 4 / Math.sqrt(2))));
-            assert.deepStrictEqual(runtime.lab.snapshot().actors, state.actors, 'raster resizing does not reset the fleet or its external lease');
+            const ownership = (actors: any[]) => actors.map(({ x: _x, y: _y, goal: _goal, ...actor }) => actor);
+            assert.deepStrictEqual(ownership(runtime.lab.snapshot().actors), ownership(state.actors),
+                'geometry updates preserve actor identity, activity and the external lease');
+            for (const actor of runtime.lab.snapshot().actors) {
+                const factor = actor.vehicle === 'heavyquad' ? 2.5 : 1;
+                const ink = robots.robotArtworkGeometry(actor.vehicle, factor / Math.sqrt(2));
+                assert.ok(actor.x + ink.left >= 0 && actor.x + ink.right <= 480);
+                assert.ok(actor.y + ink.top >= 0 && actor.y + ink.bottom <= 250);
+            }
             const writes = runtime.canvases.map(surface => surface.rasterWrites);
             canvas.rect.left += 70; canvas.rect.top -= 30; runtime.resize(); runtime.frame();
             assert.deepStrictEqual(runtime.canvases.map(surface => surface.rasterWrites), writes, 'position-only changes reuse every backing store');
@@ -282,6 +291,83 @@ describe('the procedural PDF robot fleet', function () {
             assert.ok(canvas.width > densityTwoWidth && canvas.width >= 480 * 86 / 250 * 4,
                 'DPR changes rebuild a sharp backing instead of stretching the initial bitmap');
             assert.strictEqual(canvas.width / canvas.height, 480 / 250, 'intrinsic aspect ratio stays equal to the logical scene');
+            assert.strictEqual(runtime.callbacks.size, 0);
+        } finally { runtime.dispose(); }
+    });
+
+    it('shares the MORUS logical scale between actual Lab paint, cached detail and dispatch origins', () => {
+        for (const dpr of [1, 3]) {
+            const runtime = new RobotRuntime(robots);
+            try {
+                runtime.window.devicePixelRatio = dpr;
+                runtime.lab.update(ready); runtime.lab.setActive(true);
+                const canvas = runtime.stage.children.find(node => node.className === 'robot-canvas')!;
+                const quad = runtime.lab.dispatch.reserve('quad'), morus = runtime.lab.dispatch.reserve('heavyquad');
+                assert.ok(quad && morus);
+                assert.ok(Math.abs(morus.scale / quad.scale - 2.5) < 1e-10, 'borrowed bodies preserve their actual relative presence');
+                assert.ok(canvas.scales.some(value => Math.abs(value[0] - 2.5 / Math.sqrt(dpr)) < 1e-10
+                    && value[0] === value[1]), 'actual body painting applies the descriptor factor once');
+                const bodies = runtime.lab.snapshot().renderer.raster.bodies;
+                const body = bodies.find((value: any) => value.vehicle === 'heavyquad');
+                const small = bodies.find((value: any) => value.vehicle === 'quad');
+                const requested = Math.sqrt(dpr);
+                assert.ok(body.width >= Math.ceil(128 * requested * 2.5 - 1e-8)
+                    && body.height >= Math.ceil(100 * requested * 2.5 - 1e-8)
+                    && small.width >= Math.ceil(128 * requested - 1e-8),
+                'each cache covers its own requested detail despite independent density quantization');
+                const actor = runtime.lab.snapshot().actors.find((value: any) => value.vehicle === 'heavyquad');
+                const bounds = robots.robotArtworkGeometry('heavyquad', 2.5 / Math.sqrt(dpr));
+                assert.ok(actor.x + bounds.left >= 0 && actor.x + bounds.right <= 480);
+                assert.ok(actor.y + bounds.top >= 0 && actor.y + bounds.bottom <= 250);
+                runtime.lab.dispatch.release('quad'); runtime.lab.dispatch.release('heavyquad');
+                assert.strictEqual(runtime.callbacks.size, 0);
+            } finally { runtime.dispose(); }
+        }
+    });
+
+    it('keeps enlarged MORUS goals reachable and finishes edge work at both Lab frame cadences', () => {
+        for (const fps of [30, 60]) {
+            const fleet = new robots.RobotChoreographer(13);
+            fleet.step(0, ready);
+            const actor = fleet.actors.find((value: any) => value.vehicle === 'heavyquad');
+            for (const other of fleet.actors) { if (other !== actor) { fleet.reserveVehicle(other.vehicle, 0); } }
+            fleet.assign(actor, 'scene', [
+                { x: -1000, y: -1000, activity: 'signal', holdMs: 200 },
+                { x: 1000, y: 1000, activity: 'signal', holdMs: 200 },
+            ]);
+            const contained = (point: any) => point.x >= 100 && point.x <= 380 && point.y >= 62.5 && point.y <= 160;
+            assert.ok(actor.task.steps.every(contained), 'the owned goals use the real body envelope, not unclamped unreachable points');
+            let at = 0;
+            for (let frame = 0; frame < fps * 40 && fleet.needsAnimation(); frame++) {
+                fleet.step(at += 1000 / fps);
+                assert.ok(contained(actor), 'every physics step keeps the enlarged body in its stage');
+            }
+            assert.strictEqual(fleet.needsAnimation(), false);
+            fleet.delivery(actor, { kind: 'preview', bytes: 0, page: 2, count: 1 });
+            assert.ok(actor.task.steps.every(contained), 'loading and unloading goals use the same envelope');
+            for (let frame = 0; frame < fps * 40 && fleet.needsAnimation(); frame++) { fleet.step(at += 1000 / fps); }
+            assert.strictEqual(fleet.snapshot().stats.deliveredCargo, 1);
+            assert.strictEqual(fleet.needsAnimation(), false);
+        }
+    });
+
+    it('returns the geometry-adjusted MORUS centre through the same borrowed Lab lease', () => {
+        const runtime = new RobotRuntime(robots);
+        try {
+            runtime.window.devicePixelRatio = 3;
+            runtime.lab.update(ready); runtime.lab.setActive(true);
+            const origin = runtime.lab.dispatch.reserve('heavyquad'); assert.ok(origin);
+            const id = runtime.lab.snapshot().actors.find((actor: any) => actor.vehicle === 'heavyquad').id;
+            runtime.window.devicePixelRatio = 1; runtime.resize();
+            const destination = runtime.lab.dispatch.destination('heavyquad');
+            const actor = runtime.lab.snapshot().actors.find((value: any) => value.id === id);
+            assert.strictEqual(destination.x, actor.x, 'the pending geometry update precedes the copied return centre');
+            assert.strictEqual(destination.y, actor.y);
+            assert.strictEqual(destination.scale, 2.5);
+            assert.ok(destination.x <= 380 && destination.y >= 62.5);
+            assert.strictEqual(actor.outside, true, 'geometry keeps the original borrowed owner');
+            runtime.lab.dispatch.release('heavyquad');
+            for (let frame = 0; frame < 600 && runtime.callbacks.size; frame++) { runtime.frame(); }
             assert.strictEqual(runtime.callbacks.size, 0);
         } finally { runtime.dispose(); }
     });
@@ -618,6 +704,113 @@ describe('the procedural PDF robot fleet', function () {
         assert.ok(frame.stats.deliveredCargo >= 3);
     });
 
+    it('paints the structural service while its owner works and clears it after borrowing or completion', () => {
+        for (const [vehicle, service, text, otherText] of [
+            ['heavyquad', 'refuel', 'Refuelling', 'Charging'], ['quad', 'charge', 'Charging', 'Refuelling'],
+        ]) {
+            const prototype = robots.RobotChoreographer.prototype;
+            const snapshot = prototype.snapshot;
+            let fleet: any;
+            let runtime: RobotRuntime;
+            prototype.snapshot = function (this: any) { fleet = this; return snapshot.call(this); };
+            try { runtime = new RobotRuntime(robots); }
+            finally { prototype.snapshot = snapshot; }
+            try {
+                runtime.lab.update(ready); runtime.lab.setActive(true);
+                const canvas = runtime.stage.children.find(node => node.className === 'robot-canvas')!;
+                const actor = fleet.actors.find((candidate: any) => candidate.vehicle === vehicle);
+                const courier = fleet.actors.find((candidate: any) => candidate.vehicle === 'rover');
+                for (const other of fleet.actors) { if (other !== actor && other !== courier) { fleet.reserveVehicle(other.vehicle, 0); } }
+                Object.assign(actor, { energy: 0.1, x: Math.max(83, -actor.footprint.left), y: 124, vx: 0, vy: 0, idleUntil: 0 });
+                fleet.delivery(courier, { kind: 'preview', bytes: 0, page: 2, count: 1 });
+                canvas.texts.length = 0;
+                runtime.tick(34); runtime.document.emit('pointerdown');
+                assert.strictEqual(runtime.lab.snapshot().actors[actor.id].activity, service);
+                assert.ok(canvas.texts.some(value => value.text === text), vehicle + ' paints its actual service');
+                assert.ok(!canvas.texts.some(value => value.text === otherText));
+                canvas.texts.length = 0;
+                assert.ok(runtime.lab.dispatch.reserve(vehicle));
+                assert.ok(!canvas.texts.some(value => value.text === text), 'a borrowed actor has no local service label');
+                runtime.tick(500); canvas.texts.length = 0;
+                runtime.lab.dispatch.release(vehicle);
+                assert.ok(canvas.texts.some(value => value.text === text), 'return resumes the same service presentation');
+                for (let frame = 0; frame < 1800 && runtime.callbacks.size; frame++) { runtime.frame(); }
+                assert.strictEqual(runtime.callbacks.size, 0, 'service presentation creates no extra idle frames');
+                assert.strictEqual(runtime.lab.snapshot().stats.deliveredCargo, 1);
+                assert.notStrictEqual(runtime.lab.snapshot().actors[actor.id].activity, service);
+                canvas.texts.length = 0; runtime.document.emit('pointerdown');
+                assert.ok(!canvas.texts.some(value => value.text === text), 'the finished service leaves no caption');
+                assert.strictEqual(runtime.callbacks.size, 0);
+            } finally { runtime.dispose(); }
+        }
+    });
+
+    it('refuels petrol actors and charges battery actors through their existing finite service owner', () => {
+        for (const [vehicle, source, service] of [['heavyquad', 'petrol', 'refuel'], ['quad', 'battery', 'charge']]) {
+            const fleet = new robots.RobotChoreographer(13);
+            fleet.step(0, ready);
+            const actor = fleet.actors.find((candidate: any) => candidate.vehicle === vehicle);
+            const courier = fleet.actors.find((candidate: any) => candidate.vehicle === 'rover');
+            for (const other of fleet.actors) { if (other !== actor && other !== courier) { fleet.reserveVehicle(other.vehicle, 0); } }
+            // Seed the depleted service state, including the old field for the pre-correction control.
+            Object.assign(actor, { energy: 0.1, battery: 0.1, x: Math.max(83, -actor.footprint.left), y: 124, vx: 0, vy: 0, idleUntil: 0 });
+            fleet.delivery(courier, { kind: 'preview', bytes: 0, page: 2, count: 1 });
+            let frame = fleet.step(34);
+            assert.strictEqual(frame.actors[actor.id].activity, service, vehicle + ' uses its structural service');
+            assert.strictEqual(frame.actors[actor.id].energySource, source);
+            assert.strictEqual(frame.actors[actor.id].energyService, service);
+            const task = actor.task, energy = frame.actors[actor.id].energy;
+            fleet.reserveVehicle(vehicle, 34);
+            frame = fleet.step(1034);
+            assert.strictEqual(frame.actors[actor.id].energy, energy, 'a borrowed actor keeps its service state frozen');
+            fleet.returnVehicle(vehicle, 1034);
+            assert.strictEqual(actor.task, task, 'the original owned task resumes');
+            for (let at = 1068; at <= 4034; at += 34) { frame = fleet.step(at); }
+            assert.ok(frame.actors[actor.id].energy > 0.55, 'the actual service replenishes its energy');
+            assert.ok(actor.task !== task, 'service completion releases the original task');
+            assert.strictEqual(frame.actors[actor.id].battery, frame.actors[actor.id].energy, 'legacy diagnostics keep a numeric alias');
+            assert.strictEqual(frame.actors[actor.id].fuel, source === 'petrol' ? frame.actors[actor.id].energy : null);
+            for (let at = 4068; at <= 60000 && fleet.needsAnimation(); at += 34) { frame = fleet.step(at); }
+            assert.strictEqual(frame.stats.deliveredCargo, 1);
+            assert.strictEqual(fleet.needsAnimation(), false, 'service, delivery and return all settle');
+            assert.ok(frame.actors.every((value: any) => Number.isFinite(value.energy) && value.energy >= 0 && value.energy <= 1));
+        }
+    });
+
+    it('restores the same fuel or battery reserve through actual finite assistance', () => {
+        for (const vehicle of ['heavyquad', 'quad']) {
+            const fleet = new robots.RobotChoreographer(17);
+            fleet.step(0, ready);
+            const actor = fleet.actors.find((candidate: any) => candidate.vehicle === vehicle);
+            const helper = fleet.actors.find((candidate: any) => candidate.vehicle === 'mecanum');
+            for (const other of fleet.actors) { if (other !== actor && other !== helper) { fleet.reserveVehicle(other.vehicle, 0); } }
+            fleet.assign(actor, 'scene', [{ x: 200, y: 100, activity: 'stranded', holdMs: Infinity }]);
+            Object.assign(actor, { energy: 0.04, battery: 0.04, x: 200, y: 100, needsHelp: true });
+            const ids = fleet.snapshot().actors.map((value: any) => value.id);
+            let frame = fleet.snapshot();
+            for (let at = 34; at <= 30000 && fleet.needsAnimation(); at += 34) { frame = fleet.step(at); }
+            assert.strictEqual(frame.stats.assists, 1);
+            assert.ok(frame.actors[actor.id].energy >= 0.5, 'assistance replenishes the correct energy store before the return');
+            assert.strictEqual(frame.actors[actor.id].energySource, vehicle === 'heavyquad' ? 'petrol' : 'battery');
+            assert.strictEqual(frame.actors[actor.id].battery, frame.actors[actor.id].energy);
+            assert.strictEqual(frame.actors[actor.id].needsHelp, false);
+            assert.deepStrictEqual(frame.actors.map((value: any) => value.id), ids);
+            assert.strictEqual(fleet.needsAnimation(), false);
+        }
+    });
+
+    it('keeps depleted parked fuel and battery actors asleep until actual work arrives', () => {
+        const fleet = new robots.RobotChoreographer(13);
+        fleet.step(0, ready);
+        for (const actor of fleet.actors) { actor.energy = actor.battery = 0.1; actor.idleUntil = 0; }
+        for (let at = 250; at <= 60000; at += 250) {
+            const frame = fleet.step(at, ready);
+            assert.strictEqual(fleet.needsAnimation(), false);
+            assert.ok(frame.actors.every((actor: any) => actor.activity === 'park' && actor.job === 'idle'));
+            assert.ok(frame.actors.every((actor: any) => actor.energy === 0.1 && actor.battery === actor.energy));
+        }
+    });
+
     it('finishes a dock service even when avoidance has displaced an already-arrived courier', () => {
         const fleet = new robots.RobotChoreographer(13);
         fleet.step(0, ready);
@@ -782,8 +975,9 @@ describe('the procedural PDF robot fleet', function () {
                 for (const value of [actor.x, actor.y, actor.vx, actor.vy, actor.patience, actor.battery]) {
                     assert.ok(Number.isFinite(value));
                 }
-                assert.ok(actor.x >= 18 && actor.x <= robots.ROBOT_LIMITS.width - 18);
-                assert.ok(actor.y >= 28 && actor.y <= robots.ROBOT_LIMITS.height - 20);
+                const ink = robots.robotArtworkGeometry(actor.vehicle, actor.vehicle === 'heavyquad' ? 2.5 : 1);
+                assert.ok(actor.x + ink.left >= 0 && actor.x + ink.right <= robots.ROBOT_LIMITS.width);
+                assert.ok(actor.y + ink.top >= 0 && actor.y + ink.bottom <= robots.ROBOT_LIMITS.height);
             }
         }
         assert.ok(frame.stats.yields > 0, 'neighbors change one another\'s motion');

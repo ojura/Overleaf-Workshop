@@ -4,6 +4,7 @@ import { paintEkokomvoz } from './robot-ekokomvoz-artwork';
 import { LabelPlacementSolver } from './label-placement';
 import { ROBOT_RESCUE_POLICY } from './robot-rescue';
 import { robotRasterPlan, ROBOT_RASTER_LIMITS, type RobotRasterPlan } from './robot-raster-sizing';
+import { robotStructure, robotPresentationScale, type RobotEnergyProfile, type RobotEnergyService } from './robot-structure';
 
 /**
  * The motion lab's crew keep their own jobs, destinations and patience. Scenarios give them
@@ -25,6 +26,31 @@ export const ROBOT_VEHICLES = [
 export type RobotVehicle = typeof ROBOT_VEHICLES[number]['id'];
 export const ROBOT_ARTWORK_SIZE = Object.freeze({ width: 128, height: 100 });
 const GROUND_ARTWORK_SCALE = 0.86;
+/** Swept body/rotor/gesture ink after the internal artwork transform, before presentation scale.
+ * Stage shadows, carried parcels, smoke and measured captions retain their own placement. */
+const ROBOT_BODY_INK: Readonly<Record<RobotVehicle, Readonly<{ left: number; top: number; right: number; bottom: number; radius: number }>>> = Object.freeze({
+    quad: Object.freeze({ left: -35, top: -21, right: 35, bottom: 26, radius: 36 }),
+    heavyquad: Object.freeze({ left: -40, top: -25, right: 40, bottom: 36, radius: 41 }),
+    tiltwing: Object.freeze({ left: -42, top: -22, right: 42, bottom: 27, radius: 43 }),
+    rover: Object.freeze({ left: -35, top: -43, right: 35, bottom: 22, radius: 44 }),
+    mecanum: Object.freeze({ left: -32, top: -42, right: 35, bottom: 22, radius: 43 }),
+    forklift: Object.freeze({ left: -43, top: -43, right: 42, bottom: 22, radius: 45 }),
+    hexapod: Object.freeze({ left: -34, top: -26, right: 35, bottom: 24, radius: 36 }),
+    walker: Object.freeze({ left: -33, top: -20, right: 33, bottom: 24, radius: 35 }),
+    lugv: Object.freeze({ left: -25, top: -15, right: 25, bottom: 22, radius: 28 }),
+    ekokomvoz: Object.freeze({ left: -54, top: -40, right: 54, bottom: 38, radius: 57 }),
+});
+
+/** The caller supplies the complete effective scale once, including character presentation. */
+export function robotArtworkGeometry(vehicle: RobotVehicle, scale = 1) {
+    const ink = ROBOT_BODY_INK[vehicle];
+    const chassis = ROBOT_VEHICLES.find(value => value.id === vehicle)!;
+    return { left: ink.left * scale, top: ink.top * scale, right: ink.right * scale, bottom: ink.bottom * scale,
+        width: (ink.right - ink.left) * scale, height: (ink.bottom - ink.top) * scale, radius: ink.radius * scale,
+        // Ground masts and gestures project above neighbouring parking bays. Traffic
+        // clears the chassis; airborne vehicles clear their swept rotor envelope.
+        trafficRadius: (chassis.air ? ink.radius : chassis.radius) * scale };
+}
 /**
  * Navines attachment coordinates are relative to the vehicle center before its internal
  * artwork scale. Multiply by scale, then by the displayed sprite scale, to place external
@@ -130,7 +156,7 @@ type Point = { x: number; y: number };
 type Mode = 'dispatch' | 'outage' | 'quiet' | 'recovery';
 type Activity = 'park' | 'navigate' | 'load' | 'deliver' | 'unload' | 'inspect' | 'scan' | 'signal'
     | 'lift' | 'weld' | 'calibrate' | 'balance' | 'yield' | 'replan' | 'assist' | 'stranded'
-    | 'charge' | 'read' | 'sleep' | 'celebrate';
+    | RobotEnergyService | 'read' | 'sleep' | 'celebrate';
 type Notice = 'SOS' | 'After you?' | 'Replan' | null;
 export interface RobotCargo {
     kind: 'bytes' | 'preview' | 'page';
@@ -152,6 +178,8 @@ interface Actor {
     vehicle: RobotVehicle;
     x: number; y: number; vx: number; vy: number;
     home: Point;
+    homeAnchor: Point;
+    footprint: ReturnType<typeof robotArtworkGeometry>;
     goal: Point;
     activity: Activity;
     task: Task | null;
@@ -169,7 +197,8 @@ interface Actor {
     detourGoal: Point | null;
     needsHelp: boolean;
     partner: number | null;
-    battery: number;
+    energy: number;
+    energyProfile: RobotEnergyProfile;
     distance: number;
     idleUntil: number;
     phase: number;
@@ -262,6 +291,7 @@ export class RobotChoreographer {
     private lastDocumentAt = -Infinity;
     private stats = counters();
     private emitAt = 0;
+    private bodyScale = 1;
 
     constructor(seed = 0x1a41c5, options: { sceneOrder?: readonly string[] } = {}) {
         this.rng = new Random(seed);
@@ -275,15 +305,44 @@ export class RobotChoreographer {
             const rng = new Random(Math.floor(this.rng.next() * 0xffffffff));
             const temperament = rng.range(0.65, 1.45);
             const patienceLimit = rng.range(650, 1800);
+            const footprint = robotArtworkGeometry(vehicle.id, robotPresentationScale(vehicle.id));
+            const home = { x: clamp(homes[id].x, -footprint.left, ROBOT_LIMITS.width - footprint.right),
+                y: clamp(homes[id].y, -footprint.top, ROBOT_LIMITS.height - footprint.bottom) };
             return {
-                id, vehicle: vehicle.id, ...homes[id], home: { ...homes[id] }, goal: { ...homes[id] },
+                id, vehicle: vehicle.id, ...home, home: { ...home }, homeAnchor: { ...homes[id] }, footprint, goal: { ...home },
                 vx: 0, vy: 0, activity: 'park', task: null, carrying: false,
                 temperament, patience: patienceLimit, patienceLimit, blockedMs: 0, yieldTo: null,
                 notice: null, noticeSince: 0, noticeCandidate: null, noticeCandidateSince: 0,
-                detour: null, detourGoal: null, needsHelp: false, partner: null, battery: rng.range(0.55, 1),
+                detour: null, detourGoal: null, needsHelp: false, partner: null, energy: rng.range(0.55, 1),
+                energyProfile: robotStructure(vehicle.id)!.energy,
                 distance: 0, idleUntil: rng.range(1000, 6000), phase: rng.range(0, Math.PI * 2), look: 0, reservedAt: null, rng,
             };
         });
+    }
+
+    /** Update reachable destinations with an actual fitted body-scale change, without an idle loop. */
+    setBodyScale(scale: number): boolean {
+        if (!Number.isFinite(scale) || scale <= 0 || scale === this.bodyScale) { return false; }
+        this.bodyScale = scale;
+        for (const actor of this.actors) {
+            const parkedAtHome = !actor.task && actor.reservedAt === null && distance(actor, actor.home) < 1
+                && Math.hypot(actor.vx, actor.vy) < 2;
+            actor.footprint = robotArtworkGeometry(actor.vehicle, scale * robotPresentationScale(actor.vehicle));
+            actor.home = this.contain(actor, actor.homeAnchor);
+            if (actor.task) {
+                actor.task.steps = actor.task.steps.map(value => ({ ...value, ...this.contain(actor, value) }));
+                actor.goal = this.contain(actor, actor.goal);
+            } else { actor.goal = { ...actor.home }; }
+            Object.assign(actor, parkedAtHome ? actor.home : this.contain(actor, actor));
+            if (actor.detour) { actor.detour = this.contain(actor, actor.detour); }
+        }
+        return true;
+    }
+
+    private contain(actor: Actor, point: Point): Point {
+        const bounds = actor.footprint;
+        return { x: clamp(point.x, -bounds.left, ROBOT_LIMITS.width - bounds.right),
+            y: clamp(point.y, -bounds.top, ROBOT_LIMITS.height - bounds.bottom) };
     }
 
     open(now: number, input: RobotTelemetry): void {
@@ -411,7 +470,11 @@ export class RobotChoreographer {
                 job: actor.task?.kind ?? 'idle', carrying: actor.carrying,
                 cargo: actor.task?.cargo ? { ...actor.task.cargo } : null,
                 temperament: actor.temperament, patience: actor.patience, needsHelp: actor.needsHelp,
-                partner: actor.partner, yieldTo: actor.yieldTo, notice: actor.notice, battery: actor.battery,
+                partner: actor.partner, yieldTo: actor.yieldTo, notice: actor.notice,
+                energy: actor.energy, energySource: actor.energyProfile.source, energyService: actor.energyProfile.service,
+                fuel: actor.energyProfile.source === 'petrol' ? actor.energy : null,
+                // Compatibility alias for older diagnostics; energySource identifies the actual store.
+                battery: actor.energy,
                 outside: actor.reservedAt !== null,
                 distance: actor.distance, phase: actor.phase, look: actor.look,
                 progress: actor.task?.arrivedAt === null || !actor.task ? 0
@@ -547,7 +610,7 @@ export class RobotChoreographer {
             break;
         case 'battery': {
             const flat = task('quad', [step(190, 98, 'stranded', Infinity)], true);
-            if (flat) { flat.battery = 0.06; flat.task!.steps[0] = step(flat.x, flat.y, 'stranded', Infinity); }
+            if (flat) { flat.energy = 0.06; flat.task!.steps[0] = step(flat.x, flat.y, 'stranded', Infinity); }
             task('mecanum', [step(195, 195, 'lift', 1400), step(260, 198, 'charge', 800)]);
             prop('battery', 210, 180, 'AERIAL-CORE');
             break;
@@ -688,6 +751,7 @@ export class RobotChoreographer {
     }
 
     private assign(actor: Actor, kind: Task['kind'], steps: TaskStep[], partner?: number): void {
+        steps = steps.map(value => ({ ...value, ...this.contain(actor, value) }));
         actor.task = { kind, steps, index: 0, arrivedAt: null, partner };
         actor.goal = { x: steps[0].x, y: steps[0].y };
         actor.activity = 'navigate';
@@ -724,8 +788,8 @@ export class RobotChoreographer {
             && !this.actors.some(other => other.task?.kind === 'delivery' || other.task?.kind === 'help')) { return; }
         if (this.mode === 'quiet') {
             this.assign(actor, 'idle', [step(actor.home.x, actor.home.y, 'sleep', Infinity)]);
-        } else if (actor.battery < 0.25) {
-            this.assign(actor, 'idle', [step(83, vehicleOf(actor).air ? 124 : 216, 'charge', 2500)]);
+        } else if (actor.energy < 0.25) {
+            this.assign(actor, 'idle', [step(83, vehicleOf(actor).air ? 124 : 216, actor.energyProfile.service, 2500)]);
         } else {
             const air = vehicleOf(actor).air;
             const activity: Activity = actor.rng.next() < 0.5 ? 'scan' : 'read';
@@ -762,7 +826,7 @@ export class RobotChoreographer {
             const partner = this.actors[task.partner!];
             if (partner?.needsHelp) {
                 partner.needsHelp = false;
-                partner.battery = Math.max(0.55, partner.battery);
+                partner.energy = Math.max(0.55, partner.energy);
                 this.release(partner);
                 this.stats.assists++;
                 this.emit(partner, 'spark', '#70e7d3');
@@ -793,6 +857,12 @@ export class RobotChoreographer {
             // A timed service remains started if avoidance previously displaced its actor.
             // Advancing that timer only inside the arrival radius stranded unloading jobs.
             if (actor.task && actor.task.arrivedAt !== null) { this.arrive(actor); }
+            if (!actor.task && !actor.detour && distance(actor, actor.goal) <= 1 && Math.hypot(actor.vx, actor.vy) <= 2) {
+                actor.vx = actor.vy = 0;
+                actor.yieldTo = null;
+                actor.activity = 'park';
+                continue;
+            }
             if (actor.task?.kind === 'delivery' && actor.task.arrivedAt !== null
                 && ['load', 'unload'].includes(actor.task.steps[actor.task.index].activity)) {
                 // A docked courier owns its service position; approaching traffic yields
@@ -814,7 +884,7 @@ export class RobotChoreographer {
             for (const other of this.actors) {
                 if (actor === other || other.reservedAt !== null || spec.air !== vehicleOf(other).air || actor.partner === other.id || other.partner === actor.id) { continue; }
                 const separation = distance(actor, other);
-                const reach = (spec.radius + vehicleOf(other).radius) * 0.82;
+                const reach = (actor.footprint.trafficRadius + other.footprint.trafficRadius) * 0.82;
                 if (separation < reach + 15 && separation > 0.01) {
                     const priority = trafficPriority(actor);
                     const otherPriority = trafficPriority(other);
@@ -845,10 +915,10 @@ export class RobotChoreographer {
                 actor.look = Math.sign(yielding.x - actor.x);
                 if (actor.patience <= 0) {
                     const side = actor.id % 2 ? 1 : -1;
-                    actor.detour = {
+                    actor.detour = this.contain(actor, {
                         x: clamp(actor.x + Math.sign(dx || side) * 44, 28, 450),
                         y: clamp(actor.y + side * 37, spec.air ? 35 : 152, spec.air ? 130 : 225),
-                    };
+                    });
                     actor.detourGoal = actor.goal;
                     actor.activity = 'replan';
                     actor.patience = actor.patienceLimit;
@@ -882,11 +952,10 @@ export class RobotChoreographer {
             const maxSpeed = spec.speed * 1.8;
             const magnitude = Math.hypot(actor.vx, actor.vy);
             if (magnitude > maxSpeed) { actor.vx *= maxSpeed / magnitude; actor.vy *= maxSpeed / magnitude; }
-            actor.x = clamp(actor.x + actor.vx * dt, 18, ROBOT_LIMITS.width - 18);
-            actor.y = clamp(actor.y + actor.vy * dt, 28, ROBOT_LIMITS.height - 20);
+            Object.assign(actor, this.contain(actor, { x: actor.x + actor.vx * dt, y: actor.y + actor.vy * dt }));
             actor.distance += Math.hypot(actor.vx, actor.vy) * dt;
-            actor.battery = clamp(actor.battery - Math.hypot(actor.vx, actor.vy) * dt / 25000, 0.04, 1);
-            if (actor.activity === 'charge') { actor.battery = Math.min(1, actor.battery + dt * 0.3); }
+            actor.energy = clamp(actor.energy - Math.hypot(actor.vx, actor.vy) * dt / 25000, 0.04, 1);
+            if (actor.activity === actor.energyProfile.service) { actor.energy = Math.min(1, actor.energy + dt * 0.3); }
             if (!yielding) { actor.look += (Math.sign(dx) - actor.look) * response; }
             if (gap < 5) {
                 if (actor.detour) { actor.detour = null; actor.blockedMs = 0; }
@@ -1124,6 +1193,7 @@ export type RobotArtworkActor = Pick<RobotFrame['actors'][number],
         gesturePhase?: number;
         pullDirection?: -1 | 1;
         labels?: boolean;
+        shadow?: boolean;
         malfunction?: 'sparks' | 'smoke';
     };
 
@@ -1138,8 +1208,7 @@ export function paintRobotVehicle(ctx: Paint, actor: RobotArtworkActor, time: nu
     const quiet = reduced || mode === 'quiet' && actor.job !== 'delivery' && actor.job !== 'help' && moving < 2;
     const bob = spec.air && !quiet ? Math.sin(time * (1.9 + actor.temperament) + actor.phase) * 1.2 : 0;
     const bank = spec.air && !quiet ? clamp(actor.vx / 450 + actor.vy / 350, -0.2, 0.2) : 0;
-    ellipse(ctx, actor.x, spec.air ? 222 - (222 - actor.y) * 0.07 : actor.y + 17,
-        spec.air ? 15 : 22, spec.air ? 3 : 4, spec.air ? '#05111c35' : '#06132080');
+    if (actor.shadow !== false) { paintRobotShadow(ctx, actor, 1); }
     ctx.save(); ctx.translate(actor.x, actor.y + bob); ctx.rotate(bank);
     ctx.scale(scale, scale);
     const gait = quiet ? actor.phase : actor.distance / 11;
@@ -1281,6 +1350,12 @@ export function paintRobotVehicle(ctx: Paint, actor: RobotArtworkActor, time: nu
     ctx.restore();
 }
 
+function paintRobotShadow(ctx: Paint, actor: Pick<RobotArtworkActor, 'vehicle' | 'x' | 'y'>, scale: number): void {
+    const air = vehicleOf(actor).air;
+    ellipse(ctx, actor.x, air ? 222 - (222 - actor.y) * 0.07 : actor.y + 17 * scale,
+        (air ? 15 : 22) * scale, (air ? 3 : 4) * scale, air ? '#05111c35' : '#06132080');
+}
+
 function robotCanvasGeometry(canvas: HTMLCanvasElement) {
     const rect = canvas.getBoundingClientRect(), win = canvas.ownerDocument.defaultView!;
     const style = win.getComputedStyle(canvas);
@@ -1327,10 +1402,14 @@ class RobotStagePainter {
         if (this.rasterGeometry === geometry && this.rasterDpr === devicePixelRatio) { return; }
         this.rasterGeometry = geometry; this.rasterDpr = devicePixelRatio;
         const next = robotRasterPlan({ width: ROBOT_LIMITS.width, height: ROBOT_LIMITS.height,
-            bodyWidth: ROBOT_ARTWORK_SIZE.width, bodyHeight: ROBOT_ARTWORK_SIZE.height, bodyCount: this.bodies.size },
+            bodyWidth: ROBOT_ARTWORK_SIZE.width, bodyHeight: ROBOT_ARTWORK_SIZE.height, bodyCount: this.bodies.size,
+            bodyScales: ROBOT_VEHICLES.map(vehicle => robotPresentationScale(vehicle.id)) },
         { ...geometry, devicePixelRatio }, this.raster);
         const stageChanged = this.canvas.width !== next.width || this.canvas.height !== next.height;
-        const bodiesChanged = this.raster?.bodyWidth !== next.bodyWidth || this.raster?.bodyHeight !== next.bodyHeight;
+        const bodiesChanged = ROBOT_VEHICLES.some((vehicle, index) => {
+            const image = this.bodies.get(vehicle.id)!, size = next.bodyRasters[index];
+            return image.width !== size.width || image.height !== size.height;
+        });
         this.raster = next;
         if (!stageChanged && !bodiesChanged) { return; }
         // Release every replaced surface first. Growing one cache while the old cohort is
@@ -1348,11 +1427,12 @@ class RobotStagePainter {
             this.paintBackground(bg);
         }
         if (bodiesChanged) {
-            for (const vehicle of ROBOT_VEHICLES) {
+            for (const [index, vehicle] of ROBOT_VEHICLES.entries()) {
                 const image = this.bodies.get(vehicle.id)!;
-                image.width = next.bodyWidth; image.height = next.bodyHeight;
+                const size = next.bodyRasters[index];
+                image.width = size.width; image.height = size.height;
                 const ctx = image.getContext('2d')!;
-                ctx.setTransform(next.bodyWidth / ROBOT_ARTWORK_SIZE.width, 0, 0, next.bodyHeight / ROBOT_ARTWORK_SIZE.height, 0, 0);
+                ctx.setTransform(size.width / ROBOT_ARTWORK_SIZE.width, 0, 0, size.height / ROBOT_ARTWORK_SIZE.height, 0, 0);
                 ctx.translate(ROBOT_ARTWORK_SIZE.width / 2, ROBOT_ARTWORK_SIZE.height / 2);
                 bodyArtwork(ctx, vehicle);
             }
@@ -1363,6 +1443,8 @@ class RobotStagePainter {
     rasterSnapshot() {
         return { width: this.canvas.width, height: this.canvas.height,
             bodyWidth: this.raster?.bodyWidth ?? 0, bodyHeight: this.raster?.bodyHeight ?? 0,
+            bodies: ROBOT_VEHICLES.map(vehicle => { const body = this.bodies.get(vehicle.id);
+                return { vehicle: vehicle.id, width: body?.width ?? 0, height: body?.height ?? 0 }; }),
             density: this.raster?.density ?? 0, bytes: this.raster?.bytes ?? 0,
             budgetBytes: ROBOT_RASTER_LIMITS.maxBytes, limited: this.raster?.limited ?? false, resizes: this.resizes };
     }
@@ -1422,7 +1504,9 @@ class RobotStagePainter {
         }
         const ordered = frame.actors.filter(actor => !actor.outside).sort((a, b) => a.y - b.y);
         for (const actor of ordered) {
-            ctx.save(); ctx.translate(actor.x, actor.y); ctx.scale(geometry.bodyScale, geometry.bodyScale); ctx.translate(-actor.x, -actor.y);
+            const scale = geometry.bodyScale * robotPresentationScale(actor.vehicle);
+            paintRobotShadow(ctx, actor, scale);
+            ctx.save(); ctx.translate(actor.x, actor.y); ctx.scale(scale, scale); ctx.translate(-actor.x, -actor.y);
             this.paintActor(ctx, actor, frame, time, reduced); ctx.restore();
         }
         this.paintLabels(ctx, ordered, frame.at, geometry);
@@ -1441,7 +1525,7 @@ class RobotStagePainter {
     }
 
     private paintActor(ctx: Paint, actor: RobotFrame['actors'][number], frame: RobotFrame, time: number, reduced: boolean): void {
-        paintRobotVehicle(ctx, { ...actor, labels: false }, time, frame.mode, reduced, this.bodies.get(actor.vehicle));
+        paintRobotVehicle(ctx, { ...actor, labels: false, shadow: false }, time, frame.mode, reduced, this.bodies.get(actor.vehicle));
     }
 
     private paintLabels(ctx: Paint, actors: RobotFrame['actors'], at: number, geometry: RobotCanvasGeometry): void {
@@ -1450,18 +1534,23 @@ class RobotStagePainter {
         const geometryKey = [geometry.width, geometry.height, geometry.bodyScale, metrics.localFontSize, metrics.localLineHeight].join(',');
         if (this.labelGeometry !== geometryKey) { this.labelGeometry = geometryKey; this.labels.reset(); }
         ctx.font = ROBOT_LAB_CAPTION_STYLE.fontWeight + ' ' + metrics.localFontSize + 'px system-ui, sans-serif';
-        const text = new Map(actors.map(actor => [String(actor.id), [vehicleOf(actor).name, ...(actor.notice ? [actor.notice] : [])]]));
+        const text = new Map(actors.map(actor => {
+            const energy = robotStructure(actor.vehicle)!.energy;
+            const detail = actor.notice || (actor.activity === energy.service ? energy.serviceLabel : undefined);
+            return [String(actor.id), [vehicleOf(actor).name, ...(detail ? [detail] : [])]];
+        }));
         const placed = this.labels.layout({ now: at, maxVisible: 3,
             bounds: { x: 4, y: 4, width: ROBOT_LIMITS.width - 8, height: ROBOT_LIMITS.height - 8 },
             labels: actors.map(actor => {
                 const lines = text.get(String(actor.id))!;
                 const width = Math.max(...lines.map(value => ctx.measureText(value)?.width ?? value.length * metrics.localFontSize * 0.58));
-                return { id: String(actor.id), anchor: { x: actor.x, y: actor.y - 24 * geometry.bodyScale },
+                const body = robotArtworkGeometry(actor.vehicle, geometry.bodyScale * robotPresentationScale(actor.vehicle));
+                return { id: String(actor.id), anchor: { x: actor.x, y: actor.y + body.top - 3 * geometry.bodyScale },
                     width: Math.min(ROBOT_LIMITS.width - 12, width + metrics.localPaddingX * 2),
                     height: lines.length * metrics.localLineHeight + metrics.localPaddingY * 2,
-                    radius: 8 * geometry.bodyScale, priority: actor.notice ? 3 : actor.carrying || actor.job === 'delivery' ? 2 : 1 };
-            }), obstacles: actors.map(actor => ({ x: actor.x - 25 * geometry.bodyScale, y: actor.y - 20 * geometry.bodyScale,
-                width: 50 * geometry.bodyScale, height: 40 * geometry.bodyScale })),
+                    radius: 8 * geometry.bodyScale, priority: lines.length > 1 ? 3 : actor.carrying || actor.job === 'delivery' ? 2 : 1 };
+            }), obstacles: actors.map(actor => { const body = robotArtworkGeometry(actor.vehicle, geometry.bodyScale * robotPresentationScale(actor.vehicle));
+                return { x: actor.x + body.left, y: actor.y + body.top, width: body.width, height: body.height }; }),
         });
         for (const placement of placed) {
             if (placement.blocked) { continue; }
@@ -1701,6 +1790,7 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
             }
             geometry = measured;
             geometryDpr = win.devicePixelRatio;
+            if (model.setBodyScale(measured.bodyScale)) { latest = model.snapshot(); }
         }
         return geometry;
     }
@@ -1816,13 +1906,16 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     });
     observer.observe(stage);
 
-    function viewportPoint(point: Point): RobotDispatchPoint | undefined {
+    function viewportPoint(vehicle: RobotVehicle): RobotDispatchPoint | undefined {
         const geometry = currentGeometry();
-        if (!geometry) { return; }
+        // Geometry can update the actor's reachable centre. Read it after that update,
+        // including the synchronous text/layout change caused by a reservation.
+        const point = model.reservedPosition(vehicle);
+        if (!geometry || !point) { return; }
         return {
             x: geometry.left + point.x / ROBOT_LIMITS.width * geometry.width,
             y: geometry.top + point.y / ROBOT_LIMITS.height * geometry.height,
-            scale: geometry.fit * geometry.bodyScale,
+            scale: geometry.fit * geometry.bodyScale * robotPresentationScale(vehicle),
         };
     }
 
@@ -1834,14 +1927,13 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
                 const point = model.reserveVehicle(vehicle, win.performance.now());
                 if (!point) { return; }
                 schedule();
-                const origin = viewportPoint(point);
+                const origin = viewportPoint(vehicle);
                 if (!origin) { model.returnVehicle(vehicle, win.performance.now()); latest = model.snapshot(); }
                 return origin;
             },
             destination(vehicle) {
                 if (!active || disposed || doc.hidden || !inView) { return; }
-                const point = model.reservedPosition(vehicle);
-                return point ? viewportPoint(point) : undefined;
+                return viewportPoint(vehicle);
             },
             release(vehicle) {
                 model.returnVehicle(vehicle, win.performance.now());

@@ -49,6 +49,24 @@ describe('structural robot teams and owned operations', function () {
         assert.strictEqual(api.robotCapabilities('__proto__'), undefined);
     });
 
+    it('owns propulsion energy and servicing alongside the shared robot structure', () => {
+        assert.deepStrictEqual(api.robotStructure('heavyquad').energy, { source: 'petrol', service: 'refuel', serviceLabel: 'Refuelling' });
+        assert.deepStrictEqual(api.robotStructure('quad').energy, { source: 'battery', service: 'charge', serviceLabel: 'Charging' });
+        assert.ok(Object.values(api.ROBOT_STRUCTURES).every((value: any) => Object.isFrozen(value.energy)));
+        assert.strictEqual(api.robotCapabilities('heavyquad').lift, 3);
+        assert.strictEqual(api.robotCapabilities('heavyquad').carry, 3);
+    });
+
+    it('authors one relative MORUS presentation scale independently of its operation capabilities', () => {
+        assert.strictEqual(api.robotPresentationScale('heavyquad'), 2.5);
+        assert.strictEqual(api.robotPresentationScale('quad'), 1);
+        assert.strictEqual(api.robotPresentationScale('constructor'), 1);
+        const rotorSpanRatio = (64 + 26) / (50 + 26) * api.robotPresentationScale('heavyquad') / api.robotPresentationScale('quad');
+        assert.ok(rotorSpanRatio > 2.95 && rotorSpanRatio < 3, 'the authored visual factor represents the remembered relative presence');
+        assert.strictEqual(api.robotCapabilities('heavyquad').mass, 3);
+        assert.strictEqual(api.robotCapabilities('heavyquad').lift, 3);
+    });
+
     it('expresses reverse aversion and carrier affinity as personality affordances', () => {
         const lugv = api.robotStructure('lugv').personality;
         assert.ok(lugv.reverseAversion > 0 && lugv.carrierAffinity > 0);
@@ -279,6 +297,61 @@ describe('structural robot teams and owned operations', function () {
         assert.ok(values.every((value: any) => value.spec.key === job.key));
     });
 
+    it('keeps small photograph crews proportional before optional stories and staged heavy equipment', () => {
+        const workload = api.robotCargoWorkload({ width: 160, height: 120 });
+        assert.strictEqual(workload.mass, 0.5);
+        assert.strictEqual(workload.preferredCrew, 1);
+        const available = Object.entries(api.ROBOT_STRUCTURES).map(([vehicle, value]: [string, any]) =>
+            ({ vehicle, staged: value.mass > 2, inUse: value.mass <= 2 }));
+        const preferences = [['formation', 2], ['formation', 3], ['handoff', 2], ['airlift', 2]] as const;
+        for (let seed = 0; seed < 16; seed++) {
+            for (const [preferredMode, preferredHelpers] of preferences) {
+                const candidates = api.robotCargoCandidates({ key: 'portrait:small', goal: 'delivery', workload }, available,
+                    { seed, preferredMode, preferredHelpers, maxHelpers: 3 });
+                const selected = candidates.find((value: any) => value.assessment.normalAdmissible && value.assessment.preferredCrewMet);
+                assert.ok(selected, 'a normally capable crew is available');
+                assert.strictEqual(selected.vehicles.length, 1, preferredMode + ' must not add helpers to a one-person photograph');
+                const structure = api.robotStructure(selected.vehicles[0]);
+                assert.ok(structure.mass <= 2 && structure.presentationScale === 1,
+                    'small work uses comparably small equipment despite heavy staging and fresh-type preference');
+            }
+        }
+    });
+
+    it('uses structural variety within fitting crews without letting it promote an oversized vehicle', () => {
+        const job = { key: 'portrait:variety', goal: 'delivery', workload: api.robotCargoWorkload({ width: 160, height: 120 }) };
+        const options = { preferredMode: 'solo', preferredHelpers: 1, maxHelpers: 3 };
+        for (let seed = 0; seed < 32; seed++) {
+            const comparable = api.robotCargoCandidates(job,
+                [{ vehicle: 'quad', inUse: true }, { vehicle: 'hexapod', inUse: false }], { ...options, seed });
+            const fresh = comparable.find((value: any) => value.assessment.normalAdmissible && value.assessment.preferredCrewMet);
+            assert.deepStrictEqual(fresh.vehicles, ['hexapod'], 'an unused comparable worker keeps the fleet varied');
+            const oversized = api.robotCargoCandidates(job,
+                [{ vehicle: 'quad', inUse: true }, { vehicle: 'ekokomvoz', staged: true }], { ...options, seed });
+            const fitting = oversized.find((value: any) => value.assessment.normalAdmissible && value.assessment.preferredCrewMet);
+            assert.deepStrictEqual(fitting.vehicles, ['quad'], 'a fresh structural type or staged body cannot override the workload fit');
+        }
+    });
+
+    it('scales the same fleet from a small portrait to a large page chunk and retains actual availability fallback', () => {
+        const available = [{ vehicle: 'ekokomvoz', staged: true }, { vehicle: 'quad' }, { vehicle: 'lugv' }];
+        const options = { seed: 11, preferredMode: 'handoff', preferredHelpers: 2, maxHelpers: 3 };
+        const propose = (width: number, height: number, pool = available) => api.robotCargoCandidates({
+            key: 'cargo:proportional', goal: 'delivery', workload: api.robotCargoWorkload({ width, height }),
+        }, pool, options);
+        const ordinary = (values: any[]) => values.find(value => value.assessment.normalAdmissible && value.assessment.preferredCrewMet);
+        assert.strictEqual(ordinary(propose(160, 120)).vehicles.length, 1);
+        const large = propose(480, 540), selected = ordinary(large);
+        assert.deepStrictEqual([...selected.vehicles].sort(), ['ekokomvoz', 'lugv', 'quad']);
+        assert.strictEqual(selected.mode, 'formation');
+        assert.ok(large.some((value: any) => value.vehicles.length === 1 && value.vehicles[0] === 'ekokomvoz'
+            && value.assessment.normalAdmissible && !value.assessment.preferredCrewMet), 'the qualified solo volunteer remains available');
+        assert.deepStrictEqual(ordinary(propose(160, 120, [available[0]])).vehicles, ['ekokomvoz'],
+            'the same generic policy still works when only the larger machine is available');
+        assert.deepStrictEqual(propose(480, 540), propose(480, 540, [...available].reverse()),
+            'input roster order does not change the ranked proposals');
+    });
+
     it('applies the same workload and exceptional opportunity to removal without inventing a handoff phase', () => {
         const workload = { mass: 2, span: 320, preferredCrew: 2 };
         const values = api.robotCargoCandidates({ key: 'removal:one', goal: 'removal', workload }, [{ vehicle: 'quad' }],
@@ -301,6 +374,23 @@ describe('structural robot teams and owned operations', function () {
         assert.strictEqual(api.robotActivityPhase(decision.plan, 1800, true), 'recovery');
         assert.strictEqual(api.robotActivityPhase(decision.plan, 2200, true), 'complete');
         assert.strictEqual(decision.plan.timing.deadline, 1900);
+    });
+
+    it('distinguishes a requested body transport from an optional two-person cargo story', () => {
+        const job = { key: 'body-transport:small-photo', goal: 'delivery', workload: api.robotCargoWorkload({ width: 140, height: 100 }) };
+        const available = [{ vehicle: 'lugv', staged: true }, { vehicle: 'heavyquad', staged: true }, { vehicle: 'quad' }];
+        const options = { seed: 13, preferredMode: 'airlift', preferredHelpers: 2, maxHelpers: 3 };
+        const qualified = (values: any[]) => values.filter(value => value.assessment.normalAdmissible && value.assessment.preferredCrewMet);
+        const ordinary = qualified(api.robotCargoCandidates(job, available, options))[0];
+        assert.strictEqual(ordinary.mode, 'solo', 'an optional story still uses the fitting small courier');
+        const transport = qualified(api.robotCargoCandidates(job, available, { ...options, bodyTransport: 'lugv' }))[0];
+        assert.strictEqual(transport.mode, 'airlift', 'the committed body move supplies an actual second role');
+        assert.strictEqual(transport.vehicles[0], 'lugv');
+        assert.strictEqual(transport.fit.transportDifference, 0);
+        assert.ok(transport.spec.phases.some((phase: any) => phase.loads.some((load: any) => load.bodies?.includes('lugv'))));
+        const fallback = qualified(api.robotCargoCandidates(job, [available[0]], { ...options, bodyTransport: 'lugv' }))[0];
+        assert.strictEqual(fallback.mode, 'solo');
+        assert.strictEqual(fallback.fit.transportDifference, 1, 'an unavailable carrier retains a valid self-driven fallback');
     });
 
     it('returns structured compatibility reasons for unavailable roles, duplicates and occupied support', () => {

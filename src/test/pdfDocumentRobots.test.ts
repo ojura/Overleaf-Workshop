@@ -268,15 +268,49 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     function cooperative(mode?: string, helpers = 2, useLab = false, options: Record<string, unknown> = {}, coarse = false) {
         const f = fixture({ maxActors: helpers, ...options });
         f.desktop();
+        if (mode === 'airlift') {
+            f.desktop(1, 1280, 1100);
+            const held = new Set<string>(); let preparing = true;
+            let groundDock = { x: 1100, y: 400, scale: 0.7 };
+            const airDock = { x: 950, y: 80, scale: 0.7 }, dock = (vehicle: string) => vehicle === 'lugv' ? groundDock : airDock;
+            f.api.setDispatchOrigin({ reserve(vehicle: string) {
+                if (held.has(vehicle) || vehicle !== 'lugv' && (vehicle !== 'heavyquad' || preparing)) { return; }
+                held.add(vehicle); return dock(vehicle);
+            }, destination: dock, release(vehicle: string) { assert.ok(held.delete(vehicle)); } });
+            const page = f.page(); page.pageElement.rect = { left: 40, top: 60, width: 640, height: 900 };
+            if (coarse) { page.canvas.width = 135; page.canvas.height = 192; }
+            f.api.setVisibleWork([work([page])]); f.finish();
+            const staged = f.api.snapshot().advance[0].actors[0];
+            assert.strictEqual(staged.vehicle, 'lugv');
+            const at = point(f.owned.find(canvas => canvas.dataset.courier === String(staged.id))!);
+            const bodyScale = staged.spriteScale / module.DOCUMENT_ROBOT_LIMITS.spriteScale;
+            const center = { x: at.x + 29 * bodyScale, y: at.y + 180 - 25 * bodyScale };
+            preparing = false;
+            assert.strictEqual(f.api.offer({ ...page, imageRegions: [{ id: 'actual-steep-body-transport',
+                x: (center.x - 40 - 100) / 640, y: (center.y - 60 - 80) / 900, width: 200 / 640, height: 160 / 900 }] }), 'started');
+            const payload = f.api.snapshot().pages[0].payloads[0];
+            assert.strictEqual(payload.mode, 'airlift', 'an actual staged body receives transport for its measured steep route');
+            assert.ok(payload.helpers.includes(staged.id));
+            return { f, page, payload, held, airDock, setGroundDock: (point: typeof groundDock) => { groundDock = point; } };
+        }
         if (useLab) { f.api.setDispatchOrigin(f.openLab().lab.dispatch); }
+        else if (mode === 'handoff') {
+            const held = new Set<string>();
+            const dock = (vehicle: string) => vehicle === 'heavyquad' ? { x: 900, y: 80, scale: 0.5 } : { x: 0, y: 460, scale: 0.5 };
+            f.api.setDispatchOrigin({ reserve(vehicle: string) {
+                if (!['heavyquad', 'hexapod'].includes(vehicle) || held.has(vehicle)) { return; }
+                held.add(vehicle); return dock(vehicle);
+            }, destination: dock, release(vehicle: string) { assert.ok(held.delete(vehicle)); } });
+        }
         for (let id = 1; id <= 12; id++) {
             const page = f.page(id);
             if (coarse) { page.canvas.width = 135; page.canvas.height = 192; }
             page.pageElement.rect = { left: 40, top: 60, width: 465, height: 661 };
             f.api.setVisiblePages([id]);
-            f.api.offer(mode === 'airlift' ? { ...page, imageRegions: [
-                { id: 'qualified-airlift-photo', x: 0.3, y: 0.25, width: 0.4, height: 0.25 },
-            ] } : page);
+            f.api.offer({ ...page, imageRegions: [
+                { id: 'qualified-team-photo', x: 0.1, y: 0.2, width: (helpers === 3 ? 320 : 240) / 465,
+                    height: (helpers === 3 ? 300 : 270) / 661 },
+            ] });
             const payload = f.api.snapshot().pages[0]?.payloads?.find((candidate: any) => candidate.helpers.length === helpers
                 && (!mode || candidate.mode === mode));
             if (payload) { return { f, page, payload }; }
@@ -336,6 +370,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const draws = [0.99, 0.1, 0.5, 0];
         return { seed: 16, encounterRandom: () => draws.shift() ?? 0.99 };
     };
+    const successOptions = () => ({ seed: 58, maxActors: 1, encounterRandom: () => 0.15 });
 
     function coarsePhoto(options: Record<string, unknown> = {}, pageSize = { width: 465, height: 661 }) {
         const f = fixture({ maxActors: 2, seed: options.maxActors === 1 ? 10 : 13, ...options }); f.desktop();
@@ -359,21 +394,217 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         (type === 'pointerup' ? f.window : f.container).emit(type, event);
     }
 
+    function morusCrew(crew = 1, dpr = 1, compact = false, spare = 0) {
+        const f = fixture({ seed: crew === 3 ? 2 : 1, maxActors: crew + spare, device: compact ? 'mobile' : 'desktop', encounterRandom: () => 0.99 });
+        f.desktop(dpr, 1600, 2200);
+        const leased = new Set<string>(), released: string[] = [];
+        const vehicles = ['heavyquad', 'quad', 'tiltwing'].slice(0, crew);
+        const origin = (vehicle: string) => ({ x: 250 + vehicles.indexOf(vehicle) * 100, y: 160,
+            scale: vehicle === 'heavyquad' ? 0.625 : 0.25 });
+        f.api.setDispatchOrigin({ reserve(vehicle: string) {
+            if (!vehicles.includes(vehicle) || leased.has(vehicle)) { return; }
+            leased.add(vehicle); return origin(vehicle);
+        }, destination: origin, release(vehicle: string) { assert.ok(leased.delete(vehicle)); released.push(vehicle); } });
+        const page = f.page(99), width = crew === 1 ? 640 : 1280, height = crew === 1 ? 900 : 1800;
+        page.pageElement.rect = { left: 40, top: 60, width, height };
+        page.canvas.width = 135; page.canvas.height = 192;
+        const cropWidth = crew === 1 ? 80 : crew === 2 ? 280 : 320, cropHeight = crew === 1 ? 80 : crew === 2 ? 200 : 300;
+        const delivery = { ...page, kind: 'preview', imageRegions: [
+            { id: 'morus-load', x: 0.35, y: 0.25, width: cropWidth / width, height: cropHeight / height },
+        ] };
+        f.api.setVisiblePages([99]);
+        return { f, page, delivery, leased, released };
+    }
+
+    it('keeps MORUS document size and its ordinary character cue under the same finite cargo owner', () => {
+        const { f, delivery, leased } = morusCrew();
+        assert.strictEqual(f.api.offer(delivery), 'started');
+        f.tick(600);
+        const before = f.api.snapshot().pages[0].payloads[0];
+        const actor = f.api.snapshot().pages[0].actors[0];
+        assert.strictEqual(actor.vehicle, 'heavyquad');
+        assert.ok(Math.abs(actor.spriteScale - 1.92 * 2.5) < 1e-10, 'document scale includes the authored MORUS factor once');
+        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
+        assert.ok(Math.abs(parseFloat(sprite.style.width) - 128 * actor.spriteScale) < 0.02);
+        pointer(f, 'pointermove', point(sprite)); f.frame();
+        assert.strictEqual(f.api.snapshot().interaction.hovered, actor.id);
+        assert.match(f.api.snapshot().caption?.text ?? '', /benzinska motora/i);
+        const after = f.api.snapshot().pages[0].payloads[0];
+        for (const key of ['id', 'helpers', 'target', 'deadline']) { assert.deepStrictEqual(after[key], before[key]); }
+        assert.deepStrictEqual(after.operation.decision, before.operation.decision);
+        f.tick(before.deadline - f.now + 4000);
+        assert.strictEqual(leased.size, 0);
+        assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+        assert.strictEqual(f.callbacks.size, 0);
+    });
+
+    it('funds the complete enlarged MORUS crew at compact DPR1 and DPR3 without changing logical jobs', () => {
+        for (const dpr of [1, 3]) {
+            for (const crew of [2, 3]) {
+                const { f, delivery, leased } = morusCrew(crew, dpr, true);
+                assert.strictEqual(f.api.offer(delivery), 'started');
+                const state = f.api.snapshot(), before = state.pages[0].payloads[0];
+                assert.strictEqual(before.helpers.length, crew, 'complete qualified crew survives bounded raster adaptation at ' + dpr + '/' + crew);
+                assert.strictEqual(leased.size, crew);
+                assert.strictEqual(state.maxSpriteBytes, 204800);
+                assert.ok(state.spriteBytes <= state.maxSpriteBytes);
+                for (const actor of state.pages[0].actors) {
+                    const factor = actor.vehicle === 'heavyquad' ? 2.5 : 1;
+                    const scale = 0.64 * 1.35 / Math.sqrt(dpr) * factor;
+                    assert.ok(Math.abs(actor.spriteScale - scale) < 1e-10, 'only backing density adapts');
+                    assert.ok(actor.spriteDensity > 0 && actor.spriteDensity <= dpr);
+                    const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
+                    const minimum = Math.min(1, Math.max(scale, actor.vehicle === 'heavyquad' ? 0.625 : 0.25) * dpr);
+                    assert.ok(sprite.width >= Math.ceil(128 * minimum) && sprite.height >= Math.ceil(100 * minimum));
+                }
+                const widths = f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle').map(canvas => [canvas.width, canvas.height]);
+                f.tick(200);
+                const sharper = new Canvas(f.document); sharper.width = 541; sharper.height = 768;
+                assert.ok(f.api.refine({ ...delivery, canvas: sharper }) > 0);
+                const after = f.api.snapshot().pages[0].payloads[0];
+                for (const key of ['id', 'helpers', 'target', 'deadline']) { assert.deepStrictEqual(after[key], before[key]); }
+                assert.deepStrictEqual(after.operation.decision, before.operation.decision);
+                assert.deepStrictEqual(f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle').map(canvas => [canvas.width, canvas.height]), widths,
+                    'ordinary frames and pixel refinement retain the admitted backing plan');
+                f.tick(before.deadline - f.now + 4000);
+                assert.strictEqual(leased.size, 0);
+                assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+                assert.strictEqual(f.callbacks.size, 0);
+            }
+        }
+    });
+
+    it('returns the complete enlarged crew after a failed cargo copy and preserves its canonical retry', () => {
+        const { f, delivery, leased, released } = morusCrew(2, 3, true);
+        let fail = true;
+        f.onCanvasCreated = canvas => { canvas.beforeCopy = args => { if (fail && args.length === 9) { throw new Error('bounded failed copy'); } }; };
+        assert.strictEqual(f.api.offer(delivery), 'deferred');
+        const rejected = f.api.snapshot();
+        assert.ok(released.includes('heavyquad') && released.includes('quad'), 'the joint reservation included both actual members');
+        assert.strictEqual(leased.size + rejected.retainedBytes + rejected.activeActors + f.callbacks.size, 0);
+        assert.ok(f.owned.every(canvas => canvas.width === 0 && canvas.height === 0));
+        fail = false;
+        assert.strictEqual(f.api.offer(delivery), 'started');
+        const accepted = f.api.snapshot().pages[0].payloads[0];
+        assert.deepStrictEqual(accepted.operation.decision, rejected.lastOperationDecision.decision);
+        f.tick(accepted.deadline - f.now + 4000);
+        assert.strictEqual(leased.size + f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+    });
+
+    it('banks an all-air crop and its actual attachment offsets together, then levels before deposit', () => {
+        const angle = (canvas: Canvas) => Number(canvas.style.transform.match(/rotate\(([-\d.]+)deg\)/)?.[1] ?? 0);
+        for (const crew of [1, 2]) {
+            const { f, delivery, leased } = morusCrew(crew, 1, false, 1);
+            assert.strictEqual(f.api.offer(delivery), 'started');
+            const before = f.api.snapshot().pages[0].payloads[0];
+            assert.strictEqual(before.helpers.length, crew);
+            const clock = before.operation.timing;
+            f.tick(clock.startedAt + (clock.workEnd - clock.startedAt) * 0.6 - f.now);
+            let cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
+            const bank = angle(cargo);
+            assert.ok(Math.abs(bank) > 1 && Math.abs(bank) <= 4, 'the actual aerial crop has a modest flight bank');
+            const radians = bank * Math.PI / 180, center = point(cargo);
+            const width = parseFloat(cargo.style.width), height = parseFloat(cargo.style.height);
+            for (const [slot, id] of before.helpers.entries()) {
+                const actor = f.api.snapshot().pages[0].actors.find((value: any) => value.id === id);
+                assert.strictEqual(actor.locomotion, 'air');
+                const sprite = f.owned.find(canvas => canvas.dataset.courier === String(id)
+                    && canvas.className === 'pdfDocumentRobotVehicle')!;
+                const scale = actor.spriteScale / module.DOCUMENT_ROBOT_LIMITS.spriteScale;
+                const local = crew === 1 ? { x: 0, y: -34 * scale }
+                    : { x: (slot === 0 ? -1 : 1) * (width * 0.42 + 10 * scale), y: -(height * 0.35 + 14 * scale) };
+                const expected = { x: center.x + local.x * Math.cos(radians) - local.y * Math.sin(radians),
+                    y: center.y + local.x * Math.sin(radians) + local.y * Math.cos(radians) };
+                assert.ok(Math.hypot(point(sprite).x - expected.x, point(sprite).y - expected.y) < 0.07,
+                    'the admitted helper remains rigidly attached to the banked cargo');
+                assert.ok(Math.abs(angle(sprite) - bank) < 0.02, 'the body and its cargo share the flight pose');
+            }
+            const cover = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotArrival');
+            assert.ok(cover, 'the source region has its actual owned arrival cover');
+            const coverTransform = cover.style.transform;
+            const sharp = new Canvas(f.document); sharp.width = 1082; sharp.height = 1536;
+            assert.ok(f.api.refine({ ...delivery, canvas: sharp }) > 0);
+            f.frame();
+            const layers = f.owned.filter(canvas => ['pdfDocumentRobotCargo', 'pdfDocumentRobotCargoUnderlay'].includes(canvas.className) && canvas.width);
+            assert.strictEqual(layers.length, 2, 'both coarse and sharp layers remain owned during the wipe');
+            assert.strictEqual(layers[0].style.transform, layers[1].style.transform, 'refinement shares the complete rigid transform');
+            assert.strictEqual(cover.style.transform, coverTransform, 'the source mask stays in the fixed page region');
+            for (const caption of captions(f)) { assert.ok(!caption.style.transform?.includes('rotate'), 'readable labels stay level'); }
+            const current = f.api.snapshot().pages[0].payloads[0];
+            for (const key of ['id', 'helpers', 'target', 'deadline']) { assert.deepStrictEqual(current[key], before[key]); }
+            assert.deepStrictEqual(current.operation.decision, before.operation.decision);
+            f.tick(clock.workEnd - 0.01 - f.now);
+            cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
+            assert.ok(Math.abs(angle(cargo)) < 0.001, 'landing reaches a level logical page crop');
+            f.tick(34);
+            assert.strictEqual(f.api.snapshot().pages[0].payloads[0].deposited, true);
+            for (const id of before.helpers) {
+                const sprite = f.owned.find(canvas => canvas.dataset.courier === String(id) && canvas.className === 'pdfDocumentRobotVehicle')!;
+                assert.strictEqual(angle(sprite), 0, 'the landed crew is level before its separate empty return');
+            }
+            f.tick(before.deadline - f.now + 4000);
+            assert.strictEqual(leased.size + f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+        }
+    });
+
+    it('keeps mixed, handoff and carried-ground cargo level on their existing route', () => {
+        const ground = stagedLugv('unavailable');
+        assert.strictEqual(ground.f.api.offer(ground.delivery(80)), 'started');
+        const cases = [ground, cooperative('handoff'), cooperative('airlift')];
+        for (const { f } of cases) {
+            const before = f.api.snapshot().pages[0].payloads[0], clock = before.operation.timing;
+            f.tick(clock.startedAt + (clock.workEnd - clock.startedAt) * 0.6 - f.now);
+            assert.ok(f.api.snapshot().pages[0].actors.some((actor: any) => actor.locomotion === 'ground'));
+            const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
+            assert.strictEqual(Number(cargo.style.transform.match(/rotate\(([-\d.]+)deg\)/)?.[1] ?? 0), 0);
+            assert.deepStrictEqual(f.api.snapshot().pages[0].payloads[0].operation.decision, before.operation.decision);
+            f.tick(before.deadline - f.now + 4000);
+            assert.strictEqual(f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+        }
+    });
+
+    it('promotes a fully staged crew at the exact sprite cap without requesting fresh raster bytes', () => {
+        const f = fixture({ seed: 1, maxActors: 2, device: 'mobile', encounterRandom: () => 1 }); f.desktop(3, 1200, 1000);
+        const vehicles = ['quad'], held = new Set<string>();
+        const origin = { x: 200, y: 150, scale: 1 };
+        f.api.setDispatchOrigin({ reserve(vehicle: string) {
+            if (!vehicles.includes(vehicle) || held.has(vehicle)) { return; }
+            held.add(vehicle); return origin;
+        }, destination: () => origin, release(vehicle: string) { assert.ok(held.delete(vehicle)); } });
+        const pages = [1].map(id => { const page = f.page(id);
+            page.pageElement.rect = { left: 40, top: 60, width: 300, height: 420 }; return page; });
+        f.api.setVisibleWork(pages.map(page => work([page]))); f.finish();
+        const state = f.api.snapshot();
+        assert.strictEqual(state.spriteBytes, 204800);
+        assert.strictEqual(held.size, 1);
+        const actor = state.advance[0].actors[0], sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
+        const size = [sprite.width, sprite.height], allocations = f.owned.length;
+        assert.strictEqual(f.api.offer({ ...pages[0], imageRegions: [{ id: 'staged-small', x: 0.3, y: 0.25, width: 0.15, height: 0.1 }] }), 'started');
+        assert.ok(f.api.snapshot().pages[0].actors.some((value: any) => value.id === actor.id));
+        assert.deepStrictEqual([sprite.width, sprite.height], size);
+        assert.strictEqual(f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle').length, 1);
+        assert.ok(f.owned.length > allocations, 'only the real cargo obtains a fresh backing');
+        f.api.reset();
+        assert.strictEqual(held.size + f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+    });
+
     function stagedLugv(carrier: 'owned' | 'new' | 'unavailable' | 'overbudget' = 'owned') {
-        const f = fixture({ maxActors: 4, encounterRandom: () => 0.99 }); f.desktop(1, 1280, 1000);
+        const f = fixture({ maxActors: 4, device: carrier === 'overbudget' ? 'mobile' : undefined, encounterRandom: () => 0.99 });
+        f.desktop(carrier === 'overbudget' ? 3 : 1, 1280, 1000);
         const held = new Set<string>(), releases: string[] = [], reservations: string[] = [];
         let staging = true;
-        const groundDock = { x: 1200, y: 280, scale: 0.7 }, airDock = { x: 1100, y: 90, scale: 0.7 };
+        const groundDock = { x: 1200, y: 280, scale: carrier === 'overbudget' ? 1 : 0.7 }, airDock = { x: 1100, y: 90, scale: 0.7 };
         f.api.setDispatchOrigin({ reserve(vehicle: string) {
             if (held.has(vehicle) || vehicle !== 'lugv' && (vehicle !== 'heavyquad' || carrier === 'unavailable' || staging && carrier !== 'owned')) { return; }
             held.add(vehicle); reservations.push(vehicle);
-            return vehicle === 'lugv' ? groundDock : { ...airDock, scale: carrier === 'overbudget' ? 100 : airDock.scale };
+            return vehicle === 'lugv' ? groundDock : airDock;
         }, destination: (vehicle: string) => vehicle === 'lugv' ? groundDock : airDock,
         release(vehicle: string) { assert.ok(held.delete(vehicle), 'one owner releases ' + vehicle); releases.push(vehicle); } });
         const page = f.page(99); page.pageElement.rect = { left: 40, top: 60, width: 1000, height: 800 };
         f.api.setVisibleWork([work([page], ['preparing'])]); f.tick(1600);
         const actor = f.api.snapshot().advance[0].actors.find((value: any) => value.vehicle === 'lugv');
         assert.ok(actor, 'the real advance crew has the L-UGV body');
+        if (carrier === 'overbudget') { assert.strictEqual(f.api.snapshot().spriteBytes, 204800, 'the existing staged owner consumes the real joint cap'); }
         const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
         const start = point(sprite);
         staging = false;
@@ -607,9 +838,12 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                     // Ground routes keep their admitted carrying offset while a borrowed
                     // body changes size; aerial solo offsets follow the displayed size.
                     const scale = actor.vehicle === 'lugv' ? actor.spriteScale / 1.92 : parseFloat(sprite.style.width) / 128 / 1.92;
-                    assert.ok(Math.abs(c.x - a.x - (actor.vehicle === 'lugv' ? 87 : 0) * scale) < 0.08,
+                    const bank = Number(cargo.style.transform.match(/rotate\(([-\d.]+)deg\)/)?.[1] ?? 0) * Math.PI / 180;
+                    const local = { x: (actor.vehicle === 'lugv' ? 87 : 0) * scale,
+                        y: (actor.vehicle === 'lugv' ? -75 : 102) * scale };
+                    assert.ok(Math.abs(c.x - a.x - (local.x * Math.cos(bank) - local.y * Math.sin(bank))) < 0.08,
                         JSON.stringify({ vehicle: actor.vehicle, cargo: c, body: a, scale, spriteScale: actor.spriteScale, phase: payload.progress }));
-                    assert.ok(Math.abs(c.y - a.y - (actor.vehicle === 'lugv' ? -75 : 102) * scale) < 0.08,
+                    assert.ok(Math.abs(c.y - a.y - (local.x * Math.sin(bank) + local.y * Math.cos(bank))) < 0.08,
                         'each cargo offset stays with its delivery group while one loaded robot assists the other');
                 }
             }
@@ -1149,10 +1383,10 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('refinement refuses an over-budget copy even when replacing the old raster would fit afterward', () => {
-        const { f, source } = coarsePhoto({ device: 'mobile', maxCargoBytes: 230000 }, { width: 320, height: 450 });
+        const { f, source } = coarsePhoto({ device: 'mobile', maxActors: 1, maxCargoBytes: 110000 }, { width: 320, height: 450 });
         const old = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
         assert.deepStrictEqual([old.width, old.height], [81, 77]);
-        assert.ok(240 * 227 * 4 < 230000 && 240 * 227 * 4 + old.width * old.height * 4 > 230000);
+        assert.ok(160 * 152 * 4 < 110000 && 160 * 152 * 4 + old.width * old.height * 4 > 110000);
         const allocated = f.owned.length, before = f.api.snapshot();
         assert.strictEqual(f.api.refine(source()), 0);
         assert.strictEqual(f.owned.length, allocated, 'peak budget is checked before any new bitmap allocation');
@@ -2029,7 +2263,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('holds the longest exact Croatian success line after ordinary motion without another animation frame', () => {
-        const f = fixture({ seed: 58 }); const page = f.page();
+        const f = fixture(successOptions()); const page = f.page();
         f.api.setVisiblePages([1]); f.api.offer(page);
         const line = 'ovako fino ne bi ni Marić izbrusio';
         let bubble: Element | undefined;
@@ -2124,7 +2358,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             f => { f.media.matches = true; f.media.emit('change'); }, f => f.api.dispose(),
         ];
         for (const end of endings) {
-            const f = fixture({ seed: 58 }); const page = f.page();
+            const f = fixture(successOptions()); const page = f.page();
             f.api.setVisiblePages([1]); f.api.offer(page); f.finish();
             assert.strictEqual(f.api.snapshot().activeActors, 0);
             assert.strictEqual(captions(f).length, 1, 'each boundary starts with an ordinary-completion caption');
@@ -2140,7 +2374,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('reacts to a successful real deposit with a readable finite caption and no extra lifetime', () => {
-        const f = fixture();
+        const f = fixture(successOptions());
         const page = f.page();
         f.api.setVisiblePages([1]);
         assert.strictEqual(f.api.offer(page), 'started');
@@ -2210,9 +2444,10 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     it('uses a real approaching advance pair for a near miss and promotes its reacted pose into unchanged cargo work', () => {
         const f = fixture(nearMissOptions()); f.desktop();
         const page = f.page();
-        let reserved = 0, released = 0;
+        let reserved = 0, released = 0, available: Set<string> | undefined;
         f.api.setDispatchOrigin({
-            reserve: () => ({ x: reserved++ ? 80 : 600, y: 220, scale: 1.92 }),
+            reserve: (vehicle: string) => available && !available.has(vehicle) ? undefined
+                : ({ x: reserved++ ? 80 : 600, y: 220, scale: 1.92 }),
             destination: () => ({ x: 600, y: 220, scale: 1.92 }),
             release: () => released++,
         });
@@ -2222,6 +2457,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(state.encounters?.active?.kind, 'near-miss', 'actual computed approach geometry admits the seeded encounter');
         assert.ok(state.advance[0].actors.some((actor: any) => actor.reaction === 'drowsy'));
         const ids = state.encounters.active.ids;
+        available = new Set(state.advance[0].actors.filter((actor: any) => ids.includes(actor.id)).map((actor: any) => actor.vehicle));
         const sprites = f.owned.filter(canvas => ids.includes(Number(canvas.dataset.courier)));
         const redraws = sprites.map(canvas => canvas.transforms.length);
         f.tick(136);
@@ -2254,7 +2490,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             f => { f.media.matches = true; f.media.emit('change'); }, f => f.api.dispose(),
         ];
         for (const end of endings) {
-            const f = fixture(); const page = f.page();
+            const f = fixture(successOptions()); const page = f.page();
             f.api.setVisiblePages([1]); f.api.offer(page);
             for (let step = 0; step < 90 && !f.api.snapshot().encounters?.active; step++) { f.frame(); }
             assert.ok(f.api.snapshot().encounters?.active, 'each boundary starts with a real active reaction');
@@ -2423,7 +2659,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.callbacks.size, 0);
         assert.strictEqual(f.owned.length, allocated);
         const actual = mean();
-        assert.ok(Math.abs(actual.x - (page.pageElement.rect.left + (original.x - originalPage.left) / originalPage.width * 500)) < 0.02);
+        assert.ok(Math.abs(actual.x - (page.pageElement.rect.left + (original.x - originalPage.left) / originalPage.width * 500)) < 0.02,
+            JSON.stringify({ original, actual, page: page.pageElement.rect, actors: finished.advance[0].actors,
+                sprites: sprites.map(sprite => ({ point: point(sprite), width: sprite.style.width })) }));
         assert.ok(Math.abs(actual.y - (page.pageElement.rect.top + (original.y - originalPage.top) / originalPage.height * 650)) < 0.02);
     });
 
@@ -2454,15 +2692,48 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.callbacks.size, 0);
     });
 
+    it('clamps the enlarged waiting crew as one formation and preserves its page translation', () => {
+        const f = fixture({ maxActors: 4, encounterRandom: () => 0.99 }); f.desktop();
+        const held = new Set<string>();
+        f.api.setDispatchOrigin({ reserve(vehicle: string) {
+            if (!['heavyquad', 'quad'].includes(vehicle) || held.has(vehicle)) { return; }
+            held.add(vehicle); return { x: 900, y: 120, scale: vehicle === 'heavyquad' ? 1 : 0.4 };
+        }, destination: () => ({ x: 900, y: 120, scale: 0.4 }), release(vehicle: string) { assert.ok(held.delete(vehicle)); } });
+        const page = f.page(); page.pageElement.rect.left = -200;
+        f.api.setVisibleWork([work([page])]); f.finish();
+        const actors = f.api.snapshot().advance[0].actors;
+        assert.strictEqual(actors.length, 2);
+        const sprites = actors.map((actor: any) => f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!);
+        const before = sprites.map(point);
+        const bounds = actors.map((actor: any, index: number) => {
+            const ink = module.robotArtworkGeometry(actor.vehicle, actor.spriteScale);
+            return { left: before[index].x + ink.left, right: before[index].x + ink.right };
+        }).sort((a: any, b: any) => a.left - b.left);
+        assert.ok(bounds[0].left >= -0.02 && bounds[1].right <= f.window.innerWidth + 0.02);
+        assert.ok(bounds[1].left - bounds[0].right >= 11.98, 'edge clearance translates the complete formation without crushing its body gap');
+        f.scroll(13, 29); f.api.setVisibleWork([work([page])]); f.finish();
+        sprites.forEach((sprite: Canvas, index: number) => {
+            const after = point(sprite);
+            assert.ok(Math.abs(after.x - before[index].x + 13) < 0.02);
+            assert.ok(Math.abs(after.y - before[index].y + 29) < 0.02);
+        });
+        assert.deepStrictEqual(f.api.snapshot().advance[0].actors.map((actor: any) => actor.id), actors.map((actor: any) => actor.id));
+        assert.strictEqual(f.callbacks.size, 0);
+        f.api.reset(); assert.strictEqual(held.size + f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+    });
+
+    // An intact 300 x 300 CSS crop requests three helpers. This seed volunteers a qualified fork on pages 1 and 2.
+    const forkWorkSeed = 9;
+    const lowerForkPhoto = Object.freeze({ id: 'lower-photo', x: 0.125, y: 0.36, width: 0.75, height: 0.5 });
+
     it('keeps a newly admitted ground mast hidden until its first gated geometry paint', () => {
-        const f = fixture({ maxActors: 1 }); f.desktop();
+        const f = fixture({ maxActors: 1, seed: forkWorkSeed }); f.desktop();
         const first = f.page(1), second = f.page(2);
         f.api.setVisiblePages([1]);
-        assert.strictEqual(f.api.offer(first), 'started');
+        assert.strictEqual(f.api.offer({ ...first, imageRegions: [lowerForkPhoto] }), 'started');
         const frames = f.api.snapshot().frames;
         f.api.setVisiblePages([2]);
-        assert.strictEqual(f.api.offer({ ...second,
-            imageRegions: [{ id: 'lower-photo', x: 0.3, y: 0.68, width: 0.4, height: 0.2 }] }), 'started');
+        assert.strictEqual(f.api.offer({ ...second, imageRegions: [lowerForkPhoto] }), 'started');
         const transit = f.container.children.find(child => child.className === 'pdfDocumentRobotTransit')!;
         const mast = transit.children.flatMap(child => child.children).find(child => child.className === 'pdfDocumentRobotMast')!;
         assert.ok(mast?.isConnected, 'the deferred delivery includes its ground mast');
@@ -2479,13 +2750,12 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('initializes every deferred visual node as hidden and inert before geometry is available', () => {
-        const f = fixture({ maxActors: 1 }); f.desktop();
+        const f = fixture({ maxActors: 1, seed: forkWorkSeed }); f.desktop();
         const first = f.page(1), second = f.page(2), third = f.page(3);
-        f.api.setVisiblePages([1]); f.api.offer(first);
+        f.api.setVisiblePages([1]); f.api.offer({ ...first, imageRegions: [lowerForkPhoto] });
         const frames = f.api.snapshot().frames;
         f.api.setVisiblePages([2]);
-        assert.strictEqual(f.api.offer({ ...second,
-            imageRegions: [{ id: 'lower-photo', x: 0.3, y: 0.68, width: 0.4, height: 0.2 }] }), 'started');
+        assert.strictEqual(f.api.offer({ ...second, imageRegions: [lowerForkPhoto] }), 'started');
         const transit = f.container.children.find(child => child.className === 'pdfDocumentRobotTransit')!;
         const nodes = transit.children.flatMap(child => child.children).filter(child =>
             ['pdfDocumentRobotCargo', 'pdfDocumentRobotVehicle', 'pdfDocumentRobotMast'].includes(child.className));
@@ -2549,11 +2819,18 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.deepStrictEqual(parcel, [attachment.cargo.x, attachment.cargo.y]);
 
         for (const desktop of [false, true]) {
-            const f = fixture({ maxActors: 1 }); if (desktop) { f.desktop(2); }
+            const f = fixture({ maxActors: 1, seed: forkWorkSeed }); if (desktop) { f.desktop(2); }
+            const held = new Set<string>();
+            if (!desktop) {
+                const dock = { x: 0, y: 630, scale: 0.5 };
+                f.api.setDispatchOrigin({ reserve: (vehicle: string) => {
+                    if (vehicle !== 'forklift' || held.has(vehicle)) { return; }
+                    held.add(vehicle); return dock;
+                }, destination: () => dock, release: (vehicle: string) => held.delete(vehicle) });
+            }
             const page = f.page();
             f.api.setVisiblePages([1]);
-            assert.strictEqual(f.api.offer({ ...page,
-                imageRegions: [{ id: 'lower-photo', x: 0.36, y: 0.67, width: 0.34, height: 0.23 }] }), 'started');
+            assert.strictEqual(f.api.offer({ ...page, imageRegions: [lowerForkPhoto] }), 'started');
             for (let tick = 0; tick < 100 && f.api.snapshot().pages[0].payloads[0].progress < 0.25; tick++) { f.frame(); }
             const payload = f.api.snapshot().pages[0].payloads[0];
             assert.strictEqual(payload.stage, 'carry', 'alignment is checked while the lower fork supports the photo');
@@ -2581,18 +2858,22 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             close(parseFloat(fork.style.width), Math.ceil((front.points[1][0] - front.points[0][0]) * scale) * displayScale, 'fork length');
             close(parseFloat(fork.style.height), Math.round(rear.width * scale) * displayScale, 'fork thickness');
             close(parseFloat(mast.style.top) + origin.top + parseFloat(fork.style.top), cargoBottom, 'the external fork carries the real photo');
+            f.finish(); assert.strictEqual(held.size, 0, 'the available compact-lab fork returns its lease');
         }
     });
 
     it('gives Navines a lower photograph, a level page-base approach and a mast lift to its exact source', () => {
-        const f = fixture({ maxActors: 1 }); f.desktop();
-        const page = f.page();
-        const lower = { id: 'lower-photo', x: 0.36, y: 0.67, width: 0.34, height: 0.23 };
-        const images = [{ id: 'upper-photo', x: 0.12, y: 0.08, width: 0.55, height: 0.37 }, lower];
+        const f = fixture({ maxActors: 1, seed: 1 }); f.desktop();
+        const page = f.page(); page.pageElement.rect.height = 800;
+        const lower = { id: 'lower-photo', x: 0.125, y: 0.5, width: 0.75, height: 0.375 };
+        const images = [{ id: 'upper-photo', x: 0.1, y: 0.05, width: 0.8, height: 0.4 }, lower];
         f.api.setVisiblePages([1]);
         assert.strictEqual(f.api.offer({ ...page, imageRegions: images }), 'started');
         const episode = f.api.snapshot().pages[0], actor = episode.actors[0], payload = episode.payloads[0];
         assert.strictEqual(actor.vehicle, 'forklift', 'a lower cargo opportunity receives the ground carrier');
+        assert.strictEqual(payload.operation.operatingMode, 'volunteer', 'substantial work admits a physically qualified solo fork');
+        assert.ok(payload.operation.workload.mass > 2 && payload.operation.peakStrain < 1,
+            'the intact page chunk requests a crew but fits the fork carrying and lifting phases');
         assert.strictEqual(payload.imageId, lower.id, 'the lower photograph takes priority over the larger upper image');
         for (const key of ['x', 'y', 'width', 'height'] as const) { assert.ok(Math.abs(payload.target[key] - lower[key]) < 1e-9); }
         const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.dataset.courier === String(actor.id))!;
@@ -2615,7 +2896,8 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.ok(travel.length >= 2 && lift.length >= 2, 'the ground approach precedes a visible lift interval');
         assert.ok(Math.max(...positions.map(value => value.robot.y)) - Math.min(...positions.map(value => value.robot.y)) < 0.1,
             'Navines stays on the page base while the photograph rises');
-        assert.ok(660 - travel[0].robot.y > 0 && 660 - travel[0].robot.y < 70, 'wheel height is tied to the real page lower edge');
+        const pageBottom = page.pageElement.rect.top + page.pageElement.rect.height;
+        assert.ok(pageBottom - travel[0].robot.y > 0 && pageBottom - travel[0].robot.y < 70, 'wheel height is tied to the real page lower edge');
         assert.ok(Math.abs(travel[0].robot.x - travel.at(-1)!.robot.x) > 20, 'the forklift actually drives along the base');
         assert.ok(lift[0].cargo.y - lift.at(-1)!.cargo.y > 10, 'the payload rises while the vehicle stays grounded');
         f.tick(beforeDeposit - f.now);
@@ -2623,7 +2905,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.api.snapshot().pages[0].payloads[0].deposited, false);
         const delivered = point(cargo);
         assert.ok(Math.abs(delivered.x - (40 + (lower.x + lower.width / 2) * 400)) < 0.02);
-        assert.ok(Math.abs(delivered.y - (60 + (lower.y + lower.height / 2) * 600)) < 0.02);
+        assert.ok(Math.abs(delivered.y - (60 + (lower.y + lower.height / 2) * 800)) < 0.02);
         f.frame();
         const deposited = f.api.snapshot().pages[0].payloads[0];
         assert.strictEqual(deposited.deposited, true);
@@ -2638,10 +2920,18 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('keeps a ground delivery alongside cooperative real cargo within the same desktop actor and byte caps', () => {
-        const f = fixture({ maxActors: 3 }); f.desktop();
-        const page = f.page(); page.pageElement.rect = { left: 40, top: 60, width: 465, height: 661 };
-        const images = [{ id: 'upper-photo', x: 0.1, y: 0.08, width: 0.6, height: 0.4 },
-            { id: 'lower-photo', x: 0.3, y: 0.7, width: 0.38, height: 0.25 }];
+        const f = fixture({ maxActors: 3, seed: forkWorkSeed }); f.desktop();
+        const held = new Set<string>();
+        const docks: Record<string, { x: number; y: number; scale: number }> = {
+            forklift: { x: 0, y: 600, scale: 0.5 }, quad: { x: 40, y: 100, scale: 0.5 }, lugv: { x: 0, y: 270, scale: 0.5 },
+        };
+        f.api.setDispatchOrigin({ reserve: (vehicle: string) => {
+            if (!docks[vehicle] || held.has(vehicle)) { return; }
+            held.add(vehicle); return docks[vehicle];
+        }, destination: (vehicle: string) => docks[vehicle], release: (vehicle: string) => held.delete(vehicle) });
+        const page = f.page();
+        const images = [{ id: 'upper-photo', x: 0.1, y: 0, width: 0.6, height: 0.35 },
+            lowerForkPhoto];
         f.api.setVisiblePages([1]);
         assert.strictEqual(f.api.offer({ ...page, imageRegions: images }), 'started');
         const snapshot = f.api.snapshot(), episode = snapshot.pages[0];
@@ -2657,6 +2947,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.ok(snapshot.cargoBytes <= snapshot.maxCargoBytes && snapshot.spriteBytes <= snapshot.maxSpriteBytes);
         f.finish();
         assert.strictEqual(f.api.snapshot().deliveredFragments, 2);
+        assert.strictEqual(held.size, 0, 'both jobs return their actual distinct fleet leases');
         assert.strictEqual(f.callbacks.size, 0);
     });
 
@@ -2674,9 +2965,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
 
     it('removes a ground mast and its one real payload on every cancellation boundary', () => {
         for (const ending of ['hide', 'offscreen', 'reset', 'disable', 'dispose']) {
-            const f = fixture({ maxActors: 1 }); f.desktop();
+            const f = fixture({ maxActors: 1, seed: forkWorkSeed }); f.desktop();
             const page = f.page(); f.api.setVisiblePages([1]);
-            f.api.offer({ ...page, imageRegions: [{ id: 'lower-photo', x: 0.3, y: 0.68, width: 0.4, height: 0.2 }] });
+            f.api.offer({ ...page, imageRegions: [lowerForkPhoto] });
             const transit = f.container.children.find(child => child.className === 'pdfDocumentRobotTransit')!;
             const mast = transit.children.flatMap(child => child.children).find(child => child.className === 'pdfDocumentRobotMast')!;
             const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo')!;
@@ -2980,7 +3271,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.api.snapshot().retainedBytes, 0);
     });
 
-    it('admits fewer sharp compact actors rather than exceeding their shared sprite budget', () => {
+    it('adapts compact crew backing detail within the shared sprite budget while keeping the committed job', () => {
         const leased = new Set<string>();
         const f = fixture({ device: 'mobile' }); f.desktop(3, 4000, 4000);
         f.api.setDispatchOrigin({ reserve(vehicle: string) {
@@ -2995,13 +3286,19 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         ] }), 'started');
         const state = f.api.snapshot();
         assert.strictEqual(state.maxActors, 4);
-        assert.strictEqual(state.activeActors, 1, 'two full-density sprites would exceed the existing 200 KiB ceiling');
-        assert.strictEqual(leased.size, 1, 'failed cooperative allocation returned its temporary reservation');
+        assert.ok(state.activeActors >= 2 && state.activeActors <= state.maxActors, 'the larger logical job keeps its qualified crew');
+        assert.strictEqual(leased.size, state.activeActors, 'every committed member has one actual reservation');
         assert.ok(state.spriteBytes <= state.maxSpriteBytes);
         f.tick(600);
-        const actor = f.api.snapshot().pages[0].actors[0];
-        const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width)!;
-        assert.ok(sprite.width >= Math.ceil(128 * actor.spriteScale * 3 - 1e-8));
+        const actors = f.api.snapshot().pages[0].actors;
+        for (const actor of actors) {
+            const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.dataset.courier === String(actor.id))!;
+            const minimum = Math.min(1, actor.spriteScale * 3);
+            assert.ok(sprite.width >= Math.ceil(128 * minimum) && sprite.height >= Math.ceil(100 * minimum));
+            assert.deepStrictEqual([sprite.width, sprite.height], [Math.ceil(128 * actor.spriteScale * actor.spriteDensity),
+                Math.ceil(100 * actor.spriteScale * actor.spriteDensity)]);
+        }
+        assert.ok(actors.some((actor: any) => actor.spriteDensity < 3), 'only raster quality adapts to the bounded joint allocation');
         f.finish();
         assert.strictEqual(leased.size, 0);
         assert.strictEqual(f.api.snapshot().retainedBytes, 0);
@@ -3435,15 +3732,20 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             }
             f.tick(duration * 0.62 * 0.4);
             const current = f.api.snapshot().pages[0].payloads[0];
-            assert.strictEqual(current.routeState.requiresAir, dx > 0, 'committed travel, not gaze, determines a turn');
-            assert.strictEqual(current.routeState.groundCarried, dx > 0);
-            assert.strictEqual(current.routeState.reason, dx > 0 ? 'turn' : undefined);
             if (dx > 0) {
+                assert.strictEqual(current.mode, 'airlift');
+                assert.strictEqual(current.routeState.requiresAir, true, 'committed travel, not gaze, determines a turn');
+                assert.strictEqual(current.routeState.groundCarried, true);
+                assert.strictEqual(current.routeState.reason, 'turn');
                 const groundPoint = point(sprite), route = current.routeState;
                 assert.ok(Math.hypot(groundPoint.x - route.ground.x, groundPoint.y - route.ground.y) < 0.04);
                 const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
                 const pixels = point(cargo);
                 assert.ok(Math.hypot(pixels.x - route.cargo.x, pixels.y - route.cargo.y) < 0.04, 'the same photograph stays attached to the carried chassis');
+            } else {
+                assert.strictEqual(current.mode, 'solo', 'a forward trip with a small photograph uses its fitting staged courier');
+                assert.deepStrictEqual(current.helpers, [actor.id]);
+                assert.strictEqual(current.routeState, undefined);
             }
             assert.strictEqual(current.deadline, before.deadline); assert.deepStrictEqual(current.helpers, before.helpers);
             assert.deepStrictEqual(current.target, before.target); assert.strictEqual(current.id, before.id);
@@ -3455,7 +3757,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                 if (returning?.stage !== 'return') { continue; }
                 assert.strictEqual(returning.routeState.reason, 'turn', 'the same companion carries a committed reverse return');
                 reverseReturn ||= returning.routeState.groundCarried;
-                assert.deepStrictEqual(returning.helpers, before.helpers); assert.strictEqual(returning.deadline, before.deadline);
+                if (dx > 0) { assert.deepStrictEqual(returning.helpers, before.helpers); }
+                else { assert.ok(returning.helpers.includes(actor.id), 'the empty return retains its original body when a carrier joins'); }
+                assert.strictEqual(returning.deadline, before.deadline);
             }
             assert.ok(reverseReturn);
             assert.strictEqual(held.size + f.callbacks.size + f.api.snapshot().retainedBytes, 0, 'the committed return deadline releases every owner');
@@ -3639,7 +3943,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('reuses a handoff aircraft from its completed pose for the L-UGV reverse return', () => {
-        const f = fixture({ maxActors: 2, encounterRandom: () => 0.99 }); f.desktop(1, 1280, 1000);
+        const f = fixture({ seed: 132112, maxActors: 2, encounterRandom: () => 0.99 }); f.desktop(1, 1280, 1000);
         const held = new Set<string>();
         const groundDock = { x: 1000, y: 380, scale: 0.7 }, airDock = { x: 1000, y: 90, scale: 0.7 };
         f.api.setDispatchOrigin({ reserve(vehicle: string) {
@@ -3647,15 +3951,13 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             held.add(vehicle); return vehicle === 'lugv' ? groundDock : airDock;
         }, destination: (vehicle: string) => vehicle === 'lugv' ? groundDock : airDock,
         release(vehicle: string) { assert.ok(held.delete(vehicle)); } });
-        let payload: any, started = 0;
-        for (let id = 1; id <= 20; id++) {
-            const page = f.page(id); page.pageElement.rect = { left: 40, top: 60, width: 1000, height: 800 };
-            f.api.setVisiblePages([id]); started = f.now;
-            f.api.offer({ ...page, imageRegions: [{ id: 'handoff-' + id, x: 0.4, y: 0.15, width: 0.2, height: 0.2 }] });
-            payload = f.api.snapshot().pages[0]?.payloads.find((value: any) => value.mode === 'handoff');
-            if (payload) { break; } f.finish();
-        }
-        assert.ok(payload, 'the real mode sequence admits a L-UGV handoff');
+        const page = f.page(1); page.pageElement.rect = { left: 40, top: 60, width: 1000, height: 800 };
+        f.api.setVisiblePages([1]); const started = f.now;
+        f.api.offer({ ...page, imageRegions: [{ id: 'handoff-1', x: 0.4, y: 0.15, width: 0.24, height: 0.25 }] });
+        const payload = f.api.snapshot().pages[0]?.payloads.find((value: any) => value.mode === 'handoff');
+        assert.ok(payload, 'the fixed canonical opportunity admits a real L-UGV handoff');
+        assert.strictEqual(payload.operation.operatingMode, 'overreach');
+        assert.strictEqual(payload.operation.outcome.family, 'clean-triumph');
         const duration = payload.deadline - started;
         f.tick(started + duration * 0.70 - f.now);
         const air = f.api.snapshot().pages[0].actors.find((value: any) => value.vehicle === 'quad');
@@ -3777,23 +4079,23 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     it('keeps a sloped lab handoff continuous from the real dock through deposit and return', () => {
         const f = fixture({ maxActors: 2, encounterRandom: () => 0.99 }); f.desktop();
         const held = new Set<string>();
-        const dock = { x: 0, y: 460, scale: 1.92 }, airDock = { x: 900, y: 80, scale: 1.92 };
+        const dock = { x: 0, y: 440, scale: 1.92 }, airDock = { x: 900, y: 80, scale: 1.92 };
         f.api.setDispatchOrigin({ reserve(vehicle: string) {
-            if (!['rover', 'quad'].includes(vehicle) || held.has(vehicle)) { return; }
-            held.add(vehicle); return vehicle === 'rover' ? dock : airDock;
-        }, destination: (vehicle: string) => vehicle === 'rover' ? dock : airDock,
+            if (!['hexapod', 'heavyquad'].includes(vehicle) || held.has(vehicle)) { return; }
+            held.add(vehicle); return vehicle === 'hexapod' ? dock : airDock;
+        }, destination: (vehicle: string) => vehicle === 'hexapod' ? dock : airDock,
         release: (vehicle: string) => held.delete(vehicle) });
         let payload: any;
         for (let id = 1; id <= 16; id++) {
             const page = f.page(id);
             page.pageElement.rect = { left: 40, top: 60, width: 465, height: 661 };
             f.api.setVisiblePages([id]);
-            f.api.offer({ ...page, imageRegions: [{ id: 'sloped-handoff', x: 0.3, y: 0.32, width: 0.45, height: 0.3 }] });
+            f.api.offer({ ...page, imageRegions: [{ id: 'sloped-handoff', x: 0.3, y: 0.2, width: 240 / 465, height: 270 / 661 }] });
             payload = f.api.snapshot().pages[0]?.payloads.find((value: any) => value.mode === 'handoff');
             if (payload) { break; } f.finish();
         }
         assert.ok(payload, 'a ground dock at a different height can join a gentle cooperative handoff');
-        const actor = f.api.snapshot().pages[0].actors.find((value: any) => value.vehicle === 'rover');
+        const actor = f.api.snapshot().pages[0].actors.find((value: any) => value.vehicle === 'hexapod');
         const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
         let previous = point(sprite), handoff: { x: number; y: number } | undefined;
         assert.ok(Math.hypot(previous.x - dock.x, previous.y - dock.y) < 0.03, 'the real borrowed body does not teleport');
@@ -3822,27 +4124,14 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('returns the aircraft independently when its carried ground partner has a shallow route home', () => {
-        const f = fixture({ maxActors: 2 }); f.desktop();
-        const held = new Set<string>();
-        let groundDock = { x: 100, y: 620, scale: 0.5 };
-        const airDock = { x: 980, y: 90, scale: 0.5 };
-        f.api.setDispatchOrigin({ reserve(vehicle: string) {
-            if (!['lugv', 'heavyquad'].includes(vehicle) || held.has(vehicle)) { return; }
-            held.add(vehicle); return vehicle === 'lugv' ? groundDock : airDock;
-        }, destination: (vehicle: string) => vehicle === 'lugv' ? groundDock : airDock,
-        release: (vehicle: string) => held.delete(vehicle) });
-        let payload: any;
-        for (let id = 1; id <= 16; id++) {
-            const page = f.page(id); f.api.setVisiblePages([id]);
-            f.api.offer({ ...page, imageRegions: [{ id: 'qualified-home-' + id, x: 0.3, y: 0.25, width: 0.4, height: 0.25 }] });
-            payload = f.api.snapshot().pages[0]?.payloads.find((value: any) => value.mode === 'airlift');
-            if (payload) { break; } f.finish();
-        }
-        assert.ok(payload);
+        const scene = cooperative('airlift');
+        assert.ok('setGroundDock' in scene);
+        const { f, payload, held, airDock } = scene;
         while (f.now <= payload.deadline && !f.api.snapshot().pages[0]?.payloads[0].deposited) { f.frame(); }
         assert.ok(f.api.snapshot().pages[0]?.payloads[0].deposited, 'the qualified fixture reaches the semantic deposit boundary');
         const state = f.api.snapshot().pages[0], route = state.payloads[0].routeState;
-        groundDock = { x: route.ground.x + 80, y: route.ground.y, scale: 0.5 };
+        const ground = state.actors.find((value: any) => value.vehicle === 'lugv');
+        scene.setGroundDock!({ x: route.ground.x + 80 * (ground.drivingDirection ?? 1), y: route.ground.y, scale: 0.5 });
         const air = state.actors.find((actor: any) => actor.vehicle === 'heavyquad');
         const sprite = f.owned.find(canvas => canvas.dataset.courier === String(air.id))!;
         const distances: number[] = [];
@@ -3851,11 +4140,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             if (current?.stage !== 'return') { continue; }
             assert.strictEqual(current.routeState.requiresAir, false);
             const currentPoint = point(sprite);
-            distances.push(Math.hypot(currentPoint.x - airDock.x, currentPoint.y - airDock.y));
+            distances.push(Math.hypot(currentPoint.x - airDock!.x, currentPoint.y - airDock!.y));
         }
         assert.ok(distances.length > 3);
         assert.ok(distances.at(-1)! < distances[0] * 0.1, 'the aircraft reaches its dock before its lease is released');
-        assert.strictEqual(held.size, 0);
+        assert.strictEqual(held!.size, 0);
         assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size, 0);
     });
 
@@ -3910,7 +4199,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         }
     });
 
-    it('mixes solo and cooperative deliveries within the existing mobile and desktop resource caps', () => {
+    it('mixes proportionate solo and formation deliveries within the existing mobile and desktop resource caps', () => {
         const modes = new Set<string>();
         for (const device of ['mobile', 'desktop']) {
             const f = fixture({ device });
@@ -3920,13 +4209,18 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                 page.pageElement.rect = { left: 40, top: 60, width: 465, height: 661 };
                 f.api.setVisiblePages([id]); f.api.offer(page);
                 const state = f.api.snapshot();
-                for (const payload of state.pages[0]?.payloads ?? []) { modes.add(payload.mode); }
+                for (const payload of state.pages[0]?.payloads ?? []) {
+                    modes.add(payload.mode);
+                    if (payload.operation.operatingMode !== 'overreach') {
+                        assert.ok(payload.helpers.length <= payload.operation.workload.preferredCrew, 'ordinary photo-only work uses its fitting crew');
+                    }
+                }
                 assert.ok(state.activeActors <= state.maxActors && state.cargoBytes <= state.maxCargoBytes && state.spriteBytes <= state.maxSpriteBytes);
                 assert.strictEqual(state.retainedBytes, f.owned.reduce((bytes, canvas) => bytes + canvas.width * canvas.height * 4, 0));
                 f.finish();
             }
         }
-        assert.deepStrictEqual([...modes].sort(), ['airlift', 'formation', 'handoff', 'solo']);
+        assert.deepStrictEqual([...modes].sort(), ['formation', 'solo']);
     });
 
     it('falls back to solo fragments when a larger cooperative raster cannot fit the existing byte cap', () => {
@@ -3958,10 +4252,10 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.desktop();
         const held = new Set<string>();
         let reservations = 0, releases = 0;
-        const origin = { x: 550, y: 80, scale: 0.4 };
+        const origin = { x: 1300, y: 620, scale: 0.4 };
         f.api.setDispatchOrigin({
             reserve(vehicle: string) {
-                if (vehicle !== 'quad' || held.has(vehicle)) { return; }
+                if (vehicle !== 'lugv' || held.has(vehicle)) { return; }
                 held.add(vehicle); reservations++; return origin;
             },
             destination: (vehicle: string) => held.has(vehicle) ? origin : undefined,
@@ -3969,7 +4263,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         });
         const page = f.page();
         page.pageElement.rect = { left: 40, top: 60, width: 640, height: 900 };
-        const light = { id: 'independent-light-photo', x: 0.1, y: 0.65, width: 0.1, height: 0.1 };
+        const light = { id: 'independent-light-photo', x: 0.1, y: 0.52, width: 0.1, height: 0.1 };
         f.api.setVisiblePages([1]);
         assert.strictEqual(f.api.offer({ ...page, imageRegions: [
             { id: 'heavy-photo', x: 0.1, y: 0.1, width: 0.6, height: 0.4 }, light,
@@ -4057,9 +4351,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             const documentScale = (465 * 661 / (640 * 900)) ** 0.25;
             const scale = 1.92 * documentScale / Math.sqrt(dpr);
             for (const sprite of sprites) {
-                assert.ok(Math.abs(parseFloat(sprite.style.width) - 128 * scale) < 0.02, 'CSS size receives document growth and partial DPI compensation exactly once');
-                assert.deepStrictEqual([sprite.width, sprite.height], [Math.ceil(128 * scale * dpr), Math.ceil(100 * scale * dpr)]);
-                assert.ok(sprite.transforms.some(values => values[0] >= scale * dpr && values[3] >= scale * dpr), 'artwork is redrawn into display-resolution backing');
+                const actor = actors.find((value: any) => String(value.id) === sprite.dataset.courier), factor = actor.vehicle === 'heavyquad' ? 2.5 : 1;
+                const effective = scale * factor;
+                assert.ok(Math.abs(parseFloat(sprite.style.width) - 128 * effective) < 0.02, 'CSS size receives document, character and DPI scale exactly once');
+                assert.deepStrictEqual([sprite.width, sprite.height], [Math.ceil(128 * effective * dpr), Math.ceil(100 * effective * dpr)]);
+                assert.ok(sprite.transforms.some(values => values[0] >= effective * dpr && values[3] >= effective * dpr), 'artwork is redrawn into display-resolution backing');
             }
             assert.strictEqual(f.api.snapshot().spriteBytes, sprites.reduce((bytes, sprite) => bytes + sprite.width * sprite.height * 4, 0));
             assert.strictEqual(f.api.snapshot().retainedBytes, f.owned.reduce((bytes, canvas) => bytes + canvas.width * canvas.height * 4, 0));
@@ -4068,7 +4364,8 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                 f.window.innerWidth = f.container.rect.width = 860;
                 f.frame();
                 assert.ok(f.api.snapshot().spriteBytes < before, 'an active resize redraws smaller backing instead of leaving oversized sprites');
-                assert.ok(sprites.every(sprite => parseFloat(sprite.style.width) < 210));
+                assert.ok(sprites.every(sprite => parseFloat(sprite.style.width) < 210
+                    * (actors.find((value: any) => String(value.id) === sprite.dataset.courier).vehicle === 'heavyquad' ? 2.5 : 1)));
             }
             f.finish();
             assert.strictEqual(f.api.snapshot().retainedBytes, 0);
@@ -4097,9 +4394,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             f.frame();
             const actors = f.api.snapshot().pages.flatMap((page: any) => page.actors);
             assert.ok(f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width).every(canvas => {
-                const scale = actors.find((actor: any) => String(actor.id) === canvas.dataset.courier)!.spriteScale;
-                return canvas.width >= Math.ceil(128 * scale * 3 - 1e-8) && canvas.height >= Math.ceil(100 * scale * 3 - 1e-8);
-            }), 'even staggered, not-yet-painted actors have backing for their admitted physical size');
+                const actor = actors.find((value: any) => String(value.id) === canvas.dataset.courier)!;
+                const minimum = Math.min(1, actor.spriteScale * 3);
+                return canvas.width >= Math.ceil(128 * minimum) && canvas.height >= Math.ceil(100 * minimum)
+                    && actor.spriteDensity > 0 && actor.spriteDensity <= 3;
+            }), 'even staggered, not-yet-painted actors retain their admitted local-art detail floor');
         }
         const touchscreenDesktop = fixture();
         touchscreenDesktop.desktop();
@@ -4282,10 +4581,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(new Set(actors.map((actor: any) => actor.vehicle)).size, actors.length);
         assert.strictEqual(lab.snapshot().actors.filter((actor: any) => actor.outside).length, actors.length);
         const sprites = f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width);
-        assert.ok(sprites.every(sprite => Math.abs(parseFloat(sprite.style.width) - 128 * 86 / 250 / Math.sqrt(2)) < 0.02));
+        const factor = (sprite: Canvas) => actors.find((actor: any) => String(actor.id) === sprite.dataset.courier).vehicle === 'heavyquad' ? 2.5 : 1;
+        assert.ok(sprites.every(sprite => Math.abs(parseFloat(sprite.style.width) - 128 * 86 / 250 / Math.sqrt(2) * factor(sprite)) < 0.02));
         f.now += 700; f.frame();
         const documentScale = (465 * 661 / (640 * 900)) ** 0.25;
-        assert.ok(sprites.every(sprite => Math.abs(parseFloat(sprite.style.width) - 128 * 1.92 * documentScale / Math.sqrt(2)) < 0.02));
+        assert.ok(sprites.every(sprite => Math.abs(parseFloat(sprite.style.width) - 128 * 1.92 * documentScale / Math.sqrt(2) * factor(sprite)) < 0.02));
         f.finish();
         assert.ok(lab.snapshot().actors.every((actor: any) => !actor.outside));
         assert.strictEqual(f.api.snapshot().retainedBytes, 0);
@@ -4383,7 +4683,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
 
     it('leaves a failed region proposal available after canvas or helper reservation rollback', () => {
         for (const failure of ['copy', 'helper']) {
-            let f: Fixture, failCopy = failure === 'copy', notifications = 0;
+            let f: Fixture, failCopy = failure === 'copy', failReservation = failure === 'helper', notifications = 0;
             f = fixture({ maxActors: 3, onCapacityAvailable: () => notifications++, createCanvas: () => {
                 const canvas = new Canvas(f.document); f.owned.push(canvas);
                 canvas.beforeCopy = args => {
@@ -4394,18 +4694,20 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             f.desktop(1, 1200, 1100);
             const held = new Set<string>(); let borrowed = 0, released = 0;
             if (failure === 'helper') {
-                const origin = { x: 550, y: 80, scale: 0.4 };
+                const origin = { x: 1300, y: 450, scale: 0.4 };
                 f.api.setDispatchOrigin({ reserve(vehicle: string) {
-                    if (vehicle !== 'heavyquad' || held.has(vehicle)) { return; }
+                    if (!['lugv', 'quad'].includes(vehicle) || held.has(vehicle)) { return; }
+                    if (failReservation && held.size) { failReservation = false; throw new Error('second crew reservation failed'); }
                     held.add(vehicle); borrowed++; return origin;
                 }, destination: () => origin, release(vehicle: string) { assert.ok(held.delete(vehicle)); released++; } });
             }
             const page = f.page(); page.pageElement.rect = { left: 40, top: 60, width: 640, height: 900 };
-            const image = { id: 'single-job', x: 0.2, y: 0.2, width: 0.3, height: 0.2 };
+            const image = { id: 'single-job', x: 0.2, y: 0.2,
+                width: failure === 'helper' ? 240 / 640 : 0.3, height: failure === 'helper' ? 270 / 900 : 0.2 };
             const delivery = { ...page, imageRegions: [image] };
             f.api.setVisiblePages([1]);
-            if (failure === 'copy') {
-                assert.strictEqual(f.api.offer(delivery), 'deferred', 'a physical copy failure keeps its canonical job eligible');
+            {
+                assert.strictEqual(f.api.offer(delivery), 'deferred', 'a physical copy or reservation failure keeps its canonical job eligible');
                 const rejected = f.api.snapshot();
                 assert.strictEqual(f.api.hasHandled(1), false);
                 assert.strictEqual(rejected.activeActors + rejected.retainedBytes + rejected.activeArrivalCovers + f.callbacks.size + notifications, 0);
@@ -4414,13 +4716,15 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                 assert.strictEqual(f.api.offer(delivery), 'started', 'a later explicit offer retries the same unclaimed region');
                 assert.deepStrictEqual(f.api.snapshot().pages[0].payloads[0].operation.decision, rejected.lastOperationDecision.decision);
                 assert.strictEqual(f.api.snapshot().operationNarrativeRecords, rejected.operationNarrativeRecords);
-            } else { assert.strictEqual(f.api.offer(delivery), 'started'); }
+            }
             const jobs = f.api.snapshot().pages[0].payloads;
             assert.strictEqual(jobs.length, 1);
-            if (failure === 'helper') { assert.strictEqual(jobs[0].mode, 'solo'); }
+            if (failure === 'helper') { assert.strictEqual(jobs[0].helpers.length, 2); }
             assert.deepStrictEqual(jobs[0].target, { x: image.x, y: image.y, width: image.width, height: image.height });
-            assert.ok(f.owned.some(canvas => canvas.zeroWrites === 1), 'failed construction releases its temporary owner');
-            if (failure === 'helper') { assert.ok(borrowed >= 2 && released >= 1, 'the failed crew returned its real lease before ordinary admission'); }
+            if (failure === 'copy') { assert.ok(f.owned.some(canvas => canvas.zeroWrites === 1), 'failed construction releases its temporary owner'); }
+            else { assert.strictEqual(f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle').length, jobs[0].helpers.length,
+                'a missing crew member rejects the provisional leases before allocating any body backing'); }
+            if (failure === 'helper') { assert.ok(borrowed >= 3 && released >= 1, 'the failed crew returned its real lease before the explicit retry committed its full pair'); }
             f.finish(); assert.strictEqual(held.size + f.api.snapshot().retainedBytes + f.callbacks.size, 0);
             assert.strictEqual(borrowed, released);
         }
@@ -4577,7 +4881,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.callbacks.size, 0);
     });
 
-    it('varies vehicle combinations and arrival routes instead of replaying one full scene', () => {
+    it('varies fitting vehicle combinations and arrival routes for repeated small work', () => {
         const f = fixture();
         const vehicles = new Set<string>(), routes = new Set<number>(), combinations = new Set<string>();
         for (let id = 1; id <= 12; id++) {
@@ -4589,7 +4893,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             combinations.add(actors.map((actor: any) => actor.vehicle).join(','));
             f.finish();
         }
-        assert.strictEqual(vehicles.size, module.ROBOT_VEHICLES.length);
+        assert.ok(vehicles.size >= 4, 'repeated small work still visits several fitting structural carriers');
         assert.strictEqual(routes.size, 4);
         assert.ok(combinations.size >= 6);
         assert.strictEqual(f.callbacks.size, 0);
@@ -4627,7 +4931,8 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             assert.ok(actors.every((actor: any) => actor.fromLab));
             for (const actor of actors) {
                 const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.dataset.courier === String(actor.id))!;
-                assert.ok(Math.abs(parseFloat(sprite.style.width) - module.ROBOT_ARTWORK_SIZE.width * 86 / 250) < 0.02,
+                assert.ok(Math.abs(parseFloat(sprite.style.width) - module.ROBOT_ARTWORK_SIZE.width * 86 / 250
+                    * (actor.vehicle === 'heavyquad' ? 2.5 : 1)) < 0.02,
                     'every departing body begins at its visible compact-lab scale');
                 assert.strictEqual(sprite.style.opacity, '1', 'every visible lab actor is replaced immediately without a staggered-launch gap');
             }

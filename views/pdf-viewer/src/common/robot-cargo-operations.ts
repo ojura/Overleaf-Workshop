@@ -9,13 +9,31 @@ export const ROBOT_DELIVERY_PHASES = Object.freeze({ rendezvousEnd: 0.18, handof
     handoffEnd: 0.36, deposit: 0.62, return: 0.76, forkLiftStart: 0.44, removalAftermathEnd: 0.9 });
 export type RobotCargoMode = 'solo' | 'formation' | 'handoff' | 'airlift';
 export interface RobotCargoJob { key: string; goal: RobotOperationGoal; workload: Readonly<RobotCargoWorkload> }
+/** Comparable equipment shares a class; each further doubling of mobilized size costs one class. */
+export const ROBOT_CARGO_SELECTION_POLICY = Object.freeze({ comparableWorkMultiplier: 2 });
+export interface RobotCargoFit {
+    transportDifference: number;
+    helperDifference: number;
+    mobilizedMass: number;
+    visualPresence: number;
+    sizeClass: number;
+}
 export interface RobotCargoCandidate {
     mode: RobotCargoMode;
     ground: boolean;
     vehicles: readonly RobotVehicle[];
     spec: RobotOperationSpec;
     assessment: RobotOperationAssessment;
+    fit: Readonly<RobotCargoFit>;
+    repeatedTypes: number;
     rank: number;
+}
+
+/** Workload fit precedes variety and optional stories, including already staged heavy equipment. */
+export function compareRobotCargoCandidates(a: RobotCargoCandidate, b: RobotCargoCandidate): number {
+    return a.fit.transportDifference - b.fit.transportDifference || a.fit.helperDifference - b.fit.helperDifference || a.fit.sizeClass - b.fit.sizeClass
+        || a.repeatedTypes - b.repeatedTypes || a.rank - b.rank || a.mode.localeCompare(b.mode)
+        || a.vehicles.join(',').localeCompare(b.vehicles.join(','));
 }
 
 /** Describe the members who actually support the load in each phase, including bodies carried with it. */
@@ -48,9 +66,9 @@ export function robotCargoOperation(job: RobotCargoJob, mode: RobotCargoMode, me
 }
 
 /** Bounded proposals precede reservation. Availability and the final actual members remain the caller's authority. */
-export function robotCargoCandidates(job: RobotCargoJob, available: readonly { vehicle: RobotVehicle; staged?: boolean }[],
+export function robotCargoCandidates(job: RobotCargoJob, available: readonly { vehicle: RobotVehicle; staged?: boolean; inUse?: boolean }[],
     options: { seed: number; preferredMode: RobotCargoMode; preferredHelpers: number; maxHelpers: number;
-        ground?: boolean; preferredGround?: RobotVehicle }): RobotCargoCandidate[] {
+        ground?: boolean; bodyTransport?: RobotVehicle }): RobotCargoCandidate[] {
     const entries = [...new Map(available.map(value => [value.vehicle, value])).values()]
         .filter(value => !!robotStructure(value.vehicle)).sort((a, b) => a.vehicle.localeCompare(b.vehicle));
     const max = Math.max(0, Math.min(3, options.maxHelpers)), candidates: RobotCargoCandidate[] = [];
@@ -65,9 +83,18 @@ export function robotCargoCandidates(job: RobotCargoJob, available: readonly { v
         const preferred = mode === options.preferredMode && crew.length === options.preferredHelpers && ground === !!options.ground;
         const teamwork = crew.reduce((sum, value) => sum + robotStructure(value.vehicle)!.personality.teamPreference, 0) / crew.length;
         const personality = mode === 'airlift' ? robotStructure(crew[0].vehicle)!.personality.carrierAffinity : 0;
+        const mobilizedMass = crew.reduce((sum, value) => sum + robotStructure(value.vehicle)!.mass, 0);
+        const visualPresence = crew.reduce((sum, value) => sum + robotStructure(value.vehicle)!.presentationScale ** 2, 0);
+        const transportsBody = !!options.bodyTransport && mode === 'airlift' && crew[0].vehicle === options.bodyTransport;
+        const comparableSize = ROBOT_CARGO_SELECTION_POLICY.comparableWorkMultiplier
+            * Math.max(job.workload.mass, job.workload.preferredCrew);
+        const fit = Object.freeze({ transportDifference: options.bodyTransport && !transportsBody ? 1 : 0,
+            helperDifference: Math.abs(crew.length - Math.max(job.workload.preferredCrew, transportsBody ? 2 : 1)),
+            mobilizedMass, visualPresence,
+            sizeClass: Math.ceil(Math.log2(Math.max(1, Math.max(mobilizedMass, visualPresence) / comparableSize))) });
         candidates.push({ mode, ground, vehicles: crew.map(value => value.vehicle), spec, assessment,
+            fit, repeatedTypes: crew.filter(value => !value.staged && value.inUse).length,
             rank: (preferred ? -4 : 0) - staged * 2 - personality
-                + Math.abs(crew.length - Math.max(job.workload.preferredCrew, options.preferredHelpers)) * 0.3
                 - (crew.length > 1 ? teamwork * 0.1 : 0)
                 + robotOperationRandom(options.seed, job.key, 'crew-rank', signature) });
     };
@@ -88,10 +115,9 @@ export function robotCargoCandidates(job: RobotCargoJob, available: readonly { v
         for (const flyer of job.goal === 'removal' ? [] : air) {
             for (const driver of ground) {
                 add('handoff', [flyer, driver]);
-                if (!options.preferredGround || driver.vehicle === options.preferredGround) { add('airlift', [driver, flyer]); }
+                if (!options.bodyTransport || driver.vehicle === options.bodyTransport) { add('airlift', [driver, flyer]); }
             }
         }
     }
-    return candidates.sort((a, b) => a.rank - b.rank || a.mode.localeCompare(b.mode)
-        || a.vehicles.join(',').localeCompare(b.vehicles.join(',')));
+    return candidates.sort(compareRobotCargoCandidates);
 }
