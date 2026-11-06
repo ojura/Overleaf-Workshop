@@ -429,7 +429,10 @@ export class HistoryViewProvider {
                 if (focused && this.historyView.visible) { this.treeDataProvider.invalidate(); return this.updateView(this.pathParts); }
             }),
             EventBus.on('projectStateChangedEvent', ({uri, kind}) => {
-                if (this.sameProject(uri) && (kind === 'files' || kind === 'joined')) { this.treeDataProvider.invalidate(); }
+                if (this.sameProject(uri) && (kind === 'files' || kind === 'joined')) {
+                    this.treeDataProvider.invalidate();
+                    return this.updateView(this.pathParts);
+                }
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.clearSelection`, () => this.updateView()),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.revealHistoryView`, () =>

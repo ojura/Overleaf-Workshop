@@ -41,6 +41,7 @@ function world() {
     };
     const status = { shows: 0, disposed: false, show() { this.shows++; }, dispose() { this.disposed = true; } };
     const diagnostics = new Map<string, any[]>();
+    const decorations: { disposed: boolean; dispose(): void }[] = [];
     const collection = { get: (uri: Uri) => diagnostics.get(uri.toString()), set: (uri: Uri, value: any[]) => diagnostics.set(uri.toString(), value),
         delete: (uri: Uri) => diagnostics.delete(uri.toString()), clear: () => diagnostics.clear(), dispose: () => diagnostics.clear() };
     const commands = new Map<string, (...args: any[]) => unknown>();
@@ -61,7 +62,10 @@ function world() {
             createStatusBarItem: () => status, createTreeView: () => tree,
             onDidChangeWindowState: events.focus.event, onDidChangeActiveTextEditor: events.active.event,
             onDidChangeTextEditorSelection: events.selection.event, onDidChangeVisibleTextEditors: events.visible.event,
-            registerWebviewViewProvider: () => ({ dispose() {} }), createTextEditorDecorationType: () => ({ dispose() {} }),
+            registerWebviewViewProvider: () => ({ dispose() {} }), createTextEditorDecorationType: () => {
+                const decoration = { disposed: false, dispose() { this.disposed = true; } };
+                decorations.push(decoration); return decoration;
+            },
         },
         languages: { createDiagnosticCollection: () => collection, registerCompletionItemProvider: () => ({ dispose() {} }), registerCodeActionsProvider: () => ({ dispose() {} }) },
         commands: { registerCommand: (name: string, fn: (...args: any[]) => unknown) => { commands.set(name, fn); return { dispose: () => commands.delete(name) }; }, executeCommand: async () => undefined },
@@ -99,7 +103,7 @@ function world() {
         const doc = { uri, version: 1, languageId: 'latex', lineCount: 1, getText: () => text, lineAt: () => ({text}), validateRange: (range: Range) => range };
         documents.push(doc); return doc;
     }
-    return { ...modules, vscode, vfs, vfsm, socket, registrations, connected, events, status, tree, diagnostics, document, replicaPaths };
+    return { ...modules, vscode, vfs, vfsm, socket, registrations, connected, events, status, tree, diagnostics, decorations, document, replicaPaths };
 }
 
 async function withTimers(run: (timers: Map<object, () => void>) => Promise<void>) {
@@ -200,6 +204,90 @@ describe('live project state owners', () => {
         const late = [...timers.values()]; subscriptions.forEach((s: any) => s.dispose()); late.forEach(callback => callback());
         assert.strictEqual(timers.size, 0); assert.strictEqual(f.tree.disposed, true);
     }));
+
+    for (const kind of ['files', 'joined']) {
+        it(`reloads the selected visible history after a ${kind} event`, async () => withTimers(async () => {
+            const f = world(), fresh = deferred<any>(); let requests = 0;
+            const updates = (version: number) => ({ updates: [{ fromV: version - 1, toV: version,
+                meta: { end_ts: Date.now(), users: [] }, labels: [], pathnames: ['chapter.tex'], project_ops: [] }] });
+            f.vfs.getUpdates = () => ++requests === 1 ? Promise.resolve(updates(1)) : fresh.promise;
+            const history = new f.HistoryViewProvider(f.vfs), subscriptions = history.triggers;
+            const data = history.treeDataProvider, painted = deferred<void>();
+            try {
+                f.tree.visible = true; await f.events.viewVisible.fire({visible:true});
+                await history.updateView(['chapter.tex']);
+                assert.deepStrictEqual((await data.getChildren()).map((item:any) => item.version), [1]);
+                const subscription = data.onDidChangeTreeData(() => painted.resolve()); subscriptions.push(subscription);
+                f.EventBus.fire('projectStateChangedEvent', {uri:new Uri('/Other', 'user=u1&project=p2'), kind});
+                assert.strictEqual(requests, 1, 'another project cannot reload this history');
+                f.EventBus.fire('projectStateChangedEvent', {uri:f.vfs.origin, kind});
+                assert.strictEqual(requests, 2, 'the visible invalidation must start a current history request');
+                fresh.resolve(updates(2)); await painted.promise;
+                assert.deepStrictEqual((await data.getChildren()).map((item:any) => item.version), [2]);
+                assert.strictEqual(f.tree.description, 'chapter.tex', 'the active history filter remains selected');
+            } finally { fresh.resolve(updates(2)); subscriptions.forEach((subscription:any) => subscription.dispose()); }
+        }));
+    }
+
+    it('defers hidden history invalidation until shown and ignores a response after disposal', async () => withTimers(async timers => {
+        const f = world(), response = deferred<any>(); let requests = 0, paints = 0;
+        f.vfs.getUpdates = () => { requests++; return response.promise; };
+        const history = new f.HistoryViewProvider(f.vfs), subscriptions = history.triggers;
+        subscriptions.push(history.treeDataProvider.onDidChangeTreeData(() => { paints++; }));
+        let showing: Promise<unknown> | undefined;
+        try {
+            f.EventBus.fire('projectStateChangedEvent', {uri:f.vfs.origin, kind:'files'});
+            f.EventBus.fire('projectStateChangedEvent', {uri:f.vfs.origin, kind:'joined'});
+            assert.strictEqual(requests, 0); assert.strictEqual(timers.size, 0);
+            f.tree.visible = true; showing = f.events.viewVisible.fire({visible:true});
+            assert.strictEqual(requests, 1, 'showing the invalidated view fetches once');
+            subscriptions.forEach((subscription:any) => subscription.dispose());
+            response.resolve({updates:[]}); await showing;
+            assert.strictEqual(paints, 0, 'the disposed history cannot repaint after its request completes');
+            assert.strictEqual(timers.size, 0);
+        } finally {
+            response.resolve({updates:[]}); await showing;
+            subscriptions.forEach((subscription:any) => subscription.dispose());
+        }
+    }));
+
+    it('keeps a newer cursor and its decoration when the initial user snapshot arrives', async () => withTimers(async () => {
+        const f = world(); f.vfs._resolveById = (id:string) => ({path:'/' + id,fileEntity:{_id:id}});
+        const manager = new f.ClientManager(f.vfs, {extensionUri:new Uri('/extension')}, 'self', f.socket);
+        const handlers = [...f.registrations].find(registration => registration.onClientUpdated);
+        try {
+            handlers.onClientUpdated({id:'other',user_id:'u2',name:'Current',email:'',doc_id:'new',row:8,column:3});
+            const user = manager.onlineUsers.other, selection = user.selection;
+            f.connected.resolve([
+                {client_id:'other',user_id:'u2',first_name:'Old',email:'',cursorData:{doc_id:'old',row:1,column:0},last_updated_at:'1'},
+                {client_id:'untouched',user_id:'u3',first_name:'Untouched',email:'',cursorData:{doc_id:'chapter',row:4,column:2},last_updated_at:'1'},
+            ]);
+            await f.connected.promise;
+            assert.strictEqual(manager.onlineUsers.other, user, 'the snapshot must keep the current client record');
+            assert.strictEqual(user.selection, selection, 'the existing decoration stays owned by that record');
+            assert.strictEqual(user.doc_id, 'new'); assert.strictEqual(selection.ranges[0].range.start.line, 8);
+            assert.strictEqual(manager.onlineUsers.untouched.row, 4, 'an unchanged client is still admitted from the snapshot');
+            assert.strictEqual(f.decorations.length, 2);
+        } finally { manager.dispose(); }
+        assert.ok(f.decorations.every(decoration => decoration.disposed), 'all created decorations are released');
+    }));
+
+    for (const hadPosition of [false, true]) {
+        it(`keeps a ${hadPosition ? 'displayed' : 'not-yet-listed'} collaborator disconnected after the initial snapshot`, async () => withTimers(async () => {
+            const f = world(); f.vfs._resolveById = (id:string) => ({path:'/' + id,fileEntity:{_id:id}});
+            const manager = new f.ClientManager(f.vfs, {extensionUri:new Uri('/extension')}, 'self', f.socket);
+            const handlers = [...f.registrations].find(registration => registration.onClientUpdated);
+            try {
+                if (hadPosition) { handlers.onClientUpdated({id:'other',user_id:'u2',name:'Other',email:'',doc_id:'chapter',row:2,column:0}); }
+                handlers.onClientDisconnected('other');
+                assert.ok(f.decorations.every(decoration => decoration.disposed));
+                f.connected.resolve([{client_id:'other',user_id:'u2',first_name:'Other',email:'',cursorData:{doc_id:'chapter',row:1,column:0},last_updated_at:'1'}]);
+                await f.connected.promise;
+                assert.strictEqual(manager.onlineUsers.other, undefined, 'the older list cannot recreate the disconnected client');
+                assert.strictEqual(f.decorations.length, hadPosition ? 1 : 0, 'the snapshot cannot create a replacement decoration');
+            } finally { manager.dispose(); }
+        }));
+    }
 
     it('replays chat edits and deletions over a pending HTTP snapshot without duplicate messages', async () => {
         const f = world(); const fetch = deferred<any[]>(); f.vfs.getMessages = () => fetch.promise;

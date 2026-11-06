@@ -61,6 +61,8 @@ export class ClientManager {
     private readonly socketSubscription: { dispose(): void };
     private readonly positionRevisions = new Map<string, number>();
     private positionRevision = 0;
+    /** Cursor and disconnect events take precedence over the pending initial list. */
+    private initialUserChanges?: Set<string> = new Set();
     private readonly status: vscode.StatusBarItem;
     private readonly onlineUsers: {[K:string]:ExtendedUpdateUserSchema} = {};
     private connectedFlag: boolean = true;
@@ -78,10 +80,12 @@ export class ClientManager {
     ) {
         this.socketSubscription = this.socket.updateEventHandlers({
             onClientUpdated: (user:UpdateUserSchema) => {
+                this.initialUserChanges?.add(user.id);
                 if (user.id !== this.publicId) { this.setStatusActive(user.id); }
                 void this.updatePosition(user.id, user.doc_id, user.row, user.column, user).catch(error => console.warn('Overleaf collaborator update failed:', error));
             },
             onClientDisconnected: (id:string) => {
+                this.initialUserChanges?.add(id);
                 this.removePosition(id);
             },
             onDisconnected: () => {
@@ -96,8 +100,11 @@ export class ClientManager {
             }
         });
         this.socket.getConnectedUsers().then(users => {
+            const changed = this.initialUserChanges;
+            this.initialUserChanges = undefined;
             if (this.disposed) { return; }
             users.forEach(user => {
+                if (user.client_id === this.publicId || changed?.has(user.client_id)) { return; }
                 const onlineUser = {
                     id: user.client_id,
                     user_id: user.user_id,
@@ -108,14 +115,14 @@ export class ClientManager {
                     column: user.cursorData?.column || 0,
                     last_updated_at: Number(user.last_updated_at),
                 };
-                if (user.client_id !== this.publicId) {
-                    this.onlineUsers[user.client_id] = onlineUser;
-                    void this.updatePosition(user.client_id, onlineUser.doc_id, onlineUser.row, onlineUser.column, onlineUser)
-                        .catch(error => { if (!this.disposed) { console.warn('Overleaf collaborator update failed:', error); } });
-                }
+                void this.updatePosition(user.client_id, onlineUser.doc_id, onlineUser.row, onlineUser.column, onlineUser)
+                    .catch(error => { if (!this.disposed) { console.warn('Overleaf collaborator update failed:', error); } });
             });
             this.updateStatus();
-        }).catch(error => { if (!this.disposed) { console.warn('Overleaf collaborator list failed:', error); } });
+        }).catch(error => {
+            this.initialUserChanges = undefined;
+            if (!this.disposed) { console.warn('Overleaf collaborator list failed:', error); }
+        });
 
         this.chatViewer = new ChatViewProvider(this.vfs, this.publicId, this.context.extensionUri, this.socket, () => this.updateStatus());
         this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
@@ -415,6 +422,7 @@ export class ClientManager {
     dispose() {
         if (this.disposed) { return; }
         this.disposed = true;
+        this.initialUserChanges = undefined;
         clearTimeout(this.statusTask); clearTimeout(this.inactivateTask);
         this.statusTask = undefined; this.inactivateTask = undefined;
         this.socketSubscription.dispose();
