@@ -22,6 +22,8 @@ export interface PerformanceEvent {
     data: EventData;
 }
 interface FetchSample { at: number; start: number; bytes: number }
+const readingCounters = () => ({ manifestBytes: 0, pdfBytes: 0, imageBytes: 0, imageTransfers: 0, failedTransfers: 0,
+    passes: 0, coveredPages: 0, finalPages: 0, passTotalMs: 0, passMaxMs: 0 });
 
 export interface DiskCacheSnapshot {
     storedBytes: number;
@@ -77,6 +79,7 @@ export class PdfPerformance {
     private firstFetchAt = Infinity;
     private startedAt = 0;
     private diskCache?: DiskCacheSnapshot;
+    private reading = readingCounters();
 
     constructor(private readonly now: () => number = () => performance.now()) {
         this.startedAt = now();
@@ -143,6 +146,19 @@ export class PdfPerformance {
                 copy[key.slice(0, PERFORMANCE_LIMITS.eventTextLength)] = value;
             }
         }
+        if (type === 'reading-transfer' || type === 'reading-transfer-error') {
+            const bytes = typeof copy.bytes === 'number' ? Math.max(0, copy.bytes) : 0;
+            if (copy.kind === 'manifest') { this.reading.manifestBytes += bytes; }
+            if (copy.kind === 'pdf') { this.reading.pdfBytes += bytes; }
+            if (copy.kind === 'image') { this.reading.imageBytes += bytes; this.reading.imageTransfers++; }
+            if (type === 'reading-transfer-error') { this.reading.failedTransfers++; }
+        } else if (type === 'image-pass') {
+            this.reading.passes++;
+            if (copy.firstCoverage === true) { this.reading.coveredPages++; }
+            if (copy.firstFinal === true) { this.reading.finalPages++; }
+            const ms = typeof copy.ms === 'number' ? Math.max(0, copy.ms) : 0;
+            this.reading.passTotalMs += ms; this.reading.passMaxMs = Math.max(this.reading.passMaxMs, ms);
+        }
         this.events.push({
             sequence: ++this.eventCount,
             at: this.now(),
@@ -193,6 +209,7 @@ export class PdfPerformance {
             fetchLastDurationMs: this.fetchLastDurationMs,
             fetchAverageDurationMs: this.fetchCount ? this.fetchDurationMs / this.fetchCount : 0,
             diskCache: this.diskCache ? { ...this.diskCache } : undefined,
+            reading: { ...this.reading },
         };
     }
 
@@ -204,6 +221,7 @@ export class PdfPerformance {
         this.firstFetchAt = Infinity;
         this.startedAt = this.now();
         this.diskCache = undefined;
+        this.reading = readingCounters();
         this.notifyFetchChange();
     }
 }
@@ -442,6 +460,8 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
         const imageStats = bytes && bytes.imageDecodeConcurrency > 0 ? bytes : undefined;
         field('image-work', imageStats ? `Image decoding: ${format(imageStats.imageDecodeActive)} / ${format(imageStats.imageDecodeConcurrency)} active; ${format(imageStats.imageDecodeQueued)} queued; peak ${format(imageStats.imageDecodePeakActive)} active. ${format(imageStats.imageDecodeCompletedNative)} native; ${format(imageStats.imageDecodeCompletedFallback)} fallback.` : '');
         field('image-pixels', imageStats && imageStats.imageDecodeOriginalPixels > 0 ? `Decoded pixels, cumulative: ${format(imageStats.imageDecodeOutputPixels / 1e6, 1)} MP output / ${format(imageStats.imageDecodeOriginalPixels / 1e6, 1)} MP original.` : '');
+        field('reading-images', bytes && bytes.externalImageBudgetBytes > 0
+            ? `Progressive images: ${format(bytes.externalImageActive)} active; ${format(bytes.externalImageQueued)} queued; ${format(bytes.externalImagePaused)} paused. ${format(bytes.externalImageReservedBytes / (1024 * 1024), 1)} / ${format(bytes.externalImageBudgetBytes / (1024 * 1024))} MiB incremental state (${format(bytes.externalImagePartialRasterBytes / (1024 * 1024), 1)} MiB partial pixels); ${format(bytes.externalImageNativeRasterBytes / (1024 * 1024), 1)} MiB final native pixels.` : '');
         const disk = metrics.diskCache;
         field('disk-cache', disk ? `Disk: ${format(disk.storedBytes / (1024 * 1024), 1)} / ${format(disk.totalBytes / (1024 * 1024), 1)} MiB of this build. ${disk.complete ? 'Complete' : disk.filling ? 'Filling' : 'Paused'}. All builds: ${format(disk.diskBytes / (1024 * 1024), 1)} / ${format(disk.budgetBytes / (1024 * 1024))} MiB.` : '');
         field('work', `${state.pending.length} preparing; ${state.prepared.length} preview targets; ${state.renderAhead.length} render targets; ${state.failed.length} failed`);
@@ -621,7 +641,7 @@ ${ROBOT_ICON}
 <div><dt>Time margin</dt><dd class="margin" data-field="margin"></dd></div>
 </dl>
 <p class="explanation">Buffered time = ready distance / speed.<br>Time margin = buffered time − measured load delay.</p>
-<p class="storage" data-field="document-paint"></p>
+<p class="storage" data-field="document-paint"></p><p class="storage" data-field="reading-images"></p>
 <p class="storage" data-field="cache"></p><p class="storage" data-field="byte-cache"></p><p class="storage" data-field="decoded-images"></p><p class="storage" data-field="image-work"></p><p class="storage" data-field="image-pixels"></p><p class="storage" data-field="disk-cache"></p><p class="storage" data-field="work"></p><p class="storage" data-field="transport"></p><p class="storage" data-field="total"></p>
 <div class="graph">
 <div class="legend"><span>Velocity; last 10 s</span><span data-field="speed-scale"></span></div>

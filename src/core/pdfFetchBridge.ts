@@ -5,7 +5,7 @@ import { setTimeout as sleep } from 'timers/promises';
 import { Agent, fetch } from 'undici';
 import { cachedDownloadDomainUrl } from '../api/downloadDomain';
 import { PdfDiskCache, PdfCacheViewer, PdfFillRequest } from './pdfDiskCache';
-import type { BridgeRequest, BridgeResponse, PdfOutput } from './viewerProtocol';
+import type { BridgeRequest, BridgeResponse, PdfOutput, ReadingImageRequest } from './viewerProtocol';
 
 // The old public name remains for the harness and callers that only use content pieces.
 export { PdfDiskCache as PieceCache } from './pdfDiskCache';
@@ -75,6 +75,8 @@ export class PdfFetchBridge {
     private readonly viewer?: PdfCacheViewer;
     private output?: PdfOutput;
     private readonly outputs: PdfOutput[] = [];
+    private readonly readings = new Map<string, (id: string, chunk: number, signal: AbortSignal) => Promise<{ body: Uint8Array; offset: number; total: number }>>();
+    private readonly readingRequests = new Set<AbortController>();
     private disposed = false;
 
     constructor(private readonly allowed: (url: URL) => boolean, private readonly cache?: PdfDiskCache, private readonly options: BridgeOptions = {}) {
@@ -134,6 +136,39 @@ export class PdfFetchBridge {
         this.disposed = true;
         this.abortAll();
         this.viewer?.dispose();
+        this.readings.clear();
+    }
+
+    /** Old displayed documents remain authorized while a prepared replacement is loading. */
+    setReading(revision: string, read: (id: string, chunk: number, signal: AbortSignal) => Promise<{ body: Uint8Array; offset: number; total: number }>): void {
+        if (this.disposed) { return; }
+        this.readings.delete(revision);
+        this.readings.set(revision, read);
+        while (this.readings.size > 4) { this.readings.delete(this.readings.keys().next().value!); }
+    }
+
+    async handleReading(request: ReadingImageRequest): Promise<BridgeResponse> {
+        const read = this.readings.get(request.manifestRevision);
+        if (this.disposed || !read || !Number.isSafeInteger(request.id) || request.id < 1
+            || typeof request.imageId !== 'string' || !Number.isSafeInteger(request.chunkIndex) || request.chunkIndex < 0) {
+            throw new Error('Reading image request is not registered for this viewer');
+        }
+        if (this.readingRequests.size >= 4) { throw new Error('Reading image request limit reached'); }
+        const controller = new AbortController();
+        this.running.get(request.id)?.abort();
+        this.running.set(request.id, controller); this.readingRequests.add(controller);
+        try {
+            const value = await read(request.imageId, request.chunkIndex, controller.signal);
+            if (controller.signal.aborted || this.disposed) { throw new Error('Reading image request stopped'); }
+            const partial = value.offset !== 0 || value.body.byteLength !== value.total;
+            return { id: request.id, status: partial ? 206 : 200, statusText: partial ? 'Partial Content' : 'OK', body: value.body,
+                headers: [['content-type', 'application/octet-stream'], ['content-length', String(value.body.byteLength)],
+                    ['content-encoding', 'identity'], ...(partial ? [['content-range',
+                        'bytes ' + value.offset + '-' + (value.offset + value.body.byteLength - 1) + '/' + value.total] as [string, string]] : [])] };
+        } finally {
+            if (this.running.get(request.id) === controller) { this.running.delete(request.id); }
+            this.readingRequests.delete(controller);
+        }
     }
 
     private async cachedRanges(request: BridgeRequest, output: PdfOutput, ranges: Array<{ start: number, end: number }>): Promise<BridgeResponse | undefined> {

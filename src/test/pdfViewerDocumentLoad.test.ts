@@ -66,6 +66,24 @@ describe('prepared Spomenar editions', function () {
         assert.strictEqual(f.counts.tasks, 0); assert.strictEqual(f.counts.aborts, 1);
     });
 
+    it('loads verified structural bytes with the external image reader while keeping original identity', async () => {
+        const f = fixture(), data = new Uint8Array([37, 80, 68, 70]), imageSource = { images: [], read() {} };
+        let disposed = 0, asked: any;
+        const reading = { manifest: { source: { pageCount: 460 } }, data, externalImageSource: imageSource,
+            dispose() { disposed++; } };
+        const ready = await loader.prepareSiteDocument(f.pdfjs, { ...config, reading: {
+            ...config.previews, manifestUrl: 'https://book.test/previews/a/reading.json', manifestRevision: 'b'.repeat(64),
+        } }, { ...f.options, openReading: async (descriptor: any) => { asked = descriptor; return reading; } });
+        assert.strictEqual(f.params().data, data);
+        assert.strictEqual(f.params().range, undefined);
+        assert.strictEqual(f.params().externalImageSource, imageSource);
+        assert.deepStrictEqual(asked.identity, { sha256: 'a'.repeat(64), size: 1234 });
+        assert.strictEqual(ready.source, f.source);
+        assert.strictEqual(f.counts.aborts, 1, 'the original range transport cannot request photographs');
+        ready.destroy(); ready.destroy();
+        assert.strictEqual(disposed, 1); assert.strictEqual(f.counts.aborts, 1);
+    });
+
     it('cancels a load whose PDF.js promise never settles after transport destruction', async () => {
         const f = fixture(); f.task.promise = new Promise(() => {});
         const pending = loader.prepareSiteDocument(f.pdfjs, config, f.options);

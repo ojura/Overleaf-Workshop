@@ -17,6 +17,7 @@ describe('the viewer\'s requests through the extension host (bridge-fetch.ts)', 
     const saved: Record<string, PropertyDescriptor | undefined> = {};
     let dir: string;
     let bridge: any;
+    let client: any;
     /** the page's window, where the host's answers arrive as message events */
     let page: EventTarget;
     const posted: any[] = [];
@@ -45,7 +46,7 @@ export { pdfPerformance } from ${JSON.stringify(path.join(viewerRoot, 'src', 'co
         posted.length = 0;
         bridge.pdfPerformance.reset();
         // the page's ID, which the host wrote into its configuration
-        bridge.installBridgeFetch((message: unknown) => posted.push(message), () => true, 'page-2');
+        client = bridge.installBridgeFetch((message: unknown) => posted.push(message), () => true, 'page-2');
     });
 
     afterEach(() => {
@@ -65,6 +66,32 @@ export { pdfPerformance } from ${JSON.stringify(path.join(viewerRoot, 'src', 'co
         deliver({ type: 'fetchResponse', page: 'page-2', id: 1, status: 206, statusText: 'Partial Content', headers: [], body: new Uint8Array([2, 2]) });
         const response = await answered;
         assert.deepStrictEqual(new Uint8Array(await response.arrayBuffer()), new Uint8Array([2, 2]));
+        assert.strictEqual(bridge.pdfPerformance.pendingFetchCount, 0);
+    });
+
+    it('shares request identity and cancellation for registered image reads without double counting loader measurements', async () => {
+        const abort = new AbortController(), revision = 'a'.repeat(64);
+        const image = client.readImage({ manifestRevision: revision, imageId: 'x1', chunkIndex: 2 }, abort.signal);
+        const original = (globalThis as any).fetch('https://dl.test/project/p1/output.pdf');
+        assert.deepStrictEqual(posted.map(message => [message.type, message.page, message.id]),
+            [['readingFetch', 'page-2', 1], ['fetch', 'page-2', 2]]);
+        assert.deepStrictEqual(posted[0], { type: 'readingFetch', page: 'page-2', id: 1,
+            manifestRevision: revision, imageId: 'x1', chunkIndex: 2 });
+        assert.strictEqual(bridge.pdfPerformance.pendingFetchCount, 1, 'the reading loader owns its own request metric');
+        deliver({ type: 'fetchResponse', page: 'old-page', id: 1, status: 206, headers: [], body: new Uint8Array([99]) });
+        deliver({ type: 'fetchResponse', page: 'page-2', id: 1, status: 206,
+            headers: [['content-range', 'bytes 6-7/12']], body: new Uint8Array([7, 8]) });
+        assert.deepStrictEqual(new Uint8Array(await (await image).arrayBuffer()), new Uint8Array([7, 8]));
+        assert.strictEqual(bridge.pdfPerformance.snapshot().fetchBytes, 0);
+        deliver({ type: 'fetchResponse', page: 'page-2', id: 2, status: 200, headers: [], body: new Uint8Array([3]) });
+        await original;
+        assert.strictEqual(bridge.pdfPerformance.snapshot().fetchBytes, 1);
+        const cancelled = client.readImage({ manifestRevision: revision, imageId: 'x1', chunkIndex: 0 }, abort.signal);
+        const rejected = assert.rejects(cancelled, { name: 'AbortError' });
+        abort.abort(); await rejected;
+        assert.deepStrictEqual(posted.at(-1), { type: 'fetchAbort', page: 'page-2', id: 3 });
+        deliver({ type: 'fetchResponse', page: 'page-2', id: 3, status: 206, headers: [], body: new Uint8Array([9]) });
+        assert.strictEqual(bridge.pdfPerformance.snapshot().fetchBytes, 1);
         assert.strictEqual(bridge.pdfPerformance.pendingFetchCount, 0);
     });
 

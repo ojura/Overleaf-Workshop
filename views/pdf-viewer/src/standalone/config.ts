@@ -1,4 +1,4 @@
-import type { PdfPreviewDescriptor } from '../common/protocol';
+import type { PdfPreviewDescriptor, PdfReadingDescriptor } from '../common/protocol';
 import type { PdfHttpValidator } from './http-range';
 
 export interface SitePreviewConfig {
@@ -16,6 +16,7 @@ export interface SiteConfig {
     filename: string;
     sourceUrl?: string;
     previews?: SitePreviewConfig;
+    reading?: SitePreviewConfig & { manifestRevision: string };
     publicationGeneration?: number;
 }
 
@@ -68,17 +69,34 @@ export function readSiteConfig(value: unknown, baseUrl: string): SiteConfig {
     }
     const publicationGeneration = typeof input.publicationGeneration === 'number' && Number.isSafeInteger(input.publicationGeneration)
         && input.publicationGeneration >= 0 ? input.publicationGeneration : undefined;
+    const previews = readPreviewConfig(input.previews, base), reading = readPreviewConfig(input.reading, base);
+    const boundReading = reading?.manifestRevision && (!previews || previews.sha256 === reading.sha256
+        && previews.size === reading.size && previews.validator.header === reading.validator.header
+        && previews.validator.value === reading.validator.value) ? { ...reading, manifestRevision: reading.manifestRevision } : undefined;
     return { pdfUrl: pdf.href, title: input.title.trim(), filename: input.filename, sourceUrl, publicationGeneration,
-        previews: readPreviewConfig(input.previews, base) };
+        previews, reading: boundReading };
+}
+
+function matchesSource(bound: SitePreviewConfig | undefined, source: { length: number; validator?: PdfHttpValidator }): boolean {
+    const actual = source.validator;
+    return !!bound && bound.size === source.length && !!actual
+        && bound.validator.header === actual.header && bound.validator.value === actual.value;
 }
 
 /** The published digest is trusted only while the PDF transport observes its bound HTTP version. */
 export function sitePreviewDescriptor(config: SiteConfig, source: { length: number; validator?: PdfHttpValidator }): PdfPreviewDescriptor | undefined {
-    const preview = config.previews, actual = source.validator;
-    if (!preview || preview.size !== source.length || !actual
-        || preview.validator.header !== actual.header || preview.validator.value !== actual.value) { return; }
+    const preview = config.previews;
+    if (!preview || !matchesSource(preview, source)) { return; }
     return { identity: { key: 'sha256:' + preview.sha256, size: preview.size, sha256: preview.sha256 },
         manifestUrl: preview.manifestUrl };
+}
+
+/** The reading representation shares the original transport's observed version and download identity. */
+export function siteReadingDescriptor(config: SiteConfig, source: { length: number; validator?: PdfHttpValidator }): PdfReadingDescriptor | undefined {
+    const reading = config.reading;
+    if (!reading || !matchesSource(reading, source)) { return; }
+    return { identity: { sha256: reading.sha256, size: reading.size },
+        manifestUrl: reading.manifestUrl, manifestRevision: reading.manifestRevision };
 }
 
 /** PDF.js supplies the page, zoom and position as one canonical PDF-open hash. */
