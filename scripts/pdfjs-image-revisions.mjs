@@ -8,9 +8,16 @@ export function imageRevisionViewer(source, file = 'PDF.js viewer') {
     if (source.includes('// Verified external image passes')) { return source; }
     const changes = [
         ['    const prevCanvas = this.canvas;\n    const updateOnFirstShow',
-            '    const prevCanvas = this.canvas;\n    this._imageCanvasRetained = false;\n    const updateOnFirstShow'],
+            '    const prevCanvas = this.canvas;\n    this._imageCanvasRetained = false;\n    this._imagePassComplete = false;\n    const updateOnFirstShow'],
         ['      if (prevCanvas) {\n        prevCanvas.replaceWith(canvas);',
-            `      if (prevCanvas && this._imagePassStatus && !this._imagePassStatus.final
+            `      const monotoneImagePass = this._imagePassComplete && this._imagePassIntent
+        && this._imagePassIntent === this._paintedImageIntent
+        && this._imagePassGeometry === this._paintedImageGeometry
+        && this._imagePassStatus?.discovered && this.paintedImageStatus?.discovered
+        && this._imagePassStatus.total === this.paintedImageStatus.total
+        && this._imagePassStatus.covered >= this.paintedImageStatus.covered
+        && this._imagePassStatus.revision >= this.paintedImageStatus.revision;
+      if (prevCanvas && this._imagePassStatus && !this._imagePassStatus.final && !monotoneImagePass
           && (!this._imagePassStatus.discovered || this._imagePassStatus.covered < this._imagePassStatus.total)) {
         canvas.remove();
         canvas.width = canvas.height = 0;
@@ -20,15 +27,25 @@ export function imageRevisionViewer(source, file = 'PDF.js viewer') {
       }
       if (prevCanvas) {
         prevCanvas.replaceWith(canvas);`],
+        ['    const renderTask = this.renderTask = this.pdfPage.render(options);',
+            `    const imageGeometry = JSON.stringify([options.viewport?.width, options.viewport?.height,
+      options.viewport?.transform, options.transform || null, options.background || null,
+      options.pageColors?.background, options.pageColors?.foreground]);
+    const renderTask = this.renderTask = this.pdfPage.render(options);`],
         ['      await renderTask.promise;\n      this.#showCanvas?.(true);',
             `      await renderTask.promise;
+      this._imagePassComplete = true;
       this._imagePassStatus = renderTask.imageStatus;
+      this._imagePassIntent = renderTask.imageIntent;
+      this._imagePassGeometry = imageGeometry;
       this.imagePassStatus = renderTask.imageStatus;
       this.imagePassRevision = renderTask.imageRevision;
       this.#showCanvas?.(true);
       if (!this._imageCanvasRetained) {
         this.paintedImageStatus = renderTask.imageStatus;
         this.paintedImageRevision = renderTask.imageRevision;
+        this._paintedImageIntent = renderTask.imageIntent;
+        this._paintedImageGeometry = imageGeometry;
       }`],
         ['      error = e;\n      this.#showCanvas?.(true);',
             '      error = e;\n      this._imagePassStatus = renderTask.imageStatus;\n      this.#showCanvas?.(true);'],

@@ -245,7 +245,7 @@
    saveDocument() {
      return this._transport.saveDocument();
    }
-@@ -11865,6 +11946,231 @@
+@@ -11865,6 +11946,232 @@
      return this._transport.getCalculationOrderIds();
    }
  }
@@ -284,6 +284,7 @@
 +  }
 +  newIntent(state, key, intent) {
 +    state.externalImageEpoch = ++this.epoch;
++    state.externalImageToken = Object.freeze({});
 +    state.externalImageCacheKey = key;
 +    state.externalImagePrint = !!(intent & RenderingIntentFlag.PRINT);
 +    state.externalImageCancelled = false;
@@ -477,7 +478,7 @@
  class PDFPageProxy {
    #pendingCleanup = false;
    constructor(pageIndex, pageInfo, transport, pdfBug = false) {
-@@ -11876,6 +12182,7 @@
+@@ -11876,6 +12183,7 @@
      this.commonObjs = transport.commonObjs;
      this.objs = new PDFObjects();
      this._intentStates = new Map();
@@ -485,7 +486,7 @@
      this.destroyed = false;
    }
    get pageNumber() {
-@@ -11930,6 +12237,14 @@
+@@ -11930,6 +12238,14 @@
    async getXfa() {
      return this._transport._htmlForXfa?.children[this._pageIndex] || null;
    }
@@ -500,7 +501,7 @@
    render({
      canvasContext,
      viewport,
-@@ -11941,10 +12256,28 @@
+@@ -11941,10 +12257,28 @@
      annotationCanvasMap = null,
      pageColors = null,
      printAnnotationStorage = null,
@@ -530,7 +531,7 @@
      const {
        renderingIntent,
        cacheKey
-@@ -11953,7 +12286,11 @@
+@@ -11953,7 +12287,11 @@
      optionalContentConfigPromise ||= this._transport.getOptionalContentConfig(renderingIntent);
      let intentState = this._intentStates.get(cacheKey);
      if (!intentState) {
@@ -543,7 +544,7 @@
        this._intentStates.set(cacheKey, intentState);
      }
      if (intentState.streamReaderCancelTimeout) {
-@@ -11972,8 +12309,12 @@
+@@ -11972,8 +12310,13 @@
        this._stats?.time("Page Request");
        this._pumpOperatorList(intentArgs);
      }
@@ -551,12 +552,13 @@
      const complete = error => {
 +      internalRenderTask.task.imageStatus = this._externalImages?.status(intentState) || this.imageStatus;
 +      internalRenderTask.task.imageRevision = internalRenderTask.task.imageStatus.revision;
++      internalRenderTask.task.imageIntent = intentState.externalImageToken;
        intentState.renderTasks.delete(internalRenderTask);
 +      if (!error) { this._externalImages?.finish(intentState); }
        if (intentPrint) {
          this.#pendingCleanup = true;
        }
-@@ -12120,6 +12461,11 @@
+@@ -12120,6 +12463,11 @@
    _destroy() {
      this.destroyed = true;
      const waitOn = [];
@@ -568,7 +570,7 @@
      for (const intentState of this._intentStates.values()) {
        this._abortOperatorList({
          intentState,
-@@ -12158,6 +12504,7 @@
+@@ -12158,6 +12506,7 @@
          return false;
        }
      }
@@ -576,7 +578,7 @@
      this._intentStates.clear();
      this.objs.clear();
      this.#pendingCleanup = false;
-@@ -12177,11 +12524,13 @@
+@@ -12177,11 +12526,13 @@
        intentState.operatorList.argsArray.push(operatorListChunk.argsArray[i]);
      }
      intentState.operatorList.lastChunk = operatorListChunk.lastChunk;
@@ -590,7 +592,7 @@
        this.#tryCleanup();
      }
    }
-@@ -12189,21 +12538,27 @@
+@@ -12189,21 +12540,27 @@
      renderingIntent,
      cacheKey,
      annotationStorageSerializable,
@@ -621,7 +623,7 @@
      intentState.streamReader = reader;
      const pump = () => {
        reader.read().then(({
-@@ -12214,7 +12569,7 @@
+@@ -12214,7 +12571,7 @@
            intentState.streamReader = null;
            return;
          }
@@ -630,7 +632,7 @@
            return;
          }
          this._renderPageChunk(value, intentState);
-@@ -12563,6 +12918,7 @@
+@@ -12563,6 +12920,7 @@
      this.destroyed = false;
      this.destroyCapability = null;
      this._networkStream = networkStream;
@@ -638,7 +640,7 @@
      this._fullReader = null;
      this._lastProgress = null;
      this.downloadInfoCapability = Promise.withResolvers();
-@@ -12635,6 +12991,8 @@
+@@ -12635,6 +12993,8 @@
        return this.destroyCapability.promise;
      }
      this.destroyed = true;
@@ -647,7 +649,7 @@
      this.destroyCapability = Promise.withResolvers();
      this.#passwordCapability?.reject(new Error("Worker was destroyed during onPassword callback"));
      const waitOn = [];
-@@ -12857,6 +13215,32 @@
+@@ -12857,6 +13217,32 @@
        }
        return null;
      });
@@ -680,7 +682,7 @@
      messageHandler.on("obj", ([id, pageIndex, type, imageData]) => {
        if (this.destroyed) {
          return;
-@@ -12899,9 +13283,23 @@
+@@ -12899,9 +13285,23 @@
      });
    }
    getData() {
@@ -704,7 +706,7 @@
      if (this.annotationStorage.size <= 0) {
        warn("saveDocument called while `annotationStorage` is empty, " + "please use the getData-method instead.");
      }
-@@ -13005,6 +13403,13 @@
+@@ -13005,6 +13405,13 @@
      });
    }
    getStructTree(pageIndex) {
@@ -718,7 +720,7 @@
      return this.messageHandler.sendWithPromise("GetStructTree", {
        pageIndex
      });
-@@ -13047,6 +13452,7 @@
+@@ -13047,6 +13454,7 @@
          throw new Error(`startCleanup: Page ${page.pageNumber} is currently rendering.`);
        }
      }
@@ -726,7 +728,7 @@
      this.commonObjs.clear();
      if (!keepLoadedFonts) {
        this.fontLoader.clear();
-@@ -13095,6 +13501,17 @@
+@@ -13095,6 +13503,17 @@
      }
      delete this.#objs[objId];
      return true;
