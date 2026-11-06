@@ -21,12 +21,13 @@ function deferred<T = void>() {
 
 describe('native external-image PDF passes', function () {
     this.timeout(15_000);
-    let directory: string, pdfjs: any, canvas: any;
+    let directory: string, pdfjs: any, worker: any, canvas: any;
     const saved = new Map<string, PropertyDescriptor | undefined>();
     before(async () => {
         const { pdfjsRelease } = await importModule(path.join(repo, 'scripts/viewer-protocol.mjs'));
         directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-image-revisions-'));
-        fs.copyFileSync(path.join(pdfjsRelease, 'build/pdf.worker.mjs'), path.join(directory, 'pdf.worker.mjs'));
+        fs.writeFileSync(path.join(directory, 'pdf.worker.mjs'), fs.readFileSync(path.join(pdfjsRelease, 'build/pdf.worker.mjs'), 'utf8')
+            + '\nexport { ExternalImageManager as TestExternalImages };\n');
         fs.writeFileSync(path.join(directory, 'pdf.mjs'), fs.readFileSync(path.join(pdfjsRelease, 'build/pdf.mjs'), 'utf8')
             + '\nexport { PageImageRevisions as TestImageRevisions, PDFObjects as TestObjects };\n');
         canvas = await importModule(path.join(repo, 'node_modules/@napi-rs/canvas/index.js'));
@@ -35,6 +36,7 @@ describe('native external-image PDF passes', function () {
             if (canvas[name]) { Object.defineProperty(globalThis, name, { value: canvas[name], configurable: true, writable: true }); }
         }
         pdfjs = await importModule(pathToFileURL(path.join(directory, 'pdf.mjs')).href);
+        worker = await importModule(pathToFileURL(path.join(directory, 'pdf.worker.mjs')).href);
         pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(path.join(directory, 'pdf.worker.mjs')).href;
     });
     after(() => {
@@ -360,6 +362,73 @@ describe('native external-image PDF passes', function () {
             await value.task.destroy(); await originalDocument.task.destroy();
         }
     });
+
+    for (const completion of ['finish', 'cancel']) {
+        it(`charges both installed and pending rasters until a paused native pass can ${completion}`, async () => {
+            const page: any = { _pageIndex: 0, _intentStates: new Map(), destroyed: false,
+                objs: new pdfjs.TestObjects(), commonObjs: new pdfjs.TestObjects(), _transport: {} };
+            const owner = new pdfjs.TestImageRevisions(page);
+            const state: any = { operatorList: { lastChunk: true }, renderTasks: new Set<any>() };
+            page._intentStates.set('display', state);
+            owner.newIntent(state, 'display', 2);
+            state.externalImageDiscovered = true;
+            owner.begin(state);
+            const messages: any[] = [], releases: number[] = [];
+            const manager = new worker.TestExternalImages({ metadata: metadata().map(image => ({ ...image, id: 'x1' })),
+                budget: { maxActiveBytes: 1 << 20, maxEncodedBytes: 1 << 20, maxCoefficientBytes: 1 << 20, maxOutputPixels: 6144 },
+                queue: { limit: 1, run: (operation: () => Promise<void>) => Promise.resolve().then(operation) },
+                handler: {
+                    send(_name: string, data: any) { owner.register(data); },
+                    async sendWithPromise(_name: string, data: any) { messages.push(data); return owner.receive(data); },
+                },
+            });
+            page._transport.messageHandler = {
+                send(name: string, data: any) {
+                    if (name === 'ReleaseExternalImageRasters') { releases.push(...data.ids); manager.releaseRasters(data.ids); }
+                },
+                sendWithPromise(_name: string, data: any) { return manager.cancelPage(data.pageIndex, data.epoch); },
+            };
+            const subscriber = { id: 'x1', objId: 'image', pageIndex: 0, epoch: state.externalImageEpoch,
+                cacheKey: 'display', width: 96, height: 64, outputPixels: 100, progressive: true };
+            const group = manager.add(subscriber);
+            const partial = { width: 10, height: 10, data: new Uint8Array(300), kind: 2 };
+            const replacedFinal = { width: 96, height: 64, data: new Uint8Array(18_432), kind: 2 };
+            const final = { width: 96, height: 64, data: new Uint8Array(18_432), kind: 2 };
+            try {
+                manager._reserve(group, 10_000);
+                await manager._publish(group, subscriber, partial, false);
+                const paused = { cancel() { state.renderTasks.delete(paused); } };
+                state.renderTasks.add(paused);
+                await manager._publish(group, subscriber, replacedFinal, true);
+                await manager._publish(group, subscriber, final, true);
+                group.finished = true;
+                manager._release(group);
+                assert.strictEqual(page.objs.get('image'), partial);
+                assert.strictEqual(owner.pending.get('image').image, final);
+                assert.strictEqual(manager.stats().externalImagePartialRasterBytes, 300);
+                assert.strictEqual(manager.stats().externalImageReservedBytes, 300);
+                assert.strictEqual(manager.stats().externalImageNativeRasterBytes, 18_432);
+                assert.deepStrictEqual(releases, [messages[1].rasterId], 'only the replaced pending image has been released');
+                if (completion === 'finish') {
+                    state.renderTasks.clear(); owner.finish(state);
+                    assert.strictEqual(page.objs.get('image'), final);
+                    assert.strictEqual(manager.stats().externalImagePartialRasterBytes, 0);
+                    assert.strictEqual(manager.stats().externalImageNativeRasterBytes, 18_432);
+                }
+                await owner.cancel();
+                await owner.cancel();
+                manager.releaseRasters(messages.map(message => message.rasterId));
+                for (const field of ['externalImagePartialRasterBytes', 'externalImageNativeRasterBytes', 'externalImageReservedBytes']) {
+                    assert.strictEqual(manager.stats()[field], 0, field);
+                }
+                let closed = 0;
+                assert.strictEqual(owner.receive({ ...subscriber, id: subscriber.objId, image: { width: 1, height: 1,
+                    bitmap: { close() { closed++; } } }, rasterId: 999, final: true }), false);
+                assert.strictEqual(closed, 1);
+                assert.strictEqual(manager.outputs.size, 0);
+            } finally { state.renderTasks.clear(); await owner.cancel(); await manager.close(); }
+        });
+    }
 
     it('holds one pending bitmap between passes and retains a failed outcome while installing its last useful pixels', async () => {
         const release = deferred();

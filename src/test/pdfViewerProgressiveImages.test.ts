@@ -293,7 +293,8 @@ describe('production progressive JPEG decoding', function () {
             });
             manager.startPage(0, 1);
             await transferred.promise;
-            assert.strictEqual(manager.stats().externalImagePartialRasterBytes, 37 * 25 * 3);
+            assert.strictEqual(manager.stats().externalImagePartialRasterBytes, 2 * 37 * 25 * 3,
+                'the installed raster and the unacknowledged transfer both remain owned');
             let released = false;
             const cancellation = manager.cancelPage(0, 1).then(() => { released = true; });
             await Promise.resolve();
@@ -355,6 +356,7 @@ describe('production progressive JPEG decoding', function () {
     it('finishes a page whose final native rasters exceed the partial-state budget and releases each raster owner once', async () => {
         const finished = deferred<void>();
         const ids = Array.from({ length: 10 }, (_, index) => `x${index + 1}`);
+        const installed = new Map<string, number>();
         let complete = 0;
         const manager = new worker.ExternalImages({
             metadata: ids.map(id => ({ id, sha256: fixture.sha256, originalSha256: fixture.originalSha256,
@@ -372,6 +374,9 @@ describe('production progressive JPEG decoding', function () {
                 },
                 async sendWithPromise(_name: string, revision: any) {
                     if (revision.failed) { finished.reject(new Error(revision.message)); }
+                    const previous = installed.get(revision.id);
+                    installed.set(revision.id, revision.rasterId);
+                    if (previous !== undefined) { manager.releaseRasters([previous]); }
                     if (revision.final && ++complete === ids.length) { finished.resolve(); }
                     return true;
                 },
