@@ -95,7 +95,9 @@ async function registeredEdition(specification, classes) {
         if (!descriptor || descriptor.manifestRevision !== readingRevision || descriptor.identity.sha256 !== identity.sha256) {
             throw new Error('The registered reading publication differs from the pinned edition');
         }
-        const manifest = JSON.parse(await readSmallFile(descriptor.manifestPath, classes.PDF_READING_LIMITS.manifestBytes));
+        const readingBytes = await readSmallFile(descriptor.manifestPath, classes.PDF_READING_LIMITS.manifestBytes);
+        if (digest(readingBytes) !== readingRevision) { throw new Error('Reading manifest changed during registration'); }
+        const manifest = JSON.parse(readingBytes);
         const reading = classes.validatePdfReadingManifest(manifest, identity);
         if (!reading) { throw new Error('The registered reading manifest is invalid'); }
         const prefix = `/registered/${readingRevision}/`;
@@ -103,11 +105,12 @@ async function registeredEdition(specification, classes) {
         const add = (relative, metadata, type) => {
             if (typeof relative !== 'string' || relative.split('/').some(part => !/^[A-Za-z0-9._-]+$/.test(part) || ['.', '..'].includes(part))
                 || !Number.isSafeInteger(metadata.bytes) || metadata.bytes < 1 || metadata.bytes > classes.PDF_READING_LIMITS.pdfBytes
-                || !hashPattern.test(metadata.sha256 ?? '')) { throw new Error('Registered resource has invalid metadata'); }
-            resources.set(prefix + relative, { filename: path.join(previewDirectory, relative), ...metadata, type });
+                || typeof metadata.sha256 !== 'string' || !hashPattern.test(metadata.sha256)
+                || !['application/json', 'application/pdf', 'image/jpeg', 'image/png', 'image/webp'].includes(type)) {
+                throw new Error('Registered resource has invalid metadata');
+            }
+            resources.set(prefix + relative, { filename: path.join(previewDirectory, relative), bytes: metadata.bytes, sha256: metadata.sha256, type });
         };
-        const readingBytes = await readSmallFile(descriptor.manifestPath, classes.PDF_READING_LIMITS.manifestBytes);
-        if (digest(readingBytes) !== readingRevision) { throw new Error('Reading manifest changed during registration'); }
         const previewBytes = await readSmallFile(store.manifestPath(identity), 4 * 1024 * 1024);
         const preview = JSON.parse(previewBytes);
         if (preview.document?.key !== identity.key || preview.document?.size !== identity.size

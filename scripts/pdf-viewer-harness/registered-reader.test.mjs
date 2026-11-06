@@ -167,6 +167,39 @@ test('registered resource paths refuse a replaced symlink and leave the outside 
     assert.deepEqual(f.originalRequests, ['bytes=0-15']);
 });
 
+test('extra atlas metadata cannot replace the registered resource filename', async t => {
+    const f = await fixture(t), outside = path.join(f.root, 'outside-sentinel');
+    const expected = await fs.readFile(path.join(f.directory, 'assets/page.jpg'));
+    const sentinel = Buffer.alloc(expected.length, 0x58);
+    await fs.writeFile(outside, sentinel);
+    const manifestPath = path.join(f.directory, 'manifest.json');
+    const preview = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+    preview.pages[0].assets[0].filename = outside;
+    await fs.writeFile(manifestPath, json(preview));
+    const h = await f.start();
+    const response = await fetch(h.origin + `/registered/${f.spec.readingRevision}/assets/page.jpg`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), expected);
+});
+
+test('the pinned reading digest and routed layout come from one manifest body', async t => {
+    const f = await fixture(t);
+    const substituted = structuredClone(f.manifest);
+    substituted.pdf = { ...substituted.pdf, path: 'reading/other-layout.pdf', sha256: hash('other layout') };
+    const replacement = path.join(f.root, 'replacement-manifest.json');
+    await fs.writeFile(replacement, json(substituted));
+    const readingPath = path.join(f.directory, 'reading.json'), open = fs.open;
+    let opens = 0;
+    fs.open = async (filename, ...args) => {
+        if (filename === readingPath && ++opens === 2) { return open(replacement, ...args); }
+        return open(filename, ...args);
+    };
+    try {
+        await assert.rejects(f.start(), /changed during registration|differs from the pinned edition/);
+        assert.deepEqual(f.originalRequests, []);
+    } finally { fs.open = open; }
+});
+
 test('the existing fixture host still serves an ordinary adapter and exact bridge response', async t => {
     const f = await fixture(t), book = path.join(f.root, 'ordinary-book');
     await fs.mkdir(book);
