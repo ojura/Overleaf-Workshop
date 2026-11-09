@@ -46,7 +46,9 @@ interface SCMRecord {
     scm: BaseSCM;
     enabled: boolean;
     triggers: vscode.Disposable[];
-    stopping?: Promise<unknown>;
+    stopping?: Promise<void>;
+    changing?: Promise<void>;
+    settingsLifetime?: AbortController;
 }
 
 export class SCMCollectionProvider extends vscode.Disposable {
@@ -65,7 +67,10 @@ export class SCMCollectionProvider extends vscode.Disposable {
         super(() => {
             if (this.disposed) { return; }
             this.disposed = true;
-            this.scms.splice(0).forEach(scm => scm.triggers.forEach(t => t.dispose()));
+            this.scms.splice(0).forEach(scm => {
+                scm.settingsLifetime?.abort();
+                scm.triggers.forEach(t => t.dispose());
+            });
             this.historyDataProvider.dispose();
             this.statusBarItem.dispose();
             this.statusListener.dispose();
@@ -189,23 +194,33 @@ export class SCMCollectionProvider extends vscode.Disposable {
     }
 
     /** Keep a pending stop after Disable empties the triggers, so Remove can await it too. */
-    private stop(item: SCMRecord): Promise<unknown> {
+    private stop(item: SCMRecord): Promise<void> {
         const triggers = item.triggers.splice(0);
-        return item.stopping = Promise.all([item.stopping, ...triggers.map(async trigger => trigger.dispose())]);
+        return item.stopping = Promise.all([item.stopping, ...triggers.map(async trigger => trigger.dispose())]).then(() => {});
     }
 
-    private async removeSCM(item: SCMRecord) {
-        if (this.disposed) { return; }
-        if (this.scms.includes(item)) {
+    /** An item's start, stop and removal run in order; a removed item accepts no later action. */
+    private change(item: SCMRecord, run: () => Promise<void>): Promise<void> {
+        const changing = (item.changing ?? Promise.resolve()).catch(() => {}).then(async () => {
+            if (this.disposed || !this.scms.includes(item)) { return; }
+            await run();
+        });
+        item.changing = changing;
+        return changing;
+    }
+
+    private removeSCM(item: SCMRecord): Promise<void> {
+        return this.change(item, async () => {
             // Final recording still uses this source control's configured ignore patterns.
             await this.stop(item);
+            item.settingsLifetime?.abort();
             // remove from collection
             const index = this.scms.indexOf(item);
             if (index!==-1) { this.scms.splice(index, 1); }
             // remove from global state
             await this.vfs.setProjectSCMPersist(item.scm.scmKey, undefined);
             this.updateStatus();
-        }
+        });
     }
 
     private createNewSCM(scmProto: SupportedSCM) {
@@ -245,6 +260,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
     }
 
     private configSCM(scmItem: SCMRecord) {
+        if (this.disposed || !this.scms.includes(scmItem)) { return Promise.resolve(); }
+        const signal = (scmItem.settingsLifetime ??= new AbortController()).signal;
+        if (signal.aborted) { return Promise.resolve(); }
         const baseUri = scmItem.scm.baseUri.toString();
         const settingItems = scmItem.scm.settingItems as SettingItem[];
         const status = scmItem.enabled? scmItem.scm.status.status : 'disabled';
@@ -259,33 +277,36 @@ export class SCMCollectionProvider extends vscode.Disposable {
             ignoreFocusOut: true,
             title: vscode.l10n.t('Project Source Control Management'),
         }).then(select => select===undefined ? undefined : this.runAction(scmItem.scm, select.label, async () => {
+            if (signal.aborted || !this.scms.includes(scmItem)) { return; }
             switch (select.label) {
                 case 'Enable':
                 case 'Disable':
-                    const persist = this.vfs.getProjectSCMPersist(scmItem.scm.scmKey);
-                    persist.enabled = !(persist.enabled ?? true);
-                    this.vfs.setProjectSCMPersist(scmItem.scm.scmKey, persist);
-                    //
-                    const scmIndex = this.scms.indexOf(scmItem);
-                    this.scms[scmIndex].enabled = persist.enabled;
-                    if (persist.enabled) {
-                        await scmItem.stopping;
-                        const triggers = await this.start(scmItem.scm);
-                        if (this.disposed) { return; }
-                        if (triggers===undefined) {
-                            // it did not start, which start() has told: it stays disabled
-                            persist.enabled = false;
-                            this.vfs.setProjectSCMPersist(scmItem.scm.scmKey, persist);
-                            this.scms[scmIndex].enabled = false;
-                            this.updateStatus();
-                            break;
+                    await this.change(scmItem, async () => {
+                        const enabled = select.label==='Enable';
+                        if (scmItem.enabled===enabled) { return; }
+                        const persist = this.vfs.getProjectSCMPersist(scmItem.scm.scmKey);
+                        persist.enabled = enabled;
+                        await this.vfs.setProjectSCMPersist(scmItem.scm.scmKey, persist);
+                        scmItem.enabled = enabled;
+                        if (enabled) {
+                            await scmItem.stopping;
+                            const triggers = await this.start(scmItem.scm);
+                            if (this.disposed) { return; }
+                            if (triggers===undefined) {
+                                // it did not start, which start() has told: it stays disabled
+                                persist.enabled = false;
+                                await this.vfs.setProjectSCMPersist(scmItem.scm.scmKey, persist);
+                                scmItem.enabled = false;
+                                this.updateStatus();
+                                return;
+                            }
+                            scmItem.triggers = triggers;
+                        } else {
+                            await this.stop(scmItem);
                         }
-                        scmItem.triggers = triggers;
-                    } else {
-                        await this.stop(scmItem);
-                    }
-                    this.updateStatus();
-                    vscode.window.showWarningMessage(`"${(scmItem.scm.constructor as any).label}" ${persist.enabled?'enabled':'disabled'}: ${baseUri}.`);
+                        this.updateStatus();
+                        vscode.window.showWarningMessage(`"${(scmItem.scm.constructor as any).label}" ${enabled?'enabled':'disabled'}: ${baseUri}.`);
+                    });
                     break;
                 case 'Remove':
                     if (await vscode.window.showWarningMessage(`${vscode.l10n.t('Remove')} ${baseUri}?`, 'Yes', 'No')==='Yes') {
@@ -293,7 +314,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     }
                     break;
                 default:
-                    await settingItems.find(item => item.label===select.label)?.callback();
+                    await settingItems.find(item => item.label===select.label)?.callback(signal);
                     break;
             }
         }));

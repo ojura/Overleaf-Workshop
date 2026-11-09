@@ -1331,7 +1331,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
 
         // tools ask for a sync on the control socket
-        const control = new ReplicaControlServer(this.baseUri.fsPath, (request, signal) => this.answerTool(request, signal),
+        const requests = new Set<Promise<ControlAnswer>>();
+        let shutdown: Promise<void> | undefined;
+        const control = new ReplicaControlServer(this.baseUri.fsPath, (request, signal) => {
+            if (shutdown) { return Promise.resolve({ok: false, error: 'This local replica has stopped.'}); }
+            const answer = this.answerTool(request, signal);
+            requests.add(answer);
+            return answer.finally(() => { requests.delete(answer); });
+        },
                                                  message => log(`[${this.vfs.projectName}] ${message}`), {
                                                      reload: () => vscode.commands.executeCommand('workbench.action.reloadWindow'),
                                                  });
@@ -1339,13 +1346,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         listeners.push(
             {dispose: () => control.dispose()},
             {dispose: () => {
+                if (shutdown) { return shutdown; }
                 this.waitingMessage?.dispose();
                 this.waitingMessage = undefined;
                 providers.delete(this);
-                record.stopped ??= sync.stop();
-                return record.stopped.finally(() => {
+                const engineStopped = record.stopped ?? sync.stop();
+                // Keep this provider's settings through work around the engine too, such as a
+                // control request finishing its Git reads after the engine stopped accepting work.
+                const pending = [...this.liveWork, ...requests, this.fullSync, this.scanning];
+                shutdown = Promise.all([engineStopped, Promise.allSettled(pending)]).then(() => {}).finally(() => {
                     if (folderSyncs.get(key)===record) { folderSyncs.delete(key); }
                 });
+                record.stopped = shutdown;
+                return shutdown;
             }},
         );
 
@@ -1440,9 +1453,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             // configure ignore patterns
             {
                 label: vscode.l10n.t('Configure sync ignore patterns ...'),
-                callback: async () => {
+                callback: async (signal) => {
+                    if (signal?.aborted) { return; }
                     const ignorePatterns = (this.getSetting<string[]>(IGNORE_SETTING_KEY) || this.ignorePatterns).sort();
                     const quickPick = vscode.window.createQuickPick();
+                    const listeners: vscode.Disposable[] = [];
+                    const close = () => {
+                        signal?.removeEventListener('abort', close);
+                        listeners.splice(0).forEach(listener => listener.dispose());
+                        quickPick.hide();
+                        quickPick.dispose();
+                    };
+                    listeners.push(quickPick.onDidHide(close));
+                    signal?.addEventListener('abort', close, {once: true});
                     quickPick.ignoreFocusOut = true;
                     quickPick.title = vscode.l10n.t('Press Enter to add a new pattern, or click the trash icon to remove a pattern.');
                     quickPick.items = ignorePatterns.map(pattern => ({
@@ -1450,22 +1473,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         buttons: [{iconPath: new vscode.ThemeIcon('trash')}],
                     }));
                     // remove pattern when click the trash icon
-                    quickPick.onDidTriggerItemButton(async ({item}) => {
+                    listeners.push(quickPick.onDidTriggerItemButton(async ({item}) => {
+                        if (signal?.aborted) { return; }
                         const index = ignorePatterns.indexOf(item.label);
                         ignorePatterns.splice(index, 1);
                         await this.setSetting(IGNORE_SETTING_KEY, ignorePatterns);
+                        if (signal?.aborted) { return; }
                         quickPick.items = ignorePatterns.map(pattern => ({
                             label: pattern,
                             buttons: [{iconPath: new vscode.ThemeIcon('trash')}],
                         }));
-                    });
+                    }));
                     // add new pattern when not exist
-                    quickPick.onDidAccept(async () => {
+                    listeners.push(quickPick.onDidAccept(async () => {
+                        if (signal?.aborted) { return; }
                         if (quickPick.selectedItems.length===0) {
                             const pattern = quickPick.value;
                             if (pattern!=='') {
                                 ignorePatterns.push(pattern);
                                 await this.setSetting(IGNORE_SETTING_KEY, ignorePatterns);
+                                if (signal?.aborted) { return; }
                                 quickPick.items = ignorePatterns.map(pattern => ({
                                     label: pattern,
                                     buttons: [{iconPath: new vscode.ThemeIcon('trash')}],
@@ -1473,7 +1500,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 quickPick.value = '';
                             }
                         }
-                    });
+                    }));
                     // show the quick pick
                     quickPick.show();
                 },

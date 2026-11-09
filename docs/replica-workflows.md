@@ -81,6 +81,19 @@ readiness, `4` when no window owns the replica, `5` for timeout, `130`/`143` for
 one ordinary **Developer: Reload Window** after the first supporting build is installed;
 subsequent installs can use this command. The command does not install extension files.
 
+## Disabling and removing a replica
+
+**Disable** stops that replica's synchronization. **Remove** also unregisters its folder from
+the project's source controls. Removal keeps the replica's settings available until accepted
+file events, comparisons, control requests and Git recording finish. A recording already in
+progress still finishes when a landing has paused the sync. New work is refused once shutdown
+starts, and a pending deletion question releases its wait without applying the deletions.
+
+Enable, Disable and Remove run in order for each replica, so removing a copy while it starts
+also stops the triggers that start returns. Removing one copy leaves the other copies
+registered. A settings editor closes when its replica is removed, and a late choice cannot
+recreate the removed settings. The local folder and its Git history remain on disk.
+
 ## The repository
 
 The replica folder is the work tree of a repository of its own, with `.git` at the folder's

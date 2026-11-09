@@ -3,7 +3,8 @@ import { VirtualFileSystem } from "../core/remoteFileSystemProvider";
 import { EventBus } from "../utils/eventBus";
 
 export interface SettingItem extends vscode.QuickPickItem {
-    callback: () => Promise<void>;
+    /** Cancel a pending setting choice when its source control is removed or its project closes. */
+    callback: (signal?: AbortSignal) => Promise<void>;
 }
 
 export interface StatusInfo {
@@ -168,4 +169,3 @@ export abstract class BaseSCM {
         return Promise.resolve([0,0]);
     }
 }
-

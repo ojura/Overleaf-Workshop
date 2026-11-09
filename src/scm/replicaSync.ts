@@ -275,6 +275,12 @@ function emptySummary(): SyncSummary {
     };
 }
 
+const STOPPED_REASON = 'the sync stopped';
+
+function stoppedSummary(): SyncSummary {
+    return {...emptySummary(), waitingFor: STOPPED_REASON};
+}
+
 export function gitBlobHash(content: Uint8Array): string {
     return createHash('sha1').update(`blob ${content.byteLength}\0`).update(content).digest('hex');
 }
@@ -377,6 +383,16 @@ interface FlushOptions {
     request?: ToolRequest,
 }
 
+interface RecordOptions {
+    force?: boolean;
+    stopping?: boolean;
+    /** A tool's request waits for git's index lock by its rule (mayAct). */
+    by?: 'tool' | 'user';
+    request?: ToolRequest;
+}
+
+type RecordOutcome = {waiting?: boolean, waitingFor?: string} | undefined;
+
 /** A mode that collects deletions. */
 function collecting(summary: SyncSummary, options: Partial<Pick<Mode, 'live' | 'tool' | 'request' | 'approved'>> = {}): Mode {
     return {deletions: 'collect', collected: {local: [], remote: []}, summary, ...options};
@@ -454,6 +470,9 @@ export class ReplicaSync {
     private transfers = new Semaphore(ReplicaSync.concurrency);
     private baseTexts = new Map<string, string>();
     private stopped = false;
+    /** Accepted operations, including preparation before they reach the per-path queues. */
+    private readonly operations = new Set<Promise<unknown>>();
+    private stoppedWork?: Promise<void>;
     private cancelled = false;
     private saveTimer?: NodeJS.Timeout;
     private saving: Promise<void> = Promise.resolve();
@@ -532,6 +551,11 @@ export class ReplicaSync {
         return this.load();
     }
 
+    private own<T>(operation: Promise<T>): Promise<T> {
+        this.operations.add(operation);
+        return operation.finally(() => { this.operations.delete(operation); });
+    }
+
     /** The deletions that a question open in the window asks about now; undefined while the window does not ask. */
     get openQuestion(): Deletions | undefined {
         return this.question && {where: this.question.where, paths: [...this.question.paths]};
@@ -591,7 +615,7 @@ export class ReplicaSync {
             } else {
                 await this.indexLockReleased(lock);
             }
-            if (this.stopped) { return 'the sync stopped'; }
+            if (this.stopped) { return STOPPED_REASON; }
         }
         const tree = await this.store.workTree?.();
         let reason: string | undefined;
@@ -736,12 +760,13 @@ export class ReplicaSync {
      * starts, and again on request. Changes reported meanwhile are queued per file.
      */
     syncAll(): Promise<SyncSummary> {
+        if (this.stopped) { return Promise.resolve(stoppedSummary()); }
         if (this.fullSync===undefined) {
             this.comparisonGeneration++;
-            this.fullSync = this.runSyncAll().catch(error => {
+            this.fullSync = this.own(this.runSyncAll().catch(error => {
                 this.noteFailure('/', error, emptySummary(), 'comparison');
                 throw error;
-            }).finally(() => { this.comparisonGeneration++; this.fullSync = undefined; });
+            }).finally(() => { this.comparisonGeneration++; this.fullSync = undefined; }));
         }
         return this.fullSync;
     }
@@ -816,7 +841,12 @@ export class ReplicaSync {
     }
 
     /** A local file or folder at `path` was created, changed or deleted. */
-    async localChanged(path: string): Promise<void> {
+    localChanged(path: string): Promise<void> {
+        if (this.stopped) { return Promise.resolve(); }
+        return this.own(this.localChange(path));
+    }
+
+    private async localChange(path: string): Promise<void> {
         if (this.holds>0) {
             this.heldPaths.add(path);
             return;
@@ -855,12 +885,13 @@ export class ReplicaSync {
 
     /** A file or folder at `path` was created, changed or deleted on Overleaf. */
     remoteChanged(path: string, deleted: boolean): Promise<void> {
+        if (this.stopped) { return Promise.resolve(); }
         if (deleted) {
             // Replacing a file on Overleaf removes it and then adds it again.
-            return new Promise(resolve => setTimeout(resolve, ReplicaSync.remoteDeleteDelayMs))
-                .then(() => this.changed(path, true));
+            return this.own(new Promise(resolve => setTimeout(resolve, ReplicaSync.remoteDeleteDelayMs))
+                .then(() => this.changed(path, true)));
         }
-        return this.changed(path, true);
+        return this.own(this.changed(path, true));
     }
 
     /**
@@ -871,8 +902,12 @@ export class ReplicaSync {
      * folder), its two paths sync as a deletion and a new file. While the sync waits (`mayAct`),
      * the rename waits too, and the next full sync applies it first.
      */
-    async remoteRenamed(from: string, to: string): Promise<void> {
-        if (this.stopped || from===to) { return; }
+    remoteRenamed(from: string, to: string): Promise<void> {
+        if (this.stopped || from===to) { return Promise.resolve(); }
+        return this.own(this.renameFromRemote(from, to));
+    }
+
+    private async renameFromRemote(from: string, to: string): Promise<void> {
         // From now until the move is applied, other reconciles leave both paths alone: a reconcile
         // of `from` would take the local file for one deleted on Overleaf, one of `to` would download it.
         this.remoteMoves.set(from, to);
@@ -1006,7 +1041,12 @@ export class ReplicaSync {
      * saw open in the window (`questionOpened`): the answer names it, also when the user has
      * answered it since; without it, the answer names the question open at its end.
      */
-    async flush(scan: boolean, options: FlushOptions = {}): Promise<SyncSummary> {
+    flush(scan: boolean, options: FlushOptions = {}): Promise<SyncSummary> {
+        if (this.stopped) { return Promise.resolve(stoppedSummary()); }
+        return this.own(this.runFlush(scan, options));
+    }
+
+    private async runFlush(scan: boolean, options: FlushOptions): Promise<SyncSummary> {
         if (!scan) { return this.flushWork(false, options); }
         const failure = this.slots.get('/')?.failure;
         try {
@@ -1101,17 +1141,23 @@ export class ReplicaSync {
         return this.state.entries[path]!==undefined;
     }
 
-    /** Stop syncing: drop the queued work, wait for the running work and save the state. */
-    async stop(): Promise<void> {
+    /** Stop accepting work, settle every accepted operation, then save and record the state. */
+    stop(): Promise<void> {
+        if (this.stoppedWork) { return this.stoppedWork; }
         this.stopped = true;
         this.markStopped();
-        await Promise.all([...this.slots.values()].map(slot => slot.tail));
-        if (this.saveTimer) {
-            clearTimeout(this.saveTimer);
-            this.saveTimer = undefined;
-        }
+        clearTimeout(this.saveTimer);
+        this.saveTimer = undefined;
         clearTimeout(this.recordTimer);
         this.recordTimer = undefined;
+        return this.stoppedWork = this.finishStop();
+    }
+
+    private async finishStop(): Promise<void> {
+        // The stopped entry points cannot add work while this snapshot drains. Each operation
+        // owns its preparation, queued reconciles and recording, including a held landing's record.
+        await Promise.allSettled([...this.operations]);
+        await this.recording;
         // a state that could not be read is not saved over
         if (this.loaded && await this.loaded.then(() => true, () => false)) {
             await this.saveNow().catch(error => this.ui.log(`Saving the sync state failed: ${errorMessage(error)}`));
@@ -1120,7 +1166,12 @@ export class ReplicaSync {
     }
 
     /** Upload local files that the first sync left alone because they were not on Overleaf. */
-    async uploadUntracked(): Promise<SyncSummary> {
+    uploadUntracked(): Promise<SyncSummary> {
+        if (this.stopped) { return Promise.resolve(stoppedSummary()); }
+        return this.own(this.runUploadUntracked());
+    }
+
+    private async runUploadUntracked(): Promise<SyncSummary> {
         await this.load();
         const waiting = await this.mayAct();
         if (waiting!==undefined) { return {...emptySummary(), waitingFor: waiting}; }
@@ -1359,7 +1410,9 @@ export class ReplicaSync {
                     this.questionListeners.forEach(listener => listener(this.openQuestion!));
                     let confirmed: boolean;
                     try {
-                        confirmed = await this.ui.confirmDeletions(where, counted);
+                        confirmed = await Promise.race([
+                            this.ui.confirmDeletions(where, counted), this.stopping.then(() => false),
+                        ]);
                     } finally {
                         this.question = undefined;
                     }
@@ -1908,7 +1961,12 @@ export class ReplicaSync {
      * way. Check again whether the sync may act (`mayAct`), and sync the files that waited for
      * their conflicts to be resolved.
      */
-    async gitChanged(): Promise<void> {
+    gitChanged(): Promise<void> {
+        if (this.stopped) { return Promise.resolve(); }
+        return this.own(this.runGitChanged());
+    }
+
+    private async runGitChanged(): Promise<void> {
         const paths = Object.entries(this.state.entries).filter(([, entry]) => entry.conflict).map(([path]) => path);
         paths.push(...[...this.warnedConflicts].filter(path => !paths.includes(path)));
         const mode = collecting(emptySummary(), {live: true});
@@ -1983,11 +2041,13 @@ export class ReplicaSync {
      * Have the store record the synced state now (the git store's commit of Overleaf's state),
      * after the reconciles under way. Does nothing while held, unless `force`.
      */
-    async recordNow({force = false, stopping = false, by, request}: {
-        force?: boolean, stopping?: boolean,
-        /** a tool's request (`by`, `request`) waits for git's index lock by its rule (`mayAct`) */
-        by?: 'tool' | 'user', request?: ToolRequest,
-    } = {}): Promise<{waiting?: boolean, waitingFor?: string} | undefined> {
+    recordNow(options: RecordOptions = {}): Promise<RecordOutcome> {
+        if (this.stopped && !options.stopping) { return Promise.resolve({waiting: true, waitingFor: STOPPED_REASON}); }
+        const recording = this.runRecord(options);
+        return options.stopping ? recording : this.own(recording);
+    }
+
+    private async runRecord({force = false, stopping = false, by, request}: RecordOptions): Promise<RecordOutcome> {
         if (!this.store.record || (this.holds>0 && !force)) { return undefined; }
         if (!stopping) {
             while (this.active>0) {
