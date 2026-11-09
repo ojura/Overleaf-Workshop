@@ -17,8 +17,10 @@ import { ReplicaModes, replicaModes } from './replicaModes';
 import { GitReplicaStore, OVERLEAF_REF, Person } from './replicaGit';
 import type { HistoryUpdate } from '../gitbridge/history';
 import { errorMessage } from '../utils/errorMessage';
+import { GitIgnoreMatcher } from './gitIgnore';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
+const RESPECT_GITIGNORE_SETTING_KEY = 'respect-gitignore';
 
 interface ReplicaProjectSettings { uri: string; [key: string]: unknown }
 type InitialSyncResult = { summary: SyncSummary } | { error: string };
@@ -321,9 +323,81 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     /** the ignore patterns, compiled once for each value of the setting */
     private readonly ignoreMatcher = new IgnoreMatcher();
+    private gitIgnore?: GitIgnoreMatcher;
+    private verifyFolder?: () => Promise<void>;
+    private requestedIgnoreSelection?: string;
+    private ignoreChanges = 0;
+    private comparedIgnoreChanges = 0;
+    private ignoreSync?: Promise<void>;
 
-    private matchIgnorePatterns(path: string): boolean {
+    private matchConfiguredPatterns(path: string): boolean {
         return this.ignoreMatcher.matches(this.getSetting<string[]>(IGNORE_SETTING_KEY) || this.ignorePatterns, path);
+    }
+
+    private get respectGitignore(): boolean {
+        return this.getSetting<boolean>(RESPECT_GITIGNORE_SETTING_KEY) !== false;
+    }
+
+    private matchIgnorePatterns(path: string, directory = false): boolean {
+        return this.matchConfiguredPatterns(path) || (this.respectGitignore && !!this.gitIgnore?.matches(path, directory));
+    }
+
+    private async refreshIgnoreRules(force = false, path?: string): Promise<boolean> {
+        if (!this.respectGitignore || !this.gitIgnore) { return false; }
+        if (force || path !== undefined) { await this.verifyFolder?.(); }
+        const before = this.gitIgnore.key;
+        if (force) { this.gitIgnore.invalidate(); }
+        if (path !== undefined) { await this.gitIgnore.refreshPath(path); }
+        else { await this.gitIgnore.refresh(); }
+        return before !== this.gitIgnore.key;
+    }
+
+    private async setRespectGitignore(enabled: boolean, signal?: AbortSignal): Promise<void> {
+        if (signal?.aborted) { return; }
+        // Prepare the rules before enabling the predicate for work already in a path queue.
+        if (enabled && this.gitIgnore) {
+            await this.verifyFolder?.();
+            this.gitIgnore.invalidate();
+            await this.gitIgnore.refresh();
+        }
+        if (signal?.aborted) { return; }
+        await this.setSetting(RESPECT_GITIGNORE_SETTING_KEY, enabled);
+        if (this.sync && !signal?.aborted) { await this.syncIgnoreChanges(); }
+    }
+
+    private ignoreSelection(): string {
+        const enabled = this.respectGitignore;
+        return JSON.stringify([enabled, enabled ? this.gitIgnore?.key : undefined]);
+    }
+
+    /** A changed selection gets a comparison after any comparison with an older file list. */
+    private syncIgnoreChanges(): Promise<void> {
+        const selection = this.ignoreSelection();
+        if (selection === this.requestedIgnoreSelection) { return this.ignoreSync ?? Promise.resolve(); }
+        this.requestedIgnoreSelection = selection;
+        const revision = ++this.ignoreChanges;
+        this.receivedRevision++;
+        const work = (this.ignoreSync ?? Promise.resolve()).catch(() => {}).then(async () => {
+            if (this.comparedIgnoreChanges >= revision || !this.sync || !providers.has(this)) { return; }
+            const sync = this.sync;
+            await sync.currentComparison?.catch(() => {});
+            if (this.sync !== sync || !providers.has(this)) { return; }
+            // Requests received while the old comparison ran share this next comparison.
+            // A further change during it appends one more, because it may have newer paths.
+            const comparing = this.ignoreChanges;
+            const result = await this.syncAll();
+            if ('error' in result) { throw new Error(result.error); }
+            this.comparedIgnoreChanges = comparing;
+        }).catch(error => {
+            if (this.requestedIgnoreSelection === selection) { this.requestedIgnoreSelection = undefined; }
+            throw error;
+        });
+        const owned = work.finally(() => {
+            this.receivedRevision++;
+            if (this.ignoreSync === owned) { this.ignoreSync = undefined; }
+        });
+        this.ignoreSync = owned;
+        return owned;
     }
 
     /** The path of `uri` inside the local folder, like '/dir/name.ext'; undefined when outside. */
@@ -473,8 +547,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 throw error;
             }
         };
-        return {
+        const local: ReplicaLocal = {
             list: async () => {
+                await this.refreshIgnoreRules(true);
                 const files = new Map<string, LocalStat>();
                 const walk = async (dir: string) => {
                     let items: [string, number][];
@@ -487,7 +562,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     }
                     await Promise.all(items.map(async ([name, type]) => {
                         const path = dir + name;
-                        if (this.leftOut(path)) { return; }
+                        if (this.leftOut(path, !!(type & localFs.fileType.directory))) { return; }
                         if (type & localFs.fileType.directory) {
                             if (!(type & localFs.fileType.symbolicLink)) { await walk(`${path}/`); }
                         } else if (type & localFs.fileType.file) {
@@ -522,7 +597,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     : !await fs.exists(start.gitDir) ? 'gitFolderGone'
                     : !await fs.exists(settings) ? 'settingsGone'
                     : undefined;
-                if (reason===undefined) { return; }
+                if (reason===undefined) { await this.refreshIgnoreRules(); return; }
                 const problem = {
                     gone: vscode.l10n.t('it is gone'),
                     replaced: vscode.l10n.t('another folder is at its path'),
@@ -569,6 +644,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 }
             },
         };
+        this.verifyFolder = local.verify;
+        return local;
     }
 
     /** Where the local writes go before the rename over their target (localFolderFs.writeFile). */
@@ -577,8 +654,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     /** Whether the sync leaves `path` out: the replica's own folders, and the ignored paths. */
-    private leftOut(path: string): boolean {
-        return isReplicaOwnPath(path) || this.matchIgnorePatterns(path);
+    private leftOut(path: string, directory = false): boolean {
+        return isReplicaOwnPath(path) || this.matchIgnorePatterns(path, directory);
     }
 
     /** The sync state, in the replica's git repository (src/scm/replicaGit.ts). */
@@ -762,7 +839,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         for (;;) {
             checkControlRequest(signal);
             if (sync.openQuestion) { return sync.openQuestion; }
-            const pending: Promise<unknown>[] = [...this.liveWork, ...(this.scanning ? [this.scanning] : [])];
+            const pending: Promise<unknown>[] = [...this.liveWork, ...(this.scanning ? [this.scanning] : []),
+                ...(this.ignoreSync ? [this.ignoreSync] : [])];
             if (sync.currentComparison) { pending.push(sync.currentComparison.catch(() => undefined)); }
             if (pending.length===0) { return undefined; }
             const question = sync.questionOpened();
@@ -841,6 +919,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (this.ready===undefined) { return; } // never started, e.g. disabled
         await this.ready;
         await this.fullSync;
+        await this.refreshIgnoreRules(true);
+        await this.syncIgnoreChanges();
         const scan = vscode.workspace
             .getConfiguration('overleaf-workshop.localReplica.syncOnFileChange')
             .get<boolean>('enabled', false);
@@ -870,6 +950,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return await this.sync.flush(false, {by, question});
         }
         await this.fullSync;
+        await this.refreshIgnoreRules(true);
+        const changing = this.syncIgnoreChanges();
+        if (by === 'tool' && this.ignoreSync) {
+            const question = await this.receivedWork();
+            if (question) { return await this.sync.flush(false, {by, question}); }
+        }
+        await changing;
         return await this.sync.flush(true, {record: true, by});
     }
 
@@ -951,7 +1038,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (this.scanning || this.fullSyncRunning || this.sync===undefined) { return this.scanning; }
         this.receivedRevision++;
         const sync = this.sync;
-        this.scanning = sync.flush(true, {skipRecentMs: SCAN_SKIP_RECENT_MS})
+        this.scanning = this.refreshIgnoreRules(true)
+            .then(() => this.syncIgnoreChanges())
+            .then(() => sync.flush(true, {skipRecentMs: SCAN_SKIP_RECENT_MS}))
             .then(() => {}, error => log(`[${this.vfs.projectName}] The scan of the folder failed: ${error}`))
             .finally(() => { this.receivedRevision++; this.scanning = undefined; });
         return this.scanning;
@@ -1062,7 +1151,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             } finally { observing.dispose(); }
             const git = await waitForControl(signal, () => this.gitState());
             if (current !== this.fullSync || receivedRevision !== this.receivedRevision || comparisonRevision !== this.sync.comparisonRevision
-                || this.liveWork.size>0 || this.scanning || this.sync.currentComparison) { continue; }
+                || this.liveWork.size>0 || this.scanning || this.ignoreSync || this.sync.currentComparison) { continue; }
             for (const file of git?.unmerged ?? []) {
                 const path = '/' + file;
                 if (!summary.conflicts.includes(path)) { summary.conflicts.push(path); }
@@ -1158,7 +1247,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
      * is still there was changed.
      */
     private async localEvent(sync: ReplicaSync, path: string, syncOnFileChange: boolean, onLocal: (path: string) => Promise<void> | undefined) {
-        if (syncOnFileChange) {
+        if (syncOnFileChange || path.endsWith('/.gitignore')) {
             await onLocal(path);
             return;
         }
@@ -1203,6 +1292,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const identity = await step(`The replica folder ${this.baseUri.fsPath} could not be read`, () => localFs.identity(this.baseUri.fsPath));
         const store = this.gitStore();
         const gitDir = await step('The replica\'s git repository could not be opened', () => store.open());
+        await step('The replica\'s .gitignore files could not be read', async () => {
+            const ignoreCase = await store.git.run(['config', '--type=bool', '--get', 'core.ignorecase'], {allowFailure: true});
+            if (ignoreCase.status !== 0 && ignoreCase.status !== 1) { throw new Error(ignoreCase.stderr); }
+            this.gitIgnore = new GitIgnoreMatcher(this.baseUri.fsPath, ignoreCase.stdout.toString('utf8').trim() === 'true',
+                path => this.matchConfiguredPatterns(path));
+            await this.refreshIgnoreRules();
+        });
+        this.requestedIgnoreSelection = this.ignoreSelection();
         const replicaSettings = vscode.workspace.getConfiguration('overleaf-workshop.localReplica');
         const {modes, notices} = replicaModes({fetch: replicaSettings.get('fetchMode'), push: replicaSettings.get('pushMode')});
         this.modes = modes;
@@ -1236,8 +1333,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 void vscode.window.showInformationMessage(vscode.l10n.t('Overleaf Workshop: {0}', notice));
             }
         }
-        const localChange = (path: string) => {
+        const localChange = async (path: string) => {
             if (!isReplicaOwnPath(path)) {
+                const changed = await this.refreshIgnoreRules(false, path);
+                if (changed || path.endsWith('/.gitignore')) {
+                    if (!changed) { await this.refreshIgnoreRules(true); }
+                    await this.syncIgnoreChanges();
+                }
                 return sync.localChanged(path);
             }
         };
@@ -1250,7 +1352,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (path!==undefined) { onLocal(path); }
         };
         const onRemote = (path: string, deleted: boolean) => {
-            this.track('pull', path, sync.remoteChanged(path, deleted));
+            this.track('pull', path, this.refreshIgnoreRules(false, path).then(async changed => {
+                if (changed) { await this.syncIgnoreChanges(); }
+                await sync.remoteChanged(path, deleted);
+            }));
         };
 
         const listeners: vscode.Disposable[] = [
@@ -1265,7 +1370,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     if (from!==undefined && from!==to) { renamed.set(from, to); }
                 }
                 for (const [from, to] of renamed) {
-                    this.track('pull', to, sync.remoteRenamed(from, to));
+                    this.track('pull', to, Promise.all([this.refreshIgnoreRules(false, from), this.refreshIgnoreRules(false, to)])
+                        .then(async changed => {
+                            if (changed.some(Boolean)) { await this.syncIgnoreChanges(); }
+                            await sync.remoteRenamed(from, to);
+                        }));
                 }
                 const moved = new Set([...renamed].flat());
                 for (const event of events) {
@@ -1448,6 +1557,27 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 callback: async () => {
                     outputChannel ??= vscode.window.createOutputChannel('Overleaf Workshop: Local Replica');
                     outputChannel.show();
+                },
+            },
+            {
+                label: vscode.l10n.t('Respect .gitignore ...'),
+                description: this.respectGitignore ? vscode.l10n.t('Enabled for this replica (default)') : vscode.l10n.t('Disabled for this replica'),
+                callback: async (signal?: AbortSignal) => {
+                    if (signal?.aborted) { return; }
+                    const enabled = this.respectGitignore;
+                    const cancellation = new vscode.CancellationTokenSource();
+                    const cancel = () => cancellation.cancel();
+                    signal?.addEventListener('abort', cancel, {once: true});
+                    try {
+                        const choice = await vscode.window.showQuickPick([
+                            {label: vscode.l10n.t('Enabled (default)'), enabled: true, picked: enabled},
+                            {label: vscode.l10n.t('Disabled'), enabled: false, picked: !enabled},
+                        ], {title: vscode.l10n.t('Respect .gitignore for this local replica')}, cancellation.token);
+                        if (choice !== undefined && !signal?.aborted) { await this.setRespectGitignore(choice.enabled, signal); }
+                    } finally {
+                        signal?.removeEventListener('abort', cancel);
+                        cancellation.dispose();
+                    }
                 },
             },
             // configure ignore patterns
