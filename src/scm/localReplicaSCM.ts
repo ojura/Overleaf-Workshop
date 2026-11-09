@@ -1343,7 +1343,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 this.waitingMessage = undefined;
                 providers.delete(this);
                 record.stopped ??= sync.stop();
-                record.stopped.finally(() => {
+                return record.stopped.finally(() => {
                     if (folderSyncs.get(key)===record) { folderSyncs.delete(key); }
                 });
             }},

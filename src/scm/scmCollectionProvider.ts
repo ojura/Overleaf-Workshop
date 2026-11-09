@@ -46,6 +46,7 @@ interface SCMRecord {
     scm: BaseSCM;
     enabled: boolean;
     triggers: vscode.Disposable[];
+    stopping?: Promise<unknown>;
 }
 
 export class SCMCollectionProvider extends vscode.Disposable {
@@ -187,15 +188,22 @@ export class SCMCollectionProvider extends vscode.Disposable {
         vscode.window.showErrorMessage(vscode.l10n.t('"{scm}" creation failed: {error}', {scm: label, error: errorMessage(error)}));
     }
 
-    private removeSCM(item: SCMRecord) {
+    /** Keep a pending stop after Disable empties the triggers, so Remove can await it too. */
+    private stop(item: SCMRecord): Promise<unknown> {
+        const triggers = item.triggers.splice(0);
+        return item.stopping = Promise.all([item.stopping, ...triggers.map(async trigger => trigger.dispose())]);
+    }
+
+    private async removeSCM(item: SCMRecord) {
         if (this.disposed) { return; }
-        const index = this.scms.indexOf(item);
-        if (index!==-1) {
+        if (this.scms.includes(item)) {
+            // Final recording still uses this source control's configured ignore patterns.
+            await this.stop(item);
             // remove from collection
-            item.triggers.forEach(trigger => trigger.dispose());
-            this.scms.splice(index, 1);
+            const index = this.scms.indexOf(item);
+            if (index!==-1) { this.scms.splice(index, 1); }
             // remove from global state
-            this.vfs.setProjectSCMPersist(item.scm.scmKey, undefined);
+            await this.vfs.setProjectSCMPersist(item.scm.scmKey, undefined);
             this.updateStatus();
         }
     }
@@ -261,6 +269,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     const scmIndex = this.scms.indexOf(scmItem);
                     this.scms[scmIndex].enabled = persist.enabled;
                     if (persist.enabled) {
+                        await scmItem.stopping;
                         const triggers = await this.start(scmItem.scm);
                         if (this.disposed) { return; }
                         if (triggers===undefined) {
@@ -273,15 +282,14 @@ export class SCMCollectionProvider extends vscode.Disposable {
                         }
                         scmItem.triggers = triggers;
                     } else {
-                        scmItem.triggers.forEach(trigger => trigger.dispose());
-                        scmItem.triggers = [];
+                        await this.stop(scmItem);
                     }
                     this.updateStatus();
                     vscode.window.showWarningMessage(`"${(scmItem.scm.constructor as any).label}" ${persist.enabled?'enabled':'disabled'}: ${baseUri}.`);
                     break;
                 case 'Remove':
                     if (await vscode.window.showWarningMessage(`${vscode.l10n.t('Remove')} ${baseUri}?`, 'Yes', 'No')==='Yes') {
-                        this.removeSCM(scmItem);
+                        await this.removeSCM(scmItem);
                     }
                     break;
                 default:
