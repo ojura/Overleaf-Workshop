@@ -278,7 +278,7 @@ A commit that descends from the checked-out one lands in these steps:
 
 1. the IDE window that keeps the replica in sync syncs it, and Overleaf's state must be the
    checked-out commit;
-2. Overleaf must hold that commit file for file: documents by their text as the editor reads
+2. Overleaf must hold the commit's selected files: documents by their text as the editor reads
    them, binary files by the hash Overleaf reports;
 3. the window pushes the commit (the control socket's land request): it fast-forwards the
    branch, uploads what the commit changed and waits for Overleaf's acknowledgements. The
@@ -292,8 +292,18 @@ A commit that descends from the checked-out one lands in these steps:
    `OVERLEAF_PARENT_COMPILE` (the parent's compile, made first when missing), `OVERLEAF_COMMIT`
    and `OVERLEAF_PARENT`, e.g. a project's own check of where the pages of its contents fall.
 
-Without a commit, it checks and compiles the checked-out commit. With `--push bridge`, step 3 is
-git's push through the bridge (see below).
+Native landing uses the owning window's per-replica ignore patterns and **Respect .gitignore**
+choice. Its control answers report that selection as `syncIgnore`. The CLI reads local ignore
+rules before each comparison, including after the landed commit changes them. A host that
+predates this field uses the CLI's existing default exclusions.
+
+After checking out the commit, the window compares local files, remote files and saved sync
+paths. This includes a remote-only file when the commit's ignore rules make it part of the
+replica again. The comparison keeps the landing's approved deletions and Git-lock request.
+Ordinary comparisons wait until the landing releases its hold, and shutdown ends that wait.
+
+Without a commit, the command checks and compiles the checked-out commit. With `--push bridge`,
+step 3 is Git's push through the bridge, which sends the whole committed tree (see below).
 
 ## Conflicts
 

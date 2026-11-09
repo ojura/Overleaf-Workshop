@@ -11,6 +11,7 @@ import { BuildCheck, checkBuild } from './buildCheck';
 import type { CompileResult, JoinedProject } from './client';
 import type { ProjectRanges } from './ranges';
 import { errorMessage } from '../utils/errorMessage';
+import { replicaComparisonIgnore } from './replicaIgnore';
 
 /*
  * Landing a commit of a local replica's repository in its Overleaf project (replica-land):
@@ -63,7 +64,7 @@ export interface LandOptions {
     /** the replica folder, the repository's work tree */
     folder: string;
     projectId: string;
-    /** whether the sync leaves a path ('/dir/name') out; such paths are not compared */
+    /** Comparison selection for older hosts and bridge pushes; paths are '/dir/name'. */
     isIgnored: (path: string) => boolean;
     /** how long the window may take to sync, and to push */
     windowTimeoutMs: number;
@@ -226,9 +227,12 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
         throw new LandError(`${commit.slice(0, 7)} does not descend from Overleaf's state ${head.slice(0, 7)}; merge that state into it first (git pull --no-rebase in the clone it comes from, or git merge ${head.slice(0, 7)})`);
     }
     const report: LandReport = { commit, parent: head, pushed: false };
+    let syncIgnore: ControlAnswer['syncIgnore'] = synced.syncIgnore;
+    const compare = async (expected: string) => overleafDifferences(repo, expected, client, options.projectId,
+        bridge ? options.isIgnored : await replicaComparisonIgnore(repo, syncIgnore, options.isIgnored));
 
     // 2. Overleaf holds the parent, file for file
-    const before = await overleafDifferences(repo, head, client, options.projectId, options.isIgnored);
+    const before = await compare(head);
     if (before.differing.length) {
         throw new LandError(`Overleaf does not hold ${head.slice(0, 7)}, which the replica recorded as its state`, before.differing);
     }
@@ -267,6 +271,7 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
             report.push = answer;
             report.pushed = true;
             if (!answer.ok) { throw new LandError(`the push failed: ${answer.error}`); }
+            syncIgnore = answer.syncIgnore ?? syncIgnore;
             report.overleaf = answer.overleaf;
             log(`the window pushed ${commit.slice(0, 7)}; ${OVERLEAF_REF} is ${String(answer.overleaf).slice(0, 7)}${answer.editedSince ? ', with edits made on Overleaf meanwhile on top' : ''}`);
             // with edits made meanwhile, Overleaf holds the window's newer state
@@ -276,7 +281,7 @@ export async function landCommit(repo: Repo, client: LandClient, ask: AskWindow,
         // 4. Overleaf holds the commit
         const end = Date.now() + (options.verifyTimeoutMs ?? 180_000);
         for (;;) {
-            const after = await overleafDifferences(repo, expect, client, options.projectId, options.isIgnored);
+            const after = await compare(expect);
             if (after.differing.length === 0) {
                 held = after.joined;
                 report.verified = after.checked;

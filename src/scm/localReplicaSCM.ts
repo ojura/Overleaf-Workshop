@@ -330,8 +330,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private comparedIgnoreChanges = 0;
     private ignoreSync?: Promise<void>;
 
+    private get configuredIgnorePatterns(): string[] {
+        return this.getSetting<string[]>(IGNORE_SETTING_KEY) || this.ignorePatterns;
+    }
+
     private matchConfiguredPatterns(path: string): boolean {
-        return this.ignoreMatcher.matches(this.getSetting<string[]>(IGNORE_SETTING_KEY) || this.ignorePatterns, path);
+        return this.ignoreMatcher.matches(this.configuredIgnorePatterns, path);
     }
 
     private get respectGitignore(): boolean {
@@ -1114,6 +1118,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             connected: this.vfs.connected,
             watcher: this.watchedBy,
             modes: this.modes,
+            syncIgnore: {patterns: [...this.configuredIgnorePatterns], respectGitignore: this.respectGitignore},
             fullSyncRunning: this.fullSyncRunning,
             question: question && {...question, message: this.deletionsWaiting(question, true)},
             waiting: waiting && {reason: waiting, message: this.waitingText(waiting)},
@@ -1166,16 +1171,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     /** Answer a tool's request on the control socket (src/scm/replicaControl.ts). */
     private async answerTool(request: ControlRequest, signal?: AbortSignal): Promise<ControlAnswer> {
         if (request.op === 'ready' || request.op === 'reload') { return this.toolReady(signal); }
-        const state = this.toolState();
         if (request.op==='status') {
-            return {ok: true, ...state, git: await this.gitState(), recent: [...this.recent]};
+            const git = await this.gitState();
+            return {ok: true, ...this.toolState(), git, recent: [...this.recent]};
         }
         if (request.op==='land') {
-            return {...await this.land(request.commit), ...state, recent: [...this.recent]};
+            const answer = await this.land(request.commit);
+            return {...answer, ...this.toolState(), recent: [...this.recent]};
         }
         const summary = await this.syncNow('tool');
         const problems = this.syncProblems(summary);
         const git = await this.gitState();
+        const state = this.toolState();
         return problems.length===0
             ? {ok: true, ...state, summary, git, recent: [...this.recent]}
             : {ok: false, error: problems.join('; '), ...state, summary, git, recent: [...this.recent]};
@@ -1226,7 +1233,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const deleted = (await git.run(['diff', '--name-only', '--no-renames', '--diff-filter=D', '-z', head, target]))
                 .stdout.toString('utf8').split('\0').filter(Boolean).map(p => `/${p}`);
             await git.ownIndexWrite(() => git.run(['merge', '--ff-only', '--quiet', target]));
-            const summary = await sync.flush(true, {by: 'tool', approved: new Set(deleted), request});
+            // A landed ignore rule can include files that have never existed in this folder.
+            const summary = await sync.flush(true, {complete: true, by: 'tool', approved: new Set(deleted), request});
             const failed = this.syncProblems(summary);
             const recorded = await sync.recordNow({force: true, by: 'tool', request});
             const after = await git.commit(OVERLEAF_REF);
@@ -1462,7 +1470,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 const engineStopped = record.stopped ?? sync.stop();
                 // Keep this provider's settings through work around the engine too, such as a
                 // control request finishing its Git reads after the engine stopped accepting work.
-                const pending = [...this.liveWork, ...requests, this.fullSync, this.scanning];
+                const pending = [...this.liveWork, ...requests, this.fullSync, this.scanning, this.ignoreSync];
                 shutdown = Promise.all([engineStopped, Promise.allSettled(pending)]).then(() => {}).finally(() => {
                     if (folderSyncs.get(key)===record) { folderSyncs.delete(key); }
                 });

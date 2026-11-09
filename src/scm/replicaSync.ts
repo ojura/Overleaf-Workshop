@@ -382,6 +382,8 @@ interface Mode {
 
 interface FlushOptions {
     skipRecentMs?: number, now?: number, record?: boolean, by?: 'tool' | 'user', approved?: ReadonlySet<string>, question?: Deletions,
+    /** Compare every path on both sides, including remote files newly included by changed ignore rules. */
+    complete?: boolean,
     /** a tool's request that the flush is a part of, e.g. a landing's (`ToolRequest`); a tool's flush makes its own otherwise */
     request?: ToolRequest,
 }
@@ -486,8 +488,9 @@ export class ReplicaSync {
     private active = 0;
     private recordTimer?: NodeJS.Timeout;
     private recording: Promise<unknown> = Promise.resolve();
-    /** while held, local changes reported by events wait, e.g. while a commit is checked out to be pushed */
+    /** while held, local events and ordinary comparisons wait, e.g. while a commit is checked out to be pushed */
     private holds = 0;
+    private holdEnded?: {promise: Promise<void>, release(): void};
     private heldPaths = new Set<string>();
     /** deletions the user declined in the window, by side: asked again by the next full sync or Sync Now */
     private declined = {local: new Set<string>(), remote: new Set<string>()};
@@ -501,7 +504,7 @@ export class ReplicaSync {
     private waitReason?: string;
     /** the index lock of another program that the window's steps wait for (`indexLockReleased`), and why the sync waits once the lock stays (`lockReason`) */
     private lockWait?: {file: string, released: Promise<void>, stale?: string};
-    /** resolves when the sync stops, so that a step waiting for git's index lock ends then */
+    /** Resolves when the sync stops, ending Git waits, deletion questions, and held comparisons. */
     private readonly stopping: Promise<void>;
     private markStopped!: () => void;
     /** the checked-out commit that the user agreed to put on Overleaf, and the last one asked about */
@@ -764,6 +767,11 @@ export class ReplicaSync {
      */
     syncAll(): Promise<SyncSummary> {
         if (this.stopped) { return Promise.resolve(stoppedSummary()); }
+        if (this.holdEnded) {
+            // Keep this wait outside fullSync: the held landing performs its own tool-owned
+            // complete flush, with its approvals and lock budget, before it releases events.
+            return this.own(Promise.race([this.holdEnded.promise, this.stopping]).then(() => this.syncAll()));
+        }
         if (this.fullSync===undefined) {
             this.comparisonGeneration++;
             this.fullSync = this.own(this.runSyncAll().catch(error => {
@@ -868,10 +876,15 @@ export class ReplicaSync {
     }
 
     /**
-     * Let local changes reported by events wait until `release`, e.g. while a commit is
-     * checked out to be pushed; `flush` still syncs the whole folder meanwhile.
+     * Let local events and ordinary comparisons wait until `release`, e.g. while a commit is
+     * checked out to be pushed; an explicit `flush` still syncs meanwhile with its own policy.
      */
     hold() {
+        if (this.holds===0) {
+            let release!: () => void;
+            const promise = new Promise<void>(resolve => { release = resolve; });
+            this.holdEnded = {promise, release};
+        }
         this.holds += 1;
     }
 
@@ -879,6 +892,8 @@ export class ReplicaSync {
     release() {
         this.holds = Math.max(0, this.holds-1);
         if (this.holds>0) { return; }
+        this.holdEnded?.release();
+        this.holdEnded = undefined;
         const paths = [...this.heldPaths];
         this.heldPaths.clear();
         for (const path of paths) {
@@ -1042,7 +1057,8 @@ export class ReplicaSync {
      * window, who is asked again about deletions declined before. `approved` lists deletions
      * that the request itself confirms. `question` is the question about deletions that a tool
      * saw open in the window (`questionOpened`): the answer names it, also when the user has
-     * answered it since; without it, the answer names the question open at its end.
+     * answered it since; without it, the answer names the question open at its end. `complete`
+     * scans every path on both sides instead of only local changes, with the same request policy.
      */
     flush(scan: boolean, options: FlushOptions = {}): Promise<SyncSummary> {
         if (this.stopped) { return Promise.resolve(stoppedSummary()); }
@@ -1054,17 +1070,18 @@ export class ReplicaSync {
         const failure = this.slots.get('/')?.failure;
         try {
             const summary = await this.flushWork(true, options);
-            if (failure?.recovery==='scan' && summary.failed.length===0 && summary.waitingFor===undefined) {
+            const recovers = failure?.recovery==='scan' || (options.complete && failure?.recovery==='comparison');
+            if (recovers && summary.failed.length===0 && summary.waitingFor===undefined) {
                 this.recoverFailure('/', failure);
             }
             return summary;
         } catch (error) {
-            this.noteFailure('/', error, emptySummary(), 'scan');
+            this.noteFailure('/', error, emptySummary(), options.complete ? 'comparison' : 'scan');
             throw error;
         }
     }
 
-    private async flushWork(scan: boolean, {skipRecentMs = 0, now = Date.now(), record = false, by, approved, question: seen, request: given}: FlushOptions): Promise<SyncSummary> {
+    private async flushWork(scan: boolean, {skipRecentMs = 0, now = Date.now(), record = false, complete = false, by, approved, question: seen, request: given}: FlushOptions): Promise<SyncSummary> {
         await this.load();
         const request = by==='tool' ? given ?? {} : undefined;
         const summary = emptySummary();
@@ -1076,30 +1093,41 @@ export class ReplicaSync {
         }
         if (scan) {
             const localFiles = await this.local.list();
-            const changed: string[] = [];
-            const deleted: string[] = [];
-            let recentNewFile = false;
-            for (const [path, stat] of localFiles) {
-                const entry = this.state.entries[path];
-                if (!this.tracked(path) || this.state.untracked.includes(path)) { continue; }
-                if (skipRecentMs>0 && now - stat.mtime < skipRecentMs) {
-                    recentNewFile ||= entry===undefined;
-                    continue;
-                }
-                if (!entry || entry.size!==stat.size || entry.mtime!==stat.mtime) { changed.push(path); }
-            }
-            // A new file written a moment ago may be the new path of a deleted file, still half
-            // written, which git cannot pair with it yet: the deletions wait for the next scan.
-            if (!recentNewFile) {
+            let paths: string[];
+            if (complete) {
+                // Listing locally refreshes ignore rules before the remote tree is filtered.
+                // Include both trees and saved entries without joining a window comparison.
+                const remoteFiles = await this.remote.list();
+                paths = [...new Set([...localFiles.keys(), ...remoteFiles.keys(), ...Object.keys(this.state.entries)])]
+                    .filter(path => this.tracked(path));
                 for (const path of Object.keys(this.state.entries)) {
-                    if (!localFiles.has(path) && this.tracked(path)) { deleted.push(path); }
+                    if (!this.tracked(path)) { delete this.state.entries[path]; }
+                }
+            } else {
+                paths = [];
+                let recentNewFile = false;
+                for (const [path, stat] of localFiles) {
+                    const entry = this.state.entries[path];
+                    if (!this.tracked(path) || this.state.untracked.includes(path)) { continue; }
+                    if (skipRecentMs>0 && now - stat.mtime < skipRecentMs) {
+                        recentNewFile ||= entry===undefined;
+                        continue;
+                    }
+                    if (!entry || entry.size!==stat.size || entry.mtime!==stat.mtime) { paths.push(path); }
+                }
+                // A new file written a moment ago may be the new path of a deleted file, still half
+                // written, which git cannot pair with it yet: the deletions wait for the next scan.
+                if (!recentNewFile) {
+                    for (const path of Object.keys(this.state.entries)) {
+                        if (!localFiles.has(path) && this.tracked(path)) { paths.push(path); }
+                    }
                 }
             }
             // A tool's request does not join a reconcile that another step scheduled and has not
             // started: that step would decide the deletion, without the request's approvals and
             // without the request learning about it. The request reconciles after it instead.
             const mode = collecting(summary, {live: by!=='tool', tool: by==='tool', request, approved});
-            await this.scheduleAll([...changed, ...deleted], mode);
+            await this.scheduleAll(paths, mode);
             await this.applyDeletions(mode);
             this.ui.liveResult(mode.summary);
         }

@@ -8,7 +8,8 @@ import type { CompileRequest } from '../api/base';
 import { Repo } from '../gitbridge/plumbing';
 import { checkBuild } from '../sandbox/buildCheck';
 import { AskWindow, fetchCommitFrom, LandClient, LandError, landCommit, landedCleanly } from '../sandbox/land';
-import { replicaSocketPath, requestReplica } from '../scm/replicaControl';
+import { ReplicaControlServer, ReplicaSyncIgnore, replicaSocketPath, requestReplica } from '../scm/replicaControl';
+import { DEFAULT_IGNORE_PATTERNS, IgnoreMatcher, isReplicaOwnPath } from '../scm/ignorePatterns';
 import { SHORT_TEMP } from './replicaTestWorld';
 
 const OVERLEAF_REF = 'refs/remotes/overleaf/main';
@@ -89,15 +90,20 @@ describe('replica-land', function () {
         overleaf.docs.set('main.tex', 'main v1\n');
         overleaf.files.set('slike/a.png', git(folder, 'rev-parse', 'HEAD:slike/a.png'));
         const asked: string[] = [];
-        const window = { connected: true, pushLater: false, push: 'native' };
+        const window: { connected: boolean, pushLater: boolean, push: string, syncIgnore?: ReplicaSyncIgnore,
+            afterMerge?: () => void, skipped: Set<string> } = {
+            connected: true, pushLater: false, push: 'native', skipped: new Set(),
+        };
         const ask: AskWindow = async (request) => {
             asked.push(request.op === 'land' ? `land ${request.commit.slice(0, 7)}` : request.op);
             const state = () => ({ head: git(folder, 'rev-parse', 'HEAD'), overleaf: git(folder, 'rev-parse', OVERLEAF_REF), branch: 'main', unmerged: [] });
-            if (request.op === 'sync') { return { ok: true, connected: window.connected, modes: { fetch: 'native', push: window.push }, git: state() }; }
+            if (request.op === 'sync') { return { ok: true, connected: window.connected, modes: { fetch: 'native', push: window.push }, git: state(), syncIgnore: window.syncIgnore }; }
             if (request.op === 'land') {
                 git(folder, 'merge', '--ff-only', '--quiet', request.commit);
+                window.afterMerge?.();
                 const apply = () => {
                     for (const p of git(folder, 'diff', '--name-only', head, request.commit).split('\n').filter(Boolean)) {
+                        if (window.skipped.has(p)) { continue; }
                         const exists = fs.existsSync(path.join(folder, p));
                         if (!exists) { overleaf.docs.delete(p); overleaf.files.delete(p); continue; }
                         if (p.endsWith('.png')) { overleaf.files.set(p, git(folder, 'rev-parse', `${request.commit}:${p}`)); } else { overleaf.docs.set(p, fs.readFileSync(path.join(folder, p), 'utf8')); }
@@ -105,11 +111,11 @@ describe('replica-land', function () {
                 };
                 if (window.pushLater) { overleaf.beforeRead = () => { if (overleaf.reads >= 2) { apply(); } }; } else { apply(); }
                 git(folder, 'update-ref', OVERLEAF_REF, request.commit);
-                return { ok: true, landed: request.commit, overleaf: request.commit, summary: { uploaded: ['/main.tex'], renamed: [] } };
+                return { ok: true, landed: request.commit, overleaf: request.commit, summary: { uploaded: ['/main.tex'], renamed: [] }, syncIgnore: window.syncIgnore };
             }
             return { ok: true, git: state() };
         };
-        const commit = (files: Record<string, string>, message: string) => {
+        const commit = (files: Record<string, string | undefined>, message: string) => {
             const index = path.join(scratch, 'index');
             const env = { ...process.env, GIT_INDEX_FILE: index };
             const run = (args: string[], input?: string) => {
@@ -119,15 +125,17 @@ describe('replica-land', function () {
             };
             run(['read-tree', 'HEAD']);
             for (const [p, content] of Object.entries(files)) {
+                if (content === undefined) { run(['update-index', '--force-remove', '--', p]); continue; }
                 run(['update-index', '--add', '--cacheinfo', `100644,${run(['hash-object', '-w', '--stdin'], content)},${p}`]);
             }
             const tree = run(['write-tree']);
             fs.rmSync(index, { force: true });
             return run(['commit-tree', tree, '-p', 'HEAD', '-m', message]);
         };
+        const defaults = new IgnoreMatcher();
         const options = {
             folder, projectId: 'p'.repeat(24), windowTimeoutMs: 1000, verifyIntervalMs: 1, sleep: async () => {},
-            isIgnored: (p: string) => p.endsWith('.aux') || p.startsWith('/.overleaf'), log: () => {},
+            isIgnored: (p: string) => isReplicaOwnPath(p) || defaults.matches(DEFAULT_IGNORE_PATTERNS, p), log: () => {},
         };
         return { folder, head, overleaf, ask, asked, window, commit, options, repo: new Repo(folder) };
     }
@@ -165,6 +173,112 @@ describe('replica-land', function () {
         assert.strictEqual(report.verified, 2);
         assert.ok(t.overleaf.reads >= 3);
     });
+
+    it('uses the replica patterns returned through its control socket', async () => {
+        const t = setup();
+        t.window.syncIgnore = { patterns: ['/local-only.txt'], respectGitignore: false };
+        t.window.skipped.add('local-only.txt');
+        const commit = t.commit({ 'main.tex': 'main v2\n', 'local-only.txt': 'local material\n' }, 'Filtered');
+        const saved = process.env.XDG_RUNTIME_DIR;
+        const runtime = fs.mkdtempSync(path.join(SHORT_TEMP, 'owr-'));
+        process.env.XDG_RUNTIME_DIR = runtime;
+        const server = new ReplicaControlServer(t.folder, request => t.ask(request, 1000), () => {});
+        try {
+            assert.ok(await server.start());
+            const ask: AskWindow = (request, timeout) => requestReplica(t.folder, request, timeout);
+            const report = await landCommit(t.repo, t.overleaf, ask, { ...t.options, commit, compile: false, verifyTimeoutMs: -1 });
+            assert.strictEqual(report.verified, 2);
+            assert.strictEqual(t.overleaf.docs.has('local-only.txt'), false);
+            assert.deepStrictEqual(t.asked, ['sync', 'land ' + commit.slice(0, 7)]);
+        } finally {
+            server.dispose();
+            if (saved === undefined) { delete process.env.XDG_RUNTIME_DIR; } else { process.env.XDG_RUNTIME_DIR = saved; }
+            fs.rmSync(runtime, { recursive: true, force: true });
+        }
+    });
+
+    it('replaces default patterns with the reported per-replica patterns', async () => {
+        const t = setup();
+        t.window.syncIgnore = { patterns: [], respectGitignore: false };
+        git(t.folder, 'add', '-f', 'main.aux');
+        git(t.folder, 'commit', '--quiet', '-m', 'Tracked auxiliary file');
+        git(t.folder, 'update-ref', OVERLEAF_REF, 'HEAD');
+        await assert.rejects(landCommit(t.repo, t.overleaf, t.ask, { ...t.options, compile: false }),
+            (error: any) => error instanceof LandError && error.details.includes('main.aux: not on Overleaf'));
+        assert.deepStrictEqual(t.asked, ['sync']);
+    });
+
+    it('reads the landed commit\'s gitignore before comparing a tracked archive', async () => {
+        const t = setup();
+        t.window.syncIgnore = { patterns: [...DEFAULT_IGNORE_PATTERNS], respectGitignore: true };
+        t.window.skipped.add('.gitignore');
+        t.window.skipped.add('assets/bundle.tar.gz');
+        const commit = t.commit({ '.gitignore': 'assets/*.tar.gz\n', 'assets/bundle.tar.gz': 'archive bytes\n' }, 'Ignored archive');
+        const report = await landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit, compile: false, verifyTimeoutMs: -1 });
+        assert.strictEqual(report.verified, 2);
+        assert.ok(t.repo.flatTree(commit).has('assets/bundle.tar.gz'), 'the archive belongs to the commit');
+        assert.strictEqual(t.overleaf.docs.has('assets/bundle.tar.gz'), false);
+    });
+
+    it('compares a newly included file when the landed commit removes gitignore', async () => {
+        const t = setup();
+        t.window.syncIgnore = { patterns: [...DEFAULT_IGNORE_PATTERNS], respectGitignore: true };
+        const base = t.commit({ '.gitignore': '*.tar.gz\n', 'bundle.tar.gz': 'archive bytes\n' }, 'Local archive');
+        git(t.folder, 'merge', '--ff-only', '--quiet', base);
+        git(t.folder, 'update-ref', OVERLEAF_REF, base);
+        t.window.skipped.add('.gitignore');
+        t.window.skipped.add('bundle.tar.gz');
+        const commit = t.commit({ '.gitignore': undefined }, 'Include the archive');
+        await assert.rejects(landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit, compile: false, verifyTimeoutMs: -1 }),
+            (error: any) => error instanceof LandError && /still differs/.test(error.message)
+                && error.details.includes('bundle.tar.gz: not on Overleaf'));
+        assert.deepStrictEqual(t.asked, ['sync', 'land ' + commit.slice(0, 7)]);
+    });
+
+    it('refreshes local gitignore before each final comparison', async () => {
+        const t = setup();
+        t.window.syncIgnore = { patterns: [...DEFAULT_IGNORE_PATTERNS], respectGitignore: true };
+        t.window.skipped.add('bundle.tar.gz');
+        const commit = t.commit({ 'bundle.tar.gz': 'archive bytes\n' }, 'Archive awaiting a rule');
+        let comparisons = 0;
+        const report = await landCommit(t.repo, t.overleaf, t.ask, {
+            ...t.options, commit, compile: false,
+            sleep: async () => {
+                assert.strictEqual(comparisons++, 0, 'the next comparison must use the new rule');
+                fs.writeFileSync(path.join(t.folder, '.gitignore'), '*.tar.gz\n');
+            },
+        });
+        assert.strictEqual(comparisons, 1);
+        assert.strictEqual(report.verified, 2);
+        assert.strictEqual(t.overleaf.reads, 3);
+    });
+
+    it('uses the selection reported after the window finishes landing', async () => {
+        const t = setup();
+        t.window.syncIgnore = { patterns: [...DEFAULT_IGNORE_PATTERNS], respectGitignore: true };
+        t.window.afterMerge = () => { t.window.syncIgnore = { patterns: ['/local-only.txt'], respectGitignore: false }; };
+        t.window.skipped.add('local-only.txt');
+        const commit = t.commit({ 'local-only.txt': 'local material\n' }, 'Updated selection');
+        const report = await landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit, compile: false, verifyTimeoutMs: -1 });
+        assert.strictEqual(report.verified, 2);
+    });
+
+    for (const respectGitignore of [false, undefined]) {
+        it(respectGitignore === false ? 'compares gitignored files when that replica disables gitignore'
+            : 'retains the previous comparison selection for a host without syncIgnore', async () => {
+            const t = setup();
+            if (respectGitignore !== undefined) {
+                t.window.syncIgnore = { patterns: [...DEFAULT_IGNORE_PATTERNS], respectGitignore };
+            }
+            fs.writeFileSync(path.join(t.folder, '.gitignore'), '*.tar.gz\n');
+            const base = t.commit({ 'bundle.tar.gz': 'archive bytes\n' }, 'Tracked archive');
+            git(t.folder, 'merge', '--ff-only', '--quiet', base);
+            git(t.folder, 'update-ref', OVERLEAF_REF, base);
+            await assert.rejects(landCommit(t.repo, t.overleaf, t.ask, { ...t.options, compile: false }),
+                (error: any) => error instanceof LandError && error.details.includes('bundle.tar.gz: not on Overleaf'));
+            assert.deepStrictEqual(t.asked, ['sync']);
+        });
+    }
 
     it('stops before pushing when Overleaf does not hold the parent, and says which files differ', async () => {
         const t = setup();
@@ -212,6 +326,7 @@ describe('replica-land', function () {
         await assert.rejects(landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit, push: 'bridge', bridgePush }), /push mode native/);
         assert.deepStrictEqual(pushes, []);
         t.window.push = 'bridge';
+        t.window.syncIgnore = { patterns: ['/**'], respectGitignore: true };
         const report = await landCommit(t.repo, t.overleaf, t.ask, { ...t.options, commit, push: 'bridge', bridgePush, compile: false });
         assert.deepStrictEqual(pushes, [commit]);
         assert.strictEqual(git(t.folder, 'rev-parse', 'HEAD'), commit);

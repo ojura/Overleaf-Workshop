@@ -4,7 +4,7 @@ import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { Uri, load, until, wait, world } from './replicaTestWorld';
+import { Cleanup, Uri, load, until, wait, world } from './replicaTestWorld';
 
 const OVERLEAF_REF = 'refs/remotes/overleaf/main';
 
@@ -225,6 +225,136 @@ describe('landing a commit through the replica\'s window (the land request)', fu
         assert.strictEqual(dirty.ok, false);
         assert.match(dirty.error, /changes that are not committed/);
         assert.strictEqual(t.w.remote.get('/chapters/one.tex'), 'one v1\n');
+    });
+});
+
+describe('native landing after ignore rules change', function () {
+    this.timeout(20000);
+    let cleanup: Cleanup, folder: string, clone: string;
+    beforeEach(() => {
+        cleanup = new Cleanup();
+        cleanup.privateRuntime();
+        folder = cleanup.tempDir('replica-land-ignore-');
+        clone = `${folder}-clone`;
+        cleanup.add(() => fs.rmSync(clone, {recursive: true, force: true}));
+    });
+    afterEach(() => cleanup.undo());
+
+    async function start() {
+        const t = world(folder, true);
+        const ignored = 'remote-only.tex\n';
+        fs.writeFileSync(path.join(folder, '.gitignore'), ignored);
+        t.w.remote.set('/.gitignore', ignored);
+        t.w.remote.set('/main.tex', 'document\n');
+        t.w.remote.set('/remote-only.tex', 'previously ignored on Overleaf\n');
+        const deleted = Array.from({length: 6}, (_, i) => `chapter-${i}.tex`);
+        for (const file of deleted) { t.w.remote.set(`/${file}`, `${file}: old chapter\n`); }
+        git(folder, 'init', '--quiet', '--initial-branch=main');
+        git(folder, 'config', 'user.name', 'Local User');
+        git(folder, 'config', 'user.email', 'local@example.com');
+        const { LocalReplicaSCMProvider, requestReplica } = load(t.mock);
+        const scm = new LocalReplicaSCMProvider(t.vfs, Uri.file(folder));
+        const triggers = await scm.triggers;
+        const stop = async () => { await Promise.all(triggers.map((trigger: any) => trigger.dispose())); };
+        cleanup.add(stop);
+        await cleanup.controlListens(folder);
+        const first = await requestReplica(folder, {op: 'sync'}, 10000);
+        assert.strictEqual(first.ok, true, JSON.stringify(first));
+        assert.strictEqual(fs.existsSync(path.join(folder, 'remote-only.tex')), false);
+        // Drive rule-change work explicitly; the landing must work without a watcher finding it.
+        scm.localEvent = async () => {};
+        scm.scanFolder = async () => {};
+        const changes: Record<string, string | null> = {'.gitignore': '# include every project file\n'};
+        for (const file of deleted) { changes[file] = null; }
+        const commit = commitInClone(folder, clone, git(folder, 'rev-parse', 'HEAD'), changes, 'Include the remote file and remove old chapters');
+        let questions = 0;
+        scm.sync.ui.confirmDeletions = async () => { questions++; return false; };
+        return {...t, scm, requestReplica, commit, deleted, stop, questions: () => questions};
+    }
+
+    it('compares the newly included remote-only file and the commit-approved deletions', async () => {
+        const t = await start();
+        const answer: any = await t.requestReplica(folder, {op: 'land', commit: t.commit}, 10000);
+        assert.strictEqual(answer.ok, true, JSON.stringify(answer));
+        assert.deepStrictEqual(answer.summary.downloaded, ['/remote-only.tex']);
+        assert.strictEqual(fs.readFileSync(path.join(folder, 'remote-only.tex'), 'utf8'), 'previously ignored on Overleaf\n');
+        assert.deepStrictEqual(answer.summary.deletedRemote.sort(), t.deleted.map(file => `/${file}`).sort());
+        for (const file of t.deleted) { assert.strictEqual(t.w.remote.has(`/${file}`), false); }
+        assert.strictEqual(t.questions(), 0, 'the landed commit supplies the deletion approval');
+        assert.strictEqual(git(folder, 'show', `${OVERLEAF_REF}:remote-only.tex`), 'previously ignored on Overleaf');
+        assert.strictEqual(git(folder, 'merge-base', t.commit, answer.overleaf), t.commit);
+    });
+
+    it('defers a rule-change comparison until the landing releases its hold', async () => {
+        const t = await start();
+        const sync = t.scm.sync;
+        const flush = sync.flush, syncAll = sync.syncAll, runSyncAll = sync.runSyncAll;
+        let ruleWork: Promise<void> | undefined, comparisonStarted = false;
+        sync.runSyncAll = (...args: any[]) => { comparisonStarted = true; return runSyncAll.apply(sync, args); };
+        sync.flush = async (scan: boolean, options: any = {}) => {
+            if (options.approved) {
+                await t.scm.refreshIgnoreRules(true);
+                let entered!: () => void;
+                const started = new Promise<void>(resolve => { entered = resolve; });
+                sync.syncAll = () => { const work = syncAll.call(sync); entered(); return work; };
+                ruleWork = t.scm.syncIgnoreChanges();
+                await started;
+                assert.strictEqual(comparisonStarted, false, 'the ordinary comparison must wait for the held landing');
+                assert.strictEqual(sync.currentComparison, undefined, 'held comparison work must not own the active comparison');
+            }
+            return flush.call(sync, scan, options);
+        };
+        try {
+            const answer: any = await t.requestReplica(folder, {op: 'land', commit: t.commit}, 10000);
+            await ruleWork;
+            assert.strictEqual(answer.ok, true, JSON.stringify(answer));
+            assert.strictEqual(comparisonStarted, true, 'rule changes are compared after the landing releases its hold');
+            assert.strictEqual(t.questions(), 0);
+            assert.strictEqual(fs.readFileSync(path.join(folder, 'remote-only.tex'), 'utf8'), 'previously ignored on Overleaf\n');
+        } finally {
+            sync.flush = flush;
+            sync.syncAll = syncAll;
+            sync.runSyncAll = runSyncAll;
+            await ruleWork;
+        }
+    });
+
+    it('keeps a failed complete enumeration unresolved through an ordinary local scan', async () => {
+        const t = await start();
+        const sync = t.scm.sync, list = sync.remote.list;
+        sync.remote.list = async () => { throw new Error('the remote tree could not be listed'); };
+        try {
+            await assert.rejects(sync.flush(true, {complete: true, by: 'tool'}), /remote tree could not be listed/);
+        } finally { sync.remote.list = list; }
+        await sync.flush(true, {by: 'tool'});
+        const unresolved = await sync.readiness();
+        assert.ok(unresolved.failed.some((failure: {path: string, error: string}) =>
+            failure.path === '/' && failure.error.includes('remote tree could not be listed')),
+        'a local-only scan has not recovered the failed remote enumeration');
+        await sync.flush(true, {complete: true, by: 'tool'});
+        assert.deepStrictEqual((await sync.readiness()).failed, [], 'a complete comparison recovers the enumeration');
+    });
+
+    it('wakes a held rule-change comparison when the provider stops', async () => {
+        const t = await start();
+        const sync = t.scm.sync, syncAll = sync.syncAll;
+        let entered!: () => void;
+        const started = new Promise<void>(resolve => { entered = resolve; });
+        sync.syncAll = () => { const work = syncAll.call(sync); entered(); return work; };
+        sync.hold();
+        try {
+            fs.writeFileSync(path.join(folder, '.gitignore'), '# include every project file\n');
+            await t.scm.refreshIgnoreRules(true);
+            const ruleWork = t.scm.syncIgnoreChanges();
+            await started;
+            assert.strictEqual(sync.currentComparison, undefined, 'the held comparison has not started');
+            await t.stop();
+            await ruleWork;
+            assert.strictEqual(fs.existsSync(path.join(folder, 'remote-only.tex')), false, 'stopping does not start the held comparison');
+        } finally {
+            sync.syncAll = syncAll;
+            sync.release();
+        }
     });
 });
 

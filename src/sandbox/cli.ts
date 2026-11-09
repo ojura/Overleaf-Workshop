@@ -472,7 +472,7 @@ async function replicaReloadCommand(folder: string, timeoutS: number, json: bool
     }
 }
 
-/** The paths the replica leaves out: its own folders, and its default ignore patterns; '/dir/name' */
+/** Selection for older host comparisons and bridge anchoring; paths are '/dir/name'. */
 const replicaIgnored = (p: string) => isReplicaOwnPath(p) || DEFAULT_IGNORE_PATTERNS.some(g => minimatch(p, g, { dot: true }));
 
 /** replica-connect: join a development history with the replica's repository (src/scm/replicaConnect.ts). */
@@ -593,7 +593,7 @@ async function replicaLand(folder: string, commit: string | undefined,
         : `Overleaf holds the checked-out commit ${short(report.commit)}`);
     const summary = (report.push as any)?.summary as SyncSummary | undefined;
     if (summary) { lines.push(`push: ${describe(summary)}${summary.renamed?.length ? `; renamed ${summary.renamed.map(r => `${r.from} -> ${r.to}`).join(', ')}` : ''}`); }
-    if (report.verified !== undefined) { lines.push(`Overleaf holds every file of it (${report.verified} compared)`); }
+    if (report.verified !== undefined) { lines.push(`Verified ${report.verified} files on Overleaf`); }
     if (report.parentCompile) { lines.push(`compiled the parent first: ${report.parentCompile.status} (${report.parentCompile.dir})`); }
     if (report.compile) {
         const check = report.compile.check;

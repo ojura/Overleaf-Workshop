@@ -4,6 +4,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Cleanup, Uri, load, world } from './replicaTestWorld';
 import { AsyncGit } from '../scm/replicaGit';
+import { DEFAULT_IGNORE_PATTERNS } from '../scm/ignorePatterns';
+import { requestReplica } from '../scm/replicaControl';
 
 function deferred() {
     let resolve!: () => void;
@@ -69,9 +71,12 @@ describe('the replica setting to respect .gitignore', function () {
         const other = cleanup.tempDir('replica-gitignore-other-');
         for (const root of [folder, other]) { fs.writeFileSync(path.join(root, '.gitignore'), '*.generated\n'); }
         const t = persistedWorld();
+        const customPatterns = [...DEFAULT_IGNORE_PATTERNS, '**/*.private'];
+        t.persists.set(Uri.file(folder).toString(), {settings: {'ignore-patterns': customPatterns}});
         t.w.remote.set('/main.tex', 'document\n');
         t.w.remote.set('/build.generated', 'generated output\n');
         t.w.remote.set('/main.aux', 'configured exclusion\n');
+        t.w.remote.set('/notes.private', 'per-replica exclusion\n');
         const { LocalReplicaSCMProvider } = load(t.mock);
         const first = new LocalReplicaSCMProvider(t.vfs, Uri.file(folder));
         const second = new LocalReplicaSCMProvider(t.vfs, Uri.file(other));
@@ -84,6 +89,13 @@ describe('the replica setting to respect .gitignore', function () {
         assert.strictEqual(fs.readFileSync(path.join(folder, 'build.generated'), 'utf8'), 'generated output\n');
         assert.strictEqual(fs.existsSync(path.join(other, 'build.generated')), false, 'the other replica keeps the default');
         assert.strictEqual(fs.existsSync(path.join(folder, 'main.aux')), false, 'configured patterns still apply when disabled');
+        assert.strictEqual(fs.existsSync(path.join(folder, 'notes.private')), false);
+        assert.strictEqual(fs.readFileSync(path.join(other, 'notes.private'), 'utf8'), 'per-replica exclusion\n');
+        const [firstAnswer, secondAnswer] = await Promise.all([
+            requestReplica(folder, {op: 'status'}, 5000), requestReplica(other, {op: 'status'}, 5000),
+        ]);
+        assert.deepStrictEqual(firstAnswer.syncIgnore, {patterns: customPatterns, respectGitignore: false});
+        assert.deepStrictEqual(secondAnswer.syncIgnore, {patterns: DEFAULT_IGNORE_PATTERNS, respectGitignore: true});
     });
 
     it('rechecks changed, removed and new ignore files during normal sync', async () => {

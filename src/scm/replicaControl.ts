@@ -34,7 +34,15 @@ export type ControlRequest = { op: 'status' } | { op: 'sync' } | { op: 'land', c
     | { op: 'host' }
     | { op: 'ready', folder: string, host: string }
     | { op: 'reload', folder: string, host: string, id: string };
-export type ControlAnswer = { ok: true, [key: string]: unknown } | { ok: false, error: string, [key: string]: unknown };
+
+/** The owning window's effective selection for files synchronized through this replica. */
+export interface ReplicaSyncIgnore {
+    patterns: string[];
+    respectGitignore: boolean;
+}
+
+export type ControlAnswer = ({ ok: true, [key: string]: unknown } | { ok: false, error: string, [key: string]: unknown })
+    & { syncIgnore?: ReplicaSyncIgnore };
 
 export interface ReplicaHostIdentity {
     id: string;
