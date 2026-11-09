@@ -81,6 +81,30 @@ readiness, `4` when no window owns the replica, `5` for timeout, `130`/`143` for
 one ordinary **Developer: Reload Window** after the first supporting build is installed;
 subsequent installs can use this command. The command does not install extension files.
 
+## Files left out of sync
+
+Each local replica has a **Respect .gitignore ...** item in its settings menu. It is enabled
+by default, including for replicas created before this setting existed. The choice belongs to
+that replica folder, so another local copy of the same project can use a different choice.
+
+When enabled, the sync reads the local `.gitignore` files in the replica's root and nested
+folders. Patterns use Git's rules: nested files have precedence within their folders, `!`
+can include a path again, and a file inside an ignored parent folder stays ignored until
+the parent is included. Matching also applies to files already tracked in Git. A rule
+change, or a change to this setting, takes effect in normal synchronization without a reload.
+The **Sync now** item also compares the whole project again.
+
+The configured sync ignore patterns still apply in addition to `.gitignore`. A negation in
+`.gitignore` can undo another `.gitignore` rule, while a configured exclusion remains in
+effect. The default patterns exclude dot files, including `.gitignore` itself, but its rules
+are still read. `.git` and `.overleaf` always stay outside sync. Git's global exclude file
+and personal entries in `.git/info/exclude` affect Git only and are not added to sync's rules.
+
+Ignoring a path leaves its current local and Overleaf content in place. It stops uploads,
+downloads, renames and deletions through the replica for that path; enabling the setting does
+not remove files from either side. Existing Git content for ignored paths remains in the
+recorded history. Disabling the setting restores the replica's configured sync patterns alone.
+
 ## The repository
 
 The replica folder is the work tree of a repository of its own, with `.git` at the folder's
@@ -143,9 +167,9 @@ the files, so only the branch and the index move; a path staged with other conte
 it is. When the branch and the state conflict, or have no commit in common, the branch stays
 where it is and the log says so.
 
-Files the sync leaves out (its ignore patterns) are not Overleaf's: a commit of Overleaf's state
-keeps them as its parent has them, and keeps each file's mode (an executable script stays
-executable).
+Files the sync leaves out (its configured patterns and, when enabled, `.gitignore`) are not
+Overleaf's: a commit of Overleaf's state keeps them as its parent has them, and keeps each
+file's mode (an executable script stays executable).
 
 Uploads still happen as files change: each upload batch becomes a commit, and the branch follows
 it. A file written by another program, an editor's atomic save or a git checkout is seen by the
