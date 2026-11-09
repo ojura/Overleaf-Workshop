@@ -174,6 +174,29 @@ Overleaf. When the sync may act again, a full sync catches up with what changed 
 first applies the renames and moves made on Overleaf while the sync waited, so that the local
 files move with their local changes.
 
+### Server overload and transfer retries
+
+Project API requests and file downloads share an overload pause for each server origin,
+including requests made by separate replicas in the same extension host. An HTTP/2 stream
+reset with `NGHTTP2_ENHANCE_YOUR_CALM`, HTTP 429 or HTTP 503 starts the pause. The client
+respects `Retry-After` in seconds or as an HTTP date; otherwise it uses its retry backoff.
+After the pause, one request checks recovery through the end of its response body. Other
+requests wait for that check, and another overload extends the pause. Other servers
+continue independently.
+
+Waiting for this admission has a deadline, including time behind an unfinished recovery
+request. Ordinary requests and downloads use the existing 60-second server-wait allowance;
+compile and latest-compile queries use their own allowances. A longer requested pause is
+reported without sending a request early. The existing network timeouts still apply once
+a request starts.
+
+Repeatable reads, deletes and same-path file uploads retain up to two additional attempts
+after transient failures. File upload repeats the same bytes at the same folder and filename
+using Overleaf's upsert operation. Other mutations, such as creating a project or a comment,
+are sent once unless the operation explicitly permits retries. If a transfer still fails,
+the replica keeps its local content and reports the path for the next connection recovery
+or **Sync Now**.
+
 ## Renames and moves
 
 A file gone from the folder and a new file in it are one file renamed or moved when git's rename

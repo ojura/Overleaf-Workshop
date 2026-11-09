@@ -8,6 +8,8 @@ import { PdfDiskCache, PdfCacheViewer, PdfFillRequest } from './pdfDiskCache';
 import type { BridgeRequest, BridgeResponse, PdfOutput, ReadingImageRequest } from './viewerProtocol';
 import { PDF_READING_REQUEST_LIMITS } from './viewerProtocol';
 import { PDF_READING_LIMITS } from './pdfReadingManifest';
+import { retryAfterMs } from '../utils/httpRetry';
+export { retryAfterMs } from '../utils/httpRetry';
 
 // The old public name remains for the harness and callers that only use content pieces.
 export { PdfDiskCache as PieceCache } from './pdfDiskCache';
@@ -315,24 +317,6 @@ export class DownloadError extends Error {
     constructor(message: string, readonly status: number, readonly retryAfterMs?: number) {
         super(message);
     }
-}
-
-/**
- * The time in ms that a Retry-After header asks a client to wait before it asks again: a number
- * of seconds, or a date, which has passed for 0 (RFC 9110, section 10.2.3); undefined without the
- * header or for a value of another form.
- */
-export function retryAfterMs(value: string | null, now: number = Date.now()): number | undefined {
-    const text = value?.trim();
-    if (!text) {
-        return undefined;
-    }
-    if (/^\d+$/.test(text)) {
-        return Number(text) * 1000;
-    }
-    // an HTTP date names its weekday and month, as in "Sun, 01 Nov 2026 05:00:30 GMT"
-    const date = /[a-z]/i.test(text) ? Date.parse(text) : NaN;
-    return Number.isNaN(date) ? undefined : Math.max(0, date - now);
 }
 
 /**

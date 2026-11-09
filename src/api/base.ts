@@ -7,6 +7,8 @@ import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/re
 import type { SyncBox } from '../core/viewerProtocol';
 import { errorMessage } from '../utils/errorMessage';
 import { downloadDomainUrl } from './downloadDomain';
+import { apiRequests, HTTP_RETRIES, HttpResponseError } from './requestRetry';
+import { retryAfterMs } from '../utils/httpRetry';
 
 /** Extract set-cookie headers from an undici/Response object. */
 function getSetCookie(res: any): string[] {
@@ -268,8 +270,10 @@ export interface CompileRequest {
 export interface RequestOptions {
     /** the undici dispatcher, which sets the time limits; undici's default waits five minutes */
     dispatcher?: Dispatcher;
-    /** how often to send it again after a network error, a 5xx or a 429 */
+    /** Additional attempts for a repeatable operation; GET/DELETE default to two, POST to zero. */
     retries?: number;
+    /** Admission may wait this long for origin recovery; ordinary requests use the download wait allowance. */
+    maximumWaitMs?: number;
 }
 
 export class BaseAPI {
@@ -433,133 +437,42 @@ export class BaseAPI {
         return this;
     }
 
-    /**
-     * Check if an HTTP error is transient (worth retrying).
-     * Retries on: 5xx server errors, network errors (fetch failures), and 429 rate limiting.
-     */
-    private isTransientError(statusCode: number | undefined, errorMessage?: string): boolean {
-        if (statusCode === undefined) {
-            // Network-level error (DNS, connection refused, reset, timeout)
-            return true;
-        }
-        // Server errors and rate limiting
-        if (statusCode >= 500 || statusCode === 429) {
-            return true;
-        }
-        // Common transient network error messages
-        if (errorMessage && (
-            errorMessage.includes('ECONNRESET') ||
-            errorMessage.includes('ETIMEDOUT') ||
-            errorMessage.includes('ECONNREFUSED') ||
-            errorMessage.includes('ENOTFOUND') ||
-            errorMessage.includes('socket hang up')
-        )) {
-            return true;
-        }
-        return false;
-    }
-
     protected async request(type:'GET'|'POST'|'PUT'|'DELETE', route:string, body?:FormData|object, callback?: (res?:string)=>object|undefined, extraHeaders?:object, options?: RequestOptions): Promise<ResponseSchema> {
         if (this.identity===undefined) { return Promise.reject(); }
-
-        const MAX_HTTP_RETRIES = options?.retries ?? 2;
-        const dispatcher = options?.dispatcher;
-        let lastError: {statusCode?: number, message?: string} = {};
-
-        for (let attempt = 0; attempt <= MAX_HTTP_RETRIES; attempt++) {
-            try {
-                let res = undefined;
-                switch(type) {
-                    case 'GET':
-                        res = await fetch(this.url+route, {
-                            method: 'GET', redirect: 'manual',
-                            headers: {
-                                'Connection': 'keep-alive',
-                                'Cookie': this.identity!.cookies,
-                                ...extraHeaders
-                            },
-                            dispatcher,
-                        });
-                        break;
-                    case 'POST':
-                        const content_type = body instanceof FormData ? undefined : {'Content-Type': 'application/json'};
-                        const raw_body = body instanceof FormData ? body : JSON.stringify({
-                            _csrf: this.identity!.csrfToken,
-                            ...body
-                        });
-                        res = await fetch(this.url+route, {
-                            method: 'POST', redirect: 'manual',
-                            headers: {
-                                'Connection': 'keep-alive',
-                                'Cookie': this.identity!.cookies,
-                                ...content_type,
-                                ...extraHeaders
-                            },
-                            body: raw_body,
-                            dispatcher,
-                        });
-                        break;
-                    case 'PUT':
-                        break;
-                    case 'DELETE':
-                        res = await fetch(this.url+route, {
-                            method: 'DELETE', redirect: 'manual',
-                            headers: {
-                                'Connection': 'keep-alive',
-                                'Cookie': this.identity!.cookies,
-                                'X-Csrf-Token': this.identity!.csrfToken,
-                                ...extraHeaders
-                            },
-                            dispatcher,
-                        });
-                        break;
-                };
-
-                if (res && (res.status===200 || res.status===204)) {
-                    const _res = res.status===200 ? await res.text() : undefined;
-                    const response = callback && callback(_res);
-                    return {
-                        type: 'success',
-                        ...response
-                    } as ResponseSchema;
-                } else if (res && this.isTransientError(res.status) && attempt < MAX_HTTP_RETRIES) {
-                    // Transient error: retry with backoff
-                    const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000);
-                    console.log(`HTTP ${res.status} on ${route}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
-                    lastError = {statusCode: res.status, message: await res.text().catch(() => '')};
-                    await new Promise(r => setTimeout(r, delayMs));
-                    continue;
-                } else {
-                    const resOrFallback = res || { status:'undefined', text: async () => '' };
-                    let errorBody = '';
-                    try { errorBody = await resOrFallback.text(); } catch { errorBody = ''; }
-                    return {
-                        type: 'error',
-                        status: res?.status,
-                        message: `${resOrFallback.status}: ${errorBody}`
-                    };
+        if (type==='PUT') { return {type: 'error', message: 'PUT requests are not implemented.'}; }
+        const identity = this.identity;
+        const retries = options?.retries ?? (type==='POST' ? 0 : HTTP_RETRIES);
+        const url = this.url + route;
+        const multipart = body instanceof FormData;
+        const rawBody = type==='POST' ? (multipart ? body as FormData : JSON.stringify({_csrf: identity.csrfToken, ...body})) : undefined;
+        try {
+            const text = await apiRequests.run(url, async observe => {
+                const res = await fetch(url, {
+                    method: type, redirect: 'manual', dispatcher: options?.dispatcher,
+                    headers: {
+                        'Connection': 'keep-alive', 'Cookie': identity.cookies,
+                        ...(type==='POST' && !multipart ? {'Content-Type': 'application/json'} : {}),
+                        ...(type==='DELETE' ? {'X-Csrf-Token': identity.csrfToken} : {}),
+                        ...extraHeaders,
+                    },
+                    body: rawBody,
+                });
+                if (res.status===200 || res.status===204) {
+                    return res.status===200 ? await res.text() : undefined;
                 }
-            } catch (err: any) {
-                // with the cause, which says what failed: "fetch failed: Headers Timeout Error"
-                const errMsg = errorMessage(err);
-                if (this.isTransientError(undefined, errMsg) && attempt < MAX_HTTP_RETRIES) {
-                    const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000);
-                    console.log(`HTTP fetch error on ${route}: ${errMsg}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
-                    await new Promise(r => setTimeout(r, delayMs));
-                    continue;
-                }
-                return {
-                    type: 'error',
-                    message: errMsg
-                };
-            }
+                const failure = new HttpResponseError(res.status, `HTTP ${res.status}`, retryAfterMs(res.headers.get('retry-after')));
+                observe(failure);
+                failure.message = `${res.status}: ${await res.text().catch(() => '')}`;
+                throw failure;
+            }, {
+                retries, maximumWaitMs: options?.maximumWaitMs ?? BaseAPI.downloadIdleTimeoutMs,
+                retrying: (error, attempt) => console.log(`HTTP ${type} ${new URL(url).pathname} failed (${errorMessage(error)}), retrying (${attempt}/${retries})`),
+            });
+            // Parsing a completed answer must not resend a mutation if its callback fails.
+            return {type: 'success', ...callback?.(text)} as ResponseSchema;
+        } catch (error) {
+            return {type: 'error', status: error instanceof HttpResponseError ? error.status : undefined, message: errorMessage(error)};
         }
-
-        // All retries exhausted
-        return {
-            type: 'error',
-            message: lastError.message || `Request failed after ${MAX_HTTP_RETRIES + 1} attempts`
-        };
     }
 
     private static latestCompileAgent?: Agent;
@@ -570,8 +483,9 @@ export class BaseAPI {
      * (ProjectBuilds), so one that hangs would hold up every later one.
      */
     protected static get latestCompileRequestOptions(): RequestOptions {
-        BaseAPI.latestCompileAgent ??= new Agent({headersTimeout: 5_000, bodyTimeout: 5_000});
-        return { dispatcher: BaseAPI.latestCompileAgent, retries: 0 };
+        const timeoutMs = 5_000;
+        BaseAPI.latestCompileAgent ??= new Agent({headersTimeout: timeoutMs, bodyTimeout: timeoutMs});
+        return {dispatcher: BaseAPI.latestCompileAgent, retries: 0, maximumWaitMs: timeoutMs};
     }
 
     /**
@@ -587,7 +501,7 @@ export class BaseAPI {
                 agent: new Agent({headersTimeout: timeoutMs, bodyTimeout: timeoutMs}),
             };
         }
-        return {dispatcher: BaseAPI.compileAgent.agent, retries: 0};
+        return {dispatcher: BaseAPI.compileAgent.agent, retries: 0, maximumWaitMs: timeoutMs};
     }
 
     /**
@@ -617,11 +531,8 @@ export class BaseAPI {
      * retried as in `request`; any other status than 200 throws.
      */
     private async fetchContent(url: string, headers: Record<string, string>): Promise<Buffer> {
-        const MAX_HTTP_RETRIES = 2;
-        for (let attempt = 0; ; attempt++) {
-            let status: number | undefined;
-            let message: string;
-            try {
+        try {
+            return await apiRequests.run(url, async observe => {
                 const res = await fetch(url, {
                     method: 'GET', redirect: 'manual',
                     headers: {'Connection': 'keep-alive', ...headers},
@@ -630,18 +541,16 @@ export class BaseAPI {
                 if (res.status===200) {
                     return Buffer.from(await res.arrayBuffer());
                 }
-                status = res.status;
-                message = `HTTP ${res.status}`;
+                const failure = new HttpResponseError(res.status, `HTTP ${res.status}`, retryAfterMs(res.headers.get('retry-after')));
+                observe(failure);
                 await res.body?.cancel().catch(() => {});
-            } catch (err: any) {
-                message = errorMessage(err);
-            }
-            if (attempt>=MAX_HTTP_RETRIES || !this.isTransientError(status, message)) {
-                throw new Error(`Download failed (${message}): ${url}`);
-            }
-            const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000);
-            console.log(`Download of ${url} failed (${message}), retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
-            await new Promise(r => setTimeout(r, delayMs));
+                throw failure;
+            }, {
+                retries: HTTP_RETRIES, maximumWaitMs: BaseAPI.downloadIdleTimeoutMs,
+                retrying: (error, attempt) => console.log(`Download ${new URL(url).pathname} failed (${errorMessage(error)}), retrying (${attempt}/${HTTP_RETRIES})`),
+            });
+        } catch (error) {
+            throw new Error(`Download failed (${errorMessage(error)}): ${url}`);
         }
     }
 
@@ -667,7 +576,7 @@ export class BaseAPI {
         return this.request('POST', 'api/project', {}, (res) => {
             const projects = (JSON.parse(res!) as any).projects;
             return {projects};
-        });
+        }, undefined, {retries: HTTP_RETRIES});
     }
 
     async projectEntitiesJson(identity:Identity, projectId:string): Promise<ResponseSchema> {
@@ -791,11 +700,13 @@ export class BaseAPI {
         formData.append('qqfile', new Blob([fileContent]), filename);
 
         this.setIdentity(identity);
+        // Overleaf upserts this name in this folder. Replaying the same bytes replaces that
+        // path again; unlike creating a project or comment, it cannot add another named item.
         return this.request('POST', `project/${projectId}/upload?folder_id=${parentFolderId}`, formData, (res) => {
-            const {success, entity_id, entity_type} = JSON.parse(res!) as any;
-            const entity = {_type:entity_type, _id:entity_id, name:filename} as FileEntity;
+            const {entity_id, entity_type, hash} = JSON.parse(res!) as any;
+            const entity = {_type:entity_type, _id:entity_id, name:filename, ...(typeof hash==='string' ? {hash} : {})} as FileEntity;
             return {entity};
-        }, {'X-Csrf-Token': identity.csrfToken});
+        }, {'X-Csrf-Token': identity.csrfToken}, {retries: HTTP_RETRIES});
     }
 
     async uploadProject(identity:Identity, filename:string, fileContent:Uint8Array) {
@@ -921,7 +832,7 @@ export class BaseAPI {
         return this.request('POST', 'spelling/check', body, (res) => {
             const misspellings = JSON.parse(res!).misspellings as MisspellingItemSchema[];
             return {misspellings};
-        });
+        }, undefined, {retries: HTTP_RETRIES});
     }
 
     async spellingControllerLearn(identity:Identity, userId:string, word: string) {
