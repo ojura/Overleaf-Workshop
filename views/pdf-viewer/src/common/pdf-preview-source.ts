@@ -12,7 +12,7 @@ export interface PdfPreviewAsset {
     mime: 'image/jpeg' | 'image/png' | 'image/webp';
 }
 /** Image placements in the intrinsic-rotation CropBox, normalized to the page rectangle. */
-export interface PdfPreviewImageRegion { id: string; x: number; y: number; width: number; height: number }
+export interface PdfPreviewImageRegion { id: string; resourceId?: string; x: number; y: number; width: number; height: number }
 export interface PdfPreviewPage {
     pageNumber: number;
     width: number;
@@ -20,6 +20,7 @@ export interface PdfPreviewPage {
     rotation: number;
     assets: readonly PdfPreviewAsset[];
     imageRegions?: readonly PdfPreviewImageRegion[];
+    imageRegionsComplete?: boolean;
 }
 export interface PdfPreviewManifest {
     version: 1;
@@ -80,7 +81,7 @@ function imageRegions(value: unknown, remaining: number): readonly PdfPreviewIma
             || entry.x < 0 || entry.y < 0 || entry.x >= 1 || entry.y >= 1 || entry.width <= 0 || entry.height <= 0
             || entry.x + entry.width > 1.000001 || entry.y + entry.height > 1.000001) { continue; }
         ids.add(entry.id);
-        regions.push(Object.freeze({ id: entry.id, x: entry.x, y: entry.y,
+        regions.push(Object.freeze({ id: entry.id, ...(typeof entry.resourceId === 'string' && /^x[1-9][0-9]*$/.test(entry.resourceId) ? { resourceId: entry.resourceId } : {}), x: entry.x, y: entry.y,
             width: Math.min(entry.width, 1 - entry.x), height: Math.min(entry.height, 1 - entry.y) }));
     }
     return Object.freeze(regions);
@@ -123,7 +124,9 @@ export function validatePdfPreviewManifest(value: unknown, expected: PdfPreviewI
         const placements = imageRegions(page.imageRegions, PDF_PREVIEW_LIMITS.maxRegions - regions);
         regions += placements.length;
         pages.push(Object.freeze({ pageNumber: page.pageNumber, width: page.width, height: page.height,
-            rotation: page.rotation, assets: Object.freeze(levels), imageRegions: placements }));
+            rotation: page.rotation, assets: Object.freeze(levels), imageRegions: placements,
+            imageRegionsComplete: page.imageRegionsComplete === true && Array.isArray(page.imageRegions)
+                && placements.length === page.imageRegions.length && placements.every(region => !!region.resourceId) }));
     }
     return Object.freeze({ version: 1, document: Object.freeze({ ...actual, pageCount }), pages: Object.freeze(pages) });
 }
@@ -132,11 +135,12 @@ export function validatePdfPreviewManifest(value: unknown, expected: PdfPreviewI
 export function rotatePdfPreviewImageRegions(regions: readonly PdfPreviewImageRegion[] = [], rotation = 0): readonly PdfPreviewImageRegion[] {
     const angle = rotationOf(rotation);
     if (![0, 90, 180, 270].includes(angle)) { return []; }
-    return regions.map(({ id, x, y, width, height }) => {
-        if (angle === 90) { return { id, x: 1 - y - height, y: x, width: height, height: width }; }
-        if (angle === 180) { return { id, x: 1 - x - width, y: 1 - y - height, width, height }; }
-        if (angle === 270) { return { id, x: y, y: 1 - x - width, width: height, height: width }; }
-        return { id, x, y, width, height };
+    return regions.map(({ id, resourceId, x, y, width, height }) => {
+        const identity = { id, ...(resourceId ? { resourceId } : {}) };
+        if (angle === 90) { return { ...identity, x: 1 - y - height, y: x, width: height, height: width }; }
+        if (angle === 180) { return { ...identity, x: 1 - x - width, y: 1 - y - height, width, height }; }
+        if (angle === 270) { return { ...identity, x: y, y: 1 - x - width, width: height, height: width }; }
+        return { ...identity, x, y, width, height };
     });
 }
 

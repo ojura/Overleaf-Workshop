@@ -599,6 +599,42 @@ class Watcher:
                  and set(PRODUCER.TIERS).issubset({max(asset["width"], asset["height"]) for asset in page["assets"]})}
         return payload, value, ready
 
+    def atlas_metadata_ready(self, directory, sha):
+        # Legacy geometry and complete raster tiers remain valid while the new
+        # occurrence evidence is prepared. False is a processed conservative result.
+        _, value, ready = self.manifest(directory, sha)
+        return len(ready) == value["document"]["pageCount"] and all(
+            type(page.get("imageRegionsComplete")) is bool for page in value["pages"])
+
+    def prepare_metadata_work(self, sha):
+        self.reserve(incoming_derived=self.settings.max_output_mib * MIB)
+        work = self.work_directory(sha)
+        if (work / "manifest.json").exists():
+            self.manifest(work, sha, verify_assets=True)
+            return work
+        # Seed through the same validating publisher used for live publication.
+        # Only its destination changes; the public edition remains untouched.
+        public = self.settings.preview_root / sha
+        self.manifest(public, sha, verify_assets=True)
+        user = pwd.getpwnam(self.settings.renderer_user)
+        with writer_lock(work / PRODUCER_LOCK, user):
+            args = PUBLISHER.parser().parse_args([str(public), "--web-root", str(self.settings.work_root),
+                "--sha256", sha, "--max-assets-mib", str(self.settings.max_output_mib)])
+            with open(os.devnull, "w") as output, contextlib.redirect_stdout(output):
+                PUBLISHER.publish(args, cancellation=self)
+            # The publisher writes protected files as the supervisor. The ordinary
+            # producer owns this resumable staging tree and must create new assets.
+            if os.geteuid() == 0:
+                entries = 0
+                for _, folders, files, descriptor in os.fwalk(work, follow_symlinks=False):
+                    entries += len(folders) + len(files)
+                    if entries > PRODUCER.MAX_DIRECTORY_ENTRIES:
+                        raise Failure("The metadata staging scan exceeds its entry bound")
+                    os.fchown(descriptor, user.pw_uid, user.pw_gid)
+                    for name in files:
+                        os.chown(name, user.pw_uid, user.pw_gid, dir_fd=descriptor, follow_symlinks=False)
+        return work
+
     def reading_manifest(self, directory, sha, *, verify_assets=False, expected_revision=None):
         deadline = PUBLISHER.Deadline(self.settings.render_deadline_seconds if verify_assets else 10, self)
         with PUBLISHER.directory(directory) as folder:
@@ -890,6 +926,12 @@ class Watcher:
                     self.publish_reading(sha, source, work)
                 else:
                     self.launch(sha, "reading")
+            elif not self.atlas_metadata_ready(self.settings.preview_root / sha, sha):
+                work = self.prepare_metadata_work(sha)
+                if self.atlas_metadata_ready(work, sha):
+                    self.publish(sha, source, work, full=True)
+                else:
+                    self.launch(sha, "metadata")
             return
         if self.adopt(sha, source):
             return
@@ -953,7 +995,9 @@ class Watcher:
                 if phase == "reading":
                     self.publish_reading(sha, source, self.settings.work_root / sha)
                 else:
-                    self.publish(sha, source, self.settings.work_root / sha, full=phase == "full")
+                    if phase == "metadata" and not self.atlas_metadata_ready(self.settings.work_root / sha, sha):
+                        raise Failure("The metadata producer did not finish occurrence inventory processing")
+                    self.publish(sha, source, self.settings.work_root / sha, full=phase in {"full", "metadata"})
                 if phase == "priority":
                     self.launch(sha, "full")
             else:

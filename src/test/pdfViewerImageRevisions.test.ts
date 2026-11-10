@@ -6,6 +6,7 @@ import * as path from 'path';
 import { pathToFileURL } from 'url';
 import { createHash } from 'crypto';
 import { deflateSync } from 'zlib';
+import * as ts from 'typescript';
 
 const importModule = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
 const repo = path.resolve(__dirname, '..', '..');
@@ -64,24 +65,36 @@ describe('native external-image PDF passes', function () {
         text += `trailer\n<< /Root 1 0 R /Size ${objects.length} >>\nstartxref\n${start}\n%%EOF\n`;
         return new Uint8Array(Buffer.from(text, 'latin1'));
     }
-    function pdf(external: boolean, mask = false) {
-        const commands = 'q 10 8 74 48 re W n 80 12 -8 50 12 8 cm /Photo Do Q\n0 0 1 rg 25 15 14 18 re f\nBT /F1 10 Tf 4 70 Td (Native text first) Tj ET';
+    function pdf(external: boolean, mask = false, graphicsState = false) {
+        const commands = (graphicsState ? '/GS gs\n' : '') + 'q 10 8 74 48 re W n 80 12 -8 50 12 8 cm /Photo Do Q\n0 0 1 rg 25 15 14 18 re f\nBT /F1 10 Tf 4 70 Td (Native text first) Tj ET';
         const objects = ['', '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-            '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 110 85] /Resources << /XObject << /Photo 5 0 R >> /Font << /F1 6 0 R >> >> /Contents 4 0 R >>',
+            `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 110 85] /Resources << /XObject << /Photo 5 0 R >> /Font << /F1 6 0 R >> ${graphicsState ? '/ExtGState << /GS << /ca 0.5 >> >>' : ''} >> /Contents 4 0 R >>`,
             stream('', commands),
             stream(`/Type /XObject /Subtype /Image /Width 96 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode ${mask ? '/SMask 7 0 R' : ''} ${external ? '/MotionLabImage (x5)' : ''}`, external ? '' : original),
             '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'];
         if (mask) { objects.push(stream(`/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode ${external ? '/MotionLabImage (x7)' : ''}`, external ? '' : deflateSync(new Uint8Array([0, 90, 180, 255])))); }
         return pdfBytes(objects);
     }
-    function type3Pdf(external: boolean) {
-        const page = (content: number) => `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 110 85] /Resources << /Font << /F1 5 0 R >> >> /Contents ${content} 0 R >>`;
+    function type3Pdf(external: boolean, graphicsState = false) {
+        const page = (content: number) => `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 110 85] /Resources << /Font << /F1 5 0 R >> ${graphicsState ? '/ExtGState << /GS << /Font [5 0 R 80] >> >>' : ''} >> /Contents ${content} 0 R >>`;
         return pdfBytes(['', '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>',
             page(6), page(7),
             '<< /Type /Font /Subtype /Type3 /FontBBox [0 0 96 64] /FontMatrix [0.01 0 0 0.01 0 0] /CharProcs << /A 8 0 R >> /Encoding << /Type /Encoding /Differences [65 /A] >> /FirstChar 65 /LastChar 65 /Widths [100] /Resources << /XObject << /Photo 9 0 R >> >> >>',
-            stream('', 'BT /F1 80 Tf 10 15 Td (A) Tj ET'), stream('', 'BT /F1 80 Tf 10 15 Td (A) Tj ET'),
+            stream('', `BT ${graphicsState ? '/GS gs' : '/F1 80 Tf'} 10 15 Td (A) Tj ET`), stream('', `BT ${graphicsState ? '/GS gs' : '/F1 80 Tf'} 10 15 Td (A) Tj ET`),
             stream('', '100 0 d0 q 96 0 0 64 0 0 cm /Photo Do Q'),
             stream(`/Type /XObject /Subtype /Image /Width 96 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode ${external ? '/MotionLabImage (x5)' : ''}`, external ? '' : original)]);
+    }
+    function twoPhotoPdf() {
+        const image = (id: string) => stream(`/Type /XObject /Subtype /Image /Width 96 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /MotionLabImage (${id})`, '');
+        return pdfBytes(['', '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+            '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 220 100] /Resources << /XObject << /A 5 0 R /B 6 0 R >> /Font << /F1 7 0 R >> >> /Contents 4 0 R >>',
+            stream('', 'BT /F1 10 Tf 4 90 Td (Native text first) Tj ET\nq 96 0 0 64 4 4 cm /A Do Q\nq 96 0 0 64 116 4 cm /B Do Q'),
+            image('x5'), image('x6'), '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>']);
+    }
+    function inlinePhotoPdf() {
+        return pdfBytes(['', '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+            '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 110 85] /Resources << >> /Contents 4 0 R >>',
+            stream('', 'q 80 0 0 60 4 4 cm BI /W 1 /H 1 /CS /RGB /BPC 8 ID \xff\x00\x00 EI Q')]);
     }
 
     function metadata(mask = false) {
@@ -135,6 +148,7 @@ describe('native external-image PDF passes', function () {
             await pass.task.promise;
             assert.strictEqual(pass.task.imageStatus.total, 1);
             assert.strictEqual(pass.task.imageStatus.covered, 0);
+            assert.strictEqual(pass.task.imageStatus.untrackedImageOperations, false, 'ordinary text and registered placeholders prove no photo exposure');
             assert.strictEqual(pass.task.imageStatus.final, false);
             assert.ok(pass.task.imageIntent && Object.isFrozen(pass.task.imageIntent), 'a completed native pass carries its owned intent identity');
             const text = await value.page.getTextContent();
@@ -164,6 +178,151 @@ describe('native external-image PDF passes', function () {
             const clean = await value.document.getRangeCacheStats();
             assert.strictEqual(clean.externalImageReservedBytes, 0);
         } finally { first.resolve(); rest.resolve(); await value.task.destroy(); await originalDocument.task.destroy(); }
+    });
+
+    it('preserves text-only proof for ordinary nonfont graphics state', async () => {
+        const release = deferred();
+        const value = await open(async ({ id, chunkIndex, chunkCount }) => {
+            await release.promise; return encoded(id, chunkIndex, chunkCount);
+        }, false, metadata(), pdf(true, false, true));
+        try {
+            const pass = render(value.page); await pass.task.promise;
+            assert.strictEqual(pass.task.imageStatus.untrackedImageOperations, false);
+        } finally { release.resolve(); await value.task.destroy(); }
+    });
+
+    it('recognizes Type3 image glyph exposure when ExtGState installs the font', async () => {
+        const value = await open(async ({ id, chunkIndex, chunkCount }) => encoded(id, chunkIndex, chunkCount), false, metadata(), type3Pdf(true, true));
+        try {
+            const pass = render(value.page); await pass.task.promise;
+            const state = [...value.page._intentStates.values()].find((entry: any) => entry.externalImageToken === pass.task.imageIntent);
+            assert.ok(state.operatorList.fnArray.includes(pdfjs.OPS.setGState));
+            assert.strictEqual(state.operatorList.fnArray.includes(pdfjs.OPS.setFont), false);
+            assert.strictEqual(pass.task.imageStatus.untrackedImageOperations, true, 'graphics-state font selection cannot bypass Type3 image proof');
+        } finally { await value.task.destroy(); }
+    });
+
+    it('recognizes the actual repeated external image inventory before photo bytes arrive', async () => {
+        const release = deferred();
+        const data = pdfBytes(['', '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+            '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 110 85] /Resources << /XObject << /A 5 0 R >> >> /Contents 4 0 R >>',
+            stream('', [0, 36, 72].map(x => `q 32 0 0 24 ${x} 4 cm /A Do Q`).join('\n')),
+            stream('/Type /XObject /Subtype /Image /Width 96 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /MotionLabImage (x5)', '')]);
+        const value = await open(async ({ id, chunkIndex, chunkCount }) => {
+            await release.promise; return encoded(id, chunkIndex, chunkCount);
+        }, false, metadata(), data);
+        try {
+            const pass = render(value.page); await pass.task.promise;
+            const operators = [...value.page._intentStates.values()].find((state: any) => state.externalImageToken === pass.task.imageIntent)?.operatorList;
+            const paints = operators.fnArray.filter((fn: number) => fn === pdfjs.OPS.paintImageXObject || fn === pdfjs.OPS.paintImageXObjectRepeat);
+            assert.ok(paints.length > 0, 'the completed display inventory includes the actual external image paints');
+            assert.ok(pass.task.imageStatus.resources.every((resource: any) => resource.imageId === 'x5'));
+            assert.strictEqual(pass.task.imageStatus.untrackedImageOperations, false);
+            assert.strictEqual(pass.task.imageStatus.covered, 0);
+        } finally { release.resolve(); await value.task.destroy(); }
+    });
+
+    it('does not mistake ordinary native images, masks or Type3 glyph images for text-only external passes', async () => {
+        for (const [data, mask] of [[pdf(false), false], [inlinePhotoPdf(), false], [pdf(false, true), true], [type3Pdf(true), false]] as const) {
+            const value = await open(async ({ id, chunkIndex, chunkCount }) => encoded(id, chunkIndex, chunkCount), mask, metadata(mask), data);
+            try {
+                const pass = render(value.page); await pass.task.promise;
+                assert.strictEqual(pass.task.imageStatus.untrackedImageOperations, true);
+            } finally { await value.task.destroy(); }
+        }
+    });
+
+    for (const engine of ['pdfjs', 'overleaf']) {
+        it(`${engine} retains both displayed photographs when the real replacement pass fails after its first image`, async () => {
+            const { pdfjsRelease } = await importModule(path.join(repo, 'scripts/viewer-protocol.mjs'));
+            const { imageRevisionViewer } = await importModule(path.join(repo, 'scripts/pdfjs-image-revisions.mjs'));
+            const file = engine === 'pdfjs' ? path.join(pdfjsRelease, 'web/viewer.mjs') : path.join(repo, 'node_modules/pdfjs-dist/web/pdf_viewer.mjs');
+            const source = ts.createSourceFile(file, imageRevisionViewer(fs.readFileSync(file, 'utf8'), file), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+            const base = source.statements.find(statement => ts.isClassDeclaration(statement) && statement.name?.text === 'BasePDFPageView');
+            assert.ok(base);
+            let displayed: any;
+            const createCanvas = () => {
+                const image = canvas.createCanvas(220, 100);
+                image.remove = () => { if (displayed === image) { displayed = undefined; } };
+                image.replaceWith = (next: any) => { assert.strictEqual(displayed, image); displayed = next; };
+                image.setAttribute = () => {};
+                return image;
+            };
+            const Constructor = new Function('RenderingStates', 'RenderingCancelledException', 'document', base.getText(source) + '\nreturn BasePDFPageView;')(
+                { INITIAL: 0, RUNNING: 1, PAUSED: 2, FINISHED: 3 }, pdfjs.RenderingCancelledException, { createElement: createCanvas });
+            const view = new Constructor({ id: 1, eventBus: { dispatch() {} } });
+            view.div = { classList: { add() {}, remove() {} } };
+            const first = deferred(), second = deferred();
+            const value = await open(async ({ id, chunkIndex, chunkCount }) => {
+                await (id === 'x5' ? first.promise : second.promise);
+                return encoded(id, chunkIndex, chunkCount);
+            }, false, [metadata()[0], { ...metadata()[0], id: 'x6' }], twoPhotoPdf());
+            try {
+                await render(value.page).task.promise;
+                first.resolve(); second.resolve();
+                await value.page.waitForImages({ final: true });
+                view.pdfPage = value.page;
+                const paint = async (fail = false) => {
+                    const { ctx } = view._createCanvas((next: any) => { displayed = next; });
+                    let draws = 0;
+                    if (fail) {
+                        const draw = ctx.drawImage.bind(ctx);
+                        ctx.drawImage = (...args: any[]) => {
+                            if (++draws === 2) { throw new Error('second native image paint failed'); }
+                            return draw(...args);
+                        };
+                    }
+                    await view._drawCanvas({ viewport: value.page.getViewport({ scale: 1 }), canvasContext: ctx },
+                        () => assert.fail('unexpected cancellation'), () => {});
+                };
+                await paint();
+                const prior = displayed, status = view.paintedImageStatus;
+                const photos = (image: any) => [image.getContext('2d').getImageData(12, 40, 64, 32).data,
+                    image.getContext('2d').getImageData(124, 40, 64, 32).data];
+                const pixels = photos(prior);
+                assert.strictEqual(status.covered, 2);
+                assert.strictEqual(status.final, true);
+                await assert.rejects(paint(true), /second native image paint failed/);
+                const shown = photos(displayed);
+                assert.deepStrictEqual({ sameCanvas: displayed === prior, sameViewCanvas: view.canvas === prior,
+                    firstPhotoSame: Buffer.from(shown[0]).equals(Buffer.from(pixels[0])),
+                    secondPhotoSame: Buffer.from(shown[1]).equals(Buffer.from(pixels[1])), sameStatus: view.paintedImageStatus === status },
+                { sameCanvas: true, sameViewCanvas: true, firstPhotoSame: true, secondPhotoSame: true, sameStatus: true },
+                'a failed candidate must retain the exact displayed raster, both photographs and their matching status');
+            } finally { first.resolve(); second.resolve(); await value.task.destroy(); }
+        });
+    }
+
+    it('settles a rejected first scan without blocking an unrelated photograph from completing', async () => {
+        const rejectFirst = deferred(), releaseOther = deferred(), failed = deferred(), settled = deferred();
+        const reads: string[] = [];
+        const value = await open(async ({ id, chunkIndex, chunkCount }) => {
+            reads.push(id);
+            if (id === 'x5') { await rejectFirst.promise; throw new Error('first photo scan rejected'); }
+            await releaseOther.promise;
+            return encoded(id, chunkIndex, chunkCount);
+        }, false, [metadata()[0], { ...metadata()[0], id: 'x6' }], twoPhotoPdf());
+        const unsubscribe = value.page.onImageRevision(({ status }: any) => {
+            if (status.failed === 1) { failed.resolve(); }
+            if (status.discovered && status.total === 2 && status.pending === 0) { settled.resolve(); }
+        });
+        try {
+            await render(value.page).task.promise;
+            rejectFirst.resolve();
+            await failed.promise;
+            assert.strictEqual(value.page.imageStatus.failed, 1);
+            assert.strictEqual(value.page.imageStatus.pending, 1, 'failure of one image keeps the other real resource pending');
+            releaseOther.resolve();
+            await settled.promise;
+            assert.ok(reads.includes('x6'));
+            assert.strictEqual(reads.filter(id => id === 'x5').length, 1, 'terminal failure does not retry the rejected resource implicitly');
+            const pass = render(value.page); await pass.task.promise;
+            assert.deepStrictEqual({ pending: pass.task.imageStatus.pending, failed: pass.task.imageStatus.failed,
+                covered: pass.task.imageStatus.covered, completed: pass.task.imageStatus.completed, final: pass.task.imageStatus.final },
+            { pending: 0, failed: 1, covered: 1, completed: 1, final: false });
+            assert.ok(pass.image.getContext('2d').getImageData(124, 40, 64, 32).data.some((byte: number) => byte < 200),
+                'the unrelated completed photograph paints real pixels');
+        } finally { rejectFirst.resolve(); releaseOther.resolve(); unsubscribe(); await value.task.destroy(); }
     });
 
     it('reuses prepared coverage when a clipped candidate pass keeps the adopting viewport and output transform', async () => {

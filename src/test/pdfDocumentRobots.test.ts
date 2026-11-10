@@ -26,8 +26,11 @@ class Element extends Events {
     private text = '';
     textWrites = 0;
     layoutReads = 0;
-    get textContent() { return this.text; }
-    set textContent(value: string) { this.text = value; this.textWrites++; }
+    get textContent(): string { return this.text + this.children.map(child => child.textContent).join(''); }
+    set textContent(value: string) {
+        for (const child of [...this.children]) { child.remove(); }
+        this.text = value; this.textWrites++;
+    }
     rect = { left: 0, top: 0, width: 800, height: 700 };
     objectFit = 'fill';
     scrollLeft = 0;
@@ -44,7 +47,8 @@ class Element extends Events {
             const width = parseFloat(this.style.width) || parseFloat(this.style.maxWidth) || 0;
             const height = this.style.height === 'auto'
                 ? (this.className === 'pdfDocumentRobotCaption' ? this.ownerDocument.captionHeight : this.ownerDocument.workStatusHeight)
-                    ?? 16 + this.textContent.split('\n').length * parseFloat(this.style.lineHeight)
+                    ?? 16 + (this.style.display === 'grid' ? Math.max(...this.children.map(child => child.textContent.split('\n').length))
+                        : this.textContent.split('\n').length) * parseFloat(this.style.lineHeight)
                 : parseFloat(this.style.height) || 0;
             return { left: 0, top: 0, x: 0, y: 0, width, height, right: width, bottom: height };
         }
@@ -129,7 +133,7 @@ class Fixture {
     readonly timers = new Map<number, { at: number; callback: () => void }>();
     readonly owned: Canvas[] = [];
     onCanvasCreated?: (canvas: Canvas) => void;
-    readonly observers: Array<{ disconnected: boolean }> = [];
+    readonly observers: Array<{ disconnected: boolean; targets: Set<Element>; emit(target: Element, width: number, height: number, safari?: boolean): void }> = [];
     readonly document = new Events() as Events & Record<string, any>;
     readonly window = new Events() as Events & Record<string, any>;
     readonly media = new Events() as Events & { matches: boolean };
@@ -155,8 +159,13 @@ class Fixture {
         for (const name of ['IntersectionObserver', 'ResizeObserver']) {
             this.window[name] = class {
                 disconnected = false;
-                constructor(_callback: unknown) { fixture.observers.push(this); }
-                observe() {}
+                targets = new Set<Element>();
+                constructor(readonly callback: (entries: any[]) => void) { fixture.observers.push(this); }
+                observe(target: Element) { this.targets.add(target); }
+                emit(target: Element, width: number, height: number, safari = false) {
+                    const size = { inlineSize: width, blockSize: height };
+                    this.callback([{ target, borderBoxSize: safari ? size : [size], contentRect: { width: width - 14, height: height - 8 } }]);
+                }
                 disconnect() { this.disconnected = true; }
             };
         }
@@ -264,6 +273,138 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         fixtures.push(result);
         return result;
     }
+
+    function publication(f: Fixture, page = f.page()) {
+        const candidate: any = { document: {}, page: {}, pageNumber: page.pageNumber, appearance: 'plain', attempt: {}, successful: true,
+            canvas: page.canvas, revision: 1, coverage: { kind: 'complete-page' },
+            projection: { width: page.canvas.width, height: page.canvas.height,
+                pageToRaster: [page.canvas.width, 0, 0, page.canvas.height, 0, 0] } };
+        const encounter: any = { pageElement: page.pageElement, moving: false, axis: 'y', imageRegionsComplete: true,
+            imageRegions: [{ id: 'photo', x: .1, y: .1, width: .4, height: .3, resourceId: 'x5' }],
+            pageProjection: { content: { x: 0, y: 0, width: 400, height: 600 }, clip: { x: 0, y: 0, width: 400, height: 600 } } };
+        return { page, candidate, encounter };
+    }
+
+    it('protects prefetched publication without cargo, retains queued covers across canonical reset, and adopts that cover on entry', () => {
+        const f = fixture(); const p = publication(f);
+        p.page.pageElement.rect.top = 2000;
+        const before = f.owned.length;
+        const transaction = f.api.preparePublication(p.candidate, p.encounter);
+        const cover = sceneNodes(p.page.pageElement).find(node => node.className === 'pdfDocumentRobotArrival')!;
+        assert.ok(cover, 'protection precedes publication');
+        assert.strictEqual(f.owned.length, before, 'queued protection allocates no canvas');
+        transaction.commit();
+        assert.strictEqual(f.api.snapshot().activeActors, 0);
+        cover.remove(); f.api.restoreArrivals(p.page.pageNumber, p.page.pageElement);
+        assert.strictEqual(cover.parentNode, p.page.pageElement, 'canonical reset restores the same queued owner');
+        p.page.pageElement.rect.top = 60; f.api.setVisiblePages([p.page.pageNumber]);
+        f.api.reconcileEncounter(p.candidate.page, p.encounter, p.candidate);
+        assert.ok(f.api.snapshot().activeActors > 0);
+        assert.strictEqual(sceneNodes(p.page.pageElement).find(node => node.className === 'pdfDocumentRobotArrival'), cover);
+        const payload = f.api.snapshot().pages[0].payloads[0];
+        const identity = [payload.id, payload.deadline, payload.helpers, payload.target];
+        p.page.pageElement.rect.width *= 1.1; p.encounter.pageProjection.content.width *= 1.1;
+        p.candidate.revision++;
+        f.api.preparePublication(p.candidate, p.encounter).commit();
+        const refined = f.api.snapshot().pages[0].payloads[0];
+        assert.deepStrictEqual([refined.id, refined.deadline, refined.helpers, refined.target], identity);
+        f.finish();
+        assert.strictEqual(f.api.snapshot().deliveryPlans[0].crops[0].state, 'delivered');
+        assert.strictEqual(cover.parentNode, null);
+    });
+
+    it('rolls back publication covers and treats an unexpectedly lost queued cover as terminal exposure', () => {
+        const f = fixture(); const p = publication(f); p.page.pageElement.rect.top = 2000;
+        f.api.preparePublication(p.candidate, p.encounter).abort();
+        assert.ok(!sceneNodes(p.page.pageElement).some(node => node.className === 'pdfDocumentRobotArrival'));
+        f.api.preparePublication(p.candidate, p.encounter).commit();
+        const cover = sceneNodes(p.page.pageElement).find(node => node.className === 'pdfDocumentRobotArrival')!;
+        cover.remove(); p.page.pageElement.rect.top = 60;
+        f.api.reconcileEncounter(p.candidate.page, p.encounter, p.candidate);
+        assert.strictEqual(f.api.snapshot().deliveryPlans[0].crops[0].state, 'cancelled');
+        f.api.preparePublication(p.candidate, p.encounter).commit();
+        assert.ok(!sceneNodes(p.page.pageElement).some(node => node.className === 'pdfDocumentRobotArrival'));
+        assert.strictEqual(f.api.snapshot().activeActors, 0);
+    });
+
+    it('never adds a late cover after incomplete unknown-image publication and reveals capacity failures immediately', () => {
+        const f = fixture(); const p = publication(f);
+        p.encounter.imageRegions = undefined; p.encounter.imageRegionsComplete = false;
+        p.candidate.coverage = { kind: 'native', intent: {}, discovered: false, resources: [] };
+        f.api.preparePublication(p.candidate, p.encounter).commit();
+        p.encounter.imageRegions = [{ id: 'photo', x: .1, y: .1, width: .4, height: .3, resourceId: 'x5' }];
+        p.encounter.imageRegionsComplete = true; p.candidate.coverage = { kind: 'complete-page' };
+        f.api.preparePublication(p.candidate, p.encounter).commit();
+        assert.ok(!sceneNodes(p.page.pageElement).some(node => node.className === 'pdfDocumentRobotArrival'));
+        const g = fixture({ maxActors: 0 }); const q = publication(g);
+        g.api.preparePublication(q.candidate, q.encounter).commit();
+        assert.strictEqual(g.api.snapshot().deliveryPlans[0].crops[0].state, 'skipped');
+        assert.ok(!sceneNodes(q.page.pageElement).some(node => node.className === 'pdfDocumentRobotArrival'));
+    });
+
+    it('restores coarse-raster protection geometry when a sharper publication aborts', () => {
+        const f = fixture(); const p = publication(f); p.page.pageElement.rect.top = 2000;
+        p.page.canvas.width = 192; p.page.canvas.height = 288;
+        p.candidate.projection = { width: 192, height: 288, pageToRaster: [192, 0, 0, 288, 0, 0] };
+        f.api.preparePublication(p.candidate, p.encounter).commit();
+        const cover = sceneNodes(p.page.pageElement).find(node => node.className === 'pdfDocumentRobotArrival')!;
+        const before = [cover.style.left, cover.style.top, cover.style.width, cover.style.height];
+        const sharper = f.page(88).canvas;
+        const candidate = { ...p.candidate, canvas: sharper, projection: { width: sharper.width, height: sharper.height,
+            pageToRaster: [sharper.width, 0, 0, sharper.height, 0, 0] } };
+        f.api.preparePublication(candidate, p.encounter).abort();
+        assert.deepStrictEqual([cover.style.left, cover.style.top, cover.style.width, cover.style.height], before,
+            'aborted publication preserves the preceding raster guard fringe');
+    });
+
+    it('keeps an active payload when compatible publication replaces its DOM page element', () => {
+        const f = fixture(); const p = publication(f); f.api.setVisiblePages([p.page.pageNumber]);
+        f.api.preparePublication(p.candidate, p.encounter).commit();
+        const payload = f.api.snapshot().pages[0].payloads[0];
+        const replacement = f.page(89); const encounter = { ...p.encounter, pageElement: replacement.pageElement };
+        const transaction = f.api.preparePublication(p.candidate, encounter);
+        p.page.pageElement.remove(); transaction.commit(); f.frame();
+        const after = f.api.snapshot().pages[0]?.payloads[0];
+        assert.ok(after, 'the current episode follows the committed DOM owner');
+        assert.strictEqual(after.id, payload.id); assert.strictEqual(after.deadline, payload.deadline);
+        assert.ok(f.api.snapshot().activeActors > 0);
+        assert.strictEqual(f.api.snapshot().deliveryPlans[0].crops[0].state, 'active');
+    });
+
+    it('releases advance-only appearance ownership without resetting unrelated document history', () => {
+        const f = fixture(); f.desktop(); const page = f.page();
+        f.api.setVisibleWork([work([page])]); f.finish();
+        assert.ok(f.api.snapshot().advance.length > 0);
+        const generation = f.api.snapshot().operationDecisionRecords;
+        f.api.removePage({}, 'appearance', false, page.pageElement);
+        assert.strictEqual(f.api.snapshot().advance.length, 0);
+        assert.strictEqual(f.api.snapshot().activeActors, 0);
+        assert.strictEqual(f.api.snapshot().operationDecisionRecords, generation);
+        f.api.removePage({}, 'appearance', false, page.pageElement);
+        assert.strictEqual(f.api.snapshot().advance.length, 0);
+    });
+
+    it('retains committed bounded selection when unselected photos were exposed before detached eviction', () => {
+        const f = fixture(); const p = publication(f); p.page.pageElement.rect.top = 2000;
+        p.encounter.imageRegions = Array.from({ length: 20 }, (_, index) => ({ id: 'photo' + index,
+            resourceId: 'x' + (index + 1), x: index % 2 ? .55 : .05, y: Math.floor(index / 2) * .095 + .01,
+            width: .35, height: .06 }));
+        f.api.preparePublication(p.candidate, p.encounter).commit();
+        const original = f.api.snapshot().deliveryPlans[0];
+        assert.ok(original.crops.length > 0 && original.crops.length < 20, 'representative selection remains bounded');
+        const selected = original.crops.map((crop: any) => crop.geometry.imageId);
+        p.page.pageElement.remove(); f.api.removePage(p.candidate.page, 'eviction', true);
+        f.container.append(p.page.pageElement); p.page.pageElement.rect.top = -420;
+        f.api.setVisiblePages([p.page.pageNumber]);
+        f.api.preparePublication(p.candidate, p.encounter).commit();
+        const after = f.api.snapshot().deliveryPlans[0];
+        assert.strictEqual(after.id, original.id, 'connected publication keeps its committed selection history');
+        assert.deepStrictEqual(after.crops.map((crop: any) => crop.geometry.imageId), selected);
+        assert.ok(after.crops.every((crop: any) => crop.state === 'cancelled'));
+        assert.ok(!sceneNodes(p.page.pageElement).some(node => node.className === 'pdfDocumentRobotArrival'),
+            'a lower clip cannot add covers to previously unselected exposed photographs');
+        assert.strictEqual(f.api.snapshot().activeActors, 0);
+    });
 
     function cooperative(mode?: string, helpers = 2, useLab = false, options: Record<string, unknown> = {}, coarse = false) {
         const f = fixture({ maxActors: helpers, ...options });
@@ -3029,12 +3170,52 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.api.snapshot().frames, frames);
         assert.strictEqual(f.callbacks.size, 0);
         f.api.setVisibleWork([work(pages, ['preparing', 'preparing'])]);
-        assert.strictEqual(f.callbacks.size, 1, 'a real work transition can trigger one short coordination gesture');
+        assert.strictEqual(f.callbacks.size, 1, 'a work-state label change can request one repaint');
+        assert.strictEqual(f.api.snapshot().advance[0].phase, 'parked', 'waiting to preparing does not restart coordination');
         f.finish();
         const coordinated = f.api.snapshot().frames;
         for (let i = 0; i < 20; i++) { f.api.setVisibleWork([work(pages, ['preparing', 'preparing'])]); }
         assert.strictEqual(f.api.snapshot().frames, coordinated);
         assert.strictEqual(f.callbacks.size, 0);
+    });
+
+    it('reconciles a continuing physical spread atomically across disjoint visible halves', () => {
+        for (const reduced of [false, true]) {
+            const f = fixture(); f.desktop(); f.media.matches = reduced;
+            const pages = [f.page(99), f.page(100)];
+            const layoutPages = pages.map(page => ({ pageNumber: page.pageNumber, label: String(page.pageNumber - 11) }));
+            const group = (index: number) => ({ ...work([pages[index]]), key: '99,100', layoutPages });
+            f.api.setVisibleWork([group(1)]); f.finish();
+            const label = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotWorkStatus')!;
+            const layer = label.parentNode;
+            const actors = f.api.snapshot().advance[0].actors.map((actor: any) => actor.id);
+            const allocated = f.owned.length;
+            for (const index of [0, 1, 0]) {
+                f.api.setVisibleWork([group(index)]);
+                assert.ok(label.isConnected, 'a retained group owns its existing status even with no old visible page in common');
+                assert.strictEqual(label.parentNode, layer);
+                assert.deepStrictEqual(f.api.snapshot().advance[0].actors.map((actor: any) => actor.id), actors,
+                    'visibility changes do not release and recreate the continuing crew');
+                assert.strictEqual(f.owned.length, allocated);
+                assert.deepStrictEqual(f.api.snapshot().advance[0].pages, [pages[index].pageNumber]);
+                f.finish();
+            }
+            if (!reduced) {
+                const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle'
+                    && canvas.dataset.courier === String(actors[0]))!;
+                const before = point(sprite);
+                pages[1].pageElement.rect.left -= 1500;
+                f.api.setVisibleWork([group(0)]); f.finish();
+                const after = point(sprite);
+                assert.ok(Math.abs(after.x - before.x) < 1,
+                    'the handed-over crew no longer follows its obsolete offscreen page anchor');
+                assert.ok(Number.isFinite(after.y));
+                assert.ok(label.isConnected);
+            }
+            f.api.setVisibleWork([]);
+            assert.strictEqual(label.isConnected, false, 'an omitted group still releases its real ownership');
+            assert.strictEqual(f.api.snapshot().advance.length, 0);
+        }
     });
 
     it('promotes staged lab actors into real pixels while the other duplex half is still preparing', () => {
@@ -3141,6 +3322,118 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.api.hasHandled(99), false);
     });
 
+    it('reserves all automatic work text before status, crew and pending membership change', () => {
+        const f = fixture(); f.desktop(); f.media.matches = true;
+        const pages = [f.page(99), f.page(100)];
+        const group = work(pages, ['waiting', 'waiting']);
+        f.api.setVisibleWork([group]);
+        const status = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotWorkStatus')!;
+        assert.ok(status.children.length > 1, 'real alternative spans reserve the complete episode before the first paint');
+        const live = status.children.find(node => node.attributes.get('aria-hidden') !== 'true')!;
+        const reserved = status.children.filter(node => node !== live);
+        assert.ok(reserved.some(node => node.textContent.includes('Delivery crew assembling')));
+        assert.ok(reserved.some(node => node.textContent.includes('Coordinating the handoff')));
+        assert.ok(reserved.some(node => node.textContent.includes('Crew in position')));
+        for (const node of reserved) {
+            assert.strictEqual(node.attributes.get('aria-hidden'), 'true');
+            assert.strictEqual(node.style.visibility, 'hidden');
+            assert.strictEqual(node.style.userSelect, 'none');
+            assert.strictEqual(node.style.pointerEvents, 'none');
+        }
+        const measured = status.layoutReads, height = status.style.height;
+        f.api.setVisibleWork([work(pages, ['preparing', 'waiting'])]);
+        assert.ok(live.textContent.startsWith('Preparing pages'));
+        f.api.setVisibleWork([work(pages, ['ready', 'preparing'])]);
+        assert.ok(live.textContent.startsWith('Preparing page 89'));
+        assert.strictEqual(status.layoutReads, measured, 'state and pending membership do not remeasure the envelope');
+        assert.strictEqual(status.style.height, height);
+        f.api.setVisibleWork([work(pages, ['ready', 'ready'])]);
+        assert.strictEqual(status.isConnected, false, 'completion removes an actorless loading episode');
+    });
+
+    it('reserves a clipped spread member before it becomes visible and recalculates for available width', () => {
+        const f = fixture(); f.desktop(); f.media.matches = true;
+        const pages = [f.page(99), f.page(100)];
+        const layoutPages = [{ pageNumber: 99, label: '88' }, { pageNumber: 100, label: 'a long printed page label' }];
+        const first = { ...work([pages[0]]), key: '99,100', layoutPages };
+        f.api.setVisibleWork([first]);
+        const status = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotWorkStatus')!;
+        const reservations = status.children.filter(node => node.attributes.get('aria-hidden') === 'true');
+        assert.ok(reservations.some(node => node.textContent.includes('a long printed page label')));
+        const reads = status.layoutReads, height = status.style.height;
+        const both = { ...work(pages), key: first.key, layoutPages };
+        both.pages[1].label = layoutPages[1].label;
+        f.api.setVisibleWork([both]);
+        assert.strictEqual(status.layoutReads, reads, 'newly visible membership uses the already reserved full domain');
+        assert.strictEqual(status.style.height, height);
+        f.window.innerWidth = 180; f.container.rect.width = 180;
+        f.api.setVisibleWork([both]);
+        assert.ok(status.layoutReads > reads, 'a genuine viewport width change recalculates wrapping');
+        assert.ok(parseFloat(status.style.maxWidth) <= 164);
+        f.api.setVisiblePages([]);
+        assert.strictEqual(status.isConnected, false);
+        assert.strictEqual(status.children.length, 0, 'episode disposal releases every reservation and the live span');
+    });
+
+    it('updates a changed complete text domain atomically even when the visible signature is unchanged', () => {
+        for (const reduced of [false, true]) {
+            const f = fixture(); f.desktop(); f.media.matches = reduced;
+            const page = f.page(99);
+            const layoutPages = [{ pageNumber: 99, label: '88' }, { pageNumber: 100, label: '89' }];
+            const group = { ...work([page]), key: '99,100', layoutPages };
+            f.api.setVisibleWork([group]); f.finish();
+            const status = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotWorkStatus')!;
+            const live = status.children.find(node => node.attributes.get('aria-hidden') !== 'true')!;
+            const text = live.textContent, reads = status.layoutReads;
+            const changedDomain = { ...group, layoutPages: [layoutPages[0], { ...layoutPages[1], label: 'clipped member changed' }] };
+            f.api.setVisibleWork([changedDomain]);
+            assert.strictEqual(live.textContent, text, 'a domain-only update cannot blank the valid live message');
+            f.finish();
+            assert.ok(status.layoutReads > reads, 'a changed clipped-member reservation independently wakes placement');
+            const changedVisible = { ...changedDomain, pages: group.pages.map(value => ({ ...value, label: 'visible member changed' })),
+                layoutPages: [{ ...layoutPages[0], label: 'visible member changed' }, changedDomain.layoutPages[1]] };
+            f.api.setVisibleWork([changedVisible]);
+            assert.ok(live.textContent.includes('visible member changed'), 'current content updates synchronously before any capped paint');
+            assert.ok(live.textContent.length > 0);
+            f.finish();
+        }
+    });
+
+    it('observes natural reserved text geometry without waking unchanged or retired work', () => {
+        for (const reduced of [false, true]) {
+            const f = fixture(); f.desktop(); f.media.matches = reduced;
+            const page = f.page(99), group = work([page]);
+            f.api.setVisibleWork([group]); f.finish();
+            const status = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotWorkStatus')!;
+            const observer = f.observers.find(value => value.targets.has(status));
+            assert.ok(observer, 'the live loading episode owns a border-box observer');
+            assert.strictEqual(status.style.height, 'auto', 'the reserved grid keeps natural wrapping height');
+            const reads = status.layoutReads, frames = f.api.snapshot().frames;
+            const initial = status.getBoundingClientRect();
+            observer.emit(status, initial.width, initial.height);
+            assert.strictEqual(f.api.snapshot().frames, frames, 'initial unchanged observer delivery does not schedule a paint');
+            f.document.workStatusHeight = 128;
+            observer.emit(status, initial.width, 128, reduced);
+            f.finish();
+            assert.strictEqual(status.style.height, 'auto');
+            assert.strictEqual(status.layoutReads, reads + 1, 'the observer supplies border-box dimensions without another synchronous label read');
+            assert.strictEqual(status.style.opacity, '1');
+            const changedFrames = f.api.snapshot().frames;
+            for (let repeat = 0; repeat < 10; repeat++) { observer.emit(status, initial.width, 128); }
+            assert.strictEqual(f.api.snapshot().frames, changedFrames);
+            assert.strictEqual(f.callbacks.size, 0, 'an unchanged reserved box adds no idle animation');
+            f.api.setVisibleWork([]);
+            assert.strictEqual(observer.disconnected, true);
+            observer.emit(status, initial.width, 200);
+            assert.strictEqual(f.callbacks.size, 0, 'a queued old callback cannot wake a removed group');
+            f.api.setVisibleWork([group]); f.finish();
+            const replacementFrames = f.api.snapshot().frames;
+            observer.emit(status, initial.width, 240);
+            assert.strictEqual(f.api.snapshot().frames, replacementFrames, 'an old callback cannot paint a replacement with the same key');
+            assert.strictEqual(f.callbacks.size, 0);
+        }
+    });
+
     it('admits one stable measured work status on a static paint and suppresses a clipped label', () => {
         const f = fixture(); f.desktop(); f.media.matches = true;
         const pages = [f.page(99), f.page(100), f.page(101)];
@@ -3151,7 +3444,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(statuses().length, 3);
         assert.strictEqual(shown().length, 1);
         const selected = shown()[0];
-        assert.ok(selected.textContent.startsWith('Preparing page 89'), 'active preparation takes priority over ambient waiting statuses');
+        assert.ok(selected.children.find(node => node.attributes.get('aria-hidden') !== 'true')!.textContent.startsWith('Preparing page 89'), 'active preparation takes priority over ambient waiting statuses');
         assert.strictEqual(selected.layoutReads, 1);
         f.api.setVisibleWork([...groups].reverse());
         assert.strictEqual(shown()[0], selected, 'input order does not cycle the admitted status');
@@ -5004,7 +5297,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             assert.deepStrictEqual([...returned].sort(), [...reserved].sort());
             assert.strictEqual(held.size, 0);
             const statusText = () => sceneNodes(f.container).filter(node => node.className === 'pdfDocumentRobotWorkStatus'
-                && node.style.opacity === '1').map(node => node.textContent);
+                && node.style.opacity === '1').map(node => node.children.find(child => child.attributes.get('aria-hidden') !== 'true')!.textContent);
             if (activity === 'waiting') {
                 assert.ok(statusText().some(text => text.includes('Preparing page 88')), 'static preparation status survives cancellation');
                 assert.strictEqual(f.api.hasHandled(99), false);

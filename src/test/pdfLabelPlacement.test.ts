@@ -35,6 +35,20 @@ describe('measured robot caption placement', function () {
 
     after(() => { if (directory) { fs.rmSync(directory, { recursive: true, force: true }); } });
 
+    it('admits a full-width label at an off-center anchor while retaining collision suppression', () => {
+        const solver = new api.LabelPlacementSolver();
+        const viewport = { x: 8, y: 8, width: 148, height: 300 };
+        const full = label('work', { anchor: { x: 120, y: 100 }, width: 148, height: 64, leaderAnchors: [] });
+        let placed = frame(solver, 0, [full], [], viewport)[0];
+        placed = frame(solver, 100, [full], [], viewport)[0];
+        assert.strictEqual(placed.blocked, false);
+        close(placed.x, viewport.x);
+        assert.ok(placed.opacity > 0);
+        const covered = frame(new api.LabelPlacementSolver(), 0,
+            [full, { ...full, id: 'second' }], [], { ...viewport, height: 64 });
+        assert.strictEqual(covered.filter(value => !value.blocked).length, 1);
+    });
+
     it('remembers a nearby attachment base when candidates change order', () => {
         const solver = new api.LabelPlacementSolver();
         const original = label('a', { candidates: [candidate(100, 50), candidate(100, 150)] });

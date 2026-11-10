@@ -10,6 +10,7 @@ body {
     background: var(--spomenar-ink);
 }
 #spomenarHeader {
+    position:relative;
     display: flex; align-items: center; justify-content: space-between; gap: 12px;
     flex: 0 0 auto; min-height: 64px; box-sizing: border-box;
     padding: 6px max(16px, env(safe-area-inset-right)) 6px max(16px, env(safe-area-inset-left));
@@ -37,17 +38,20 @@ body {
 #outerContainer { flex: 1 1 auto; min-height: 0; height: auto; width: 100%; position: relative; }
 #mainContainer { min-width: 0; }
 #viewerContainer { scroll-padding-bottom: env(safe-area-inset-bottom); }
+/* Notices are anchored to the actual header and never resize the reader. */
 #spomenarNotice {
-    flex: 0 0 auto; display: flex; align-items: center; justify-content: center; gap: 12px;
-    padding: 9px 16px; color: var(--spomenar-ink); background: #f0f1f3; font-size: 13px; line-height: 1.5;
+    position:absolute; top:var(--notice-top, 100%); right:12px; z-index:1000;
+    max-height:var(--notice-available-height, 100dvh); overflow:auto; overscroll-behavior:contain;
+    display:flex; align-items:center; gap:12px;
+    width:max-content; max-width:calc(100% - 24px); box-sizing:border-box;
+    padding:9px 16px; border-radius:8px; box-shadow:0 3px 18px #10131840;
+    color:var(--spomenar-ink); background:#f0f1f3; font-size:13px; line-height:1.5;
 }
-#spomenarNotice[hidden] { display: none; }
-#spomenarNotice[data-error] { color: #642519; background: #fff1e9; }
-#spomenarNotice[data-edition] {
-    position: fixed; top: max(76px, env(safe-area-inset-top)); right: 12px; z-index: 1000;
-    max-width: calc(100vw - 24px); box-sizing: border-box; border-radius: 8px;
-    box-shadow: 0 3px 18px #10131840; pointer-events: none;
-}
+#spomenarNoticeText { min-width:0; max-height:30dvh; overflow:auto; overflow-wrap:anywhere; overscroll-behavior:contain; }
+#spomenarNotice:focus-visible, #spomenarNoticeText:focus-visible { outline:2px solid var(--spomenar-accent); outline-offset:2px; }
+#spomenarNotice[hidden] { display:none; }
+#spomenarNotice[data-error] { color:#642519; background:#fff1e9; }
+#spomenarNotice[data-edition] { pointer-events:none; }
 #spomenarRetry, #spomenarCopy {
     min-height: 44px; border: 0; border-radius: 7px; padding: 8px 14px; font: inherit;
     background: var(--spomenar-ink); color: white; cursor: pointer; flex-shrink: 0;
@@ -93,7 +97,7 @@ body {
     #spomenarActions { gap: 4px; }
     .spomenarAction { padding: 8px; }
     .spomenarAction > span { display: none; }
-    #spomenarNotice { flex-wrap: wrap; gap: 6px; padding: 6px 12px; font-size: 12px; }
+    #spomenarNotice { gap: 6px; padding: 6px 12px; font-size: 12px; }
 }
 @media (max-width: 360px) {
     #spomenarTitle { font-size: 13px; }

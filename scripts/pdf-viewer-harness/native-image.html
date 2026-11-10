@@ -1,0 +1,5 @@
+<!doctype html><meta charset="utf-8"><title>Native image lifecycle regression</title>
+<link rel="stylesheet" href="/ext/native-image.css">
+<style>html,body{margin:0;height:100%;background:#ddd}#viewerContainer{position:absolute;inset:16px;overflow:auto}#viewer{position:relative}</style>
+<div id="viewerContainer"><div id="viewer" class="pdfViewer"></div></div>
+<script type="module">import * as pdfjs from '/ext/site/assets/pdfjs/build/pdf.mjs';globalThis.pdfjsLib=pdfjs;pdfjs.GlobalWorkerOptions.workerSrc='/ext/site/assets/pdfjs/build/pdf.worker.mjs';await import('/ext/native-image.js');</script>

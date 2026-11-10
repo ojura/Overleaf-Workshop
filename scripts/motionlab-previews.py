@@ -265,24 +265,61 @@ def page_geometry(page, page_number: int, include_regions: bool):
     result = {"pageNumber": page_number, "width": bounds.width, "height": bounds.height, "rotation": page.rotation}
     if include_regions:
         regions = []
-        source_regions = page.get_image_info(hashes=False, xrefs=False)
+        complete = True
+        source_regions = page.get_image_info(hashes=True, xrefs=False)
+        # PyMuPDF 1.23 maps occurrence digests to the last matching xref, including
+        # inline images. Only a unique resource digest on an inline-free content tree
+        # is usable evidence. Unsupported/ambiguous pages retain geometry only.
+        resource_digests = {}
+        inline_or_unsupported = False
+        try:
+            content = [page.parent.xref_stream(xref) for xref in page.get_contents()]
+            forms = [page.parent.xref_stream(entry[0]) for entry in page.get_xobjects()]
+            if any(not isinstance(stream, bytes) for stream in content + forms):
+                inline_or_unsupported = True
+            else:
+                # PDF content arrays are one token stream. PDF whitespace includes NUL;
+                # comments and every delimiter can terminate the BI operator. False
+                # positives are conservative: they only disable optional resource links.
+                token_boundary = rb"[\x00\x09\x0a\x0c\x0d\x20()<>\[\]{}/%]"
+                inline = re.compile(rb"(?:^|" + token_boundary + rb")BI(?=$|" + token_boundary + rb")")
+                inline_or_unsupported = any(inline.search(stream) for stream in [b"\n".join(content), *forms])
+            for entry in page.get_images(full=True):
+                xref = entry[0]
+                if type(xref) is int and xref > 0:
+                    digest = fitz.Pixmap(page.parent, xref).digest
+                    resource_digests.setdefault(digest, set()).add(xref)
+        except (AttributeError, RuntimeError, ValueError):
+            inline_or_unsupported = True
+        complete = not inline_or_unsupported
         for ordinal, info in enumerate(source_regions):
             coordinates = info.get("bbox", ())
             if len(coordinates) != 4 or not all(math.isfinite(value) for value in coordinates):
+                complete = False
                 continue
             box = (fitz.Rect(coordinates) * page.rotation_matrix) & bounds
             if box.is_empty or not all(math.isfinite(value) for value in box):
+                complete = False
                 continue
             left = max(0.0, min(1.0, (box.x0 - bounds.x0) / bounds.width))
             top = max(0.0, min(1.0, (box.y0 - bounds.y0) / bounds.height))
             right = max(0.0, min(1.0, (box.x1 - bounds.x0) / bounds.width))
             bottom = max(0.0, min(1.0, (box.y1 - bounds.y0) / bounds.height))
             if right > left and bottom > top:
-                regions.append({"id": f"p{page_number}-i{ordinal}", "x": left, "y": top,
-                                "width": right - left, "height": bottom - top})
+                region = {"id": f"p{page_number}-i{ordinal}", "x": left, "y": top,
+                          "width": right - left, "height": bottom - top}
+                candidates = resource_digests.get(info.get("digest"), set())
+                if not inline_or_unsupported and len(candidates) == 1:
+                    region["resourceId"] = f"x{next(iter(candidates))}"
+                else:
+                    complete = False
+                regions.append(region)
+            else:
+                complete = False
         regions.sort(key=lambda item: (-item["width"] * item["height"], item["id"]))
         result["imageRegions"] = regions[:MAX_REGIONS_PER_PAGE]
         result["regionsOmitted"] = max(0, len(regions) - MAX_REGIONS_PER_PAGE)
+        result["imageRegionsComplete"] = complete and len(regions) <= MAX_REGIONS_PER_PAGE
     return result
 
 
@@ -474,6 +511,10 @@ def existing_manifest(root: Path, identity, page_count: int, deadline: Deadline)
         regions = page.get("imageRegions", [])
         if not isinstance(regions, list) or len(regions) > MAX_REGIONS_PER_PAGE:
             raise Failure("Invalid existing image regions")
+        if "imageRegionsComplete" in page and type(page["imageRegionsComplete"]) is not bool:
+            raise Failure("Invalid existing occurrence completeness")
+        if page.get("imageRegionsComplete") and "imageRegions" not in page:
+            raise Failure("Complete occurrence inventory is missing")
         region_count += len(regions)
         region_ids = set()
         for region in regions:
@@ -486,6 +527,10 @@ def existing_manifest(root: Path, identity, page_count: int, deadline: Deadline)
                     or not 0 < region["width"] <= 1 - region["x"] + 0.000001
                     or not 0 < region["height"] <= 1 - region["y"] + 0.000001):
                 raise Failure("Invalid existing image region")
+            if "resourceId" in region and (not isinstance(region["resourceId"], str) or not re.fullmatch(r"x[1-9][0-9]*", region["resourceId"])):
+                raise Failure("Invalid existing image resource")
+            if page.get("imageRegionsComplete") and "resourceId" not in region:
+                raise Failure("Complete occurrence inventory has an unlinked image")
             region_ids.add(region["id"])
         for asset in page["assets"]:
             if not isinstance(asset, dict):
@@ -579,9 +624,10 @@ class Publisher:
         if len(candidate["assets"]) >= 6:
             raise LimitReached("manifest-limit")
         omitted = geometry.get("regionsOmitted", 0)
-        if "imageRegions" not in candidate and "imageRegions" in geometry:
-            candidate["imageRegions"] = geometry["imageRegions"][:max(0, MAX_REGIONS - self.regions)]
+        if "imageRegionsComplete" not in candidate and "imageRegions" in geometry:
+            candidate["imageRegions"] = geometry["imageRegions"][:max(0, MAX_REGIONS - self.regions + len(candidate.get("imageRegions", [])))]
             omitted += len(geometry["imageRegions"]) - len(candidate["imageRegions"])
+            candidate["imageRegionsComplete"] = geometry.get("imageRegionsComplete") is True and omitted == 0
         relative = f"assets/p{page_number:05d}-{tier}-{digest}.jpg"
         asset = {"path": relative, "width": width, "height": height, "bytes": size, "sha256": digest, "mime": "image/jpeg"}
         candidate["assets"].append(asset)
@@ -658,7 +704,7 @@ async def generate(args, source: Path, source_fd: int, expected, identity, page_
         ordinal = 0
         for phase, tier in ((phase, tier) for phase in phases for tier in tiers):
             queue = [page for page in phase if not publisher.has(page, tier)
-                     or has_fitz and "imageRegions" not in publisher.pages.get(page, {})]
+                     or has_fitz and "imageRegionsComplete" not in publisher.pages.get(page, {})]
             index = 0
             while index < len(queue) or active:
                 deadline.remaining()
@@ -673,7 +719,7 @@ async def generate(args, source: Path, source_fd: int, expected, identity, page_
                     folder.mkdir()
                     job = {"operation": "render", "source": str(source), "fingerprint": expected,
                            "page": number, "tier": tier, "renderer": renderer, "has_fitz": has_fitz,
-                           "regions": has_fitz and "imageRegions" not in publisher.pages.get(number, {}),
+                           "regions": has_fitz and "imageRegionsComplete" not in publisher.pages.get(number, {}),
                            "memory_mib": args.max_worker_mib, "file_limit": cap}
                     task = asyncio.create_task(invoke_worker(job, folder, deadline, args.job_timeout_seconds))
                     active[task] = (number, folder, cap * 3, ordinal)

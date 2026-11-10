@@ -245,7 +245,7 @@
    saveDocument() {
      return this._transport.saveDocument();
    }
-@@ -11865,6 +11946,232 @@
+@@ -11865,6 +11946,262 @@
      return this._transport.getCalculationOrderIds();
    }
  }
@@ -295,6 +295,35 @@
 +    const state = this.page._intentStates.get(data.cacheKey);
 +    return state && !state.externalImageCancelled && state.externalImageEpoch === data.epoch ? state : null;
 +  }
++  untrackedImageOperations(state) {
++    const list = state.operatorList;
++    if (!state.externalImageDiscovered || !list?.lastChunk || !Array.isArray(list.fnArray) || !Array.isArray(list.argsArray)) { return true; }
++    const imageOps = new Set(Object.entries(OPS).filter(([name]) => /(?:Image|Jpeg)/.test(name)).map(([, value]) => value));
++    const fontMayContainImages = fontId => {
++      if (typeof fontId !== "string") { return true; }
++      try { return this.page.commonObjs.get(fontId)?.isType3Font !== false; }
++      catch { return true; }
++    };
++    for (let index = 0; index < list.fnArray.length; index++) {
++      const fn = list.fnArray[index], args = list.argsArray[index];
++      if (fn === OPS.setFillColorN || fn === OPS.setStrokeColorN) { return true; }
++      if (fn === OPS.setFont && fontMayContainImages(args?.[0])) { return true; }
++      if (fn === OPS.setGState) {
++        if (!Array.isArray(args?.[0])) { return true; }
++        for (const entry of args[0]) {
++          if (!Array.isArray(entry)) { return true; }
++          if (entry[0] === "Font" && (!Array.isArray(entry[1]) || fontMayContainImages(entry[1][0]))) { return true; }
++          if (entry[0] === "SMask" && entry[1]) { return true; }
++        }
++      }
++      if (imageOps.has(fn)) {
++        if (fn !== OPS.paintImageXObject && fn !== OPS.paintImageXObjectRepeat || typeof args?.[0] !== "string") { return true; }
++        const record = this.records.get(args[0]);
++        if (!record || record.state !== state) { return true; }
++      }
++    }
++    return false;
++  }
 +  status(state = this.current) {
 +    if (!state) { return this.lastStatus || { revision: this.revision, total: 0, covered: 0, pending: 0, completed: 0, failed: 0, discovered: false, final: false }; }
 +    let total = 0, covered = 0, completed = 0, failed = 0;
@@ -305,7 +334,8 @@
 +      completed += +record.final;
 +      failed += +record.failed;
 +    }
-+    return { revision: this.revision, total, covered, completed, failed, pending: total - completed - failed,
++    const resources = [...this.records].filter(([, record]) => record.state === state).map(([objectId, record]) => Object.freeze({ objectId, imageId: record.imageId, covered: record.covered, final: record.final, failed: record.failed }));
++    return { untrackedImageOperations: this.untrackedImageOperations(state), intent: state.externalImageToken, resources: Object.freeze(resources), revision: this.revision, total, covered, completed, failed, pending: total - completed - failed,
 +      discovered: !!state.externalImageDiscovered,
 +      final: !!state.externalImageDiscovered && completed === total && failed === 0 };
 +  }

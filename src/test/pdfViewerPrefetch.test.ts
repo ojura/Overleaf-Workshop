@@ -99,7 +99,7 @@ class DocumentRobots {
     readonly offers: number[] = [];
     readonly admissions: Array<{ pageNumber: number; admission?: RobotAdmission }> = [];
     readonly visibleCalls: number[][] = [];
-    readonly workCalls: Array<Array<{ key: string; pages: Array<{ pageNumber: number; pageElement: Element; label?: string; state: string }> }>> = [];
+    readonly workCalls: Array<Array<{ key: string; pages: Array<{ pageNumber: number; pageElement: Element; label?: string; state: string }>; layoutPages?: readonly { pageNumber: number; label?: string }[] }>> = [];
     readonly enabledCalls: boolean[] = [];
     readonly active = new Set<number>();
     readonly handled = new Set<number>();
@@ -631,6 +631,44 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         };
     }
 
+    it('keeps logical native appearance through scale changes and retires detached raster authority', async () => {
+        const f = fixture({ startPage: 1, pages: 40, initialNative: false, autoPages: false, mobile: true });
+        const images = externalImages(f); await f.frame();
+        const view = images.view;
+        const publish = (scale: number, intent: object, full: boolean) => {
+            view.viewport = { ...view.viewport, width: 800 * scale, height: 1000 * scale, scale,
+                transform: [scale, 0, 0, -scale, 0, 1000 * scale] };
+            view.outputScale = { sx: 1, sy: 1 };
+            f.queue.renderView(view);
+            const image = new Canvas(); image.width = 800 * scale; image.height = 1000 * scale; view.canvas = image;
+            const status = { revision: full ? 2 : 3, discovered: true, final: full, covered: full ? 2 : 1, total: 2,
+                pending: full ? 0 : 1, completed: full ? 2 : 0, failed: 0, untrackedImageOperations: false,
+                resources: ['x5', 'x6'].map((imageId, index) => ({ objectId: imageId, imageId, covered: full || index === 0, final: full, failed: false })) };
+            images.page.imageStatus = status; images.page.imageRevision = status.revision;
+            const accepted = view.publishImageCandidate({ canvas: image, status, intent,
+                appearance: view.imageAppearance, geometry: 'scale-' + scale }, () => view.div.prepend(image));
+            return { accepted, appearance: view.imageAppearance, image };
+        };
+        const first = publish(1, {}, true);
+        assert.strictEqual(first.accepted, true);
+        const zoom = publish(1.25, {}, true);
+        assert.strictEqual(zoom.accepted, true);
+        assert.strictEqual(zoom.appearance, first.appearance, 'scale and raster transforms are independent of logical appearance');
+        view.destroy();
+        const returned = publish(1.25, {}, false);
+        assert.strictEqual(returned.accepted, true, 'a removed predecessor cannot reject useful partial return pixels');
+        assert.strictEqual(returned.image.parentNode, view.div);
+        publish(1.25, {}, true);
+        view.renderingState = 3; f.cached.add(view);
+        f.createCanvas = () => { const image = new Canvas(); image.getContext = () => null as any; return image; };
+        const destroyed = view.destroyCalls;
+        f.scrollBy(20_000); await f.frame();
+        assert.ok(view.destroyCalls > destroyed, 'mobile offscreen policy destroys the old native view when preview allocation fails');
+        assert.strictEqual(f.controller.snapshot().previewPages, 0);
+        f.scrollBy(-20_000); await f.frame();
+        assert.strictEqual(publish(1.25, {}, false).accepted, true, 'controller eviction cannot retain authority over detached predecessor pixels');
+    });
+
     it('starts structural text passes directly while photograph requests are pending', async () => {
         const f = fixture({ startPage: 1, pages: 2, initialNative: false });
         externalImages(f);
@@ -640,6 +678,38 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.strictEqual(f.queue.renderView(f.pages[0]), true);
         assert.strictEqual(f.pdf.renders.length, 0, 'no speculative raster pass starts the photographs ahead of text');
         transfers.forEach(id => fetches.end(id));
+    });
+
+    it('ends terminal external-image loading while allowing other pending resources to finish', async () => {
+        const robots = new DocumentRobots();
+        const f = fixture({ startPage: 1, pages: 2, initialNative: false, autoPages: false },
+            { robotsEnabled: true, createDocumentRobots: () => robots });
+        const images = externalImages(f);
+        images.paint(0, 0); await f.frame();
+        const publish = async (revision: number, pending: number, covered: number, completed: number) => {
+            images.page.imageRevision = revision;
+            images.page.imageStatus = { revision, pending, completed, failed: 1, covered, total: 2, final: false, discovered: true };
+            for (const listener of images.listeners) { listener(); }
+            await f.frame();
+            images.view.imagePassRevision = images.view.paintedImageRevision = revision;
+            images.view.imagePassStatus = images.view.paintedImageStatus = { ...images.page.imageStatus };
+            f.cachePage(1); await f.frame();
+        };
+        await publish(1, 1, 0, 0);
+        assert.strictEqual(images.page.cleanupCalls, 0, 'one failure cannot release resources needed by the independent pending image');
+        assert.ok(['waiting', 'preparing'].includes(robots.workCalls.at(-1)![0].pages[0].state),
+            'one failed resource cannot terminate the still-pending independent resource');
+        await publish(2, 0, 1, 1);
+        assert.strictEqual(images.view.paintedImageStatus.covered, 1);
+        assert.strictEqual(robots.workCalls.at(-1)![0].pages[0].state, 'failed',
+            'settled failed work cannot remain a phantom waiting or parked preparation episode');
+        const redraws = images.redraws;
+        await f.frame();
+        assert.strictEqual(images.redraws, redraws, 'settled terminal facts do not restart the failed attempt');
+        assert.deepStrictEqual(f.controller.snapshot().visibleMissing, []);
+        assert.strictEqual(f.controller.snapshot().starved, false);
+        assert.ok(f.controller.snapshot().failed.includes(1));
+        assert.strictEqual(f.controller.snapshot().idle, true);
     });
 
     it('coalesces native image revisions and keeps resources until final painted quality', async () => {
@@ -1504,6 +1574,8 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         const half = robots.workCalls[robots.workCalls.length - 1][0];
         assert.strictEqual(half.key, '99,100');
         assert.deepStrictEqual(half.pages.map(page => page.pageNumber), [100]);
+        assert.deepStrictEqual(half.layoutPages, [{ pageNumber: 99, label: '88' }, { pageNumber: 100, label: '89' }],
+            'clipping a spread half retains both labels in the layout domain');
     });
 
     it('uses retained sidecar pixels as real cargo and rotates its image placements with the viewer', async () => {

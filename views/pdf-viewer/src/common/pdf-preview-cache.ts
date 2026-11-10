@@ -1,4 +1,5 @@
 import { createPdfRasterProjection, resizePdfRasterProjection, type PdfRasterProjection } from './pdf-raster-projection';
+import { PdfPagePresentation, type PdfPagePresentationCandidate } from './pdf-page-presentation';
 
 /** A retained raster is independent of PDF.js's decoded page resources. */
 export interface PdfPreview {
@@ -6,6 +7,7 @@ export interface PdfPreview {
     bytes: number;
     projection: PdfRasterProjection;
     contentRevision: number;
+    candidate?: PdfPagePresentationCandidate;
 }
 
 interface Options {
@@ -13,6 +15,7 @@ interface Options {
     maxPages: number;
     trailMaxDimension: number;
     createCanvas: () => HTMLCanvasElement;
+    publishAttached?: (id: number, candidate: PdfPagePresentationCandidate | undefined, commit: () => void) => boolean;
 }
 
 const RGBA_BYTES = 4;
@@ -60,9 +63,15 @@ export class PdfPreviewCache implements Iterable<[number, PdfPreview]> {
      * The caller protects the union of visible and prepared page IDs. A rejected replacement
      * keeps the old entry and its DOM coverage; the new canvas is released in either case.
      */
-    retain(id: number, canvas: HTMLCanvasElement, protectedIds: ReadonlySet<number>, projection?: PdfRasterProjection, contentRevision = 0): boolean {
+    retain(id: number, canvas: HTMLCanvasElement, protectedIds: ReadonlySet<number>, projection?: PdfRasterProjection, contentRevision = 0,
+        candidate?: PdfPagePresentationCandidate): boolean {
         const previous = this.entries.get(id);
         if (previous?.canvas === canvas) { this.touch(id); return true; }
+        if (previous?.candidate) {
+            const presentation = new PdfPagePresentation();
+            presentation.present(previous.candidate, () => {});
+            if (!candidate || !presentation.accepts(candidate)) { this.release(canvas); return false; }
+        }
         const bytes = canvas.width * canvas.height * RGBA_BYTES;
         if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > this.options.maxBytes || this.options.maxPages < 1) {
             this.release(canvas);
@@ -102,12 +111,19 @@ export class PdfPreviewCache implements Iterable<[number, PdfPreview]> {
             this.remove(oldest[0]);
         }
         if (previous) {
-            this.replaceAttached(previous.canvas, canvas);
+            if (previous.canvas.parentNode && this.options.publishAttached) {
+                try {
+                    if (!this.options.publishAttached(id, candidate, () => this.replaceAttached(previous.canvas, canvas))) {
+                        this.release(canvas); return false;
+                    }
+                } catch (error) { this.release(canvas); throw error; }
+            }
+            if (!this.options.publishAttached) { this.replaceAttached(previous.canvas, canvas); }
             this.entries.delete(id);
             this.retainedBytes -= previous.bytes;
             this.release(previous.canvas);
         }
-        this.entries.set(id, { canvas, bytes, projection: projection ?? createPdfRasterProjection(canvas.width, canvas.height), contentRevision });
+        this.entries.set(id, { canvas, bytes, projection: projection ?? createPdfRasterProjection(canvas.width, canvas.height), contentRevision, candidate });
         this.retainedBytes += bytes;
         return true;
     }
@@ -139,7 +155,8 @@ export class PdfPreviewCache implements Iterable<[number, PdfPreview]> {
             return;
         }
         // set() preserves the old entry's LRU position; a downgrade is not a new visit.
-        this.entries.set(id, { canvas, bytes, projection, contentRevision: entry.contentRevision });
+        this.entries.set(id, { canvas, bytes, projection, contentRevision: entry.contentRevision,
+            candidate: entry.candidate && { ...entry.candidate, canvas, projection } });
         this.retainedBytes += bytes - entry.bytes;
         this.release(source);
     }

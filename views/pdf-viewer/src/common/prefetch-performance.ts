@@ -1,3 +1,4 @@
+import { installReservedText } from './reserved-text';
 import { installPrefetchRobots, type RobotDispatchPort, type RobotLab } from './prefetch-robots';
 import { installMotionLabPanel, MOTION_LAB_RESIZE_HANDLES, type MotionLabPanelLayout, type MotionLabPanelPreparation,
     type MotionLabResizeDirection } from './motion-lab-panel';
@@ -303,6 +304,8 @@ interface DiagnosticsOptions {
 
 const ROBOT_ICON = `<svg class="robot-icon" viewBox="0 0 28 28" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3v4M7 11H4v10h20V11h-3M9 7h10v14H9zM11 24h6"/><path d="M12 12v2m4-2v2m-4 4h4"/></g><circle cx="14" cy="3" r="1.5" fill="currentColor"/></svg>`;
 const MEASUREMENTS_ICON = `<svg class="robot-icon" viewBox="0 0 28 28" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5v18h19M8 18l5-8 5 5 6-9"/><circle cx="13" cy="10" r="1.5"/><circle cx="18" cy="15" r="1.5"/></g></svg>`;
+export const MOTION_STATUS = Object.freeze({ waiting: 'Waiting for visible pages', stopped: 'Motion stopped', ready: 'Buffered ahead', preparing: 'Preparing to catch up' });
+const COPY_STATUS = Object.freeze({ empty: '', copied: 'Measurements copied', unavailable: 'Clipboard unavailable in this viewer' });
 const MEASUREMENTS_PREFERENCE_KEY = 'pdf-motion-lab-measurements-open';
 
 /**
@@ -332,10 +335,13 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
     let previousFocus: Element | null = null;
     const history: TraceSample[] = [];
     const fields = new Map<string, HTMLElement>();
+    const reservedFields = new Map<string, ReturnType<typeof installReservedText>>();
 
     function field(name: string, text: string): void {
         const element = fields.get(name);
-        if (element && element.textContent !== text) { element.textContent = text; }
+        const reserved = reservedFields.get(name);
+        if (reserved) { reserved.setText(text); }
+        else if (element && element.textContent !== text) { element.textContent = text; }
     }
 
     function panelGeometryChanged(): void { robots?.invalidateGeometry(); }
@@ -472,12 +478,7 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
         const status = fields.get('status')!;
         const starved = !!state.starved || !!state.visibleMissing?.length;
         status.dataset.state = starved ? 'late' : margin === null ? 'idle' : margin >= 0 ? 'ready' : 'late';
-        const statusText = starved ? 'Waiting for visible pages' : margin === null ? 'Motion stopped' : margin >= 0 ? 'Buffered ahead' : 'Preparing to catch up';
-        if (status.textContent !== statusText) {
-            status.textContent = statusText;
-            // This line is above the canvas and can wrap without resizing the canvas itself.
-            panelGeometryChanged();
-        }
+        field('status', starved ? MOTION_STATUS.waiting : margin === null ? MOTION_STATUS.stopped : margin >= 0 ? MOTION_STATUS.ready : MOTION_STATUS.preparing);
 
         const speedMax = Math.max(1, ...history.map(point => Math.abs(point.velocity)));
         const timeMax = Math.max(0.1, ...history.flatMap(point => [point.delay, point.buffer ?? 0]));
@@ -530,9 +531,9 @@ export function installPrefetchDiagnostics(container: HTMLElement, sample: () =>
                     textarea.remove();
                 }
             }
-            field('copy-status', 'Measurements copied');
+            field('copy-status', COPY_STATUS.copied);
         } catch {
-            field('copy-status', 'Clipboard unavailable in this viewer');
+            field('copy-status', COPY_STATUS.unavailable);
         }
     }
 
@@ -581,6 +582,9 @@ button:hover { background:#30485f; } button:focus-visible { outline:2px solid #6
 .robot-canvas { display:block; width:100%; aspect-ratio:480 / 250; }
 .robot-caption { min-height:32px; padding:7px 10px 1px; color:#d0e2f0; font-size:11px; line-height:1.4; }
 .robot-activity { padding:3px 10px 8px; color:#849eb5; font-size:10px; line-height:1.3; font-variant-numeric:tabular-nums; }
+.robot-activity-rows { display:grid; gap:2px; }
+.robot-activity-row { display:flex; justify-content:space-between; gap:6px; }
+.robot-activity-value { flex:none; white-space:nowrap; text-align:right; }
 dl { display:grid; grid-template-columns:1fr 1fr; gap:9px 14px; margin:13px 0; }
 dt { color:#b2c0cf; font-size:10px; } dd { margin:1px 0 0; font:500 15px/1.3 system-ui,sans-serif; font-variant-numeric:tabular-nums; white-space:nowrap; }
 .margin { color:#66e5cf; } p { margin:5px 0; } .explanation,.storage,.foot { color:#b2c0cf; font-size:10px; }
@@ -595,8 +599,9 @@ summary { cursor:pointer; font-size:10px; color:#b2c0cf; }
 .measurements > summary::marker { color:#93cbbb; }
 .measurements > summary:hover { background:#66e5cf10; }
 .measurements > summary:focus-visible { outline:1px solid #93cbbb; outline-offset:1px; }
-.measurements-hint { margin-left:6px; font-size:10px; color:#9fb4c7; }
-.measurements[open] .measurements-expand, .measurements:not([open]) .measurements-collapse { display:none; }
+.measurements-hint { display:inline-grid; margin-left:6px; font-size:10px; color:#9fb4c7; }
+.measurements-hint > span { grid-area:1 / 1; }
+.measurements[open] .measurements-expand, .measurements:not([open]) .measurements-collapse { visibility:hidden; }
 pre { font:9px/1.5 ui-monospace,monospace; margin:6px 0 0; max-height:78px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
 footer { display:flex; align-items:center; gap:8px; margin-top:10px; }
 footer span { font-size:10px; color:#b2c0cf; }
@@ -627,7 +632,7 @@ ${ROBOT_ICON}
 <div class="panel-position" role="group" aria-label="Motion Lab position"><button type="button" data-panel-dock="left" aria-pressed="false">Dock left</button><button type="button" data-panel-dock="right" aria-pressed="false">Dock right</button><button type="button" data-panel-dock="float" aria-pressed="true">Float</button></div>
 <div class="panel-content">
 <div class="panel-content-flow">
-<div class="meta"><span class="status" data-field="status">Motion stopped</span></div>
+<div class="meta"><span class="status" data-field="status"></span></div>
 <div class="robot-stage" data-robot-stage></div>
 <details class="measurements"><summary>Motion and buffer measurements<span class="measurements-hint" aria-hidden="true"><span class="measurements-expand">Expand</span><span class="measurements-collapse">Collapse</span></span></summary>
 <dl>
@@ -663,6 +668,9 @@ ${resizeDirections.map(direction => `<button type="button" class="panel-resize" 
             fields.set(element.dataset.field!, element);
         }
         root.querySelector('.close')!.addEventListener('click', toggle);
+        fields.get('status')!.textContent = '';
+        reservedFields.set('status', installReservedText(fields.get('status')!, Object.values(MOTION_STATUS), MOTION_STATUS.stopped));
+        reservedFields.set('copy-status', installReservedText(fields.get('copy-status')!, Object.values(COPY_STATUS), COPY_STATUS.empty));
         root.querySelector('.copy')!.addEventListener('click', () => { void copySnapshot(); });
         (doc.body ?? doc.documentElement).append(host);
         robots = installPrefetchRobots(root.querySelector<HTMLElement>('[data-robot-stage]')!);
@@ -829,6 +837,8 @@ ${resizeDirections.map(direction => `<button type="button" class="panel-resize" 
             measurementsButton = undefined;
             shown = false;
             host = root = undefined;
+            for (const field of reservedFields.values()) { field.dispose(); }
+            reservedFields.clear();
             fields.clear();
             history.length = 0;
         },

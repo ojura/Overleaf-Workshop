@@ -1,3 +1,4 @@
+import { installReservedText } from './reserved-text';
 import type { RobotExpression } from './robot-encounters';
 import { robotScreenMetrics, robotCaptionMetrics, ROBOT_LAB_CAPTION_STYLE } from './robot-screen-scale';
 import { paintEkokomvoz } from './robot-ekokomvoz-artwork';
@@ -116,6 +117,17 @@ export const ROBOT_QUIET_DETAILS = [
     'The coffee has achieved steady state.',
     'The crew is waiting with you.',
 ] as const;
+
+const ROBOT_CAPTION_DEFAULTS = Object.freeze({
+    quiet: 'The crew is standing by. The rescue repertoire is resting.',
+    recovery: 'Buffer restored. Everybody act like that was planned.',
+    dispatch: 'LARICS dispatch; every parcel is a completed fetch or page.',
+});
+export const ROBOT_CAPTION_VARIANTS = Object.freeze([
+    ...ROBOT_SCENES.map(scene => scene.title), ...ROBOT_QUIET_DETAILS, ...Object.values(ROBOT_CAPTION_DEFAULTS),
+]);
+const ROBOT_ACTIVITY_WAITING = 'Waiting tableau; the outage repertoire has finished';
+
 
 export const ROBOT_LIMITS = Object.freeze({
     width: 480,
@@ -453,9 +465,9 @@ export class RobotChoreographer {
         return {
             at: this.now, mode: this.mode, scene: this.sceneId,
             caption: this.mode === 'quiet'
-                ? this.quietDetails.length ? ROBOT_QUIET_DETAILS[this.quietDetails.at(-1)!] : 'The crew is standing by. The rescue repertoire is resting.'
-                : this.mode === 'recovery' ? 'Buffer restored. Everybody act like that was planned.'
-                    : scene?.title ?? 'LARICS dispatch; every parcel is a completed fetch or page.',
+                ? this.quietDetails.length ? ROBOT_QUIET_DETAILS[this.quietDetails.at(-1)!] : ROBOT_CAPTION_DEFAULTS.quiet
+                : this.mode === 'recovery' ? ROBOT_CAPTION_DEFAULTS.recovery
+                    : scene?.title ?? ROBOT_CAPTION_DEFAULTS.dispatch,
             episode: this.episode, opening: this.opening, sceneIndex: this.sceneIndex,
             nextTransitionAt: this.nextTransitionAt, sceneStartedAt: this.sceneStartedAt,
             missingPage: this.input.visibleMissing?.[0] ?? null,
@@ -1755,6 +1767,23 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
         fontWeight: '400', color: ROBOT_LAB_CAPTION_STYLE.color,
         background: ROBOT_LAB_CAPTION_STYLE.background, border: '0',
         borderRadius: '3px', whiteSpace: 'normal', overflowWrap: 'anywhere', opacity: '1' });
+    const captionContent = doc.createElement('div');
+    caption.append(captionContent);
+    const captionText = installReservedText(captionContent, ROBOT_CAPTION_VARIANTS, model.snapshot().caption);
+    const activityState = doc.createElement('div');
+    const activityText = installReservedText(activityState, ['', ROBOT_ACTIVITY_WAITING], '');
+    const activityRows = doc.createElement('div');
+    activityRows.className = 'robot-activity-rows';
+    // Counters are nonnegative integer Numbers. String uses at most 21 fixed digits
+    // before exponent notation, whose longest value is Number.MAX_VALUE.
+    const counterWidth = Math.max(21, String(Number.MAX_VALUE).length);
+    const activityValues = ['Couriers', 'Yields', 'Assists', 'Replans'].map(label => {
+        const row = doc.createElement('div'), name = doc.createElement('span'), value = doc.createElement('span');
+        row.className = 'robot-activity-row'; name.textContent = label;
+        value.className = 'robot-activity-value'; value.style.width = counterWidth + 'ch';
+        row.append(name, value); activityRows.append(row); return value;
+    });
+    activity.append(activityState, activityRows);
     stage.append(canvas, caption, activity);
     stage.setAttribute('aria-hidden', 'true');
     stage.style.pointerEvents = 'none';
@@ -1826,12 +1855,13 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
     function render(now: number): boolean {
         const started = win.performance.now();
         latest = media.matches ? model.snapshot() : model.step(now);
-        if (caption.textContent !== latest.caption) { caption.textContent = latest.caption; invalidateGeometry(); }
+        captionText.setText(latest.caption);
         const working = latest.actors.filter(actor => actor.job === 'delivery').length;
-        const text = latest.mode === 'quiet'
-            ? 'Waiting tableau; the outage repertoire has finished'
-            : working + ' couriers; ' + latest.stats.yields + ' yields; ' + latest.stats.assists + ' assists; ' + latest.stats.replans + ' replans';
-        if (activity.textContent !== text) { activity.textContent = text; invalidateGeometry(); }
+        activityText.setText(latest.mode === 'quiet' ? ROBOT_ACTIVITY_WAITING : '');
+        [working, latest.stats.yields, latest.stats.assists, latest.stats.replans].forEach((value, index) => {
+            const text = String(value);
+            if (activityValues[index].textContent !== text) { activityValues[index].textContent = text; }
+        });
         if (stage.dataset.mode !== latest.mode) { stage.dataset.mode = latest.mode; }
         if (stage.dataset.scene !== latest.scene) { stage.dataset.scene = latest.scene; }
         // Complete real text changes before measuring, including synchronous reserve().
@@ -1990,6 +2020,8 @@ export function installPrefetchRobots(stage: HTMLElement): RobotLab {
             win.visualViewport?.removeEventListener('scroll', geometryChanged);
             geometry = undefined;
             painter.dispose();
+            captionText.dispose();
+            activityText.dispose();
             stage.replaceChildren();
             delete (stage as HTMLElement & { robotLab?: RobotLab }).robotLab;
         },

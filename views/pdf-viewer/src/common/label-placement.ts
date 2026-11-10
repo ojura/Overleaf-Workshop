@@ -142,14 +142,18 @@ function leaders(rect: PlacementRect, anchors: readonly PlacementPoint[]): Place
     return result;
 }
 
-function ringCandidates(label: LabelPlacementInput): LabelCandidate[] {
+function ringCandidates(label: LabelPlacementInput, bounds: PlacementRect): LabelCandidate[] {
     const result: LabelCandidate[] = [];
     ringOffsets.forEach((ring, ringIndex) => {
         directions.forEach((direction, directionIndex) => {
             const angle = direction * Math.PI / 180, ux = Math.cos(angle), uy = Math.sin(angle);
             const base = (label.radius ?? 0) + 4 + ring;
             const distance = base + 0.5 * (label.width * Math.abs(ux) + label.height * Math.abs(uy));
-            result.push({ x: label.anchor.x + ux * distance, y: label.anchor.y + uy * distance,
+            // A fitting rectangle must have a candidate inside the available bounds even
+            // when the anchor is near an edge or the label occupies the complete width.
+            const x = label.anchor.x + ux * distance, y = label.anchor.y + uy * distance;
+            result.push({ x: label.width <= bounds.width ? clamp(x, bounds.x + label.width / 2, bounds.x + bounds.width - label.width / 2) : x,
+                y: label.height <= bounds.height ? clamp(y, bounds.y + label.height / 2, bounds.y + bounds.height - label.height / 2) : y,
                 base: { x: label.anchor.x + ux * base, y: label.anchor.y + uy * base },
                 cost: ringIndex * ringCost + directionIndex * directionCost });
         });
@@ -224,7 +228,7 @@ export class LabelPlacementSolver {
                 result.set(label.id, { id: label.id, ...atCenter(center, label), opacity: 0, blocked: true, leaders: [] });
                 continue;
             }
-            const candidates = label.candidates ?? ringCandidates(label);
+            const candidates = label.candidates ?? ringCandidates(label, frame.bounds);
             const anchors = label.leaderAnchors ?? [label.anchor];
             const home = remembered ? { x: label.anchor.x + remembered.base.x, y: label.anchor.y + remembered.base.y } : undefined;
             const away = candidates.map(candidate => home ? Math.hypot(candidate.base.x - home.x, candidate.base.y - home.y) : 0);

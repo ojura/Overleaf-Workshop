@@ -1,7 +1,8 @@
 import { pdfCachePolicy, pdfSidecarDecodeOptions, ScrollPrefetchDynamics, type PdfCachePolicy } from './scroll-prefetch';
 import { installPrefetchDiagnostics, pdfPerformance, type DecodedImageSnapshot, type MotionLabMeasurementsPreference } from './prefetch-performance';
 import { PdfPreviewCache } from './pdf-preview-cache';
-import { installPdfDocumentRobots, type DocumentRobotDelivery, type DocumentRobotWorkGroup } from './pdf-document-robots';
+import { PdfPagePresentation, type PdfPagePresentationCandidate } from './pdf-page-presentation';
+import { installPdfDocumentRobots, documentRobotWorkMembers, type DocumentRobotDelivery, type DocumentRobotWorkGroup } from './pdf-document-robots';
 import { createPdfPreviewSourceLoader, rotatePdfPreviewImageRegions, type PdfPreviewSource } from './pdf-preview-source';
 import type { RobotDispatchPort } from './prefetch-robots';
 import { createPdfRenderTimings, type PdfRenderMeasurement } from './pdf-render-timing';
@@ -112,9 +113,75 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     const previews = new PdfPreviewCache({
         maxBytes: limits.maxPreviewBytes, maxPages: limits.maxPreviewPages,
         trailMaxDimension: limits.trailPreviewMaxDimension, createCanvas,
+        publishAttached: (_id, candidate, commit) => !!candidate && presentCandidate(candidate, commit),
     });
     const declinedPreviews = new Set<number>();
     const failed = new Set<number>();
+    let appearanceEpoch = 0;
+    const presentations = new Map<number, PdfPagePresentation>();
+    const presentationHooks = new Map<any, { previous: unknown; installed?: unknown }>();
+
+    function presentation(id: number): PdfPagePresentation {
+        let value = presentations.get(id);
+        if (!value) { presentations.set(id, value = new PdfPagePresentation()); }
+        return value;
+    }
+
+    function encounter(id: number) {
+        const view = pageView(id), metadata = previewLoader?.page(id);
+        return { pageElement: view.div, moving: !layoutPending && (dynamics.direction !== 0 || position() !== lastPosition),
+            axis: horizontal() ? 'x' as const : 'y' as const, pageProjection: pageProjection(view),
+            imageRegions: metadata && rotatePdfPreviewImageRegions(metadata.imageRegions, viewer.pagesRotation || 0),
+            imageRegionsComplete: metadata?.imageRegionsComplete === true };
+    }
+
+    function presentCandidate(candidate: PdfPagePresentationCandidate, commit: () => void): boolean {
+        retireMissingPresentation(candidate.pageNumber);
+        const value = presentation(candidate.pageNumber);
+        if (!value.accepts(candidate)) { return false; }
+        const transaction = documentRobots?.enabled && documentRobots.preparePublication
+            ? documentRobots.preparePublication(candidate, encounter(candidate.pageNumber)) : undefined;
+        try {
+            const accepted = value.present(candidate, commit);
+            if (accepted) {
+                pageView(candidate.pageNumber).hasUsefulPresentation = true;
+                pageView(candidate.pageNumber).div.classList?.remove('loadingIcon', 'loading');
+                transaction?.commit();
+            } else { transaction?.abort(); }
+            return accepted;
+        } catch (error) { transaction?.abort(); throw error; }
+    }
+
+    function retireMissingPresentation(id: number): void {
+        const value = presentations.get(id), current = value?.current();
+        if (!current || current.canvas.parentNode && current.canvas.width > 0 && current.canvas.height > 0) { return; }
+        value!.reset();
+        const view = pageView(id);
+        if (view) { view.hasUsefulPresentation = false; }
+        documentRobots?.removePage?.(current.page, 'raster-removed', true, view?.div);
+    }
+
+    function installPresentationHook(view: any): void {
+        if (presentationHooks.has(view)) { return; }
+        const hook = { previous: view.publishImageCandidate, installed: undefined as unknown };
+        presentationHooks.set(view, hook);
+        view.publishImageCandidate = (pass: any, commit: () => void) => {
+            if (disposed || !document || document !== viewer.pdfDocument || pageView(view.id) !== view) { return false; }
+            captureNativeRaster(view);
+            const projection = nativeProjection(view);
+            if (!projection) { return false; }
+            const candidate: PdfPagePresentationCandidate = { document, page: view.pdfPage, pageNumber: view.id,
+                appearance: pass.appearance, rasterGeometry: pass.geometry, attempt: {}, successful: true, canvas: pass.canvas, projection,
+                revision: pass.status?.revision ?? 0, coverage: Array.isArray(pass.status?.resources) && pass.intent
+                    ? { kind: 'native', intent: pass.intent, discovered: !!pass.status.discovered, resources: pass.status.resources, untrackedImageOperations: pass.status.untrackedImageOperations }
+                    : !document.hasExternalImages ? { kind: 'complete-page' } : { kind: 'unknown' } };
+            return presentCandidate(candidate, () => {
+                previews.get(view.id)?.canvas.remove();
+                commit();
+            });
+        };
+        hook.installed = view.publishImageCandidate;
+    }
     const renderStarts = new Map<number, PdfRenderMeasurement>();
     const imageWatches = new Map<number, ImageWatch>();
     const imageRestarts = new Set<number>();
@@ -172,7 +239,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     const imageCoverage = (status: any) => !status || status.discovered === true && status.covered === status.total && status.total >= 0;
     const paintedCoverage = (view: any) => !document?.hasExternalImages || !!view?.paintedImageStatus && imageCoverage(view.paintedImageStatus);
     const imagesPending = (view: any) => !!document?.hasExternalImages && !!view?.pdfPage?.imageStatus
-        && (!view.pdfPage.imageStatus.final && !view.pdfPage.imageStatus.failed
+        && (!view.pdfPage.imageStatus.discovered || view.pdfPage.imageStatus.pending > 0
             || (view.pdfPage.imageRevision ?? 0) > (view.imagePassRevision ?? view.paintedImageRevision ?? -1));
     const retainResources = (id: number) => policy.releaseRenderedResources
         ? nativeTarget(id) && (pageView(id)?.renderingState !== FINISHED || imagesPending(pageView(id))) : prepared.includes(id);
@@ -188,6 +255,11 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         entry.unsubscribe = page.onImageRevision(() => {
             if (disposed || document !== doc || generation !== epoch || imageWatches.get(id) !== entry) { return; }
             const status = page.imageStatus;
+            if (status?.discovered && status.pending === 0 && status.failed > 0) { failed.add(id); }
+            if (documentRobots?.updateSource && Array.isArray(status?.resources) && status.intent) {
+                documentRobots.updateSource(page, { kind: 'native', intent: status.intent,
+                    discovered: !!status.discovered, resources: status.resources, untrackedImageOperations: status.untrackedImageOperations });
+            }
             pdfPerformance.event('image-progress', { page: id, revision: page.imageRevision ?? 0,
                 covered: status?.covered ?? 0, total: status?.total ?? 0, pending: status?.pending ?? 0,
                 failed: status?.failed ?? 0, final: !!status?.final, discovered: !!status?.discovered });
@@ -288,7 +360,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     }
 
     function visibleRobotWork(): DocumentRobotWorkGroup[] {
-        const groups = new Map<string, { key: string; pages: DocumentRobotWorkGroup['pages'][number][] }>();
+        const groups = new Map<string, { key: string; pages: DocumentRobotWorkGroup['pages'][number][]; layoutPages: DocumentRobotWorkGroup['layoutPages'] }>();
         for (const id of visible) {
             const view = pageView(id);
             if (!view?.div) { continue; }
@@ -297,11 +369,20 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
                 .filter(member => Number.isSafeInteger(member) && member > 0 && member <= viewer.pagesCount).sort((a, b) => a - b) : [];
             const key = (members.length ? members : [id]).join(',');
             let group = groups.get(key);
-            if (!group) { groups.set(key, group = { key, pages: [] }); }
+            if (!group) {
+                // PDF.js owns one/two-page physical spreads; clipping either half must
+                // not change the text domain of the loading episode for that spread.
+                const layoutPages = documentRobotWorkMembers((members.length ? members : [id]).map(pageNumber => {
+                    const member = pageView(pageNumber), label = member?.pageLabel ?? viewer._pageLabels?.[pageNumber - 1];
+                    return { pageNumber, ...(typeof label === 'string' && label.length <= 128 ? { label } : {}) };
+                }));
+                groups.set(key, group = { key, pages: [], layoutPages });
+            }
             const label = view.pageLabel ?? viewer._pageLabels?.[id - 1];
             group.pages.push({ pageNumber: id, pageElement: view.div,
                 ...(typeof label === 'string' && label.length <= 128 ? { label } : {}),
-                state: isReady(id) ? 'ready' : failed.has(id) ? 'failed'
+                state: failed.has(id) || view.pdfPage?.imageStatus?.discovered && view.pdfPage.imageStatus.pending === 0
+                    && view.pdfPage.imageStatus.failed > 0 ? 'failed' : presentations.get(id)?.current() || isReady(id) ? 'ready'
                     : jobs.has(id) || previewLoader?.isPending(id) || [RUNNING, PAUSED].includes(view.renderingState) ? 'preparing' : 'waiting' });
         }
         return [...groups.values()];
@@ -453,6 +534,11 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
 
     /** Each page can deliver its real pixels on first useful entry, including a ready cache hit. */
     function deliverPixels(id: number): void {
+        if (documentRobots?.reconcileEncounter && presentations.get(id)?.current()) {
+            const candidate = presentations.get(id)!.current()!;
+            documentRobots.reconcileEncounter(candidate.page, encounter(id), candidate);
+            return;
+        }
         if (!documentRobots?.enabled || !pendingRobotPages.has(id) || !visible.includes(id)
             || robotCapacityBlocked || deferredRobotPages.has(id)
             || hidden() || !document || document !== viewer.pdfDocument) { return; }
@@ -475,6 +561,12 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     }
 
     function publishPixels(id: number): void {
+        if (documentRobots?.updateSource && presentations.get(id)?.current()) {
+            const candidate = presentations.get(id)!.current()!;
+            documentRobots.updateSource(candidate.page, candidate.coverage);
+            if (visible.includes(id)) { documentRobots.reconcileEncounter(candidate.page, encounter(id), candidate); }
+            return;
+        }
         if (documentRobots?.enabled && visible.includes(id) && !hidden() && document && document === viewer.pdfDocument) {
             try {
                 const value = pixels(id);
@@ -555,7 +647,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             && !previewLoader?.snapshot().pending && previewLoader?.snapshot().state !== 'loading'
             && dynamics.direction === 0 && jobs.size === 0 && pdfPerformance.pendingFetchCount === 0
             && !imagePause && !imageCancellations.size && visible.every(id => !imagesPending(pageView(id)))
-            && visible.length > 0 && visible.every(isReady)
+            && visible.length > 0 && visible.every(id => isReady(id) || failed.has(id))
             && [...nativePages, ...renderAhead].every(id => ![RUNNING, PAUSED].includes(pageView(id)?.renderingState)));
     }
 
@@ -593,7 +685,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
                     if (!view || view.renderingState === FINISHED) { return release(); }
                     // A trusted identity still needs the same page geometry before pixels are attached.
                     if (!previewGeometryMatches(page, view)) { return release(); }
-                    const retained = retainPreview(page.pageNumber, canvas, projection);
+                    const retained = retainPreview(page.pageNumber, canvas, projection, 0, true);
                     if (retained) { pdfPerformance.event('preview-ready', { page: page.pageNumber, sidecar: true }); }
                     return retained;
                 },
@@ -863,8 +955,15 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         previews.touch(id);
     }
 
-    function retainPreview(id: number, canvas: HTMLCanvasElement, projection: PdfRasterProjection, contentRevision = 0) {
-        const retained = previews.retain(id, canvas, new Set([...visible, ...prepared]), projection, contentRevision);
+    function retainPreview(id: number, canvas: HTMLCanvasElement, projection: PdfRasterProjection, contentRevision = 0, verifiedAtlas = false) {
+        const view = pageView(id), prior = presentations.get(id)?.current();
+        const candidate: PdfPagePresentationCandidate | undefined = document && view?.pdfPage ? {
+            document, page: view.pdfPage, pageNumber: id, appearance: verifiedAtlas ? logicalAppearance(view) : prior?.appearance ?? logicalAppearance(view),
+            attempt: {}, successful: true, canvas, projection, revision: contentRevision,
+            coverage: prior && prior.canvas === view.canvas ? prior.coverage
+                : verifiedAtlas || !document.hasExternalImages ? { kind: 'complete-page' } : { kind: 'unknown' },
+        } : undefined;
+        const retained = previews.retain(id, canvas, new Set([...visible, ...prepared]), projection, contentRevision, candidate);
         if (retained) {
             declinedPreviews.delete(id);
             // Coverage is useful immediately, even while this job still holds its cold slot for worker trimming.
@@ -938,7 +1037,9 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         if (canvas.parentNode !== view.div) {
             canvas.className = 'pdfPrefetchPreview';
             canvas.setAttribute('aria-hidden', 'true');
-            view.div.prepend(canvas);
+            const commit = () => { view.div.prepend(canvas); };
+            if (entry.candidate) { presentCandidate(entry.candidate, commit); }
+            else if (!presentations.get(id)?.current()) { commit(); }
         }
     }
 
@@ -1111,7 +1212,13 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
 
     // forceRendering awaits getPage before calling renderView. A scroll or document swap can
     // make that selection obsolete while the request is in flight. Check the completion too.
+    function logicalAppearance(view: any): string {
+        return JSON.stringify([generation, appearanceEpoch, view.pdfPage?.view, viewer.pagesRotation || 0, viewer.pageColors]);
+    }
+
     function render(view: any) {
+        if (view) { view.imageAppearance = logicalAppearance(view); }
+        if (view?.id && view === pageView(view.id)) { installPresentationHook(view); }
         const currentView = pageView(view.id);
         const isPage = view === currentView || /^page\d+$/.test(view.renderingId ?? '');
         const isDetail = /^detail\d+$/.test(view.renderingId ?? '');
@@ -1165,6 +1272,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
                 copyRendered(view.id);
                 const released = (view.canvas?.width || 0) * (view.canvas?.height || 0) * RGBA_BYTES;
                 view.destroy();
+                retireMissingPresentation(view.id);
                 warm.delete(view.id);
                 bytes -= released;
                 pdfPerformance.event('canvas-evict', { page: view.id, bytes: released });
@@ -1277,6 +1385,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         if (disposed || !document || document !== viewer.pdfDocument || hidden()) { return; }
         void sampleRangeCache();
         plan(viewer._getVisiblePages());
+        for (const id of presentations.keys()) { retireMissingPresentation(id); }
         // updateviewarea can schedule this frame before the scroll event arrives. Only a
         // layout correction may reset the baseline; otherwise that would erase real motion.
         if (layoutPending) { lastPosition = position(); }
@@ -1295,6 +1404,14 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     }
 
     function clearDocument(preserveReplacement = false) {
+        for (const [view, hook] of presentationHooks) {
+            if (view.publishImageCandidate === hook.installed) {
+                if (hook.previous === undefined) { delete view.publishImageCandidate; }
+                else { view.publishImageCandidate = hook.previous; }
+            }
+        }
+        presentationHooks.clear();
+        presentations.clear();
         setIdle(false);
         renderTimings.invalidate();
         clearRobotPending();
@@ -1342,12 +1459,22 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     }
 
     function layout(invalidate = false) {
+        if (invalidate) {
+            appearanceEpoch++;
+            if (documentRobots?.removePage) {
+                for (const id of visible) {
+                    const page = pageView(id)?.pdfPage;
+                    if (page) { documentRobots.removePage(page, 'appearance', false, pageView(id)?.div); }
+                }
+            } else { documentRobots?.setVisiblePages([]); }
+        }
         stop();
         pageProjections = new WeakMap();
         renderTimings.invalidate(); renderStarts.clear();
         previewLoader?.update([], false);
         clearRobotPending();
-        documentRobots?.setVisiblePages([], { preserveReplacement: !!replacement?.captured });
+        // Layout changes retain source-page ownership; the next geometry reconciliation
+        // updates normalized targets without pretending the pages were removed.
         layoutPending = true;
         signature = '';
         lastPosition = position();
@@ -1373,7 +1500,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             }
         }
         const bufferSeconds = sample.velocityPxPerMs > 0 ? readyDistancePx / sample.velocityPxPerMs / 1000 : null;
-        const visibleMissing = visible.filter(id => !isReady(id));
+        const visibleMissing = visible.filter(id => !isReady(id) && !failed.has(id));
         return {
             ...sample, cachePolicy: policy.name, cacheLimits: limits, idle: !!idle,
             rangeCache: rangeCache ? { ...rangeCache } : undefined,

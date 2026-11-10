@@ -5,7 +5,7 @@ import path from 'node:path';
 import { repo } from './viewer-protocol.mjs';
 
 export function imageRevisionViewer(source, file = 'PDF.js viewer') {
-    if (source.includes('// Verified external image passes')) { return source; }
+    if (source.includes('// Verified external image passes')) { return publicationHooks(source); }
     const changes = [
         ['    const prevCanvas = this.canvas;\n    const updateOnFirstShow',
             '    const prevCanvas = this.canvas;\n    this._imageCanvasRetained = false;\n    this._imagePassComplete = false;\n    const updateOnFirstShow'],
@@ -17,8 +17,8 @@ export function imageRevisionViewer(source, file = 'PDF.js viewer') {
         && this._imagePassStatus.total === this.paintedImageStatus.total
         && this._imagePassStatus.covered >= this.paintedImageStatus.covered
         && this._imagePassStatus.revision >= this.paintedImageStatus.revision;
-      if (prevCanvas && this._imagePassStatus && !this._imagePassStatus.final && !monotoneImagePass
-          && (!this._imagePassStatus.discovered || this._imagePassStatus.covered < this._imagePassStatus.total)) {
+      if (prevCanvas && (!this._imagePassComplete || !this.publishImageCandidate && this._imagePassStatus && !this._imagePassStatus.final && !monotoneImagePass
+          && (!this._imagePassStatus.discovered || this._imagePassStatus.covered < this._imagePassStatus.total))) {
         canvas.remove();
         canvas.width = canvas.height = 0;
         this.canvas = prevCanvas;
@@ -31,6 +31,7 @@ export function imageRevisionViewer(source, file = 'PDF.js viewer') {
             `    const imageGeometry = JSON.stringify([options.viewport?.width, options.viewport?.height,
       options.viewport?.transform, options.transform || null, options.background || null,
       options.pageColors?.background, options.pageColors?.foreground]);
+    const imageLogicalAppearance = this.imageAppearance;
     const renderTask = this.renderTask = this.pdfPage.render(options);`],
         ['      await renderTask.promise;\n      this.#showCanvas?.(true);',
             `      await renderTask.promise;
@@ -38,6 +39,7 @@ export function imageRevisionViewer(source, file = 'PDF.js viewer') {
       this._imagePassStatus = renderTask.imageStatus;
       this._imagePassIntent = renderTask.imageIntent;
       this._imagePassGeometry = imageGeometry;
+      this._imagePassAppearance = imageLogicalAppearance;
       this.imagePassStatus = renderTask.imageStatus;
       this.imagePassRevision = renderTask.imageRevision;
       this.#showCanvas?.(true);
@@ -92,6 +94,25 @@ export function imageRevisionViewer(source, file = 'PDF.js viewer') {
         }
         source = source.replace(from, to);
     }
+    return publicationHooks(source);
+}
+
+function publicationHooks(source) {
+    source = source.replace('      case RenderingStates.RUNNING:\n        this.div.classList.add("loadingIcon");',
+        '      case RenderingStates.RUNNING:\n        if (this.hasUsefulPresentation) { this.div.classList.remove("loadingIcon", "loading"); break; }\n        this.div.classList.add("loadingIcon");');
+    if (source.includes('this.publishImageCandidate({ canvas,')) { return source; }
+    source = source.replace('const updateOnFirstShow = !prevCanvas && !hasHCM && !hideUntilComplete;',
+        'const updateOnFirstShow = !prevCanvas && !hasHCM && !hideUntilComplete && !this.publishImageCandidate;');
+    source = source.replace('      if (prevCanvas) {\n        prevCanvas.replaceWith(canvas);\n        prevCanvas.width = prevCanvas.height = 0;\n      } else {\n        onShow(canvas);\n      }',
+        `      const commit = () => {
+        if (prevCanvas) { prevCanvas.replaceWith(canvas); prevCanvas.width = prevCanvas.height = 0; }
+        else { onShow(canvas); }
+      };
+      if (this.publishImageCandidate) {
+        const accepted = this._imagePassComplete && this.publishImageCandidate({ canvas,
+          status: this._imagePassStatus, intent: this._imagePassIntent, geometry: this._imagePassGeometry, appearance: this._imagePassAppearance }, commit);
+        if (!accepted) { canvas.remove(); canvas.width = canvas.height = 0; this.canvas = prevCanvas || null; this._imageCanvasRetained = true; }
+      } else { commit(); }`);
     return source;
 }
 

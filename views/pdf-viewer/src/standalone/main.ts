@@ -7,9 +7,12 @@ import { createSiteDocumentLifecycle } from './document-lifecycle';
 import { watchSitePublication } from './publication';
 import { httpPdfPreviewSource } from '../common/pdf-preview-http';
 import { pdfPerformance } from '../common/prefetch-performance';
+import { installReservedText } from '../common/reserved-text';
+import { installNoticeLayout } from './notice-layout';
 import './viewer.css';
 
 const elements = {
+    header: document.getElementById('spomenarHeader')!,
     title: document.getElementById('spomenarTitle')!,
     source: document.getElementById('spomenarSource') as HTMLAnchorElement,
     download: document.getElementById('spomenarDownload') as HTMLAnchorElement,
@@ -25,6 +28,9 @@ const elements = {
 let settings: SiteConfig | undefined;
 let currentLink = location.href;
 let noticeTimer: number | undefined;
+const SHARE_COPY_STATUS = Object.freeze({ empty: '', copied: 'Poveznica je kopirana.', manual: 'Kopirajte označenu poveznicu.' });
+const copyStatus = installReservedText(elements.copyStatus, Object.values(SHARE_COPY_STATUS), SHARE_COPY_STATUS.empty);
+const noticeLayout = installNoticeLayout(elements.header, elements.notice, elements.noticeText);
 
 /** The website always opens its configured document, including URLs copied from other viewers. */
 if (new URL(location.href).searchParams.has('file')) {
@@ -39,6 +45,9 @@ function notice(message?: string, error = false, edition = false) {
     elements.notice.toggleAttribute('data-error', error);
     elements.notice.toggleAttribute('data-edition', edition);
     elements.retry.hidden = !error;
+    elements.noticeText.tabIndex = error ? 0 : -1;
+    elements.notice.tabIndex = error ? 0 : -1;
+    noticeLayout.refresh();
     if (edition) { noticeTimer = window.setTimeout(() => notice(), 4000); }
 }
 
@@ -118,7 +127,7 @@ function installSharing(app: any) {
             }
         }
         elements.shareUrl.value = currentLink;
-        elements.copyStatus.textContent = '';
+        copyStatus.setText(SHARE_COPY_STATUS.empty);
         elements.shareDialog.showModal();
         elements.shareUrl.focus();
         elements.shareUrl.select();
@@ -126,11 +135,11 @@ function installSharing(app: any) {
     elements.copy.addEventListener('click', async () => {
         try {
             await navigator.clipboard.writeText(elements.shareUrl.value);
-            elements.copyStatus.textContent = 'Poveznica je kopirana.';
+            copyStatus.setText(SHARE_COPY_STATUS.copied);
         } catch {
             elements.shareUrl.focus();
             elements.shareUrl.select();
-            elements.copyStatus.textContent = 'Kopirajte označenu poveznicu.';
+            copyStatus.setText(SHARE_COPY_STATUS.manual);
         }
     });
 }
@@ -143,7 +152,11 @@ async function start() {
         elements.title.textContent = value.title;
         elements.download.href = value.pdfUrl;
         elements.download.download = value.filename;
-        elements.source.hidden = !value.sourceUrl;
+        elements.source.setAttribute('aria-disabled', String(!value.sourceUrl));
+        if (!value.sourceUrl) {
+            elements.source.removeAttribute('href');
+            elements.source.removeAttribute('title');
+        }
         if (value.sourceUrl) {
             elements.source.href = value.sourceUrl;
             elements.source.title = 'Izvorna knjiga na Nextcloudu';
@@ -296,6 +309,8 @@ async function start() {
         documentLifecycle.dispose();
         publication.dispose();
         window.clearTimeout(noticeTimer);
+        copyStatus.dispose();
+        noticeLayout.dispose();
         for (const name of inputEvents) { document.removeEventListener(name, interaction, true); }
         window.removeEventListener('beforeprint', beforePrint);
         window.removeEventListener('afterprint', afterPrint);

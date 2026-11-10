@@ -110,7 +110,7 @@ describe('PDF prefetch performance measurements', function () {
                     if (!nodes.has(selector)) { nodes.set(selector, new ElementNode(selector)); }
                     return nodes.get(selector)!;
                 };
-                const fields = ['margin', 'status', 'reading-images'].map(name => {
+                const fields = ['margin', 'status', 'copy-status', 'reading-images'].map(name => {
                     const node = lookup('[data-field="' + name + '"]'); node.dataset.field = name; return node;
                 });
                 return this.shadow = { innerHTML: '', querySelector: lookup, querySelectorAll: () => fields };
@@ -720,7 +720,7 @@ describe('PDF prefetch performance measurements', function () {
                     if (!nodes.has(selector)) { nodes.set(selector, new Node()); }
                     return nodes.get(selector)!;
                 };
-                const fields = ['margin', 'status'].map(name => { const node = lookup('[data-field="' + name + '"]'); node.dataset.field = name; return node; });
+                const fields = ['margin', 'status', 'copy-status'].map(name => { const node = lookup('[data-field="' + name + '"]'); node.dataset.field = name; return node; });
                 let html = '';
                 return this.shadow = {
                     get innerHTML() { return html; },

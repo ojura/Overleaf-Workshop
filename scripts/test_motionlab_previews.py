@@ -7,6 +7,7 @@ import copy
 import ctypes
 import hashlib
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -500,6 +501,96 @@ class MotionLabPreviewsTest(unittest.TestCase):
         self.assertEqual(self.output_snapshot(), before)
         self.assertEqual(source_state(outside), outside_before)
 
+    def test_unlinked_and_invalid_occurrences_declare_incomplete_inventory(self):
+        spec = importlib.util.spec_from_file_location("occurrence_producer", SCRIPT)
+        producer = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = producer
+        spec.loader.exec_module(producer)
+        class Page:
+            rect = fitz.Rect(0, 0, 200, 200)
+            rotation = 0
+            rotation_matrix = fitz.Matrix(1, 1)
+            def get_image_info(self, hashes, xrefs):
+                self.xrefs_requested = xrefs
+                return [{"bbox": (10, 10, 50, 50), "xref": 42},
+                        {"bbox": (70, 10, 110, 50), "xref": 0},
+                        {"bbox": (float("nan"), 0, 10, 10), "xref": 99}]
+        page = Page()
+        result = producer.page_geometry(page, 1, True)
+        self.assertFalse(page.xrefs_requested)
+        self.assertFalse(result["imageRegionsComplete"])
+        self.assertEqual(len(result["imageRegions"]), 2)
+        by_id = {region["id"]: region for region in result["imageRegions"]}
+        self.assertNotIn("resourceId", by_id["p1-i0"])
+        self.assertNotIn("resourceId", by_id["p1-i1"])
+
+    def test_equal_content_external_and_inline_occurrences_are_not_invented_links(self):
+        spec = importlib.util.spec_from_file_location("ambiguity_producer", SCRIPT)
+        producer = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = producer
+        spec.loader.exec_module(producer)
+        for inline in (None, b"BI ", b"BI% inline dictionary follows\n", b"BI\x00", b"split"):
+            with fitz.open() as document:
+                page = document.new_page(width=200, height=100)
+                first = document.get_new_xref()
+                dictionary = "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 >>"
+                document.update_object(first, dictionary)
+                pixels = bytes([220, 20, 30]) * 4
+                document.update_stream(first, pixels)
+                second = None
+                if inline is None:
+                    second = document.get_new_xref()
+                    document.update_object(second, dictionary)
+                    document.update_stream(second, pixels)
+                resources = document.get_new_xref()
+                extra = f" /B {second} 0 R" if second is not None else ""
+                document.update_object(resources, f"<< /XObject << /A {first} 0 R{extra} >> >>")
+                document.xref_set_key(page.xref, "Resources", f"{resources} 0 R")
+                commands = b"q 60 0 0 60 10 20 cm /A Do Q\n"
+                commands += (b"q 60 0 0 60 110 20 cm " + (b"BI " if inline == b"split" else inline) + b"/W 2 /H 2 /CS /RGB /BPC 8 ID " + pixels + b" EI Q") if inline is not None else b"q 60 0 0 60 110 20 cm /B Do Q"
+                content = document.get_new_xref()
+                document.update_object(content, "<< >>")
+                if inline == b"split":
+                    prefix, suffix = commands.split(b"BI", 1)
+                    document.update_stream(content, prefix + b"BI")
+                    tail = document.get_new_xref()
+                    document.update_object(tail, "<< >>")
+                    document.update_stream(tail, suffix)
+                    document.xref_set_key(page.xref, "Contents", f"[{content} 0 R {tail} 0 R]")
+                else:
+                    document.update_stream(content, commands)
+                    document.xref_set_key(page.xref, "Contents", f"{content} 0 R")
+                result = producer.page_geometry(page, 1, True)
+                self.assertEqual(len(result["imageRegions"]), 2)
+                self.assertFalse(result["imageRegionsComplete"])
+                self.assertTrue(all("resourceId" not in region for region in result["imageRegions"]))
+
+    def test_occurrences_keep_actual_shared_xref_and_distinct_placements(self):
+        source = self.root / "repeated-resource.pdf"
+        with fitz.open() as document:
+            page = document.new_page(width=200, height=200)
+            xref = page.insert_image(fitz.Rect(10, 10, 50, 30), stream=solid_image())
+            page.insert_image(fitz.Rect(70, 60, 150, 100), xref=xref)
+            document.save(source)
+        self.complete("--tiers", "192", "--require-image-regions", source=source)
+        page = self.manifest()["pages"][0]
+        self.assertTrue(page["imageRegionsComplete"])
+        self.assertEqual(len(page["imageRegions"]), 2)
+        self.assertEqual({r["resourceId"] for r in page["imageRegions"]}, {f"x{xref}"})
+        self.assertEqual(len({r["id"] for r in page["imageRegions"]}), 2)
+        manifest_path = self.output / "manifest.json"
+        legacy = self.manifest()
+        legacy["pages"][0].pop("imageRegionsComplete")
+        for region in legacy["pages"][0]["imageRegions"]:
+            region.pop("resourceId", None)
+        manifest_path.write_text(json.dumps(legacy))
+        self.complete("--tiers", "192", "--require-image-regions", source=source)
+        self.assertTrue(self.manifest()["pages"][0]["imageRegionsComplete"])
+        second_events = self.complete("--tiers", "192", "--require-image-regions", source=source)
+        self.assertFalse(any(event.get("event") == "asset" for event in second_events))
+        self.complete("--tiers", "512", "--require-image-regions", source=source)
+        self.assertEqual(self.manifest()["pages"][0]["imageRegions"], page["imageRegions"])
+
     def test_image_region_cap_keeps_largest_regions_and_reports_omissions(self):
         source = self.root / "many-regions.pdf"
         image = solid_image()
@@ -514,6 +605,7 @@ class MotionLabPreviewsTest(unittest.TestCase):
         manifest = self.validate_manifest(source=source, selected=[1])
         regions = manifest["pages"][0]["imageRegions"]
         self.assertEqual(len(regions), 256)
+        self.assertFalse(manifest["pages"][0]["imageRegionsComplete"])
         self.assertTrue(any(abs(region["width"] - .45) < 1e-5 and abs(region["height"] - .45) < 1e-5 for region in regions))
         self.assertEqual([event["regionsOmitted"] for event in events if event.get("event") == "asset"], [1])
 

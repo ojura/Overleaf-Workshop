@@ -144,6 +144,33 @@ describe('exact-document page preview sources', function () {
         assert.strictEqual(module.PDF_PREVIEW_LIMITS.manifestBytes, 4 * 1024 * 1024);
     });
 
+    it('preserves actual resource links for repeated placements and marks incomplete inventories conservatively', () => {
+        const { value } = manifest([1]);
+        const region = { ...value.pages[0].imageRegions[0], resourceId: 'x42' };
+        value.pages[0].imageRegions = [region, { ...region, id: 'repeated', x: 0.5 }];
+        value.pages[0].imageRegionsComplete = true;
+        const validate = () => module.validatePdfPreviewManifest(value, identity, 100).pages[0];
+        assert.strictEqual(validate().imageRegionsComplete, true);
+        assert.deepStrictEqual(validate().imageRegions.map((r: any) => r.resourceId), ['x42', 'x42']);
+        assert.deepStrictEqual(module.rotatePdfPreviewImageRegions(validate().imageRegions, 90).map((r: any) => r.resourceId), ['x42', 'x42']);
+        value.pages[0].imageRegions[1].resourceId = 'ordinal-2';
+        assert.strictEqual(validate().imageRegionsComplete, false);
+        assert.strictEqual(validate().imageRegions[1].resourceId, undefined);
+        delete value.pages[0].imageRegions[1].resourceId;
+        assert.strictEqual(validate().imageRegionsComplete, false);
+        value.pages[0].imageRegions[1].resourceId = 'x42';
+        value.pages[0].imageRegions.push({ ...region, id: 'outside', x: -1 });
+        assert.strictEqual(validate().imageRegionsComplete, false);
+        value.pages[0].imageRegions.pop();
+        const original = value.pages[0].imageRegions;
+        value.pages[0].imageRegions = Array.from({ length: module.PDF_PREVIEW_LIMITS.maxRegionsPerPage + 1 }, (_, i) => ({ ...region, id: 'limited-' + i }));
+        assert.strictEqual(validate().imageRegionsComplete, false);
+        assert.deepStrictEqual(validate().imageRegions, []);
+        value.pages[0].imageRegions = original;
+        delete value.pages[0].imageRegionsComplete;
+        assert.strictEqual(validate().imageRegionsComplete, false, 'legacy links do not assert a complete occurrence inventory');
+    });
+
     it('rotates normalized placements into the current rendered page orientation', () => {
         const input = [{ id: 'photo', x: 0.125, y: 0.25, width: 0.5, height: 0.25 }];
         assert.deepStrictEqual(module.rotatePdfPreviewImageRegions(input, 90), [{ id: 'photo', x: 0.5, y: 0.125, width: 0.25, height: 0.5 }]);

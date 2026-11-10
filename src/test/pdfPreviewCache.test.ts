@@ -92,6 +92,22 @@ describe('the shared graduated PDF preview cache', function () {
     });
     after(() => { if (directory) { fs.rmSync(directory, { recursive: true, force: true }); } });
 
+    it('releases rejected and throwing attached publication candidates while preserving the predecessor', () => {
+        for (const throws of [false, true]) {
+            const cache = new module.PdfPreviewCache({ maxBytes: MIB, maxPages: 4, trailMaxDimension: 128,
+                createCanvas: () => canvas(), publishAttached: () => { if (throws) { throw new Error('publication failed'); } return false; } });
+            caches.push(cache);
+            const prior = canvas(128, 128), incoming = canvas(128, 128), parent = new Parent();
+            assert.strictEqual(cache.retain(1, prior, new Set([1])), true);
+            parent.prepend(prior);
+            if (throws) { assert.throws(() => cache.retain(1, incoming, new Set([1])), /publication failed/); }
+            else { assert.strictEqual(cache.retain(1, incoming, new Set([1])), false); }
+            assert.strictEqual(cache.get(1).canvas, prior);
+            assert.strictEqual(prior.parentNode, parent);
+            assert.strictEqual(incoming.width * incoming.height, 0);
+        }
+    });
+
     function canvas(width = 384, height = 512) {
         const result = new Canvas(width, height);
         canvases.push(result);

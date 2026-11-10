@@ -1,5 +1,8 @@
+import { PdfDeliveryPlans, type PdfDeliveryEncounter, type PdfDeliveryPlannedCrop } from './pdf-delivery-plan';
+import type { PdfPagePresentationCandidate, PdfPageCoverage } from './pdf-page-presentation';
 import { paintRobotVehicle, robotArtworkGeometry, RobotRandom, ROBOT_ARTWORK_SIZE, ROBOT_FORKLIFT_ATTACHMENT, ROBOT_AIRLIFT_ATTACHMENT, ROBOT_VEHICLES, type RobotArtworkActor, type RobotVehicle, type RobotDispatchPort, type RobotDispatchPoint } from './prefetch-robots';
 import { pdfCachePolicy } from './scroll-prefetch';
+import { installReservedText } from './reserved-text';
 import { RobotEncounters, ROBOT_INTERACTION_REACTIONS, ROBOT_OPERATION_DIALOGUE, type RobotEncounterActor, type RobotEncounterReaction } from './robot-encounters';
 import { LabelPlacementSolver, LABEL_PLACEMENT_LIMITS, type LabelPlacement, type LabelPlacementInput, type PlacementRect } from './label-placement';
 import { ASAP_CLEANER_ARTWORK_SIZE, paintAsapCleaner } from './robot-cleaner-artwork';
@@ -15,7 +18,7 @@ import { robotCargoWorkload, robotOperationKey, commitRobotOperation, robotOpera
     type RobotOperationPlan, type RobotCargoWorkload, type RobotOperationGoal, type RobotCommitment } from './robot-operations';
 import { ROBOT_DELIVERY_PHASES, robotCargoCandidates, robotCargoOperation, type RobotCargoCandidate } from './robot-cargo-operations';
 import { robotScreenMetrics, robotCaptionMetrics, ROBOT_CAPTION_STYLE } from './robot-screen-scale';
-import { robotDocumentMetrics, selectRobotImageCrops, planRobotDocumentRegion,
+import { robotDocumentMetrics, selectRobotImageCrops, planRobotDocumentRegion, ROBOT_DOCUMENT_POLICY,
     type RobotDocumentSize, type RobotImageCrop } from './robot-document-policy';
 import { RobotTraffic } from './robot-traffic';
 import { installRobotInteraction, type RobotInteractionPoint } from './robot-interaction';
@@ -85,9 +88,21 @@ export interface DocumentRobotWorkPage {
     label?: string;
     state: DocumentRobotWorkState;
 }
+export type DocumentRobotWorkMember = Pick<DocumentRobotWorkPage, 'pageNumber' | 'label'>;
+/** PDF.js owns physical spreads of one or two pages, independently of which half is visible. */
+export type DocumentRobotWorkMembers = readonly [DocumentRobotWorkMember] | readonly [DocumentRobotWorkMember, DocumentRobotWorkMember];
+
+export function documentRobotWorkMembers(pages: readonly DocumentRobotWorkMember[]): DocumentRobotWorkMembers {
+    if (pages.length === 1) { return [pages[0]]; }
+    if (pages.length === 2) { return [pages[0], pages[1]]; }
+    throw new RangeError('A physical PDF spread must contain one or two pages.');
+}
+
 export interface DocumentRobotWorkGroup {
     key: string;
     pages: readonly DocumentRobotWorkPage[];
+    /** Complete physical spread, including a currently clipped or already ready half. */
+    layoutPages?: DocumentRobotWorkMembers;
 }
 /** Image placements normalized in the orientation of the supplied rendered page. */
 export interface DocumentRobotImageRegion {
@@ -96,6 +111,7 @@ export interface DocumentRobotImageRegion {
     y: number;
     width: number;
     height: number;
+    resourceId?: string;
 }
 
 export interface DocumentRobotDelivery {
@@ -145,6 +161,7 @@ interface Payload {
     mast?: HTMLDivElement;
     sling?: HTMLDivElement;
     cover?: HTMLDivElement;
+    planOwner?: { planId: number; cropId: number };
     landingShadow?: HTMLDivElement;
     underlay?: { canvas: HTMLCanvasElement; bytes: number };
     bytes: number;
@@ -242,6 +259,9 @@ interface AdvanceWork {
     pages: readonly DocumentRobotWorkPage[];
     layer: HTMLDivElement;
     label: HTMLDivElement;
+    text: ReturnType<typeof installReservedText>;
+    layoutPages: DocumentRobotWorkMembers;
+    variants: readonly string[];
     actors: AdvanceActor[];
     phase: 'arriving' | 'coordinating' | 'parked' | 'returning';
     started: number;
@@ -256,6 +276,7 @@ interface AdvanceWork {
     message: string;
     labelAnchor?: Point;
     labelSize?: { key: string; width: number; height: number };
+    labelObserver?: ResizeObserver;
     anchor?: { element: HTMLElement; x: number; y: number; left: number; right: number; top: number; bottom: number };
 }
 interface Episode {
@@ -1127,7 +1148,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             if (index < 0) { continue; }
             const actor = work.actors.splice(index, 1)[0];
             if (!work.actors.length) { work.phase = 'parked'; }
-            work.message = advanceMessage(work); work.label.textContent = work.message;
+            work.message = advanceMessage(work); work.text.setText(work.message);
             return { body: actor.body, point: { ...actor.point }, adopted: true };
         }
         if (actorCount() >= policy.maxActors) { return; }
@@ -1290,12 +1311,16 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     function paintArrival(payload: Payload, page: PdfPageProjection, displayed?: PdfRasterProjection): void {
         const cover = payload.cover;
         if (!cover || !payload.canvas) { return; }
+        paintProtection(cover, payload.crop, page, displayed);
+    }
+
+    function paintProtection(cover: HTMLElement, crop: Crop, page: PdfPageProjection, displayed?: PdfRasterProjection): void {
         const dpr = Math.max(1, win.devicePixelRatio || 1);
         const raster = displayed ?? createPdfRasterProjection(Math.max(1, Math.ceil(page.content.width * dpr)),
             Math.max(1, Math.ceil(page.content.height * dpr)), page.content.width * dpr, page.content.height * dpr);
         // A magnified preview can carry filtered or encoded photo colour in the first outside source texel.
         // Extend only the cover footprint on the displayed raster's grid, including retained rotation.
-        const sampled = projectPdfRasterCrop(raster, payload.crop, 1)?.sampled;
+        const sampled = projectPdfRasterCrop(raster, crop, 1)?.sampled;
         const bounds = sampled && projectPdfPageRect(page, sampled);
         const density = Number.isFinite(win.devicePixelRatio) && win.devicePixelRatio > 0 ? win.devicePixelRatio : 1;
         const viewportScale = win.visualViewport?.scale ?? 1;
@@ -1304,7 +1329,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         // Cover that pixel at the current pinch scale, without changing cargo sampling or the logical photo target.
         const mask = bounds && clipPdfPageRect(page, { x: bounds.x - guard, y: bounds.y - guard,
             width: bounds.width + guard * 2, height: bounds.height + guard * 2 });
-        if (!mask) { releasePayload(payload); return; }
+        if (!mask) { return; }
         for (const [property, value] of [['left', mask.x], ['top', mask.y], ['width', mask.width], ['height', mask.height]] as const) {
             const css = value + 'px';
             if (cover.style[property] !== css) { cover.style[property] = css; }
@@ -1320,6 +1345,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         releaseLandingShadow(payload);
         if (cleaner?.payload === payload) { releaseCleaner(); }
         finishRefinement(payload);
+        if (payload.planOwner) {
+            const owner = payload.planOwner; payload.planOwner = undefined;
+            deliveryPlans.finishCrop(owner.planId, owner.cropId, payload.id, payload.deposited ? 'delivered' : 'cancelled');
+        }
         payload.cover?.remove(); payload.cover = undefined;
         payload.mast?.remove(); payload.mast = undefined;
         if (!payload.canvas) { return; }
@@ -1389,8 +1418,14 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
 
     /** PDF.js may remove page children during reset; only this live episode can restore its cover. */
     function restoreArrivals(pageNumber: number, pageElement: HTMLElement): void {
+        if (disposed || !enabled || hidden()) { return; }
+        // Called by the canonical page-reset path before its replacement raster attaches.
+        // Reattach the same owned node; ordinary reconciliation never recreates lost protection.
+        for (const owned of plannedCovers.values()) {
+            if (owned.pageElement === pageElement && !owned.element.parentNode && pageElement.isConnected) { pageElement.append(owned.element); }
+        }
         const episode = episodes.get(pageNumber);
-        if (disposed || !enabled || hidden() || !visible.has(pageNumber) || episode?.element !== pageElement) { return; }
+        if (!visible.has(pageNumber) || episode?.element !== pageElement) { return; }
         for (const payload of episode.payloads) {
             const cover = payload.cover;
             if (!payload.canvas || !cover) { continue; }
@@ -1508,6 +1543,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     }
 
     function clearActive(): void {
+        deliveryPlans.cancelAll();
+        displayProjections.clear(); planPageElements.clear();
         clearColumnPull();
         releaseCleaner();
         encounters.clear(now());
@@ -1531,6 +1568,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     }
 
     function resetDocument(): void {
+        deliveryPlans.resetDocument();
+        displayProjections.clear();
         documentGeneration++;
         jobDecisions.clear();
         lastOperationDecision = undefined;
@@ -1548,6 +1587,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         for (const actor of work.actors) { releaseActor(actor.body); }
         work.actors.length = 0;
         clearAdvanceCarry(work);
+        work.labelObserver?.disconnect();
+        work.text.dispose();
         work.layer.remove();
         advance.delete(work.key);
         if (!episodes.size && !advance.size && !retiring && !captionGroup && !columnPull) { transit.remove(); }
@@ -1580,14 +1621,41 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             signature: [left, right, top, bottom, x, y, scale].join(',') };
     }
 
+    const crewMessages = { arriving: 'Delivery crew assembling', coordinating: 'Coordinating the handoff', parked: 'Crew in position', returning: 'Crew in position' };
+    function workMessage(pages: readonly DocumentRobotWorkMember[], preparing: boolean, crew = ''): string {
+        if (!pages.length) { return ''; }
+        const labels = pages.map(page => (page.label || String(page.pageNumber)).slice(0, 48));
+        const heading = (preparing ? 'Preparing' : 'Waiting for') + (pages.length === 1 ? ' page ' : ' pages ') + labels.join(' + ');
+        return heading + (crew ? '\n' + crew : '');
+    }
+    function workVariants(pages: DocumentRobotWorkMembers): readonly string[] {
+        // Physical PDF.js spreads have at most two pages. Enumerate their actual pending
+        // subsets rather than accumulating whichever messages happened to appear first.
+        const subsets = pages.length === 1 ? [pages] : [pages, [pages[0]], [pages[1]]];
+        return ['', ...subsets.flatMap(subset => [false, true].flatMap(preparing =>
+            ['', ...new Set(Object.values(crewMessages))].map(crew => workMessage(subset, preparing, crew))))];
+    }
+    function observeWorkLabel(work: AdvanceWork): void {
+        work.labelObserver = new win.ResizeObserver(entries => {
+            if (disposed || !enabled || hidden() || advance.get(work.key) !== work || !work.label.isConnected) { return; }
+            for (const entry of entries) {
+                if (entry.target !== work.label || !work.labelSize) { continue; }
+                // Safari also exposes the original single-size object shape. A content
+                // rectangle is insufficient here because placement owns the border box.
+                const size = Array.isArray(entry.borderBoxSize) ? entry.borderBoxSize[0]
+                    : entry.borderBoxSize as unknown as ResizeObserverSize;
+                const measured = size ? { width: size.inlineSize, height: size.blockSize } : work.label.getBoundingClientRect();
+                if (!(measured.width > 0 && measured.height > 0)
+                    || measured.width === work.labelSize.width && measured.height === work.labelSize.height) { continue; }
+                work.labelSize = { ...work.labelSize, width: measured.width, height: measured.height };
+                requestPaint();
+            }
+        });
+        work.labelObserver.observe(work.label, { box: 'border-box' });
+    }
     function advanceMessage(work: AdvanceWork): string {
         const pending = pendingWorkPages(work);
-        if (!pending.length) { return ''; }
-        const labels = pending.map(page => (page.label || String(page.pageNumber)).slice(0, 48));
-        const operation = pending.some(page => page.state === 'preparing') ? 'Preparing' : 'Waiting for';
-        const heading = operation + (pending.length === 1 ? ' page ' : ' pages ') + labels.join(' + ');
-        return heading + (!work.actors.length ? '' : '\n' + (work.phase === 'arriving' ? 'Delivery crew assembling'
-            : work.phase === 'coordinating' ? 'Coordinating the handoff' : 'Crew in position'));
+        return workMessage(pending, pending.some(page => page.state === 'preparing'), work.actors.length ? crewMessages[work.phase] : '');
     }
 
     function beginAdvanceReturn(work: AdvanceWork): void {
@@ -1703,7 +1771,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             };
         }
         work.message = advanceMessage(work);
-        if (work.label.textContent !== work.message) { work.label.textContent = work.message; }
+        work.text.setText(work.message);
         if (!resizeSprites(work.actors.map(actor => actor.body), policy)) { dropAdvance(work); return; }
         const targets = advanceTargets(work, area);
         for (let index = work.actors.length - 1; index >= 0; index--) {
@@ -1780,16 +1848,23 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     function setVisibleWork(groups: readonly DocumentRobotWorkGroup[]): void {
         if (disposed || !enabled || hidden()) { return; }
         const valid = (page: DocumentRobotWorkPage) => Number.isSafeInteger(page.pageNumber) && page.pageNumber > 0;
-        setVisiblePages(groups.flatMap(group => group.pages.filter(valid).map(page => page.pageNumber)));
-        const keys = new Set(groups.map(group => group.key));
-        for (const work of [...advance.values()]) { if (!keys.has(work.key)) { dropAdvance(work); } }
+        const incoming = groups.map(group => ({ ...group, pages: group.pages.filter(valid) })).filter(group => group.pages.length)
+            .map(group => ({ ...group, layoutPages: documentRobotWorkMembers(group.layoutPages ?? group.pages) }));
+        const keyed = new Map(incoming.map(group => [group.key, group]));
+        // Group identity owns the crew. Reconcile its current members before page
+        // visibility cleanup, since two visible halves can have no page in common.
+        for (const work of [...advance.values()]) {
+            const group = keyed.get(work.key);
+            if (group) { work.pages = group.pages; }
+            else { dropAdvance(work); }
+        }
+        setVisiblePages(incoming.flatMap(group => group.pages.map(page => page.pageNumber)));
         const bounds = container.getBoundingClientRect();
         syncSceneOrigin(bounds);
         const viewport = viewportBounds(bounds), policy = presentation(viewport);
         let changed = false;
-        for (const group of groups) {
-            const pages = group.pages.filter(valid);
-            if (!pages.length) { continue; }
+        for (const group of incoming) {
+            const pages = group.pages;
             let work = advance.get(group.key);
             const missing = pages.some(page => page.state === 'waiting' || page.state === 'preparing');
             if (!work && !missing) { continue; }
@@ -1804,22 +1879,47 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                     textAlign: 'center', whiteSpace: 'pre-line', overflowWrap: 'anywhere',
                     boxShadow: '0 3px 12px #0002' });
                 layer.append(label);
-                work = { key: group.key, pages, layer, label, actors: [], phase: 'parked', started: now(),
+                const layoutPages = documentRobotWorkMembers(group.layoutPages ?? pages);
+                const variants = workVariants(layoutPages);
+                const text = installReservedText(label, variants, '');
+                work = { key: group.key, pages, layer, label, text, layoutPages, variants, actors: [], phase: 'parked', started: now(),
                     admitted: false, signature: '', geometry: '', message: '' };
                 advance.set(group.key, work);
                 try { container.append(transit); transit.append(layer); }
                 catch { work.admitted = true; stats.rejected++; }
+                observeWorkLabel(work);
             }
             const signature = pages.map(page => [page.pageNumber, page.label, page.state].join(':')).join(',');
             const stateChanged = signature !== work.signature;
-            work.pages = pages; work.signature = signature;
+            work.pages = pages;
+            const layoutPages = documentRobotWorkMembers(group.layoutPages ?? pages);
+            if (JSON.stringify(layoutPages.map(page => [page.pageNumber, page.label])) !== JSON.stringify(work.layoutPages.map(page => [page.pageNumber, page.label]))) {
+                work.layoutPages = layoutPages;
+                work.variants = workVariants(layoutPages);
+                work.message = advanceMessage(work);
+                work.text.update(work.variants, work.message);
+                work.labelSize = undefined;
+                changed = true;
+            }
+            work.signature = signature;
             if (!missing) { beginAdvanceReturn(work); changed = true; continue; }
+            const handover = !!work.anchor && !pages.some(page => page.pageElement === work!.anchor!.element);
+            if (handover) { work.anchor = undefined; }
             const area = advanceGeometry(work, viewport, policy);
+            if (handover && area) {
+                const reference = area.reference;
+                work.anchor = { element: area.element,
+                    x: (area.x - reference.left) / reference.width, y: (area.y - reference.top) / reference.height,
+                    left: (viewport.left - reference.left) / reference.width, right: (viewport.right - reference.left) / reference.width,
+                    top: (viewport.top - reference.top) / reference.height, bottom: (viewport.bottom - reference.top) / reference.height };
+                for (const actor of work.actors) { actor.start = { ...actor.point }; }
+                const targets = advanceTargets(work, area);
+                work.actors.forEach((actor, index) => commitGroundDrive(actor.body, actor.start, targets[index]));
+                work.phase = 'arriving'; work.started = now(); work.gestureAt = undefined;
+                changed = true;
+            } else if (handover) { beginAdvanceReturn(work); changed = true; }
             const geometryChanged = (area?.signature ?? '') !== work.geometry;
             work.geometry = area?.signature ?? '';
-            if (stateChanged && work.phase === 'parked' && work.actors.length) {
-                work.gestureAt = now(); work.phase = 'coordinating';
-            }
             if (!media.matches && area && !work.admitted && pages.some(page => !seen.has(page.pageNumber)
                 && (page.state === 'waiting' || page.state === 'preparing'))) {
                 const stagingLimit = Math.min(policy.kind === 'desktop' ? 4 : 2, Math.floor(policy.maxActors / 2));
@@ -1877,7 +1977,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             clearAdvanceCarry(work);
             for (const actor of actors) { actor.body.carried = false; }
             work.phase = 'parked';
-            work.message = advanceMessage(work); work.label.textContent = work.message;
+            work.message = advanceMessage(work); work.text.setText(work.message);
             if (!pendingWorkPages(work).length) { dropAdvance(work); }
             return actors;
         });
@@ -2379,14 +2479,13 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             if (!work.labelAnchor || work.phase === 'returning' || !work.message || bounds.width < 100 || bounds.height <= 0
                 || labels.length >= LABEL_PLACEMENT_LIMITS.labels - 1) { continue; }
             const maxWidth = Math.min(224, bounds.width);
-            const key = [work.message, maxWidth, metrics.fontSize, metrics.lineHeight].join('|');
+            const key = [maxWidth, metrics.fontSize, metrics.lineHeight, metrics.paddingX, metrics.paddingY].join('|');
             if (work.labelSize?.key !== key) {
                 Object.assign(work.label.style, { fontSize: metrics.fontSize + 'px', lineHeight: metrics.lineHeight + 'px',
                     padding: metrics.paddingY + 'px ' + metrics.paddingX + 'px', width: 'max-content',
                     maxWidth: maxWidth + 'px', height: 'auto' });
                 const measured = work.label.getBoundingClientRect();
                 work.labelSize = { key, width: measured.width, height: measured.height };
-                work.label.style.height = measured.height + 'px';
             }
             const { width, height } = work.labelSize;
             if (!(width > 0 && height > 0)) { continue; }
@@ -2743,7 +2842,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 releaseActor(actor.body); return false;
             });
             if (!work.actors.length) {
-                work.phase = 'parked'; work.message = advanceMessage(work); work.label.textContent = work.message;
+                work.phase = 'parked'; work.message = advanceMessage(work); work.text.setText(work.message);
             }
         }
         paintWorkLabels(displayed.filter(value => !failed.has(value.body)), viewport, displayedObstacles);
@@ -2818,7 +2917,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                     for (const actor of work.actors) { releaseActor(actor.body); }
                     clearAdvanceCarry(work);
                     work.actors.length = 0; work.admitted = true; work.phase = 'parked';
-                    work.message = advanceMessage(work); work.label.textContent = work.message;
+                    work.message = advanceMessage(work); work.text.setText(work.message);
                     stats.rejected++;
                 }
             }
@@ -3052,9 +3151,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             y: clamp(crop.y + crop.height / 2 - height / 2, area.top, area.bottom - height) };
     }
 
-    function offer(value: DocumentRobotDelivery, admission?: Readonly<DocumentRobotAdmission>): DocumentRobotOffer {
-        if (disposed || !enabled || hidden() || !visible.has(value.pageNumber)
-            || !Number.isSafeInteger(value.pageNumber) || value.pageNumber < 1 || seen.has(value.pageNumber)) { return 'skipped'; }
+    function offer(value: DocumentRobotDelivery, admission?: Readonly<DocumentRobotAdmission>,
+        planned?: { crop: Crop; cover: HTMLDivElement; planId: number; cropId: number }): DocumentRobotOffer {
+        if (disposed || !enabled || hidden() || !planned && !visible.has(value.pageNumber)
+            || !Number.isSafeInteger(value.pageNumber) || value.pageNumber < 1 || !planned && seen.has(value.pageNumber)) { return 'skipped'; }
         if (media.matches) { seen.add(value.pageNumber); stats.skipped++; return 'skipped'; }
         if (!value.canvas.width || !value.canvas.height) { return 'deferred'; }
         const viewport = viewportBounds();
@@ -3082,7 +3182,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             || dispatchOrigin && used.size >= ROBOT_VEHICLES.length) {
             capacityBlocked = true; return 'busy';
         }
-        const crops = selectCrops(value.canvas, area, policy, value.imageRegions, value.rasterProjection);
+        const crops = planned ? [planned.crop] : selectCrops(value.canvas, area, policy, value.imageRegions, value.rasterProjection);
         if (!crops.length) { seen.add(value.pageNumber); stats.skipped++; return 'skipped'; }
         syncSceneOrigin();
         // Ready pixels have priority over parked work. Their bodies are reused, never duplicated.
@@ -3161,9 +3261,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             if (actorCount()) { capacityBlocked = true; return 'busy'; }
             stats.rejected++; seen.add(value.pageNumber); return 'skipped';
         }
+        const priorEpisode = planned ? episodes.get(value.pageNumber) : undefined;
         let layer: HTMLDivElement | undefined;
         try {
-            layer = doc.createElement('div');
+            layer = priorEpisode?.layer ?? doc.createElement('div');
             layer.className = 'pdfDocumentRobots';
             layer.dataset.page = String(value.pageNumber);
             layer.setAttribute('aria-hidden', 'true');
@@ -3175,19 +3276,20 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             }
             container.append(transit);
             transit.append(layer);
-            const episode: Episode = { page: value.pageNumber, element: value.pageElement, kind: value.kind, layer, payloads,
+            const episode: Episode = { page: value.pageNumber, element: value.pageElement, kind: value.kind, layer, payloads: [...(priorEpisode?.payloads ?? []), ...payloads],
                 pageSize: { width: area.width, height: area.height },
                 pageProjection: value.pageProjection, displayRasterProjection: value.displayRasterProjection };
             episodes.set(value.pageNumber, episode);
             for (const payload of payloads) {
-                const cover = doc.createElement('div');
+                const cover = planned?.cover ?? doc.createElement('div');
                 initializeSceneNode(cover, 'pdfDocumentRobotArrival', '4');
                 cover.dataset.payload = String(payload.id);
                 if (payload.crop.imageId) { cover.dataset.imageId = payload.crop.imageId; }
                 Object.assign(cover.style, { background: 'var(--page-bg-color, #fff)', opacity: '1',
                     border: '0', borderRadius: '0', boxShadow: 'none' });
                 payload.cover = cover;
-                value.pageElement.append(cover);
+                if (planned) { payload.planOwner = { planId: planned.planId, cropId: planned.cropId }; }
+                if (cover.parentNode !== value.pageElement) { value.pageElement.append(cover); }
                 paintArrival(payload, area.projection!, value.displayRasterProjection);
             }
             activePresentation = policy.kind;
@@ -3197,9 +3299,12 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             return 'started';
         } catch {
             const episode = episodes.get(value.pageNumber);
-            if (episode) { dropEpisode(episode, true); }
+            if (priorEpisode) {
+                episodes.set(value.pageNumber, priorEpisode);
+                for (const payload of payloads) { dropPayload(payload); }
+            } else if (episode) { dropEpisode(episode, true); }
             else { for (const payload of payloads) { dropPayload(payload); } }
-            layer?.remove();
+            if (!priorEpisode) { layer?.remove(); }
             if (!episodes.size && !advance.size && !retiring && !captionGroup && !columnPull) { transit.remove(); }
             seen.add(value.pageNumber);
             stats.rejected++;
@@ -3213,7 +3318,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     }
     function motionChanged(): void {
         interaction?.setEnabled(enabled && !hidden() && !media.matches);
-        const groups = [...advance.values()].map(work => ({ key: work.key, pages: work.pages }));
+        const groups = [...advance.values()].map(work => ({ key: work.key, pages: work.pages, layoutPages: work.layoutPages }));
         const ids = [...visible];
         const restoreStatus = () => { if (groups.length) { setVisibleWork(groups); setVisiblePages(ids); } };
         if (media.matches) {
@@ -3229,6 +3334,95 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             notifyCapacity();
         }
     }
+    const displayProjections = new Map<HTMLElement, PdfRasterProjection>();
+    const planPageElements = new Map<object, HTMLElement>();
+    const plannedCovers = new Map<string, { element: HTMLDivElement; crop: Crop; pageElement: HTMLElement }>();
+    const coverKey = (planId: number, cropId: number) => planId + ':' + cropId;
+    const projectionFor = (encounter: PdfDeliveryEncounter): PdfPageProjection => encounter.pageProjection ?? {
+        content: { x: 0, y: 0, width: encounter.pageElement.clientWidth, height: encounter.pageElement.clientHeight },
+        clip: { x: 0, y: 0, width: encounter.pageElement.clientWidth, height: encounter.pageElement.clientHeight },
+    };
+    const deliveryPlans = new PdfDeliveryPlans({
+        select(candidate, encounter) {
+            if (!enabled || hidden() || media.matches) { return []; }
+            const projection = projectionFor(encounter), viewport = viewportBounds();
+            const area = geometry(encounter.pageElement, viewport, projection);
+            const size = projection.content;
+            const policy = pagePresentation(presentation(viewport), size);
+            const clip = area ? { x: area.left, y: area.top, width: area.right - area.left, height: area.bottom - area.top }
+                : { x: 0, y: 0, width: 1, height: 1 };
+            const images = selectRobotImageCrops(encounter.imageRegions ?? [], size, clip,
+                { bodyScale: policy.documentScale, cargoEdge: policy.cargoEdge });
+            if (images.length) { return images.slice(0, policy.maxFragmentsPerPage); }
+            if (candidate.coverage.kind === 'native' && (!candidate.coverage.discovered
+                || candidate.coverage.resources.some(resource => !resource.covered || !resource.final || resource.failed))) { return []; }
+            // Unknown legacy imagery keeps the existing completed-raster fallback,
+            // selected before this candidate can first be attached.
+            const fallbackArea: Geometry = area ?? { width: size.width, height: size.height, left: 0, top: 0,
+                right: 1, bottom: 1, pageLeft: 0, pageTop: 0, projection };
+            return selectCrops(candidate.canvas, fallbackArea, policy, undefined, candidate.projection)
+                .slice(0, policy.maxFragmentsPerPage).map((crop, index) => ({ ...crop, imageId: crop.imageId ?? 'fallback:' + index,
+                    imageIds: crop.imageIds ?? [], kind: crop.kind ?? 'portion' }));
+        },
+        protect(planId, crop, encounter) {
+            const element = doc.createElement('div');
+            initializeSceneNode(element, 'pdfDocumentRobotArrival', '4');
+            Object.assign(element.style, { background: 'var(--page-bg-color, #fff)', opacity: '1', border: '0', borderRadius: '0', boxShadow: 'none' });
+            paintProtection(element, crop.geometry, projectionFor(encounter), displayProjections.get(encounter.pageElement));
+            encounter.pageElement.append(element);
+            plannedCovers.set(coverKey(planId, crop.id), { element, crop: crop.geometry, pageElement: encounter.pageElement });
+        },
+        rebind(planId, crop, encounter) {
+            const owned = plannedCovers.get(coverKey(planId, crop.id));
+            if (!owned?.element.parentNode) { return false; }
+            if (owned.pageElement !== encounter.pageElement) {
+                encounter.pageElement.append(owned.element); owned.pageElement = encounter.pageElement;
+            }
+            paintProtection(owned.element, crop.geometry, projectionFor(encounter), displayProjections.get(encounter.pageElement));
+            return true;
+        },
+        release(planId, crop) {
+            const key = coverKey(planId, crop.id), owned = plannedCovers.get(key);
+            plannedCovers.delete(key); owned?.element.remove();
+        },
+        eligible(crop, encounter) {
+            if (!enabled || hidden() || media.matches) { return 'skip'; }
+            const viewport = viewportBounds(), area = geometry(encounter.pageElement, viewport, encounter.pageProjection);
+            if (!area) { return 'waiting'; }
+            const showing = { width: Math.max(0, Math.min(area.right, crop.x + crop.width) - Math.max(area.left, crop.x)),
+                height: Math.max(0, Math.min(area.bottom, crop.y + crop.height) - Math.max(area.top, crop.y)) };
+            if (!showing.width || !showing.height) { return 'waiting'; }
+            if (showing.width * area.width < ROBOT_DOCUMENT_POLICY.minVisibleEdgeCss || showing.height * area.height < ROBOT_DOCUMENT_POLICY.minVisibleEdgeCss) { return encounter.moving ? 'waiting' : 'skip'; }
+            if (encounter.moving) {
+                const { content, clip } = area.projection!;
+                const horizontal = encounter.axis === 'x';
+                const start = horizontal ? area.pageLeft + clip.x - content.x : area.pageTop + clip.y - content.y;
+                const end = start + (horizontal ? clip.width : clip.height);
+                const low = horizontal ? viewport.left : viewport.top, high = horizontal ? viewport.right : viewport.bottom;
+                if (!(start <= (low + high) / 2 && end >= (low + high) / 2) && !(start >= low && end <= high)) { return 'waiting'; }
+            }
+            return 'ready';
+        },
+        admit(planId, crop, candidate, encounter) {
+            const owned = plannedCovers.get(coverKey(planId, crop.id));
+            if (!owned) { return; }
+            const before = new Set(episodes.get(candidate.pageNumber)?.payloads.map(payload => payload.id));
+            const result = offer({ pageNumber: candidate.pageNumber, pageElement: encounter.pageElement, canvas: candidate.canvas,
+                kind: candidate.coverage.kind === 'complete-page' ? 'preview' : 'page', contentRevision: candidate.revision,
+                rasterProjection: candidate.projection, displayRasterProjection: candidate.projection,
+                pageProjection: encounter.pageProjection }, { moving: encounter.moving, axis: encounter.axis },
+            { crop: crop.geometry, cover: owned.element, planId, cropId: crop.id });
+            if (result !== 'started') { return; }
+            return episodes.get(candidate.pageNumber)?.payloads.find(payload => !before.has(payload.id))?.id;
+        },
+        cancel(payloadId) {
+            for (const episode of episodes.values()) {
+                const payload = episode.payloads.find(value => value.id === payloadId);
+                if (payload) { payload.planOwner = undefined; dropPayload(payload); }
+            }
+        },
+    });
+
     interaction = installRobotInteraction(container, {
         hitTest(point) {
             const dx = hitScrollLeft - (container.scrollLeft || 0) + documentOffset() - hitColumn;
@@ -3258,6 +3452,64 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     media.addEventListener('change', motionChanged);
 
     return {
+        preparePublication(candidate: PdfPagePresentationCandidate, encounter: PdfDeliveryEncounter) {
+            const previousElement = planPageElements.get(candidate.page);
+            const previousProjection = previousElement && displayProjections.get(previousElement);
+            const displacedProjection = displayProjections.get(encounter.pageElement);
+            const restoreProjection = () => {
+                if (displacedProjection) { displayProjections.set(encounter.pageElement, displacedProjection); }
+                else { displayProjections.delete(encounter.pageElement); }
+                if (previousElement) {
+                    planPageElements.set(candidate.page, previousElement);
+                    if (previousProjection) { displayProjections.set(previousElement, previousProjection); }
+                } else { planPageElements.delete(candidate.page); }
+            };
+            planPageElements.set(candidate.page, encounter.pageElement);
+            displayProjections.set(encounter.pageElement, candidate.projection);
+            let transaction: ReturnType<PdfDeliveryPlans['preparePublication']>;
+            try { transaction = deliveryPlans.preparePublication(candidate, encounter); }
+            catch (error) { restoreProjection(); throw error; }
+            let finished = false;
+            return { abort() {
+                if (finished) { return; } finished = true;
+                // Rebinding protection must read the preceding displayed raster's
+                // projection while the plan rolls its DOM owner back.
+                restoreProjection(); transaction.abort();
+            }, commit() {
+                if (finished) { return; } finished = true;
+                transaction.commit();
+                if (previousElement && previousElement !== encounter.pageElement) { displayProjections.delete(previousElement); }
+                const episode = episodes.get(candidate.pageNumber);
+                if (episode) { episode.element = encounter.pageElement; episode.pageProjection = encounter.pageProjection;
+                    episode.displayRasterProjection = candidate.projection; }
+                refine({ pageNumber: candidate.pageNumber, pageElement: encounter.pageElement, canvas: candidate.canvas,
+                    kind: candidate.coverage.kind === 'complete-page' ? 'preview' : 'page', contentRevision: candidate.revision,
+                    rasterProjection: candidate.projection, displayRasterProjection: candidate.projection, pageProjection: encounter.pageProjection });
+            } };
+        },
+        reconcileEncounter(page: object, encounter: PdfDeliveryEncounter, candidate?: PdfPagePresentationCandidate) {
+            if (candidate) {
+                displayProjections.set(encounter.pageElement, candidate.projection);
+                const episode = episodes.get(candidate.pageNumber);
+                if (episode) { episode.element = encounter.pageElement; episode.pageProjection = encounter.pageProjection;
+                    episode.displayRasterProjection = candidate.projection; }
+            }
+            deliveryPlans.reconcileEncounter(page, encounter, candidate);
+        },
+        updateSource(page: object, coverage: PdfPageCoverage) { deliveryPlans.updateSource(page, coverage); },
+        removePage(page: object, reason: string, detached = false, pageElement?: HTMLElement) {
+            deliveryPlans.removePage(page, reason, detached);
+            const element = pageElement ?? planPageElements.get(page);
+            if (element) {
+                for (const work of [...advance.values()]) {
+                    if (work.anchor?.element === element || work.pages.some(member => member.pageElement === element)) { dropAdvance(work); }
+                }
+                cancelFrameIfEmpty(); notifyCapacity();
+            }
+            if (element) { displayProjections.delete(element); }
+            planPageElements.delete(page);
+        },
+        resetDocument(identity?: object) { void identity; resetDocument(); },
         offer,
         refine,
         restoreArrivals,
@@ -3276,7 +3528,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             clearRetiring(); cancelFrameIfEmpty(); notifyCapacity();
         },
         deliver(value: DocumentRobotDelivery): boolean { return offer(value) === 'started'; },
-        hasHandled(page: number): boolean { return seen.has(page); },
+        hasHandled(page: number): boolean {
+            const plan = deliveryPlans.snapshot().find(value => value.pageNumber === page);
+            return plan ? plan.exposed || plan.crops.length > 0 && plan.crops.every(crop => crop.state !== 'queued' && crop.state !== 'active') : seen.has(page);
+        },
         setDispatchOrigin(port: RobotDispatchPort | undefined) {
             dispatchOrigin = port;
             if (episodes.size || advance.size || retiring || columnPull) {
@@ -3293,6 +3548,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const policy = presentation();
             return {
                 enabled, reducedMotion: media.matches, scheduled: frame !== undefined, frames, paintTotalMs, paintMaxMs, paintLastMs,
+                deliveryPlans: deliveryPlans.snapshot(),
+                queuedDeliveryCovers: deliveryPlans.snapshot().reduce((sum, plan) => sum + plan.crops.filter(crop => crop.state === 'queued' && crop.protected).length, 0),
                 operationDecisionRecords: jobDecisions.size,
                 lastOperationDecision,
                 encounters: encounters.snapshot(),

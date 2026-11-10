@@ -118,7 +118,7 @@
                 appearance="icon" aria-label="Reply">
                 <span class="codicon codicon-comment"></span>
                 &nbsp;
-                <inline v-show="hoverButton=='reply'">Reply</inline>
+                <inline :style="{ visibility: hoverButton==='reply' ? 'visible' : 'hidden' }" aria-hidden="true">Reply</inline>
             </vscode-button>
         </div>
         <InputBox

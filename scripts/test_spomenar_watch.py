@@ -68,7 +68,7 @@ def atlas(path, sha, size, *, pages=(1, 2, 3), count=3):
             assets.append({"path": relative, "width": tier, "height": tier,
                            "bytes": len(data), "sha256": digest, "mime": "image/jpeg"})
         value["pages"].append({"pageNumber": number, "width": 100, "height": 100,
-                               "rotation": 0, "assets": assets, "imageRegions": []})
+                               "rotation": 0, "assets": assets, "imageRegions": [], "imageRegionsComplete": False})
     WATCH.atomic_json(path / "manifest.json", value)
     return value
 
@@ -189,19 +189,93 @@ class WatcherTest(unittest.TestCase):
         self.watcher.tick()
         return sha
 
-    def adopt_current(self, payload=None, *, reading=True):
+    def adopt_current(self, payload=None, *, reading=True, legacy=False):
         if payload is not None:
             self.source.write_bytes(payload)
         sha = checksum(self.source.read_bytes())
         if self.seed.exists():
             shutil.rmtree(self.seed)
-        atlas(self.seed, sha, self.source.stat().st_size)
+        value = atlas(self.seed, sha, self.source.stat().st_size)
+        if legacy:
+            for page in value["pages"]:
+                page.pop("imageRegionsComplete")
+            WATCH.atomic_json(self.seed / "manifest.json", value)
         if reading:
             reading_assets(self.seed, sha, self.source.stat().st_size)
         self.watcher.settings = replace(self.watcher.settings, adopt_atlas=self.seed)
         self.settle()
         self.assertEqual(self.watcher.current(), sha, self.output.getvalue())
         return sha
+
+    def test_full_current_reading_edition_enriches_legacy_atlas_once_and_survives_restart(self):
+        sha = self.adopt_current(legacy=True)
+        before = self.watcher.current_config()
+        public = self.settings.preview_root / sha
+        original = (public / "manifest.json").read_bytes()
+        assets = {str(path.relative_to(public)): WATCH.identity(path) for path in (public / "assets").iterdir()}
+        self.watcher.tick()
+        self.assertEqual(self.watcher.child_phase, "metadata", self.output.getvalue())
+        self.assertEqual(self.watcher.current_config(), before)
+        self.assertEqual((public / "manifest.json").read_bytes(), original)
+        work = self.settings.work_root / sha
+        value = WATCH.read_json(work / "manifest.json")
+        for page in value["pages"]:
+            page["imageRegionsComplete"] = False
+        WATCH.atomic_json(work / "manifest.json", value)
+        self.watcher.child.returncode = 0
+        self.watcher.tick()
+        after = self.watcher.current_config()
+        self.assertEqual(after["pdfUrl"], before["pdfUrl"])
+        self.assertEqual(after["reading"], before["reading"])
+        self.assertNotEqual(after["previews"]["manifestRevision"], before["previews"]["manifestRevision"])
+        self.assertEqual({name: WATCH.identity(public / name) for name in assets}, assets)
+        self.assertFalse(work.exists())
+        self.watcher.tick()
+        self.assertEqual(self.watcher.launched, [(sha, "metadata")])
+        self.watcher.close()
+        self.watcher = self.make_watcher()
+        self.settle()
+        self.assertFalse(self.watcher.launched, "explicit false metadata is already processed after restart")
+        self.assertEqual(self.watcher.current_config(), after)
+
+    def test_failed_or_cancelled_metadata_enrichment_keeps_public_edition_and_resumes_staging(self):
+        sha = self.adopt_current(legacy=True)
+        before = self.watcher.config_path.read_bytes()
+        public_manifest = (self.settings.preview_root / sha / "manifest.json").read_bytes()
+        self.watcher.tick()
+        self.assertEqual(self.watcher.child_phase, "metadata", self.output.getvalue())
+        work = self.settings.work_root / sha
+        seeded = (work / "manifest.json").read_bytes()
+        self.watcher.child.returncode = 1
+        self.watcher.tick()
+        self.assertEqual(self.watcher.config_path.read_bytes(), before)
+        self.assertEqual((self.settings.preview_root / sha / "manifest.json").read_bytes(), public_manifest)
+        self.clock[0] += 4000
+        self.watcher.tick()
+        self.assertEqual(self.watcher.child_phase, "metadata")
+        self.assertEqual((work / "manifest.json").read_bytes(), seeded)
+        child = self.watcher.child
+        self.watcher.close()
+        self.assertTrue(child.terminated)
+        self.watcher = self.make_watcher()
+        self.settle()
+        self.assertEqual(self.watcher.child_phase, "metadata")
+        self.assertEqual((work / "manifest.json").read_bytes(), seeded)
+        self.assertEqual(self.watcher.config_path.read_bytes(), before)
+
+    def test_metadata_success_without_processed_inventory_preserves_live_publication(self):
+        sha = self.adopt_current(legacy=True)
+        before = self.watcher.config_path.read_bytes()
+        public = self.settings.preview_root / sha / "manifest.json"
+        fingerprint = WATCH.identity(public)
+        self.watcher.tick()
+        self.assertEqual(self.watcher.child_phase, "metadata")
+        self.watcher.child.returncode = 0
+        self.watcher.tick()
+        self.assertEqual(self.watcher.config_path.read_bytes(), before)
+        self.assertEqual(WATCH.identity(public), fingerprint)
+        self.assertTrue((self.settings.work_root / sha / "manifest.json").exists())
+        self.assertGreater(self.watcher.records[sha]["retryAt"], self.watcher.wall_time())
 
     def test_current_completed_edition_adds_reading_without_changing_source_or_atlas(self):
         sha = self.adopt_current(reading=False)

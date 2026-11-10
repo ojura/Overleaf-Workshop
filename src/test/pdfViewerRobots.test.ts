@@ -52,7 +52,13 @@ class RobotElement {
     constructor(readonly ownerDocument: any) {}
     getContext() { return this.context; }
     getBoundingClientRect() { this.rectReads++; return { ...this.rect }; }
-    append(...elements: RobotElement[]) { this.children.push(...elements); }
+    parent?: RobotElement;
+    append(...elements: RobotElement[]) {
+        for (const element of elements) { element.parent = this; this.children.push(element); }
+    }
+    remove() {
+        if (this.parent) { this.parent.children.splice(this.parent.children.indexOf(this), 1); this.parent = undefined; }
+    }
     replaceChildren(...elements: RobotElement[]) { this.children.splice(0, this.children.length, ...elements); }
     setAttribute(name: string, value: string) { this.attributes.set(name, value); }
 }
@@ -176,6 +182,32 @@ describe('the procedural PDF robot fleet', function () {
         if (dir) { fs.rmSync(dir, { recursive: true, force: true }); }
     });
 
+
+    it('reserves the complete caption domain before animation and keeps full activity values in stable rows', () => {
+        const runtime = new RobotRuntime(robots);
+        try {
+            const caption = runtime.stage.children.find(node => node.className === 'robot-caption')!;
+            const content = caption.children[0];
+            assert.ok(content, 'automatic captions reserve geometry before the first frame');
+            const reservations = content.children.filter(node => node.attributes.get('aria-hidden') === 'true');
+            assert.deepStrictEqual(reservations.map(node => node.textContent), [...new Set(robots.ROBOT_CAPTION_VARIANTS)]);
+            const nodes = [...content.children];
+            const activity = runtime.stage.children.find(node => node.className === 'robot-activity')!;
+            const rows = activity.children.find(node => node.className === 'robot-activity-rows')!;
+            assert.strictEqual(rows.children.length, 4);
+            runtime.lab.update(outage); runtime.lab.setActive(true);
+            for (let frame = 0; frame < 100; frame++) { runtime.frame(); }
+            assert.deepStrictEqual(content.children, nodes, 'caption transitions retain the original reservation nodes');
+            const live = content.children.find(node => node.attributes.get('aria-hidden') !== 'true')!;
+            assert.strictEqual(live.textContent, runtime.lab.snapshot().caption);
+            const state = runtime.lab.snapshot();
+            assert.deepStrictEqual(rows.children.map(row => row.children[1].textContent),
+                [state.actors.filter((actor: any) => actor.job === 'delivery').length, state.stats.yields, state.stats.assists, state.stats.replans].map(String));
+            for (const row of rows.children) {
+                assert.ok(parseInt(row.children[1].style.width) >= String(Number.MAX_VALUE).length);
+            }
+        } finally { runtime.dispose(); }
+    });
 
     it('stops idle animation frames and ignores unchanged telemetry while the fleet stays visible', () => {
         const runtime = new RobotRuntime(robots);
