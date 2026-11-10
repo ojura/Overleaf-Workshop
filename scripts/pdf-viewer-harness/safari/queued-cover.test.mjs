@@ -16,7 +16,7 @@ const sample = (nodes, plans, count) => ({
 });
 const plan = [{ id: 1, crops: [{ id: 0, state: 'queued', protected: true }] }];
 test('queued cover ownership is complete and cleans up', () => {
-  const observer = new PayloadObservations();
+  const observer = new PayloadObservations({ historical: true });
   assert.doesNotThrow(() =>
     observer.observe(
       sample([node({ deliveryPlan: '1', deliveryCrop: '0' })], plan, 1),
@@ -58,7 +58,7 @@ const invalidCases = [
 for (const { name, nodes, plans, count } of invalidCases) {
   test('rejects ' + name, () => {
     assert.throws(() =>
-      new PayloadObservations().observe(sample(nodes, plans, count)),
+      new PayloadObservations({ historical: true }).observe(sample(nodes, plans, count)),
     );
   });
 }
@@ -69,7 +69,7 @@ test('queued protection hands off exclusively to a payload and retirement remove
       new URL('./fixtures/refine-then-retire.json', import.meta.url),
     ),
   );
-  const observer = new PayloadObservations();
+  const observer = new PayloadObservations({ historical: true });
   observer.observe(
     sample([node({ deliveryPlan: '1', deliveryCrop: '0' })], plan, 1),
   );

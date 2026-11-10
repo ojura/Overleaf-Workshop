@@ -1,0 +1,20 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import { loadBrowserSource } from './browser-source.mjs';
+import { photoEvidence } from './photo-evidence.mjs';
+const source=loadBrowserSource('sidecar-active.js');
+const start=source.indexOf('        for (const page of state.robots.pages)');
+const end=source.indexOf('        if (state.visible.includes(state.page)',start);
+const selection=source.slice(start,end);
+test('actual active selection skips earlier ineligible/offscreen cargo and accepts opaque portion',async()=>{
+ const region={id:'source',x:.1,y:.1,width:.6,height:.4};
+ const payload={id:3,imageId:'opaque portion',imageIds:['source'],cropKind:'portion',target:{x:.1,y:.1,width:.3,height:.4},rasterWidth:100,rasterHeight:100,progress:.4,deposited:false};
+ const crop={id:0,payloadId:3,state:'active',geometry:{...payload.target,imageId:payload.imageId,imageIds:payload.imageIds,kind:'portion'}};
+ const rect={left:0,top:0,right:100,bottom:100,width:100,height:100,toJSON(){return this;}};
+ const context={state:{at:1,robots:{deliveryPlans:[{id:1,pageNumber:102,committed:true,crops:[{...crop,id:1,payloadId:2},crop]}],pages:[{page:102,actors:[],payloads:[{id:1,imageId:'old',progress:.4,deposited:true},{...payload,id:2},payload]}]}},pages:new Map([[102,{pageNumber:102,imageRegions:[region]}]]),photoEvidence,viewer:{pagesRotation:0},result:{},document:{querySelectorAll:()=>[{dataset:{payload:'2'},width:100,height:100,getBoundingClientRect:()=>({...rect,left:200,right:300})},{dataset:{payload:'3'},width:100,height:100,getBoundingClientRect:()=>rect}],querySelector:()=>null},container:{getBoundingClientRect:()=>rect},getComputedStyle:()=>({pointerEvents:'none'}),innerWidth:400,innerHeight:700,devicePixelRatio:3,clearTimeout(){},activeTimer:1};
+ const value=await vm.runInNewContext('(async()=>{'+selection+'})()',context);
+ assert.equal(value.active.payload.id,3);assert.equal(value.active.photoRegions[0].id,'source');
+ const old=selection.replace('const evidence = photoEvidence(payload, page.page, state.robots, pages.get(page.page), viewer.pagesRotation || 0);',"const region = pages.get(page.page).imageRegions.find(r=>r.id===payload.imageId); if(!region) throw new Error('Cargo photo is not from the exact priority atlas'); const evidence={photoRegions:[region]};");
+ await assert.rejects(vm.runInNewContext('(async()=>{'+old+'})()',context),/exact priority atlas/);
+});

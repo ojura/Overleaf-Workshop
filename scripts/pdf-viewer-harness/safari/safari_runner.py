@@ -440,7 +440,7 @@ class Wire:
                 'initial': self.initial_operations, 'errors': list(self.failed_operations),
                 'recent': list(self.operations), 'recentLimit': 256}
 
-    async def command(self, method, timeout=RPC_SECONDS, *, flush_after_send=False, purpose=None, **params):
+    async def command(self, method, timeout=RPC_SECONDS, *, flush_after_send=False, purpose=None, _sent=None, _owned_release=None, **params):
         limit = min(timeout, self.budget.remaining('detach'))
         if limit <= 0:
             raise TimeoutError('Host deadline expired before ' + method)
@@ -453,6 +453,7 @@ class Wire:
             raise RuntimeError('Source flushing requires the owned native target')
         deadline = self.budget.now() + limit
         flush_task = None
+        flush_release = asyncio.Event()
         self.sequence += 1
         row = {'sequence': self.sequence, 'method': method, 'startedHostMs': self.budget.now() * 1000,
                'timeoutSeconds': limit, 'payloadBytes': len(json.dumps(params).encode()),
@@ -476,21 +477,29 @@ class Wire:
                         self.id_rows.pop(next(iter(self.id_rows)))
                     identifier = await self.session.send_message_to_target({'method': method, 'params': params})
                     row['sendCompletedHostMs'] = self.budget.now() * 1000
+                    if _sent is not None:
+                        _sent.set()
                     row['phase'] = 'waiting-reply'
                     self.id_rows[identifier] = row
                     if flush_after_send:
                         # This device buffers large outgoing source until another
                         # command arrives. One inert no-op releases that delivery.
-                        # Both replies remain inside the original operation deadline.
+                        # The send must finish; its auxiliary reply is not a completion barrier.
+                        flush_sent = asyncio.Event()
                         flush_task = asyncio.create_task(self.command('Runtime.evaluate',
-                            timeout=max(0, deadline - self.budget.now()), purpose='large-source-flush',
+                            timeout=max(0, deadline - self.budget.now()), purpose='large-source-flush', _sent=flush_sent, _owned_release=flush_release,
                             expression='void 0', returnByValue=True,
                             emulateUserGesture=False, objectGroup=OBJECT_GROUP))
+                        sent_waiter = asyncio.create_task(flush_sent.wait())
+                        try:
+                            await asyncio.wait({sent_waiter, flush_task}, return_when=asyncio.FIRST_COMPLETED)
+                            if flush_task.done():
+                                await flush_task
+                        finally:
+                            if not sent_waiter.done(): sent_waiter.cancel()
+                            with contextlib.suppress(asyncio.CancelledError): await sent_waiter
                     response = await self.session.receive_response_by_id(identifier)
                     response = json.loads(response['params']['message'])
-                    if flush_task:
-                        row['phase'] = 'waiting-flush-reply'
-                        await flush_task
                 else:
                     row['phase'] = 'sending-or-waiting-reply'
                     response = await self.session.send_command(method, **params)
@@ -499,8 +508,11 @@ class Wire:
             row['outcome'] = 'ok'
             return response.get('result', response)
         except asyncio.CancelledError:
-            row.update(outcome='cancelled', errorType='CancelledError')
-            self.failed_operations.append(row)
+            if _owned_release is not None and _owned_release.is_set():
+                row.update(outcome='owned-release')
+            else:
+                row.update(outcome='cancelled', errorType='CancelledError')
+                self.failed_operations.append(row)
             raise
         except Exception as error:
             row.update(outcome='timeout' if isinstance(error, TimeoutError) else 'error',
@@ -511,6 +523,7 @@ class Wire:
             raise
         finally:
             if flush_task:
+                flush_release.set()
                 if not flush_task.done():
                     flush_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):

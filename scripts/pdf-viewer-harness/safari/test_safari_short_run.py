@@ -191,7 +191,7 @@ class ShortTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'passed')
         active, finish = [value for value in wire.invocations if value['objectId'] != 'abort']
         limits = active['arguments'][0]['value']['budget']
-        self.assertEqual(limits['activeMs'], active['timeout'] * 1000)
+        self.assertLess(limits['activeMs'], active['timeout'] * 1000)
         self.assertLess(limits['finishMs'], finish['timeout'] * 1000)
         self.assertEqual(limits['workMs'], limits['activeMs'] + limits['captureMs'] + limits['finishMs'])
         self.assertGreaterEqual(limits['restoreMs'], 15000)

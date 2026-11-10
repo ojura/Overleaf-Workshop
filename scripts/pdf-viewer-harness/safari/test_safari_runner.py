@@ -609,12 +609,46 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_flush_reply_cancels_its_waiter_after_prepare_reply_was_consumed(self):
         self.session.lose_flush_reply = True
-        with self.assertRaises(TimeoutError):
-            async with asyncio.timeout(.01):
-                await self.wire.prepare_initializer(JS)
+        async with asyncio.timeout(.01):
+            handle = await self.wire.prepare_initializer(JS)
+        self.assertEqual(handle, 'owned-function-handle')
         self.assertEqual(self.session.consumed, [1])
         self.assertEqual(self.session.reply_waiters, set())
         self.assertEqual(len(self.session.calls), 2)
+
+    async def test_authoritative_error_is_not_blocked_by_missing_auxiliary_reply(self):
+        self.session.lose_flush_reply = True
+        self.session.protocol_error = {'code': -32000, 'message': 'source rejected'}
+        with self.assertRaises(runner.NativeProtocolError):
+            async with asyncio.timeout(.01):
+                await self.wire.prepare_initializer(JS)
+        self.assertEqual(self.session.reply_waiters, set())
+
+    async def test_next_command_remains_isolated_after_missing_flush_reply(self):
+        self.session.lose_flush_reply = True
+        self.assertEqual(await self.wire.prepare_initializer(JS), 'owned-function-handle')
+        self.session.lose_flush_reply = False
+        await self.wire.command('Memory.enable')
+        self.assertEqual(self.session.reply_waiters, set())
+        self.assertEqual(len(self.session.calls), 3)
+
+    async def test_auxiliary_send_failure_propagates_without_waiting_for_deadline(self):
+        original = self.session.send_message_to_target
+        async def send(message):
+            if message.get('params', {}).get('expression') == 'void 0':
+                raise OSError('auxiliary send failed')
+            return await original(message)
+        self.session.send_message_to_target = send
+        with self.assertRaisesRegex(OSError, 'auxiliary send failed'):
+            async with asyncio.timeout(.03):
+                await self.wire.prepare_initializer(JS)
+        self.assertEqual(self.session.reply_waiters, set())
+
+    async def test_expected_auxiliary_waiter_release_is_not_a_failed_rpc(self):
+        self.session.lose_flush_reply = True
+        await self.wire.prepare_initializer(JS)
+        self.assertEqual(list(self.wire.failed_operations), [])
+        self.assertEqual(self.wire.operations[-1]['outcome'], 'owned-release')
 
 
 

@@ -493,18 +493,26 @@ class ReleaseTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls[1]['params']['expression'], 'void 0')
         self.assertEqual(self.waiters, set())
 
-    async def test_lost_either_preparation_reply_cannot_install_or_retain_a_waiter(self):
-        for missing in ('lose_prepare_reply', 'lose_flush_reply'):
-            with self.subTest(missing=missing):
-                self.setUp()
-                setattr(self, missing, True)
-                with self.assertRaises(TimeoutError):
-                    async with asyncio.timeout(.01):
-                        await self.evaluate('/*release:install*/ ({token:"owned"})')
-                self.assertEqual(self.installs, 0)
-                self.assertEqual(len(self.calls), 2)
-                self.assertEqual(self.waiters, set())
-                self.assertEqual(len(self.consumed), 1)
+    async def test_missing_authoritative_preparation_reply_cannot_install(self):
+        self.lose_prepare_reply = True
+        with self.assertRaises(TimeoutError):
+            async with asyncio.timeout(.01):
+                await self.evaluate('/*release:install*/ ({token:"owned"})')
+        self.assertEqual(self.installs, 0)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.waiters, set())
+        self.assertEqual(self.consumed, [2])
+
+    async def test_missing_auxiliary_reply_allows_one_authorized_install(self):
+        self.lose_flush_reply = True
+        async with asyncio.timeout(.01):
+            await self.evaluate('/*release:install*/ ({token:"owned"})')
+        self.assertEqual(self.installs, 1)
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(self.consumed, [1, 3])
+        self.assertEqual(self.waiters, set())
+        self.assertEqual(self.wire.operations[1]['outcome'], 'owned-release')
+        self.assertEqual(list(self.wire.failed_operations), [])
 
     async def test_async_restore_is_prepared_inert_then_invoked_once_with_one_shared_budget(self):
         self.prepare_elapsed = 3

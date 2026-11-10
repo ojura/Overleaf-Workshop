@@ -28,7 +28,8 @@ READINESS = '''(() => {
     editable:!!active?.matches('input,textarea,[contenteditable="true"]'),
     page:viewer?.currentPageNumber,scale:viewer?.currentScaleValue,
     top:container?.scrollTop,left:container?.scrollLeft,pages:app?.pdfDocument?.numPages,
-    probePresent:!!window.__spomenarSustainedProbe,
+    probePresent:!!(window.__spomenarSustainedProbe || window.__spomenarManualProbe || window.__spomenarSidecarProbe),
+    probes:{sustained:!!window.__spomenarSustainedProbe,manual:!!window.__spomenarManualProbe,short:!!window.__spomenarSidecarProbe},
     screenWakeLockAvailable:!!navigator.wakeLock?.request};
 })()'''
 

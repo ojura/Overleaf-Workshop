@@ -220,3 +220,16 @@ class OwnerCliTests(unittest.TestCase):
         for scenario in ('sustained', 'traverse', 'manual'):
             with self.subTest(scenario=scenario), self.assertRaises(ValueError):
                 owner_module.command_request({**request, 'scenario': scenario})
+
+
+class ProbeReadinessTests(unittest.TestCase):
+    def test_actual_readiness_reports_each_probe_and_aggregate(self):
+        script = """const vm=require('node:vm');const source=JSON.parse(process.argv[1]);
+const names=['__spomenarSustainedProbe','__spomenarManualProbe','__spomenarSidecarProbe'];
+const results=[null,...names].map(name=>{const window={};if(name)window[name]={};return vm.runInNewContext(source,{window,document:{activeElement:null,visibilityState:'visible',hasFocus:()=>false},getSelection:()=>null,location:{href:'https://example.test/'},navigator:{}});});process.stdout.write(JSON.stringify(results));"""
+        result = subprocess.run(['node', '-e', script, json.dumps(owner_module.READINESS)], check=True, capture_output=True, text=True)
+        values = json.loads(result.stdout)
+        self.assertFalse(values[0]['probePresent'])
+        for index, name in enumerate(['sustained', 'manual', 'short'], 1):
+            self.assertTrue(values[index]['probePresent'])
+            self.assertEqual(values[index]['probes'], {key: key == name for key in ['sustained', 'manual', 'short']})

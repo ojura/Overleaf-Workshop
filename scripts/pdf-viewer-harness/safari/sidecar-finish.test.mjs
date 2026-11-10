@@ -12,7 +12,7 @@ const box = (x, y, width, height) => ({ x, y, left: x, top: y, width, height,
 function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 0, pageLeft = 300, pageWidth = 300,
   stallDock, insufficientFloat = false, interruptDuringRestore = false, recoverFloatFrom,
   measurements = false, recoveryMeasurements, contentSizing = false, toggleDelay = 0,
-  restoredWork, withholdRestoredFrames = false } = {}) {
+  selectedOutcome = 'delivered', initialWork, restoredWork, withholdRestoredFrames = false } = {}) {
   let now = 0, serial = 0, columnX = 0, animation, column, pointer, callback, restoring, restoredAt;
   let closed = false, interrupted = false, stalled = false, recovery = false, recoveryPositioned = false;
   let measurementsOpen = measurements, recoveryDisclosureChanged = false;
@@ -48,7 +48,7 @@ function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 
   const reading = { ...saved, page: 99, top: 50000 };
   const container = { dataset: {}, clientLeft: 0, clientTop: 0, clientWidth: 1000, clientHeight: 700,
     scrollWidth: 1000, scrollHeight: 200000, getBoundingClientRect: () => box(readerLeft, 0, 1000, 700) };
-  const result = { token: 'owned-sidecar-fixture', startedAt: 0, saved, interrupted: false, errors: [] };
+  const result = { active: {planId:1,cropId:0,page:99,payload:{id:8}}, token: 'owned-sidecar-fixture', startedAt: 0, saved, interrupted: false, errors: [] };
   const timeout = (fn, delay = 0) => { const id = ++serial; timers.set(id, { at: now + delay, fn }); return id; };
   const ease = value => 1 - (1 - Math.min(1, Math.max(0, value))) ** 3;
   const plan = (value, target) => {
@@ -129,11 +129,11 @@ function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 
     setDiagnosticsEnabled(value) { reading.lab = value; if (!value) { animation = undefined; column = undefined;
       delete host.dataset.panelMoving; delete container.dataset.pdfColumnMoving; columnX = 0; }
       else if (Math.abs(columnX - plan(currentDock, rect)) > 0.01) moveColumn(plan(currentDock, rect)); } };
-  const sample = () => ({ documentVisible: true, prefetchIdle: true, robots: { activeActors: 0, activePayloads: 0, retainedBytes: 0,
+  const sample = () => ({ documentVisible: true, prefetchIdle: true, robots: { deliveryPlans:[{id:1,pageNumber:99,committed:true,crops:[{id:0,payloadId:8,state:selectedOutcome}]}], activeActors: 0, activePayloads: 0, retainedBytes: 0,
       scheduled: false, frames: 0 }, effectNodes: {}, missing: [], pending: [], pendingFetches: 0,
     canvases: [{ page: saved.page, state: 3, native: { connected: true, width: 300, height: 600,
       rect: { width: 300, height: 600 }, computed: { display: 'block', visibility: 'visible' } } }],
-    ...(restoredAt === undefined ? {} : restoredWork?.(now - restoredAt)) });
+    ...(restoredAt === undefined ? initialWork?.(now) : restoredWork?.(now - restoredAt)) });
   const probe = { token: result.token, result, budget, sample, guard, sleep: delay => new Promise(resolve => timeout(resolve, delay)),
     panel: () => reading.lab ? controls : undefined, panelState, readState: () => ({ ...reading }),
     setPanelRestore(value) { callback = value; },
@@ -354,4 +354,26 @@ test('reader recovery awaits queued toggle and content motion before saved geome
     assert.equal(h.timers.size, 0);
     assert.equal(h.toggleListeners.size, 0, 'the temporary toggle listener is removed');
   }
+});
+
+test('selected pending delivery remains visible beyond the old six-second cutoff', async () => {
+  const h = fixture({ initialWork: now => now < 9000 ? { prefetchIdle: false } : {} });
+  const result = await h.run();
+  assert.equal(result.failure, undefined);
+  assert.ok(result.deliverySettled.settled);
+  assert.ok(h.history.every(entry => entry.at >= 9000), 'no panel move precedes scene readiness');
+});
+test('incomplete selected delivery names its deadline and still restores', async () => {
+  const h = fixture({ initialWork: () => ({ prefetchIdle: false }) });
+  const result = await h.run();
+  assert.match(result.failure, /Incomplete selected delivery scene/);
+  assert.equal(result.observersRemoved, true);
+});
+
+for (const selectedOutcome of ['cancelled', 'skipped', undefined]) test('finish rejects selected outcome ' + selectedOutcome, async () => {
+  const h = fixture({ selectedOutcome: selectedOutcome ?? 'absent' });
+  const result = await h.run();
+  assert.match(result.failure, /Selected delivery did not finish/);
+  assert.equal(result.observersRemoved, true);
+  assert.equal(h.history.some(entry => entry.action === 'drag'), false);
 });

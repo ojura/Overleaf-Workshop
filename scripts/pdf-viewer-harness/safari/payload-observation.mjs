@@ -44,6 +44,8 @@ function ownershipCounts(inventory) {
 export class PayloadObservations {
   #seen = new Map();
   #helperOwners = new Map();
+  #historical;
+  constructor({ historical = false } = {}) { this.#historical = historical; }
 
   observe(sample) {
     const counts = ownershipCounts(sample.payloadArtifacts);
@@ -71,6 +73,35 @@ export class PayloadObservations {
         || !Number.isSafeInteger(payload.refinements) || payload.refinements < 0
         || ['x', 'y', 'width', 'height'].some(key => !Number.isFinite(payload.target?.[key]))) {
         throw new Error('Invalid payload observation');
+      }
+      let planIdentity;
+      if (!this.#historical) {
+        if (typeof payload.operation?.key !== 'string' || !Array.isArray(payload.operation.memberIds)
+          || !payload.operation.memberIds.length || !Array.isArray(payload.imageIds) || typeof payload.cropKind !== 'string'
+          || !Array.isArray(payload.helpers)) throw new Error('Incomplete current payload identity');
+        for (const values of [payload.operation.memberIds, payload.helpers]) {
+          if (!values.length || values.some(value => !Number.isSafeInteger(value) || value < 1)
+            || new Set(values).size !== values.length) throw new Error('Invalid numeric crew identity');
+        }
+        const bindings = [];
+        for (const plan of sample.robots?.deliveryPlans ?? []) for (const crop of plan.crops) {
+          if (plan.pageNumber === page.page && crop.payloadId === id) bindings.push({ plan, crop });
+        }
+        if (bindings.length !== 1 || !bindings[0].plan.committed) throw new Error('Payload has no unique committed plan');
+        const { plan, crop } = bindings[0], geometry = crop.geometry;
+        if (!Number.isSafeInteger(plan.id) || plan.id < 1 || !Number.isSafeInteger(crop.id) || crop.id < 0) throw new Error('Invalid committed plan identity');
+        if (geometry.imageId !== payload.imageId || geometry.kind !== payload.cropKind
+          || JSON.stringify(geometry.imageIds) !== JSON.stringify(payload.imageIds)
+          || ['x', 'y', 'width', 'height'].some(key => !Number.isFinite(geometry[key]) || geometry[key] !== payload.target[key])) throw new Error('Payload differs from frozen plan');
+        planIdentity = plan.id + ':' + crop.id;
+        if (this.#seen.has(id) && this.#seen.get(id).planIdentity !== planIdentity) throw new Error('Payload changed committed plan');
+        const original = payload.operation.memberIds;
+        const emptyReturn = payload.deposited === true && payload.stage === 'return' && width === 0 && height === 0 && payload.arrivalCovered === false;
+        if (emptyReturn ? !original.every(id => payload.helpers.includes(id))
+          : JSON.stringify(original) !== JSON.stringify(payload.helpers)) throw new Error('Payload helper membership changed');
+        const before = this.#seen.get(id)?.payload;
+        if (before && JSON.stringify([before.operation.key, before.operation.memberIds, before.imageIds, before.cropKind])
+          !== JSON.stringify([payload.operation.key, original, payload.imageIds, payload.cropKind])) throw new Error('Payload operation or source identity changed');
       }
       for (const helper of payload.helpers ?? []) {
         const owner = this.#helperOwners.get(helper);
@@ -103,7 +134,7 @@ export class PayloadObservations {
       if (kind) observations.push({ kind, at: sample.at, page: page.page, payloadId: id, stable: true, before, after: payload });
       // Retain terminal identities for this bounded run; never silently forget a retired payload.
       if (!previous && this.#seen.size >= 4096) throw new Error('Payload observation history limit reached');
-      this.#seen.set(id, { page: page.page, payload, retired });
+      this.#seen.set(id, { page: page.page, payload, retired, planIdentity });
       for (const helper of payload.helpers ?? []) this.#helperOwners.set(helper, id);
     }
     return observations;

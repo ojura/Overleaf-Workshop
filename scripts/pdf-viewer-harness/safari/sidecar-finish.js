@@ -1,5 +1,6 @@
 (async options => {
   // @include awake-idle.mjs
+  // @include scene-ready.mjs
   const probe = window.__spomenarSidecarProbe;
   if (!probe || probe.token !== options?.token) throw new Error('The short observation owner does not match');
   const { result, budget, sample, dispose, restore, guard, sleep, panel, panelState } = probe;
@@ -16,12 +17,7 @@
     && image.computed.display !== 'none' && image.computed.visibility !== 'hidden';
   const useful = state => state.documentVisible && state.canvases.length > 0 && state.missing.length === 0
     && state.canvases.every(page => displayed(page.preview) || page.state === 3 && displayed(page.native));
-  const ready = state => state.prefetchIdle === true && settled(state) && useful(state)
-    && state.canvases.every(page => page.state !== 1 && page.state !== 2)
-    && !state.pending.length && !state.pendingFetches && state.source?.state !== 'loading'
-    && !state.source?.pending && !state.source?.decoding && !state.source?.queuedDecodes
-    && !state.raw?.activeOperations && !state.raw?.pendingRequests && !state.raw?.imageDecodeActive && !state.raw?.imageDecodeQueued
-    && !state.raw?.externalImageActive && !state.raw?.externalImageQueued && !state.raw?.externalImagePaused;
+  const ready = state => sceneReady({ ...state, sceneMoving: moving() });
   const nextFrame = maximum => new Promise((resolve, reject) => {
     let id, timer;
     const end = (at, error) => { cancelAnimationFrame(id); clearTimeout(timer); error ? reject(error) : resolve(at); };
@@ -239,7 +235,11 @@
   }
   try {
     guard();
-    result.deliverySettled = await settle(budget.settleMs);
+    while (performance.now() < finishDeadline && !ready(sample())) { guard(); await sleep(80); }
+    guard();
+    if (performance.now() >= finishDeadline || !ready(sample())) throw new Error('Incomplete selected delivery scene before finish deadline');
+    if (!selectedDeliveryComplete(result.active, sample())) throw new Error('Selected delivery did not finish with a delivered committed crop');
+    result.deliverySettled = { settled: true };
     if (!result.interrupted) {
       await checkPanel();
       guard(); await restore(); guard();

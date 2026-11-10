@@ -110,7 +110,7 @@ async def run_short(wire, recorder, settings, budget, stop_event, checkpoint, *,
         attempted = True
         receipt['initializationAttemptedHostMs'] = budget.now() * 1000
         value = await invoke(wire, load_browser_source('sidecar-active.js'), options,
-            budget, stop_event, SHORT_BUDGET_MS['activeMs'] / 1000)
+            budget, stop_event, budget.remaining('work'))
         if not isinstance(value, dict) or value.get('token') != token:
             raise RuntimeError('Short observation did not acknowledge its token')
         receipt['active'] = value

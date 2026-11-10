@@ -194,7 +194,7 @@ def load_browser_source(filename):
     if filename not in {'sustained.js', 'release-guard.js', 'sidecar-active.js', 'sidecar-finish.js', 'manual-observe.js'}:
         raise ValueError('Unknown maintained browser probe')
     source = (ASSETS / filename).read_text()
-    for module in ('payload-observation.mjs', 'awake-idle.mjs'):
+    for module in ('scene-ready.mjs', 'photo-evidence.mjs', 'payload-observation.mjs', 'awake-idle.mjs'):
         marker = '// @include ' + module
         count = source.count(marker)
         if count > 1:

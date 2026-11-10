@@ -11,7 +11,7 @@ const embedded = phone.split('  // BEGIN portable payload observer\n')[1]?.split
   .split('\n').map(line => line.startsWith('  ') ? line.slice(2) : line).join('\n').trim();
 const start = phone.indexOf('  const sample = () => {'), end = phone.indexOf('  const probe = {', start);
 assert.ok(start >= 0 && end > start, 'the actual phone sample function is available');
-const pixelStart = phone.indexOf('  const displayed =');
+const pixelStart = phone.indexOf('  const displayed =', phone.indexOf('// END scene readiness'));
 const sampleSource = phone.slice(pixelStart < 0 ? start : pixelStart, end);
 const oldPixelStart = phone.indexOf('        if (!entry.firstPixels');
 const oldPixelEnd = phone.indexOf('        for (const page of state.robots.pages)', oldPixelStart);
@@ -35,7 +35,8 @@ function harness() {
   let at = 0;
   const context = { current: () => true, dispose: () => {}, payloads: new Map(), eventSequences: new Set(),
     result: { startedAt: 0, events: [], samples: [], refinements: [], retirements: [] },
-    container: { scrollWidth: 400, scrollHeight: 800, clientWidth: 400, clientHeight: 700 },
+    panel: () => null,
+    container: { dataset: {}, scrollWidth: 400, scrollHeight: 800, clientWidth: 400, clientHeight: 700 },
     performance: { now: () => ++at }, latest: undefined, nodes: [],
     viewer: { currentPageNumber: event.page }, getComputedStyle: node => node.computed };
   const view = { renderingState: 3, canvas: { isConnected: false, width: 396, height: 564 },
@@ -44,7 +45,7 @@ function harness() {
   context.prefetch = { snapshot: () => context.latest };
   context.document = { visibilityState: 'visible', querySelectorAll: selector => context.nodes.filter(value => selector.split(',')
     .some(name => value.classList.contains(name.slice(1)))) };
-  vm.runInNewContext((embedded ?? portable) + '\nconst payloadObservations = new PayloadObservations();\n'
+  vm.runInNewContext((embedded ?? portable) + '\nconst payloadObservations = new PayloadObservations({ historical: true });\n'
     + sampleSource + oldPixelSource + '\nglobalThis.phoneSample = sample; globalThis.phoneFirstPixels = recordFirstPixels;', context);
   return { result: context.result, view, setPreview(node) { context.preview = node; },
     firstPixels(state, target = event.page, entry = { at: 0 }) { context.phoneFirstPixels(state, target, entry); return entry; },

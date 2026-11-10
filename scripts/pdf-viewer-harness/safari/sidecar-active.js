@@ -1,5 +1,7 @@
 (async options => {
   // @include payload-observation.mjs
+  // @include photo-evidence.mjs
+  // @include scene-ready.mjs
   if (window.__spomenarSidecarProbe || window.__spomenarSustainedProbe) throw new Error('A phone observation is already active');
   const token = options?.token, expected = options?.document, targets = options?.pages ?? [99, 100];
   const budget = options?.budget;
@@ -51,7 +53,7 @@
       columnX: Number.parseFloat(getComputedStyle(container).getPropertyValue('--pdf-document-column-x')) || 0 };
   };
   result.savedPanel = panelState();
-  let timer, disposed = false, changed = false, closing = false, panelRestore, restoreInFlight, closeInFlight;
+  let activeTimer, timer, disposed = false, changed = false, closing = false, panelRestore, restoreInFlight, closeInFlight;
   const current = () => app.pdfDocument === pdfDocument && viewer.pdfDocument === pdfDocument
     && new URL(app.url, location.href).href === pdfUrl.href;
   const stop = event => {
@@ -67,7 +69,7 @@
   const types = ['touchstart', 'touchmove', 'gesturestart', 'gesturechange', 'pointerdown', 'keydown', 'wheel'];
   const dispose = () => {
     if (disposed) return;
-    disposed = true; clearTimeout(timer); request.abort();
+    disposed = true; clearTimeout(timer); clearTimeout(activeTimer); request.abort();
     for (const type of types) document.removeEventListener(type, stop, true);
     window.removeEventListener('orientationchange', stop); document.removeEventListener('visibilitychange', hidden);
     window.removeEventListener('error', error); window.removeEventListener('unhandledrejection', error);
@@ -144,7 +146,7 @@
     if (robots.activeActors > robots.maxActors || robots.cargoBytes > robots.maxCargoBytes
         || robots.spriteBytes > robots.maxSpriteBytes || robots.retainedBytes !== robots.cargoBytes + robots.spriteBytes
         || state.previewBytes > state.cacheLimits.maxPreviewBytes || state.previewSource?.pending > 2) throw new Error('Phone resource limit exceeded');
-    const next = { at: performance.now(), documentVisible: document.visibilityState === 'visible', prefetchIdle: state.idle,
+    const next = { sceneMoving: panel()?.host.dataset.panelMoving === 'true' || container.dataset.pdfColumnMoving === 'true', at: performance.now(), documentVisible: document.visibilityState === 'visible', prefetchIdle: state.idle,
       page: viewer.currentPageNumber, visible: state.visible, missing: state.visibleMissing,
       pending: state.pending, pendingFetches: state.performance.pendingFetchCount, source: state.previewSource,
       imagePages: state.imagePages, raw: state.rangeCache, robots,
@@ -169,7 +171,7 @@
     abort(supplied, reason = 'host-stop') {
       if (supplied !== token) return { ok: false };
       if (closeInFlight) return closeInFlight;
-      closing = true; clearTimeout(timer); request.abort();
+      closing = true; clearTimeout(timer); clearTimeout(activeTimer); request.abort();
       closeInFlight = Promise.resolve().then(async () => {
         try { await restore(); } catch (error) { result.cleanupError = String(error.message || error); }
         finally { result.interrupted = true; result.interruption ??= String(reason).slice(0, 160); dispose();
@@ -185,6 +187,9 @@
     result.failure ??= 'Short observation work deadline expired';
     void probe.abort(token, 'watchdog');
   }, budget.workMs);
+  const activeDeadline = result.startedAt + budget.activeMs;
+  let activePhase = 'metadata';
+  activeTimer = setTimeout(() => request.abort(), Math.max(0, activeDeadline - performance.now()));
   async function json(url, cap) {
     const response = await fetch(url, { cache: 'no-cache', credentials: 'same-origin', signal: request.signal });
     if (!response.ok || response.redirected || !response.body) {
@@ -221,37 +226,42 @@
     if (pages.size !== 2 || [...pages.values()].some(page => !page.imageRegions?.length)) throw new Error('Priority photo regions are missing');
     result.identity = { path: expectedPath, key: manifest.document.key, sha256: manifest.document.sha256,
       bytes: manifest.document.size, pages: manifest.document.pageCount };
-    const deadline = performance.now() + 10000;
+    const deadline = activeDeadline;
     while (!result.interrupted && performance.now() < deadline && prefetch.snapshot().previewSource?.state !== 'ready') {
       sample(); await sleep(100);
     }
     guard();
     if (prefetch.snapshot().previewSource?.state !== 'ready') throw new Error('Published preview source is not ready');
     if (!app.isInitialViewSet) throw new Error('The PDF initial view has not settled');
+    activePhase = 'initial saved scene';
+    while (performance.now() < activeDeadline && !sceneReady(sample())) { guard(); await sleep(80); }
+    if (performance.now() >= activeDeadline || !sceneReady(sample())) throw new Error('Incomplete initial saved scene at active deadline');
+    guard();
     changed = true;
     prefetch.setRobotsEnabled(true); prefetch.setDiagnosticsEnabled(false);
     for (const target of targets) {
       guard();
       const entry = { page: target, at: performance.now() }; result.entries.push(entry);
+      activePhase = 'target scene ' + target;
       viewer.scrollPageIntoView({ pageNumber: target });
-      const deadline = performance.now() + 10000;
+      const deadline = activeDeadline;
       while (!result.interrupted && performance.now() < deadline) {
         guard();
         const state = sample();
         recordFirstPixels(state, target, entry);
         for (const page of state.robots.pages) {
           if (!pages.has(page.page)) continue;
-          const payload = page.payloads.find(value => value.imageId && value.progress >= 0.28 && value.progress < 0.68);
-          if (!payload) continue;
-          const region = pages.get(page.page)?.imageRegions.find(value => value.id === payload.imageId);
-          if (!region) throw new Error('Cargo photo is not from the exact priority atlas');
+          for (const payload of page.payloads) {
+          if (!payload.imageId || payload.progress < 0.28 || payload.progress >= 0.68) continue;
+          const evidence = photoEvidence(payload, page.page, state.robots, pages.get(page.page), viewer.pagesRotation || 0);
+          if (!evidence) continue;
           const cargo = [...document.querySelectorAll('.pdfDocumentRobotCargo')].filter(node => node.dataset.payload === String(payload.id));
           const picture = cargo[0]?.getBoundingClientRect(), area = container.getBoundingClientRect();
           const width = picture && Math.max(0, Math.min(picture.right, area.right) - Math.max(picture.left, area.left));
           const height = picture && Math.max(0, Math.min(picture.bottom, area.bottom) - Math.max(picture.top, area.top));
           if (!picture || width * height < picture.width * picture.height * 0.8) continue;
           const transit = document.querySelector('.pdfDocumentRobotTransit'), style = transit && getComputedStyle(transit);
-          result.active = { at: state.at, page: page.page, payload, photoRegion: region,
+          result.active = { at: state.at, page: page.page, payload, ...evidence,
             helpers: page.actors.filter(actor => actor.payloadId === payload.id),
             cargo: cargo.map(node => ({ width: node.width, height: node.height, bytes: node.width * node.height * 4,
               rect: node.getBoundingClientRect().toJSON(), pointerEvents: getComputedStyle(node).pointerEvents })),
@@ -259,14 +269,19 @@
             transit: { position: style?.position, contain: style?.contain, width: style?.width, height: style?.height,
               insideScroller: !!transit && container.contains(transit) },
             viewer: area.toJSON(), viewport: { width: innerWidth, height: innerHeight, dpr: devicePixelRatio } };
+          clearTimeout(activeTimer);
           return result;
+          }
         }
+        if (state.visible.includes(state.page) && state.visible.includes(target) && state.canvases.some(page => page.page === target) && sceneReady(state)) break;
         await sleep(80);
       }
+      if (performance.now() >= activeDeadline) throw new Error('Incomplete ' + activePhase + ' at active deadline');
     }
+    clearTimeout(activeTimer);
     result.noContentAwarePayloadObserved = !result.interrupted;
   } catch (error) {
-    if (!result.interrupted && !closing) result.failure = String(error.message || error);
+    if (!result.interrupted && !closing) result.failure = performance.now() >= activeDeadline ? 'Incomplete ' + activePhase + ' at active deadline' : String(error.message || error);
     try { await restore(); } catch (cleanup) { result.cleanupError = String(cleanup.message || cleanup); }
     dispose(); if (window.__spomenarSidecarProbe === probe) delete window.__spomenarSidecarProbe;
   }
