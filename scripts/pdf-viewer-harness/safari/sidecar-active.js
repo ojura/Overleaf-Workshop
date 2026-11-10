@@ -7,9 +7,9 @@
       || !/^[a-f0-9]{64}$/.test(expected.sha256) || !Number.isSafeInteger(expected.bytes) || expected.bytes <= 0
       || !Number.isInteger(expected.pages) || !Array.isArray(targets) || targets.length !== 2
       || new Set(targets).size !== 2 || targets.some(page => !Number.isInteger(page) || page < 1 || page > expected.pages)
-      || !budget || ['activeMs', 'captureMs', 'finishMs', 'workMs', 'restoreMs', 'settleMs', 'awakeMs'].some(key => !Number.isSafeInteger(budget[key]) || budget[key] <= 0)
+      || !budget || ['activeMs', 'captureMs', 'finishMs', 'workMs', 'restoreMs', 'settleMs'].some(key => !Number.isSafeInteger(budget[key]) || budget[key] <= 0)
       || budget.workMs !== budget.activeMs + budget.captureMs + budget.finishMs) {
-    throw new Error('Invalid sidecar observation options');
+    throw new Error('Invalid short observation options');
   }
   const pageUrl = new URL(expected.pageUrl), pdfUrl = new URL(expected.pdfUrl), here = new URL(location.href);
   if (here.origin !== pageUrl.origin || here.pathname !== pageUrl.pathname || here.search !== pageUrl.search
@@ -144,9 +144,10 @@
     if (robots.activeActors > robots.maxActors || robots.cargoBytes > robots.maxCargoBytes
         || robots.spriteBytes > robots.maxSpriteBytes || robots.retainedBytes !== robots.cargoBytes + robots.spriteBytes
         || state.previewBytes > state.cacheLimits.maxPreviewBytes || state.previewSource?.pending > 2) throw new Error('Phone resource limit exceeded');
-    const next = { at: performance.now(), documentVisible: document.visibilityState === 'visible',
+    const next = { at: performance.now(), documentVisible: document.visibilityState === 'visible', prefetchIdle: state.idle,
       page: viewer.currentPageNumber, visible: state.visible, missing: state.visibleMissing,
-      pending: state.pending, pendingFetches: state.performance.pendingFetchCount, source: state.previewSource, raw: state.rangeCache, robots,
+      pending: state.pending, pendingFetches: state.performance.pendingFetchCount, source: state.previewSource,
+      imagePages: state.imagePages, raw: state.rangeCache, robots,
       payloadArtifacts: collectPayloadArtifacts(document),
       effectNodes: Object.fromEntries(['Arrival', 'Cargo', 'CargoUnderlay', 'Vehicle', 'Cleaner'].map(name =>
         [name, document.querySelectorAll('.pdfDocumentRobot' + name).length])),

@@ -55,8 +55,16 @@ The expected entry can instead be supplied as `--entry-sha <64 lowercase hex>` w
 | --- | --- | --- |
 | `sustained` | `--scenario sustained --seconds 600 --start-mode tap` | Example extended budget: twelve stages over a selected 600 seconds of motion, 12 seconds of dwell, then exact awake restoration. |
 | `traverse` | `--scenario traverse --start-mode immediate` | Two 60→90→65 passes with 11 seconds of actual motion, bounded settling, eight seconds of robots-on idle and four seconds off. |
-| `short` | `--scenario short` | Actual photo delivery, screenshot, refinement/retirement and finite Motion Lab drag/resize/dock checks. |
+| `short` | `--scenario short --pages 101 102` | Actual photo delivery, screenshot, refinement/retirement and finite Motion Lab drag/resize/dock checks. |
 | `manual` | `--scenario manual --seconds 120` | Passive observations while the user performs actual pinch, fling, selection, rotation and toolbar/lab actions. |
+
+For the short scenario, `--pages` selects exactly two distinct positive PDF page numbers within the configured document. Each must have photo regions in that edition's atlas. Omitting the option preserves the default pair, 99 and 100. Choose a pair that includes a page whose first delivery has not already been admitted in the current document. Cached pixels can supply a first delivery, but returning to a previously handled page does not replay it. The probe records the first qualifying photo payload from either target; it does not require both pages to admit an episode.
+
+```sh
+"$SAFARI_PYTHON" scripts/pdf-viewer-harness/safari/safari_owner.py command \
+  --execute --work-dir "$SAFARI_WORK" --id short-1 run \
+  --prefix short-1 --scenario short --pages 101 102
+```
 
 For a passive manual session on the same retained connection:
 
@@ -104,7 +112,7 @@ The activation deadline reserves separate time for restoration, bootstrap/guard 
 
 Keep the short and manual scenarios separately named: two page 60 to 90 to 65 traversals for reversal/recovery, robots enabled/disabled and natural idle; a first-delivery/refinement/retirement check; and actual trusted pinch, fling, text selection, orientation, toolbar and lab manipulation. Programmatic scrollTop and viewer scale changes do not exercise those trusted gesture paths.
 
-The short scenario waits for the panel and column movement flags to clear, then checks stable measured geometry on consecutive animation frames. This includes the quiet period for a pending destination, stationary approach, parked continuation and the panel's wait for the column. Floating placement may shift the column in either direction: a feasible placement must preserve the whole visible page/spread and a 16 px panel gap; an already-clear column or a layout with no feasible side keeps zero displacement. Each settle has a six-second failure limit. The host defines one shared budget of 35 seconds for delivery observation, five seconds for capture and 60 seconds for finish, totaling a 100-second work watchdog, with 15 seconds reserved for recovery. These are limits, not inserted delays. Normal finish, abort and watchdog share awaited panel restoration before reader/focus cleanup; trusted input ends that restoration without overwriting the user's state.
+The short scenario waits for the panel and column movement flags to clear, then checks stable measured geometry on consecutive animation frames. This includes the quiet period for a pending destination, stationary approach, parked continuation and the panel's wait for the column. Floating placement may shift the column in either direction: a feasible placement must preserve the whole visible page/spread and a 16 px panel gap; an already-clear column or a layout with no feasible side keeps zero displacement. Each panel settle has a six-second failure limit. The host defines one shared budget of 35 seconds for delivery observation, five seconds for capture and 60 seconds for finish, totaling a 100-second work watchdog, with 15 seconds reserved for recovery. Final readiness and its 1,500 ms continuous awake-idle interval share the remaining finish deadline. Preview requests, native decodes and external-image work must drain while useful pixels remain displayed; resumed rendering or a frame gap over 100 ms restarts the idle interval. Terminal result collection uses the remaining host work budget, keeping the later restoration and recorder-cleanup allowances available. These are limits, not inserted delays. Normal finish, abort and watchdog share awaited panel restoration before reader/focus cleanup; trusted input ends that restoration without overwriting the user's state.
 
 For manual participation, start the passive scenario and perform a natural fling followed by reversal, a pinch in and out, text selection and dismissal, device rotation and return, toolbar zoom/sidebar changes, then Motion Lab drag/resize/dock and robot toggles. The recorder labels actual trusted events and captures the visual viewport, toolbar geometry, displayed canvases, payload transitions and resource counters. It does not manufacture those events or restore over the user's chosen final state. Typed text and selected document content are not recorded.
 
@@ -144,6 +152,100 @@ For a completed PDF range, compare actual `Network.dataReceived` body lengths wi
 The native recorder accumulates counters over the full observed interval. Its detailed tails hold the newest 512 memory samples, 512 CPU samples, 1,024 requests, 32 pressure events and 64 errors. The dropped-tail counters describe detail removed from those arrays; the accumulated native totals remain. Report which client aggregates were actually recovered when the page or inspection channel becomes unavailable.
 
 Compare fresh runs with the same initial document, page, zoom, viewport, cache state and power conditions. Preserve the exact executed entry identity in the receipt. Differences in those conditions belong beside the comparison. Readiness from an available low-resolution preview and readiness of the final native canvas are separate observations.
+
+## Completed short check, 10 November 2026
+
+The retained USB owner completed `final-short-2` with status `passed` in 23.168 seconds. The preceding `source-readiness-2` check verified the executing entry at `/spomenar/assets/spomenar.mjs`: 339,059 bytes, SHA-256 `77d5bd3981a323ad65b6a2c1e9cfce230fd2fabeca078183b80f9fff55431221`. Its binding was `single-main-frame-unique-entry`, its source matched, and source inspection finished in 92.5 ms without navigation. Source-check cleanup succeeded, the target stayed unchanged, and all nine source-check RPCs completed, including domain disable and object-group release.
+
+The public book was 1,608,358,464 bytes and 460 pages, SHA-256 `6abb3d0b13d2970bca0f613287a6ea5d30280be14435b5c681b8ca8bd61d24d0`. The configured pair was PDF pages 101/102. The first target, PDF page 101, supplied the active delivery, so this short scenario completed there. The owner inspected the saved screenshot: printed page 90 / PDF page 101 showed the sharp photograph grid and the complete drone-and-lynx crop being carried with the robot. The screenshot was `short-9072edf826361bc6d74f5e0b.png`, 2,044,738 bytes.
+
+### Delivery and refinement
+
+Useful displayed native pixels appeared 438 ms after navigation. Four initial samples reported page 101 missing, at 203, 296, 377 and 464 ms after browser observation started. All 84 samples recorded a visible document. The final restored viewport had useful displayed pixels and an empty missing-page list.
+
+The active delivery was payload 8, image `p101-i7`, using L-UGV 12 and heavy quad 13 as an airlift team. The cargo raster was 240 by 136 pixels, 130,560 bytes, with pointer events disabled. Six directly observed, stable refinement comparisons followed the payload counter through 0, 1, 2, 3, 5, 6 and 8. Every comparison preserved the payload deadline, helper IDs and target. Those six comparisons captured eight counter increments because two comparisons spanned more than one refinement. A stable `retired-between-samples` observation then recorded the same payload deposited, its operation fulfilled, its raster reduced to zero by zero and its arrival cover removed. Delivery settling completed 1,358 ms into the finish wait.
+
+The following changes compare the first recorded sample, taken after navigation, with final idle. They are sampled changes within this run; the final values also include activity before this capture.
+
+| Counter | First sample | Final idle | Sampled change |
+| --- | ---: | ---: | ---: |
+| Episodes | 2 | 3 | 1 |
+| Delivered fragments | 4 | 5 | 1 |
+| Refinements | 8 | 16 | 8 |
+| Operation admissions | 4 | 5 | 1 |
+| Operation candidates | 181 | 247 | 66 |
+| Commit checks | 10 | 13 | 3 |
+| Narrative records | 4 | 5 | 1 |
+| Admission time | 7 ms | 12 ms | 5 ms |
+| Renderer frames | 452 | 834 | 382 |
+| Renderer paint time | 159 ms | 282 ms | 123 ms |
+
+Maximum paint time was 6 ms. Recorded samples peaked at two actors against the four-actor limit, 130,560 cargo bytes against 524,288, and 202,920 sprite bytes against 204,800. Combined retained robot bytes peaked at 333,480, with one active payload and one arrival cover. The snapshot's cumulative cargo peak was 273,920 bytes; this capture's sampled cargo maximum was 130,560 bytes.
+
+### Panel checks and restoration
+
+All five panel trials preserved PDF page 101, scale 0.6, scroll top 57,600, scroll left zero, rotation zero, scroll mode zero, spread mode zero and sidebar zero. Each completed with panel and column motion stopped. The viewport was 402 by 654 pixels; the reader was 402 by 548; scroll dimensions stayed 402 by 264,960.
+
+| Trial | Panel rectangle: x, y, width, height | Column translation | Settle time |
+| --- | --- | ---: | ---: |
+| Drag | 54, 80, 340, 554 | 0 px | 22 ms |
+| Resize | 54, 80, 320, 534 | 0 px | 14 ms |
+| Dock left | 8, 8, 320, 638 | 1.5 px | 3,726 ms |
+| Dock right | 74, 8, 320, 638 | -1.5 px | 3,715 ms |
+| Float | 54, 80, 320, 534 | 0 px | 3,715 ms |
+
+Panel opening settled in 2 ms, floating geometry restoration in 12 ms, and panel restoration in 16 ms. The restored floating rectangle, 54, 92, 340, 554, exactly matched the panel's geometry before the trials. Motion Lab was initially disabled with `savedPanel: null`, and was disabled again after restoration.
+
+The final reading state exactly matched the saved state: page 100, scale value `"0.6"` and numeric scale 0.6, rotation zero, scroll mode zero, spread mode zero, sidebar zero, scroll top 56,874, scroll left zero, robots enabled and Motion Lab disabled. Document focus was false before and after; active-element restoration succeeded. `restored`, `focusRestored`, `restorationExact`, `probeRemoved` and `observersRemoved` were true. The restored viewport was visible and displayed.
+
+### Awake idle and resource release
+
+Readiness observation lasted 8,350 ms and included 1,501 ms of continuous awake idle, with a 23 ms maximum frame gap and zero added robot frames. `awake` and `quiet` were true. At completion the robot renderer was unscheduled at frame 834. Active episodes, actors, payloads, arrival covers and refinements were zero, as were cargo, sprite and retained robot bytes. Arrival, cargo, underlay, vehicle and cleaner DOM node counts were zero. Prefetch was idle with empty pending work and zero pending fetches.
+
+The preview source was ready with zero pending requests, decodes or queued decodes. Preview memory was 2,217,984 bytes against its 8,388,608-byte limit. The visible restored native canvases on pages 99/100 were each 1197 by 1698 pixels, giving 16,260,048 bytes of visible native raster storage at four bytes per pixel. Those visible pages had no preview canvases.
+
+External image jobs finished with zero active, queued or paused jobs. Encoded, coefficient, reserved, partial-raster, native-raster and native-input byte counts were zero. Native decode active and queued counts were zero; concurrency and its cumulative peak were one. The cumulative external reservation peak was 66,118,208 bytes against 67,108,864, and cumulative native input peak was 11,358,968 against 67,108,864.
+
+From the first sample to final idle, native decode completions increased from 54 to 89; external image bytes from 217,758,928 to 332,950,872; first scans from 28 to 50; image revisions from 82 to 139; and final decode time from 9,745 to 14,746 ms. Fallbacks increased from 34 to 51: 13 additional shared-state-budget fallbacks and four state-budget fallbacks. These sampled changes include loading the restored reader. Image failed and cancelled totals stayed zero.
+
+### Native recording and reporting differences
+
+Recording covered initialization through collection of the terminal result, with 46 memory and 46 CPU samples. Every dropped-detail counter was zero. Pressure and error lists were empty. Network, CPU tracking, memory and memory tracking each had their corresponding stop or disable acknowledgement. The run was uninterrupted, with empty browser error, validation failure, cleanup error and RPC error lists. The owner retained the attachment through result and image review.
+
+| Native measurement | Value |
+| --- | ---: |
+| Elapsed host operation | 23.167539 seconds |
+| Elapsed short workload | 23.159298 seconds |
+| Memory first / peak / last | 141,113,344 / 553,993,216 / 455,145,472 bytes |
+| JavaScript category peak | 166,399,219 bytes |
+| JIT category peak | 8,732,672 bytes |
+| Image category peak | 60,817,408 bytes |
+| Page category peak | 404,638,025 bytes |
+| Other category peak | 16,678,912 bytes |
+| Layer category peak | 0 bytes |
+| CPU peak | 102.399986% |
+| Weighted CPU time | 13.490017 CPU-seconds |
+| CPU sample span | 22.661765 seconds |
+| Last CPU sample | 7.4% |
+| Maximum native sample gap | 505.207 ms |
+| Maximum host sample gap | 527.305 ms |
+
+Category peaks occurred at different times and are separate from total memory peak. Native CPU can exceed 100% across cores.
+
+The recorder observed 60 configuration/preview requests: two configuration and 58 preview requests, all completed. Peak pending was one and final active requests were zero. Status counts were three 200 responses, sixteen 206 responses and forty-one 304 responses. Raw request records reported zero failed or cancelled requests; range validation failures were zero. The existing PDF data was cached, so this request count describes configuration and preview traffic.
+
+| Network reporting path | Bytes |
+| --- | ---: |
+| Encoded `dataReceived` | 6,930,327 |
+| Decoded `dataReceived` | 115,802,078 |
+| Completion `responseBodyBytesReceived` | 6,930,327 |
+| Completion `responseBodyDecodedSize` | 6,922,614 |
+| Advertised body lengths | 6,922,614 |
+| Completion response headers | 2,724 |
+
+The decoded data-event total differed from the completion decoded-size and advertised-length totals. The recorder also retained 35 unattributed data events. These reporting paths remain separate; they are not added together or substituted for one another. The application's sampled external-image byte increase, 115,191,944 bytes, has a different interval and accounting scope from the native network totals.
+
+This completed short check closes the outstanding acceptance item. After result and image review, the owner closed through the maintained command with process exit zero, `attached: false` and an empty `closeErrors` list; PID 1235665 exited. The result and recording remain outside Git as `final-short-2-result.json` and `final-short-2-recording.json`, the source-check receipt as `source-readiness-2-result.json`, and the screenshot as `short-9072edf826361bc6d74f5e0b.png`.
 
 ## Observed partial baselines, 5 November 2026
 

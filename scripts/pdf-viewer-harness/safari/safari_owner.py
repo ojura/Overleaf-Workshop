@@ -14,7 +14,7 @@ import time
 
 import safari_runner as core
 from safari_owned_run import run_owned
-from safari_settings import Entry, REPOSITORY, Settings, Worker, add_arguments, add_worker_arguments, prefix, read_json
+from safari_settings import Entry, REPOSITORY, Settings, Worker, add_arguments, add_worker_arguments, prefix, read_json, short_page_pair
 
 SAFARI = 'com.apple.mobilesafari'
 READINESS = '''(() => {
@@ -40,7 +40,7 @@ def command_request(value):
     action = value.get('action')
     fields = {
         'status': set(), 'stop': set(), 'close': set(), 'resume': set(),
-        'run': {'prefix', 'seconds', 'startMode', 'startWaitMs', 'scenario'},
+        'run': {'prefix', 'seconds', 'startMode', 'startWaitMs', 'scenario', 'pages'},
         'activate': {'prefix', 'sourceOnly', 'entrySha', 'entryBytes', 'workerUrl', 'workerSha', 'workerBytes'},
         'recover': {'prefix', 'receiptPrefix'}, 'transport-check': {'prefix'},
     }
@@ -64,6 +64,10 @@ def command_request(value):
             raise ValueError('Tap start is available for sustained and traverse scenarios')
         if scenario == 'manual' and seconds > 300:
             raise ValueError('Manual observation is bounded to 300 seconds')
+        if 'pages' in value:
+            if scenario != 'short':
+                raise ValueError('Page selection is supported only for the short scenario')
+            result['pages'] = short_page_pair(value['pages'])
         result.update(seconds=seconds, startMode=mode, startWaitMs=wait, scenario=scenario)
     if action == 'activate':
         if type(value.get('sourceOnly', False)) is not bool:
@@ -189,13 +193,18 @@ class Owner:
             if not worker.url.startswith(settings.document.origin + '/'):
                 raise ValueError('The worker artifact must belong to the selected page origin')
             settings = dataclasses.replace(settings, worker=worker)
+        pages = None
+        if 'pages' in request:
+            if request['action'] != 'run' or request.get('scenario') != 'short':
+                raise ValueError('Page selection is supported only for the short scenario')
+            pages = short_page_pair(request['pages'], page_count=settings.document.pages)
         self.stop_event = asyncio.Event()
         self.job_request = request
         self.job = asyncio.create_task(self.operation(self.session, self.inspector, settings,
             request['prefix'], self.stop_event, operation=request['action'],
             receipt_prefix=request.get('receiptPrefix'), seconds=request.get('seconds', 600),
             start_mode=request.get('startMode', 'immediate'), start_wait_ms=request.get('startWaitMs', 60000),
-            source_only=request.get('sourceOnly', False), scenario=request.get('scenario', 'sustained')))
+            source_only=request.get('sourceOnly', False), scenario=request.get('scenario', 'sustained'), pages=pages))
         self.publish(status='running', command=request['id'], action=request['action'], prefix=request['prefix'])
 
     async def handle(self, request):
@@ -389,6 +398,8 @@ def parse_args(argv=None):
     command.add_argument('--start-mode', choices=['immediate', 'tap'])
     command.add_argument('--start-wait-ms', type=int)
     command.add_argument('--scenario', choices=['sustained', 'traverse', 'short', 'manual'])
+    command.add_argument('--pages', nargs=2, type=int, metavar=('FIRST', 'SECOND'),
+                         help='Two distinct PDF page numbers for the short scenario')
     command.add_argument('--source-only', action='store_true', default=None)
     command.add_argument('--entry-file')
     command.add_argument('--entry-sha')
@@ -410,7 +421,7 @@ def main(argv=None):
     request = {'id': args.id, 'action': args.action}
     for argument, field in [('prefix', 'prefix'), ('receipt_prefix', 'receiptPrefix'), ('seconds', 'seconds'),
             ('start_mode', 'startMode'), ('start_wait_ms', 'startWaitMs'), ('scenario', 'scenario'),
-            ('source_only', 'sourceOnly')]:
+            ('source_only', 'sourceOnly'), ('pages', 'pages')]:
         value = getattr(args, argument)
         if value is not None:
             request[field] = value

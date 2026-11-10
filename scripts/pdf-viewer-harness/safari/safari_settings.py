@@ -18,6 +18,16 @@ def prefix(value):
     return value
 
 
+def short_page_pair(value, *, page_count=None):
+    if not isinstance(value, list) or len(value) != 2 or \
+            any(type(page) is not int or not 1 <= page <= 2 ** 53 - 1 for page in value) or \
+            value[0] == value[1]:
+        raise ValueError('Short scenario pages must be two distinct positive integers supported by the browser')
+    if page_count is not None and any(page > page_count for page in value):
+        raise ValueError('Short scenario pages exceed the document page count')
+    return list(value)
+
+
 def read_json(filename, limit=65536):
     filename = pathlib.Path(filename)
     if filename.stat().st_size > limit:

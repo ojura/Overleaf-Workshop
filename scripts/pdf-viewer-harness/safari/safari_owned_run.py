@@ -12,7 +12,7 @@ import secrets
 
 import safari_runner as core
 from safari_activation import Budget as SourceBudget, guard_evaluate, release_check
-from safari_settings import ASSETS, load_browser_source, prefix as validate_prefix
+from safari_settings import ASSETS, load_browser_source, prefix as validate_prefix, short_page_pair
 
 _active = set()
 
@@ -93,7 +93,7 @@ async def recover_recorded(wire, recorder, settings, prior_prefix, budget, check
 
 async def run_owned(session, inspector, settings, prefix, stop_event, *, operation='run',
                     receipt_prefix=None, seconds=600, start_mode='immediate', start_wait_ms=60000,
-                    source_only=False, scenario='sustained'):
+                    source_only=False, scenario='sustained', pages=None):
     """Perform one command while the caller retains the native connection."""
     validate_prefix(prefix)
     if operation not in {'run', 'recover', 'activate', 'transport-check'}:
@@ -107,6 +107,10 @@ async def run_owned(session, inspector, settings, prefix, stop_event, *, operati
         raise ValueError('Unknown maintained scenario')
     if scenario == 'manual' and seconds > 300:
         raise ValueError('Manual observation is bounded to 300 seconds')
+    if pages is not None:
+        if operation != 'run' or scenario != 'short':
+            raise ValueError('Page selection is supported only for the short scenario')
+        pages = short_page_pair(pages, page_count=settings.document.pages)
     if id(session) in _active:
         raise RuntimeError('This inspector session already has an owned operation')
     settings.prepare_work()
@@ -202,7 +206,7 @@ async def run_owned(session, inspector, settings, prefix, stop_event, *, operati
             return await run_diagnostic(wire, session, budget, stop_event, checkpoint, recorder)
         if scenario == 'short':
             from safari_short_run import run_short
-            return await run_short(wire, recorder, settings, budget, stop_event, checkpoint)
+            return await run_short(wire, recorder, settings, budget, stop_event, checkpoint, pages=pages)
         if scenario == 'manual':
             from safari_short_run import run_manual
             return await run_manual(wire, recorder, settings, seconds, budget, stop_event, checkpoint)

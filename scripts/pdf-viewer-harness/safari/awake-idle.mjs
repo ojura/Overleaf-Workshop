@@ -25,7 +25,13 @@ export async function observeAwakeIdle({ now, deadline, sample, canContinue, rea
         intervalStart = undefined; idle.observedMs = 0;
       }
     }
-  } catch (error) { idle.error = String(error.message || error); }
+  } catch (error) {
+    if (now() < deadline) idle.error = String(error.message || error);
+  }
+  if (!idle.awake && now() >= deadline) {
+    idle.deadlineExpired = true;
+    idle.error = 'Continuous awake idle was not reached before the observation deadline';
+  }
   idle.durationMs = now() - began;
   idle.framesAdded = intervalFrames === undefined ? 0 : frameCount(state) - intervalFrames;
   return { state, idle };

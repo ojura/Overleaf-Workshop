@@ -6,14 +6,14 @@ import json
 import secrets
 
 import safari_runner as core
-from safari_settings import load_browser_source
+from safari_settings import load_browser_source, short_page_pair
 
 SIDECAR_API = '__spomenarSidecarProbe'
 # Nine finite panel/column settles can take about 33.3 seconds, followed by
 # the existing delivery/reader settling and awake proof. These are failure
 # limits, not delays: the browser finishes each action from observed state.
 SHORT_BUDGET_MS = {'activeMs': 35000, 'captureMs': 5000, 'finishMs': 60000, 'restoreMs': 15000,
-                   'settleMs': 6000, 'awakeMs': 4000}
+                   'settleMs': 6000}
 SHORT_BUDGET_MS['workMs'] = sum(SHORT_BUDGET_MS[key] for key in ('activeMs', 'captureMs', 'finishMs'))
 
 
@@ -51,10 +51,15 @@ async def invoke(wire, source, options, budget, stop_event, cap, *, phase='work'
                 await task
 
 
-async def run_short(wire, recorder, settings, budget, stop_event, checkpoint):
+async def run_short(wire, recorder, settings, budget, stop_event, checkpoint, *, pages=None):
+    if pages is not None:
+        pages = short_page_pair(pages, page_count=settings.document.pages)
     token = secrets.token_hex(12)
     receipt = {'status': 'running', 'scenario': 'short', 'token': token,
                'budgetMs': dict(SHORT_BUDGET_MS), 'cleanupErrors': [], 'screenshots': []}
+    options = {'token': token, 'document': settings.document.browser(), 'budget': dict(SHORT_BUDGET_MS)}
+    if pages is not None:
+        receipt['pages'] = options['pages'] = pages
     domains = []
     attempted = False
 
@@ -104,8 +109,7 @@ async def run_short(wire, recorder, settings, budget, stop_event, checkpoint):
         receipt['recordingReadyHostMs'] = budget.now() * 1000
         attempted = True
         receipt['initializationAttemptedHostMs'] = budget.now() * 1000
-        value = await invoke(wire, load_browser_source('sidecar-active.js'),
-            {'token': token, 'document': settings.document.browser(), 'budget': dict(SHORT_BUDGET_MS)},
+        value = await invoke(wire, load_browser_source('sidecar-active.js'), options,
             budget, stop_event, SHORT_BUDGET_MS['activeMs'] / 1000)
         if not isinstance(value, dict) or value.get('token') != token:
             raise RuntimeError('Short observation did not acknowledge its token')
@@ -115,8 +119,10 @@ async def run_short(wire, recorder, settings, budget, stop_event, checkpoint):
             raise RuntimeError('Short observation stopped before its delivery sample')
         receipt['screenshots'].append(await core.bounded(snapshot(), budget, 'work',
             SHORT_BUDGET_MS['captureMs'] / 1000, 'short delivery capture'))
+        # The browser owns its finish limit. Collect its terminal reply within
+        # the host work deadline, preserving the separate recovery allowance.
         value = await invoke(wire, load_browser_source('sidecar-finish.js'), {'token': token},
-                             budget, stop_event, SHORT_BUDGET_MS['finishMs'] / 1000)
+                             budget, stop_event, budget.remaining('work'))
         if not isinstance(value, dict) or value.get('token') != token:
             raise RuntimeError('Short finish did not acknowledge its token')
         receipt['result'] = value
@@ -129,7 +135,9 @@ async def run_short(wire, recorder, settings, budget, stop_event, checkpoint):
             ('restoration', value.get('restorationExact') is not True or value.get('focusRestored') is not True),
             ('displayed-awake-idle', not core.restored_ready(value)),
             ('observer-cleanup', value.get('observersRemoved') is not True),
-            ('frontend-errors', bool(value.get('errors')) or bool(value.get('failure')) or bool(value.get('cleanupError'))),
+            ('probe-failure', bool(value.get('failure'))),
+            ('probe-cleanup', bool(value.get('cleanupError'))),
+            ('frontend-errors', bool(value.get('errors'))),
             ('native-recording', bool(recorder.counts['errors'])),
         ) if failed]
         receipt['status'] = 'passed' if not receipt['validationFailures'] else 'failed'

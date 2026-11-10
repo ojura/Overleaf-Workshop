@@ -170,6 +170,33 @@ class OwnedAdapterTests(unittest.IsolatedAsyncioTestCase):
             await adapter.run_owned(self.session, self.inspector, self.settings, 'owned', self.stop)
         self.assert_owner_retained(result)
 
+    async def test_short_page_pair_reaches_runner_and_retains_the_same_owner(self):
+        import safari_short_run
+        run_short = mock.AsyncMock(return_value={'status': 'passed'})
+        with mock.patch.object(safari_short_run, 'run_short', run_short):
+            result = await adapter.run_owned(self.session, self.inspector, self.settings, 'owned', self.stop,
+                                            scenario='short', pages=[101, 102])
+        run_short.assert_awaited_once()
+        self.assertEqual(run_short.call_args.kwargs['pages'], [101, 102])
+        self.assertIs(run_short.call_args.args[0], self.wires[0])
+        self.assertIs(run_short.call_args.args[2], self.settings)
+        self.assert_owner_retained(result)
+
+    async def test_invalid_short_pages_fail_before_source_inspection_or_work_files(self):
+        for options in ({'scenario': 'short', 'pages': [1, self.settings.document.pages + 1]},
+                        {'scenario': 'short', 'pages': [True, 2]},
+                        {'scenario': 'short', 'pages': ['1', 2]},
+                        {'scenario': 'short', 'pages': [1, 1]},
+                        {'scenario': 'sustained', 'pages': [101, 102]},
+                        {'scenario': 'manual', 'pages': [101, 102]},
+                        {'operation': 'activate', 'scenario': 'short', 'pages': [101, 102]}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                await adapter.run_owned(self.session, self.inspector, self.settings, 'owned', self.stop, **options)
+        self.source_check.assert_not_awaited()
+        self.assertEqual(self.wires, [])
+        self.assertEqual(list(self.work.iterdir()), [])
+        self.assertNotIn(id(self.session), adapter._active)
+
 
 class RecoveryWire(OwnedWire):
     def __init__(self, *args):

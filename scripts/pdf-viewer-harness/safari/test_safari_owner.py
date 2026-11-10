@@ -46,9 +46,9 @@ class OwnerTests(unittest.IsolatedAsyncioTestCase):
         with contextlib.suppress(asyncio.CancelledError):
             await self.receiver
 
-    async def start(self):
+    async def start(self, **options):
         self.owner.publish()
-        owner_module.submit(self.settings.work, {'id': 'run-one', 'action': 'run', 'prefix': 'recording'})
+        owner_module.submit(self.settings.work, {'id': 'run-one', 'action': 'run', 'prefix': 'recording', **options})
         request = self.owner.consume()
         self.assertFalse((self.owner.control / 'request.json').exists())
         await self.owner.handle(request)
@@ -59,6 +59,22 @@ class OwnerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(FileExistsError):
             owner_module.submit(self.settings.work, {'id': 'run-one', 'action': 'run', 'prefix': 'other'})
         self.assertEqual(len(self.calls), 1)
+
+    async def test_short_page_pair_reaches_the_owned_operation(self):
+        await self.start(scenario='short', pages=[101, 102])
+        self.assertEqual(len(self.calls), 1)
+        self.assertIs(self.calls[0][0], self.session)
+        self.assertEqual(self.calls[0][4]['pages'], [101, 102])
+
+    async def test_page_pair_outside_the_document_is_rejected_before_a_job_starts(self):
+        operation = self.owner.operation = mock.AsyncMock(return_value={'status': 'passed', 'attached': True})
+        request = {'id': 'out-of-range', 'action': 'run', 'prefix': 'recording', 'scenario': 'short',
+                   'pages': [1, self.settings.document.pages + 1]}
+        with self.assertRaisesRegex(ValueError, 'page'):
+            await self.owner.start_operation(request)
+        operation.assert_not_called()
+        self.assertIsNone(self.owner.job)
+        self.inspector.open_app.assert_not_awaited()
 
     async def test_running_status_is_cached_and_stop_does_not_issue_competing_native_calls(self):
         await self.start()
@@ -177,3 +193,30 @@ class OwnerCliTests(unittest.TestCase):
         for scenario, seconds in [('sustained', 600), ('traverse', 60), ('short', 60), ('manual', 120)]:
             value = owner_module.command_request({'id': 'one', 'action': 'run', 'prefix': 'run', 'scenario': scenario})
             self.assertEqual(value['seconds'], seconds)
+
+    def test_explicit_short_pages_round_trip_from_cli_to_the_command_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = pathlib.Path(directory) / 'owner'
+            control.mkdir()
+            (control / 'state.json').write_text('{}')
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(owner_module.main(['command', '--execute', '--work-dir', directory,
+                    '--id', 'explicit-pages', 'run', '--prefix', 'recording', '--scenario', 'short',
+                    '--pages', '101', '102']), 0)
+            request = json.loads((control / 'request.json').read_text())
+            self.assertEqual(request['pages'], [101, 102])
+            self.assertEqual(request['scenario'], 'short')
+            self.assertEqual(request['seconds'], 60)
+
+    def test_page_pairs_are_strict_and_belong_only_to_short_runs(self):
+        request = {'id': 'one', 'action': 'run', 'prefix': 'run', 'scenario': 'short', 'pages': [101, 102]}
+        accepted = owner_module.command_request(request)
+        self.assertEqual(accepted['pages'], request['pages'])
+        self.assertIsNot(accepted['pages'], request['pages'])
+        for pages in (None, [], [1], [1, 2, 3], [1, 1], [0, 2], [-1, 2], [True, 2],
+                      [1.0, 2], ['1', 2], [1, 2 ** 53], '1,2', (1, 2), {'first': 1, 'second': 2}):
+            with self.subTest(pages=pages), self.assertRaises(ValueError):
+                owner_module.command_request({**request, 'pages': pages})
+        for scenario in ('sustained', 'traverse', 'manual'):
+            with self.subTest(scenario=scenario), self.assertRaises(ValueError):
+                owner_module.command_request({**request, 'scenario': scenario})

@@ -4,16 +4,16 @@ import vm from 'node:vm';
 import { loadBrowserSource } from './browser-source.mjs';
 
 const source = loadBrowserSource('sidecar-finish.js');
-const budget = { activeMs: 35000, captureMs: 5000, finishMs: 60000, workMs: 100000, restoreMs: 15000,
-  settleMs: 6000, awakeMs: 4000 };
+const budget = { activeMs: 35000, captureMs: 5000, finishMs: 60000, workMs: 100000, restoreMs: 15000, settleMs: 6000 };
 const clone = value => JSON.parse(JSON.stringify(value));
 const box = (x, y, width, height) => ({ x, y, left: x, top: y, width, height,
   right: x + width, bottom: y + height, toJSON() { return { ...this, toJSON: undefined }; } });
 
 function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 0, pageLeft = 300, pageWidth = 300,
   stallDock, insufficientFloat = false, interruptDuringRestore = false, recoverFloatFrom,
-  measurements = false, recoveryMeasurements, contentSizing = false, toggleDelay = 0 } = {}) {
-  let now = 0, serial = 0, columnX = 0, animation, column, pointer, callback, restoring;
+  measurements = false, recoveryMeasurements, contentSizing = false, toggleDelay = 0,
+  restoredWork, withholdRestoredFrames = false } = {}) {
+  let now = 0, serial = 0, columnX = 0, animation, column, pointer, callback, restoring, restoredAt;
   let closed = false, interrupted = false, stalled = false, recovery = false, recoveryPositioned = false;
   let measurementsOpen = measurements, recoveryDisclosureChanged = false;
   const timers = new Map(), overlaps = [], history = [];
@@ -129,10 +129,11 @@ function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 
     setDiagnosticsEnabled(value) { reading.lab = value; if (!value) { animation = undefined; column = undefined;
       delete host.dataset.panelMoving; delete container.dataset.pdfColumnMoving; columnX = 0; }
       else if (Math.abs(columnX - plan(currentDock, rect)) > 0.01) moveColumn(plan(currentDock, rect)); } };
-  const sample = () => ({ documentVisible: true, robots: { activeActors: 0, activePayloads: 0, retainedBytes: 0,
+  const sample = () => ({ documentVisible: true, prefetchIdle: true, robots: { activeActors: 0, activePayloads: 0, retainedBytes: 0,
       scheduled: false, frames: 0 }, effectNodes: {}, missing: [], pending: [], pendingFetches: 0,
     canvases: [{ page: saved.page, state: 3, native: { connected: true, width: 300, height: 600,
-      rect: { width: 300, height: 600 }, computed: { display: 'block', visibility: 'visible' } } }] });
+      rect: { width: 300, height: 600 }, computed: { display: 'block', visibility: 'visible' } } }],
+    ...(restoredAt === undefined ? {} : restoredWork?.(now - restoredAt)) });
   const probe = { token: result.token, result, budget, sample, guard, sleep: delay => new Promise(resolve => timeout(resolve, delay)),
     panel: () => reading.lab ? controls : undefined, panelState, readState: () => ({ ...reading }),
     setPanelRestore(value) { callback = value; },
@@ -155,6 +156,7 @@ function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 
         await callback?.({ guard: () => guard(true), deadline: now + budget.restoreMs });
         if (result.interrupted) return false;
         Object.assign(reading, saved); pdfPrefetch.setDiagnosticsEnabled(saved.lab); result.focusRestored = true;
+        restoredAt ??= now;
         recovery = false; return true;
       })().finally(() => { restoring = undefined; });
       return restoring;
@@ -165,7 +167,8 @@ function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 
     document: { visibilityState: 'visible', hasFocus: () => false }, innerWidth: readerRight, innerHeight: 700,
     performance: { now: () => now }, PointerEvent: class { constructor(type, fields) { Object.assign(this, fields, { type }); } },
     setTimeout: timeout, clearTimeout: id => timers.delete(id),
-    requestAnimationFrame: fn => timeout(() => fn(now), 16), cancelAnimationFrame: id => timers.delete(id) };
+    requestAnimationFrame: fn => withholdRestoredFrames && restoredAt !== undefined ? ++serial : timeout(() => fn(now), 16),
+    cancelAnimationFrame: id => timers.delete(id) };
   const finish = vm.runInNewContext(source, context);
   return { result, history, overlaps, original, originalFloat, panelState, reading, timers, probe, toggleListeners,
     async run() {
@@ -181,8 +184,67 @@ function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 
       assert.ok(done, 'the finite finish must terminate');
       if (failure) throw failure;
       return result;
-    }, get floating() { return floating; }, get now() { return now; } };
+    }, get floating() { return floating; }, get now() { return now; }, get restoredAt() { return restoredAt; } };
 }
+
+test('restored progressive work can resume after a ready frame and settle beyond four seconds', async () => {
+  const h = fixture({ restoredWork(elapsed) {
+    const busy = elapsed >= 800 && elapsed < 8000;
+    return { prefetchIdle: !busy, raw: { imageDecodeActive: Number(busy), externalImageActive: Number(busy) } };
+  } }), result = await h.run();
+  assert.equal(result.failure, undefined);
+  assert.equal(result.restorationExact, true);
+  assert.equal(result.idle.awake, true);
+  assert.ok(result.idle.durationMs >= 9500, 'readiness regression must earn a fresh observed idle interval');
+  assert.ok(result.idle.observedMs >= 1500);
+  assert.ok(h.now <= budget.finishMs, 'completion stays inside the existing shared finish deadline');
+  assert.equal(h.timers.size, 0);
+});
+
+test('restored idle waits for reader, preview, native painting and every external image work state', async () => {
+  const native = { connected: true, width: 300, height: 600, rect: { width: 300, height: 600 },
+    computed: { display: 'block', visibility: 'visible' } };
+  const pending = [
+    ['reader readiness', busy => ({ prefetchIdle: !busy })],
+    ['preview loading', busy => ({ source: { state: busy ? 'loading' : 'ready' } })],
+    ['native painting', busy => ({ canvases: [{ page: 46, state: busy ? 1 : 3, native, preview: native }] })],
+    ...['externalImageActive', 'externalImageQueued', 'externalImagePaused'].map(key =>
+      [key, busy => ({ raw: { [key]: Number(busy) } })]),
+  ];
+  for (const [name, state] of pending) {
+    const h = fixture({ restoredWork: elapsed => state(elapsed < 6000) }), result = await h.run();
+    assert.equal(result.failure, undefined, name);
+    assert.equal(result.idle.awake, true, name);
+    assert.ok(result.idle.durationMs >= 7500, name + ' must finish before continuous idle earns credit');
+    assert.equal(result.restorationExact, true, name);
+    assert.equal(h.timers.size, 0, name);
+  }
+});
+
+test('persistent native work reports the shared readiness deadline instead of a missing frame', async () => {
+  const h = fixture({ restoredWork: () => ({ prefetchIdle: false, raw: { imageDecodeActive: 1 } }) });
+  const result = await h.run();
+  assert.equal(result.idle.awake, false);
+  assert.equal(result.idle.deadlineExpired, true);
+  assert.match(result.idle.error, /deadline/i);
+  assert.doesNotMatch(result.idle.error, /frame did not arrive/i);
+  assert.ok(result.idle.maxGapMs <= 100, 'the reader continued producing frames');
+  assert.ok(h.now >= budget.finishMs);
+  assert.ok(h.now <= budget.finishMs + 16);
+  assert.equal(result.restorationExact, true);
+  assert.equal(result.observersRemoved, true);
+  assert.equal(h.timers.size, 0);
+});
+
+test('a missing restoration frame is reported before the shared deadline', async () => {
+  const h = fixture({ withholdRestoredFrames: true }), result = await h.run();
+  assert.equal(result.idle.awake, false);
+  assert.notEqual(result.idle.deadlineExpired, true);
+  assert.match(result.idle.error, /frame did not arrive/i);
+  assert.ok(h.now < budget.finishMs);
+  assert.equal(result.restorationExact, true);
+  assert.equal(h.timers.size, 0);
+});
 
 test('finish waits through stationary column phases and the subsequent panel glide before each trial', async () => {
   const h = fixture({ dock: 'right' }), result = await h.run();
@@ -273,7 +335,7 @@ test('viewport-clamped floating recovery handles growth-leftward and shrink-righ
   }
 });
 
-test('sidecar recovery awaits queued toggle and content motion before saved geometry', async () => {
+test('reader recovery awaits queued toggle and content motion before saved geometry', async () => {
   for (const measurements of [false, true]) {
     const h = fixture({ floatX: 140, floatWidth: 320, measurements, recoveryMeasurements: !measurements,
       contentSizing: true, toggleDelay: 80, recoverFloatFrom: [100, 70, 360, measurements ? 260 : 420], stallDock: 'right' });
