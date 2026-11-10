@@ -205,7 +205,6 @@ interface RobotBody {
     spriteBytes: number;
     spriteScale: number;
     spriteDensity: number;
-    spriteKey: string;
     pose: RobotArtworkActor;
     departing: boolean;
     port?: RobotDispatchPort;
@@ -687,33 +686,74 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         return { ...ROBOT_ARTWORK_SIZE, scale: Math.max(bodyScale(vehicle, policy), origin?.scale ?? 0) };
     }
 
-    function spriteKey(vehicle: RobotVehicle, policy: Presentation, origin?: RobotDispatchPoint): string {
-        return [bodyScale(vehicle, policy), origin?.scale ?? 0, policy.spriteDpr].join(',');
+
+    function cleanerSpriteShape(policy: Presentation) {
+        return { ...ASAP_CLEANER_ARTWORK_SIZE, scale: policy.cleanerScale };
     }
 
-    function resizeSprites(actors: readonly RobotBody[], policy: Presentation): boolean {
-        if (!actors.length || actors.every(actor => actor.spriteKey === spriteKey(actor.vehicle, policy, actor.origin))) { return true; }
-        const oldBytes = actors.reduce((sum, actor) => sum + actor.spriteBytes, 0);
-        const plan = robotSpriteRasterPlan(actors.map(actor => spriteShape(actor.vehicle, policy, actor.origin)),
-            policy.spriteDpr, policy.maxSpriteBytes - spriteBytes + oldBytes);
-        if (!plan) { return false; }
-        // Release the replaced cohort before growing any backing. Array position follows
-        // actual body identity, including independent bodies of the same structural type.
-        for (const actor of actors) {
+    /** Existing, staged and proposed bodies share one plan with pending quality artwork. */
+    function planBodySprites(targets: readonly RobotBody[], policy: Presentation,
+        fresh: readonly { vehicle: RobotVehicle; origin?: RobotDispatchPoint }[] = [], requireCleaner = false) {
+        const reserveCleaner = requireCleaner || qualityReactions.pending > 0 && !qualityScenes.size && !qualityPreparedActors;
+        const actors = [...new Set(reserveCleaner ? [...allActors(), ...targets] : targets)];
+        const changing = new Set(targets);
+        const shapes = actors.map(actor => changing.has(actor) ? spriteShape(actor.vehicle, policy, actor.origin)
+            : { ...ROBOT_ARTWORK_SIZE, scale: Math.max(actor.spriteScale, actor.origin?.scale ?? 0) });
+        shapes.push(...fresh.map(actor => spriteShape(actor.vehicle, policy, actor.origin)));
+        if (!shapes.length && !reserveCleaner) {
+            return { actors, changing, plan: { density: policy.spriteDpr, sprites: [], bytes: 0, limited: false },
+                cleaner: undefined, fresh: [], failed: new Set<RobotBody>() };
+        }
+        const chargedBodies = actors.reduce((sum, actor) => sum + actor.spriteBytes, 0);
+        const available = policy.maxSpriteBytes - (spriteBytes - chargedBodies);
+        let plan = robotSpriteRasterPlan(reserveCleaner ? [...shapes, cleanerSpriteShape(policy)] : shapes,
+            policy.spriteDpr, available);
+        const cleaner = reserveCleaner && plan ? plan.sprites[shapes.length] : undefined;
+        // A required cohort keeps its ordinary detail when even the minimum joint plan
+        // cannot include an optional wipe. Final pixels then publish directly.
+        if (!plan && reserveCleaner && !requireCleaner) { plan = robotSpriteRasterPlan(shapes, policy.spriteDpr, available); }
+        if (!plan) { return; }
+        return { actors, changing, plan, cleaner,
+            fresh: plan.sprites.slice(actors.length, actors.length + fresh.length), failed: new Set<RobotBody>() };
+    }
+
+    function applyBodySprites(allocation: NonNullable<ReturnType<typeof planBodySprites>>, policy: Presentation): boolean {
+        const changed = allocation.actors.filter((actor, index) => {
+            const size = allocation.plan.sprites[index];
+            return actor.sprite.width !== size.width || actor.sprite.height !== size.height;
+        });
+        for (const actor of changed) {
+            try { if (!actor.sprite.getContext('2d')) { allocation.failed.add(actor); } }
+            catch { allocation.failed.add(actor); }
+        }
+        if (allocation.failed.size) { retireFailedBodies(allocation.failed); return false; }
+        // Release changed backings before growing the replacement cohort, charging the
+        // actual rounded dimensions while preserving each body's identity and pose.
+        for (const actor of changed) {
             actor.sprite.width = actor.sprite.height = 0;
             spriteBytes -= actor.spriteBytes; actor.spriteBytes = 0;
         }
-        try {
-            actors.forEach((actor, index) => {
-                const size = plan.sprites[index];
-                actor.sprite.width = size.width; actor.sprite.height = size.height;
-                actor.spriteBytes = size.bytes; spriteBytes += size.bytes;
-                actor.spriteScale = bodyScale(actor.vehicle, policy); actor.spriteDensity = size.density;
-                actor.spriteKey = spriteKey(actor.vehicle, policy, actor.origin);
-                drawVehicle(actor);
-            });
-            return true;
-        } catch { return false; }
+        allocation.actors.forEach((actor, index) => {
+            const size = allocation.plan.sprites[index];
+            if (allocation.changing.has(actor)) { actor.spriteScale = bodyScale(actor.vehicle, policy); }
+            actor.spriteDensity = size.density;
+            if (!changed.includes(actor)) { return; }
+            actor.sprite.width = size.width; actor.sprite.height = size.height;
+            actor.spriteBytes = size.bytes; spriteBytes += size.bytes;
+            try { drawVehicle(actor); } catch { allocation.failed.add(actor); }
+        });
+        if (allocation.failed.size) { retireFailedBodies(allocation.failed); }
+        return allocation.failed.size === 0;
+    }
+
+    function resizeSprites(actors: readonly RobotBody[], policy: Presentation): boolean {
+        if (!actors.length) { return true; }
+        // Pending quality can change after staging without changing the presentation key.
+        const requested = [...actors];
+        const allocation = planBodySprites(requested, policy);
+        if (!allocation) { return false; }
+        return applyBodySprites(allocation, policy) || requested.every(actor => !allocation.failed.has(actor)
+            && actor.sprite.width > 0 && actor.sprite.height > 0);
     }
 
     function resizeSprite(actor: RobotBody, policy: Presentation): boolean {
@@ -960,11 +1000,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const old = rasterSize(previous.canvas, planned.geometry, payload?.mode ?? 'solo', oldPolicy, previous.projection);
         const next = payload ? rasterSize(candidate.canvas, planned.geometry, payload.mode, policy, candidate.projection) : undefined;
         if (!old || payload && (!next || next.width < old.width || next.height < old.height)) { return { reason: 'invalid-raster' }; }
-        const density = policy.cleanerScale * policy.spriteDpr;
-        const sw = Math.ceil(ASAP_CLEANER_ARTWORK_SIZE.width * density), sh = Math.ceil(ASAP_CLEANER_ARTWORK_SIZE.height * density);
-        const spriteCost = sw * sh * RGBA_BYTES;
+        const allocation = planBodySprites([], policy, [], true);
+        if (!allocation?.cleaner) { return { reason: 'sprite-limit' }; }
+        const { width: sw, height: sh, bytes: spriteCost } = allocation.cleaner;
         if (cargoBytes + old.bytes + (next?.bytes ?? 0) > policy.maxCargoBytes) { return { reason: 'cargo-limit' }; }
-        if (spriteBytes + spriteCost > policy.maxSpriteBytes) { return { reason: 'sprite-limit' }; }
         let coarse: HTMLCanvasElement | undefined, sharp: HTMLCanvasElement | undefined, sprite: HTMLCanvasElement | undefined;
         let preparedScene: QualityScene | undefined;
         const layer = doc.createElement('div'); layer.className = 'pdfDocumentRobotQuality'; layer.setAttribute('aria-hidden', 'true');
@@ -984,7 +1023,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         try {
             coarse = copy(previous.canvas, old, 'pdfDocumentRobotQualityCoarse');
             if (next) { sharp = copy(candidate.canvas, next, 'pdfDocumentRobotQualitySharp'); }
-            sprite = createCanvas(); sprite.width = sw; sprite.height = sh;
+            sprite = createCanvas();
+            if (!sprite.getContext('2d') || !applyBodySprites(allocation, policy)) { throw new Error('Quality sprite allocation unavailable'); }
+            sprite.width = sw; sprite.height = sh;
             decorate(sprite, 'pdfDocumentRobotQualityCleaner', '6'); sprite.dataset.quality = String(id);
             sprite.dataset.page = String(candidate.pageNumber); sprite.dataset.imageId = planned.geometry.imageId ?? '';
             const actorId = ++serial;
@@ -1122,7 +1163,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const actor: RobotBody = {
                 id: ++serial, vehicle, started: now(),
                 sprite, spriteBytes: size.bytes, spriteScale: bodyScale(vehicle, policy), spriteDensity: size.density,
-                spriteKey: spriteKey(vehicle, policy, origin), departing: false, port: reserved.port, origin,
+                departing: false, port: reserved.port, origin,
                 pose: { vehicle, x: ROBOT_ARTWORK_SIZE.width / 2, y: ROBOT_ARTWORK_SIZE.height / 2,
                     vx: 50, vy: 0, activity: 'navigate', job: 'delivery', temperament: 1,
                     phase: random.range(0, Math.PI * 2), distance: random.range(0, 80), needsHelp: false,
@@ -1156,10 +1197,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         failed?: (reason: BodyAdmissionFailure) => void): RobotBody | undefined {
         const reserved = reserveBody(used, accepts, acceptsOrigin, failed);
         if (!reserved) { return; }
-        const plan = robotSpriteRasterPlan([spriteShape(reserved.vehicle, policy, reserved.origin)],
-            policy.spriteDpr, policy.maxSpriteBytes - spriteBytes);
-        if (!plan) { failed?.('allocation'); releaseReservation(reserved); return; }
-        return allocateBody(reserved, policy, plan.sprites[0], failed);
+        const allocation = planBodySprites([], policy, [reserved]);
+        if (!allocation || !applyBodySprites(allocation, policy)) { failed?.('allocation'); releaseReservation(reserved); return; }
+        return allocateBody(reserved, policy, allocation.fresh[0], failed);
     }
 
     function prepareCourier(payload: Payload, area: Geometry, used: ReadonlySet<RobotVehicle>, policy: Presentation,
@@ -2490,8 +2530,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     function paintRetiring(scene: RetiringScene, at: number, viewport: ReturnType<typeof viewportBounds>, policy: Presentation,
         destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, placements: BodyPlacement[], captionObstacles: SceneObstacle[]): void {
         const timing = DOCUMENT_ROBOT_LIMITS.replacement;
-        for (let index = scene.pieces.length - 1; index >= 0; index--) {
-            const piece = scene.pieces[index], payload = piece.payload;
+        for (const piece of [...scene.pieces].reverse()) {
+            if (!scene.pieces.includes(piece)) { continue; }
+            const payload = piece.payload;
             const pagePolicy = pagePresentation(policy, piece.area);
             try {
                 const elapsed = at - payload.started - payload.delay;
@@ -2499,7 +2540,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 const progress = payload.progress = clamp(elapsed / payload.duration, 0, 1);
                 if (progress >= RETURN_START) { resolveRemovalPayload(payload); }
                 if (progress >= 1 || actorCount() > policy.maxActors || !resizeSprites(payload.helpers, pagePolicy)) {
-                    dropRetiringPiece(scene, index, progress < 1); continue;
+                    const position = scene.pieces.indexOf(piece);
+                    if (position >= 0) { dropRetiringPiece(scene, position, progress < 1); }
+                    continue;
                 }
                 // PDF.js resets scrollTop before restoring its initial view. Only this short
                 // retired scene stays in captured viewport coordinates; normal cargo is page-local.
@@ -2568,7 +2611,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                         look: exit.x < target.x ? -1 : 1, phase: 'parked', fixed: true, remainingMs: (1 - progress) * payload.duration,
                         group: payload.id, pages: [piece.page], payload });
                 }
-            } catch { stats.rejected++; dropRetiringPiece(scene, index); }
+            } catch {
+                stats.rejected++; const position = scene.pieces.indexOf(piece);
+                if (position >= 0) { dropRetiringPiece(scene, position); }
+            }
         }
     }
 
@@ -2986,6 +3032,11 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             paintCaption(displayed.filter(value => value.opacity > 0.2), reactions, viewport, policy, displayedObstacles);
             paintWorkLabels(displayed, viewport, displayedObstacles); return;
         }
+        retireFailedBodies(failed);
+        paintWorkLabels(displayed.filter(value => !failed.has(value.body)), viewport, displayedObstacles);
+    }
+
+    function retireFailedBodies(failed: ReadonlySet<RobotBody>): void {
         if (columnPull && failed.has(columnPull.body)) { clearColumnPull(); }
         for (const episode of [...episodes.values()]) {
             for (let index = episode.payloads.length - 1; index >= 0; index--) {
@@ -3013,7 +3064,6 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 work.phase = 'parked'; work.message = advanceMessage(work); work.text.setText(work.message);
             }
         }
-        paintWorkLabels(displayed.filter(value => !failed.has(value.body)), viewport, displayedObstacles);
     }
 
     function paint(at: number, scheduled = false): void {
@@ -3068,14 +3118,15 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 const area = areas.get(episode);
                 if (!area) { dropEpisode(episode, true); continue; }
                 const pagePolicy = pagePresentation(policy, area);
-                for (let index = episode.payloads.length - 1; index >= 0; index--) {
-                    const payload = episode.payloads[index];
+                for (const payload of [...episode.payloads].reverse()) {
+                    if (!episode.payloads.includes(payload)) { continue; }
                     try {
                         if (actorCount() <= policy.maxActors && resizeSprites(payload.helpers, pagePolicy)
                             && paintPayload(payload, episode.page, area, at, destinations, viewport, placements, captionObstacles, pagePolicy)) { continue; }
                     } catch { stats.rejected++; }
                     dropPayload(payload);
-                    episode.payloads.splice(index, 1);
+                    const position = episode.payloads.indexOf(payload);
+                    if (position >= 0) { episode.payloads.splice(position, 1); }
                 }
                 if (!episode.payloads.length) { dropEpisode(episode, false); }
             }
@@ -3215,20 +3266,20 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 prepared.push(actor);
             }
             const fresh = prepared.filter(actor => actor.reservation);
-            // An entirely staged crew needs no fresh bytes, even at the exact joint cap.
-            const raster = fresh.length ? robotSpriteRasterPlan(fresh.map(actor => spriteShape(actor.vehicle, policy, actor.origin)),
-                policy.spriteDpr, policy.maxSpriteBytes - spriteBytes) : undefined;
-            if (fresh.length && !raster) {
+            const stagedBodies = staged.map(actor => actor.body);
+            const allocation = planBodySprites(qualityReactions.pending > 0 ? stagedBodies : [], policy, fresh);
+            if (!allocation || !applyBodySprites(allocation, policy)) {
+                for (const actor of [...staged]) {
+                    if (allocation?.failed.has(actor.body)) { discardDamagedStaged(actor); }
+                }
                 for (const member of fresh) {
-                    if (!robotSpriteRasterPlan([spriteShape(member.vehicle, policy, member.origin)], policy.spriteDpr, policy.maxSpriteBytes - spriteBytes)) {
-                        unavailable.add(member.vehicle);
-                    }
+                    if (!planBodySprites(stagedBodies, policy, [member])) { unavailable.add(member.vehicle); }
                 }
                 rejectResource(); rollback(); return;
             }
             let freshIndex = 0;
             for (const member of prepared) {
-                const body = member.waiting?.body ?? allocateBody(member.reservation!, policy, raster!.sprites[freshIndex++]);
+                const body = member.waiting?.body ?? allocateBody(member.reservation!, policy, allocation.fresh[freshIndex++]);
                 if (!body) { unavailable.add(member.vehicle); rejectResource(); rollback(); return; }
                 payload.helpers.push(courierDraft(body, payload, area, member.waiting?.point));
             }

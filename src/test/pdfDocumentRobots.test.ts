@@ -5759,4 +5759,112 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.callbacks.size + f.timers.size, 0);
     });
 
+    for (const staged of [false, true]) {
+        it(`funds real compact DPR3 photo quality together with ${staged ? 'unchanged staged' : 'fresh'} live delivery sprites`, () => {
+            const f = fixture({ maxActors: 4, device: 'mobile', encounterRandom: () => 0.99 });
+            Object.assign(f.window, { devicePixelRatio: 3, innerWidth: 414, innerHeight: 896 });
+            f.container.rect = { left: 0, top: 32, width: 414, height: 864 };
+            const leased = new Set<string>();
+            const origin = { x: 200, y: 130, scale: 0.64 };
+            f.api.setDispatchOrigin({ reserve(vehicle: string) {
+                if (!['quad', 'tiltwing'].includes(vehicle) || leased.has(vehicle)) { return; }
+                leased.add(vehicle); return origin;
+            }, destination: () => origin, release(vehicle: string) { assert.ok(leased.delete(vehicle)); } });
+            const p = publication(f); p.page.pageElement.rect = { left: 7.5, top: 100, width: 399, height: 566 };
+            p.encounter.pageProjection = { content: { x: 0, y: 0, width: 399, height: 566 }, clip: { x: 0, y: 0, width: 399, height: 566 } };
+            p.candidate.canvas.width = 135; p.candidate.canvas.height = 192;
+            p.candidate.projection = { width: 135, height: 192, pageToRaster: [135, 0, 0, 192, 0, 0] };
+            p.encounter.imageRegions = [0, 1, 2].map(index => ({ id: 'compact-photo-' + index, resourceId: 'x' + (5 + index),
+                x: index === 1 ? .12179443341006087 : .5081779361128561,
+                y: index === 0 ? .6572468658656471 : .34033928353341597, width: .3695460698597801, height: .14647176372281367 }));
+            let stagedIds: number[] = [];
+            if (staged) {
+                f.api.setVisibleWork([work([p.page])]); f.finish();
+                stagedIds = f.api.snapshot().advance.flatMap((value: any) => value.actors.map((actor: any) => actor.id));
+                assert.ok(stagedIds.length > 0);
+            }
+            f.api.setVisiblePages([p.page.pageNumber]); f.api.preparePublication(p.candidate, p.encounter).commit(); f.tick(300);
+            const before = f.api.snapshot();
+            assert.strictEqual(before.maxSpriteBytes, 204800); assert.strictEqual(before.maxCargoBytes, 524288);
+            assert.ok(before.activeActors > 0 && before.activeActors < 4, 'real delivery leaves an actor for quality');
+            assert.ok(before.pages.some((page: any) => page.payloads.some((payload: any) => payload.rasterWidth > 0)));
+            if (staged) { assert.ok(before.pages.flatMap((page: any) => page.actors).some((actor: any) => stagedIds.includes(actor.id)), 'staged body identity is reused: ' + JSON.stringify({ stagedIds, actors: before.pages.flatMap((page: any) => page.actors).map((actor: any) => ({ id: actor.id, vehicle: actor.vehicle })) })); }
+            const payloads = before.pages.flatMap((page: any) => page.payloads).map((payload: any) => ({ id: payload.id, deadline: payload.deadline, helpers: payload.helpers }));
+            const next = finalPublication(p);
+            next.coverage.resources = [0, 1, 2].map(index => ({ objectId: 'compact-object-' + index, imageId: 'x' + (5 + index), covered: true, final: true, failed: false }));
+            const transaction = f.api.preparePublication(next, p.encounter, p.candidate);
+            p.candidate.canvas.replaceWith(next.canvas); transaction.commit();
+            const began = f.api.snapshot();
+            assert.strictEqual(began.qualityReactions.length, 1, 'feasible joint allocation: ' + JSON.stringify({ beforeActors: before.activeActors,
+                beforeSpriteBytes: before.spriteBytes, cap: before.maxSpriteBytes, actors: before.pages.flatMap((page: any) => page.actors).map((actor: any) => ({ id: actor.id, vehicle: actor.vehicle, density: actor.spriteDensity })), decisions: began.qualityDecisions.history }));
+            assert.ok(began.spriteBytes <= began.maxSpriteBytes && began.activeActors <= 4);
+            for (const retained of payloads) {
+                const current = began.pages.flatMap((page: any) => page.payloads).find((payload: any) => payload.id === retained.id);
+                assert.ok(current); assert.strictEqual(current.deadline, retained.deadline); assert.deepStrictEqual(current.helpers, retained.helpers);
+            }
+            const id = began.qualityReactions[0].id;
+            assert.strictEqual(began.qualityReactions[0].spriteBytes, 30184, 'the measured compact cleaner keeps its full natural DPR backing');
+            for (const actor of began.pages.flatMap((page: any) => page.actors)) {
+                const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
+                const detail = Math.min(1, Math.max(actor.spriteScale, origin.scale) * 3);
+                assert.ok(sprite.width >= Math.ceil(module.ROBOT_ARTWORK_SIZE.width * detail)
+                    && sprite.height >= Math.ceil(module.ROBOT_ARTWORK_SIZE.height * detail), 'crew artwork retains the existing minimum detail');
+            }
+            const actualSpriteBytes = f.owned.filter(canvas => canvas.isConnected && (canvas.className === 'pdfDocumentRobotVehicle' || canvas.className === 'pdfDocumentRobotQualityCleaner'))
+                .reduce((sum, canvas) => sum + canvas.width * canvas.height * 4, 0);
+            assert.strictEqual(began.spriteBytes, actualSpriteBytes, 'accounting charges actual rounded sprite allocations');
+            f.finish(); const done = f.api.snapshot();
+            assert.strictEqual(done.qualityOutcomes.find((value: any) => value.id === id).outcome, 'completed');
+            assert.strictEqual(done.activeActors + done.retainedBytes, 0); assert.strictEqual(f.callbacks.size, 0); assert.strictEqual(leased.size, 0);
+        });
+    }
+
+    it('retires a failed existing redraw once and preserves an unrelated live owner during late quality rebalancing', () => {
+        const f = fixture({ device: 'mobile', maxActors: 4, encounterRandom: () => .99 });
+        Object.assign(f.window, { devicePixelRatio: 3, innerWidth: 414, innerHeight: 896 });
+        f.container.rect = { left: 0, top: 32, width: 414, height: 864 };
+        const held = new Map<string, number>(), released: number[] = []; let leaseSerial = 0;
+        const origin = (vehicle: string) => ({ x: 200, y: 130, scale: vehicle === 'quad' ? .5 : .6 });
+        f.api.setDispatchOrigin({ reserve(vehicle: string) {
+            if (!['quad', 'tiltwing'].includes(vehicle) || held.has(vehicle) || !held.size && vehicle !== 'quad') { return; }
+            held.set(vehicle, ++leaseSerial); return origin(vehicle);
+        }, destination: origin, release(vehicle: string) { const lease = held.get(vehicle); assert.ok(lease); assert.ok(held.delete(vehicle)); released.push(lease); } });
+        const p = publication(f), other = f.page(2);
+        p.page.pageElement.rect = other.pageElement.rect = { left: 7.5, top: 100, width: 399, height: 566 };
+        p.encounter.pageProjection = { content: { x: 0, y: 0, width: 399, height: 566 }, clip: { x: 0, y: 0, width: 399, height: 566 } };
+        p.encounter.imageRegions = [{ id: 'photo', resourceId: 'x5', x: .1, y: .1, width: .2, height: .15 }];
+        for (const canvas of [p.candidate.canvas, other.canvas]) { canvas.width = 135; canvas.height = 192; }
+        p.candidate.projection = { width: 135, height: 192, pageToRaster: [135, 0, 0, 192, 0, 0] };
+        f.api.setVisiblePages([1, 2]);
+        assert.strictEqual(f.api.offer({ ...p.page, kind: 'preview', imageRegions: p.encounter.imageRegions }), 'started');
+        assert.strictEqual(f.api.offer({ ...other, kind: 'preview', imageRegions: [{ id: 'other-photo', x: .1, y: .1, width: .2, height: .15 }] }), 'started');
+        f.tick(300); const before = f.api.snapshot();
+        assert.strictEqual(before.activeActors, 2); assert.strictEqual(before.qualityDecisions.pending, 0);
+        const failedActor = before.pages.find((page: any) => page.page === 1).actors[0], failedId = failedActor.id;
+        const failedLease = held.get(failedActor.vehicle);
+        const healthy = before.pages.find((page: any) => page.page === 2), healthyPayload = healthy.payloads[0];
+        const healthyLease = held.get(healthy.actors[0].vehicle);
+        const failed = f.owned.find(canvas => canvas.dataset.courier === String(failedId))!;
+        const kept = f.owned.find(canvas => canvas.dataset.courier === String(healthy.actors[0].id))!;
+        assert.ok(failed.getContext('2d'), 'the existing body passes the context precheck');
+        failed.context.clearRect = () => { throw new Error('intentional existing body redraw failure'); };
+        const next = finalPublication(p), transaction = f.api.preparePublication(next, p.encounter, p.candidate);
+        p.candidate.canvas.replaceWith(next.canvas); transaction.commit();
+        const after = f.api.snapshot(), retained = after.pages.find((page: any) => page.page === 2);
+        assert.ok(kept.isConnected && kept.width > 0 && kept.height > 0, 'later healthy body is redrawn despite the earlier failure');
+        assert.ok(retained); assert.strictEqual(retained.payloads[0].id, healthyPayload.id);
+        assert.strictEqual(retained.payloads[0].deadline, healthyPayload.deadline);
+        assert.deepStrictEqual(retained.payloads[0].helpers, healthyPayload.helpers);
+        assert.strictEqual(failed.isConnected, false); assert.strictEqual(failed.width * failed.height, 0);
+        assert.strictEqual(released.filter(lease => lease === failedLease).length, 1);
+        assert.strictEqual(held.get(healthy.actors[0].vehicle), healthyLease);
+        assert.ok(after.pages.flatMap((page: any) => page.actors).every((actor: any) => actor.id !== failedId));
+        assert.strictEqual(held.size, after.activeActors, 'any newly admitted owner has its own actual lease');
+        assert.strictEqual(after.spriteBytes, f.owned.filter(canvas => canvas.isConnected && canvas.className === 'pdfDocumentRobotVehicle')
+            .reduce((sum, canvas) => sum + canvas.width * canvas.height * 4, 0));
+        assert.strictEqual(after.qualityReactions.length, 0);
+        assert.ok(after.qualityDecisions.history.some((decision: any) => decision.reason === 'allocation-failed'));
+        f.finish(); assert.strictEqual(f.api.snapshot().retainedBytes, 0); assert.strictEqual(held.size, 0);
+    });
+
 });
