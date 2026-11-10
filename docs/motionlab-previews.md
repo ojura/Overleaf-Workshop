@@ -205,19 +205,23 @@ only part of the requested work.
 
 Rerunning against the same identity merges with the existing manifest and reuses
 valid assets after checking file size, SHA-256, JPEG format, and encoded
-dimensions. Existing pages outside a new selection remain available. When an
-earlier preview-only run omitted `imageRegions` and PyMuPDF is now available, the
-producer processes those selected pages at their first scheduled tier to add
-the metadata, even if that preview asset already exists. It updates that tier's
-manifest reference and retains immutable files already on disk. A manifest for
-a different document identity causes the output directory to be refused. Choose
-a different directory for different source bytes.
+dimensions. Existing pages outside a new selection remain available. With
+PyMuPDF available, a selected page missing `imageRegionsComplete` receives one
+occurrence-metadata update at its first scheduled tier. If that tier already
+exists, the worker performs metadata inspection only: it creates no JPEG, and
+publication changes only the page's occurrence fields in the manifest. Existing
+page geometry, asset descriptors, filenames, bytes and pixels remain unchanged.
+Only missing tiers invoke raster generation. A present `imageRegionsComplete`
+value, including `false`, marks the metadata processed and prevents repeated
+enrichment. A manifest for a different document identity causes the output
+directory to be refused. Choose a different directory for different source bytes.
 
 The output quota counts regular-file payload bytes already present in the
-directory as well as reservations for render staging within that directory.
+directory as well as reservations for native-job staging within that directory.
 It does not measure filesystem allocation overhead or directory blocks.
-Concurrent jobs share the same total budget. Each render worker reserves three
-per-file allowances for its image, metadata, and diagnostics. Initial PDF
+Concurrent jobs share the same total budget. Each worker reserves three
+per-file allowances for its possible image, metadata, and diagnostics. Metadata
+jobs use the same bounded child and atomic manifest publication path. Initial PDF
 inspection uses one worker in a separate temporary directory outside the output
 directory, with at most two 64 KiB files present at once and the same worker
 memory and time limits. The producer enforces these additional hard bounds:
@@ -243,11 +247,16 @@ global region budget is consumed in publication order. Asset progress includes
 the retained region count and `regionsOmitted`, which counts excess placements
 removed by the per-page and global caps for that publication.
 
-`get_image_info(hashes=False, xrefs=False)` avoids the explicit pixmap/MD5 branch,
-but it still interprets the page and constructs its complete metadata list.
-MuPDF can decode JPEG2000 during image loading and rasterize shadings during that
-interpretation. Capping returned regions alone would not bound that work, which
-is why metadata extraction uses the same child limits as rendering. The relevant
+`get_image_info(hashes=True, xrefs=False)` interprets the page and constructs its
+complete occurrence list and image digests. Resource-link validation also reads
+the actual image objects. MuPDF can decode JPEG2000 during image loading and
+rasterize shadings during interpretation. Capping returned regions alone would
+not bound that work, so metadata extraction uses the same child limits as
+rendering. For a new raster, the worker reads basic geometry without occurrence
+inspection, encodes the JPEG, and releases its Pixmap, Pillow image and render
+document. Optional occurrence extraction then opens a separate document, which
+closes on success or failure. Raster pixels therefore do not depend on whether
+the job also requests metadata. Each worker process handles one job. The relevant
 version-pinned sources are linked in [Geometry and source references](#geometry-and-source-references).
 
 ### Exit status
@@ -271,7 +280,8 @@ Progress and completion are JSON lines on standard output:
 | --- | --- |
 | `start` | Document identity, full page count, selected page order, tiers, renderer, image-region capability, worker count |
 | `asset` | Page number, tier, immutable path, encoded bytes, retained region count, omitted region count |
-| `complete` | Manifest path, total published pages/assets, newly published asset count, output bytes |
+| `metadata` | Page number, retained region count and omitted region count; existing raster assets are reused |
+| `complete` | Manifest path, total published pages/assets, newly published asset count (`publishedAssets`), metadata-only page count (`metadataPages`), output bytes |
 | `partial` | Limit reason, manifest path or null, newly published asset count, available totals |
 
 Validation, generation, and command-line syntax failures use an `error` JSON
@@ -313,12 +323,14 @@ The producer writes `manifest.json` with this shape. Values below are illustrati
       "imageRegions": [
         {
           "id": "p99-i0",
+          "resourceId": "x42",
           "x": 0.1,
           "y": 0.13636363636363635,
           "width": 0.3333333333333333,
           "height": 0.2727272727272727
         }
-      ]
+      ],
+      "imageRegionsComplete": true
     }
   ]
 }
@@ -442,9 +454,20 @@ for the same source identity.
 
 ## Image region geometry
 
-Each region has exactly `{id, x, y, width, height}`. Coordinates are normalized
+Each region has `{id, x, y, width, height}` and may carry a validated `resourceId`
+link to the original PDF image object, such as `x42`. Coordinates are normalized
 to `[0,1]` in the same orientation as the page preview. IDs identify placements;
-repeated occurrences of one embedded image can produce separate regions.
+repeated occurrences of one embedded image keep separate region IDs while
+sharing their resource link. The page's optional `imageRegionsComplete` field
+reports whether validation, supported extraction and the region limits retained
+a complete, linked inventory. Ambiguous image identities, inline or unsupported
+content, discarded placements and exceeded caps produce `false`. A decoded-image
+digest alone cannot identify an occurrence's object: separate objects can have
+identical pixels. The producer only links a unique verified resource on an
+inspected content tree. Unproven links remain absent. Older manifests without
+these fields remain readable and can receive the metadata-only upgrade above.
+The consumer's early-delivery and completed-raster fallback rules are described
+in [the shared PDF loading guide](pdf-prefetch.md#placement-metadata-and-payload-geometry).
 
 PyMuPDF returns image placement coordinates in the unrotated page space, while
 `page.rect` reflects page rotation. Its `page.rotation_matrix` translates between

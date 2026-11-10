@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import contextlib
 import ctypes
 import hashlib
 import io
@@ -591,6 +592,102 @@ class MotionLabPreviewsTest(unittest.TestCase):
         self.complete("--tiers", "512", "--require-image-regions", source=source)
         self.assertEqual(self.manifest()["pages"][0]["imageRegions"], page["imageRegions"])
 
+    def test_metadata_enrichment_preserves_existing_verified_raster_bytes_and_descriptors(self):
+        self.complete("--tiers", "192", "--renderer", "pymupdf")
+        value = self.manifest()
+        # A valid pre-existing encoder result need not match today's renderer.
+        for page in value["pages"]:
+            page.pop("imageRegionsComplete", None)
+            asset = page["assets"][0]
+            output = io.BytesIO()
+            Image.new("RGB", (asset["width"], asset["height"]), (123, 45, 67)).save(output, "JPEG", quality=74)
+            data = output.getvalue()
+            digest = hashlib.sha256(data).hexdigest()
+            relative = f"assets/p{page['pageNumber']:05d}-192-{digest}.jpg"
+            (self.output / relative).write_bytes(data)
+            asset.update(path=relative, bytes=len(data), sha256=digest)
+        (self.output / "manifest.json").write_text(json.dumps(value))
+        assets = copy.deepcopy([page["assets"] for page in value["pages"]])
+        before = {asset["path"]: source_state(self.output / asset["path"]) for page in value["pages"] for asset in page["assets"]}
+        events = self.complete("--tiers", "192", "--renderer", "pymupdf", "--require-image-regions")
+        after = self.manifest()
+        self.assertEqual([page["assets"] for page in after["pages"]], assets)
+        self.assertEqual({name: source_state(self.output / name) for name in before}, before)
+        self.assertFalse(any(event.get("event") == "asset" for event in events))
+        self.assertEqual(sum(event.get("event") == "metadata" for event in events), len(value["pages"]))
+        self.assertTrue(all(type(page.get("imageRegionsComplete")) is bool for page in after["pages"]))
+        self.assertEqual(events[-1]["publishedAssets"], 0)
+        self.assertEqual(events[-1]["metadataPages"], len(value["pages"]))
+
+    def test_metadata_atomic_failure_keeps_verified_assets_and_can_resume(self):
+        from unittest import mock
+        self.complete("--tiers", "192", "--renderer", "pymupdf")
+        value = self.manifest()
+        for page in value["pages"]:
+            page.pop("imageRegionsComplete", None)
+        manifest_path = self.output / "manifest.json"
+        manifest_path.write_text(json.dumps(value))
+        original = manifest_path.read_bytes()
+        assets = {asset["path"]: source_state(self.output / asset["path"]) for page in value["pages"] for asset in page["assets"]}
+        spec = importlib.util.spec_from_file_location("metadata_atomic_producer", SCRIPT)
+        producer = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = producer
+        spec.loader.exec_module(producer)
+        publisher = producer.Publisher(self.output, value["document"], len(value["pages"]), 512 * MIB, producer.Deadline(30))
+        geometry = {**value["pages"][0], "imageRegionsComplete": False}
+        replace = producer.os.replace
+        def interrupted(source, destination):
+            if Path(destination) == manifest_path:
+                raise OSError("metadata publication interrupted")
+            return replace(source, destination)
+        with mock.patch.object(producer.os, "replace", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "metadata publication interrupted"):
+                publisher.publish_metadata({"metadataOnly": True, "page": geometry}, 1, 0)
+        self.assertEqual(manifest_path.read_bytes(), original)
+        self.assertFalse((self.output / ".manifest.pending").exists())
+        self.assertEqual({name: source_state(self.output / name) for name in assets}, assets)
+        publisher = producer.Publisher(self.output, value["document"], len(value["pages"]), 512 * MIB, producer.Deadline(30))
+        with contextlib.redirect_stdout(io.StringIO()):
+            publisher.publish_metadata({"metadataOnly": True, "page": geometry}, 1, 0)
+        self.assertIs(self.manifest()["pages"][0]["imageRegionsComplete"], False)
+        self.assertEqual({name: source_state(self.output / name) for name in assets}, assets)
+
+    def test_fresh_raster_is_independent_of_occurrence_extraction_document_state(self):
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("raster_isolation_producer", SCRIPT)
+        producer = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = producer
+        spec.loader.exec_module(producer)
+        original = producer.page_geometry
+        opened_documents = []
+        open_document = fitz.open
+        def tracked_open(*args, **kwargs):
+            document = open_document(*args, **kwargs)
+            opened_documents.append(document)
+            return document
+        def geometry(page, number, include):
+            result = original(page, number, include)
+            if include:
+                self.assertTrue(opened_documents[0].is_closed, "raster document closes before metadata extraction")
+                # Model MuPDF's observed extraction-side state change with actual
+                # PDF drawing. It must remain isolated from raster generation.
+                page.draw_rect(page.rect, color=None, fill=(0, 1, 0), overlay=True)
+            return result
+        job = {"operation": "render", "source": str(self.source), "fingerprint": producer.fingerprint(self.source),
+               "has_fitz": True, "renderer": "pymupdf", "page": 1, "tier": 192, "regions": False}
+        previous_directory = Path.cwd()
+        try:
+            os.chdir(self.root)
+            producer.worker_operation(job)
+            before = Path("preview.jpg").read_bytes()
+            with mock.patch.object(producer, "page_geometry", side_effect=geometry), mock.patch.object(fitz, "open", side_effect=tracked_open):
+                producer.worker_operation({**job, "regions": True})
+            self.assertEqual(Path("preview.jpg").read_bytes(), before)
+        finally:
+            os.chdir(previous_directory)
+        self.assertEqual(len(opened_documents), 2)
+        self.assertTrue(all(document.is_closed for document in opened_documents))
+
     def test_image_region_cap_keeps_largest_regions_and_reports_omissions(self):
         source = self.root / "many-regions.pdf"
         image = solid_image()
@@ -665,7 +762,9 @@ class MotionLabPreviewsTest(unittest.TestCase):
                     "width": (100 - crop.y0) / crop.height, "height": (120 - crop.x0) / crop.width}
         for field, value in expected.items():
             self.assertAlmostEqual(region[field], value, delta=1e-5, msg=field)
-        self.assertEqual(sum(event.get("event") == "asset" for event in events), 1)
+        self.assertEqual(page["assets"], initial["pages"][0]["assets"], "metadata enrichment preserves the verified Poppler asset")
+        self.assertEqual(sum(event.get("event") == "metadata" for event in events), 1)
+        self.assertFalse(any(event.get("event") == "asset" for event in events))
 
     @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open") and shutil.which("pdfinfo"),
                          "Linux pidfds and pdfinfo are required for descendant cleanup verification")

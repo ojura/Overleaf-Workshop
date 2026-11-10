@@ -341,10 +341,14 @@ def worker_operation(job):
             raise Failure(f"The PDF page count must be within 1..{MAX_PAGES}")
         if job["operation"] == "inspect":
             result = {"pageCount": count}
+        elif job["operation"] == "metadata":
+            if document is None:
+                raise Failure("Occurrence metadata requires PyMuPDF")
+            result = {"metadataOnly": True, "page": page_geometry(document.load_page(job["page"] - 1), job["page"], True)}
         else:
             number, tier = job["page"], job["tier"]
             page = document.load_page(number - 1) if document is not None else None
-            geometry = (page_geometry(page, number, job["regions"]) if page is not None
+            geometry = (page_geometry(page, number, False) if page is not None
                         else pdfinfo(source, number))
             if (not all(math.isfinite(geometry[key]) and 0 < geometry[key] <= 1_000_000 for key in ("width", "height"))
                     or geometry["rotation"] not in (0, 90, 180, 270)):
@@ -379,6 +383,14 @@ def worker_operation(job):
                 result = {"page": geometry, "width": image.width, "height": image.height}
             finally:
                 image.close()
+            if document is not None:
+                document.close()
+                document = None
+            if job["regions"]:
+                # Digest/occurrence extraction changes MuPDF decoded-image state.
+                # Finish and close raster ownership before opening its isolated document.
+                with fitz.open(source) as metadata_document:
+                    result["page"] = page_geometry(metadata_document.load_page(number - 1), number, True)
         check_source(source, job["fingerprint"])
         return result
     finally:
@@ -594,6 +606,60 @@ class Publisher:
         # Each child may simultaneously hold a renderer image, metadata file and diagnostic log.
         return max(0, min(MAX_ASSET_BYTES, (self.quota - self.used - self.reserve - reservations) // 3))
 
+    def add_metadata(self, candidate, geometry):
+        omitted = geometry.get("regionsOmitted", 0)
+        if "imageRegionsComplete" not in candidate and "imageRegions" in geometry:
+            candidate["imageRegions"] = geometry["imageRegions"][:max(0, MAX_REGIONS - self.regions + len(candidate.get("imageRegions", [])))]
+            omitted += len(geometry["imageRegions"]) - len(candidate["imageRegions"])
+            candidate["imageRegionsComplete"] = geometry.get("imageRegionsComplete") is True and omitted == 0
+        return omitted
+
+    def manifest_candidate(self, candidate):
+        pages = {**self.pages, candidate["pageNumber"]: candidate}
+        manifest = {**self.manifest, "pages": [pages[number] for number in sorted(pages)]}
+        payload = json.dumps(manifest, separators=(",", ":"), ensure_ascii=True).encode() + b"\n"
+        if len(payload) > min(MAX_MANIFEST_BYTES, self.reserve):
+            raise LimitReached("manifest-limit")
+        return pages, manifest, payload
+
+    def commit_manifest(self, candidate, reservations):
+        pages, manifest, payload = self.manifest_candidate(candidate)
+        if self.used + len(payload) + reservations > self.quota:
+            raise LimitReached("output-limit")
+        temporary = self.root / ".manifest.pending"
+        if temporary.exists() or temporary.is_symlink():
+            raise Failure("A previous manifest publication file must be inspected before retrying")
+        try:
+            with temporary.open("xb") as output:
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.root / "manifest.json")
+            sync_directory(self.root)
+        finally:
+            temporary.unlink(missing_ok=True)
+        self.used += len(payload) - self.manifest_size
+        self.manifest_size = len(payload)
+        self.pages = pages
+        self.manifest = manifest
+        self.assets = sum(len(page["assets"]) for page in pages.values())
+        self.regions = sum(len(page.get("imageRegions", [])) for page in pages.values())
+
+    def publish_metadata(self, result, page_number, reservations):
+        self.deadline.remaining()
+        current = self.pages.get(page_number)
+        geometry = result["page"]
+        if not current or geometry.get("pageNumber") != page_number:
+            raise Failure("Metadata requires an existing verified page")
+        if current["rotation"] != geometry["rotation"] or not all(
+                math.isclose(current[key], geometry[key], rel_tol=1e-7, abs_tol=0.02)
+                for key in ("width", "height")):
+            raise Failure("Page geometry differs from the existing manifest")
+        candidate = dict(current)
+        omitted = self.add_metadata(candidate, geometry)
+        self.commit_manifest(candidate, reservations)
+        emit("metadata", pageNumber=page_number, regions=len(candidate.get("imageRegions", [])), regionsOmitted=omitted)
+
     def publish(self, result, folder: Path, page_number: int, tier: int, reservations: int):
         self.deadline.remaining()
         source = folder / "preview.jpg"
@@ -623,20 +689,12 @@ class Publisher:
         candidate["assets"] = [asset for asset in current["assets"] if max(asset["width"], asset["height"]) != tier] if current else []
         if len(candidate["assets"]) >= 6:
             raise LimitReached("manifest-limit")
-        omitted = geometry.get("regionsOmitted", 0)
-        if "imageRegionsComplete" not in candidate and "imageRegions" in geometry:
-            candidate["imageRegions"] = geometry["imageRegions"][:max(0, MAX_REGIONS - self.regions + len(candidate.get("imageRegions", [])))]
-            omitted += len(geometry["imageRegions"]) - len(candidate["imageRegions"])
-            candidate["imageRegionsComplete"] = geometry.get("imageRegionsComplete") is True and omitted == 0
+        omitted = self.add_metadata(candidate, geometry)
         relative = f"assets/p{page_number:05d}-{tier}-{digest}.jpg"
         asset = {"path": relative, "width": width, "height": height, "bytes": size, "sha256": digest, "mime": "image/jpeg"}
         candidate["assets"].append(asset)
         candidate["assets"].sort(key=lambda item: max(item["width"], item["height"]))
-        pages = {**self.pages, page_number: candidate}
-        manifest = {**self.manifest, "pages": [pages[number] for number in sorted(pages)]}
-        payload = json.dumps(manifest, separators=(",", ":"), ensure_ascii=True).encode() + b"\n"
-        if len(payload) > min(MAX_MANIFEST_BYTES, self.reserve):
-            raise LimitReached("manifest-limit")
+        _, _, payload = self.manifest_candidate(candidate)
         target = self.root / relative
         added = 0 if target.exists() else size
         if self.used + added + len(payload) + reservations > self.quota:
@@ -655,24 +713,7 @@ class Publisher:
             os.replace(source, target)
             sync_directory(target.parent)
         self.used += added
-        temporary = self.root / ".manifest.pending"
-        if temporary.exists() or temporary.is_symlink():
-            raise Failure("A previous manifest publication file must be inspected before retrying")
-        try:
-            with temporary.open("xb") as output:
-                output.write(payload)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, self.root / "manifest.json")
-            sync_directory(self.root)
-        finally:
-            temporary.unlink(missing_ok=True)
-        self.used += len(payload) - self.manifest_size
-        self.manifest_size = len(payload)
-        self.pages = pages
-        self.manifest = manifest
-        self.assets += 0 if replacing else 1
-        self.regions = sum(len(page.get("imageRegions", [])) for page in pages.values())
+        self.commit_manifest(candidate, reservations)
         emit("asset", pageNumber=page_number, tier=tier, path=relative, bytes=size,
              regions=len(candidate.get("imageRegions", [])), regionsOmitted=omitted)
 
@@ -687,6 +728,7 @@ async def generate(args, source: Path, source_fd: int, expected, identity, page_
     staging = None
     publisher = None
     completed = 0
+    metadata_completed = 0
     try:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -717,7 +759,7 @@ async def generate(args, source: Path, source_fd: int, expected, identity, page_
                     ordinal += 1
                     folder = staging / str(ordinal)
                     folder.mkdir()
-                    job = {"operation": "render", "source": str(source), "fingerprint": expected,
+                    job = {"operation": "metadata" if publisher.has(number, tier) else "render", "source": str(source), "fingerprint": expected,
                            "page": number, "tier": tier, "renderer": renderer, "has_fitz": has_fitz,
                            "regions": has_fitz and "imageRegionsComplete" not in publisher.pages.get(number, {}),
                            "memory_mib": args.max_worker_mib, "file_limit": cap}
@@ -738,13 +780,17 @@ async def generate(args, source: Path, source_fd: int, expected, identity, page_
                         # Retire metadata/log files before transferring the completed asset's reservation.
                         (folder / "result.json").unlink(missing_ok=True)
                         (folder / "stderr.txt").unlink(missing_ok=True)
-                        publisher.publish(result, folder, number, tier, reservations)
-                        completed += 1
+                        if result.get("metadataOnly") is True:
+                            publisher.publish_metadata(result, number, reservations)
+                            metadata_completed += 1
+                        else:
+                            publisher.publish(result, folder, number, tier, reservations)
+                            completed += 1
                     finally:
                         shutil.rmtree(folder, ignore_errors=True)
         check_source(source, expected, source_fd)
         emit("complete", manifest=str(root / "manifest.json"), pages=len(publisher.pages),
-             assets=publisher.assets, publishedAssets=completed, outputBytes=publisher.used)
+             assets=publisher.assets, publishedAssets=completed, metadataPages=metadata_completed, outputBytes=publisher.used)
         return 0
     except LimitReached as error:
         emit("partial", reason=str(error), manifest=str(root / "manifest.json") if (root / "manifest.json").is_file() else None,
