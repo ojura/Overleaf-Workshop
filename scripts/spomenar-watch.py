@@ -780,6 +780,8 @@ class Watcher:
         settings, record = self.settings, self.records[sha]
         if "pageCount" not in record:
             record["pageCount"] = self.inspect_pages(sha)
+            self.save()
+        if "priorities" not in record:
             record["priorities"] = [page for page in dict.fromkeys(settings.priority_pages)
                                      if page <= record["pageCount"]] or [1]
             self.save()

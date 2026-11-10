@@ -207,6 +207,27 @@ class WatcherTest(unittest.TestCase):
         self.assertEqual(self.watcher.current(), sha, self.output.getvalue())
         return sha
 
+    def test_actual_metadata_launch_initializes_priorities_for_adopted_full_record(self):
+        sha = self.adopt_current(legacy=True)
+        record = self.watcher.records[sha]
+        self.assertTrue(record["full"])
+        self.assertEqual(record["pageCount"], 3)
+        record.pop("priorities", None)
+        self.watcher.save()
+        child = FakeChild()
+        # Exercise the production implementation directly. FixtureWatcher.launch
+        # synthesizes priorities and would conceal this adopted-record boundary.
+        with mock.patch.object(self.watcher, "inspect_pages", side_effect=AssertionError("known page count must be reused")), \
+                mock.patch.object(self.watcher, "spawn", return_value=child) as spawn:
+            WATCH.Watcher.launch(self.watcher, sha, "metadata")
+        self.assertEqual(record["priorities"], [2, 3])
+        self.assertEqual(self.watcher.child_phase, "metadata")
+        self.assertIs(self.watcher.child, child)
+        arguments = spawn.call_args.args[0]
+        self.assertEqual(arguments[arguments.index("--priority-pages") + 1], "2,3")
+        self.assertIn("--require-image-regions", arguments)
+        self.assertEqual(WATCH.read_json(self.watcher.state_path)["records"][sha]["priorities"], [2, 3])
+
     def test_full_current_reading_edition_enriches_legacy_atlas_once_and_survives_restart(self):
         sha = self.adopt_current(legacy=True)
         before = self.watcher.current_config()
