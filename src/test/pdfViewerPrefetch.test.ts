@@ -2,6 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as ts from 'typescript';
 
 // tsc turns import() into require(), which cannot load ES modules.
 const importModule = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
@@ -24,6 +25,7 @@ class Events {
         this.listeners.get(name)?.delete(listener);
         this.captures.get(name)?.delete(listener);
     }
+    dispatch(name: string, detail: Record<string, unknown>) { this.emit(name, detail); }
     on(name: string, listener: (event: any) => void) { this.addEventListener(name, listener); }
     off(name: string, listener: (event: any) => void) { this.removeEventListener(name, listener); }
     emit(name: string, detail: Record<string, unknown> = {}) {
@@ -49,6 +51,9 @@ class Element extends Events {
     clientTop = 0;
     scrollTop = 0;
     scrollLeft = 0;
+    connectedRoot = false;
+    get isConnected(): boolean { return this.connectedRoot || !!this.parentNode?.isConnected; }
+    contains(node: Element): boolean { return node === this || this.children.some(child => child.contains(node)); }
     prepend(child: Element) {
         child.remove();
         child.parentNode = this;
@@ -75,7 +80,8 @@ class Canvas extends Element {
     width = 0;
     height = 0;
     copies = 0;
-    readonly context = { canvas: this, drawImage: () => { this.copies++; } };
+    source?: Canvas;
+    readonly context = { canvas: this, drawImage: (source?: Canvas) => { this.copies++; this.source = source; } };
     getContext(kind: string) { assert.strictEqual(kind, '2d'); return this.context; }
 }
 
@@ -296,6 +302,7 @@ class PageView {
     constructor(readonly id: number, readonly width: number, readonly height: number, readonly fixture: Fixture) {
         this.viewport = { width, height, scale: 1, rotation: 0 };
         this.div.ownerDocument = fixture.owner;
+        fixture.container.prepend(this.div);
         this.div.clientWidth = width;
         this.div.clientHeight = height;
         this.div.setAttribute('data-page-number', String(id));
@@ -359,6 +366,7 @@ class Fixture {
         const height = options.height ?? 1000;
         this.pdf = new PdfDocument(width, height, options.autoPages ?? true);
         this.container.ownerDocument = this.owner;
+        this.container.connectedRoot = true;
         this.container.clientWidth = width;
         this.container.clientHeight = height;
         this.visualViewport.width = width;
@@ -460,6 +468,7 @@ class Fixture {
         const page = this.pages[id - 1];
         page.pdfPage = this.pdf.page(id);
         page.pdfPage.retainDisplayIntent();
+        const precedingCanvas = page.canvas;
         page.canvas = new Canvas();
         page.canvas.width = Math.ceil(page.width);
         page.canvas.height = Math.ceil(page.height);
@@ -474,6 +483,21 @@ class Fixture {
         page.renderingState = 1;
         if (this.controller) { this.eventBus.emit('pagerender', { pageNumber: id, source: page }); }
         this.time += elapsed;
+        const managed = page as any;
+        if (managed.publishImageCandidate) {
+            const native = page.canvas!;
+            const accepted = managed.publishImageCandidate({ canvas: native, status: (() => {
+                    const status = managed.imagePassStatus ?? managed.paintedImageStatus;
+                    if (!status || status.resources) { return status; }
+                    return { ...status, untrackedImageOperations: false, resources: Array.from({ length: status.total }, (_, index) => ({
+                        objectId: 'fixture-image-' + index, imageId: 'x' + (index + 5), covered: index < status.covered,
+                        final: index < status.completed, failed: index >= status.total - status.failed })) };
+                })(),
+                intent: managed.imagePassStatus?.intent ?? managed.pdfPage?.imageStatus?.intent ?? (managed.fixtureImageIntent ??= {}), appearance: managed.imageAppearance, geometry: 'fixture-' + native.width + 'x' + native.height },
+            () => { precedingCanvas?.remove(); if (precedingCanvas) { precedingCanvas.width = precedingCanvas.height = 0; } page.div.prepend(native); });
+            if (!accepted) { native.remove(); native.width = native.height = 0; page.canvas = precedingCanvas?.parentNode ? precedingCanvas : null; }
+            else if (managed.imagePassStatus) { managed.paintedImageStatus = managed.imagePassStatus; managed.paintedImageRevision = managed.imagePassRevision; }
+        } else { page.div.prepend(page.canvas!); }
         page.renderingState = 3;
         this.cached.delete(page);
         this.cached.add(page);
@@ -610,13 +634,13 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         let redraws = 0, cancellations = 0;
         let cancellation: Promise<void> | undefined;
         page.imageRevision = 0;
-        page.imageStatus = { revision: 0, pending: 2, completed: 0, failed: 0, covered: 0, total: 2, final: false, discovered: true };
+        page.imageStatus = { intent: {}, revision: 0, pending: 2, completed: 0, failed: 0, covered: 0, total: 2, final: false, discovered: true };
         page.onImageRevision = (listener: () => void) => { listeners.add(listener); return () => listeners.delete(listener); };
         page.cancelImageRefinement = () => { cancellations++; return cancellation ?? Promise.resolve(); };
         view.redrawImages = () => { redraws++; view.renderingState = 0; };
         const update = (revision: number, covered: number, final = false) => {
             page.imageRevision = revision;
-            page.imageStatus = { revision, pending: final ? 0 : 2, completed: final ? 2 : 0, failed: 0, covered, total: 2, final, discovered: true };
+            page.imageStatus = { intent: page.imageStatus.intent, revision, pending: final ? 0 : 2, completed: final ? 2 : 0, failed: 0, covered, total: 2, final, discovered: true };
         };
         return { page, view, listeners,
             get redraws() { return redraws; }, get cancellations() { return cancellations; },
@@ -624,8 +648,8 @@ describe('the PDF viewers\' shared prefetch controller', function () {
             emit(revision: number, covered: number, final = false) { update(revision, covered, final); for (const listener of listeners) { listener(); } },
             paint(revision: number, covered: number, final = false) {
                 update(revision, covered, final);
-                view.imagePassRevision = view.paintedImageRevision = revision;
-                view.imagePassStatus = view.paintedImageStatus = { ...page.imageStatus };
+                view.imagePassRevision = revision;
+                view.imagePassStatus = { ...page.imageStatus };
                 f.cachePage(id);
             },
         };
@@ -667,6 +691,131 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.strictEqual(f.controller.snapshot().previewPages, 0);
         f.scrollBy(-20_000); await f.frame();
         assert.strictEqual(publish(1.25, {}, false).accepted, true, 'controller eviction cannot retain authority over detached predecessor pixels');
+    });
+
+    for (const engine of ['pdfjs', 'overleaf']) {
+        it(`${engine} retains the accepted preview through repeated rejected native return passes`, async () => {
+            const f = fixture({ startPage: 1, pages: 40, initialNative: false, autoPages: false, mobile: true });
+            const images = externalImages(f); await f.frame();
+            const view = images.view;
+            f.queue.renderView(view);
+            const complete = { revision: 55, discovered: true, covered: 2, total: 2, pending: 0, completed: 2, failed: 0, final: true,
+                resources: ['x5', 'x6'].map(imageId => ({ objectId: imageId, imageId, covered: true, final: true, failed: false })) };
+            const original = new Canvas(); original.width = 800; original.height = 1000; view.canvas = original; view.outputScale = { sx: 1, sy: 1 };
+            view.publishImageCandidate({ canvas: original, status: complete, intent: {}, appearance: view.imageAppearance, geometry: 'old' }, () => view.div.prepend(original));
+            view.paintedImageStatus = complete; view.paintedImageRevision = 55; view.renderingState = 3;
+            images.page.imageStatus = complete; images.page.imageRevision = 55; f.cached.add(view);
+            f.scrollBy(20_000); await f.frame();
+            f.scrollBy(-20_000); view.renderingState = 0; await f.frame();
+            const preview = view.div.children.find((node: Element) => node.className === 'pdfPrefetchPreview');
+            assert.ok(preview, 'return attaches the accepted cached preview');
+            let previewRemovals = 0; const removePreview = preview.remove.bind(preview);
+            preview.remove = () => { previewRemovals++; removePreview(); };
+            const { pdfjsRelease } = await importModule(path.join(repo, 'scripts/viewer-protocol.mjs'));
+            const { imageRevisionViewer } = await importModule(path.join(repo, 'scripts/pdfjs-image-revisions.mjs'));
+            const file = engine === 'pdfjs' ? path.join(pdfjsRelease, 'web/viewer.mjs') : path.join(repo, 'node_modules/pdfjs-dist/web/pdf_viewer.mjs');
+            const parsed = ts.createSourceFile(file, imageRevisionViewer(fs.readFileSync(file, 'utf8'), file), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+            const base = parsed.statements.find(statement => ts.isClassDeclaration(statement) && statement.name?.text === 'BasePDFPageView')!;
+            const nativeView = new Function('RenderingStates', 'RenderingCancelledException', 'document', base.getText(parsed) + '\nreturn BasePDFPageView;')(
+                Object.fromEntries([['INITIAL', 0], ['RUNNING', 1], ['PAUSED', 2], ['FINISHED', 3]]), class extends Error {}, { createElement: () => new Canvas() });
+            const native = new nativeView({ id: 1, eventBus: { dispatch() {} } }); native.div = view.div; native.div.classList = { add() {}, remove() {} };
+            native.paintedImageStatus = complete; native.paintedImageRevision = 55;
+            native.publishImageCandidate = (pass: any, commit: () => void) => view.publishImageCandidate({ ...pass, appearance: view.imageAppearance }, commit);
+            for (const revision of [56, 57, 58, 72]) {
+                const status = { ...complete, revision, covered: revision === 72 ? 2 : 1, pending: revision === 72 ? 0 : 1, final: revision === 72,
+                    resources: complete.resources.map((resource, index) => ({ ...resource, covered: revision === 72 || index === 0, final: revision === 72 })) };
+                native.renderingState = view.renderingState = 1;
+                const { ctx } = native._createCanvas((canvas: Canvas) => view.div.prepend(canvas));
+                native.canvas.width = 800; native.canvas.height = 1000; view.canvas = native.canvas;
+                native.pdfPage = { render: () => ({ promise: Promise.resolve(), imageRevision: revision, imageStatus: status, imageIntent: {} }) };
+                await native._drawCanvas({ canvasContext: ctx, viewport: { width: 800, height: 1000, transform: [1, 0, 0, -1, 0, 1000] }, transform: [1, 0, 0, 1, 0, 0] }, () => {}, () => {});
+                view.canvas = native.canvas; view.imagePassRevision = native.imagePassRevision; view.imagePassStatus = native.imagePassStatus; view.renderingState = 3;
+                images.page.imageStatus = status; images.page.imageRevision = revision;
+                f.eventBus.emit('pagerendered', { pageNumber: 1, source: view, error: null });
+                assert.strictEqual(preview.parentNode, revision === 72 ? null : view.div, 'only accepted complete native replaces the preview');
+                await f.frame();
+                if (revision === 72) { assert.ok(previewRemovals >= 1 && view.canvas?.parentNode === view.div, 'accepted native publication replaces preview before cache disposal'); }
+                else { assert.strictEqual(previewRemovals, 0, 'rejected passes never remove the preview'); }
+                assert.deepStrictEqual(f.controller.snapshot().visibleMissing, []);
+            }
+        });
+    }
+
+    it('retires displayed authority for detached and wrong-page wrapper rasters while retaining cache availability', async () => {
+        const f = fixture({ startPage: 1, pages: 4, initialNative: false, autoPages: false });
+        const images = externalImages(f); await f.frame(); images.paint(1, 2, true); await f.frame();
+        const native = images.view.canvas;
+        assert.ok(native && native.parentNode === images.view.div);
+        const wrapper = new Element(); wrapper.prepend(native!);
+        assert.strictEqual(native!.isConnected, false);
+        assert.deepStrictEqual(f.controller.snapshot().visibleMissing, [1], 'parentNode in a detached or foreign wrapper is not display authority');
+        images.view.div.prepend(wrapper);
+        Object.defineProperty(native, 'isConnected', { configurable: true, value: false });
+        assert.deepStrictEqual(f.controller.snapshot().visibleMissing, [1], 'an otherwise contained disconnected subtree is not displayed');
+    });
+
+    it('keeps semantic loading continuous through image passes and resolves without another draw', async () => {
+        const f = fixture({ startPage: 1, pages: 1, initialNative: false, autoPages: false });
+        const images = externalImages(f); await f.frame();
+        const loading = () => (f.viewer as any).getPageLoadingState(1);
+        assert.strictEqual(loading(), true, 'initial render remains pending even if old resource status was final');
+        images.paint(0, 0); await f.frame(); assert.strictEqual(loading(), true);
+        images.emit(1, 1); await f.frame(); images.paint(1, 1); await f.frame(); assert.strictEqual(loading(), true);
+        images.emit(2, 2, true); await f.frame(); assert.strictEqual(loading(), true, 'resource completion still needs its final replay');
+        images.paint(2, 2, true); await f.frame(); assert.strictEqual(loading(), false);
+        const semantic: boolean[] = []; f.eventBus.on('pageloadingstatechanged', () => semantic.push(loading()));
+        images.page.imageStatus = { ...images.page.imageStatus, pending: 1, completed: 1, final: false };
+        for (const listener of images.listeners) { listener(); } await f.frame();
+        assert.strictEqual(loading(), true);
+        const draws = f.nativeRenders.length;
+        images.page.imageStatus = { ...images.page.imageStatus, pending: 0, failed: 1, completed: 1, final: false };
+        for (const listener of images.listeners) { listener(); } await f.frame();
+        assert.strictEqual(loading(), false, 'settled terminal failure does not create phantom work');
+        assert.deepStrictEqual(semantic, [true, false], 'source settlement notifies toolbar without a new native pass');
+        assert.strictEqual(f.nativeRenders.length, draws);
+        f.controller.dispose(); assert.strictEqual((f.viewer as any).getPageLoadingState, undefined);
+    });
+
+    it('keeps one canonical page history from early atlas pixels through later native proxy installation', async () => {
+        const robots: any = new DocumentRobots();
+        const histories = new Map<object, number>(), owners: object[] = [], appearances: string[] = [];
+        robots.preparePublication = (candidate: any) => {
+            owners.push(candidate.page); appearances.push(candidate.appearance);
+            if (!histories.has(candidate.page)) { histories.set(candidate.page, histories.size + 1); }
+            return { commit() {}, abort() {} };
+        };
+        robots.reconcileEncounter = () => {};
+        const h = previewFixture({ startPage: 1, pages: 1, initialNative: false, autoPages: false }, robots), f = h.f;
+        delete f.pages[0].pdfPage;
+        const loader = h.bind(); await f.frame();
+        assert.strictEqual(f.pages[0].pdfPage, undefined);
+        const atlas = h.publish(loader, 1); assert.strictEqual(atlas.accepted, true);
+        assert.deepStrictEqual(f.controller.snapshot().visibleMissing, []);
+        f.finishNative(1);
+        assert.ok(f.pages[0].pdfPage);
+        assert.ok(owners.length >= 2);
+        assert.strictEqual(new Set(owners).size, 1, 'proxy installation cannot restart the physical page history');
+        assert.strictEqual(histories.size, 1);
+        assert.strictEqual(new Set(appearances).size, 1, 'proxy installation cannot change logical appearance');
+        const view: any = f.pages[0]; view.pdfPage = {};
+        const foreign = new Canvas(); foreign.width = 800; foreign.height = 1000; view.canvas = foreign;
+        assert.strictEqual(view.publishImageCandidate({ canvas: foreign, appearance: view.imageAppearance }, () => assert.fail('foreign proxy cannot publish')), false);
+    });
+
+    it('publishes consecutive partial passes in one image epoch while retaining the predecessor across a new epoch', async () => {
+        const f = fixture({ startPage: 1, pages: 1, initialNative: false, autoPages: false });
+        const images = externalImages(f); await f.frame();
+        images.paint(1, 1); const first = images.view.canvas;
+        images.paint(2, 1); const second = images.view.canvas;
+        assert.notStrictEqual(second, first, 'a same-epoch second partial pass must actually publish');
+        assert.strictEqual(first.width, 0);
+        const oldIntent = images.page.imageStatus.intent;
+        images.page.imageStatus.intent = {};
+        images.paint(3, 1);
+        assert.strictEqual(images.view.canvas, second, 'a new incomplete intent cannot discard previously displayed photo pixels');
+        images.paint(4, 2, true);
+        assert.notStrictEqual(images.view.canvas, second, 'complete coverage permits the new image epoch to replace its predecessor');
+        assert.notStrictEqual(images.page.imageStatus.intent, oldIntent);
     });
 
     it('starts structural text passes directly while photograph requests are pending', async () => {
@@ -773,6 +922,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
     it('keeps an existing whole-page preview through a placeholder pass until painted photo coverage', async () => {
         const f = fixture({ startPage: 1, pages: 1 });
         await f.frame();
+        f.pages[0].reset(); await f.frame();
         const images = externalImages(f);
         images.paint(0, 0); await f.frame();
         const preview = f.pages[0].div.children.find(child => child.className === 'pdfPrefetchPreview');
@@ -1278,7 +1428,11 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         };
         view.canvas = canvas; view.renderingState = 1;
         f.eventBus.emit('pagerender', { pageNumber: 1, source: view });
-        return { view, canvas };
+        return { view, canvas, publish() {
+            const managed = view as any;
+            assert.strictEqual(managed.publishImageCandidate({ canvas, appearance: managed.imageAppearance, geometry: 'measured', intent: {} },
+                () => view.div.prepend(canvas)), true);
+        } };
     }
 
     function near(actual: number, expected: number, reason: string) {
@@ -1294,7 +1448,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         const robots = new DocumentRobots();
         const h = previewFixture({ pages: 1, startPage: 1, width: 332.59866666666665, height: 472.4406666666667,
             initialNative: false, autoPages: false }, robots), f = h.f;
-        const { view, canvas: native } = measuredNative(f), loader = h.bind();
+        const { view, canvas: native, publish } = measuredNative(f), loader = h.bind();
         await f.frame();
         const preview = h.publish(loader, 1, 541, 768).canvas;
         const matrix = previewMatrix(preview);
@@ -1308,7 +1462,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.deepStrictEqual(delivered.pageProjection!.clip, { x: 0, y: 0, width: 330, height: 470 });
         assert.deepStrictEqual(delivered.rasterProjection, { width: 541, height: 768, pageToRaster: [541, 0, 0, 768, 0, 0] });
         assert.strictEqual(delivered.displayRasterProjection, delivered.rasterProjection, 'the visible atlas supplies the current display grid');
-        view.renderingState = 3;
+        publish(); view.renderingState = 3;
         f.eventBus.emit('pagerendered', { pageNumber: 1, source: view, error: null, cssTransform: false });
         const refined = robots.refinements.at(-1)!;
         assert.strictEqual(refined.canvas, native);
@@ -1325,7 +1479,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         const preview = h.publish(loader, 1, 541, 768).canvas;
         assert.strictEqual(preview.parentNode, f.pages[0].div);
         let displayed = false, measurements = 0;
-        const { view, canvas } = measuredNative(f, () => { measurements++; return displayed; });
+        const { view, canvas, publish } = measuredNative(f, () => { measurements++; return displayed; });
         assert.strictEqual(preview.parentNode, view.div, 'native draw preparation cannot remove already useful preview pixels');
         const matrix = previewMatrix(preview);
         near(matrix[0] * 330, view.viewport.width, 'provisional horizontal logical extent');
@@ -1339,7 +1493,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         const afterAttachment = measurements;
         f.eventBus.emit('updateviewarea'); await f.frame();
         assert.strictEqual(measurements, afterAttachment, 'real attached geometry can then be cached');
-        view.renderingState = 3;
+        publish(); view.renderingState = 3;
         f.eventBus.emit('pagerendered', { pageNumber: 1, source: view, error: null, cssTransform: false });
         assert.strictEqual(robots.refinements.at(-1)!.canvas, canvas);
         await f.frame();
@@ -1371,11 +1525,11 @@ describe('the PDF viewers\' shared prefetch controller', function () {
             robots.refine = value => { robots.refinements.push(value); return 0; };
             const f = fixture({ pages: 1, startPage: 1, width: 332.59866666666665, height: 472.4406666666667,
                 initialNative: false, autoPages: false }, { robotsEnabled: true, createDocumentRobots: () => robots });
-            const { view, canvas } = measuredNative(f);
+            const { view, canvas, publish } = measuredNative(f);
             let nativeMeasurements = 0;
             const rect = canvas.getBoundingClientRect;
             canvas.getBoundingClientRect = () => { nativeMeasurements++; return rect(); };
-            await f.frame(); view.renderingState = 3;
+            await f.frame(); publish(); view.renderingState = 3;
             f.eventBus.emit('pagerendered', { pageNumber: 1, source: view, error: null, cssTransform: false });
             view.viewport = { width: 944.8813333333334, height: 665.1973333333333, scale: 1, rotation: angle };
             view.div.clientWidth = 940; view.div.clientHeight = 660;
@@ -1426,6 +1580,8 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.strictEqual(robots.deliveries.length, 1);
         const before = robots.refinements.length, view = f.pages[0];
         view.canvas = new Canvas(); view.canvas.width = 800; view.canvas.height = 1000; view.renderingState = 3;
+        for (const child of [...view.div.children]) { child.remove(); }
+        view.div.prepend(view.canvas);
         f.eventBus.emit('pagerendered', { pageNumber: 1, source: view, error: null, cssTransform: true });
         await f.frame();
         assert.strictEqual(robots.refinements.length, before, 'a cached but detached preview cannot supply the unknown visible raster grid');
@@ -1555,7 +1711,7 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         const robots = new DocumentRobots();
         const h = previewFixture({ startPage: 99, pages: 120, autoPages: false, initialNative: false }, robots);
         const { f } = h;
-        const spread = new Element(); spread.className = 'spread';
+        const spread = new Element(); spread.className = 'spread'; f.container.prepend(spread);
         for (const id of [99, 100]) { spread.prepend(f.pages[id - 1].div); f.pages[id - 1].reset(); }
         (f.pages[98] as any).pageLabel = '88'; (f.pages[99] as any).pageLabel = '89';
         f.visibleIds = [99, 100];
@@ -1595,6 +1751,22 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         f.finishNative(21); await f.frame();
         assert.strictEqual(robots.deliveries.length, 1, 'native promotion does not replay a handled page');
         assert.strictEqual(loader.settings.quality(21), Infinity);
+    });
+
+    it('accepts a verified atlas after the first native task fails without an accepted display', async () => {
+        const h = previewFixture({ startPage: 1, pages: 1, initialNative: false, autoPages: false }), f = h.f;
+        const loader = h.bind(); await f.frame();
+        const view = f.pages[0]; view.renderingState = 3; view.canvas = null;
+        f.eventBus.emit('pagerendered', { pageNumber: 1, source: view, error: new Error('native first pass failed') });
+        assert.notStrictEqual(loader.settings.quality(1), Infinity, 'failed FINISHED state cannot suppress atlas fallback');
+        const atlas = h.publish(loader, 1);
+        assert.strictEqual(atlas.accepted, true);
+        assert.strictEqual(atlas.canvas.parentNode, view.div);
+        assert.deepStrictEqual(f.controller.snapshot().visibleMissing, []);
+        f.finishNative(1);
+        view.renderingState = 1;
+        assert.strictEqual(loader.settings.quality(1), Infinity, 'accepted complete native remains sufficient during another pass');
+        assert.strictEqual(h.publish(loader, 1).accepted, false);
     });
 
     it('attaches sidecar image placements to an already finished native page without downloading a raster', async () => {
@@ -2194,7 +2366,9 @@ describe('the PDF viewers\' shared prefetch controller', function () {
             f.eventBus.emit('scalechanging');
             await promisesSettled();
             await f.frame();
-            assert.ok(view.div.children.some(child => child.className === 'pdfPrefetchPreview'), 'zoom keeps raster coverage while resources return');
+            assert.ok(canvas?.isConnected && view.div.contains(canvas), 'the accepted native keeps raster coverage while resources return');
+            view.reset(); f.eventBus.emit('updateviewarea'); await f.frame();
+            assert.ok(view.div.children.some(child => child.className === 'pdfPrefetchPreview'), 'actual native reset reattaches the cached preview');
             assert.strictEqual(f.pdf.renders.filter(render => render.id === view.id).length, 2, 'a later native redraw prepares fresh resources');
         });
     }
@@ -2599,7 +2773,8 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.ok(f.canvases.filter(canvas => canvas.width > 0).every(canvas => Math.max(canvas.width, canvas.height) <= 512));
         assert.ok(f.canvases.some(canvas => Math.max(canvas.width, canvas.height) === 192), 'old detached previews become small trail rasters');
         const visible = f.pages[0];
-        visible.renderingState = 0;
+        assert.ok(visible.canvas?.isConnected);
+        visible.reset(); f.eventBus.emit('updateviewarea');
         await f.frame();
         assert.ok(visible.div.children.some(canvas => canvas.className === 'pdfPrefetchPreview'), 'visible preview survives LRU eviction');
     });
@@ -2653,8 +2828,12 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.ok(trail && Math.max(trail.width, trail.height) === 192, 'the old page is immediately covered by its small raster');
         const before = f.pdf.renders.filter(render => render.id === view.id).length;
         f.finishNative(view.id);
-        const replacement = view.div.children.find(canvas => canvas.className === 'pdfPrefetchPreview') as Canvas;
+        assert.ok(view.canvas?.isConnected && view.div.contains(view.canvas), 'accepted native displays while copied preview stays cached');
+        const replacement = f.canvases.find(canvas => canvas.source === view.canvas)!;
         assert.ok(replacement && replacement !== trail);
+        assert.strictEqual(replacement.parentNode, null);
+        view.reset(); f.eventBus.emit('updateviewarea'); await f.frame();
+        assert.strictEqual(replacement.parentNode, view.div, 'native eviction reattaches the upgraded cache without decoding');
         assert.strictEqual(Math.max(replacement.width, replacement.height), 512);
         assert.strictEqual(replacement.copies, 1, 'the native canvas supplies the higher-quality preview');
         assert.strictEqual(trail.width, 0);
@@ -2682,7 +2861,8 @@ describe('the PDF viewers\' shared prefetch controller', function () {
             assert.doesNotThrow(() => f.finishNative(view.id), 'a preview copy failure must not escape PDF.js rendering events');
             assert.strictEqual(attempted.length, 1);
             assert.strictEqual(attempted[0].width * attempted[0].height, 0, 'the failed temporary raster releases its allocation');
-            assert.strictEqual(trail.parentNode, view.div, 'the previous attached preview remains until the native view replaces it');
+            assert.strictEqual(trail.parentNode, null, 'successful native publication replaces the preview even if its cache copy fails');
+            assert.ok(view.canvas?.isConnected && view.div.contains(view.canvas));
             assert.strictEqual(Math.max(trail.width, trail.height), 192);
             for (let step = 0; step < 3; step++) {
                 f.eventBus.emit('updateviewarea');
@@ -3313,7 +3493,8 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.strictEqual(snapshot.previewBytes, 128 * 64 * 64 * 4);
         // The oldest page is visible. Its preview should survive even when its full canvas
         // needs another render; the other oldest previews supply the eviction candidates.
-        f.pages[0].renderingState = 0;
+        assert.ok(f.pages[0].canvas?.isConnected);
+        f.pages[0].reset();
         f.eventBus.emit('updateviewarea');
         await f.frame();
         assert.ok(f.pages[0].div.children.some(child => child.className === 'pdfPrefetchPreview'));

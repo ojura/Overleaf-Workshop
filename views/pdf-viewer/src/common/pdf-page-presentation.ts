@@ -17,6 +17,7 @@ export type PdfPageCoverage =
 /** Evidence travels with the successful raster, never with a mutable page proxy. */
 export interface PdfPagePresentationCandidate {
     document: object;
+    /** Stable source-page identity within this document; independent of native proxy installation. */
     page: object;
     pageNumber: number;
     appearance: string;

@@ -35,7 +35,7 @@ function harness() {
   let at = 0;
   const context = { current: () => true, dispose: () => {}, payloads: new Map(), eventSequences: new Set(),
     result: { startedAt: 0, events: [], samples: [], refinements: [], retirements: [] },
-    panel: () => null,
+    panel: () => null, surfaces: { performance() {} },
     container: { dataset: {}, scrollWidth: 400, scrollHeight: 800, clientWidth: 400, clientHeight: 700 },
     performance: { now: () => ++at }, latest: undefined, nodes: [],
     viewer: { currentPageNumber: event.page }, getComputedStyle: node => node.computed };
@@ -198,4 +198,19 @@ test('firstPixels requires FINISHED native state and rejects zero-box or hidden 
     assert.equal(h.firstPixels(h.sample(event.before)).firstPixels, undefined);
     h.setPreview(undefined);
   }
+});
+
+test('actual short cleanup propagates bounded surface failures and still releases every observer', () => {
+  const begin = phone.indexOf('  const dispose = () => {'), end = phone.indexOf('  const guard =', begin);
+  assert.ok(begin >= 0 && end > begin);
+  const removed = [], context = { disposed: false, surfaces: { result: { errors: Array(12).fill('forced capture failure') },
+    stop() { removed.push('surface'); } }, clearTimeout: () => {}, timer: 1, activeTimer: 2,
+    request: { abort() { removed.push('request'); } }, result: { errors: [] }, types: ['touchstart'],
+    document: { removeEventListener(name) { removed.push(name); } }, window: { removeEventListener(name) { removed.push(name); } },
+    stop() {}, hidden() {}, error() {} };
+  vm.runInNewContext(phone.slice(begin, end) + '\nglobalThis.finishCleanup = dispose;', context);
+  context.finishCleanup(); context.finishCleanup();
+  assert.equal(context.result.errors.length, 8); assert.ok(context.result.errors.every(value => value.startsWith('Surface observation: ')));
+  assert.equal(context.result.observersRemoved, true); assert.equal(removed.filter(value => value === 'surface').length, 1);
+  assert.ok(removed.includes('touchstart')); assert.ok(removed.includes('visibilitychange'));
 });

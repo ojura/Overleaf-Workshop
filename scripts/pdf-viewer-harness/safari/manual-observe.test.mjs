@@ -34,16 +34,16 @@ function harness(options = {}) {
       if (selector === '.measurements') return { open: false };
       return null;
     } } };
-  const container = Object.assign(target(), { get scrollTop() { return values.top; },
+  const container = Object.assign(target(), { getBoundingClientRect:box, get scrollTop() { return values.top; },
     set scrollTop(_value) { throw new Error('Manual mode must not scroll'); }, scrollLeft: 0 });
   // Object.assign evaluates getters, so keep the reader accessor explicit.
   Object.defineProperty(container, 'scrollTop', { get: () => values.top, set: () => { throw new Error('Manual mode must not scroll'); } });
   const pdf = { numPages: 460 };
-  const viewer = { pdfDocument: pdf, container, get currentPageNumber() { return values.page; },
+  const viewer = { pagesCount:460, _getVisiblePages:()=>({views:[{id:values.page}]}), pdfDocument: pdf, container, get currentPageNumber() { return values.page; },
     set currentPageNumber(_value) { throw new Error('Manual mode must not navigate'); },
     get currentScale() { return values.scale; }, currentScaleValue: 'page-width', pagesRotation: 0, scrollMode: 0, spreadMode: 0,
     scrollPageIntoView() { throw new Error('Manual mode must not navigate'); },
-    getPageView() { return { canvas, renderingState: 3, div: { querySelector: () => null } }; } };
+    getPageView() { return { canvas, renderingState: 3, div: { isConnected:true, getBoundingClientRect:box, querySelector: () => null, querySelectorAll:()=>[] } }; } };
   const app = { pdfViewer: viewer, pdfDocument: pdf, url: documentConfig.pdfUrl, pdfSidebar: { visibleView: 0 } };
   const prefetch = { robotsEnabled: true, diagnosticsEnabled: false,
     setRobotsEnabled() { throw new Error('Manual mode must not change controls'); },
@@ -56,9 +56,12 @@ function harness(options = {}) {
     getSelection: () => ({ isCollapsed: values.selection, rangeCount: values.selection ? 0 : 1 }) });
   const context = { window, document, performance: { now: () => clock }, URL, innerWidth: 402, innerHeight: 548,
     location: { href: documentConfig.pageUrl }, devicePixelRatio: 3, screen: { orientation: { angle: 0 } },
-    getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+    getComputedStyle: node => {
+      if (options.surfaceFailure && node === container) throw new Error('forced surface capture failure');
+      return { display: 'block', visibility: 'visible' };
+    },
     setTimeout(callback, ms) { const id = ++serial; jobs.set(id, { at: clock + ms, callback }); return id; },
-    clearTimeout(id) { jobs.delete(id); }, requestAnimationFrame() { throw new Error('Manual mode requires no animation loop'); } };
+    clearTimeout(id) { jobs.delete(id); }, requestAnimationFrame(callback) { const id=++serial; jobs.set(id,{at:clock+16,callback});return id; },cancelAnimationFrame(id){jobs.delete(id);},MutationObserver:class {observe(){} takeRecords(){return [];}disconnect(){}}  };
   const start = vm.runInNewContext(source, context);
   assert.equal(typeof start, 'function'); assert.equal(window.__spomenarManualProbe, undefined);
   assert.equal(reads, 0); assert.equal(jobs.size, 0);
@@ -93,6 +96,10 @@ test('manual mode records only trusted gestures and leaves the user reading stat
   assert.equal(result.eventCounts.orientationchange, 1); assert.equal(result.eventCounts.resize, 1);
   assert.ok(result.events.every(event => event.key === undefined && event.text === undefined));
   assert.equal(result.restorationSkipped, 'manual-observation');
+  assert.equal(result.surfaceObservation.stopped, true);
+  assert.equal(result.surfaceObservation.errors.length, 0);
+  assert.equal(result.surfaceObservation.first.phase, 'observing');
+  assert.equal(result.surfaceObservation.last.phase, result.state);
   assert.equal(h.jobs.size, 0); assert.equal(h.allListeners(), 0);
 });
 
@@ -149,4 +156,14 @@ test('manual samples preserve standalone header controls and changing visible Mo
   assert.equal(result.final.panel.x, 27); assert.equal(result.final.panel.width, 300); assert.equal(result.final.panel.dock, 'right');
   assert.equal(h.values.page, 46); assert.equal(h.values.top, 22500);
   assert.equal(h.jobs.size, 0); assert.equal(h.allListeners(), 0);
+});
+
+test('assembled manual capture failure reaches terminal errors while all cleanup still completes', () => {
+  const h = harness({ surfaceFailure: true }); h.advance(500); h.api.stop(token);
+  const result = h.api.result(token);
+  assert.equal(result.surfaceObservation.stopped, true);
+  assert.ok(result.surfaceObservation.errors.some(error => error.includes('forced surface capture failure')));
+  assert.ok(result.errors.some(error => error.includes('Surface observation: forced surface capture failure')),
+    'the host frontend-errors validation must see the surface failure');
+  assert.equal(result.observersRemoved, true); assert.equal(h.jobs.size, 0); assert.equal(h.allListeners(), 0);
 });

@@ -1,6 +1,7 @@
 (options => {
   'use strict';
   // @include payload-observation.mjs
+  // @include surface-observation.mjs
   // This mode observes actual user gestures. It never drives or restores the reader.
   const token = options?.token, expected = options?.document, durationMs = options?.durationMs ?? 120000;
   const leaseMs = options?.leaseMs ?? 20000;
@@ -27,6 +28,10 @@
   const result = { token, expected, state: 'observing', finished: false, startedAt: now(), durationMs,
     mutatedReader: false, saved: readState(), samples: [], events: [], eventCounts: {}, sampleCount: 0,
     observationCounts: { refined: 0, retired: 0 }, refinements: [], retirements: [], peaks: {}, errors: [] };
+  const surfaces = observeReaderSurfaces({viewer,container,bus:app.eventBus,document,window,now:()=>performance.now(),
+    requestFrame:callback=>requestAnimationFrame(callback),cancelFrame:id=>cancelAnimationFrame(id),style:getComputedStyle,MutationObserver,
+    phase: () => result.state});
+  result.surfaceObservation = surfaces.result;
   let timer, leaseUntil = now() + leaseMs, latest, disposed = false, api;
   const listeners = [];
   const listen = (target, type, callback, options) => { if (!target) return;
@@ -58,6 +63,7 @@
   const sample = () => {
     if (!current()) throw new Error('Document changed during manual observation');
     const state = prefetch.snapshot(), robots = state.robots, visual = window.visualViewport;
+    surfaces.performance(state.performance.events);
     if (state.visible.length > 32) throw new Error('Unexpected visible-page count');
     const next = { at: now(), reading: readState(), visible: [...state.visible], missing: [...state.visibleMissing],
       pending: [...state.pending], pendingFetches: state.performance.pendingFetchCount,
@@ -83,7 +89,11 @@
     }
     result.sampleCount++; latest = next; push(result.samples, next, 240); return next;
   };
-  const cleanup = () => { if (disposed) return; disposed = true; clearTimeout(timer);
+  const cleanup = () => { if (disposed) return; disposed = true; surfaces.stop();
+    for (const message of surfaces.result.errors) {
+      if (result.errors.length < 8) result.errors.push('Surface observation: ' + message);
+    }
+    clearTimeout(timer);
     for (const remove of listeners.splice(0)) remove(); result.observersRemoved = true; };
   const finish = reason => {
     if (result.finished) return;

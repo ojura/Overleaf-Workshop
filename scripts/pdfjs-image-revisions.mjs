@@ -98,8 +98,22 @@ export function imageRevisionViewer(source, file = 'PDF.js viewer') {
 }
 
 function publicationHooks(source) {
+    source = source.replace('if (this.hasUsefulPresentation) {', 'if (this.hasDisplayedPresentation?.() ?? this.hasUsefulPresentation) {');
+    if (source.includes('function onPageRender(') && !source.includes('function onPageLoadingStateChanged(')) {
+        source = source.replace('this.toolbar?.updateLoadingIndicatorState(true);', 'this.toolbar?.updateLoadingIndicatorState(this.pdfViewer.getPageLoadingState?.(pageNumber) ?? true);')
+            .replace('this.toolbar?.updateLoadingIndicatorState(false);', 'this.toolbar?.updateLoadingIndicatorState(this.pdfViewer.getPageLoadingState?.(pageNumber) ?? false);')
+            .replace('this.toolbar?.updateLoadingIndicatorState(currentPage?.renderingState === RenderingStates.RUNNING);', 'this.toolbar?.updateLoadingIndicatorState(this.pdfViewer.getPageLoadingState?.(pageNumber) ?? (currentPage?.renderingState === RenderingStates.RUNNING));')
+            .replace('eventBus._on("pagerender", onPageRender.bind(this), opts);', 'eventBus._on("pageloadingstatechanged", onPageLoadingStateChanged.bind(this), opts);\n    eventBus._on("pagerender", onPageRender.bind(this), opts);')
+            .replace('function onPageRender(', `function onPageLoadingStateChanged({ source, pageNumber }) {
+  if (source !== this.pdfViewer || pageNumber !== this.page) { return; }
+  const pending = this.pdfViewer.getPageLoadingState?.(pageNumber);
+  if (pending !== undefined) { this.toolbar?.updateLoadingIndicatorState(pending); }
+}
+function onPageRender(`);
+    }
+
     source = source.replace('      case RenderingStates.RUNNING:\n        this.div.classList.add("loadingIcon");',
-        '      case RenderingStates.RUNNING:\n        if (this.hasUsefulPresentation) { this.div.classList.remove("loadingIcon", "loading"); break; }\n        this.div.classList.add("loadingIcon");');
+        '      case RenderingStates.RUNNING:\n        if (this.hasDisplayedPresentation?.() ?? this.hasUsefulPresentation) { this.div.classList.remove("loadingIcon", "loading"); break; }\n        this.div.classList.add("loadingIcon");');
     if (source.includes('this.publishImageCandidate({ canvas,')) { return source; }
     source = source.replace('const updateOnFirstShow = !prevCanvas && !hasHCM && !hideUntilComplete;',
         'const updateOnFirstShow = !prevCanvas && !hasHCM && !hideUntilComplete && !this.publishImageCandidate;');

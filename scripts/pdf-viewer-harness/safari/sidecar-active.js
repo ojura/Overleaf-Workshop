@@ -1,5 +1,6 @@
 (async options => {
   // @include payload-observation.mjs
+  // @include surface-observation.mjs
   // @include photo-evidence.mjs
   // @include scene-ready.mjs
   if (window.__spomenarSidecarProbe || window.__spomenarSustainedProbe) throw new Error('A phone observation is already active');
@@ -31,7 +32,7 @@
     sidebar: app.pdfSidebar?.visibleView, top: container.scrollTop, left: container.scrollLeft,
     robots: prefetch.robotsEnabled, lab: prefetch.diagnosticsEnabled });
   const saved = readState();
-  const result = { token, expected, budget: { ...budget }, startedAt: performance.now(), saved, focused: document.hasFocus(), samples: [], events: [], entries: [], errors: [],
+  const result = { phase: 'preparing', token, expected, budget: { ...budget }, startedAt: performance.now(), saved, focused: document.hasFocus(), samples: [], events: [], entries: [], errors: [],
     refinements: [], retirements: [], interrupted: false, initialGeometry: { scrollWidth: container.scrollWidth,
       scrollHeight: container.scrollHeight, clientWidth: container.clientWidth, clientHeight: container.clientHeight } };
   const eventSequences = new Set(), payloadObservations = new PayloadObservations(), request = new AbortController();
@@ -53,6 +54,10 @@
       columnX: Number.parseFloat(getComputedStyle(container).getPropertyValue('--pdf-document-column-x')) || 0 };
   };
   result.savedPanel = panelState();
+  const surfaces = observeReaderSurfaces({viewer,container,bus:app.eventBus,document,window,now:()=>performance.now(),
+    requestFrame:callback=>requestAnimationFrame(callback),cancelFrame:id=>cancelAnimationFrame(id),style:getComputedStyle,MutationObserver,
+    phase: () => result.phase});
+  result.surfaceObservation = surfaces.result;
   let activeTimer, timer, disposed = false, changed = false, closing = false, panelRestore, restoreInFlight, closeInFlight;
   const current = () => app.pdfDocument === pdfDocument && viewer.pdfDocument === pdfDocument
     && new URL(app.url, location.href).href === pdfUrl.href;
@@ -69,7 +74,11 @@
   const types = ['touchstart', 'touchmove', 'gesturestart', 'gesturechange', 'pointerdown', 'keydown', 'wheel'];
   const dispose = () => {
     if (disposed) return;
-    disposed = true; clearTimeout(timer); clearTimeout(activeTimer); request.abort();
+    disposed = true; surfaces.stop();
+    for (const message of surfaces.result.errors) {
+      if (result.errors.length < 8) result.errors.push('Surface observation: ' + message);
+    }
+    clearTimeout(timer); clearTimeout(activeTimer); request.abort();
     for (const type of types) document.removeEventListener(type, stop, true);
     window.removeEventListener('orientationchange', stop); document.removeEventListener('visibilitychange', hidden);
     window.removeEventListener('error', error); window.removeEventListener('unhandledrejection', error);
@@ -82,6 +91,7 @@
   const restore = () => {
     if (restoreInFlight) return restoreInFlight;
     restoreInFlight = Promise.resolve().then(async () => {
+      result.phase = 'restoring';
       if (result.interrupted || disposed || !current()) return false;
       if (!changed) { result.readingState = readState(); return true; }
       let panelError;
@@ -137,6 +147,7 @@
   const sample = () => {
     if (!current()) { result.interrupted = true; result.interruption = 'document changed'; dispose(); }
     const state = prefetch.snapshot(), robots = state.robots;
+    surfaces.performance(state.performance.events);
     for (const event of state.performance.events) {
       if (event.at < result.startedAt || eventSequences.has(event.sequence) || !/^(sidecar-|preview-ready|page-render)/.test(event.type)) continue;
       eventSequences.add(event.sequence); result.events.push(event);
@@ -239,6 +250,7 @@
     guard();
     changed = true;
     prefetch.setRobotsEnabled(true); prefetch.setDiagnosticsEnabled(false);
+    result.phase = 'delivery';
     for (const target of targets) {
       guard();
       const entry = { page: target, at: performance.now() }; result.entries.push(entry);
@@ -261,6 +273,7 @@
           const height = picture && Math.max(0, Math.min(picture.bottom, area.bottom) - Math.max(picture.top, area.top));
           if (!picture || width * height < picture.width * picture.height * 0.8) continue;
           const transit = document.querySelector('.pdfDocumentRobotTransit'), style = transit && getComputedStyle(transit);
+          result.phase = 'selected';
           result.active = { at: state.at, page: page.page, payload, ...evidence,
             helpers: page.actors.filter(actor => actor.payloadId === payload.id),
             cargo: cargo.map(node => ({ width: node.width, height: node.height, bytes: node.width * node.height * 4,

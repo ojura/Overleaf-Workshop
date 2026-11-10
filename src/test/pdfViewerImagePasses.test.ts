@@ -41,6 +41,24 @@ describe('native image-pass presentation in both viewers', function () {
     });
 
     for (const engine of ['pdfjs', 'overleaf']) {
+        it(`${engine} derives page loading-icon suppression from the live displayed owner after reset`, () => {
+            const source = sources.get(engine)!;
+            const Constructor = new Function('RenderingStates', 'RenderingCancelledException', 'document', source.base + '\nreturn BasePDFPageView;')(states, Cancelled, {});
+            const page = new Constructor({ id: 1, eventBus: { dispatch() {} } });
+            const classes = new Set<string>();
+            page.div = { classList: { add: (...names: string[]) => names.forEach(name => classes.add(name)), remove: (...names: string[]) => names.forEach(name => classes.delete(name)) } };
+            page.hasUsefulPresentation = true;
+            let displayed = false;
+            page.hasDisplayedPresentation = () => displayed;
+            page.renderingState = states.RUNNING;
+            assert.ok(classes.has('loadingIcon'), 'detached old raster cannot suppress loading while no preview exists');
+            page.renderingState = states.INITIAL;
+            displayed = true;
+            page.renderingState = states.RUNNING;
+            assert.strictEqual(classes.has('loadingIcon'), false, 'accepted preview suppresses the native pass icon');
+            page.renderingState = states.INITIAL;
+        });
+
         it(`${engine} shows monotone photo coverage within one render intent while preserving replacement and zoom barriers`, async () => {
             const created: Canvas[] = [], events: any[] = [];
             const source = sources.get(engine)!;

@@ -234,6 +234,7 @@
     probe.setPanelRestore(undefined);
   }
   try {
+    result.phase = 'delivery-settle';
     guard();
     while (performance.now() < finishDeadline && !ready(sample())) { guard(); await sleep(80); }
     guard();
@@ -241,12 +242,15 @@
     if (!selectedDeliveryComplete(result.active, sample())) throw new Error('Selected delivery did not finish with a delivered committed crop');
     result.deliverySettled = { settled: true };
     if (!result.interrupted) {
+      result.phase = 'panel';
       await checkPanel();
       guard(); await restore(); guard();
+      result.phase = 'restoration-settle';
       result.restorationSettled = await settle(budget.settleMs);
       const baseline = sample();
       // Restoring the original view can restart progressive native images. One existing
       // finish deadline owns their completion and every renewed continuous idle interval.
+      result.phase = 'restored-readiness';
       const observed = await observeAwakeIdle({ now: () => performance.now(), deadline: finishDeadline, sample,
         canContinue: () => { guard(); return document.visibilityState === 'visible'; },
         ready, frameCount: state => state.robots.frames, nextFrame });
@@ -271,6 +275,7 @@
     if (!result.interrupted && !probe.closing) result.failure = String(error.message || error);
   } finally {
     try { await restore(); } catch (error) { result.cleanupError = String(error.message || error); }
+    result.phase = 'finished';
     dispose(); if (window.__spomenarSidecarProbe === probe) delete window.__spomenarSidecarProbe;
     result.finishedAt = performance.now();
     result.readingState = probe.readState();
