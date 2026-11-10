@@ -1,4 +1,9 @@
 // One predicate owns whether scripted navigation may leave the current scene.
+export function qualitySceneEmpty(state) {
+  return !state?.robots?.activeQualityReactions && !state?.robots?.qualityReactions?.length
+    && !state?.payloadArtifacts?.quality?.length;
+}
+
 export function sceneReady(state) {
   const displayed = image => image?.connected && image.width > 0 && image.height > 0
     && image.rect.width > 0 && image.rect.height > 0
@@ -6,7 +11,7 @@ export function sceneReady(state) {
   return !state.sceneMoving && state.documentVisible && state.prefetchIdle === true && state.canvases.length > 0 && !state.missing.length
     && state.canvases.every(page => displayed(page.preview) || page.state === 3 && displayed(page.native))
     && state.canvases.every(page => page.state !== 1 && page.state !== 2)
-    && !state.robots.activeActors && !state.robots.activePayloads && !state.robots.retainedBytes
+    && !state.robots.activeActors && !state.robots.activePayloads && !state.robots.retainedBytes && qualitySceneEmpty(state)
     && !state.robots.queuedDeliveryCovers && !state.payloadArtifacts?.plans?.length
     && !state.robots.scheduled && !state.robots.caption?.pendingExpiry
     && Object.values(state.effectNodes).every(count => count === 0)

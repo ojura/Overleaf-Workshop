@@ -1,5 +1,6 @@
 import type { PdfPageProjection } from './pdf-raster-projection';
 import type { PdfPreviewImageRegion } from './pdf-preview-source';
+import type { PdfCropQuality } from './pdf-quality-reactions';
 
 /** Current DOM facts accompany source-page candidate identities at publication. */
 export interface PdfDeliveryEncounter {
@@ -50,6 +51,32 @@ export interface PdfDeliveryPlanAdapter {
 const intersects = (a: RobotDocumentRect, b: RobotDocumentRect) => a.x < b.x + b.width && b.x < a.x + a.width
     && a.y < b.y + b.height && b.y < a.y + a.height;
 
+function cropResources(coverage: Extract<PdfPageCoverage, { kind: 'native' }>, crop: RobotDocumentRect,
+    regions: readonly PdfPreviewImageRegion[] | undefined, regionsComplete: boolean) {
+    const relevant = regions?.filter(region => intersects(region, crop));
+    const mapped = !!(regionsComplete && coverage.discovered && relevant?.length
+        && relevant.every(region => region.resourceId && coverage.resources.some(resource => resource.imageId === region.resourceId)));
+    const resources = mapped ? coverage.resources.filter(resource => relevant!.some(region => region.resourceId === resource.imageId))
+        : coverage.resources;
+    return { mapped, resources };
+}
+
+export type PdfDeliveryCropQuality = PdfCropQuality;
+
+/** Quality belongs to the successful raster and every source instance intersecting its crop. */
+export function pdfDeliveryCropQuality(candidate: PdfPagePresentationCandidate, crop: RobotDocumentRect,
+    encounter: Pick<PdfDeliveryEncounter, 'imageRegions' | 'imageRegionsComplete'>): PdfDeliveryCropQuality {
+    if (!candidate.successful || !(candidate.canvas.width > 0 && candidate.canvas.height > 0)
+        || ![crop.x, crop.y, crop.width, crop.height].every(Number.isFinite) || crop.width <= 0 || crop.height <= 0) { return 'unknown'; }
+    const coverage = candidate.coverage;
+    if (coverage.kind === 'complete-page') { return 'partial'; }
+    if (coverage.kind !== 'native' || !coverage.discovered) { return 'unknown'; }
+    const { mapped, resources } = cropResources(coverage, crop, encounter.imageRegions, encounter.imageRegionsComplete === true);
+    if (!resources.length || resources.some(resource => resource.failed) || !mapped && coverage.untrackedImageOperations !== false) { return 'unknown'; }
+    if (resources.every(resource => resource.covered && resource.final)) { return 'final'; }
+    return resources.some(resource => resource.covered) ? 'partial' : 'unknown';
+}
+
 /** Metadata and protection only: raster references are borrowed during synchronous admission. */
 export class PdfDeliveryPlans {
     private readonly pages = new Map<object, PagePlan>();
@@ -67,12 +94,7 @@ export class PdfDeliveryPlans {
     private readiness(plan: PagePlan, crop: PdfDeliveryPlannedCrop, coverage = plan.coverage): 'ready' | 'waiting' | 'failed' {
         if (!coverage) { return 'waiting'; }
         if (coverage.kind === 'complete-page' || coverage.kind === 'unknown') { return 'ready'; }
-        const regions = plan.regions;
-        const relevant = regions?.filter(region => intersects(region, crop.geometry));
-        const mapped = plan.regionsComplete && coverage.discovered && relevant?.length
-            && relevant.every(region => region.resourceId && coverage.resources.some(resource => resource.imageId === region.resourceId));
-        const resources = mapped ? coverage.resources.filter(resource => relevant!.some(region => region.resourceId === resource.imageId))
-            : coverage.resources;
+        const { mapped, resources } = cropResources(coverage, crop.geometry, plan.regions, plan.regionsComplete);
         // Unknown or unsupported occurrence linkage requires a complete successful native inventory.
         // Empty tracked resources alone cannot establish that an unmapped page has no photographs.
         if (!mapped && !coverage.discovered) { return 'waiting'; }

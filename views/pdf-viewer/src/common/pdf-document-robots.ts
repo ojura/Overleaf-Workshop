@@ -1,8 +1,10 @@
-import { PdfDeliveryPlans, type PdfDeliveryEncounter, type PdfDeliveryPlannedCrop } from './pdf-delivery-plan';
+import { PdfQualityReactions } from './pdf-quality-reactions';
+import { pdfDeliveryCropQuality, PdfDeliveryPlans, type PdfDeliveryEncounter, type PdfDeliveryPlannedCrop } from './pdf-delivery-plan';
 import type { PdfPagePresentationCandidate, PdfPageCoverage } from './pdf-page-presentation';
 import { paintRobotVehicle, robotArtworkGeometry, RobotRandom, ROBOT_ARTWORK_SIZE, ROBOT_FORKLIFT_ATTACHMENT, ROBOT_AIRLIFT_ATTACHMENT, ROBOT_VEHICLES, type RobotArtworkActor, type RobotVehicle, type RobotDispatchPort, type RobotDispatchPoint } from './prefetch-robots';
 import { pdfCachePolicy } from './scroll-prefetch';
 import { installReservedText } from './reserved-text';
+import type { RobotDialogueChoice, RobotDialogueOpportunity } from './robot-dialogue';
 import { RobotEncounters, ROBOT_INTERACTION_REACTIONS, ROBOT_OPERATION_DIALOGUE, type RobotEncounterActor, type RobotEncounterReaction } from './robot-encounters';
 import { LabelPlacementSolver, LABEL_PLACEMENT_LIMITS, type LabelPlacement, type LabelPlacementInput, type PlacementRect } from './label-placement';
 import { ASAP_CLEANER_ARTWORK_SIZE, paintAsapCleaner } from './robot-cleaner-artwork';
@@ -41,7 +43,7 @@ export const DOCUMENT_ROBOT_LIMITS = Object.freeze({
     flightBankDegrees: 4,
     advance: Object.freeze({ arrivalMs: 900, coordinationMs: 550, returnMs: 650, desktopCrew: 2, mobileCrew: 1 }),
     replacement: Object.freeze({ durationMs: 2100, pickupEnd: 0.22, lowerEnd: 0.38, fragmentsPerDesktopPage: 3 }),
-    cleaner: Object.freeze({ durationMs: 600, minDurationMs: 260, gestureSteps: 12, desktopScale: 0.85, compactScale: 0.55 }),
+    cleaner: Object.freeze({ durationMs: 600, desktopScale: 0.85, compactScale: 0.55 }),
     cooperative: Object.freeze({ rasterScale: 1.5, cropScale: 1.8, durationScale: 1.25 }),
     forklift: Object.freeze({ approachEnd: 0.16, liftStart: 0.44, baseInset: 14 }),
     desktop: Object.freeze({
@@ -163,7 +165,6 @@ interface Payload {
     cover?: HTMLDivElement;
     planOwner?: { planId: number; cropId: number };
     landingShadow?: HTMLDivElement;
-    underlay?: { canvas: HTMLCanvasElement; bytes: number };
     bytes: number;
     helpers: Courier[];
     progress: number;
@@ -173,7 +174,6 @@ interface Payload {
     refinements: number;
     contentRevision: number;
     refinementAttempt?: string;
-    cleanerShown?: boolean;
     routeState?: CargoRouteState;
     airliftReason?: CargoAirliftReason;
     returnPlanned?: boolean;
@@ -189,17 +189,13 @@ interface Payload {
     commitmentTimelines?: ReadonlyMap<number, readonly { until: number; commitments: readonly RobotCommitment[] }[]>;
     activity?: { key: string; until: number };
 }
-interface Cleaner {
-    id: number;
-    page: number;
-    payload: Payload;
-    sprite: HTMLCanvasElement;
-    bytes: number;
-    started: number;
-    duration: number;
-    phase: number;
-    direction: -1 | 1;
-    drawn: number;
+interface QualityScene {
+    id: number; actorId: number; source: object; sourceDocument: object; appearance: string; sourcePage: number; pageNumber: number;
+    pageElement: HTMLElement; pageProjection?: PdfPageProjection; pageExtent: { width: number; height: number }; planId: number; cropId: number; crop: Crop;
+    payload?: Payload; layer: HTMLDivElement; coarse: HTMLCanvasElement; sharp?: HTMLCanvasElement; sprite: HTMLCanvasElement;
+    coarseBytes: number; sharpBytes: number; spriteBytes: number; committed: boolean; released: boolean;
+    location: 'cargo' | 'page'; startedAt?: number; duration: number; deadline: number; phase: number; direction: -1 | 1;
+    opacity: string; scale: number;
 }
 interface RobotBody {
     id: number;
@@ -353,6 +349,7 @@ interface BodyPlacement {
     fixed?: boolean;
 }
 interface CaptionGroup {
+    choice?: RobotDialogueChoice;
     id: string;
     node: HTMLDivElement;
     actors: readonly number[];
@@ -428,7 +425,13 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     const episodes = new Map<number, Episode>();
     const advance = new Map<string, AdvanceWork>();
     let retiring: RetiringScene | undefined;
-    let cleaner: Cleaner | undefined;
+    const qualityReactions = new PdfQualityReactions();
+    const qualityScenes = new Map<number, QualityScene>();
+    const qualityPendingPages = new Map<object, number>();
+    const qualityPageIds = new WeakMap<object, number>();
+    let qualityPageSerial = 0;
+    let qualityPreparedActors = 0;
+    const qualityOutcomes: Array<Record<string, unknown>> = [];
     let columnPull: ColumnPull | undefined;
     const transit = doc.createElement('div');
     transit.className = 'pdfDocumentRobotTransit';
@@ -469,6 +472,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     let capacityFreed = false;
     let capacityOnMotionResume = false;
     let captionGroup: CaptionGroup | undefined;
+    let automaticSpeechSerial = Math.abs(options.seed ?? 0) % 2;
+    const automaticSpeechPhases = new Map<number, 'carrying' | 'deposit'>();
+    const speechCues = new Map<string, { choice: RobotDialogueChoice; until: number; owners: readonly number[]; released?: boolean }>();
     let captionTimer: number | undefined;
     let interaction: ReturnType<typeof installRobotInteraction> | undefined;
     let hovered: { id: number; point: RobotInteractionPoint; started: number } | undefined;
@@ -482,8 +488,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     const currentActors = (): RobotBody[] => [...[...episodes.values()].flatMap(actorsOf), ...advanceActors().map(actor => actor.body),
         ...(columnPull ? [columnPull.body] : [])];
     const allActors = (): RobotBody[] => [...currentActors(), ...(retiring?.pieces.flatMap(piece => piece.payload.helpers) ?? [])];
-    const actorCount = () => allActors().length + Number(!!cleaner);
-    const moving = () => !!retiring || !!columnPull && columnPull.phase !== 'waiting' || !!greeting
+    const actorCount = () => allActors().length + qualityScenes.size + qualityPreparedActors;
+    const moving = () => qualityScenes.size > 0 || !!retiring || !!columnPull && columnPull.phase !== 'waiting' || !!greeting
         || episodes.size > 0 || [...advance.values()].some(work => work.actors.length && work.phase !== 'parked');
     const documentOffset = () => { const offset = options.documentOffset?.() ?? 0; return Number.isFinite(offset) ? offset : 0; };
 
@@ -728,11 +734,12 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
 
     function clearCaption(): void {
         if (captionTimer !== undefined) { win.clearTimeout(captionTimer); captionTimer = undefined; }
+        if (captionGroup?.choice && ![...speechCues.values()].some(cue => cue.choice === captionGroup!.choice)) { encounters.releaseSpeech(captionGroup.choice); }
         captionGroup?.node.remove();
         for (const leader of captionGroup?.leaders ?? []) { leader.remove(); }
         captionGroup = undefined;
         captionPlacement.reset();
-        if (!episodes.size && !advance.size && !retiring && !columnPull) { transit.remove(); }
+        if (!episodes.size && !advance.size && !retiring && !columnPull && !qualityScenes.size) { transit.remove(); }
     }
 
     function expireCaption(group: CaptionGroup): void {
@@ -842,6 +849,175 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         finally { if (canvas) { release(canvas); } }
     }
 
+    function releaseQualityScene(scene: QualityScene, outcome: 'completed' | 'cancelled', reason: string): void {
+        if (scene.released) { return; }
+        scene.released = true; qualityScenes.delete(scene.id);
+        if (!scene.committed) { qualityPreparedActors--; }
+        if (scene.payload?.canvas) { scene.payload.canvas.style.opacity = scene.opacity; }
+        release(scene.coarse); if (scene.sharp) { release(scene.sharp); } release(scene.sprite); scene.layer.remove();
+        cargoBytes -= scene.coarseBytes + scene.sharpBytes; spriteBytes -= scene.spriteBytes;
+        capacityFreed = true;
+        if (!episodes.size && !advance.size && !retiring && !columnPull && !qualityScenes.size && !captionGroup) { transit.remove(); }
+        if (scene.committed) {
+            qualityOutcomes.push({ id: scene.id, sourcePage: scene.sourcePage, pageNumber: scene.pageNumber,
+                planId: scene.planId, cropId: scene.cropId, imageId: scene.crop.imageId, imageIds: scene.crop.imageIds ?? [],
+                target: scene.crop, actorId: scene.actorId, associatedPayloadId: scene.payload?.id,
+                outcome, reason, at: now() });
+            if (qualityOutcomes.length > 32) { qualityOutcomes.shift(); }
+            qualityReactions.finish(scene.id, outcome === 'completed');
+        }
+    }
+
+    function paintQualityScene(scene: QualityScene, at: number): void {
+        if (scene.released) { return; }
+        if (!scene.pageElement.isConnected || !visible.has(scene.pageNumber) || hidden() || media.matches || !enabled) {
+            releaseQualityScene(scene, 'cancelled', 'not-visible'); return;
+        }
+        const extent = scene.pageElement.getBoundingClientRect();
+        if (scene.pageProjection && (Math.abs(extent.width - scene.pageExtent.width) > 1 || Math.abs(extent.height - scene.pageExtent.height) > 1)) {
+            releaseQualityScene(scene, 'cancelled', 'geometry-changed'); return;
+        }
+        const payload = scene.payload, cargo = payload && !payload.deposited && payload.canvas;
+        if (payload && !cargo && !(payload.deposited && payload.resolution === 'fulfilled')) {
+            releaseQualityScene(scene, 'cancelled', 'cargo-cancelled'); return;
+        }
+        let opacity = '1', readable = false;
+        const viewport = viewportBounds();
+        const fits = (rect: { left: number; top: number; right: number; bottom: number; width: number; height: number }) => {
+            const shown = Math.max(0, Math.min(rect.right, viewport.right) - Math.max(rect.left, viewport.left))
+                * Math.max(0, Math.min(rect.bottom, viewport.bottom) - Math.max(rect.top, viewport.top));
+            return rect.width > 0 && rect.height > 0 && shown >= rect.width * rect.height * 0.8;
+        };
+        if (cargo) {
+            scene.location = 'cargo'; opacity = cargo.style.opacity || '0';
+            for (const canvas of [scene.coarse, scene.sharp].filter(Boolean) as HTMLCanvasElement[]) {
+                for (const property of ['width', 'height', 'transform', 'translate', 'boxShadow', 'borderRadius'] as const) {
+                    canvas.style[property] = cargo.style[property];
+                }
+            }
+            readable = Number(opacity) >= 0.99 && fits(cargo.getBoundingClientRect());
+            if (scene.committed) { cargo.style.opacity = '0'; }
+        } else {
+            scene.location = 'page';
+            if (scene.sharp) { release(scene.sharp); cargoBytes -= scene.sharpBytes; scene.sharp = undefined; scene.sharpBytes = 0; }
+            const area = geometry(scene.pageElement, viewport, scene.pageProjection);
+            if (!area) { releaseQualityScene(scene, 'cancelled', 'geometry-unavailable'); return; }
+            const box = projectPdfPageRect(area.projection!, scene.crop);
+            if (!box) { releaseQualityScene(scene, 'cancelled', 'geometry-unavailable'); return; }
+            const left = scene.pageElement.getBoundingClientRect().left + (scene.pageElement.clientLeft || 0) + box.x;
+            const top = scene.pageElement.getBoundingClientRect().top + (scene.pageElement.clientTop || 0) + box.y;
+            for (const canvas of [scene.coarse, scene.sharp].filter(Boolean) as HTMLCanvasElement[]) Object.assign(canvas.style, {
+                width: box.width + 'px', height: box.height + 'px', translate: '', boxShadow: '', borderRadius: '0',
+                transform: 'translate(' + (left - sceneOrigin.x) + 'px,' + (top - sceneOrigin.y) + 'px)',
+            });
+            readable = fits({ left, top, right: left + box.width, bottom: top + box.height, width: box.width, height: box.height });
+        }
+        scene.opacity = opacity;
+        if (scene.committed && scene.startedAt !== undefined && !readable) {
+            releaseQualityScene(scene, 'cancelled', 'visibility-lost'); return;
+        }
+        if (scene.committed && scene.startedAt === undefined) {
+            if (at + scene.duration > scene.deadline) { releaseQualityScene(scene, 'cancelled', 'visible-admission-expired'); return; }
+            if (readable) { scene.startedAt = at; }
+        }
+        scene.phase = scene.startedAt === undefined ? 0 : clamp((at - scene.startedAt) / scene.duration, 0, 1);
+        if (scene.committed && scene.phase >= 1) { releaseQualityScene(scene, 'completed', 'finished'); return; }
+        scene.coarse.style.opacity = opacity;
+        if (scene.sharp) {
+            scene.coarse.style.clipPath = ''; scene.sharp.style.opacity = opacity;
+            scene.sharp.style.clipPath = 'inset(0 ' + ((1 - ease(scene.phase)) * 100).toFixed(3) + '% 0 0)';
+        } else {
+            // Removing coarse pixels reveals the accepted native page at its actual display resolution.
+            scene.coarse.style.clipPath = 'inset(0 0 0 ' + (ease(scene.phase) * 100).toFixed(3) + '%)';
+        }
+        const width = parseFloat(scene.coarse.style.width) || 0, height = parseFloat(scene.coarse.style.height) || 0;
+        const transform = scene.coarse.style.transform.match(/translate\(([-\d.]+)px,\s*([-\d.]+)px\)/);
+        const x = Number(transform?.[1] ?? 0), y = Number(transform?.[2] ?? 0), amount = ease(scene.phase);
+        const scale = Math.min(scene.scale, width * 0.45 / ASAP_CLEANER_ARTWORK_SIZE.width,
+            height * 0.7 / ASAP_CLEANER_ARTWORK_SIZE.height);
+        const sw = ASAP_CLEANER_ARTWORK_SIZE.width * scale, sh = ASAP_CLEANER_ARTWORK_SIZE.height * scale;
+        const bank = Number(scene.coarse.style.transform.match(/rotate\(([-\d.]+)deg\)/)?.[1] ?? 0);
+        const cleanerPoint = bankPoint({ x: x + amount * width, y: y + height / 2 }, { x: x + width / 2, y: y + height / 2 }, bank);
+        Object.assign(scene.sprite.style, { width: sw + 'px', height: sh + 'px', translate: scene.coarse.style.translate,
+            opacity: scene.startedAt === undefined ? '0' : String(Number(opacity) * Math.min(1, scene.phase / 0.12, (1 - scene.phase) / 0.18)),
+            transform: 'translate(' + (cleanerPoint.x - sw / 2) + 'px,' + (cleanerPoint.y - sh / 2) + 'px) rotate(' + bank + 'deg)' });
+        drawCleaner(scene);
+    }
+
+    function qualityRasterSize(candidate: PdfPagePresentationCandidate, crop: Crop) {
+        return pdfRasterCropSize(candidate.projection, crop);
+    }
+
+    function reserveQualityScene(id: number, candidate: PdfPagePresentationCandidate, previous: PdfPagePresentationCandidate,
+        encounter: PdfDeliveryEncounter, planId: number, planned: PdfDeliveryPlannedCrop) {
+        const policy = pagePresentation(presentation(), encounter.pageProjection?.content ?? projectionFor(encounter).content);
+        const payload = episodes.get(candidate.pageNumber)?.payloads.find(value => value.id === planned.payloadId && value.canvas && !value.deposited);
+        if (!planned.geometry.imageId || !planned.geometry.imageIds?.length) { return { reason: 'unsupported-source-identity' }; }
+        if (!enabled || hidden() || media.matches || !visible.has(candidate.pageNumber)) { return { reason: 'not-visible' }; }
+        if (qualityScenes.size || qualityPreparedActors) { return { reason: 'cleaner-busy' }; }
+        if (actorCount() >= policy.maxActors) { return { reason: 'actor-limit' }; }
+        const oldPolicy = payload ? policy : { ...policy, fragmentDimension: Math.max(previous.canvas.width, previous.canvas.height) };
+        const old = rasterSize(previous.canvas, planned.geometry, payload?.mode ?? 'solo', oldPolicy, previous.projection);
+        const next = payload ? rasterSize(candidate.canvas, planned.geometry, payload.mode, policy, candidate.projection) : undefined;
+        if (!old || payload && (!next || next.width < old.width || next.height < old.height)) { return { reason: 'invalid-raster' }; }
+        const density = policy.cleanerScale * policy.spriteDpr;
+        const sw = Math.ceil(ASAP_CLEANER_ARTWORK_SIZE.width * density), sh = Math.ceil(ASAP_CLEANER_ARTWORK_SIZE.height * density);
+        const spriteCost = sw * sh * RGBA_BYTES;
+        if (cargoBytes + old.bytes + (next?.bytes ?? 0) > policy.maxCargoBytes) { return { reason: 'cargo-limit' }; }
+        if (spriteBytes + spriteCost > policy.maxSpriteBytes) { return { reason: 'sprite-limit' }; }
+        let coarse: HTMLCanvasElement | undefined, sharp: HTMLCanvasElement | undefined, sprite: HTMLCanvasElement | undefined;
+        let preparedScene: QualityScene | undefined;
+        const layer = doc.createElement('div'); layer.className = 'pdfDocumentRobotQuality'; layer.setAttribute('aria-hidden', 'true');
+        Object.assign(layer.style, { position: 'absolute', inset: '0', pointerEvents: 'none', overflow: 'visible' });
+        const copy = (source: HTMLCanvasElement, size: NonNullable<ReturnType<typeof rasterSize>>, className: string) => {
+            const canvas = createCanvas(); canvas.width = size.width; canvas.height = size.height;
+            try {
+                const context = canvas.getContext('2d', { alpha: true }); if (!context) { throw new Error('Quality crop context unavailable'); }
+                context.setTransform(...size.transform);
+                context.drawImage(source, size.sourceX, size.sourceY, size.sourceWidth, size.sourceHeight,
+                    size.sourceX, size.sourceY, size.sourceWidth, size.sourceHeight);
+                context.setTransform(1, 0, 0, 1, 0, 0); decorate(canvas, className, '5');
+                canvas.dataset.quality = String(id); canvas.dataset.page = String(candidate.pageNumber);
+                canvas.dataset.imageId = planned.geometry.imageId ?? ''; return canvas;
+            } catch (error) { release(canvas); throw error; }
+        };
+        try {
+            coarse = copy(previous.canvas, old, 'pdfDocumentRobotQualityCoarse');
+            if (next) { sharp = copy(candidate.canvas, next, 'pdfDocumentRobotQualitySharp'); }
+            sprite = createCanvas(); sprite.width = sw; sprite.height = sh;
+            decorate(sprite, 'pdfDocumentRobotQualityCleaner', '6'); sprite.dataset.quality = String(id);
+            sprite.dataset.page = String(candidate.pageNumber); sprite.dataset.imageId = planned.geometry.imageId ?? '';
+            const actorId = ++serial;
+            let sourcePage = qualityPageIds.get(candidate.page);
+            if (sourcePage === undefined) { sourcePage = ++qualityPageSerial; qualityPageIds.set(candidate.page, sourcePage); }
+            const duration = DOCUMENT_ROBOT_LIMITS.cleaner.durationMs;
+            const scene: QualityScene = { id, actorId, source: candidate.page, sourceDocument: candidate.document, appearance: candidate.appearance, sourcePage, pageNumber: candidate.pageNumber,
+                pageElement: encounter.pageElement, pageProjection: encounter.pageProjection, pageExtent: encounter.pageElement.getBoundingClientRect(), planId, cropId: planned.id,
+                crop: planned.geometry, payload, layer, coarse, sharp, sprite, coarseBytes: old.bytes, sharpBytes: next?.bytes ?? 0,
+                spriteBytes: spriteCost, committed: false, released: false, location: payload ? 'cargo' : 'page',
+                duration, deadline: 0,
+                phase: 0, direction: 1, opacity: '1', scale: policy.cleanerScale };
+            preparedScene = scene; qualityPreparedActors++;
+            cargoBytes += old.bytes + (next?.bytes ?? 0); spriteBytes += spriteCost;
+            peakCargoBytes = Math.max(peakCargoBytes, cargoBytes);
+            layer.append(coarse, ...(sharp ? [sharp] : []), sprite); container.append(transit); transit.append(layer);
+            syncSceneOrigin(); paintQualityScene(scene, now());
+            if (scene.released) { return { reason: 'not-visible' }; }
+            // Final native pixels remain behind this already-connected coarse crop until commit.
+            return { effect: { commit() {
+                const committedAt = now(); qualityPreparedActors--; scene.committed = true;
+                scene.deadline = Math.max(committedAt, scene.payload ? scene.payload.started + scene.payload.delay + scene.payload.duration : committedAt) + scene.duration;
+                qualityScenes.set(id, scene); paintQualityScene(scene, committedAt); requestPaint();
+            },
+                abort() { releaseQualityScene(scene, 'cancelled', 'publication-aborted'); },
+                cancel() { releaseQualityScene(scene, 'cancelled', 'source-cancelled'); } } };
+        } catch {
+            if (preparedScene) { releaseQualityScene(preparedScene, 'cancelled', 'allocation-failed'); }
+            else { if (coarse) { release(coarse); } if (sharp) { release(sharp); } if (sprite) { release(sprite); } layer.remove(); }
+            return { reason: 'allocation-failed' };
+        }
+    }
+
     function refine(value: DocumentRobotDelivery): number {
         if (disposed || !enabled || hidden() || !visible.has(value.pageNumber) || !value.canvas.width || !value.canvas.height) { return 0; }
         const episode = episodes.get(value.pageNumber);
@@ -886,15 +1062,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 payload.canvas = next; payload.bytes = size.bytes; payload.refinements++; payload.contentRevision = revision;
                 committed = true; next = undefined;
                 stats.refinements++; count++;
-                beginCleaner(payload, episode.page, policy);
-                if (cleaner?.payload === payload && !payload.underlay) {
-                    payload.underlay = { canvas: previous, bytes: oldBytes };
-                    try {
-                        payload.canvas!.before(previous);
-                        previous.className = 'pdfDocumentRobotCargoUnderlay';
-                        paintWipe(payload, cleaner.phase, cleaner.direction);
-                    } catch { releaseCleaner(); }
-                } else { release(previous); cargoBytes -= oldBytes; }
+                release(previous); cargoBytes -= oldBytes;
                 requestPaint();
             } catch { stats.rejected++; }
             finally {
@@ -905,33 +1073,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         return count;
     }
 
-    function releaseCleaner(): void {
-        const active = cleaner;
-        if (!active) { return; }
-        cleaner = undefined;
-        finishRefinement(active.payload);
-        release(active.sprite); spriteBytes -= active.bytes; capacityFreed = true;
-    }
-
-    function finishRefinement(payload: Payload): void {
-        if (payload.canvas) { payload.canvas.style.clipPath = ''; }
-        const underlay = payload.underlay;
-        if (!underlay) { return; }
-        payload.underlay = undefined;
-        release(underlay.canvas); cargoBytes -= underlay.bytes;
-    }
-
-    function paintWipe(payload: Payload, phase: number, direction: -1 | 1): void {
-        const underlay = payload.underlay;
-        if (!underlay || !payload.canvas) { return; }
-        for (const property of ['width', 'height', 'opacity', 'transform', 'translate'] as const) {
-            underlay.canvas.style[property] = payload.canvas.style[property];
-        }
-        const remaining = ((1 - ease(phase)) * 100).toFixed(3) + '%';
-        payload.canvas.style.clipPath = direction === 1 ? 'inset(0 ' + remaining + ' 0 0)' : 'inset(0 0 0 ' + remaining + ')';
-    }
-
-    function drawCleaner(active: Cleaner): void {
+    function drawCleaner(active: { sprite: HTMLCanvasElement; phase: number; direction: -1 | 1 }): void {
         const context = active.sprite.getContext('2d');
         if (!context) { throw new Error('ASAP artwork canvas is unavailable'); }
         context.setTransform(1, 0, 0, 1, 0, 0);
@@ -940,51 +1082,6 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             active.sprite.height / ASAP_CLEANER_ARTWORK_SIZE.height, active.sprite.width / 2, active.sprite.height / 2);
         paintAsapCleaner(context, { phase: active.phase, direction: active.direction });
         context.setTransform(1, 0, 0, 1, 0, 0);
-    }
-
-    function beginCleaner(payload: Payload, page: number, policy: Presentation): void {
-        const remaining = payload.started + payload.delay + payload.duration * RETURN_START - now();
-        if (cleaner || payload.cleanerShown || media.matches || remaining < DOCUMENT_ROBOT_LIMITS.cleaner.minDurationMs
-            || actorCount() >= policy.maxActors || !payload.canvas?.parentNode) { return; }
-        const backingScale = policy.cleanerScale * policy.spriteDpr;
-        const width = Math.ceil(ASAP_CLEANER_ARTWORK_SIZE.width * backingScale), height = Math.ceil(ASAP_CLEANER_ARTWORK_SIZE.height * backingScale);
-        const bytes = width * height * RGBA_BYTES;
-        if (spriteBytes + bytes > policy.maxSpriteBytes) { return; }
-        payload.cleanerShown = true;
-        let sprite: HTMLCanvasElement | undefined;
-        try {
-            sprite = createCanvas(); sprite.width = width; sprite.height = height;
-            const active: Cleaner = { id: ++serial, page, payload, sprite, bytes, started: now(),
-                duration: Math.min(remaining, DOCUMENT_ROBOT_LIMITS.cleaner.durationMs), phase: 0,
-                direction: payload.route < 2 ? 1 : -1, drawn: 0 };
-            drawCleaner(active);
-            decorate(sprite, 'pdfDocumentRobotCleaner', '3');
-            sprite.dataset.courier = String(active.id); sprite.dataset.payload = String(payload.id);
-            payload.canvas.parentNode.appendChild(sprite);
-            spriteBytes += bytes; cleaner = active; sprite = undefined;
-        } catch { stats.rejected++; }
-        finally { if (sprite) { release(sprite); } }
-    }
-
-    function paintCleaner(payload: Payload, point: Point, width: number, height: number, at: number, policy: Presentation, bank = 0): void {
-        const active = cleaner;
-        if (!active || active.payload !== payload) { return; }
-        if (!payload.canvas || at >= active.started + active.duration) { releaseCleaner(); return; }
-        active.phase = clamp((at - active.started) / active.duration, 0, 1);
-        paintWipe(payload, active.phase, active.direction);
-        try {
-            const pose = Math.floor(active.phase * DOCUMENT_ROBOT_LIMITS.cleaner.gestureSteps);
-            if (pose !== active.drawn) { active.drawn = pose; drawCleaner(active); }
-            const scale = Math.min(policy.cleanerScale,
-                width * 0.45 / ASAP_CLEANER_ARTWORK_SIZE.width, height * 0.7 / ASAP_CLEANER_ARTWORK_SIZE.height);
-            const bodyWidth = ASAP_CLEANER_ARTWORK_SIZE.width * scale, bodyHeight = ASAP_CLEANER_ARTWORK_SIZE.height * scale;
-            const amount = ease(active.phase), position = bankPoint({ x: point.x + (amount - 0.5) * width * active.direction,
-                y: point.y + (amount - 0.5) * height * 0.35 }, point, bank);
-            Object.assign(active.sprite.style, { width: bodyWidth + 'px', height: bodyHeight + 'px',
-                opacity: String(Math.min(1, active.phase / 0.12, (1 - active.phase) / 0.18)),
-                transform: 'translate(' + (position.x - sceneOrigin.x - bodyWidth / 2).toFixed(2) + 'px,'
-                    + (position.y - sceneOrigin.y - bodyHeight / 2).toFixed(2) + 'px) rotate(' + bank.toFixed(4) + 'deg)' });
-        } catch { stats.rejected++; releaseCleaner(); }
     }
 
     function releaseReservation(reservation: BodyReservation): void {
@@ -1188,7 +1285,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         columnPull = undefined;
         releaseActor(active.body);
         active.layer.remove();
-        if (!episodes.size && !advance.size && !retiring && !captionGroup) { transit.remove(); }
+        if (!episodes.size && !advance.size && !retiring && !captionGroup && !qualityScenes.size) { transit.remove(); }
     }
 
     function setColumnTransition(motion: Readonly<PdfDocumentColumnTransition> | undefined): void {
@@ -1219,7 +1316,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             dirty = true; schedule();
             return;
         }
-        clearRetiring(); releaseCleaner();
+        clearRetiring();
         // The controller supplies one page's content extent. Direct callers without
         // that information use the finite motion bounds as their presentation size.
         const documentSize = options.documentSize?.() ?? { width: area.width, height: area.height };
@@ -1342,9 +1439,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
 
     function releasePayload(payload: Payload): void {
         if (payload.operation && !payload.resolution) { payload.resolution = 'cancelled'; }
+        if (!(payload.deposited && payload.resolution === 'fulfilled')) {
+            for (const scene of [...qualityScenes.values()]) if (scene.payload === payload) { releaseQualityScene(scene, 'cancelled', 'cargo-cancelled'); }
+        }
         releaseLandingShadow(payload);
-        if (cleaner?.payload === payload) { releaseCleaner(); }
-        finishRefinement(payload);
         if (payload.planOwner) {
             const owner = payload.planOwner; payload.planOwner = undefined;
             deliveryPlans.finishCrop(owner.planId, owner.cropId, payload.id, payload.deposited ? 'delivered' : 'cancelled');
@@ -1362,6 +1460,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         payload.resolution = payload.operation?.outcome.completion ?? 'fulfilled';
         if (payload.resolution !== 'fulfilled') { releasePayload(payload); return; }
         payload.deposited = true;
+        for (const scene of [...qualityScenes.values()]) if (scene.payload === payload) { paintQualityScene(scene, now()); }
         stats.deliveredFragments++;
         // Refinement or visibility refresh can reach the deadline before the queued paint.
         // Retain only numeric helper IDs for that paint's cue, never their leases or rasters.
@@ -1454,7 +1553,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         for (const piece of scene.pieces) { dropPayload(piece.payload); }
         scene.pieces.length = 0;
         scene.layer.remove();
-        if (!episodes.size && !advance.size && !captionGroup && !columnPull) { transit.remove(); }
+        if (!episodes.size && !advance.size && !captionGroup && !columnPull && !qualityScenes.size) { transit.remove(); }
         options.onReplacementComplete?.(scene.identity);
     }
 
@@ -1533,20 +1632,24 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         episode.payloads.length = 0;
         episode.layer.remove();
         episodes.delete(episode.page);
-        if (!episodes.size && !advance.size && !retiring && !captionGroup && !columnPull) { transit.remove(); }
+        if (!episodes.size && !advance.size && !retiring && !captionGroup && !columnPull && !qualityScenes.size) { transit.remove(); }
         if (cancelled) { stats.cancelledEpisodes++; }
     }
 
     function cancelFrameIfEmpty(): void {
-        if (!episodes.size && !advance.size && !retiring && !columnPull) { dirty = false; }
+        if (!episodes.size && !advance.size && !retiring && !columnPull && !qualityScenes.size) { dirty = false; }
         if (!moving() && !dirty && frame) { cancelFrame(frame.id); frame = undefined; }
     }
 
     function clearActive(): void {
+        qualityReactions.reset(); qualityPendingPages.clear();
+        for (const scene of [...qualityScenes.values()]) { releaseQualityScene(scene, 'cancelled', 'scene-reset'); }
         deliveryPlans.cancelAll();
         displayProjections.clear(); planPageElements.clear();
         clearColumnPull();
-        releaseCleaner();
+
+        for (const cue of speechCues.values()) { encounters.releaseSpeech(cue.choice); }
+        speechCues.clear(); automaticSpeechPhases.clear();
         encounters.clear(now());
         traffic.reset();
         pendingDeposits.length = 0;
@@ -1573,7 +1676,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         documentGeneration++;
         jobDecisions.clear();
         lastOperationDecision = undefined;
-        clearActive(); encounters.reset(now()); seen.clear(); visible.clear(); stats = counters();
+        clearActive(); qualityOutcomes.length = 0; encounters.reset(now()); seen.clear(); visible.clear(); stats = counters();
         frames = 0; paintTotalMs = paintMaxMs = paintLastMs = peakCargoBytes = 0;
     }
 
@@ -1591,7 +1694,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         work.text.dispose();
         work.layer.remove();
         advance.delete(work.key);
-        if (!episodes.size && !advance.size && !retiring && !captionGroup && !columnPull) { transit.remove(); }
+        if (!episodes.size && !advance.size && !retiring && !captionGroup && !columnPull && !qualityScenes.size) { transit.remove(); }
     }
 
     function advanceGeometry(work: AdvanceWork, viewport = viewportBounds(), policy = presentation(viewport)) {
@@ -1832,6 +1935,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (!ids.length) { clearColumnPull(); }
         if (!ids.length && !settings.preserveReplacement) { clearRetiring(); }
         visible = new Set(ids);
+        for (const scene of [...qualityScenes.values()]) if (!visible.has(scene.pageNumber)) { qualityReactions.removePage(scene.source); }
+        for (const page of qualityPendingPages.keys()) if (!visible.has(qualityPendingPages.get(page)!)) { qualityReactions.failPage(page); }
         if (captionGroup && ![...captionGroup.pages].some(page => visible.has(page))) { clearCaption(); }
         for (const episode of [...episodes.values()]) {
             if (!visible.has(episode.page)) { dropEpisode(episode, true); }
@@ -2351,7 +2456,6 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const inkWidth = width * cosine + height * sine, inkHeight = height * cosine + width * sine;
             captionObstacles.push({ x: path.point.x - sceneOrigin.x - inkWidth / 2, y: path.point.y - sceneOrigin.y - inkHeight / 2,
                 width: inkWidth, height: inkHeight, group: payload.id });
-            if (cleaner?.payload === payload) { paintCleaner(payload, path.point, width, height, at, policy, bank); }
             paintMast(payload, path.groundY, path.point, height,
                 (leader.launch || leader.origin) && motionProgress < DOCUMENT_ROBOT_LIMITS.forklift.approachEnd ? '0' : payload.canvas.style.opacity);
         }
@@ -2522,6 +2626,16 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         }
     }
 
+    function rejectCaptionGeometry(): void {
+        const group = captionGroup;
+        if (!group?.choice || group.shownAt !== undefined) { return; }
+        encounters.rejectSpeechGeometry(group.choice);
+        for (const [key, cue] of speechCues) {
+            if (cue.choice === group.choice) { speechCues.delete(key); }
+        }
+        clearCaption(); requestPaint();
+    }
+
     function paintCaption(placements: readonly BodyPlacement[], reactions: ReadonlyMap<number, RobotEncounterReaction>,
         viewport: ReturnType<typeof viewportBounds>, policy: Presentation, obstacles: readonly PlacementRect[]): void {
         const at = now();
@@ -2540,7 +2654,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (captionGroup && captionId !== captionGroup.id) {
             // An explicit greeting may replace a hover hint. Ordinary cues wait for the
             // current readable text to expire; they do not queue or take its ownership.
-            if (captionId?.startsWith('greet:') && captionGroup.id.startsWith('hover:')) { clearCaption(); }
+            if (captionId?.startsWith('greet:') && captionGroup.id.startsWith('hover:')
+                || captionId?.startsWith('hover:') && captionGroup.id.startsWith('work:')) { clearCaption(); }
             else { detachCaption(); return; }
         }
         if (captionGroup?.detached) { return; }
@@ -2552,6 +2667,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         }
         const first = reactions.get(speakers[0].body.id)!;
         if (first.captionUntil <= at) { detachCaption(); return; }
+        if (first.dialogueChoice && (speakers.length !== first.dialogueChoice.lines.length
+            || !first.dialogueChoice.speakers.every(id => speakers.some(value => value.body.id === id)))) { detachCaption(); return; }
         const lines = speakers.map(value => ROBOT_VEHICLES.find(spec => spec.id === value.body.vehicle)!.name
             + ': ' + reactions.get(value.body.id)!.caption);
         if (width < 100) { clearCaption(); return; }
@@ -2566,7 +2683,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 textAlign: 'center', whiteSpace: 'pre-line', overflowWrap: 'anywhere', boxShadow: '0 2px 8px #0002' });
             const text = lines.join('\n');
             if (node.textContent !== text) { node.textContent = text; }
-            const group: CaptionGroup = { id: first.captionId, node, until: first.captionUntil,
+            const group: CaptionGroup = { id: first.captionId, choice: first.dialogueChoice, node, until: first.captionUntil,
                 readMs: first.captionUntil - at, detached: false,
                 actors: participating.map(value => value.body.id), pages: new Set(participating.flatMap(value => [...value.pages])),
                 lines: new Map(speakers.map(value => [value.body.id, reactions.get(value.body.id)!.caption])),
@@ -2591,6 +2708,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const height = group.height;
         if (!(group.width > 0 && height > 0) || height > viewport.bottom - viewport.top - 16) {
             if (group.shownAt !== undefined) { detachCaption(); return; }
+            if (group.choice) { rejectCaptionGeometry(); return; }
             caption.style.opacity = '0';
             for (const leader of group.leaders) { leader.style.opacity = '0'; }
             return;
@@ -2623,6 +2741,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (group.shownAt !== undefined && (placement.blocked || opacity <= 0)) { detachCaption(); return; }
         if (!placement.blocked && opacity > 0 && group.shownAt === undefined) {
             group.shownAt = at; group.until = at + group.readMs; expireCaption(group);
+            if (group.choice && group.choice.lines.length === speakers.length
+                && group.choice.speakers.every(id => speakers.some(value => value.body.id === id))) { encounters.admitSpeech(group.choice); }
         }
         group.placement = placement;
         Object.assign(caption.style, { left: placement.x + 'px', top: placement.y + 'px', opacity: opacity > 0 ? '1' : '0' });
@@ -2645,6 +2765,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     function paintBodies(placements: readonly BodyPlacement[], successfulDeposits: readonly number[][], at: number,
         viewport: ReturnType<typeof viewportBounds>, policy: Presentation, captionObstacles: readonly SceneObstacle[]): void {
         const live = placements.filter(({ body }) => body.sprite.width > 0 && body.sprite.parentNode);
+        const metrics = robotCaptionMetrics({ devicePixelRatio: win.devicePixelRatio });
+        const layoutDomain = [viewport.right - viewport.left, viewport.bottom - viewport.top, win.devicePixelRatio,
+            metrics.fontSize, metrics.lineHeight, metrics.paddingX, metrics.paddingY].join(':');
+        encounters.setSpeechGeometry(layoutDomain);
         const reactions = encounters.update(at, live.map(value => {
             const radius = robotArtworkGeometry(value.body.vehicle, value.scale).radius;
             const visible = value.point.x + radius > viewport.left && value.point.x - radius < viewport.right
@@ -2662,6 +2786,34 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 activity: payload?.activity,
                 cargo: payload?.canvas && payload.workload && plan ? { key: plan.key, mass: payload.workload.mass } : undefined };
         }), successfulDeposits);
+        const liveIds = new Set(live.map(value => value.body.id));
+        const payloadIds = new Set([...episodes.values()].flatMap(episode => episode.payloads.map(payload => payload.id)).concat(retiring?.pieces.map(piece => piece.payload.id) ?? []));
+        for (const id of automaticSpeechPhases.keys()) { if (!payloadIds.has(id)) { automaticSpeechPhases.delete(id); } }
+        for (const value of live) {
+            if (value.payload && !automaticSpeechPhases.has(value.payload.id)) {
+                automaticSpeechPhases.set(value.payload.id, automaticSpeechSerial++ % 2 ? 'deposit' : 'carrying');
+            }
+        }
+        for (const [key, cue] of speechCues) {
+            if (cue.until <= at && !cue.released) { encounters.releaseSpeech(cue.choice); cue.released = true; }
+            if (cue.released && (key.startsWith('hover:') || key.startsWith('greet:'))) { speechCues.delete(key); continue; }
+            if (!cue.owners.some(id => liveIds.has(id))) { encounters.releaseSpeech(cue.choice); speechCues.delete(key); }
+        }
+        const speech = (key: string, opportunity: RobotDialogueOpportunity, participants: readonly BodyPlacement[], until: number) => {
+            let cue = speechCues.get(key);
+            if (!cue) {
+                const choice = encounters.reserveSpeech(key, opportunity, participants.map(value => ({ id: value.body.id,
+                    vehicle: value.body.vehicle, name: ROBOT_VEHICLES.find(spec => spec.id === value.body.vehicle)!.name })), layoutDomain);
+                if (!choice) { return; }
+                cue = { choice, until, owners: participants.map(value => value.body.id) }; speechCues.set(key, cue);
+            }
+            if (cue.released || cue.until <= at) { return; }
+            cue.choice.speakers.forEach((id, index) => {
+                const existing = reactions.get(id);
+                reactions.set(id, { x: 0, y: 0, tilt: 0, expression: 'pleased', badge: null, gesturePhase: 0, ...existing,
+                    caption: cue!.choice.lines[index], captionId: key, captionUntil: cue!.until, dialogueChoice: cue!.choice });
+            });
+        };
         if (greeting && (at >= greeting.until || !live.some(value => value.body.id === greeting!.id))) { greeting = undefined; }
         const attention = greeting ?? hovered;
         const focus = attention && live.find(value => value.body.id === attention.id);
@@ -2681,6 +2833,23 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 gesturePhase: isGreeting ? Math.floor((at - attention.started) / ROBOT_INTERACTION_REACTIONS.gestureMs * 12) : existing?.gesturePhase ?? 0,
                 caption: captionUntil > at ? line : '', captionId: (isGreeting ? 'greet:' : 'hover:') + focus.body.id + ':' + attention.started,
                 captionUntil });
+            if (!robotStructure(focus.body.vehicle)?.interactionCue && captionUntil > at) {
+                speech((isGreeting ? 'greet:' : 'hover:') + focus.body.id + ':' + attention.started,
+                    isGreeting ? 'greeting' : focus.carrying && focus.payload?.canvas ? 'carrying'
+                        : focus.phase === 'return' ? 'returning' : focus.phase === 'parked' ? 'waiting' : 'preparing', [focus], captionUntil);
+            }
+        }
+        if (!attention && ![...reactions.values()].some(value => value.caption)) {
+            const focus = live.find(value => value.payload && value.opacity > 0.2
+                && (retiring?.pieces.some(piece => piece.payload === value.payload)
+                    || automaticSpeechPhases.get(value.payload.id) === 'carrying' && value.payload.canvas && value.carrying && value.remainingMs > 600
+                    || automaticSpeechPhases.get(value.payload.id) === 'deposit' && value.payload.deposited && value.payload.resolution === 'fulfilled'));
+            if (focus?.payload) {
+                const opportunity = retiring?.pieces.some(piece => piece.payload === focus.payload) ? 'new-book'
+                    : focus.payload.deposited ? 'deposit' : 'carrying';
+                speech('work:' + documentGeneration + ':' + focus.payload.id + ':' + opportunity, opportunity,
+                    live.filter(value => value.payload === focus.payload && value.opacity > 0.2), at + ROBOT_INTERACTION_REACTIONS.captionMs);
+            }
         }
         const key = (value: BodyPlacement) => value.payload?.id ?? value.group ?? -(value.body.id + 1);
         for (const value of live) {
@@ -2760,8 +2929,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 const motion = finalMotion.get(payload.id) ?? { x: 0, y: 0 };
                 const shown = visibility.get(payload.id) ?? 1;
                 const translate = motion.x.toFixed(3) + 'px ' + motion.y.toFixed(3) + 'px';
-                for (const element of [payload.canvas, payload.underlay?.canvas, payload.mast, payload.sling,
-                    cleaner?.payload === payload ? cleaner.sprite : undefined]) {
+                for (const element of [payload.canvas, payload.mast, payload.sling]) {
                     if (element) {
                         element.style.translate = translate;
                         element.style.opacity = String((Number(element.style.opacity) || 0) * shown);
@@ -2922,6 +3090,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 }
             }
             paintBodies(placements, pendingDeposits.splice(0), at, viewport, policy, captionObstacles);
+            for (const scene of [...qualityScenes.values()]) { paintQualityScene(scene, at); }
             notifyCapacity();
         } finally {
             painting = false;
@@ -3173,7 +3342,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         }
         policy = pagePresentation(policy, area);
         if (!policy.maxActors || !policy.maxCargoBytes) { seen.add(value.pageNumber); stats.skipped++; return 'skipped'; }
-        releaseCleaner();
+
         clearColumnPull();
         reclaimRetiring(policy);
         const used = new Set([...episodes.values()].flatMap(actorsOf)
@@ -3195,7 +3364,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const jobLimit = Math.min(policy.maxFragmentsPerPage, Math.max(1, crew), crops.length);
         const semanticCrew = crops.slice(0, jobLimit).reduce((total, crop) => total + (robotCargoWorkload({ width: crop.width * area.width,
             height: crop.height * area.height })?.preferredCrew ?? 1), 0);
-        const count = Math.min(policy.maxActors - actorCount(), Math.max(crew, semanticCrew),
+        const reserveQuality = qualityReactions.pending > 0 && policy.maxActors > 1 && semanticCrew < policy.maxActors ? 1 : 0;
+        const count = Math.min(policy.maxActors - actorCount() - reserveQuality, Math.max(crew, semanticCrew),
             Math.max(semanticCrew, largeImage ? Math.max(3, crops.length) : crops.length),
             dispatchOrigin ? ROBOT_VEHICLES.length - used.size : Infinity);
         const payloads: Payload[] = [];
@@ -3306,7 +3476,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             } else if (episode) { dropEpisode(episode, true); }
             else { for (const payload of payloads) { dropPayload(payload); } }
             if (!priorEpisode) { layer?.remove(); }
-            if (!episodes.size && !advance.size && !retiring && !captionGroup && !columnPull) { transit.remove(); }
+            if (!episodes.size && !advance.size && !retiring && !captionGroup && !columnPull && !qualityScenes.size) { transit.remove(); }
             seen.add(value.pageNumber);
             stats.rejected++;
             return 'skipped';
@@ -3454,7 +3624,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     media.addEventListener('change', motionChanged);
 
     return {
-        preparePublication(candidate: PdfPagePresentationCandidate, encounter: PdfDeliveryEncounter) {
+        preparePublication(candidate: PdfPagePresentationCandidate, encounter: PdfDeliveryEncounter, previous?: PdfPagePresentationCandidate) {
             const previousElement = planPageElements.get(candidate.page);
             const previousProjection = previousElement && displayProjections.get(previousElement);
             const displacedProjection = displayProjections.get(encounter.pageElement);
@@ -3471,15 +3641,41 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             let transaction: ReturnType<PdfDeliveryPlans['preparePublication']>;
             try { transaction = deliveryPlans.preparePublication(candidate, encounter); }
             catch (error) { restoreProjection(); throw error; }
+            const compatible = previous && previous.document === candidate.document && previous.page === candidate.page
+                && previous.appearance === candidate.appearance && previous.successful && previous.canvas.width > 0 && previous.canvas.height > 0
+                ? previous : undefined;
+            const planned = deliveryPlans.snapshot().find(plan => plan.pageNumber === candidate.pageNumber);
+            const quality = (visible.has(candidate.pageNumber) ? planned?.crops ?? [] : []).map(crop => {
+                const nextSize = qualityRasterSize(candidate, crop.geometry);
+                const beforeSize = compatible && qualityRasterSize(compatible, crop.geometry);
+                const next = { page: candidate.page, pageNumber: candidate.pageNumber, key: candidate.appearance + ':' + planned!.id + ':' + crop.id,
+                    imageId: crop.geometry.imageId, imageIds: crop.geometry.imageIds ?? [], quality: pdfDeliveryCropQuality(candidate, crop.geometry, encounter),
+                    width: nextSize?.width ?? 0, height: nextSize?.height ?? 0 };
+                const before = compatible && beforeSize ? { ...next, quality: pdfDeliveryCropQuality(compatible, crop.geometry, encounter),
+                    width: beforeSize.width, height: beforeSize.height } : undefined;
+                return qualityReactions.prepare(next, before, id => compatible
+                    ? reserveQualityScene(id, candidate, compatible, encounter, planned!.id, crop) : { reason: 'coarse-raster-unavailable' });
+            });
             let finished = false;
             return { abort() {
                 if (finished) { return; } finished = true;
                 // Rebinding protection must read the preceding displayed raster's
                 // projection while the plan rolls its DOM owner back.
+                for (const value of quality) { value.abort(); }
                 restoreProjection(); transaction.abort();
             }, commit() {
                 if (finished) { return; } finished = true;
                 transaction.commit();
+                for (const scene of [...qualityScenes.values()]) {
+                    if (scene.source !== candidate.page) { continue; }
+                    if (scene.sourceDocument !== candidate.document || scene.appearance !== candidate.appearance) {
+                        releaseQualityScene(scene, 'cancelled', 'source-replaced'); continue;
+                    }
+                    scene.pageElement = encounter.pageElement; scene.pageProjection = encounter.pageProjection;
+                    scene.pageExtent = encounter.pageElement.getBoundingClientRect();
+                }
+                for (const value of quality) { value.commit(); }
+                if (visible.has(candidate.pageNumber)) { qualityPendingPages.set(candidate.page, candidate.pageNumber); }
                 if (previousElement && previousElement !== encounter.pageElement) { displayProjections.delete(previousElement); }
                 const episode = episodes.get(candidate.pageNumber);
                 if (episode) { episode.element = encounter.pageElement; episode.pageProjection = encounter.pageProjection;
@@ -3490,16 +3686,32 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             } };
         },
         reconcileEncounter(page: object, encounter: PdfDeliveryEncounter, candidate?: PdfPagePresentationCandidate) {
+            for (const scene of qualityScenes.values()) if (scene.source === page) {
+                scene.pageElement = encounter.pageElement; scene.pageProjection = encounter.pageProjection;
+                scene.pageExtent = encounter.pageElement.getBoundingClientRect();
+            }
             if (candidate) {
                 displayProjections.set(encounter.pageElement, candidate.projection);
                 const episode = episodes.get(candidate.pageNumber);
                 if (episode) { episode.element = encounter.pageElement; episode.pageProjection = encounter.pageProjection;
                     episode.displayRasterProjection = candidate.projection; }
             }
+            if (candidate && visible.has(candidate.pageNumber)) {
+                const plan = deliveryPlans.snapshot().find(value => value.pageNumber === candidate.pageNumber);
+                for (const crop of plan?.crops ?? []) {
+                    const size = qualityRasterSize(candidate, crop.geometry);
+                    qualityReactions.observe({ page, pageNumber: candidate.pageNumber, key: candidate.appearance + ':' + plan!.id + ':' + crop.id,
+                        imageId: crop.geometry.imageId, imageIds: crop.geometry.imageIds ?? [], quality: pdfDeliveryCropQuality(candidate, crop.geometry, encounter),
+                        width: size.width, height: size.height });
+                }
+                qualityPendingPages.set(page, candidate.pageNumber);
+            }
             deliveryPlans.reconcileEncounter(page, encounter, candidate);
         },
-        updateSource(page: object, coverage: PdfPageCoverage) { deliveryPlans.updateSource(page, coverage); },
+        updateSource(page: object, coverage: PdfPageCoverage) { deliveryPlans.updateSource(page, coverage);
+            if (coverage.kind === 'native' && coverage.resources.some(resource => resource.failed)) { qualityReactions.failPage(page); } },
         removePage(page: object, reason: string, detached = false, pageElement?: HTMLElement) {
+            qualityReactions.removePage(page); qualityPendingPages.delete(page);
             deliveryPlans.removePage(page, reason, detached);
             const element = pageElement ?? planPageElements.get(page);
             if (element) {
@@ -3550,13 +3762,22 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const policy = presentation();
             return {
                 enabled, reducedMotion: media.matches, scheduled: frame !== undefined, frames, paintTotalMs, paintMaxMs, paintLastMs,
+                qualityReactions: [...qualityScenes.values()].map(scene => ({ id: scene.id, sourcePage: scene.sourcePage,
+                    pageNumber: scene.pageNumber, planId: scene.planId, cropId: scene.cropId, imageId: scene.crop.imageId,
+                    imageIds: scene.crop.imageIds ?? [], target: scene.crop, actorId: scene.actorId, associatedPayloadId: scene.payload?.id,
+                    location: scene.location, state: scene.startedAt === undefined ? 'waiting-visible' : 'wiping',
+                    startedAt: scene.startedAt, deadline: scene.deadline, phase: scene.phase,
+                    coarseWidth: scene.coarse.width, coarseHeight: scene.coarse.height, sharpKind: scene.sharp ? 'cargo-copy' : 'native-page', sharpWidth: scene.sharp?.width ?? 0, sharpHeight: scene.sharp?.height ?? 0,
+                    coarseBytes: scene.coarseBytes, sharpBytes: scene.sharpBytes, spriteBytes: scene.spriteBytes })),
+                activeQualityReactions: qualityScenes.size, qualityOutcomes: [...qualityOutcomes], qualityDecisions: qualityReactions.snapshot(),
                 deliveryPlans: deliveryPlans.snapshot(),
                 queuedDeliveryCovers: deliveryPlans.snapshot().reduce((sum, plan) => sum + plan.crops.filter(crop => crop.state === 'queued' && crop.protected).length, 0),
                 operationDecisionRecords: jobDecisions.size,
                 lastOperationDecision,
                 encounters: encounters.snapshot(),
                 interaction: { hovered: hovered?.id, greeting: greeting?.id, hitActors: hitBoxes.size },
-                caption: captionGroup ? { actors: [...captionGroup.actors], pages: [...captionGroup.pages],
+                caption: captionGroup ? { id: captionGroup.id, choiceId: captionGroup.choice?.entry.id,
+                    meaningIds: captionGroup.choice?.entry.meaningIds, opportunity: captionGroup.choice?.opportunity, shownAt: captionGroup.shownAt, actors: [...captionGroup.actors], pages: [...captionGroup.pages],
                     until: captionGroup.until, text: captionGroup.node.textContent, pendingExpiry: captionTimer !== undefined,
                     placement: captionGroup.placement ? { ...captionGroup.placement,
                         leaders: captionGroup.placement.leaders.map(line => ({ from: { ...line.from }, to: { ...line.to } })) } : undefined } : undefined,
@@ -3570,14 +3791,11 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                             + DOCUMENT_ROBOT_LIMITS.advance.returnMs } : undefined,
                 activeArrivalCovers: [...episodes.values()].reduce((count, episode) => count
                     + episode.payloads.filter(payload => payload.cover?.parentNode).length, 0),
-                activeRefinements: [...episodes.values()].reduce((count, episode) => count
-                    + episode.payloads.filter(payload => payload.underlay).length, 0),
+                activeRefinements: qualityScenes.size,
                 activePayloads: [...episodes.values()].reduce((count, episode) => count + episode.payloads.filter(payload => payload.canvas).length, 0)
                     + (retiring?.pieces.filter(piece => piece.payload.canvas).length ?? 0),
                 retainedBytes: cargoBytes + spriteBytes, maxActors: policy.maxActors, maxCargoBytes: policy.maxCargoBytes,
                 maxSpriteBytes: policy.maxSpriteBytes, presentation: policy.kind, spriteScale: policy.spriteScale, ...stats,
-                cleaner: cleaner ? { id: cleaner.id, page: cleaner.page, payloadId: cleaner.payload.id,
-                    started: cleaner.started, duration: cleaner.duration, phase: cleaner.phase, bytes: cleaner.bytes } : undefined,
                 replacement: retiring ? { identity: retiring.identity, started: retiring.started,
                     payloads: retiring.pieces.map(({ page, payload }) => ({ id: payload.id, page, imageId: payload.crop.imageId,
                         operation: operationSnapshot(payload),
@@ -3604,8 +3822,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                         operation: operationSnapshot(payload),
                         cropKind: payload.crop.kind ?? 'fragment', imageIds: payload.crop.imageIds,
                         deadline: payload.started + payload.delay + payload.duration, refinements: payload.refinements, contentRevision: payload.contentRevision,
-                        arrivalCovered: !!payload.cover?.parentNode, refinementPending: !!payload.underlay,
-                        refinementProgress: cleaner?.payload === payload ? ease(cleaner.phase) : 1,
+                        arrivalCovered: !!payload.cover?.parentNode, refinementPending: false,
+                        refinementProgress: 1,
                         rasterWidth: payload.canvas?.width ?? 0, rasterHeight: payload.canvas?.height ?? 0,
                         helpers: payload.helpers.map(actor => actor.id), progress: payload.progress, stage: payload.stage,
                         deposited: payload.deposited, handedOff: payload.handedOff,

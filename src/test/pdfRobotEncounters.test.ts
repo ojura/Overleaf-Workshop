@@ -141,7 +141,11 @@ describe('finite document robot encounters', function () {
         assert.strictEqual(model.snapshot().counts.success, 1);
         assert.strictEqual(success.get(1).activity, undefined, 'the mast/unload pose is unchanged');
         assert.strictEqual(success.get(1).x + success.get(1).y, 0, 'the cargo attachment does not move');
-        assert.strictEqual(success.get(1).caption, 'Nailed it.');
+        const spoken = module.ROBOT_ENCOUNTER_DIALOGUE.find((value: any) => value.id === model.snapshot().active.dialogue);
+        assert.ok(spoken && spoken.kind === 'success');
+        assert.strictEqual(success.get(1).caption, spoken.lines[0]);
+        assert.strictEqual(success.get(1).dialogueChoice.entry.id, spoken.id);
+        assert.strictEqual(model.snapshot().dialogue.shown, 0, 'selected speech has not yet been admitted as readable');
         const held = model.update(160, group);
         assert.strictEqual(held.get(1).tilt, 0, 'satisfaction does not tilt a mast away from its deposited cargo');
         const returning = model.update(300, group.map(value => ({ ...value, phase: 'return' })));
@@ -344,4 +348,15 @@ describe('finite document robot encounters', function () {
             model.clear(); assert.strictEqual(model.snapshot().trackedActors + model.snapshot().trackedRescueActors, 0);
         }
     });
+    it('releases unseen active-incident and ordinary reservations on clear', () => {
+        const { model } = owner(); approach(model);
+        assert.ok(model.snapshot().active);
+        const pending = model.reserveSpeech('pending-work', 'carrying', [{ id: 8, vehicle: 'quad', name: 'EagleRed' }], 'wide');
+        assert.ok(pending); assert.ok(model.snapshot().dialogue.reserved >= 2);
+        model.clear();
+        assert.strictEqual(model.snapshot().dialogue.reserved, 0);
+        assert.strictEqual(model.snapshot().dialogue.shown, 0);
+        assert.strictEqual(model.admitSpeech(pending), false);
+    });
+
 });

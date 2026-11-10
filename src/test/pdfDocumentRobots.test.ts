@@ -322,6 +322,253 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(cover.parentNode, null);
     });
 
+    function finalPublication(p: ReturnType<typeof publication>) {
+        const canvas = new Canvas(p.page.canvas.ownerDocument); canvas.width = 800; canvas.height = 1200;
+        return { ...p.candidate, canvas, revision: p.candidate.revision + 1, projection: {
+            width: 800, height: 1200, pageToRaster: [800, 0, 0, 1200, 0, 0] },
+            coverage: { kind: 'native', intent: {}, discovered: true, untrackedImageOperations: false,
+                resources: [{ objectId: 'instance', imageId: 'x5', covered: true, final: true, failed: false }] } };
+    }
+
+    function qualityPhoto(options: Record<string, unknown> = {}) {
+        const f = fixture({ maxActors: 4, ...options }); f.desktop(); const p = publication(f);
+        p.candidate.canvas.width = 135; p.candidate.canvas.height = 192;
+        p.candidate.projection = { width: 135, height: 192, pageToRaster: [135, 0, 0, 192, 0, 0] };
+        f.api.setVisiblePages([p.page.pageNumber]); f.api.preparePublication(p.candidate, p.encounter).commit();
+        let current = p.candidate, revision = 1;
+        const publish = (final = true) => {
+            const next = finalPublication(p); next.revision = ++revision;
+            next.coverage.resources[0].final = final;
+            const transaction = f.api.preparePublication(next, p.encounter, current);
+            current.canvas.replaceWith(next.canvas); transaction.commit(); current = next; return next;
+        };
+        return { f, p, publish, current: () => current };
+    }
+
+    it('reserves a late source-quality wipe before publication after the delivery has already retired', () => {
+        const f = fixture({ maxActors: 4 }); f.desktop(); const p = publication(f);
+        p.candidate.canvas.width = 135; p.candidate.canvas.height = 192;
+        p.candidate.projection = { width: 135, height: 192, pageToRaster: [135, 0, 0, 192, 0, 0] };
+        f.api.setVisiblePages([p.page.pageNumber]); f.api.preparePublication(p.candidate, p.encounter).commit(); f.finish();
+        assert.strictEqual(f.api.snapshot().pages.length, 0, 'the original delivery is finished before final pixels arrive');
+        const sharp = finalPublication(p), before = f.api.snapshot().cargoBytes;
+        const transaction = f.api.preparePublication(sharp, p.encounter, p.candidate);
+        const prepared = sceneNodes(f.container).filter(node => node.className.startsWith('pdfDocumentRobotQuality'));
+        assert.ok(prepared.some(node => node.className === 'pdfDocumentRobotQualityCoarse' && node.isConnected),
+            'coarse pixel ownership is connected before the final native publication');
+        assert.strictEqual(f.api.snapshot().qualityReactions.length, 0, 'provisional scenes are not reported as committed');
+        transaction.commit(); const began = f.api.snapshot(), scene = began.qualityReactions[0];
+        assert.ok(scene && scene.location === 'page'); assert.ok(began.cargoBytes > before);
+        assert.strictEqual(began.retainedBytes, began.cargoBytes + began.spriteBytes);
+        for (const node of prepared.filter(node => node.dataset.quality)) {
+            assert.strictEqual(node.dataset.quality, String(scene.id)); assert.strictEqual(node.dataset.payload, undefined);
+            assert.strictEqual(node.dataset.deliveryPlan, undefined); assert.strictEqual(node.dataset.deliveryCrop, undefined);
+        }
+        f.tick(200); const progressing = f.api.snapshot().qualityReactions[0];
+        assert.ok(progressing.phase > 0 && progressing.phase < 1);
+        const overlay = prepared.find(node => node.className === 'pdfDocumentRobotQualityCoarse')!;
+        assert.ok(overlay.style.clipPath.startsWith('inset(0 0 0 '));
+        assert.strictEqual(progressing.sharpKind, 'native-page');
+        assert.strictEqual(progressing.sharpBytes + progressing.sharpWidth + progressing.sharpHeight, 0,
+            'the wipe reveals actual native pixels rather than a cargo-resolution sharp copy');
+        f.finish(); const ended = f.api.snapshot(); assert.strictEqual(ended.qualityReactions.length, 0);
+        assert.strictEqual(ended.qualityOutcomes.at(-1).outcome, 'completed');
+        assert.strictEqual(ended.activeActors + ended.retainedBytes, 0);
+        f.api.preparePublication(sharp, p.encounter, sharp).commit();
+        assert.strictEqual(f.api.snapshot().qualityReactions.length, 0, 'a repeated final raster cannot replay the reaction');
+    });
+
+    it('aborts provisional quality copies without spending the later successful publication opportunity', () => {
+        const f = fixture({ maxActors: 4 }); f.desktop(); const p = publication(f);
+        p.candidate.canvas.width = 135; p.candidate.canvas.height = 192;
+        p.candidate.projection = { width: 135, height: 192, pageToRaster: [135, 0, 0, 192, 0, 0] };
+        f.api.setVisiblePages([p.page.pageNumber]);
+        f.api.preparePublication(p.candidate, p.encounter).commit(); f.finish();
+        const sharp = finalPublication(p), before = f.api.snapshot();
+        f.api.preparePublication(sharp, p.encounter, p.candidate).abort();
+        const aborted = f.api.snapshot(); assert.strictEqual(aborted.cargoBytes, before.cargoBytes);
+        assert.strictEqual(aborted.spriteBytes, before.spriteBytes); assert.strictEqual(aborted.activeActors, before.activeActors);
+        assert.strictEqual(aborted.qualityReactions.length, 0);
+        f.api.preparePublication(sharp, p.encounter, p.candidate).commit();
+        assert.strictEqual(f.api.snapshot().qualityReactions.length, 1); f.finish();
+        assert.strictEqual(f.api.snapshot().qualityOutcomes.at(-1).outcome, 'completed');
+    });
+
+    it('continues the same visible quality scene across cargo deposit without changing its delivery deadline', () => {
+        const f = fixture({ maxActors: 4 }); f.desktop(); const p = publication(f);
+        p.candidate.canvas.width = 135; p.candidate.canvas.height = 192;
+        p.candidate.projection = { width: 135, height: 192, pageToRaster: [135, 0, 0, 192, 0, 0] };
+        f.api.setVisiblePages([p.page.pageNumber]); f.api.preparePublication(p.candidate, p.encounter).commit();
+        const before = f.api.snapshot().pages[0].payloads[0];
+        f.tick(before.deadline * 0.55);
+        const sharp = finalPublication(p); f.api.preparePublication(sharp, p.encounter, p.candidate).commit();
+        const first = f.api.snapshot().qualityReactions[0]; assert.ok(first && first.location === 'cargo');
+        assert.strictEqual(f.api.snapshot().pages[0].payloads[0].deadline, before.deadline);
+        f.tick(before.deadline * 0.1);
+        const handed = f.api.snapshot().qualityReactions[0]; assert.ok(handed && handed.location === 'page');
+        for (const key of ['id', 'actorId', 'sourcePage', 'planId', 'cropId', 'associatedPayloadId', 'deadline', 'startedAt']) {
+            assert.strictEqual(handed[key], first[key], key + ' survives the handoff');
+        }
+        const retired = f.api.snapshot().pages[0].payloads[0];
+        assert.strictEqual(retired.rasterWidth + retired.rasterHeight, 0);
+        assert.strictEqual(handed.sharpKind, 'native-page'); assert.strictEqual(handed.sharpBytes, 0);
+        const next = f.page(2); f.api.setVisiblePages([p.page.pageNumber, 2]); f.api.offer(next);
+        assert.strictEqual(f.api.snapshot().qualityReactions[0].id, first.id, 'ready delivery does not preempt an admitted wipe');
+        f.finish(); const end = f.api.snapshot(); assert.strictEqual(end.qualityReactions.length, 0);
+        assert.strictEqual(end.qualityOutcomes.find((value: any) => value.id === first.id).outcome, 'completed');
+    });
+
+    it('does not reserve quality capacity for offscreen previews and cancels prepared source ownership before late commit', () => {
+        const f = fixture({ maxActors: 4 }); f.desktop(); const p = publication(f);
+        p.page.pageElement.rect.top = 2000;
+        f.api.preparePublication(p.candidate, p.encounter).commit();
+        assert.strictEqual(f.api.snapshot().qualityDecisions.pending, 0);
+        p.page.pageElement.rect.top = 60; f.api.setVisiblePages([p.page.pageNumber]);
+        f.api.reconcileEncounter(p.candidate.page, p.encounter, p.candidate); f.finish();
+        const tx = f.api.preparePublication(finalPublication(p), p.encounter, p.candidate);
+        f.api.removePage(p.candidate.page, 'removed'); tx.commit(); tx.abort();
+        const state = f.api.snapshot(); assert.strictEqual(state.qualityReactions.length, 0);
+        assert.strictEqual(state.qualityDecisions.active + state.qualityDecisions.pending, 0);
+        assert.strictEqual(state.retainedBytes, 0);
+    });
+
+    it('cancels independent quality ownership when cargo loses its cover instead of covering the exposed page', () => {
+        const f = fixture({ maxActors: 4 }); f.desktop(); const p = publication(f);
+        p.candidate.canvas.width = 135; p.candidate.canvas.height = 192;
+        p.candidate.projection = { width: 135, height: 192, pageToRaster: [135, 0, 0, 192, 0, 0] };
+        f.api.setVisiblePages([p.page.pageNumber]); f.api.preparePublication(p.candidate, p.encounter).commit(); f.tick(300);
+        f.api.preparePublication(finalPublication(p), p.encounter, p.candidate).commit();
+        const scene = f.api.snapshot().qualityReactions[0]; assert.ok(scene);
+        for (const node of sceneNodes(p.page.pageElement).filter(node => node.className === 'pdfDocumentRobotArrival')) { node.remove(); }
+        f.frame(); const state = f.api.snapshot(); assert.strictEqual(state.qualityReactions.length, 0);
+        const outcome = state.qualityOutcomes.find((value: any) => value.id === scene.id);
+        assert.strictEqual(outcome.outcome, 'cancelled'); assert.strictEqual(outcome.reason, 'cargo-cancelled');
+        assert.ok(!sceneNodes(f.container).some(node => node.className === 'pdfDocumentRobotQualityCoarse' && node.isConnected));
+    });
+
+    it('aligns the page quality overlay with the bordered and panned content origin', () => {
+        const f = fixture({ maxActors: 4 }); f.desktop(); const p = publication(f);
+        p.candidate.canvas.width = 135; p.candidate.canvas.height = 192;
+        p.candidate.projection = { width: 135, height: 192, pageToRaster: [135, 0, 0, 192, 0, 0] };
+        Object.assign(p.page.pageElement, { clientLeft: 5, clientTop: 7 });
+        p.encounter.pageProjection.content.x = 12; p.encounter.pageProjection.content.y = -9;
+        f.api.setVisiblePages([p.page.pageNumber]); f.api.preparePublication(p.candidate, p.encounter).commit(); f.finish();
+        f.api.preparePublication(finalPublication(p), p.encounter, p.candidate).commit();
+        const scene = f.api.snapshot().qualityReactions[0]; assert.ok(scene);
+        const coarse = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotQualityCoarse')!;
+        const x = 40 + 5 + 12 + scene.target.x * 400;
+        const y = 60 + 7 - 9 + scene.target.y * 600 - f.container.rect.top;
+        assert.ok(coarse.style.transform.startsWith('translate(' + x + 'px,' + y + 'px)'), coarse.style.transform);
+        assert.strictEqual(scene.sharpKind, 'native-page');
+        assert.ok(!sceneNodes(f.container).some(node => node.className === 'pdfDocumentRobotQualitySharp' && node.isConnected));
+        f.finish();
+    });
+
+    it('keeps useful single-slot delivery and records a direct-sharp reason when its cleaner cannot fit', () => {
+        const { f, publish } = qualityPhoto({ maxActors: 1 });
+        assert.strictEqual(f.api.snapshot().activeActors, 1); f.tick(300); publish();
+        assert.strictEqual(f.api.snapshot().qualityReactions.length, 0);
+        assert.strictEqual(f.api.snapshot().qualityDecisions.lastDecision.reason, 'actor-limit');
+        f.finish(); assert.strictEqual(f.api.snapshot().deliveredFragments, 1);
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes, 0);
+    });
+
+    it('does not replace a displayed high-resolution coarse crop with a cargo-sized page overlay', () => {
+        const f = fixture({ maxActors: 4 }); f.desktop(); const p = publication(f);
+        f.api.setVisiblePages([p.page.pageNumber]); f.api.preparePublication(p.candidate, p.encounter).commit(); f.finish();
+        const next = finalPublication(p); f.api.preparePublication(next, p.encounter, p.candidate).commit();
+        assert.strictEqual(f.api.snapshot().qualityReactions.length, 0);
+        assert.strictEqual(f.api.snapshot().qualityDecisions.lastDecision.reason, 'cargo-limit');
+        assert.ok(!sceneNodes(f.container).some(node => node.className === 'pdfDocumentRobotQualityCoarse'));
+    });
+
+    it('preserves the complete banked cargo pose on its independent coarse/sharp/ASAP layers', () => {
+        const { f, publish } = qualityPhoto(); const before = f.api.snapshot().pages[0].payloads[0];
+        f.tick(before.deadline * 0.3); publish(); f.frame();
+        const scene = f.api.snapshot().qualityReactions[0]; assert.ok(scene && scene.location === 'cargo');
+        const layers = f.owned.filter(canvas => canvas.dataset.quality === String(scene.id));
+        const coarse = layers.find(canvas => canvas.className === 'pdfDocumentRobotQualityCoarse')!;
+        const sharp = layers.find(canvas => canvas.className === 'pdfDocumentRobotQualitySharp')!;
+        const actor = layers.find(canvas => canvas.className === 'pdfDocumentRobotQualityCleaner')!;
+        assert.strictEqual(coarse.style.transform, sharp.style.transform);
+        const angle = (canvas: Canvas) => Number(canvas.style.transform.match(/rotate\(([-\d.]+)deg\)/)?.[1] ?? 0);
+        assert.ok(Math.abs(angle(coarse)) > 0.1, 'the actual aerial route is banked');
+        assert.strictEqual(angle(actor), angle(coarse), 'ASAP follows the same rotated picture');
+        f.finish(); assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+    });
+
+    it('reveals the actual final native page through the coarse mask without allocating a sharp page copy', () => {
+        const { f, publish, current, p } = qualityPhoto(); f.finish();
+        const previous = current(), next = publish();
+        assert.strictEqual(previous.canvas.isConnected, false); assert.strictEqual(next.canvas.isConnected, true);
+        const scene = f.api.snapshot().qualityReactions[0]; assert.ok(scene && scene.sharpKind === 'native-page');
+        const coarse = f.owned.find(canvas => canvas.dataset.quality === String(scene.id)
+            && canvas.className === 'pdfDocumentRobotQualityCoarse')!;
+        assert.strictEqual(coarse.copies[0][0], previous.canvas, 'the covered pixels come from the real preceding raster');
+        f.tick(300); assert.ok(coarse.style.clipPath.startsWith('inset(0 0 0 50.000%'));
+        assert.ok(p.page.pageElement.children.includes(next.canvas));
+        assert.ok(!sceneNodes(f.container).some(node => node.className === 'pdfDocumentRobotQualitySharp' && node.isConnected));
+        f.finish(); assert.strictEqual(next.canvas.isConnected, true);
+    });
+
+    it('reserves feasible quality capacity during ordinary multi-photo work and finishes the admitted wipe', () => {
+        const f = fixture({ maxActors: 4, device: 'mobile', encounterRandom: () => 0.99 }); const p = publication(f);
+        p.candidate.canvas.width = 135; p.candidate.canvas.height = 192;
+        p.candidate.projection = { width: 135, height: 192, pageToRaster: [135, 0, 0, 192, 0, 0] };
+        p.encounter.imageRegions = [0, 1, 2].map(index => ({ id: 'photo' + index, resourceId: 'x' + (5 + index),
+            x: .1, y: .08 + index * .3, width: .7, height: .16 }));
+        f.api.setVisiblePages([p.page.pageNumber]); f.api.preparePublication(p.candidate, p.encounter).commit();
+        assert.ok(f.api.snapshot().activeActors > 0 && f.api.snapshot().activeActors < 4,
+            'useful deliveries coexist with one feasible reserved quality slot');
+        f.tick(500); const next = finalPublication(p);
+        next.coverage.resources = [0, 1, 2].map(index => ({ objectId: 'object' + index, imageId: 'x' + (5 + index),
+            covered: true, final: true, failed: false }));
+        const transaction = f.api.preparePublication(next, p.encounter, p.candidate);
+        p.candidate.canvas.replaceWith(next.canvas); transaction.commit();
+        const began = f.api.snapshot(); assert.strictEqual(began.qualityReactions.length, 1);
+        assert.ok(began.activeActors <= 4); const id = began.qualityReactions[0].id;
+        f.finish(); assert.strictEqual(f.api.snapshot().qualityOutcomes.find((value: any) => value.id === id).outcome, 'completed');
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes, 0);
+    });
+
+    it('does not admit a late first visible wipe beyond its immutable deadline', () => {
+        let visibility = 0;
+        const { f, publish } = qualityPhoto({ createTraffic: () => ({ update: (_at: number, groups: Array<{ id: number }>) =>
+            new Map(groups.map(group => [group.id, { x: 0, y: 0, visibility }])), reset() {} }) });
+        f.tick(300); publish(); const scene = f.api.snapshot().qualityReactions[0];
+        assert.ok(scene && scene.startedAt === undefined);
+        visibility = 1; f.now = scene.deadline - module.DOCUMENT_ROBOT_LIMITS.cleaner.durationMs + 1; f.frame();
+        const state = f.api.snapshot(); assert.strictEqual(state.qualityReactions.length, 0);
+        const outcome = state.qualityOutcomes.find((value: any) => value.id === scene.id);
+        assert.strictEqual(outcome.outcome, 'cancelled'); assert.strictEqual(outcome.reason, 'visible-admission-expired');
+        f.finish(); assert.strictEqual(f.api.snapshot().retainedBytes, 0);
+    });
+
+    it('recognizes a real final source upgrade when both rasters exceed the cargo backing cap', () => {
+        const { f, publish, current, p } = qualityPhoto(); f.finish(); publish(); f.finish();
+        const previous = current(), canvas = new Canvas(f.document); canvas.width = 1600; canvas.height = 2400;
+        const next = { ...previous, canvas, revision: previous.revision + 1,
+            projection: { width: 1600, height: 2400, pageToRaster: [1600, 0, 0, 2400, 0, 0] } };
+        const tx = f.api.preparePublication(next, p.encounter, previous); previous.canvas.replaceWith(canvas); tx.commit();
+        const scene = f.api.snapshot().qualityReactions[0]; assert.ok(scene);
+        assert.ok(scene.coarseWidth > module.DOCUMENT_ROBOT_LIMITS.desktop.fragmentDimension);
+        assert.strictEqual(scene.sharpKind, 'native-page'); f.finish();
+        assert.strictEqual(f.api.snapshot().qualityDecisions.completed, 2);
+    });
+
+    it('keeps a settled quality reservation closed across stale partial reconciliation', () => {
+        const { f, p, publish } = qualityPhoto();
+        assert.ok(f.api.snapshot().qualityDecisions.pending > 0);
+        f.api.updateSource(p.candidate.page, { kind: 'native', intent: {}, discovered: true,
+            resources: [{ objectId: 'failed', imageId: 'x5', covered: false, final: true, failed: true }] });
+        assert.strictEqual(f.api.snapshot().qualityDecisions.pending, 0);
+        f.api.reconcileEncounter(p.candidate.page, p.encounter, p.candidate);
+        assert.strictEqual(f.api.snapshot().qualityDecisions.pending, 0);
+        publish(false); assert.ok(f.api.snapshot().qualityDecisions.pending > 0);
+        f.finish(); assert.strictEqual(f.callbacks.size + f.api.snapshot().retainedBytes, 0,
+            'partial metadata alone cannot keep an idle animation loop running');
+    });
+
     it('rolls back publication covers and treats an unexpectedly lost queued cover as terminal exposure', () => {
         const f = fixture(); const p = publication(f); p.page.pageElement.rect.top = 2000;
         f.api.preparePublication(p.candidate, p.encounter).abort();
@@ -675,9 +922,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             const sharp = new Canvas(f.document); sharp.width = 1082; sharp.height = 1536;
             assert.ok(f.api.refine({ ...delivery, canvas: sharp }) > 0);
             f.frame();
-            const layers = f.owned.filter(canvas => ['pdfDocumentRobotCargo', 'pdfDocumentRobotCargoUnderlay'].includes(canvas.className) && canvas.width);
-            assert.strictEqual(layers.length, 2, 'both coarse and sharp layers remain owned during the wipe');
-            assert.strictEqual(layers[0].style.transform, layers[1].style.transform, 'refinement shares the complete rigid transform');
+            const layers = f.owned.filter(canvas => ['pdfDocumentRobotCargo'].includes(canvas.className) && canvas.width);
+            assert.strictEqual(layers.length, 1, 'generic pixel replacement retains exactly one cargo backing');
+            assert.ok(Math.abs(angle(layers[0]) - bank) < 1, 'refined cargo continues the existing banked flight');
             assert.strictEqual(cover.style.transform, coverTransform, 'the source mask stays in the fixed page region');
             for (const caption of captions(f)) { assert.ok(!caption.style.transform?.includes('rotate'), 'readable labels stay level'); }
             const current = f.api.snapshot().pages[0].payloads[0];
@@ -775,7 +1022,8 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const copies = f.owned.reduce((sum, canvas) => sum + canvas.copies.filter(args => args.length === 9).length, 0);
         pointer(f, 'pointermove', point(sprite)); f.tick(34);
         assert.strictEqual(f.api.snapshot().interaction.hovered, actor.id);
-        assert.ok(f.api.snapshot().caption.text.includes('fotografiju'), 'the moving courier reports its actual loaded work');
+        assert.strictEqual(f.api.snapshot().caption.opportunity, 'carrying', 'the moving courier reports its actual loaded work');
+        assert.ok(f.api.snapshot().caption.meaningIds.length > 0);
         const at = point(sprite);
         pointer(f, 'pointerdown', at); pointer(f, 'pointerup', at); pointer(f, 'click', at); f.tick(34);
         assert.strictEqual(f.api.snapshot().interaction.greeting, actor.id);
@@ -871,10 +1119,10 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const body = blocked.api.snapshot().advance[0].actors[0];
         const image = blocked.owned.find(canvas => canvas.dataset.courier === String(body.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
         pointer(blocked, 'pointermove', point(image)); blocked.frame();
-        const unseen = captions(blocked)[0]; assert.strictEqual(unseen.style.opacity, '0');
-        assert.strictEqual(blocked.callbacks.size, 0);
+        assert.strictEqual(blocked.api.snapshot().encounters.dialogue.shown, 0, 'intrinsically oversized authored cues never consume readable coverage');
+        for (let step = 0; step < 100 && blocked.callbacks.size; step++) { blocked.frame(); }
         blocked.tick(4001);
-        assert.strictEqual(unseen.isConnected, false);
+        assert.ok(captions(blocked).every(node => !node.isConnected || node.style.opacity !== '1'));
         assert.strictEqual(blocked.timers.size + blocked.callbacks.size, 0);
     });
 
@@ -1479,7 +1727,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.deepStrictEqual(after.helpers, before.helpers);
         assert.deepStrictEqual(after.target, before.target);
         assert.strictEqual(after.refinements, 1);
-        assert.strictEqual(f.api.snapshot().cleaner, undefined, 'a full delivery team keeps its actor slots');
+        assert.strictEqual(f.api.snapshot().qualityReactions.length, 0, 'generic pixel refinement does not invent a quality reaction');
         const sharp = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo'
             && canvas.dataset.payload === String(before.id) && canvas.width > 0)!;
         assert.notStrictEqual(sharp, old);
@@ -1564,77 +1812,65 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(old.zeroWrites, 0);
     });
 
-    it('a real sharper crop admits one finite ASAP wipe without restarting its delivery or allocating an idle loop', () => {
-        const { f, source } = coarsePhoto({ maxActors: 4 });
-        const before = f.api.snapshot();
-        assert.strictEqual(before.cleaner, undefined, 'the coarse raster alone cannot claim a quality improvement');
-        assert.ok(before.activeActors < before.maxActors);
-        const coarse = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
-        f.tick(100);
-        assert.strictEqual(f.api.refine(source()), 1);
-        const began = f.api.snapshot(), cleaner = began.cleaner;
-        assert.ok(cleaner && cleaner.duration > 0);
-        assert.strictEqual(began.activeActors, before.activeActors + 1);
-        assert.ok(began.activeActors <= began.maxActors && began.spriteBytes <= began.maxSpriteBytes);
-        assert.strictEqual(began.pages[0].payloads[0].deadline, before.pages[0].payloads[0].deadline);
-        assert.ok(coarse.width > 0 && coarse.isConnected, 'coarse pixels remain underneath until the finite wipe reveals sharp pixels');
-        assert.strictEqual(coarse.className, 'pdfDocumentRobotCargoUnderlay');
-        assert.strictEqual(began.pages[0].payloads[0].refinementPending, true);
-        assert.strictEqual(began.cargoBytes, f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotCargo'
-            || canvas.className === 'pdfDocumentRobotCargoUnderlay').reduce((bytes, canvas) => bytes + canvas.width * canvas.height * 4, 0));
-        const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCleaner' && canvas.width)!;
-        assert.ok(sprite);
-        f.tick(120);
-        assert.ok(Number(sprite.style.opacity) > 0, 'the finite cleaner appears only after its geometry is painted');
-        const progress = f.api.snapshot().pages[0].payloads[0].refinementProgress;
-        assert.ok(progress > 0 && progress < 1);
-        const sharp = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
-        assert.ok(sharp.style.clipPath.startsWith('inset('), 'only the already wiped part of the sharper crop is visible');
-        assert.strictEqual(f.api.refine(source(1080, 1536)), 1);
-        assert.strictEqual(f.api.snapshot().cleaner.started, cleaner.started, 'a finer tier does not restart the wipe');
-        assert.strictEqual(f.api.snapshot().cleaner.id, cleaner.id);
-        assert.strictEqual(coarse.zeroWrites, 0, 'the same coarse underlay survives a second sharper tier');
-        assert.strictEqual(sharp.zeroWrites, 1, 'only the superseded sharp overlay is released');
-        f.tick(cleaner.duration);
-        assert.strictEqual(f.api.snapshot().cleaner, undefined);
-        assert.strictEqual(sprite.zeroWrites, 1);
-        assert.strictEqual(coarse.zeroWrites, 1);
-        assert.strictEqual(f.api.snapshot().pages[0].payloads[0].refinementPending, false);
-        assert.strictEqual(f.api.snapshot().activeActors, before.activeActors);
-        f.finish();
-        assert.strictEqual(f.callbacks.size, 0);
-        const frames = f.api.snapshot().frames;
-        f.tick(20000);
-        assert.strictEqual(f.api.snapshot().frames, frames, 'the wipe has no idle scheduler');
+    it('keeps the quality reaction available through intermediate cargo revisions until final source pixels arrive', () => {
+        const { f, publish } = qualityPhoto(); f.tick(300);
+        publish(false); const intermediate = f.api.snapshot();
+        assert.strictEqual((intermediate.qualityReactions ?? (intermediate.cleaner ? [intermediate.cleaner] : [])).length, 0,
+            'intermediate pixels do not consume the final-quality reaction');
+        f.frame(); publish(true);
+        assert.strictEqual(f.api.snapshot().qualityReactions.length, 1);
+        f.finish(); assert.strictEqual(f.api.snapshot().qualityOutcomes.at(-1).outcome, 'completed');
     });
 
-    it('the cleaner yields to ready delivery and releases once on every hard scene cancellation', () => {
+    it('a real sharper publication admits one finite ASAP wipe with every copied byte charged and an idle finish', () => {
+        const { f, publish, p } = qualityPhoto(); f.tick(300);
+        const before = f.api.snapshot(), original = before.pages[0].payloads[0]; publish();
+        const began = f.api.snapshot(), scene = began.qualityReactions[0]; assert.ok(scene);
+        assert.strictEqual(began.activeActors, before.activeActors + 1);
+        assert.ok(began.activeActors <= began.maxActors && began.spriteBytes <= began.maxSpriteBytes);
+        assert.strictEqual(began.pages[0].payloads[0].deadline, original.deadline);
+        const quality = f.owned.filter(canvas => canvas.dataset.quality === String(scene.id) && canvas.width > 0);
+        assert.strictEqual(quality.length, 3);
+        const old = quality.find(canvas => canvas.className === 'pdfDocumentRobotQualityCoarse')!;
+        const sharp = quality.find(canvas => canvas.className === 'pdfDocumentRobotQualitySharp')!;
+        const actor = quality.find(canvas => canvas.className === 'pdfDocumentRobotQualityCleaner')!;
+        const cargo = f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width > 0);
+        assert.strictEqual(began.cargoBytes, [...cargo, old, sharp].reduce((sum, canvas) => sum + canvas.width * canvas.height * 4, 0));
+        f.tick(120); assert.ok(Number(actor.style.opacity) > 0);
+        assert.ok(f.api.snapshot().qualityReactions[0].phase > 0);
+        assert.ok(sharp.style.clipPath.startsWith('inset('));
+        const current = f.api.snapshot().qualityReactions[0]; publish();
+        assert.strictEqual(f.api.snapshot().qualityReactions[0].id, current.id, 'later final revisions do not restart the wipe');
+        f.finish(); assert.strictEqual(f.api.snapshot().qualityReactions.length, 0);
+        assert.ok(quality.every(canvas => canvas.zeroWrites === 1));
+        assert.strictEqual(f.api.snapshot().deliveryPlans[0].crops[0].state, 'delivered');
+        assert.strictEqual(f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+        const frames = f.api.snapshot().frames; f.tick(20000); assert.strictEqual(f.api.snapshot().frames, frames);
+        void p;
+    });
+
+    it('preserves an admitted wipe for ready deliveries and releases it exactly once on hard lifecycle exits', () => {
         for (const ending of ['ready', 'offscreen', 'hide', 'reduce', 'disable', 'reset', 'replacement', 'dispose']) {
-            const { f, source, page } = coarsePhoto({ maxActors: 4 });
-            f.tick(100); assert.strictEqual(f.api.refine(source()), 1);
-            const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCleaner' && canvas.width)!;
-            assert.ok(sprite, ending);
-            const underlay = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargoUnderlay' && canvas.width)!;
-            assert.ok(underlay, ending);
+            const { f, publish, p } = qualityPhoto(); f.tick(300); publish();
+            const before = f.api.snapshot().qualityReactions[0]; assert.ok(before);
+            const owned = f.owned.filter(canvas => canvas.dataset.quality === String(before.id));
             const late = [...f.callbacks.values()];
-            if (ending === 'ready') {
-                const next = f.page(100);
-                f.api.setVisiblePages([99, 100]);
-                assert.strictEqual(f.api.offer(next), 'started');
-            } else if (ending === 'offscreen') { f.api.setVisiblePages([]); }
+            if (ending === 'ready') { const next = f.page(2); f.api.setVisiblePages([p.page.pageNumber, 2]); f.api.offer(next); }
+            else if (ending === 'offscreen') { f.api.setVisiblePages([]); }
             else if (ending === 'hide') { f.document.hidden = true; f.document.emit('visibilitychange'); }
             else if (ending === 'reduce') { f.media.matches = true; f.media.emit('change'); }
             else if (ending === 'disable') { f.api.setEnabled(false); }
             else if (ending === 'reset') { f.api.reset(); }
-            else if (ending === 'replacement') { f.api.retireDocument([page], 'new-edition'); }
+            else if (ending === 'replacement') { f.api.retireDocument([p.page], 'new-edition'); }
             else { f.api.dispose(); }
-            assert.strictEqual(f.api.snapshot().cleaner, undefined, ending);
-            assert.strictEqual(sprite.zeroWrites, 1, ending + ' has one cleanup owner');
-            assert.strictEqual(underlay.zeroWrites, 1, ending + ' releases the retained coarse crop once');
+            if (ending === 'ready') {
+                assert.strictEqual(f.api.snapshot().qualityReactions[0].id, before.id); f.finish();
+                assert.strictEqual(f.api.snapshot().qualityOutcomes.at(-1).outcome, 'completed');
+            } else { assert.strictEqual(f.api.snapshot().qualityReactions.length, 0, ending); }
+            assert.ok(owned.every(canvas => canvas.zeroWrites === 1), ending);
             const allocated = f.owned.length;
             if (ending !== 'ready') { for (const callback of late) { callback(f.now + 40); } }
-            assert.strictEqual(f.owned.length, allocated, 'an obsolete frame cannot allocate a replacement cleaner');
-            assert.ok(f.api.snapshot().activeActors <= f.api.snapshot().maxActors);
+            assert.strictEqual(f.owned.length, allocated); assert.ok(f.api.snapshot().activeActors <= f.api.snapshot().maxActors);
         }
     });
 
@@ -1651,7 +1887,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.owned.length, allocated, 'no replacement crop or cleaner is allocated');
         const state = f.api.snapshot(), after = state.pages[0].payloads[0];
         assert.strictEqual(state.activePayloads + state.activeArrivalCovers + state.cargoBytes, 0);
-        assert.strictEqual(state.cleaner, undefined);
+        assert.strictEqual(state.qualityReactions.length, 0);
         assert.strictEqual(coarse.zeroWrites, 1);
         assert.strictEqual(after.id, before.id); assert.strictEqual(after.deadline, before.deadline);
         assert.deepStrictEqual(after.helpers, before.helpers);
@@ -1675,12 +1911,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.api.refine(source()), 1, 'real sharper pixels may replace a still-owned faded crop');
         f.frame();
         const sharp = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
-        assert.ok(sharp !== coarse && coarse.width > 0, 'the finite wipe retains its coarse underlay');
+        assert.ok(sharp !== coarse && coarse.width === 0, 'generic pixel refinement retires the replaced bitmap');
         assert.ok(Number(sharp.style.opacity) > 0 && Number(sharp.style.opacity) <= 0.6);
         visibility = 1; f.frame();
         const after = f.api.snapshot().pages[0].payloads[0];
         assert.strictEqual(after.visibility, 1);
-        assert.strictEqual(coarse.style.opacity, sharp.style.opacity, 'both refinement layers recover together during the arrival ramp');
         f.tick(before.deadline * 0.30 - f.now);
         assert.strictEqual(Number(sharp.style.opacity), 1, 'normal presentation returns without another admission or source copy');
         assert.strictEqual(after.id, before.id); assert.strictEqual(after.deadline, before.deadline);
@@ -1751,9 +1986,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                     new Map(groups.map(group => [group.id, { x: 0, y: 0, visibility }])), reset() {} }) });
             f.tick(100); assert.strictEqual(f.api.refine(source()), 1);
             const before = f.api.snapshot().pages[0].payloads[0];
-            const rasters = f.owned.filter(canvas => ['pdfDocumentRobotCargo', 'pdfDocumentRobotCargoUnderlay'].includes(canvas.className) && canvas.width);
-            assert.strictEqual(rasters.length, 2);
-            assert.ok(f.api.snapshot().cleaner);
+            const rasters = f.owned.filter(canvas => ['pdfDocumentRobotCargo'].includes(canvas.className) && canvas.width);
+            assert.strictEqual(rasters.length, 1);
+            assert.strictEqual(f.api.snapshot().qualityReactions.length, 0, 'generic refine does not invent a quality transition');
             if (ending === 'explicit reveal') { f.api.revealArrivals(); }
             else if (ending === 'deposit') { f.tick(before.deadline * 0.63 - f.now); }
             else {
@@ -1764,7 +1999,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             }
             const state = f.api.snapshot(), after = state.pages[0].payloads[0];
             assert.strictEqual(state.activePayloads + state.activeArrivalCovers + state.cargoBytes, 0);
-            assert.strictEqual(state.cleaner, undefined);
+            assert.strictEqual(state.qualityReactions.length, 0);
             assert.ok(rasters.every(canvas => canvas.zeroWrites === 1 && !canvas.parentNode));
             assert.strictEqual(after.id, before.id); assert.strictEqual(after.deadline, before.deadline);
             assert.deepStrictEqual(after.helpers, before.helpers);
@@ -2364,7 +2599,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             assert.strictEqual(held.size, 0, ending);
             assert.strictEqual(released, reserved, ending);
             assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes, 0, ending);
-            assert.strictEqual(f.callbacks.size + f.timers.size, 0, ending);
+            assert.strictEqual(f.callbacks.size, 0, ending);
+            if (f.api.snapshot().caption) { f.tick(Math.max(0, f.api.snapshot().caption.until - f.now) + 1); }
+            assert.strictEqual(f.timers.size, 0, ending);
             assert.strictEqual(finished.filter(identity => identity === 'edition-b').length, 1, ending + ' reports one terminal transition');
         }
     });
@@ -2433,7 +2670,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('holds the longest exact Croatian success line after ordinary motion without another animation frame', () => {
-        const f = fixture(successOptions()); const page = f.page();
+        const f = fixture({ ...successOptions(), seed: 11 }); const page = f.page();
         f.api.setVisiblePages([1]); f.api.offer(page);
         const line = 'ovako fino ne bi ni Marić izbrusio';
         let bubble: Element | undefined;
@@ -5108,7 +5345,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const before = f.api.snapshot().pages[0].payloads[0];
         const sharper = { ...source(), kind: 'page' as const };
         assert.strictEqual(f.api.refine(sharper), 1);
-        const allocations = f.owned.length, cleaner = f.api.snapshot().cleaner;
+        const allocations = f.owned.length, quality = f.api.snapshot().qualityReactions;
         for (const repeated of [delivery, sharper, { ...sharper, kind: 'preview' as const }, sharper]) {
             assert.strictEqual(f.api.offer(repeated), 'skipped');
             assert.strictEqual(f.api.refine(repeated), 0);
@@ -5119,7 +5356,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.deepStrictEqual(after.helpers, before.helpers);
         assert.deepStrictEqual(after.target, before.target);
         assert.strictEqual(after.refinements, 1);
-        assert.deepStrictEqual(f.api.snapshot().cleaner, cleaner, 'repeated quality does not restart the finite cleaner');
+        assert.deepStrictEqual(f.api.snapshot().qualityReactions, quality, 'repeated pixel revisions do not create quality ownership');
         f.finish();
         assert.strictEqual(f.api.offer(sharper), 'skipped');
         assert.strictEqual(f.api.refine(source(1080, 1536)), 0);
@@ -5388,4 +5625,138 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.callbacks.size, 0);
         assert.ok(f.owned.every(canvas => canvas.width * canvas.height === 0));
     });
+    for (const maxActors of [1, 4]) {
+        it(`shows reachable authored dialogue during ordinary ${maxActors === 1 ? 'solo' : 'multi-photo'} work without requiring a rare incident`, () => {
+            const f = fixture({ seed: 10, maxActors, encounterRandom: () => 0.99 }); f.desktop();
+            const displayed = new Set<string>(); let admitted = 0;
+            for (let number = 1; number <= 12; number++) {
+                const page = f.page(number); page.canvas.width = 135; page.canvas.height = 192;
+                const regions = maxActors === 1 ? [{ id: 'photo-' + number, x: 0.1, y: 0.2, width: 0.2, height: 0.15 }]
+                    : [0.05, 0.55].map((x, index) => ({ id: 'photo-' + number + '-' + index, x, y: index ? 0.55 : 0.1, width: 0.4, height: 0.3 }));
+                f.api.setVisiblePages([number]);
+                if (f.api.offer({ ...page, kind: 'preview', imageRegions: regions }) === 'started') { admitted++; }
+                for (let frame = 0; frame < 160; frame++) {
+                    f.frame();
+                    for (const bubble of captions(f)) {
+                        if (bubble.isConnected && bubble.style.opacity === '1' && bubble.textContent.trim()) {
+                            displayed.add(bubble.textContent.replace(/^[^:]+: /gm, ''));
+                        }
+                    }
+                }
+            }
+            assert.ok(admitted >= 8, 'the scenario must actually perform ordinary photo work: admitted=' + admitted);
+            assert.ok(displayed.size >= 4, 'ordinary reading must expose multiple authored meanings, not merely a large unreachable catalogue: ' + JSON.stringify([...displayed]));
+        });
+    }
+
+    it('uses the authored work repertoire in actual loaded-attention captions rather than one carrying fallback', () => {
+        const f = fixture({ seed: 10, maxActors: 1, encounterRandom: () => 0.99 }); f.desktop();
+        const shown: string[] = [];
+        for (let number = 1; number <= 10; number++) {
+            const page = f.page(number); page.canvas.width = 135; page.canvas.height = 192;
+            f.api.setVisiblePages([number]);
+            assert.strictEqual(f.api.offer({ ...page, kind: 'preview', imageRegions: [{ id: 'attention-' + number, x: 0.1, y: 0.2, width: 0.2, height: 0.15 }] }), 'started');
+            for (let frame = 0; frame < 80; frame++) {
+                f.frame();
+                const snapshot = f.api.snapshot();
+                const payload = snapshot.pages.flatMap((value: any) => value.payloads).find((value: any) => value.progress > 0.25 && value.progress < 0.6 && !value.deposited);
+                const actor = payload && snapshot.pages.flatMap((value: any) => value.actors).find((value: any) => value.payloadId === payload.id);
+                if (!actor) { continue; }
+                const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.dataset.courier === String(actor.id))!;
+                pointer(f, 'pointermove', point(sprite)); f.tick(34);
+                const bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
+                if (bubble) {
+                    const evidence = f.api.snapshot();
+                    assert.ok(evidence.caption.id.startsWith('hover:'), 'the readable bubble must own the actual attention opportunity');
+                    assert.ok(evidence.caption.meaningIds?.length && evidence.caption.shownAt !== undefined);
+                    assert.ok(evidence.caption.meaningIds.every((id: string) => evidence.encounters.dialogue.coverage.some((entry: any) => entry.id === id && entry.count > 0)));
+                    shown.push(bubble.textContent.replace(/^[^:]+: /gm, ''));
+                }
+                pointer(f, 'pointerleave', point(sprite));
+                break;
+            }
+            for (let frame = 0; frame < 180; frame++) { f.frame(); }
+        }
+        assert.ok(shown.length >= 8, 'actual loaded attention must be readable in the scenario: ' + JSON.stringify(shown));
+        assert.ok(new Set(shown).size >= 4, 'ordinary attention must reach authored meanings: ' + JSON.stringify(shown));
+        assert.ok(shown.filter(line => line === 'Nosim fotografiju.').length <= shown.length / 4,
+            'one generic carrying status must not dominate the employed work repertoire');
+    });
+
+    it('admits authored completion only after actual deposit and new-book lines only during retirement', () => {
+        const f = fixture({ seed: 10, encounterRandom: () => 0.99 }); f.desktop();
+        const page = f.page(101);
+        let completion = false, carrySeen = false, depositDuringRead = false;
+        for (let number = 99; number <= 100; number++) {
+            const page = number === 99 ? f.page(99) : f.page(100); f.api.setVisiblePages([number]);
+            f.api.offer({ ...page, kind: 'preview', imageRegions: [{ id: 'semantic-photo', x: 0.1, y: 0.2, width: 0.2, height: 0.15 }] });
+            let deposited = false;
+            let carrying: { node: Element; until: number } | undefined;
+            for (let index = 0; index < 180; index++) {
+                f.frame(); const snapshot = f.api.snapshot();
+                if (!carrying && snapshot.caption?.opportunity === 'carrying' && snapshot.caption.shownAt !== undefined) {
+                    carrySeen = true;
+                    carrying = { node: captions(f).find(node => node.isConnected && node.style.opacity === '1')!, until: snapshot.caption.until };
+                }
+                if (carrying && f.now < carrying.until) { assert.ok(carrying.node.isConnected && carrying.node.style.opacity === '1', 'readable carry text survives real deposit until its owned deadline'); }
+                deposited ||= snapshot.pages.some((value: any) => value.payloads.some((payload: any) => payload.deposited));
+                if (deposited && carrying && f.now < carrying.until) { depositDuringRead = true; }
+                if (snapshot.caption?.id.endsWith(':deposit') && snapshot.caption.shownAt !== undefined) {
+                    assert.ok(deposited, 'completion wording follows actual deposited pixels'); completion = true;
+                }
+                assert.ok(!snapshot.caption?.id.endsWith(':new-book'));
+            }
+        }
+        assert.ok(carrySeen && depositDuringRead, 'the actual deposit crosses an already readable carrying interval');
+        assert.ok(completion, 'ordinary actual deposit reaches authored completion without a rare incident');
+        f.api.retireDocument([page], 'semantic-new-edition');
+        let retirement = false;
+        for (let index = 0; index < 180; index++) {
+            f.frame(); const snapshot = f.api.snapshot();
+            if (snapshot.caption?.id.endsWith(':new-book') && snapshot.caption.shownAt !== undefined) { retirement = true; }
+        }
+        assert.ok(retirement, 'actual new-edition retirement reaches its authored repertoire');
+    });
+
+    it('keeps one readable authored cue while actual cargo obstacles move and leave at unchanged viewport metrics', () => {
+        const f = fixture({ seed: 11, maxActors: 12, encounterRandom: () => 0.99 }); f.desktop(1, 400, 400);
+        f.document.captionHeight = 300;
+        const photo = f.page(1); photo.pageElement.rect = { left: 0, top: 32, width: 400, height: 360 };
+        photo.canvas.width = 135; photo.canvas.height = 192;
+        f.api.setVisiblePages([1]);
+        assert.strictEqual(f.api.offer({ ...photo, kind: 'preview', imageRegions: [{ id: 'moving-obstacle', x: 0, y: 0, width: 1, height: 1 }] }), 'started');
+        let bubble: Element | undefined, evidence: any, payloadId: number | undefined, sprite: Canvas | undefined;
+        for (let frame = 0; frame < 65 && !bubble; frame++) {
+            f.frame(); const snapshot = f.api.snapshot();
+            const payload = snapshot.pages.flatMap((page: any) => page.payloads).find((payload: any) => payload.progress > 0.5 && payload.progress < 0.65 && !payload.deposited);
+            const actor = payload && snapshot.pages.flatMap((page: any) => page.actors).find((actor: any) => actor.payloadId === payload.id);
+            if (!actor) { continue; }
+            sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
+            pointer(f, 'pointermove', point(sprite)); f.frame();
+            bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
+            if (bubble) { evidence = f.api.snapshot(); payloadId = payload.id; }
+        }
+        assert.ok(bubble && evidence.caption?.shownAt !== undefined, 'the actual loaded actor owns a readable authored cue');
+        const cargo = f.owned.find(canvas => canvas.dataset.payload === String(payloadId) && canvas.className === 'pdfDocumentRobotCargo')!;
+        assert.ok(cargo.isConnected && cargo.width > 0);
+        const initialTransform = cargo.style.transform, placements = new Set<string>();
+        const initialCounts = evidence.encounters.dialogue.coverage;
+        for (let frame = 0; frame < 65 && cargo.width > 0; frame++) {
+            if (sprite?.isConnected) { pointer(f, 'pointermove', point(sprite)); }
+            f.frame(); const snapshot = f.api.snapshot();
+            assert.ok(bubble.isConnected && bubble.style.opacity === '1');
+            assert.strictEqual(snapshot.caption.id, evidence.caption.id);
+            assert.deepStrictEqual(snapshot.caption.meaningIds, evidence.caption.meaningIds);
+            assert.strictEqual(snapshot.caption.until, evidence.caption.until);
+            if (snapshot.caption.placement) { placements.add(snapshot.caption.placement.x + ':' + snapshot.caption.placement.y); }
+        }
+        assert.notStrictEqual(cargo.style.transform, initialTransform, 'the real obstacle moved before actual deposit');
+        assert.strictEqual(cargo.width * cargo.height, 0, 'actual deposit removes its copied photo obstacle');
+        assert.ok(placements.size > 1, 'the real solver repositions the same readable cue as geometry changes');
+        assert.deepStrictEqual(f.api.snapshot().encounters.dialogue.coverage, initialCounts, 'motion/obstacle removal cannot count another authored exposure');
+        assert.strictEqual(f.api.snapshot().encounters.dialogue.blocked, 0, 'soft obstacles never enter intrinsic text-fit rejection history');
+        f.finish(); f.tick(Math.max(0, evidence.caption.until - f.now) + 1);
+        assert.strictEqual(f.callbacks.size + f.timers.size, 0);
+    });
+
 });

@@ -33,6 +33,48 @@ test('matches actual CSS body size with current backing and owner accounting', (
   assert.throws(() => validateSample(uncharged), /Connected sprite bytes/);
 });
 
+test('browser sampler accounts independent quality copies and cleaners in their existing budgets', () => {
+  const box = { x: 10, y: 40, width: 64, height: 50, right: 74, bottom: 90 };
+  const node = (className, dataset, width, height) => ({ className, dataset, width, height, isConnected: true,
+    getBoundingClientRect: () => box,
+    css: { opacity: '1', width: '64px', height: '50px', display: 'block', visibility: 'visible', transform: 'none', translate: 'none' } });
+  const nodes = [
+    node('pdfDocumentRobotCargo', { payload: '7', page: '1' }, 8, 8),
+    node('pdfDocumentRobotQualityCoarse', { quality: '11', page: '1', imageId: 'p1-i0' }, 4, 4),
+    node('pdfDocumentRobotQualitySharp', { quality: '11', page: '1', imageId: 'p1-i0' }, 8, 8),
+    node('pdfDocumentRobotQualityCleaner', { quality: '11', page: '1', imageId: 'p1-i0' }, 16, 12),
+  ];
+  const reader = { x: 0, y: 0, width: 800, height: 600, right: 800, bottom: 600 };
+  const document = { visibilityState: 'visible', querySelectorAll(selector) {
+    return nodes.filter(value => selector.split(',').some(part => {
+      if (part === '[data-payload]') { return value.dataset.payload !== undefined; }
+      if (part === '[data-quality]') { return value.dataset.quality !== undefined; }
+      return part.startsWith('.') && value.className.split(' ').includes(part.slice(1));
+    }));
+  } };
+  const robots = { activeActors: 1, maxActors: 4, cargoBytes: 576, maxCargoBytes: 1024,
+    spriteBytes: 768, maxSpriteBytes: 1024, retainedBytes: 1344, pages: [] };
+  const viewer = { pagesCount: 1, currentPageNumber: 1, currentScale: 1, currentScaleValue: '1', pagesRotation: 0,
+    container: { scrollTop: 0, scrollLeft: 0, getBoundingClientRect: () => reader },
+    getPageView: () => ({ div: { getBoundingClientRect: () => reader }, viewport: { width: 800, height: 600 }, renderingState: 3 }) };
+  const window = { PDFViewerApplication: { pdfViewer: viewer }, __labZoomVisible: visibleInReader,
+    __labZoomCollectArtifacts: () => ({}), pdfPrefetch: { snapshot: () => ({ robots, direction: 0, visible: [1], pending: [], visibleMissing: [] }) } };
+  vm.runInNewContext(fs.readFileSync(new URL('./zoom-sample.js', import.meta.url), 'utf8'), {
+    window, document, getComputedStyle: value => value.css, innerWidth: 800, innerHeight: 600, devicePixelRatio: 1,
+    performance: { now: () => 17, timeOrigin: 1 }, location: { href: 'http://127.0.0.1/page' },
+  });
+  const observed = JSON.parse(JSON.stringify(window.__labZoomSample()));
+  assert.equal(observed.cargo.length, 3, 'both quality rasters are charged alongside delivery cargo');
+  assert.equal(observed.cleaners.length, 1);
+  assert.equal(observed.ownedElements.length, 4, 'teardown inventory includes independent quality ownership');
+  assert.deepEqual(observed.cargo.filter(value => value.qualityId).map(value => value.qualityId), [11, 11]);
+  assert.equal(observed.cleaners[0].qualityId, 11);
+  assert.equal(observed.ownedElements.filter(value => value.qualityId === 11).length, 3);
+  assert.doesNotThrow(() => validateSample(observed));
+  observed.cargo.pop();
+  assert.throws(() => validateSample(observed), /Connected cargo/);
+});
+
 test('rejects readable labels outside the actual reader rectangle', () => {
   const value = sample(); value.labels = [{ opacity: 1, display: 'block', fontSize: 12, lineHeight: 16,
     rect: { x: 20, y: -5, right: 200, bottom: 20 } }];

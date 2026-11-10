@@ -802,6 +802,35 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.strictEqual(view.publishImageCandidate({ canvas: foreign, appearance: view.imageAppearance }, () => assert.fail('foreign proxy cannot publish')), false);
     });
 
+    it('supplies the connected coarse predecessor before a sharper publication can release its pixels', async () => {
+        const robots: any = new DocumentRobots(), publications: any[] = [];
+        robots.preparePublication = (candidate: any, _encounter: any, previous: any) => {
+            publications.push({ candidate, previous, priorConnected: previous?.canvas.isConnected,
+                priorWidth: previous?.canvas.width, nextConnected: candidate.canvas.isConnected });
+            return { commit() {}, abort() {} };
+        };
+        robots.reconcileEncounter = () => {};
+        const f = fixture({ startPage: 1, pages: 1, initialNative: false, autoPages: false },
+            { robotsEnabled: true, createDocumentRobots: () => robots });
+        const images = externalImages(f);
+        await f.frame(); images.paint(1, 1);
+        const coarse = images.view.canvas;
+        publications.length = 0;
+        images.paint(2, 2, true);
+        const replacement = publications.find(value => value.candidate.canvas === images.view.canvas);
+        assert.ok(replacement?.previous, 'quality preparation receives the actual preceding raster');
+        assert.strictEqual(replacement.previous.canvas, coarse);
+        assert.strictEqual(replacement.priorConnected, true);
+        assert.ok(replacement.priorWidth > 0, 'coarse pixels can be copied before replacement destroys their backing');
+        assert.strictEqual(replacement.nextConnected, false, 'the final raster is not exposed before preparation');
+        assert.strictEqual(coarse.width, 0, 'ordinary native cleanup still releases the predecessor after commit');
+        images.view.div.remove(); publications.length = 0;
+        images.paint(3, 2, true);
+        assert.ok(publications.length > 0);
+        assert.strictEqual(publications.at(-1)?.previous, undefined, 'a raster in a disconnected page cannot authorize a page wipe');
+        f.controller.dispose();
+    });
+
     it('publishes consecutive partial passes in one image epoch while retaining the predecessor across a new epoch', async () => {
         const f = fixture({ startPage: 1, pages: 1, initialNative: false, autoPages: false });
         const images = externalImages(f); await f.frame();

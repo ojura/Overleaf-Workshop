@@ -30,6 +30,73 @@ describe('PDF delivery plan ownership', function () {
         return { plans, candidate, encounter, covers, cancelled, admissions,
             eligible(value: string) { eligible = value; }, payload(value: number | undefined) { payload = value; } };
     }
+    it('binds final crop quality to all intersecting native aliases while unrelated images may still load', () => {
+        const f = fixture(), crop = f.encounter.imageRegions[0];
+        f.candidate.canvas = { width: 800, height: 1200 };
+        const resources = [
+            { objectId: 'a', imageId: 'x5', covered: true, final: true, failed: false },
+            { objectId: 'alias', imageId: 'x5', covered: true, final: true, failed: false },
+            { objectId: 'other', imageId: 'x6', covered: true, final: false, failed: false },
+        ];
+        f.candidate.coverage = { kind: 'native', intent: {}, discovered: true, resources, untrackedImageOperations: false };
+        f.encounter.imageRegions.push({ id: 'p1-i1', resourceId: 'x6', x: .7, y: .7, width: .2, height: .2 });
+        const quality = () => api.pdfDeliveryCropQuality(f.candidate, crop, f.encounter);
+        assert.strictEqual(quality(), 'final', 'a different photograph cannot delay this crop completion');
+        resources[1].final = false;
+        assert.strictEqual(quality(), 'partial', 'repeated instances of the same resource must all be final');
+        resources[1].final = true;
+        Object.assign(f.encounter.imageRegions[1], { x: .2, y: .2 });
+        assert.strictEqual(quality(), 'partial', 'overlapping pixels belong to the copied crop even outside its selected image IDs');
+        resources[2].final = true;
+        assert.strictEqual(quality(), 'final');
+        resources[2].failed = true;
+        assert.strictEqual(quality(), 'unknown', 'failed pixels cannot authorize a sharp-image reveal');
+    });
+
+    it('keeps complete previews and unavailable raster evidence distinct from final source quality', () => {
+        const f = fixture(), crop = f.encounter.imageRegions[0];
+        f.candidate.canvas = { width: 800, height: 1200 };
+        const quality = () => api.pdfDeliveryCropQuality(f.candidate, crop, f.encounter);
+        assert.strictEqual(quality(), 'partial', 'complete atlas coverage says every image is present, not that its source pixels are final');
+        for (const coverage of [
+            { kind: 'unknown' },
+            { kind: 'native', intent: {}, discovered: false, resources: [] },
+            { kind: 'native', intent: {}, discovered: true, resources: [], untrackedImageOperations: false },
+        ]) {
+            f.candidate.coverage = coverage;
+            assert.strictEqual(quality(), 'unknown');
+        }
+        f.candidate.coverage = { kind: 'native', intent: {}, discovered: true,
+            resources: [{ objectId: 'a', imageId: 'x5', covered: true, final: true, failed: false }] };
+        assert.strictEqual(quality(), 'final');
+        f.candidate.successful = false;
+        assert.strictEqual(quality(), 'unknown');
+        f.candidate.successful = true;
+        f.candidate.canvas.width = 0;
+        assert.strictEqual(quality(), 'unknown', 'zeroed backing has no final pixels to reveal');
+    });
+
+    it('requires a complete final native inventory when crop linkage is incomplete', () => {
+        const f = fixture(), crop = f.encounter.imageRegions[0];
+        f.candidate.canvas = { width: 800, height: 1200 };
+        f.encounter.imageRegionsComplete = false;
+        const resources = [
+            { objectId: 'a', imageId: 'x5', covered: true, final: true, failed: false },
+            { objectId: 'b', imageId: 'x6', covered: true, final: false, failed: false },
+        ];
+        f.candidate.coverage = { kind: 'native', intent: {}, discovered: true, resources, untrackedImageOperations: false };
+        const quality = () => api.pdfDeliveryCropQuality(f.candidate, crop, f.encounter);
+        assert.strictEqual(quality(), 'partial');
+        resources[1].final = true;
+        assert.strictEqual(quality(), 'final');
+        delete f.candidate.coverage.untrackedImageOperations;
+        assert.strictEqual(quality(), 'unknown', 'an absent inventory proof cannot authorize unmapped final quality');
+        f.candidate.coverage.untrackedImageOperations = true;
+        assert.strictEqual(quality(), 'unknown', 'unmapped untracked imagery has no complete source-quality inventory');
+        f.encounter.imageRegionsComplete = true;
+        assert.strictEqual(quality(), 'final', 'complete explicit linkage can prove the selected crop independently');
+    });
+
     it('keeps unbound proven text unplanned until metadata arrives before the first photograph', () => {
         const f = fixture();
         const text = { ...f.candidate, coverage: { kind: 'native', intent: {}, discovered: true,

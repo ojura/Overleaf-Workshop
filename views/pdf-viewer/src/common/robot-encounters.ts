@@ -1,4 +1,5 @@
-import { ROBOT_AIRLIFT_ATTACHMENT, type RobotVehicle } from './prefetch-robots';
+import { RobotDialogueSelection, robotDialogueCatalogue, ROBOT_ENCOUNTER_DIALOGUE, type RobotIncidentDialogue as Dialogue, type RobotEncounterKind, type RobotDialogueChoice, type RobotDialogueOpportunity, type RobotDialogueSpeaker } from './robot-dialogue';
+import { ROBOT_AIRLIFT_ATTACHMENT, ROBOT_VEHICLES, type RobotVehicle } from './prefetch-robots';
 import { planRobotRescue, ROBOT_RESCUE_CAPABILITIES, ROBOT_RESCUE_POLICY, type RobotRescuePlan } from './robot-rescue';
 import { GROUND_ROUTE_MAX_SLOPE } from './robot-cargo-routes';
 import { robotActivityPhase, type RobotCommitment } from './robot-operations';
@@ -32,7 +33,8 @@ export const ROBOT_ENCOUNTER_POLICY = Object.freeze({
     gestureSteps: 12,
 });
 
-export type RobotEncounterKind = 'bump' | 'near-miss' | 'reunion' | 'success' | 'rescue';
+export type { RobotEncounterKind } from './robot-dialogue';
+export { ROBOT_ENCOUNTER_DIALOGUE } from './robot-dialogue';
 export type RobotExpression = 'drowsy' | 'startled' | 'annoyed' | 'sheepish' | 'pleased';
 export const ROBOT_BOOK_CHARACTERS = Object.freeze({
     pioneer: Object.freeze({ model: 'Pioneer', names: Object.freeze(['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot']),
@@ -50,82 +52,6 @@ export const ROBOT_INTERACTION_REACTIONS = Object.freeze({
     greetings: Object.freeze(['Bok, kolega!', 'Vidim te. Fotka stiže.', 'Radimo, radimo!', 'Daj pet, čim spustim ovo.']),
     carrying: 'Nosim fotografiju.', preparing: 'Pripremam dostavu.', returning: 'Vraćam se ekipi.', waiting: 'Čekam novu stranicu.',
 });
-interface Dialogue {
-    id: string;
-    kind: RobotEncounterKind;
-    lines: readonly string[];
-    source?: string;
-}
-
-// Book-inspired satire is dialogue, not a claim about a different vehicle's biography.
-// Keep the user's wording here intact; the rendering code owns no reaction text.
-export const ROBOT_ENCOUNTER_DIALOGUE: readonly Dialogue[] = Object.freeze([
-    { id: 'bump-sorry', kind: 'bump', lines: ['Opa!', 'Moja greška.'] },
-    { id: 'bump-collision', kind: 'bump', lines: ['Kolizije su uključene?!', 'Sad znamo.'] },
-    { id: 'bump-brothers', kind: 'bump', lines: ['Bratski zagrljaj?', 'Bez branika, molim.'] },
-    { id: 'bump-frkalica', kind: 'bump', lines: ['Oprosti, nisam znao da igramo Frkalicu.', 'Bez revanša, molim.'],
-        source: 'Book-inspired dialogue: Frkalica, main.tex:1858–1874' },
-    { id: 'bump-scout', kind: 'bump', lines: ['Scout Mini kaže: „Samo sam pet centimetara širi.“', 'Ne mjeri me, nisam u javnoj nabavi.'],
-        source: '30 godina LARICS-a/main.tex:9336–9350; Scout Mini procurement story, book-inspired satire' },
-    { id: 'miss-watch', kind: 'near-miss', lines: ['Pazi kuda ideš!', 'Samo sam razmišljao…'] },
-    { id: 'miss-simulation', kind: 'near-miss', lines: ['Budan?', 'U simulaciji jesam.'] },
-    { id: 'miss-thread', kind: 'near-miss', lines: ['Hej! Putanja!', 'Misli su mi odlutale.'] },
-    { id: 'miss-coffee', kind: 'near-miss', lines: ['Kava. Odmah.', 'Prihvaćam korekciju.'] },
-    { id: 'miss-fuzzy', kind: 'near-miss', lines: ['Mir, kolega. Danas nema Fightboticsa.', 'Budnost mi je malo neizrazita…'],
-        source: 'Book-inspired dialogue: Erić main.tex:2781; Kovačić main.tex:2589' },
-    { id: 'miss-kalman', kind: 'near-miss', lines: ['Origami manevar, bez gužvanja fotke.', 'Kalman filtrira. Ja malo drijemam.'],
-        source: 'Book-inspired dialogue: Car main.tex:2709; Petrinec main.tex:3112' },
-    { id: 'miss-dream', kind: 'near-miss', lines: ['Putanja, kolega!', 'Sanjam električne knjige.'],
-        source: 'Book-inspired dialogue: electric dreams, main.tex:6317' },
-    { id: 'miss-rest', kind: 'near-miss', lines: ['Budan?', 'Ne spavam. Obnavljam organizam.'],
-        source: 'Book-inspired dialogue: skiing rest, main.tex:2116' },
-    { id: 'miss-caves', kind: 'near-miss', lines: ['Hej! Putanja!', 'Samo mali đir do Baraćevih špilja.'],
-        source: 'Book-inspired dialogue: spontaneous cave detour, main.tex:2444' },
-    { id: 'reunion-wave', kind: 'reunion', lines: ['Kolega!', 'Daj pet!'] },
-    { id: 'reunion-beer', kind: 'reunion', lines: ['Pivo poslije smjene?', 'Kad parkiramo.'] },
-    { id: 'reunion-team', kind: 'reunion', lines: ['Dobra ekipa.', 'Ista putanja kući?'] },
-    { id: 'reunion-marker', kind: 'reunion', lines: ['Prijatelja prepoznajem i bez markera.', 'Magnetski te vuče dobro društvo.'],
-        source: 'Book-inspired dialogue: Vasiljević main.tex:3233; Martinović main.tex:2967' },
-    { id: 'reunion-round', kind: 'reunion', lines: ['Petlja zatvorena. Runda otvorena.', 'Prvo fotka, onda pivo.'],
-        source: 'Book-inspired dialogue: Oršulić main.tex:3049; Peti main.tex:3092' },
-    { id: 'reunion-resource', kind: 'reunion', lines: ["Resurs 'zagrljaj' dodijeljen.", 'Uštimani. Kao ROBOBAND.'],
-        source: 'Book-inspired dialogue: Petrović main.tex:3122; ROBOBAND main.tex:6412' },
-    { id: 'reunion-lift', kind: 'reunion', lines: ['Vidi koga nosi lift!', 'Zrak i zemlja. Najbolji frendovi.'],
-        source: 'Book-inspired dialogue: main.tex:1737, 8908' },
-    { id: 'reunion-break', kind: 'reunion', lines: ['Još ova fotka, pa treće poluvrijeme.', 'Još ova fotka, pa na Robijevu svirku.'],
-        source: 'Book-inspired dialogue: football and Jolly Rogers, main.tex:1737-1756, 6635-6644' },
-    { id: 'reunion-pioneers', kind: 'reunion', lines: ['Pioneeri kažu: „still got it. barem nismo završili kao VIV.“'],
-        source: 'User-supplied Pioneer/VIV callback; the current vehicle keeps its own identity' },
-    { id: 'success-nailed', kind: 'success', lines: ['Nailed it.', 'Like a glove.'] },
-    { id: 'success-fit', kind: 'success', lines: ['Na milimetar.', 'Timski rad.'] },
-    { id: 'success-maric', kind: 'success', lines: ['ovako fino ne bi ni Marić izbrusio'],
-        source: 'User-supplied dialogue; ENDORSE grinding by demonstration, main.tex:4583–4589' },
-    { id: 'success-sofia', kind: 'success', lines: ['zgrabio sam ga kao SofIA'],
-        source: 'User-supplied dialogue; SofIA main.tex:6862–6871' },
-    { id: 'success-mbzirc', kind: 'success', lines: ['bolje prošlo nego MBZIRC'],
-        source: 'User-supplied dialogue; mixed MBZIRC 2020 story main.tex:6774, distinct from the 2023 victory at 6813–6815' },
-    { id: 'success-handoff', kind: 'success', lines: ['Držiš?', 'Držim. Sad možeš pustiti.'],
-        source: 'Book-inspired dialogue: Marić main.tex:2927' },
-    { id: 'success-map', kind: 'success', lines: ['Ti mapiraj. Ja čuvam leđa.', 'Bzz… imamo konsenzus!'],
-        source: 'Book-inspired dialogue: Milas main.tex:2987; Griparić main.tex:2833' },
-    { id: 'success-gentle', kind: 'success', lines: ['Nježno, kao s malinom.', 'Gripsters petica! Ni piksel ogreben.'],
-        source: 'Book-inspired dialogue: Pevec main.tex:3132; Wachtler main.tex:3288' },
-    { id: 'success-memories', kind: 'success', lines: ['Radionica sreće: dostava uspjela!', 'Fotka po fotka, zid uspomena.'],
-        source: 'Book-inspired dialogue: Kovačević main.tex:2886; Križmančić main.tex:2907' },
-    { id: 'success-precision', kind: 'success', lines: ['U sridu!', 'Prvo precizno. Onda Guinness.'],
-        source: 'Book-inspired dialogue: main.tex:4041–4046, 965–967' },
-    { id: 'success-care', kind: 'success', lines: ['Precizno: parizer na 0,7 milimetara.', 'Nježno, po Jeleninoj školi.'],
-        source: 'Book-inspired dialogue: mock menu and compliant manipulation, main.tex:2357, 3272-3278' },
-    { id: 'success-guitar', kind: 'success', lines: ['Predaja u ritmu. Sad jedan akord!'],
-        source: 'Book-inspired dialogue: Spudić guitar school, main.tex:3182' },
-    { id: 'success-matko', kind: 'success', lines: ['možda mi Matko nešto fino skuha'],
-        source: 'Exact user-supplied reward line and cooking lore' },
-    { id: 'success-caca', kind: 'success', lines: ['možda mi Ćaća nešto fino skuha'],
-        source: 'User-supplied occasional nickname for Matko and cooking lore' },
-    { id: 'rescue-smoke', kind: 'rescue', lines: ['Pobjegao mi je čarobni dim.', 'Drži se. Imamo ekipu.'] },
-    { id: 'rescue-field', kind: 'rescue', lines: ['Terenski rad. Doslovno.', 'Prvo kolega, onda procedura.'] },
-    { id: 'rescue-lugv', kind: 'rescue', lines: ['Opet me nosiš? Kakav divan kvar!', 'Samo ovaj put, kolega.'] },
-]);
 
 type Point = { x: number; y: number };
 export interface RobotEncounterActor extends Point {
@@ -154,6 +80,7 @@ export interface RobotEncounterReaction {
     caption: string;
     captionId: string;
     captionUntil: number;
+    dialogueChoice?: RobotDialogueChoice;
     gesturePhase: number;
     look?: number;
     carried?: boolean;
@@ -169,6 +96,7 @@ interface Incident {
     ends: number;
     armedUntil?: number;
     dialogue: Dialogue;
+    dialogueChoice?: RobotDialogueChoice;
     captionId: string;
     captionUntil: number;
     rescue?: RobotRescuePlan;
@@ -202,11 +130,28 @@ export class RobotEncounters {
     private lastRescue?: { key: string; completion: 'fulfilled' | 'partial' | 'failed' | 'cancelled'; at: number;
         position: Point; target: Point; recovery: 'self' | 'assisted' | 'release'; complete: boolean };
 
-    constructor(private readonly random: () => number, private readonly maxActors: number, private readonly operationSeed = 0) {}
+    private incidentSerial = 0;
+    private speechGeometry = 'unmeasured';
+    setSpeechGeometry(domain: string): void { this.speechGeometry = domain; }
+    private readonly speech: RobotDialogueSelection;
+    constructor(private readonly random: () => number, private readonly maxActors: number, private readonly operationSeed = 0) {
+        this.speech = new RobotDialogueSelection(robotDialogueCatalogue(ROBOT_ENCOUNTER_DIALOGUE, ROBOT_INTERACTION_REACTIONS), operationSeed);
+    }
+    reserveSpeech(key: string, opportunity: RobotDialogueOpportunity, actors: readonly RobotDialogueSpeaker[], geometry: string): RobotDialogueChoice | undefined {
+        return this.speech.reserve(key, opportunity, actors, geometry);
+    }
+    admitSpeech(choice: RobotDialogueChoice): boolean { return this.speech.admit(choice); }
+    rejectSpeechGeometry(choice: RobotDialogueChoice): void { this.speech.rejectGeometry(choice); }
+    releaseSpeech(choice: RobotDialogueChoice): void { this.speech.release(choice); }
 
-    private dialogue(kind: RobotEncounterKind): Dialogue | undefined {
-        const candidates = ROBOT_ENCOUNTER_DIALOGUE.filter(value => value.kind === kind);
-        return candidates[Math.min(candidates.length - 1, Math.floor(this.random() * candidates.length))];
+
+    private dialogue(kind: RobotEncounterKind, actors: readonly RobotEncounterActor[], at: number, allowedIds?: readonly string[], consumeRandom = true) {
+        // Preserve incident-decision RNG consumption; text choice itself is coverage-owned.
+        if (consumeRandom) { this.random(); }
+        const choice = this.speech.reserve('incident:' + ++this.incidentSerial, kind,
+            actors.map(actor => ({ id: actor.id, vehicle: actor.vehicle ?? '',
+                name: ROBOT_VEHICLES.find(vehicle => vehicle.id === actor.vehicle)?.name ?? 'Robot' })), this.speechGeometry, allowedIds);
+        return choice ? { dialogue: { id: choice.entry.id, kind, lines: choice.lines } as Dialogue, choice } : undefined;
     }
 
     private captionDuration(dialogue: Dialogue): number {
@@ -219,11 +164,12 @@ export class RobotEncounters {
         const duration = Math.min(ROBOT_ENCOUNTER_POLICY.maxDurationMs,
             ...actors.map(actor => actor.remainingMs - ROBOT_ENCOUNTER_POLICY.endMarginMs));
         if (duration < ROBOT_ENCOUNTER_POLICY.minDurationMs) { return; }
-        const dialogue = this.dialogue(kind);
-        if (!dialogue) { return; }
+        const selected = this.dialogue(kind, actors, at);
+        if (!selected) { return; }
+        const { dialogue, choice } = selected;
         this.incident = { kind, ids: actors.map(actor => actor.id), origins: actors.map(({ x, y }) => ({ x, y })),
-            normal, started: at, ends: at + duration, dialogue,
-            captionId: dialogue.id + ':' + at + ':' + actors.map(actor => actor.id).join(','),
+            normal, started: at, ends: at + duration, dialogue, dialogueChoice: choice,
+            captionId: choice.key,
             captionUntil: at + this.captionDuration(dialogue),
             armedUntil: armed ? at + ROBOT_ENCOUNTER_POLICY.lookaheadMs + 50 : undefined };
         if (!armed) { this.counts[kind === 'near-miss' ? 'nearMiss' : kind]++; }
@@ -265,11 +211,12 @@ export class RobotEncounters {
         if (plan.operation?.operatingMode !== 'overreach' && this.random() >= policy.rescueChance) { return; }
         const participantIds = [...plan.participantIds, ...carriedGroup.filter(actor => actor.id !== disabled.id).map(actor => actor.id)];
         const selected = participantIds.map(id => actors.find(actor => actor.id === id)!);
-        const dialogue = plan.enjoysAirlift ? ROBOT_ENCOUNTER_DIALOGUE.find(value => value.id === 'rescue-lugv')!
-            : ROBOT_ENCOUNTER_DIALOGUE.filter(value => value.kind === 'rescue' && value.id !== 'rescue-lugv')[this.random() < 0.5 ? 0 : 1];
+        const spoken = this.dialogue('rescue', selected, at, plan.enjoysAirlift ? ['rescue-lugv'] : ['rescue-smoke', 'rescue-field'], !plan.enjoysAirlift);
+        if (!spoken) { return; }
+        const { dialogue, choice } = spoken;
         this.incident = { kind: 'rescue', ids: participantIds, origins: selected.map(({ x, y }) => ({ x, y })),
-            normal: { x: 0, y: 0 }, started: at, ends: at + plan.durationMs, rescue: { ...plan, participantIds }, dialogue,
-            captionId: dialogue.id + ':' + at + ':' + plan.participantIds.join(','),
+            normal: { x: 0, y: 0 }, started: at, ends: at + plan.durationMs, rescue: { ...plan, participantIds }, dialogue, dialogueChoice: choice,
+            captionId: choice.key,
             captionUntil: at + this.captionDuration(dialogue) };
         this.rescues++; this.cooldownUntil = at + policy.cooldownMs;
     }
@@ -331,10 +278,10 @@ export class RobotEncounters {
                 : active!.kind === 'rescue' ? actor.phase !== 'advance' && actor.phase !== 'cargo' : !traffic(actor));
         });
         if (active) { this.resolveRescue(active, at, !!interrupted && at < active.ends); }
-        if (active && (at >= active.ends || interrupted)) { this.incident = active = undefined; }
+        if (active && (at >= active.ends || interrupted)) { if (active.dialogueChoice) { this.speech.release(active.dialogueChoice); } this.incident = active = undefined; }
         if (active?.armedUntil !== undefined) {
             const a = current.get(active.ids[0])!, b = current.get(active.ids[1])!;
-            if (at > active.armedUntil) { this.incident = active = undefined; }
+            if (at > active.armedUntil) { if (active.dialogueChoice) { this.speech.release(active.dialogueChoice); } this.incident = active = undefined; }
             else if (contact(a, b) && active.ends - at >= policy.minDurationMs) {
                 active.started = at; active.armedUntil = undefined; this.counts.bump++;
                 active.captionUntil = at + this.captionDuration(active.dialogue);
@@ -485,7 +432,8 @@ export class RobotEncounters {
                     : operation.outcome.family === 'expensive-success' ? ROBOT_OPERATION_DIALOGUE.expensive : ROBOT_OPERATION_DIALOGUE.triumph
                 : ROBOT_OPERATION_DIALOGUE.effort;
             result.set(actor.id, { x, y, tilt, expression, activity, badge, carried, malfunction,
-                caption: heroic ? heroicLine : active.dialogue.lines[index] ?? '',
+                caption: heroic ? heroicLine : active.dialogue.lines[active.dialogueChoice ? active.dialogueChoice.speakers.indexOf(actor.id) : index] ?? '',
+                dialogueChoice: heroic ? undefined : active.dialogueChoice,
                 captionId: heroic ? active.captionId + ':' + (at >= operation!.timing.workEnd ? 'result' : 'effort') : active.captionId,
                 captionUntil: heroic ? operation!.timing.deadline : active.captionUntil,
                 gesturePhase: Math.floor(progress * policy.gestureSteps),
@@ -499,22 +447,23 @@ export class RobotEncounters {
         this.previous.delete(id);
         this.rescueTried.delete(id);
         for (const [pair, ids] of this.approaches) { if (ids.includes(id)) { this.approaches.delete(pair); } }
-        if (this.incident?.ids.includes(id)) { this.resolveRescue(this.incident, this.lastAt, true); this.incident = undefined; }
+        if (this.incident?.ids.includes(id)) { this.resolveRescue(this.incident, this.lastAt, true); if (this.incident.dialogueChoice) { this.speech.release(this.incident.dialogueChoice); } this.incident = undefined; }
     }
     clear(at = this.lastAt): void {
         this.lastAt = Math.max(this.lastAt, at);
         if (this.incident) { this.resolveRescue(this.incident, this.lastAt, true); }
+        this.speech.clear();
         this.previous.clear(); this.approaches.clear(); this.rescueTried.clear(); this.incident = undefined;
     }
     reset(at = this.lastAt): void {
-        this.clear(at); this.attempts = 0; this.counts = { bump: 0, nearMiss: 0, reunion: 0, success: 0 };
+        this.clear(at); this.speech.reset(); this.attempts = 0; this.counts = { bump: 0, nearMiss: 0, reunion: 0, success: 0 };
         this.trafficAfter = this.successAfter = this.rescueAfter = this.cooldownUntil = -Infinity;
         this.rescueAttempts = this.rescues = 0;
         this.lastRescue = undefined;
     }
     snapshot() {
         const active = this.incident;
-        return { attempts: this.attempts, counts: { ...this.counts }, rescueAttempts: this.rescueAttempts, rescues: this.rescues,
+        return { dialogue: this.speech.snapshot(), attempts: this.attempts, counts: { ...this.counts }, rescueAttempts: this.rescueAttempts, rescues: this.rescues,
             lastRescue: this.lastRescue ? { ...this.lastRescue, position: { ...this.lastRescue.position }, target: { ...this.lastRescue.target } } : undefined,
             trackedRescueActors: this.rescueTried.size, trackedActors: this.previous.size, trackedPairs: this.approaches.size,
             active: active ? { kind: active.kind, ids: [...active.ids], dialogue: active.dialogue.id,

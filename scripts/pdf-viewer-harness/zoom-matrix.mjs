@@ -474,7 +474,7 @@ export function validateSample(sample, requireOperations = false) {
   assert.ok(r.spriteBytes <= r.maxSpriteBytes, 'Sprite byte budget exceeded');
   assert.equal(r.retainedBytes, r.cargoBytes + r.spriteBytes, 'Owned byte accounting differs');
   assert.equal(sample.cargo.reduce((sum, item) => sum + item.bytes, 0), r.cargoBytes,
-    'Connected cargo and underlay bytes differ from their owner');
+    'Connected cargo, underlay and quality raster bytes differ from their owner');
   assert.equal([...sample.vehicles, ...sample.cleaners].reduce((sum, item) => sum + item.bytes, 0), r.spriteBytes,
     'Connected sprite bytes differ from their owner');
   const actors = new Map((r.pages ?? []).flatMap(page => page.actors).map(actor => [actor.id, actor]));

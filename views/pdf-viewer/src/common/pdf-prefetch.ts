@@ -150,7 +150,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         const value = presentation(candidate.pageNumber);
         if (!value.accepts(candidate)) { return false; }
         const transaction = documentRobots?.enabled && documentRobots.preparePublication
-            ? documentRobots.preparePublication(candidate, encounter(candidate.pageNumber)) : undefined;
+            ? documentRobots.preparePublication(candidate, encounter(candidate.pageNumber), displayedCandidate(candidate.pageNumber)) : undefined;
         try {
             const accepted = value.present(candidate, commit);
             if (accepted) {

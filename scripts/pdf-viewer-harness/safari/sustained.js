@@ -2,6 +2,7 @@
   'use strict';
   // The host invokes this expression once with its own token. Merely loading it is inert.
   // @include payload-observation.mjs
+  // @include scene-ready.mjs
   // @include awake-idle.mjs
 
   function makePlan(workloadMs, scenario = 'endurance', currentZoom = 'page-width') {
@@ -376,7 +377,7 @@
     const data = new Uint8Array(length); let offset = 0; for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.byteLength; }
     return JSON.parse(new TextDecoder().decode(data));
   }
-  const quiet = value => value && !value.robots.activeActors && !value.robots.activePayloads && !value.robots.retainedBytes
+  const quiet = value => value && !value.robots.activeActors && !value.robots.activePayloads && !value.robots.retainedBytes && qualitySceneEmpty(value)
     && !value.robots.scheduled && !value.robots.caption?.pendingExpiry && value.payloadArtifacts.payloads.length === 0 && value.payloadArtifacts.plans.length === 0 && !value.robots.queuedDeliveryCovers && !value.vehicleNodes;
   const useful = value => value.documentVisible && value.canvases.length > 0 && value.missing.length === 0
     && value.canvases.every(page => displayed(page.preview) || page.state === 3 && displayed(page.native));

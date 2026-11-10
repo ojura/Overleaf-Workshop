@@ -7,6 +7,7 @@
   const canvas = (node, reader) => {
     const box = rect(node), css = getComputedStyle(node), opacity = Number(css.opacity);
     return { id: Number(node.dataset.courier) || null, payloadId: Number(node.dataset.payload) || null,
+      qualityId: Number(node.dataset.quality) || null, page: Number(node.dataset.page) || null, imageId: node.dataset.imageId ?? null,
       className: node.className, width: node.width, height: node.height, bytes: node.width * node.height * 4,
       cssWidth: parseFloat(css.width), cssHeight: parseFloat(css.height), opacity, rect: box,
       connected: node.isConnected, transform: css.transform, translate: css.translate,
@@ -20,8 +21,8 @@
     if (!v?.pagesCount || !controller) {throw new Error('Zoom fixture reader is not ready');}
     const state = controller.snapshot(), robots = state.robots, reader = rect(v.container);
     const vehicles = canvases('.pdfDocumentRobotVehicle', reader);
-    const cleaners = canvases('.pdfDocumentRobotCleaner', reader);
-    const cargo = canvases('.pdfDocumentRobotCargo,.pdfDocumentRobotCargoUnderlay', reader);
+    const cleaners = canvases('.pdfDocumentRobotCleaner,.pdfDocumentRobotQualityCleaner', reader);
+    const cargo = canvases('.pdfDocumentRobotCargo,.pdfDocumentRobotCargoUnderlay,.pdfDocumentRobotQualityCoarse,.pdfDocumentRobotQualitySharp', reader);
     const native = canvases('.page .canvasWrapper canvas', reader);
     const previews = canvases('.pdfPrefetchPreview', reader);
     const view = v.getPageView(v.currentPageNumber - 1);
@@ -42,9 +43,10 @@
         sizes: native.filter(item => item.bytes).map(item => [item.width, item.height]) },
       previews: { count: previews.length, bytes: previews.reduce((sum, item) => sum + item.bytes, 0) },
       payloadArtifacts: window.__labZoomCollectArtifacts(document),
-      ownedElements: Array.from(document.querySelectorAll('[data-payload]'))
+      ownedElements: Array.from(document.querySelectorAll('[data-payload],[data-quality]'))
         .filter(node => node.isConnected && String(node.className).startsWith('pdfDocumentRobot'))
-        .map(node => ({ payloadId: Number(node.dataset.payload), className: node.className })),
+        .map(node => ({ payloadId: Number(node.dataset.payload) || null, qualityId: Number(node.dataset.quality) || null,
+          page: Number(node.dataset.page) || null, imageId: node.dataset.imageId ?? null, className: node.className })),
       direction: state.direction, visible: state.visible, pending: state.pending, missing: state.visibleMissing };
   };
   return { installed: true };

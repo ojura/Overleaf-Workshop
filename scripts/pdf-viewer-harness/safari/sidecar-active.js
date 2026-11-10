@@ -162,7 +162,7 @@
       pending: state.pending, pendingFetches: state.performance.pendingFetchCount, source: state.previewSource,
       imagePages: state.imagePages, raw: state.rangeCache, robots,
       payloadArtifacts: collectPayloadArtifacts(document),
-      effectNodes: Object.fromEntries(['Arrival', 'Cargo', 'CargoUnderlay', 'Vehicle', 'Cleaner'].map(name =>
+      effectNodes: Object.fromEntries(['Arrival', 'Cargo', 'CargoUnderlay', 'Vehicle', 'Cleaner', 'QualityCoarse', 'QualitySharp', 'QualityCleaner'].map(name =>
         [name, document.querySelectorAll('.pdfDocumentRobot' + name).length])),
       scrollWidth: container.scrollWidth, scrollHeight: container.scrollHeight, clientWidth: container.clientWidth,
       clientHeight: container.clientHeight, previewBytes: state.previewBytes, cacheLimits: state.cacheLimits,

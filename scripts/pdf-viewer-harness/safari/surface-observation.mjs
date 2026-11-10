@@ -5,9 +5,11 @@ export function observeReaderSurfaces({ viewer, container, bus, document, window
     if (!Number.isSafeInteger(value) || value < 1 || value > maximum) throw new Error('Invalid surface observation limit');
   }
   const result = { frames: 0, startedAt: now(), first: null, last: null, changes: [], events: [],
-    droppedChanges: 0, droppedEvents: 0, droppedNodes: 0, droppedPages: 0, ignoredMutations: 0, stopped: false, errors: [] };
+    droppedChanges: 0, droppedEvents: 0, droppedNodes: 0, droppedPages: 0, ignoredMutations: 0, truncatedTexts: 0, stopped: false, errors: [] };
   const identities = new WeakMap(), relevantNodes = new WeakSet(), watched = new Set(), listeners = [];
   const indicator = document.getElementById?.('pageNumber');
+  const reactionSelector = '.pdfDocumentRobotQualityCoarse,.pdfDocumentRobotQualitySharp,.pdfDocumentRobotQualityCleaner,.pdfDocumentRobotCaption';
+  const reaction = node => ['pdfDocumentRobotQualityCoarse', 'pdfDocumentRobotQualitySharp', 'pdfDocumentRobotQualityCleaner', 'pdfDocumentRobotCaption'].some(name => node?.classList?.contains(name));
   const loadingState = page => {
     const value = viewer.getPageLoadingState?.(page);
     return typeof value === 'boolean' ? value : null;
@@ -92,13 +94,24 @@ export function observeReaderSurfaces({ viewer, container, bus, document, window
         surfaces, references });
     }
     const indicatorState = indicator ? { ...take(indicator), className: String(indicator.className ?? '').slice(0, 512), loading: hasClass(indicator, 'loading') } : null;
+    const reactions = [];
+    for (const node of document.querySelectorAll?.(reactionSelector) ?? []) {
+      const value = take(node); if (!value) continue;
+      const caption = hasClass(node, 'pdfDocumentRobotCaption');
+      const text = caption ? String(node.textContent ?? '') : undefined;
+      if (text && text.length > 2048) result.truncatedTexts++;
+      reactions.push({ ...value, qualityId: node.dataset?.quality ?? null,
+        page: node.dataset?.page ?? null, imageId: node.dataset?.imageId ?? null,
+        text: text?.slice(0, 2048), omittedText: Math.max(0, (text?.length ?? 0) - 2048),
+        ancestors: chain(node.parentElement ?? node.parentNode) });
+    }
     result.droppedNodes += omitted;
     const vp = window.visualViewport;
     return { phase: phase(), documentVisible: document.visibilityState, visible, page: viewer.currentPageNumber,
       loadingState: loadingState(viewer.currentPageNumber), indicator: indicatorState,
       scroll: { top: container.scrollTop, left: container.scrollLeft },
       viewport: vp && { width: vp.width, height: vp.height, offsetTop: vp.offsetTop, offsetLeft: vp.offsetLeft, scale: vp.scale },
-      ancestors, pages, omittedNodes: omitted, omittedPages: Math.max(0, wanted.length - chosen.length) };
+      ancestors, pages, reactions, omittedNodes: omitted, omittedPages: Math.max(0, wanted.length - chosen.length) };
   };
   const record = () => {
     const state = capture(), value = { at: now(), frame: result.frames, ...state }, key = JSON.stringify(state);
@@ -107,13 +120,15 @@ export function observeReaderSurfaces({ viewer, container, bus, document, window
   };
   const relevant = node => {
     if (!node || typeof node !== 'object') return false;
+    if (reaction(node)) return true;
+    if (/pdfDocumentRobot/.test(String(node.className ?? ''))) return false;
     if (node === indicator || relevantNodes.has(node)) return true;
     const classes = String(node.className ?? '');
     if (/pdfDocumentRobot/.test(classes)) return false;
     return node.tagName === 'CANVAS' || hasClass(node, 'page') || hasClass(node, 'canvasWrapper')
       || hasClass(node, 'pdfPrefetchPreview');
   };
-  const relevantSubtree = node => relevant(node) || [...(node.querySelectorAll?.('.page,.canvasWrapper,canvas,.pdfPrefetchPreview') ?? [])].some(relevant);
+  const relevantSubtree = node => relevant(node) || [...(node.querySelectorAll?.('.page,.canvasWrapper,canvas,.pdfPrefetchPreview,' + reactionSelector) ?? [])].some(relevant);
   const mutation = records => {
     let accepted = 0;
     for (const item of records) {
@@ -133,6 +148,8 @@ export function observeReaderSurfaces({ viewer, container, bus, document, window
   const observer = new MutationObserver(mutation);
   observer.observe(container, { subtree: true, childList: true, attributes: true,
     attributeOldValue: true, attributeFilter: ['width', 'height', 'style', 'class', 'hidden'] });
+  const reactionRoot = document.body;
+  if (reactionRoot && reactionRoot !== container && !container.contains?.(reactionRoot)) observer.observe(reactionRoot, { subtree: true, childList: true, attributes: true, attributeOldValue: true, attributeFilter: ['width', 'height', 'style', 'class', 'hidden'] });
   if (indicator && !container.contains?.(indicator)) observer.observe(indicator, { attributes: true, attributeOldValue: true, attributeFilter: ['class'] });
   for (const name of ['pagerender', 'pagerendered', 'updateviewarea', 'scalechanging', 'rotationchanging', 'pageloadingstatechanged']) {
     const listener = event => push('events', { at: now(), phase: phase(), type: name, page: event.pageNumber, source: id(event.source?.div ?? event.source),

@@ -115,7 +115,8 @@ async function harness(options = {}) {
 
 test('the reused observer is exact and the stage plan contains 600 seconds of motion', () => {
   assert.equal(embedded, portable);
-  const code = source.slice(source.indexOf('  function makePlan'), source.indexOf('  const displayed'));
+  const start = source.indexOf('  function makePlan');
+  const code = source.slice(start, source.indexOf('  const displayed', start));
   const plan = vm.runInNewContext(code + '\nmakePlan(600000)');
   assert.equal(plan.length, 12);
   assert.equal(plan.flatMap(stage => stage.legs).reduce((sum, leg) => sum + leg.durationMs, 0), 600000);

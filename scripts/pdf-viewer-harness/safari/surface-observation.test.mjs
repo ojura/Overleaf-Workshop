@@ -12,20 +12,20 @@ function fixture(options = {}) {
   const outer = node('DIV'), reader = node('DIV', outer), column = node('DIV', reader), root = node('DIV', column);
   const wrapper = node('DIV', root); wrapper.className = 'canvasWrapper';
   const indicator = node('INPUT', outer);
-  const old = node('CANVAS', wrapper); let children = [wrapper, old], visible = [1];
+  const old = node('CANVAS', wrapper); let children = [wrapper, old], visible = [1], reactions = [];
   root.querySelectorAll = () => children; root.querySelector = () => children.find(n => n.className === 'pdfPrefetchPreview') ?? null;
   const view = { div: root, canvas: old, renderingState: 3, pdfPage: { imageRevision: 1 } };
   const viewer = { pagesCount: 3, currentPageNumber: 1, _getVisiblePages: () => ({ views: visible.map(id => ({ id })) }),
     getPageView: index => index === 0 ? view : undefined };
   const listeners = new Map(), bus = { on: (name, fn) => listeners.set(name, fn), off: name => listeners.delete(name) };
   const pending = [];
-  const observer = observeReaderSurfaces({ viewer, container: reader, bus, document: { visibilityState: 'visible', getElementById: () => indicator }, window: {},
+  const observer = observeReaderSurfaces({ viewer, container: reader, bus, document: { visibilityState: 'visible', body: outer, getElementById: () => indicator, querySelectorAll: () => reactions }, window: {},
     now: () => time, requestFrame: fn => (callback = fn, 1), cancelFrame: () => callback = null, style: n => n.css,
     MutationObserver: class { constructor(fn) { mutation = fn; } observe(node, options) { observed.push({ node, options }); } takeRecords() { return pending.splice(0); }
       disconnect() { disconnected = true; } }, phase: () => phase, ...options });
   return { observer, view, viewer, old, root, wrapper, column, outer, indicator, observed, node, pending, listeners,
     step() { time += 16; callback(); }, setChildren(value) { children = value; }, setVisible(value) { visible = value; },
-    setPhase(value) { phase = value; }, mutation, closed: () => disconnected && listeners.size === 0 && callback === null };
+    setReactions(value) { reactions = value; }, setPhase(value) { phase = value; }, mutation, closed: () => disconnected && listeners.size === 0 && callback === null };
 }
 const page = f => f.observer.result.last.pages.find(p => p.page === 1);
 test('null public pointer differs from actual connected predecessor loss and native handoff', () => {
@@ -155,4 +155,46 @@ test('the external indicator omission is included in cumulative node losses at t
   assert.equal(f.observer.result.droppedNodes, f.observer.result.first.omittedNodes);
   const before = f.observer.result.droppedNodes; f.step();
   assert.equal(f.observer.result.droppedNodes - before, f.observer.result.last.omittedNodes); f.observer.stop();
+});
+
+
+test('a complete wipe between phase samples retains exact clip progression, native backing and caption continuity', () => {
+  const f = fixture(), transit = f.node('DIV', f.outer);
+  const coarse = f.node('CANVAS', transit), cleaner = f.node('CANVAS', transit), caption = f.node('DIV', transit);
+  coarse.className = 'pdfDocumentRobotQualityCoarse'; cleaner.className = 'pdfDocumentRobotQualityCleaner';
+  for (const node of [coarse, cleaner]) node.dataset = { quality: '7', page: '1', imageId: 'portion-2' };
+  caption.className = 'pdfDocumentRobotCaption'; caption.textContent = 'Fotografija je spremna.';
+  f.setReactions([coarse, cleaner, caption]);
+  for (const clip of ['inset(0 0 0 0%)', 'inset(0 0 0 50%)', 'inset(0 0 0 100%)']) {
+    coarse.css.clipPath = clip; transit.css.opacity = '1'; f.step();
+  }
+  coarse.isConnected = cleaner.isConnected = caption.isConnected = false;
+  f.setReactions([]); f.step(); f.observer.stop();
+  const r = f.observer.result, frames = r.changes.filter(frame => frame.reactions.length);
+  assert.deepEqual(frames.map(frame => frame.reactions[0].clipPath), ['inset(0 0 0 0%)', 'inset(0 0 0 50%)', 'inset(0 0 0 100%)']);
+  assert.equal(new Set(frames.map(frame => frame.reactions[0].id)).size, 1);
+  for (const frame of frames) {
+    assert.equal(frame.phase, 'delivery', 'no ordinary phase sample or phase change was needed');
+    assert.equal(frame.reactions[0].qualityId, '7'); assert.equal(frame.reactions[0].imageId, 'portion-2');
+    assert.equal(frame.reactions[0].width, 300); assert.ok(frame.reactions[0].ancestors.some(n => n.opacity === '1'));
+    assert.ok(frame.pages[0].surfaces.some(n => n.id === frame.pages[0].main && n.connected));
+    assert.equal(frame.reactions[2].text, 'Fotografija je spremna.');
+  }
+  assert.deepEqual(r.last.reactions, []); assert.equal(r.stopped, true); assert.deepEqual(r.errors, []);
+  assert.equal(r.droppedNodes + r.droppedChanges + r.droppedEvents + r.truncatedTexts, 0); assert.equal(f.closed(), true);
+});
+test('quality mutations survive unrelated robot noise before the next frame and reaction limits are explicit', () => {
+  const f = fixture(), quality = f.node('CANVAS'), actor = f.node('CANVAS');
+  quality.className = 'pdfDocumentRobotQualityCoarse'; actor.className = 'pdfDocumentRobotCargo';
+  f.mutation([...Array.from({length: 4000}, () => ({target: actor, type: 'attributes', attributeName: 'style'})),
+    {target: f.outer, type: 'childList', addedNodes: [quality]},
+    {target: quality, type: 'attributes', attributeName: 'style'}]);
+  assert.equal(f.observer.result.ignoredMutations, 4000); assert.equal(f.observer.result.events.length, 2);
+  const caption = f.node('DIV'); caption.className = 'pdfDocumentRobotCaption'; caption.textContent = 'x'.repeat(2050);
+  f.setReactions([caption]); f.step(); assert.equal(f.observer.result.last.reactions[0].text.length, 2048);
+  assert.equal(f.observer.result.last.reactions[0].omittedText, 2); assert.ok(f.observer.result.truncatedTexts > 0);
+  f.observer.stop();
+  const limited = fixture({nodeCap: 2}); limited.setReactions([quality]); limited.step();
+  assert.equal(limited.observer.result.last.reactions.length, 0); assert.ok(limited.observer.result.last.omittedNodes > 0);
+  limited.observer.stop();
 });
