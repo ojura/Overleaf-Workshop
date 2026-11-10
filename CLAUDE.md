@@ -40,9 +40,10 @@ window) are in CLAUDE.local.md, which git leaves out.
   - `npx eslint src --ext ts`
 - PDF changes also run `npm run test:pdf-viewer`. This includes the maintained Safari lifecycle
   and recorder fixtures. [docs/safari-validation.md](docs/safari-validation.md) preserves the
-  physical iPhone setup, both short scenarios, real gesture observation and the full 600-second
-  workload. Use that runbook for mobile validation and keep the device owner attached through
-  result review. A shorter or interrupted capture does not satisfy its endurance gate.
+  physical iPhone setup, short scenarios, real gesture observation and extended workloads.
+  Choose scenarios and a duration that cover the changed behavior, and complete them with the
+  runbook's restoration checks. Keep the device owner attached through result review. Report a
+  capture interrupted before its planned scenario and duration finish as partial.
 - A new test fails on the code before the fix and passes with it; report both runs. Tests wait for
   the events or awaited calls they need, not for sleeps or polling with a time limit, and close
   everything they open on every path.
