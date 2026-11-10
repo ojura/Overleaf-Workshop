@@ -292,6 +292,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const transaction = f.api.preparePublication(p.candidate, p.encounter);
         const cover = sceneNodes(p.page.pageElement).find(node => node.className === 'pdfDocumentRobotArrival')!;
         assert.ok(cover, 'protection precedes publication');
+        const queuedPlan = f.api.snapshot().deliveryPlans[0];
+        assert.strictEqual(cover.dataset.deliveryPlan, String(queuedPlan.id));
+        assert.strictEqual(cover.dataset.deliveryCrop, String(queuedPlan.crops[0].id));
+        assert.strictEqual(cover.dataset.payload, undefined);
+
         assert.strictEqual(f.owned.length, before, 'queued protection allocates no canvas');
         transaction.commit();
         assert.strictEqual(f.api.snapshot().activeActors, 0);
@@ -302,6 +307,10 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.ok(f.api.snapshot().activeActors > 0);
         assert.strictEqual(sceneNodes(p.page.pageElement).find(node => node.className === 'pdfDocumentRobotArrival'), cover);
         const payload = f.api.snapshot().pages[0].payloads[0];
+        assert.strictEqual(cover.dataset.deliveryPlan, undefined, 'handoff removes plan ownership');
+        assert.strictEqual(cover.dataset.deliveryCrop, undefined, 'handoff removes crop ownership');
+        assert.strictEqual(cover.dataset.payload, String(payload.id));
+        assert.strictEqual(f.api.snapshot().queuedDeliveryCovers, 0);
         const identity = [payload.id, payload.deadline, payload.helpers, payload.target];
         p.page.pageElement.rect.width *= 1.1; p.encounter.pageProjection.content.width *= 1.1;
         p.candidate.revision++;

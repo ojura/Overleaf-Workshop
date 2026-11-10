@@ -3283,6 +3283,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             for (const payload of payloads) {
                 const cover = planned?.cover ?? doc.createElement('div');
                 initializeSceneNode(cover, 'pdfDocumentRobotArrival', '4');
+                delete cover.dataset.deliveryPlan; delete cover.dataset.deliveryCrop;
                 cover.dataset.payload = String(payload.id);
                 if (payload.crop.imageId) { cover.dataset.imageId = payload.crop.imageId; }
                 Object.assign(cover.style, { background: 'var(--page-bg-color, #fff)', opacity: '1',
@@ -3368,6 +3369,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const element = doc.createElement('div');
             initializeSceneNode(element, 'pdfDocumentRobotArrival', '4');
             Object.assign(element.style, { background: 'var(--page-bg-color, #fff)', opacity: '1', border: '0', borderRadius: '0', boxShadow: 'none' });
+            element.dataset.deliveryPlan = String(planId); element.dataset.deliveryCrop = String(crop.id);
             paintProtection(element, crop.geometry, projectionFor(encounter), displayProjections.get(encounter.pageElement));
             encounter.pageElement.append(element);
             plannedCovers.set(coverKey(planId, crop.id), { element, crop: crop.geometry, pageElement: encounter.pageElement });

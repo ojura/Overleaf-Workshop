@@ -8,7 +8,8 @@
   const closeEnough = (left, right) => Math.abs(left - right) <= 1;
   const moving = () => panel()?.host.dataset.panelMoving === 'true' || container.dataset.pdfColumnMoving === 'true';
   const settled = state => !moving() && state.robots.activeActors === 0 && state.robots.activePayloads === 0
-    && state.robots.retainedBytes === 0 && !state.robots.scheduled && !state.robots.caption?.pendingExpiry
+    && state.robots.retainedBytes === 0 && !state.robots.queuedDeliveryCovers
+    && !(state.payloadArtifacts?.plans?.length) && !state.robots.scheduled && !state.robots.caption?.pendingExpiry
     && Object.values(state.effectNodes).every(count => count === 0);
   const displayed = image => image?.connected && image.width > 0 && image.height > 0
     && image.rect.width > 0 && image.rect.height > 0

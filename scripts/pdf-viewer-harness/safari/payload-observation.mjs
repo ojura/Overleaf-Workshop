@@ -4,17 +4,26 @@ export function collectPayloadArtifacts(root) {
     pdfDocumentRobotCargo: 'cargo', pdfDocumentRobotArrival: 'cover',
     pdfDocumentRobotCargoUnderlay: 'underlay', pdfDocumentRobotCleaner: 'cleaner',
   };
-  const payloads = new Map();
+  const payloads = new Map(), plans = [];
   let unassigned = 0;
   for (const node of root.querySelectorAll(Object.keys(classes).map(name => '.' + name).join(','))) {
     if (!node.isConnected) continue;
+    const plan = node.dataset.deliveryPlan, crop = node.dataset.deliveryCrop;
+    if (plan !== undefined || crop !== undefined) {
+      if (node.dataset.payload !== undefined || !/^[1-9][0-9]*$/.test(plan ?? '')
+        || !/^(0|[1-9][0-9]*)$/.test(crop ?? '') || !Number.isSafeInteger(Number(plan))
+        || !Number.isSafeInteger(Number(crop)) || !node.classList.contains('pdfDocumentRobotArrival')
+        || ['pdfDocumentRobotCargo', 'pdfDocumentRobotCargoUnderlay', 'pdfDocumentRobotCleaner'].some(name => node.classList.contains(name))) unassigned++;
+      else plans.push({ planId: Number(plan), cropId: Number(crop) });
+      continue;
+    }
     const id = Number(node.dataset.payload);
     if (!Number.isSafeInteger(id) || id < 1) { unassigned++; continue; }
     let entry = payloads.get(id);
     if (!entry) payloads.set(id, entry = { id, cargo: 0, cover: 0, underlay: 0, cleaner: 0 });
     for (const [name, kind] of Object.entries(classes)) if (node.classList.contains(name)) entry[kind]++;
   }
-  return { complete: true, unassigned, payloads: [...payloads.values()] };
+  return { complete: true, unassigned, plans, payloads: [...payloads.values()] };
 }
 
 function ownershipCounts(inventory) {
@@ -38,6 +47,19 @@ export class PayloadObservations {
 
   observe(sample) {
     const counts = ownershipCounts(sample.payloadArtifacts);
+    const expected = new Set(), actual = new Set();
+    for (const plan of sample.robots?.deliveryPlans ?? []) for (const crop of plan.crops) {
+      if (crop.state !== 'queued' || crop.protected !== true) continue;
+      const key = plan.id + ':' + crop.id;
+      if (!Number.isSafeInteger(plan.id) || plan.id < 1 || !Number.isSafeInteger(crop.id) || crop.id < 0 || expected.has(key)) throw new Error('Invalid queued cover plan ownership');
+      expected.add(key);
+    }
+    for (const entry of sample.payloadArtifacts.plans ?? []) {
+      const key = entry.planId + ':' + entry.cropId;
+      if (actual.has(key) || !expected.has(key)) throw new Error('Unowned or duplicate queued cover');
+      actual.add(key);
+    }
+    if (actual.size !== expected.size || (sample.robots?.queuedDeliveryCovers ?? 0) !== actual.size) throw new Error('Queued cover evidence is incomplete');
     for (const [id, entry] of this.#seen) {
       if (entry.retired && (counts.get(id) ?? 0) > 0) throw new Error('Retired payload artifact reappeared: ' + id);
     }

@@ -377,7 +377,7 @@
     return JSON.parse(new TextDecoder().decode(data));
   }
   const quiet = value => value && !value.robots.activeActors && !value.robots.activePayloads && !value.robots.retainedBytes
-    && !value.robots.scheduled && !value.robots.caption?.pendingExpiry && value.payloadArtifacts.payloads.length === 0 && !value.vehicleNodes;
+    && !value.robots.scheduled && !value.robots.caption?.pendingExpiry && value.payloadArtifacts.payloads.length === 0 && value.payloadArtifacts.plans.length === 0 && !value.robots.queuedDeliveryCovers && !value.vehicleNodes;
   const useful = value => value.documentVisible && value.canvases.length > 0 && value.missing.length === 0
     && value.canvases.every(page => displayed(page.preview) || page.state === 3 && displayed(page.native));
   const settled = value => quiet(value) && useful(value) && !value.pending.length && !value.pendingFetches
