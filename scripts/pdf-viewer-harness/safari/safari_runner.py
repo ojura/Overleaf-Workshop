@@ -441,6 +441,7 @@ class Wire:
                 'recent': list(self.operations), 'recentLimit': 256}
 
     async def command(self, method, timeout=RPC_SECONDS, *, flush_after_send=False, purpose=None, _sent=None, _owned_release=None, **params):
+        flush_after_send = flush_after_send or method == 'Runtime.callFunctionOn'
         limit = min(timeout, self.budget.remaining('detach'))
         if limit <= 0:
             raise TimeoutError('Host deadline expired before ' + method)
@@ -450,7 +451,7 @@ class Wire:
             self.target = self.session.target_id
             self.target_changes += 1
         if flush_after_send and self.target is None:
-            raise RuntimeError('Source flushing requires the owned native target')
+            raise RuntimeError('Dispatch flushing requires the owned native target')
         deadline = self.budget.now() + limit
         flush_task = None
         flush_release = asyncio.Event()
@@ -482,12 +483,12 @@ class Wire:
                     row['phase'] = 'waiting-reply'
                     self.id_rows[identifier] = row
                     if flush_after_send:
-                        # This device buffers large outgoing source until another
-                        # command arrives. One inert no-op releases that delivery.
+                        # Safari can defer source preparation or a prepared invocation
+                        # until another command arrives. One inert no-op releases it.
                         # The send must finish; its auxiliary reply is not a completion barrier.
                         flush_sent = asyncio.Event()
                         flush_task = asyncio.create_task(self.command('Runtime.evaluate',
-                            timeout=max(0, deadline - self.budget.now()), purpose='large-source-flush', _sent=flush_sent, _owned_release=flush_release,
+                            timeout=max(0, deadline - self.budget.now()), purpose='dispatch-flush', _sent=flush_sent, _owned_release=flush_release,
                             expression='void 0', returnByValue=True,
                             emulateUserGesture=False, objectGroup=OBJECT_GROUP))
                         sent_waiter = asyncio.create_task(flush_sent.wait())

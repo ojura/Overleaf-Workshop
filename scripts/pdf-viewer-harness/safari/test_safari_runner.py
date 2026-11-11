@@ -436,7 +436,8 @@ class NativeSession:
         call = next(value for value in self.calls if value['id'] == identifier)
         params = call['params']
         if call['method'] == 'Runtime.callFunctionOn':
-            self.token = params['arguments'][0]['value']['token']
+            arguments = params.get('arguments', [{'value': {}}])
+            self.token = arguments[0]['value'].get('token', self.token)
             value = {'result': {'type': 'object', 'value': {'ok': True, 'token': self.token, 'state': 'preparing'}}}
         elif call['method'] == 'Runtime.evaluate' and not params['returnByValue']:
             value = {'result': {'type': self.prepared_type, 'objectId': 'owned-function-handle'}}
@@ -468,6 +469,177 @@ class NativeSession:
             return self.reply(identifier)
         finally:
             self.reply_waiters.discard(identifier)
+
+
+class BufferedInvocationSession(NativeSession):
+    """The device executes a prepared function only after the next command is sent."""
+    def __init__(self, inspector, clock):
+        super().__init__(inspector, clock)
+        self.delivery = {}
+        self.invocation_waiting = asyncio.Event()
+        self.invocation_executed = asyncio.Event()
+        self.executions = []
+        self.hold_invocation_reply = self.fail_followup = False
+        self.release_reply = asyncio.Event()
+        self.followup_attempted = asyncio.Event()
+
+    async def send_message_to_target(self, message):
+        if message['params'].get('expression') == 'void 0' and self.delivery:
+            self.followup_attempted.set()
+            if self.fail_followup:
+                raise OSError('Invocation follow-up send failed')
+        identifier = await super().send_message_to_target(message)
+        for delivered in self.delivery.values():
+            delivered.set()
+        if message['method'] == 'Runtime.callFunctionOn':
+            self.delivery[identifier] = asyncio.Event()
+        return identifier
+
+    async def receive_response_by_id(self, identifier):
+        if identifier not in self.delivery:
+            return await super().receive_response_by_id(identifier)
+        self.reply_waiters.add(identifier)
+        self.invocation_waiting.set()
+        try:
+            await self.delivery[identifier].wait()
+            self.executions.append(identifier)
+            self.invocation_executed.set()
+            if self.hold_invocation_reply:
+                await self.release_reply.wait()
+            return await super().receive_response_by_id(identifier)
+        finally:
+            self.reply_waiters.discard(identifier)
+
+
+class PreparedInvocationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.inspector = types.SimpleNamespace(trace=None)
+        self.session = BufferedInvocationSession(self.inspector, self.clock)
+        self.budget = runner.Budget(now=self.clock.now)
+        self.wire = runner.Wire(self.session, self.budget)
+        self.wire.install_trace(self.inspector)
+
+    async def dispatch(self, operation):
+        task = asyncio.create_task(operation)
+        try:
+            await self.session.invocation_waiting.wait()
+            self.assertTrue(all(event.is_set() for event in self.session.delivery.values()),
+                            'The prepared invocation needs its own following command before execution')
+            return await task
+        finally:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+            self.assertEqual(self.session.reply_waiters, set())
+
+    def assert_one_invocation(self):
+        calls = self.session.calls
+        positions = [index for index, call in enumerate(calls) if call['method'] == 'Runtime.callFunctionOn']
+        self.assertEqual(len(positions), 1)
+        index = positions[0]
+        self.assertEqual(len(calls), index + 2, 'exactly one follow-up follows the invocation')
+        followup = calls[index + 1]
+        self.assertEqual(followup['method'], 'Runtime.evaluate')
+        self.assertEqual(followup['params']['expression'], 'void 0')
+        self.assertFalse(followup['params']['emulateUserGesture'])
+        self.assertEqual(self.session.executions, [calls[index]['id']])
+        self.assertEqual(self.session.reply_waiters, set())
+
+    async def test_initializer_invocation_dispatches_once_after_its_own_inert_followup(self):
+        handle = await self.wire.prepare_initializer(JS)
+        value = await self.dispatch(self.wire.invoke_initializer(handle, {'token': 'owned-token'}))
+        self.assertEqual(value['token'], 'owned-token')
+        self.assert_one_invocation()
+
+    async def test_short_active_finish_and_abort_use_the_same_invocation_delivery(self):
+        import safari_short_run as short
+        for stage, phase in [('active', 'work'), ('finish', 'work'), ('abort', 'restore')]:
+            with self.subTest(stage=stage):
+                self.setUp()
+                deadlines = dict(self.budget.ends)
+                value = await self.dispatch(short.invoke(self.wire, JS, {'token': 'owned-' + stage},
+                    self.budget, asyncio.Event(), 7, phase=phase))
+                self.assertEqual(value['token'], 'owned-' + stage)
+                self.assert_one_invocation()
+                invocation = next(row for row in self.wire.operations if row['method'] == 'Runtime.callFunctionOn')
+                self.assertEqual(invocation['timeoutSeconds'], 7)
+                self.assertEqual(self.budget.ends, deadlines)
+
+    async def test_activation_install_and_restore_use_the_same_invocation_delivery(self):
+        from safari_activation import guard_evaluate
+        for stage in ('install', 'restore'):
+            with self.subTest(stage=stage):
+                self.setUp()
+                deadlines = dict(self.budget.ends)
+                value = await self.dispatch(guard_evaluate(self.wire, '/*release:' + stage + '*/ ({ok:true})', 8))
+                self.assertTrue(value['value']['ok'])
+                self.assert_one_invocation()
+                invocation = next(row for row in self.wire.operations if row['method'] == 'Runtime.callFunctionOn')
+                self.assertLess(invocation['timeoutSeconds'], 8, 'preparation consumes the same caller budget')
+                self.assertEqual(self.budget.ends, deadlines)
+
+    async def test_missing_followup_reply_does_not_delay_authoritative_value_or_next_command(self):
+        self.session.lose_flush_reply = True
+        value = await self.dispatch(self.wire.invoke_initializer('owned-handle', {'token': 'owned-token'}))
+        self.assertEqual(value['token'], 'owned-token')
+        self.assert_one_invocation()
+        self.assertEqual(self.session.consumed, [1])
+        self.assertEqual(self.wire.operations[-1]['outcome'], 'owned-release')
+        await self.wire.command('Memory.enable')
+        self.assertEqual(self.session.consumed, [1, 3])
+        self.assertEqual(self.session.reply_waiters, set())
+        self.assertEqual(list(self.wire.failed_operations), [])
+
+    async def test_authoritative_invocation_error_survives_a_missing_followup_reply(self):
+        self.session.lose_flush_reply = True
+        self.session.protocol_error = {'code': -32000, 'message': 'invocation rejected'}
+        with self.assertRaises(runner.NativeProtocolError):
+            await self.dispatch(self.wire.invoke_initializer('owned-handle', {'token': 'owned-token'}))
+        self.assert_one_invocation()
+        self.assertEqual([row['method'] for row in self.wire.failed_operations], ['Runtime.callFunctionOn'])
+
+    async def test_followup_reply_cannot_complete_or_outlive_a_cancelled_invocation(self):
+        self.session.hold_invocation_reply = True
+        task = asyncio.create_task(self.wire.invoke_initializer('owned-handle', {'token': 'owned-token'}))
+        try:
+            await self.session.invocation_executed.wait()
+            self.assertFalse(task.done())
+            self.assertEqual(self.session.consumed, [2], 'the auxiliary reply cannot stand in for the invocation')
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        finally:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self.assert_one_invocation()
+        self.assertEqual([row['method'] for row in self.wire.failed_operations], ['Runtime.callFunctionOn'])
+
+    async def test_followup_send_failure_propagates_and_releases_invocation_waiters(self):
+        self.session.fail_followup = True
+        task = asyncio.create_task(self.wire.invoke_initializer('owned-handle', {'token': 'owned-token'}))
+        try:
+            await self.session.followup_attempted.wait()
+            with self.assertRaisesRegex(OSError, 'Invocation follow-up send failed'):
+                await task
+        finally:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self.assertEqual(self.session.executions, [])
+        self.assertEqual(self.session.reply_waiters, set())
+        self.assertEqual([call['method'] for call in self.session.calls], ['Runtime.callFunctionOn'])
+
+    async def test_prepared_invocation_requires_the_owned_native_target(self):
+        self.session.target_id = None
+        wire = runner.Wire(self.session, self.budget)
+        with self.assertRaisesRegex(RuntimeError, 'owned native target'):
+            await wire.invoke_initializer('owned-handle', {'token': 'owned-token'})
+        self.assertEqual(self.session.calls, [])
 
 
 class WireTests(unittest.IsolatedAsyncioTestCase):
@@ -505,7 +677,7 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(prepare['params']['returnByValue'])
         self.assertEqual(prepare['params']['objectGroup'], runner.OBJECT_GROUP)
         self.assertEqual(self.session.calls[1]['params']['expression'], 'void 0')
-        self.assertEqual(self.wire.snapshot()['initial'][1]['purpose'], 'large-source-flush')
+        self.assertEqual(self.wire.snapshot()['initial'][1]['purpose'], 'dispatch-flush')
         self.assertEqual(self.wire.snapshot()['initial'][0]['timeoutSeconds'], 12)
         options = {'token': 'owned-token', 'workloadMs': 600000, 'leaseMs': 20000}
         self.assertEqual((await self.wire.invoke_initializer(handle, options))['token'], 'owned-token')
@@ -519,9 +691,10 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
         status = await runner.api_call(self.wire, 'status', 'owned-token', self.budget)
         self.assertEqual(status['state'], 'running')
         self.assertEqual([item['method'] for item in self.session.calls],
-            ['Runtime.evaluate', 'Runtime.evaluate', 'Runtime.callFunctionOn', 'Runtime.evaluate'])
-        self.assertTrue(self.session.calls[3]['params']['returnByValue'])
-        self.assertNotIn('async', self.session.calls[3]['params']['expression'])
+            ['Runtime.evaluate', 'Runtime.evaluate', 'Runtime.callFunctionOn', 'Runtime.evaluate', 'Runtime.evaluate'])
+        self.assertEqual(self.session.calls[3]['params']['expression'], 'void 0')
+        self.assertTrue(self.session.calls[4]['params']['returnByValue'])
+        self.assertNotIn('async', self.session.calls[4]['params']['expression'])
         self.assertEqual(self.wire.snapshot()['initial'][2]['timeoutSeconds'], 3)
 
     async def test_target_change_rejects_invocation_of_prepared_handle(self):

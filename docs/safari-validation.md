@@ -80,7 +80,7 @@ An invocation without the execution flag is inert. Command receipts are consumed
 
 Before a new workload, obtain a fresh owner status with no operation running. It reports `probes.sustained`, `probes.manual` and `probes.short`, plus their aggregate `probePresent`; all three must be false. Read the current page, scale, scroll and focus fields as the new restoration baseline. Earlier receipts whose `probePresent` checked only the sustained probe cannot establish short or manual probe absence.
 
-The host prepares each browser initializer as an inert function and sends one no-op command to flush buffered source delivery. The initializer's own response supplies the function handle and controls completion. The no-op's reply is not a second completion barrier: its local waiter is released after the authoritative response, and that owned release is distinct from a failed RPC. A failed auxiliary send, missing authoritative response or source error still stops preparation under its existing deadline, before the initializer is invoked.
+The host prepares each browser initializer as an inert function, then invokes its returned handle once. Large-source preparation and every actual `Runtime.callFunctionOn` invocation send one inert no-op after their command reaches the owned native target, releasing buffered Inspector delivery. Each command's own reply controls completion; the no-op waiter is released after that reply and is recorded as an owned release. Failed sends, missing authoritative replies and protocol errors remain failures within the existing absolute phase deadline. This shared delivery rule covers workload, finish, abort and activation/restoration calls while preserving their cleanup allowances.
 
 ## Verify and activate the executed release
 

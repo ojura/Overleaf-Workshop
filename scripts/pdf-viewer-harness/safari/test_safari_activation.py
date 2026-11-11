@@ -497,17 +497,18 @@ class ReleaseTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row['purpose'].removeprefix('release-') for row in self.rpc['recent']],
                          ['status', 'capture', 'reload', 'verify', 'cleanup'])
 
-    async def test_install_prepares_and_flushes_once_before_its_single_invocation(self):
+    async def test_install_flushes_preparation_and_its_single_invocation(self):
         self.require_flush = True
         value = await self.evaluate('/*release:install*/ ({token:"owned"})')
         self.assertEqual(value['value']['token'], 'owned')
         self.assertEqual(self.installs, 1)
         self.assertEqual([call['method'] for call in self.calls],
-                         ['Runtime.evaluate', 'Runtime.evaluate', 'Runtime.callFunctionOn'])
+                         ['Runtime.evaluate', 'Runtime.evaluate', 'Runtime.callFunctionOn', 'Runtime.evaluate'])
         self.assertFalse(self.calls[0]['params']['returnByValue'])
         self.assertEqual(self.calls[1]['params']['expression'], 'void 0')
         self.assertFalse(self.calls[2]['params']['awaitPromise'])
-        self.assertEqual(sorted(self.consumed), [1, 2, 3])
+        self.assertEqual(self.calls[3]['params']['expression'], 'void 0')
+        self.assertEqual(sorted(self.consumed), [1, 2, 3, 4])
         self.assertEqual(self.waiters, set())
 
     async def test_bootstrap_source_is_flushed_but_its_clear_has_no_extra_command(self):
@@ -534,22 +535,24 @@ class ReleaseTransportTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(.01):
             await self.evaluate('/*release:install*/ ({token:"owned"})')
         self.assertEqual(self.installs, 1)
-        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(len(self.calls), 4)
         self.assertEqual(self.consumed, [1, 3])
         self.assertEqual(self.waiters, set())
         self.assertEqual(self.wire.operations[1]['outcome'], 'owned-release')
+        self.assertEqual(self.wire.operations[3]['outcome'], 'owned-release')
         self.assertEqual(list(self.wire.failed_operations), [])
 
     async def test_async_restore_is_prepared_inert_then_invoked_once_with_one_shared_budget(self):
         self.prepare_elapsed = 3
         value = await self.evaluate('/*release:restore*/ window.guard.restore({page:46})', timeout=8)
         self.assertTrue(value['value']['exact'])
-        self.assertEqual([call['method'] for call in self.calls], ['Runtime.evaluate', 'Runtime.callFunctionOn'])
+        self.assertEqual([call['method'] for call in self.calls], ['Runtime.evaluate', 'Runtime.callFunctionOn', 'Runtime.evaluate'])
         self.assertFalse(self.calls[0]['params']['returnByValue'])
         self.assertTrue(self.calls[0]['params']['expression'].startswith('(() => ('))
         self.assertEqual(self.calls[1]['params']['objectId'], 'owned-restore-function')
         self.assertTrue(self.calls[1]['params']['awaitPromise'])
         self.assertTrue(self.calls[1]['params']['returnByValue'])
+        self.assertEqual(self.calls[2]['params']['expression'], 'void 0')
         self.assertEqual(list(self.rpc['recent'])[1]['timeoutSeconds'], 5)
 
     async def test_restore_is_not_invoked_after_preparation_spends_its_budget(self):
