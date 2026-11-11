@@ -107,6 +107,13 @@ interface Incident {
     activityPhase?: 'work' | 'aftermath' | 'recovery' | 'complete';
 }
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
+
+export function robotCaptionReadMs(lines: readonly string[]): number {
+    const policy = ROBOT_ENCOUNTER_POLICY;
+    return clamp(policy.captionBaseMs + lines.reduce((count, line) => count + line.length, 0)
+        * policy.captionCharacterMs, policy.captionMinMs, policy.captionMaxMs);
+}
+
 const traffic = (actor: RobotEncounterActor) => actor.phase === 'advance' || actor.phase === 'return' || actor.phase === 'cargo';
 const key = (a: number, b: number) => a < b ? a + ':' + b : b + ':' + a;
 const squared = (point: Point) => point.x * point.x + point.y * point.y;
@@ -166,9 +173,7 @@ export class RobotEncounters {
     }
 
     private captionDuration(dialogue: Dialogue): number {
-        const policy = ROBOT_ENCOUNTER_POLICY;
-        return clamp(policy.captionBaseMs + dialogue.lines.reduce((count, line) => count + line.length, 0)
-            * policy.captionCharacterMs, policy.captionMinMs, policy.captionMaxMs);
+        return robotCaptionReadMs(dialogue.lines);
     }
 
     private begin(kind: Exclude<RobotEncounterKind, 'rescue'>, actors: RobotEncounterActor[], at: number, normal: Point, armed = false): void {
