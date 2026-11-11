@@ -2,8 +2,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
+import { loadBrowserSource } from './browser-source.mjs';
 
-const source = fs.readFileSync(new URL('./release-guard.js', import.meta.url), 'utf8');
+const source = loadBrowserSource('release-guard.js');
 const documentConfig = JSON.parse(fs.readFileSync(new URL('./document.example.json', import.meta.url), 'utf8'));
 const pdfPath = '/spomenar-versions/6abb3d0b13d2970bca0f613287a6ea5d30280be14435b5c681b8ca8bd61d24d0/book.pdf';
 const drain = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
@@ -591,6 +592,57 @@ test('the atomic reload rechecks trusted input and the captured reader before na
   assert.throws(() => f.api().reload(saved), /User interruption/);
   assert.equal(f.location.reloads, 0);
   await f.dispose();
+});
+
+test('focus-only recovery reacquires replaced page text without writing reader geometry or navigation', async () => {
+  const f = fixture(); f.install(); await f.ready();
+  const original = f.page(59); f.document.activeElement = original.textLayer.div;
+  const saved = f.api().capture(); original.textLayer.div.isConnected = false;
+  const replacement = f.page(59), button = f.element('pdf-prefetch-measurements');
+  f.ids.set(button.id, button); f.document.activeElement = button;
+  let navigation = 0; f.viewer.scrollPageIntoView = () => { navigation++; };
+  const restored = await f.drive(f.api().restoreFocus(saved));
+  assert.equal(restored.exact, true);
+  assert.equal(f.document.activeElement, replacement.textLayer.div);
+  assert.deepEqual(JSON.parse(JSON.stringify(restored.state)), JSON.parse(JSON.stringify(saved)));
+  assert.equal(replacement.textLayer.div.lastFocusOptions.preventScroll, true);
+  assert.equal(navigation + f.location.reloads, 0);
+  await f.dispose();
+});
+
+test('focus-only recovery refuses changed reader state and active observation ownership before focus', async () => {
+  const changes = [
+    f => { f.viewer.container.scrollTop++; }, f => { f.viewer.currentPageNumber++; },
+    f => { f.viewer.currentScaleValue = '0.6'; }, f => { f.viewer.pagesRotation = 90; },
+    f => { f.viewer.scrollMode = 1; }, f => { f.viewer.spreadMode = 0; },
+    f => { f.app.pdfSidebar.visibleView = 0; }, f => { f.prefetch.robotsEnabled = false; },
+    f => { f.location.href += '&changed=1'; }, f => { f.window.visualViewport.scale = 2; },
+    ...['__spomenarSustainedProbe', '__spomenarManualProbe', '__spomenarSidecarProbe'].map(name => f => { f.window[name] = {}; }),
+  ];
+  for (const change of changes) {
+    const f = fixture(); f.install(); await f.ready();
+    const page = f.page(59); f.document.activeElement = page.textLayer.div;
+    const saved = f.api().capture(); f.document.activeElement = f.document.body; change(f);
+    await assert.rejects(f.drive(f.api().restoreFocus(saved)), /differs|observation|pinch/);
+    assert.equal(f.document.activeElement, f.document.body);
+    assert.equal(page.textLayer.div.lastFocusOptions, undefined);
+    await f.dispose();
+  }
+});
+
+test('focus-only text reacquisition yields to trusted input and rejects arbitrary panel selectors', async () => {
+  const f = fixture(); f.install(); await f.ready();
+  const page = f.page(59); f.document.activeElement = page.textLayer.div;
+  const saved = f.api().capture(); f.document.activeElement = f.document.body;
+  page.textLayer.div.isConnected = false;
+  f.frameHooks.add(() => { f.page(59); f.document.emit('pointerdown', { isTrusted: true }); });
+  await assert.rejects(f.drive(f.api().restoreFocus(saved)), /pointerdown/);
+  assert.equal(f.document.activeElement, f.document.body);
+  await f.dispose();
+  const g = fixture(); g.install(); await g.ready();
+  const invalid = { ...g.api().capture(), focus: { kind: 'panel', selector: 'button' } };
+  await assert.rejects(g.drive(g.api().restoreFocus(invalid)), /focused control is missing/);
+  await g.dispose();
 });
 
 test('expired or missing bootstrap token installs no listener or frame loop', async () => {

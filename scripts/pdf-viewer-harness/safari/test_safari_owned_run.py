@@ -1,6 +1,7 @@
 """Offline adapter tests using the already tested sustained lifecycle fake."""
 import asyncio
 import contextlib
+import copy
 import io
 import json
 import pathlib
@@ -12,6 +13,71 @@ from unittest import mock
 import test_safari_runner as fixtures
 import safari_owned_run as adapter
 from test_support import settings
+
+
+def focus_receipts(configured, *, legacy=False):
+    saved = {'page': 149, 'scale': 0.6, 'scaleValue': '0.6', 'rotation': 0, 'scrollMode': 0,
+             'spreadMode': 0, 'sidebar': 0, 'top': 85050, 'left': 0, 'robots': True, 'lab': False}
+    state = {**saved, 'focus': {'kind': 'page-text', 'pageNumber': 149}, 'panel': None,
+             'url': configured.document.page_url + '#page=148&zoom=60,-2,236', 'visualScale': 1}
+    expected = {'url': configured.document.entry_url, 'sha256': configured.entry.sha256, 'bytes': configured.entry.bytes}
+    result = {'saved': saved, 'readingState': dict(saved), 'restored': True, 'focusRestored': False,
+              'interrupted': False, 'observersRemoved': True}
+    if not legacy:
+        result['focusRecovery'] = state
+    prior = {'document': configured.document.browser(), 'releaseCheck': {'expected': expected}, 'status': 'failed',
+             'operation': 'run', 'run': {'scenario': 'short', 'status': 'failed', 'probeRemoved': True,
+             'cleanupErrors': [], 'result': result}}
+    activation = {'document': configured.document.browser(), 'operation': 'activate', 'status': 'passed',
+                  'releaseCheck': {'expected': expected, 'preserved': state,
+                  'restored': {'exact': True, 'state': copy.deepcopy(state)},
+                  'verified': {'exact': True, 'state': copy.deepcopy(state)}}}
+    for name, value in [('failed-short', prior), ('original-activation', activation)]:
+        (configured.work / (name + '-result.json')).write_text(json.dumps(value))
+    return state, prior, activation
+
+
+class FocusReceiptTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.settings = settings(pathlib.Path(directory.name))
+
+    def test_current_short_uses_its_original_descriptor_and_refuses_a_second_baseline(self):
+        state, _, _ = focus_receipts(self.settings)
+        self.assertEqual(adapter.focus_recovery_state(self.settings, 'failed-short'), state)
+        with self.assertRaisesRegex(ValueError, 'second baseline'):
+            adapter.focus_recovery_state(self.settings, 'failed-short', 'original-activation')
+
+    def test_legacy_short_requires_its_exact_verified_activation_state(self):
+        state, _, _ = focus_receipts(self.settings, legacy=True)
+        with self.assertRaisesRegex(ValueError, 'explicit original activation'):
+            adapter.focus_recovery_state(self.settings, 'failed-short')
+        self.assertEqual(adapter.focus_recovery_state(self.settings, 'failed-short', 'original-activation'), state)
+        for field, value in [('top', 85051), ('page', 150), ('scaleValue', '1.0')]:
+            _, _, activation = focus_receipts(self.settings, legacy=True)
+            for key in ['preserved', 'restored', 'verified']:
+                target = activation['releaseCheck'][key]
+                (target if key == 'preserved' else target['state'])[field] = value
+            (self.settings.work / 'original-activation-result.json').write_text(json.dumps(activation))
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'saved reader state'):
+                adapter.focus_recovery_state(self.settings, 'failed-short', 'original-activation')
+
+    def test_foreign_source_active_probe_and_unrestored_reader_receipts_are_rejected(self):
+        changes = [
+            lambda p: p['document'].update(sha256='f' * 64),
+            lambda p: p['releaseCheck']['expected'].update(bytes=self.settings.entry.bytes + 1),
+            lambda p: p['run'].update(probeRemoved=False),
+            lambda p: p['run']['result'].update(interrupted=True),
+            lambda p: p['run']['result']['readingState'].update(top=1),
+            lambda p: p['run']['result'].update(restored=False),
+            lambda p: p['run']['result']['focusRecovery'].update(focus={'kind': 'page-text', 'pageNumber': True}),
+        ]
+        for change in changes:
+            _, prior, _ = focus_receipts(self.settings); change(prior)
+            (self.settings.work / 'failed-short-result.json').write_text(json.dumps(prior))
+            with self.subTest(change=changes.index(change)), self.assertRaises(ValueError):
+                adapter.focus_recovery_state(self.settings, 'failed-short')
 
 
 class OwnedWire(fixtures.FakeWire):
@@ -119,6 +185,31 @@ class OwnedAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.source_check.call_args.kwargs['source_only'])
         self.assertEqual(self.source_check.call_args.kwargs['expected_sha'], self.settings.entry.sha256)
         self.assertEqual(self.source_check.call_args.kwargs['expected_bytes'], self.settings.entry.bytes)
+        self.assert_owner_retained(result)
+
+    async def test_focus_recovery_dispatches_only_the_original_receipt_and_keeps_it_unchanged(self):
+        state, _, _ = focus_receipts(self.settings, legacy=True)
+        original = (self.work / 'failed-short-result.json').read_bytes()
+        self.source_check.return_value = {'status': 'focus-restored'}
+        result = await adapter.run_owned(self.session, self.inspector, self.settings, 'owned', self.stop,
+            operation='restore-focus', receipt_prefix='failed-short', focus_receipt_prefix='original-activation')
+        self.assertEqual(result['status'], 'passed')
+        self.assertEqual(self.source_check.call_args.kwargs['focus_restore'], state)
+        self.assertTrue(self.source_check.call_args.kwargs['source_only'])
+        self.assertEqual(self.wires[0].starts, 0)
+        self.assertEqual((self.work / 'failed-short-result.json').read_bytes(), original)
+        self.assertFalse(list(self.work.glob('*.png')))
+        self.assert_owner_retained(result)
+
+    async def test_invalid_focus_receipt_never_installs_a_guard_or_starts_a_workload(self):
+        _, prior, _ = focus_receipts(self.settings)
+        prior['run']['result']['readingState']['top'] += 1
+        (self.work / 'failed-short-result.json').write_text(json.dumps(prior))
+        result = await adapter.run_owned(self.session, self.inspector, self.settings, 'owned', self.stop,
+            operation='restore-focus', receipt_prefix='failed-short')
+        self.assertEqual(result['status'], 'failed')
+        self.source_check.assert_not_awaited()
+        self.assertEqual(self.wires[0].starts, 0)
         self.assert_owner_retained(result)
 
     async def test_inert_preparation_failure_releases_group_and_domains_but_retains_owner(self):

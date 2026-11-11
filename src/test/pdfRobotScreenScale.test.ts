@@ -42,7 +42,7 @@ describe('Robot screen scale and readable captions', function () {
         assert.ok(100 * two.cssScale * 2 < 100 * 2);
     });
 
-    it('funds unequal logical bodies together under the unchanged compact sprite budget', () => {
+    it('funds unequal logical bodies together under a constrained sprite budget', () => {
         for (const dpr of [1, 1.2, 2, 3]) {
             const scale = 0.64 * 1.35 * screen(dpr).cssScale;
             const shapes = Object.freeze([Object.freeze({ width: 128, height: 100, scale: scale * 2.5 }),

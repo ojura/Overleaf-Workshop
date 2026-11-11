@@ -66,6 +66,22 @@ class OwnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.calls[0][0], self.session)
         self.assertEqual(self.calls[0][4]['pages'], [101, 102])
 
+    async def test_focus_recovery_consumes_only_named_original_receipts(self):
+        operation = self.owner.operation = mock.AsyncMock(return_value={'status': 'passed', 'attached': True})
+        self.owner.publish()
+        request = {'id': 'focus-one', 'action': 'restore-focus', 'prefix': 'focus-recovery',
+                   'receiptPrefix': 'failed-short', 'focusReceiptPrefix': 'original-activation'}
+        owner_module.submit(self.settings.work, request)
+        await self.owner.handle(self.owner.consume()); await self.owner.job
+        self.assertTrue((self.owner.control / 'focus-one-accepted.json').exists())
+        self.assertEqual(operation.call_args.kwargs['operation'], 'restore-focus')
+        self.assertEqual(operation.call_args.kwargs['receipt_prefix'], 'failed-short')
+        self.assertEqual(operation.call_args.kwargs['focus_receipt_prefix'], 'original-activation')
+        self.inspector.open_app.assert_not_awaited()
+        for extra in [{'focus': {'kind': 'body'}}, {'sourceOnly': False}, {'pages': [1, 2]}, {'focusReceiptPrefix': '../other'}]:
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                owner_module.command_request({**request, **extra})
+
     async def test_page_pair_outside_the_document_is_rejected_before_a_job_starts(self):
         operation = self.owner.operation = mock.AsyncMock(return_value={'status': 'passed', 'attached': True})
         request = {'id': 'out-of-range', 'action': 'run', 'prefix': 'recording', 'scenario': 'short',

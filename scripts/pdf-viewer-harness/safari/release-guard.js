@@ -1,4 +1,5 @@
 (options => {
+  // @include reader-focus.mjs
   const name = '__spomenarReleaseGuard';
   const storageKey = name + ':' + options.token;
   const expected = options.document;
@@ -93,11 +94,8 @@
     if (app.isInitialViewSet && app.pdfDocument) documentInit();
   }
   const loaded = () => { void bind(); };
-  function deepFocus() {
-    let element = document.activeElement;
-    while (element?.shadowRoot?.activeElement) element = element.shadowRoot.activeElement;
-    return element;
-  }
+  const focusOwner = createReaderFocus({ document, window, viewer: () => viewer, pages: expected.pages,
+    panelRoot: () => panel()?.root });
   function panel() {
     const host = document.getElementById('pdf-prefetch-diagnostics'), root = host?.shadowRoot;
     if (!root || host.hidden) return;
@@ -153,48 +151,6 @@
       guard(true);
     } finally { details.removeEventListener('toggle', toggled); }
   }
-  function pageTextTarget(pageNumber) {
-    if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > expected.pages) return;
-    const view = viewer?.getPageView(pageNumber - 1), root = view?.div, target = view?.textLayer?.div;
-    if (view?.id === pageNumber && root?.isConnected && root.dataset.pageNumber === String(pageNumber)
-        && viewer.container.contains(root) && target?.isConnected && root.contains(target)) return target;
-  }
-  function focusDescriptor() {
-    const element = deepFocus();
-    if (window.getSelection()?.isCollapsed === false || element?.closest('input,textarea,[contenteditable="true"]')) {
-      throw new Error('Reading input is active');
-    }
-    if (element === document.body) return { kind: 'body' };
-    if (element === document.documentElement) return { kind: 'html' };
-    if (element === viewer?.container) return { kind: 'viewer' };
-    const pageRoot = element?.closest('.page[data-page-number]');
-    const pageNumber = Number(pageRoot?.dataset.pageNumber);
-    if (element && pageTextTarget(pageNumber) === element && viewer.getPageView(pageNumber - 1).div === pageRoot) {
-      return { kind: 'page-text', pageNumber };
-    }
-    if (element?.id && document.getElementById(element.id) === element
-      && document.querySelectorAll('#' + CSS.escape(element.id)).length === 1) return { kind: 'id', id: element.id };
-    const controls = panel();
-    if (controls) {
-      const selectors = ['.panel-drag', '[data-panel-dock="left"]', '[data-panel-dock="right"]', '[data-panel-dock="float"]'];
-      const direction = element?.dataset?.panelResize;
-      if (typeof direction === 'string' && /^(?:[ns][ew]?|[ew])$/.test(direction)) {
-        selectors.push('[data-panel-resize="' + direction + '"]');
-      }
-      for (const selector of selectors) {
-        if (uniqueControl(controls.root, selector) === element) return { kind: 'panel', selector };
-      }
-    }
-    throw new Error('The focused control cannot be restored unambiguously');
-  }
-  function focusElement(saved) {
-    if (saved.kind === 'body') return document.body;
-    if (saved.kind === 'html') return document.documentElement;
-    if (saved.kind === 'viewer') return viewer.container;
-    if (saved.kind === 'page-text') return pageTextTarget(saved.pageNumber);
-    if (saved.kind === 'id' && document.querySelectorAll('#' + CSS.escape(saved.id)).length === 1) return document.getElementById(saved.id);
-    if (saved.kind === 'panel') return uniqueControl(panel()?.root, saved.selector);
-  }
   function assertReloadBookmark() {
     const reject = () => { throw new Error('Reload requires a synchronous page/zoom bookmark'); };
     const check = value => {
@@ -237,7 +193,7 @@
       rotation: viewer.pagesRotation, scrollMode: viewer.scrollMode, spreadMode: viewer.spreadMode,
       sidebar: app.pdfSidebar?.visibleView ?? 0, top: viewer.container.scrollTop, left: viewer.container.scrollLeft,
       robots: window.pdfPrefetch.robotsEnabled, lab: window.pdfPrefetch.diagnosticsEnabled,
-      panel: panelState(), focus: focusDescriptor(), url: location.href, visualScale: visualScale() };
+      panel: panelState(), focus: focusOwner.capture(), url: location.href, visualScale: visualScale() };
   }
   function capture(forReload = false) {
     guard(true);
@@ -326,26 +282,28 @@
       }
     }
     await settleArrangement(); guard(true);
-    let target = focusElement(saved.focus);
-    while (saved.focus.kind === 'page-text' && !target) {
-      guard(true); await nextFrame(); guard(true);
-      target = focusElement(saved.focus);
-    }
-    if (!target?.isConnected || typeof target.focus !== 'function') throw new Error('The saved focused control is missing');
-    if (deepFocus() !== target) {
-      guard(true);
-      if (saved.focus.kind === 'body') {
-        const currentFocus = deepFocus();
-        if (typeof currentFocus?.blur !== 'function') throw new Error('The current focused control cannot be blurred');
-        currentFocus.blur();
-        guard(true);
-        if (deepFocus() !== document.body) throw new Error('BODY focus was not restored');
-      } else target.focus({ preventScroll: true });
-    }
+    await focusOwner.restore(saved.focus, { guard: () => guard(true), nextFrame });
     await twoFrames(); guard(true);
     if (location.href !== saved.url) history.replaceState(history.state, '', saved.url);
     const current = capture(), changed = differences(saved, current);
     if (changed.length) throw new Error('Reading restoration differs: ' + changed.join(', '));
+    return { exact: true, state: current };
+  }
+  async function restoreFocus(saved) {
+    const ready = () => {
+      guard(true);
+      if (window.__spomenarSustainedProbe || window.__spomenarManualProbe || window.__spomenarSidecarProbe) {
+        throw new Error('A phone observation still owns the reader');
+      }
+      if (arrangementMoving()) throw new Error('The reader arrangement is still moving');
+      const changed = differences(saved, readState()).filter(key => key !== 'focus');
+      if (changed.length) throw new Error('Focus recovery reader differs: ' + changed.join(', '));
+    };
+    ready();
+    await focusOwner.restore(saved.focus, { guard: ready, nextFrame });
+    await twoFrames(); ready();
+    const current = capture(), changed = differences(saved, current);
+    if (changed.length) throw new Error('Focus recovery differs: ' + changed.join(', '));
     return { exact: true, state: current };
   }
   function status() {
@@ -369,7 +327,7 @@
       if (stored?.token === options.token) sessionStorage.removeItem(storageKey);
     } finally { if (window[name] === api) delete window[name]; }
   }
-  const api = { token: options.token, status, capture, restore,
+  const api = { token: options.token, status, capture, restore, restoreFocus,
     reload(saved) {
       const current = capture(true);
       if (differences(saved, current).length) throw new Error('Reading state changed before reload');

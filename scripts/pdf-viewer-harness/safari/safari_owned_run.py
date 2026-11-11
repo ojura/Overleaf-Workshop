@@ -91,15 +91,73 @@ async def recover_recorded(wire, recorder, settings, prior_prefix, budget, check
     return receipt
 
 
+def focus_recovery_state(settings, receipt_prefix, focus_receipt_prefix=None):
+    """Read the original baseline; a current capture can never replace it."""
+    def receipt(name):
+        validate_prefix(name)
+        value = json.loads((settings.work / (name + '-result.json')).read_text())
+        expected = value.get('releaseCheck', {}).get('expected', {})
+        if value.get('document') != settings.document.browser() or expected != {
+                'url': settings.document.entry_url, 'sha256': settings.entry.sha256, 'bytes': settings.entry.bytes}:
+            raise ValueError('The focus receipt belongs to a different document or entry release')
+        return value
+
+    prior = receipt(receipt_prefix)
+    run = prior.get('run', {})
+    result = run.get('result', {})
+    saved = result.get('saved')
+    keys = ('page', 'scale', 'scaleValue', 'rotation', 'scrollMode', 'spreadMode', 'sidebar',
+            'top', 'left', 'robots', 'lab')
+    if prior.get('operation') != 'run' or prior.get('status') != 'failed' or run.get('status') != 'failed' \
+            or run.get('scenario') != 'short' or not isinstance(saved, dict) \
+            or any(key not in saved for key in keys) or result.get('readingState') != saved \
+            or result.get('restored') is not True or result.get('focusRestored') is not False \
+            or result.get('interrupted') is not False or result.get('observersRemoved') is not True \
+            or run.get('probeRemoved') is not True or run.get('cleanupErrors'):
+        raise ValueError('Focus recovery requires the original short result with restored reader state and released probes')
+    state = result.get('focusRecovery')
+    if state is None:
+        if focus_receipt_prefix is None:
+            raise ValueError('This older short receipt requires its explicit original activation receipt')
+        activation = receipt(focus_receipt_prefix)
+        check = activation.get('releaseCheck', {})
+        state = check.get('preserved')
+        if activation.get('operation') != 'activate' or activation.get('status') != 'passed' \
+                or not isinstance(state, dict) or check.get('restored', {}).get('exact') is not True \
+                or check.get('verified', {}).get('exact') is not True \
+                or check.get('restored', {}).get('state') != state or check.get('verified', {}).get('state') != state:
+            raise ValueError('The activation receipt does not preserve and verify one original focus baseline')
+    elif focus_receipt_prefix is not None:
+        raise ValueError('Use the short receipt original focus; a second baseline cannot replace it')
+    if not isinstance(state, dict) or any(state.get(key) != saved[key] for key in keys) \
+            or not settings.document.owns_page(state.get('url')) or state.get('visualScale') != 1 \
+            or not isinstance(state.get('focus'), dict):
+        raise ValueError('The original focus baseline does not match the short saved reader state')
+    focus = state['focus']
+    kind = focus.get('kind')
+    valid_focus = kind in {'body', 'html', 'viewer'} and set(focus) == {'kind'} \
+        or kind == 'page-text' and set(focus) == {'kind', 'pageNumber'} \
+        and type(focus.get('pageNumber')) is int and 1 <= focus['pageNumber'] <= settings.document.pages \
+        or kind == 'id' and set(focus) == {'kind', 'id'} and isinstance(focus.get('id'), str) and bool(focus['id']) \
+        or kind == 'panel' and set(focus) == {'kind', 'selector'} and isinstance(focus.get('selector'), str)
+    if not valid_focus or state.get('lab') and not isinstance(state.get('panel'), dict):
+        raise ValueError('The original focus descriptor is invalid')
+    return state
+
+
 async def run_owned(session, inspector, settings, prefix, stop_event, *, operation='run',
-                    receipt_prefix=None, seconds=600, start_mode='immediate', start_wait_ms=60000,
+                    receipt_prefix=None, focus_receipt_prefix=None, seconds=600, start_mode='immediate', start_wait_ms=60000,
                     source_only=False, scenario='sustained', pages=None):
     """Perform one command while the caller retains the native connection."""
     validate_prefix(prefix)
-    if operation not in {'run', 'recover', 'activate', 'transport-check'}:
+    if operation not in {'run', 'recover', 'activate', 'transport-check', 'restore-focus'}:
         raise ValueError('Unknown owned operation')
-    if operation == 'recover':
+    if operation in {'recover', 'restore-focus'}:
         validate_prefix(receipt_prefix)
+    if focus_receipt_prefix is not None:
+        if operation != 'restore-focus':
+            raise ValueError('An original focus receipt is supported only by restore-focus')
+        validate_prefix(focus_receipt_prefix)
     if not 60 <= seconds <= 600 or start_mode not in {'immediate', 'tap'} \
             or type(start_wait_ms) is not int or not 1000 <= start_wait_ms <= 300000:
         raise ValueError('Invalid workload or start-wait settings')
@@ -185,16 +243,21 @@ async def run_owned(session, inspector, settings, prefix, stop_event, *, operati
         async def evaluate(expression, timeout=3):
             return await guard_evaluate(wire, expression, timeout)
         activation = operation == 'activate'
+        focus_state = focus_recovery_state(settings, receipt_prefix, focus_receipt_prefix) \
+            if operation == 'restore-focus' else None
         output['releaseCheck'] = await core.bounded(release_check(
             wire.command, evaluate, session.response_methods, document=settings.document,
             source_only=source_only if activation else True,
             expected_sha=settings.entry.sha256, expected_bytes=settings.entry.bytes,
             budget=SourceBudget(seconds=min(60 if activation else 30, budget.remaining('detach'))),
-            stop_event=stop_event), budget, 'detach' if activation else 'setup', 60 if activation else 30,
+            stop_event=stop_event, focus_restore=focus_state), budget, 'detach' if activation else 'setup', 60 if activation else 30,
             label='owned activation' if activation else 'owned source-only verification')
         if activation:
             return {'status': 'passed' if output['releaseCheck']['status'] in {'current', 'activated'} else 'failed',
                     'operation': 'activate'}
+        if operation == 'restore-focus':
+            return {'status': 'passed' if output['releaseCheck']['status'] == 'focus-restored' else 'failed',
+                    'operation': operation, 'receiptPrefix': receipt_prefix, 'focusReceiptPrefix': focus_receipt_prefix}
         if output['releaseCheck']['status'] != 'current':
             raise RuntimeError('The loaded entry does not match the expected release')
         if stop_event.is_set():

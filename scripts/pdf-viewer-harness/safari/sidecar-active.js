@@ -1,4 +1,5 @@
 (async options => {
+  // @include reader-focus.mjs
   // @include payload-observation.mjs
   // @include surface-observation.mjs
   // @include photo-evidence.mjs
@@ -23,16 +24,18 @@
   if (!container || !pdfDocument || pdfDocument.numPages !== expected.pages
       || new URL(app.url, location.href).href !== pdfUrl.href) throw new Error('The live document is not the exact expected edition');
   if (document.visibilityState !== 'visible') throw new Error('The current Safari page is not visible');
-  const deepFocus = () => { let node = document.activeElement; while (node?.shadowRoot?.activeElement) node = node.shadowRoot.activeElement; return node; };
-  if (window.getSelection()?.isCollapsed === false
-      || deepFocus()?.matches('input,textarea,[contenteditable="true"]')) throw new Error('Reading input is active');
-  const focus = deepFocus();
+  const focusOwner = createReaderFocus({ document, window, viewer: () => viewer, pages: expected.pages,
+    panelRoot: () => {
+      const host = document.getElementById('pdf-prefetch-diagnostics');
+      return host && !host.hidden ? host.shadowRoot : undefined;
+    } });
+  const savedFocus = focusOwner.capture();
   const readState = () => ({ page: viewer.currentPageNumber, scaleValue: viewer.currentScaleValue, scale: viewer.currentScale,
     rotation: viewer.pagesRotation, scrollMode: viewer.scrollMode, spreadMode: viewer.spreadMode,
     sidebar: app.pdfSidebar?.visibleView, top: container.scrollTop, left: container.scrollLeft,
     robots: prefetch.robotsEnabled, lab: prefetch.diagnosticsEnabled });
   const saved = readState();
-  const result = { phase: 'preparing', token, expected, budget: { ...budget }, startedAt: performance.now(), saved, focused: document.hasFocus(), samples: [], events: [], entries: [], errors: [],
+  const result = { phase: 'preparing', token, expected, budget: { ...budget }, startedAt: performance.now(), saved, savedFocus, focused: document.hasFocus(), samples: [], events: [], entries: [], errors: [],
     refinements: [], retirements: [], interrupted: false, initialGeometry: { scrollWidth: container.scrollWidth,
       scrollHeight: container.scrollHeight, clientWidth: container.clientWidth, clientHeight: container.clientHeight } };
   const eventSequences = new Set(), payloadObservations = new PayloadObservations(), request = new AbortController();
@@ -54,11 +57,28 @@
       columnX: Number.parseFloat(getComputedStyle(container).getPropertyValue('--pdf-document-column-x')) || 0 };
   };
   result.savedPanel = panelState();
+  result.focusRecovery = { ...saved, focus: savedFocus, panel: result.savedPanel ?? null,
+    url: location.href, visualScale: window.visualViewport?.scale ?? 1 };
   const surfaces = observeReaderSurfaces({viewer,container,bus:app.eventBus,document,window,now:()=>performance.now(),
     requestFrame:callback=>requestAnimationFrame(callback),cancelFrame:id=>cancelAnimationFrame(id),style:getComputedStyle,MutationObserver,
     phase: () => result.phase});
   result.surfaceObservation = surfaces.result;
   let activeTimer, timer, disposed = false, changed = false, closing = false, panelRestore, restoreInFlight, closeInFlight;
+  const focusWaits = new Set();
+  const nextFocusFrame = deadline => new Promise((resolve, reject) => {
+    let frame, timeout, finished = false;
+    const finish = error => {
+      if (finished) return;
+      finished = true; cancelAnimationFrame(frame); clearTimeout(timeout); focusWaits.delete(cancel);
+      if (error) reject(error); else resolve();
+    };
+    const cancel = () => finish(new Error('Observation closed'));
+    focusWaits.add(cancel);
+    frame = requestAnimationFrame(() => finish());
+    timeout = setTimeout(() => finish(new Error('Focus restoration deadline expired')),
+      Math.max(1, deadline - performance.now()));
+    if (disposed) cancel();
+  });
   const current = () => app.pdfDocument === pdfDocument && viewer.pdfDocument === pdfDocument
     && new URL(app.url, location.href).href === pdfUrl.href;
   const stop = event => {
@@ -75,6 +95,7 @@
   const dispose = () => {
     if (disposed) return;
     disposed = true; surfaces.stop();
+    for (const cancel of focusWaits) cancel();
     for (const message of surfaces.result.errors) {
       if (result.errors.length < 8) result.errors.push('Surface observation: ' + message);
     }
@@ -93,9 +114,10 @@
     restoreInFlight = Promise.resolve().then(async () => {
       result.phase = 'restoring';
       if (result.interrupted || disposed || !current()) return false;
-      if (!changed) { result.readingState = readState(); return true; }
+      if (!changed) { result.readingState = readState(); result.focusRestored = focusOwner.matches(savedFocus); return true; }
+      const deadline = performance.now() + budget.restoreMs;
       let panelError;
-      try { await panelRestore?.({ guard: () => guard(true), deadline: performance.now() + budget.restoreMs }); }
+      try { await panelRestore?.({ guard: () => guard(true), deadline }); }
       catch (error) { panelError = error; }
       if (result.interrupted || disposed || !current()) return false;
       if (viewer.pagesRotation !== saved.rotation) viewer.pagesRotation = saved.rotation;
@@ -110,11 +132,20 @@
       }
       if (prefetch.robotsEnabled !== saved.robots) prefetch.setRobotsEnabled(saved.robots);
       if (prefetch.diagnosticsEnabled !== saved.lab) prefetch.setDiagnosticsEnabled(saved.lab);
-      if (focus?.isConnected && deepFocus() !== focus) {
-        if (focus === document.body) deepFocus()?.blur?.(); else focus.focus?.({ preventScroll: true });
+      result.restored = true; result.readingState = readState(); result.focusRestored = false;
+      try {
+        result.focusAfter = await focusOwner.restore(savedFocus, {
+          guard: () => { guard(true); if (performance.now() >= deadline) throw new Error('Focus restoration deadline expired'); },
+          nextFrame: () => nextFocusFrame(deadline),
+        });
+        result.focusRestored = focusOwner.matches(savedFocus);
+      } catch (error) {
+        result.focusFailure = String(error.message || error);
+        throw error;
+      } finally {
+        if (result.interrupted || disposed || !current()) result.restored = false;
+        result.readingState = readState();
       }
-      result.focusRestored = deepFocus() === focus;
-      result.restored = true; result.readingState = readState();
       if (panelError) throw panelError;
       return true;
     }).finally(() => { restoreInFlight = undefined; });
@@ -191,6 +222,7 @@
       });
       return closeInFlight;
     },
+    focusMatches: () => focusOwner.matches(savedFocus),
     setPanelRestore(callback) { panelRestore = callback; } };
   window.__spomenarSidecarProbe = probe;
   timer = setTimeout(() => {

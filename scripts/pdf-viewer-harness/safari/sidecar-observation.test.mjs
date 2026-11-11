@@ -207,10 +207,11 @@ test('actual short cleanup propagates bounded surface failures and still release
     stop() { removed.push('surface'); } }, clearTimeout: () => {}, timer: 1, activeTimer: 2,
     request: { abort() { removed.push('request'); } }, result: { errors: [] }, types: ['touchstart'],
     document: { removeEventListener(name) { removed.push(name); } }, window: { removeEventListener(name) { removed.push(name); } },
-    stop() {}, hidden() {}, error() {} };
+    focusWaits: new Set([() => { removed.push('focus'); }]), stop() {}, hidden() {}, error() {} };
   vm.runInNewContext(phone.slice(begin, end) + '\nglobalThis.finishCleanup = dispose;', context);
   context.finishCleanup(); context.finishCleanup();
   assert.equal(context.result.errors.length, 8); assert.ok(context.result.errors.every(value => value.startsWith('Surface observation: ')));
   assert.equal(context.result.observersRemoved, true); assert.equal(removed.filter(value => value === 'surface').length, 1);
   assert.ok(removed.includes('touchstart')); assert.ok(removed.includes('visibilitychange'));
+  assert.equal(removed.filter(value => value === 'focus').length, 1);
 });

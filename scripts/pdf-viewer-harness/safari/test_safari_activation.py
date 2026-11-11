@@ -141,13 +141,39 @@ class Session:
                 'ready': not self.generation or not self.never_ready and self.ready_calls >= 3,
                 'reloadLifecycle': ['visibilitychange', 'pagehide'] if self.generation else []}
 
-    async def run(self, source_only=False):
+    async def run(self, source_only=False, focus_restore=None):
         return await release_check(self.command, self.evaluate, self.responses, document=DOCUMENT, source_only=source_only,
                                    expected_sha=hashlib.sha256(self.expected).hexdigest(), expected_bytes=len(self.expected),
-                                   budget=Budget(now=self.clock.now, sleep=self.clock.sleep), token='test-token')
+                                   budget=Budget(now=self.clock.now, sleep=self.clock.sleep), token='test-token',
+                                   focus_restore=focus_restore)
 
 
 class ReleaseActivationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_focus_recovery_uses_the_supplied_original_state_without_capture_or_reload(self):
+        session = Session(current=True)
+        saved = {**session.saved, 'focus': {'kind': 'page-text', 'pageNumber': 59}}
+        result = await session.run(source_only=True, focus_restore=saved)
+        self.assertEqual(result['status'], 'focus-restored')
+        self.assertEqual(result['preserved'], saved)
+        self.assertEqual(session.restores, 1)
+        self.assertFalse(session.guard or session.bootstrap)
+        self.assertFalse(result['navigationAttempted'] or result['navigationRequested'])
+        self.assertFalse(any(name in {'evaluate:capture', 'evaluate:reload', 'Page.setBootstrapScript', 'Page.reload'}
+                             for name, _ in session.calls))
+
+    async def test_focus_recovery_rejects_stale_source_and_failed_exact_restoration(self):
+        stale = Session()
+        result = await stale.run(focus_restore=stale.saved)
+        self.assertEqual(result['status'], 'stale')
+        self.assertFalse(stale.guard or stale.bootstrap)
+        self.assertEqual(stale.restores, 0)
+        refused = Session(current=True, restore_mismatch=True)
+        result = await refused.run(focus_restore=refused.saved)
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(refused.restores, 1)
+        self.assertFalse(refused.guard or refused.bootstrap)
+        self.assertTrue(result['guardCleanup']['removed'])
+
     async def test_matching_source_skips_guard_and_navigation(self):
         session = Session(current=True)
         result = await session.run()

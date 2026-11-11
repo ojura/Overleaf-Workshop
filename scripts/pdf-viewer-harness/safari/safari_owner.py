@@ -44,14 +44,17 @@ def command_request(value):
         'run': {'prefix', 'seconds', 'startMode', 'startWaitMs', 'scenario', 'pages'},
         'activate': {'prefix', 'sourceOnly', 'entrySha', 'entryBytes', 'workerUrl', 'workerSha', 'workerBytes'},
         'recover': {'prefix', 'receiptPrefix'}, 'transport-check': {'prefix'},
+        'restore-focus': {'prefix', 'receiptPrefix', 'focusReceiptPrefix'},
     }
     if action not in fields or set(value) - {'id', 'action'} - fields[action]:
         raise ValueError('Unknown owner action or command fields')
     result = {'id': identifier, 'action': action}
-    if action in {'run', 'activate', 'recover', 'transport-check'}:
+    if action in {'run', 'activate', 'recover', 'transport-check', 'restore-focus'}:
         result['prefix'] = prefix(value.get('prefix'))
-    if action == 'recover':
+    if action in {'recover', 'restore-focus'}:
         result['receiptPrefix'] = prefix(value.get('receiptPrefix'))
+    if action == 'restore-focus' and 'focusReceiptPrefix' in value:
+        result['focusReceiptPrefix'] = prefix(value['focusReceiptPrefix'])
     if action == 'run':
         scenario = value.get('scenario', 'sustained')
         seconds = value.get('seconds', {'short': 60, 'traverse': 60, 'manual': 120}.get(scenario, 600))
@@ -203,7 +206,7 @@ class Owner:
         self.job_request = request
         self.job = asyncio.create_task(self.operation(self.session, self.inspector, settings,
             request['prefix'], self.stop_event, operation=request['action'],
-            receipt_prefix=request.get('receiptPrefix'), seconds=request.get('seconds', 600),
+            receipt_prefix=request.get('receiptPrefix'), focus_receipt_prefix=request.get('focusReceiptPrefix'), seconds=request.get('seconds', 600),
             start_mode=request.get('startMode', 'immediate'), start_wait_ms=request.get('startWaitMs', 60000),
             source_only=request.get('sourceOnly', False), scenario=request.get('scenario', 'sustained'), pages=pages))
         self.publish(status='running', command=request['id'], action=request['action'], prefix=request['prefix'])
@@ -392,9 +395,10 @@ def parse_args(argv=None):
     command.add_argument('--execute', action='store_true')
     command.add_argument('--work-dir')
     command.add_argument('--id')
-    command.add_argument('action', choices=['status', 'run', 'activate', 'recover', 'resume', 'stop', 'close', 'transport-check'])
+    command.add_argument('action', choices=['status', 'run', 'activate', 'recover', 'resume', 'stop', 'close', 'transport-check', 'restore-focus'])
     command.add_argument('--prefix')
     command.add_argument('--receipt-prefix')
+    command.add_argument('--focus-receipt-prefix', help='Original activation receipt, only for older short results without saved focus')
     command.add_argument('--seconds', type=int)
     command.add_argument('--start-mode', choices=['immediate', 'tap'])
     command.add_argument('--start-wait-ms', type=int)
@@ -420,7 +424,7 @@ def main(argv=None):
     if not args.work_dir:
         raise ValueError('An owner command requires --work-dir')
     request = {'id': args.id, 'action': args.action}
-    for argument, field in [('prefix', 'prefix'), ('receipt_prefix', 'receiptPrefix'), ('seconds', 'seconds'),
+    for argument, field in [('prefix', 'prefix'), ('receipt_prefix', 'receiptPrefix'), ('focus_receipt_prefix', 'focusReceiptPrefix'), ('seconds', 'seconds'),
             ('start_mode', 'startMode'), ('start_wait_ms', 'startWaitMs'), ('scenario', 'scenario'),
             ('source_only', 'sourceOnly'), ('pages', 'pages')]:
         value = getattr(args, argument)

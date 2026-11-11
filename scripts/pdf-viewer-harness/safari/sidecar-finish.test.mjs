@@ -12,7 +12,7 @@ const box = (x, y, width, height) => ({ x, y, left: x, top: y, width, height,
 function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 0, pageLeft = 300, pageWidth = 300,
   stallDock, insufficientFloat = false, interruptDuringRestore = false, recoverFloatFrom,
   measurements = false, recoveryMeasurements, contentSizing = false, toggleDelay = 0,
-  selectedOutcome = 'delivered', initialWork, restoredWork, withholdRestoredFrames = false } = {}) {
+  selectedOutcome = 'delivered', initialWork, restoredWork, withholdRestoredFrames = false, focusLostAfterRestore = false } = {}) {
   let now = 0, serial = 0, columnX = 0, animation, column, pointer, callback, restoring, restoredAt;
   let closed = false, interrupted = false, stalled = false, recovery = false, recoveryPositioned = false;
   let measurementsOpen = measurements, recoveryDisclosureChanged = false;
@@ -136,6 +136,7 @@ function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 
     ...(restoredAt === undefined ? initialWork?.(now) : restoredWork?.(now - restoredAt)) });
   const probe = { token: result.token, result, budget, sample, guard, sleep: delay => new Promise(resolve => timeout(resolve, delay)),
     panel: () => reading.lab ? controls : undefined, panelState, readState: () => ({ ...reading }),
+    focusMatches: () => !focusLostAfterRestore,
     setPanelRestore(value) { callback = value; },
     dispose() { closed = true; result.observersRemoved = true; },
     restore() {
@@ -186,6 +187,15 @@ function fixture({ dock = 'float', floatX = 140, floatWidth = 200, readerLeft = 
       return result;
     }, get floating() { return floating; }, get now() { return now; }, get restoredAt() { return restoredAt; } };
 }
+
+test('terminal restoration checks current semantic focus after later reader rendering', async () => {
+  const h = fixture({ focusLostAfterRestore: true }); await h.run();
+  assert.match(h.result.failure, /Reading state differs after restoration/);
+  assert.equal(h.result.restorationExact, false);
+  assert.equal(h.result.focusRestored, false);
+  assert.deepEqual(h.result.readingState, h.result.saved);
+  assert.equal(h.result.observersRemoved, true);
+});
 
 test('restored progressive work can resume after a ready frame and settle beyond four seconds', async () => {
   const h = fixture({ restoredWork(elapsed) {

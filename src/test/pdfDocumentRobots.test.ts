@@ -867,11 +867,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                 const state = f.api.snapshot(), before = state.pages[0].payloads[0];
                 assert.strictEqual(before.helpers.length, crew, 'complete qualified crew survives bounded raster adaptation at ' + dpr + '/' + crew);
                 assert.strictEqual(leased.size, crew);
-                assert.strictEqual(state.maxSpriteBytes, 204800);
+                assert.strictEqual(state.maxSpriteBytes, 2 * 1024 * 1024);
                 assert.ok(state.spriteBytes <= state.maxSpriteBytes);
                 for (const actor of state.pages[0].actors) {
                     const factor = actor.vehicle === 'heavyquad' ? 2.5 : 1;
-                    const scale = 0.64 * 1.35 / Math.sqrt(dpr) * factor;
+                    const scale = 1.25 * 1.35 * factor;
                     assert.ok(Math.abs(actor.spriteScale - scale) < 1e-10, 'only backing density adapts');
                     assert.ok(actor.spriteDensity > 0 && actor.spriteDensity <= dpr);
                     const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
@@ -984,10 +984,17 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         }
     });
 
-    it('promotes a fully staged crew at the exact sprite cap without requesting fresh raster bytes', () => {
+    function nearCapDockScale() {
+        const cap = module.DOCUMENT_ROBOT_LIMITS.maxSpriteBytes;
+        const height = Math.floor(Math.sqrt(cap * 100 / (128 * 4)));
+        const width = Math.floor(cap / (height * 4));
+        return Math.min(width / 128, height / 100) / 3;
+    }
+
+    it('promotes a fully staged crew with less than one minimum sprite remaining without requesting fresh raster bytes', () => {
         const f = fixture({ seed: 1, maxActors: 2, device: 'mobile', encounterRandom: () => 1 }); f.desktop(3, 1200, 1000);
         const vehicles = ['quad'], held = new Set<string>();
-        const origin = { x: 200, y: 150, scale: 1 };
+        const origin = { x: 200, y: 150, scale: nearCapDockScale() };
         f.api.setDispatchOrigin({ reserve(vehicle: string) {
             if (!vehicles.includes(vehicle) || held.has(vehicle)) { return; }
             held.add(vehicle); return origin;
@@ -996,7 +1003,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             page.pageElement.rect = { left: 40, top: 60, width: 300, height: 420 }; return page; });
         f.api.setVisibleWork(pages.map(page => work([page]))); f.finish();
         const state = f.api.snapshot();
-        assert.strictEqual(state.spriteBytes, 204800);
+        assert.ok(state.maxSpriteBytes - state.spriteBytes < 128 * 100 * 4, 'less than one minimum body remains');
         assert.strictEqual(held.size, 1);
         const actor = state.advance[0].actors[0], sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
         const size = [sprite.width, sprite.height], allocations = f.owned.length;
@@ -1014,7 +1021,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.desktop(carrier === 'overbudget' ? 3 : 1, 1280, 1000);
         const held = new Set<string>(), releases: string[] = [], reservations: string[] = [];
         let staging = true;
-        const groundDock = { x: 1200, y: 280, scale: carrier === 'overbudget' ? 1 : 0.7 }, airDock = { x: 1100, y: 90, scale: 0.7 };
+        const groundDock = { x: 1200, y: 280, scale: carrier === 'overbudget' ? nearCapDockScale() : 0.7 }, airDock = { x: 1100, y: 90, scale: 0.7 };
         f.api.setDispatchOrigin({ reserve(vehicle: string) {
             if (held.has(vehicle) || vehicle !== 'lugv' && (vehicle !== 'heavyquad' || carrier === 'unavailable' || staging && carrier !== 'owned')) { return; }
             held.add(vehicle); reservations.push(vehicle);
@@ -1025,7 +1032,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.api.setVisibleWork([work([page], ['preparing'])]); f.tick(1600);
         const actor = f.api.snapshot().advance[0].actors.find((value: any) => value.vehicle === 'lugv');
         assert.ok(actor, 'the real advance crew has the L-UGV body');
-        if (carrier === 'overbudget') { assert.strictEqual(f.api.snapshot().spriteBytes, 204800, 'the existing staged owner consumes the real joint cap'); }
+        if (carrier === 'overbudget') { assert.ok(f.api.snapshot().maxSpriteBytes - f.api.snapshot().spriteBytes < 128 * 100 * 4, 'the staged owner leaves less than one minimum body'); }
         const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
         const start = point(sprite);
         staging = false;
@@ -3249,8 +3256,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(rear.width, attachment.rearFork.strokeWidth);
         assert.deepStrictEqual(parcel, [attachment.cargo.x, attachment.cargo.y]);
 
-        for (const desktop of [false, true]) {
-            const f = fixture({ maxActors: 1, seed: forkWorkSeed }); if (desktop) { f.desktop(2); }
+        for (const { desktop, dpr } of [{ desktop: false, dpr: 1 }, { desktop: false, dpr: 3 }, { desktop: true, dpr: 2 }]) {
+            const f = fixture({ maxActors: 1, seed: forkWorkSeed }); if (desktop) { f.desktop(dpr); }
+            else { f.window.devicePixelRatio = dpr; }
             const held = new Set<string>();
             if (!desktop) {
                 const dock = { x: 0, y: 630, scale: 0.5 };
@@ -3848,7 +3856,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             'compact backing must cover the admitted physical artwork size');
         assert.ok(sprite.height >= Math.ceil(parseFloat(sprite.style.height) * 3 - 0.02));
         const state = f.api.snapshot();
-        assert.strictEqual(state.maxSpriteBytes, 4 * 128 * 100 * 4);
+        assert.strictEqual(state.maxSpriteBytes, 2 * 1024 * 1024);
         assert.ok(state.spriteBytes <= state.maxSpriteBytes);
         f.finish();
         assert.strictEqual(f.api.snapshot().retainedBytes, 0);
@@ -4972,7 +4980,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             const state = f.api.snapshot();
             assert.strictEqual(state.maxActors, 4);
             assert.strictEqual(state.maxCargoBytes, 512 * 1024);
-            assert.strictEqual(state.maxSpriteBytes, 4 * 128 * 100 * 4);
+            assert.strictEqual(state.maxSpriteBytes, 2 * 1024 * 1024);
             assert.ok(state.activeActors <= 4 && state.cargoBytes <= 512 * 1024 && state.spriteBytes <= state.maxSpriteBytes);
             f.frame();
             const actors = f.api.snapshot().pages.flatMap((page: any) => page.actors);
@@ -5809,7 +5817,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             }
             f.api.setVisiblePages([p.page.pageNumber]); f.api.preparePublication(p.candidate, p.encounter).commit(); f.tick(300);
             const before = f.api.snapshot();
-            assert.strictEqual(before.maxSpriteBytes, 204800); assert.strictEqual(before.maxCargoBytes, 524288);
+            assert.strictEqual(before.maxSpriteBytes, 2 * 1024 * 1024); assert.strictEqual(before.maxCargoBytes, 524288);
             assert.ok(before.activeActors > 0 && before.activeActors < 4, 'real delivery leaves an actor for quality');
             assert.ok(before.pages.some((page: any) => page.payloads.some((payload: any) => payload.rasterWidth > 0)));
             if (staged) { assert.ok(before.pages.flatMap((page: any) => page.actors).some((actor: any) => stagedIds.includes(actor.id)), 'staged body identity is reused: ' + JSON.stringify({ stagedIds, actors: before.pages.flatMap((page: any) => page.actors).map((actor: any) => ({ id: actor.id, vehicle: actor.vehicle })) })); }
@@ -5827,7 +5835,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                 assert.ok(current); assert.strictEqual(current.deadline, retained.deadline); assert.deepStrictEqual(current.helpers, retained.helpers);
             }
             const id = began.qualityReactions[0].id;
-            assert.strictEqual(began.qualityReactions[0].spriteBytes, 30184, 'the measured compact cleaner keeps its full natural DPR backing');
+            assert.strictEqual(began.qualityReactions[0].spriteBytes, 340560, 'the larger compact cleaner keeps its full natural DPR backing');
             for (const actor of began.pages.flatMap((page: any) => page.actors)) {
                 const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
                 const detail = Math.min(1, Math.max(actor.spriteScale, origin.scale) * 3);
@@ -5848,7 +5856,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         Object.assign(f.window, { devicePixelRatio: 3, innerWidth: 414, innerHeight: 896 });
         f.container.rect = { left: 0, top: 32, width: 414, height: 864 };
         const held = new Map<string, number>(), released: number[] = []; let leaseSerial = 0;
-        const origin = (vehicle: string) => ({ x: 200, y: 130, scale: vehicle === 'quad' ? .5 : .6 });
+        const origin = (vehicle: string) => ({ x: 200, y: 130, scale: vehicle === 'quad' ? 1.5 : 1.6 });
         f.api.setDispatchOrigin({ reserve(vehicle: string) {
             if (!['quad', 'tiltwing'].includes(vehicle) || held.has(vehicle) || !held.size && vehicle !== 'quad') { return; }
             held.set(vehicle, ++leaseSerial); return origin(vehicle);
@@ -6085,5 +6093,87 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.finish(); assert.strictEqual(f.api.snapshot().retainedBytes, 0); assert.strictEqual(held.size, 0);
     });
 
+
+    function phoneSizedPublication(dpr: number, vehicles: string[]) {
+        const f = fixture({ device: 'mobile', maxActors: 4, encounterRandom: () => .99 });
+        Object.assign(f.window, { devicePixelRatio: dpr, innerWidth: 402, innerHeight: 654 });
+        f.container.rect = { left: 0, top: 106, width: 402, height: 548 };
+        const held = new Set<string>(), origin = { x: 350, y: 292, scale: .3 };
+        f.api.setDispatchOrigin({ reserve(vehicle: string) {
+            if (!vehicles.includes(vehicle) || held.has(vehicle)) { return; }
+            held.add(vehicle); return origin;
+        }, destination: () => origin, release(vehicle: string) { assert.ok(held.delete(vehicle)); } });
+        const p = publication(f), width = 399.1184, height = 566.9288;
+        p.page.pageElement.rect = { left: 1.5, top: 106, width, height };
+        p.encounter.pageProjection = { content: { x: 0, y: 0, width, height }, clip: { x: 0, y: 0, width, height } };
+        p.candidate.canvas.width = 135; p.candidate.canvas.height = 192;
+        p.candidate.projection = { width: 135, height: 192, pageToRaster: [135, 0, 0, 192, 0, 0] };
+        p.encounter.imageRegions = [{ id: 'phone-portrait', resourceId: 'x5', x: .2, y: .2,
+            width: .3630606457469435, height: .11799540630704325 }];
+        return { f, p, held };
+    }
+
+    for (const vehicle of ['tiltwing', 'hexapod', 'walker']) {
+        it(`keeps visible phone ${vehicle} artwork at readable CSS size independently of DPR`, () => {
+            const scales: number[] = [];
+            for (const dpr of [3, 1]) {
+                const { f, p, held } = phoneSizedPublication(dpr, [vehicle]);
+                f.api.setVisiblePages([1]); f.api.preparePublication(p.candidate, p.encounter).commit();
+                const admitted = f.api.snapshot().pages[0]?.payloads[0]; assert.ok(admitted, 'real phone delivery admitted');
+                f.tick(admitted.deadline * .35);
+                const actor = f.api.snapshot().pages[0].actors[0]; assert.strictEqual(actor.vehicle, vehicle);
+                const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
+                const scale = parseFloat(sprite.style.width) / module.ROBOT_ARTWORK_SIZE.width;
+                scales.push(scale);
+                const ink = module.robotArtworkGeometry(vehicle, scale);
+                assert.ok(ink.width >= 65 && ink.width <= 85, 'actual swept artwork width: ' + ink.width);
+                assert.strictEqual(Number(sprite.style.opacity), 1);
+                assert.ok(Math.abs(scale - 1) < .001, 'fitted page preserves the intended display scale');
+                assert.ok(sprite.width >= Math.ceil(parseFloat(sprite.style.width) * dpr - .02));
+                assert.strictEqual(f.api.snapshot().maxCargoBytes, 524288);
+                pointer(f, 'pointermove', point(sprite)); f.frame();
+                const readable = captions(f).find(node => node.isConnected && node.style.opacity === '1');
+                assert.ok(readable, 'actual loaded attention admits readable text beside the larger body');
+                assert.strictEqual(readable.style.fontSize, '12px', 'caption text keeps CSS sizing at either DPR');
+                f.finish(); assert.strictEqual(held.size + f.api.snapshot().retainedBytes + f.callbacks.size, 0);
+            }
+            assert.ok(Math.abs(scales[0] - scales[1]) < .001, 'DPR changes backing pixels, not document body geometry');
+        });
+    }
+
+    it('funds a readable mixed MORUS phone crew together with its actual quality cleaner', () => {
+        const { f, p, held } = phoneSizedPublication(3, ['heavyquad', 'quad', 'tiltwing']);
+        p.encounter.imageRegions = [0, 1, 2].map(index => ({ id: 'phone-photo-' + index, resourceId: 'x' + (5 + index),
+            x: index === 1 ? .5086610871494731 : .12827872587838554,
+            y: index === 2 ? .5719593440603333 : .44177014447532975,
+            width: .3630606457469435, height: .11799540630704325 }));
+        f.api.setVisiblePages([1]); f.api.preparePublication(p.candidate, p.encounter).commit(); f.tick(300);
+        const before = f.api.snapshot(), actors = before.pages.flatMap((page: any) => page.actors);
+        assert.deepStrictEqual(actors.map((actor: any) => actor.vehicle).sort(), ['heavyquad', 'quad', 'tiltwing']);
+        assert.strictEqual(before.activeActors, 3);
+        const payloads = before.pages.flatMap((page: any) => page.payloads).map((payload: any) => ({ id: payload.id, deadline: payload.deadline, helpers: payload.helpers }));
+        const next = finalPublication(p);
+        next.coverage.resources = [0, 1, 2].map(index => ({ objectId: 'phone-object-' + index, imageId: 'x' + (5 + index), covered: true, final: true, failed: false }));
+        const transaction = f.api.preparePublication(next, p.encounter, p.candidate);
+        p.candidate.canvas.replaceWith(next.canvas); transaction.commit();
+        const began = f.api.snapshot(); assert.strictEqual(began.qualityReactions.length, 1);
+        assert.strictEqual(began.activeActors, 4); assert.strictEqual(began.maxSpriteBytes, 2 * 1024 * 1024);
+        assert.strictEqual(began.maxCargoBytes, 512 * 1024);
+        for (const actor of began.pages.flatMap((page: any) => page.actors)) {
+            assert.strictEqual(actor.spriteScale, actor.vehicle === 'heavyquad' ? 2.5 : 1);
+            assert.ok(actor.spriteDensity >= 2, 'mixed crew keeps at least double-density artwork');
+        }
+        assert.ok(began.qualityReactions[0].spriteBytes >= 220 * 172 * 4, 'proportionate cleaner retains the same joint detail');
+        assert.ok(began.spriteBytes <= began.maxSpriteBytes);
+        const actual = f.owned.filter(canvas => canvas.isConnected && ['pdfDocumentRobotVehicle', 'pdfDocumentRobotQualityCleaner'].includes(canvas.className));
+        assert.strictEqual(began.spriteBytes, actual.reduce((sum, canvas) => sum + canvas.width * canvas.height * 4, 0));
+        for (const retained of payloads) {
+            const current = began.pages.flatMap((page: any) => page.payloads).find((payload: any) => payload.id === retained.id);
+            assert.ok(current); assert.strictEqual(current.deadline, retained.deadline); assert.deepStrictEqual(current.helpers, retained.helpers);
+        }
+        const id = began.qualityReactions[0].id; f.finish(); const done = f.api.snapshot();
+        assert.strictEqual(done.qualityOutcomes.find((value: any) => value.id === id).outcome, 'completed');
+        assert.strictEqual(done.retainedBytes + done.activeActors + held.size + f.callbacks.size, 0);
+    });
 
 });

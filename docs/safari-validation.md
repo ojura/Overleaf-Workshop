@@ -74,7 +74,7 @@ For a passive manual session on the same retained connection:
   --prefix manual-1 --scenario manual --seconds 120
 ```
 
-For a stale release, submit `activate` without `--source-only`, adding the new `--entry-file` if the owner was started against an earlier release. `recover --receipt-prefix <original-prefix>` collects the surviving original sustained probe. `resume` explicitly asks the existing Safari application to resume without creating a tab. `transport-check` performs the maintained bounded Inspector transport diagnostic. `status`, `stop` and `close` report state, stop the owned workload, or close the owner respectively. Every command includes the same `--work-dir`, a fresh `--id`, and `--execute`.
+For a stale release, submit `activate` without `--source-only`, adding the new `--entry-file` if the owner was started against an earlier release. `recover --receipt-prefix <original-prefix>` collects the surviving original sustained probe. `restore-focus --receipt-prefix <original-short-prefix>` restores the original semantic focus after a short result has restored its reader coordinates and released its probes. `resume` explicitly asks the existing Safari application to resume without creating a tab. `transport-check` performs the maintained bounded Inspector transport diagnostic. `status`, `stop` and `close` report state, stop the owned workload, or close the owner respectively. Every command includes the same `--work-dir`, a fresh `--id`, and `--execute`.
 
 An invocation without the execution flag is inert. Command receipts are consumed before mutation so repeating an ID cannot repeat a workload. Keep the owner attached through result collection and review; use `close` when finished. Host errors and an unavailable page are recorded without silently starting a different attempt.
 
@@ -94,11 +94,21 @@ The temporary native `Page.setBootstrapScript` guard spans the reload. One JavaS
 
 Wait for `isInitialViewSet`, fulfillment of the captured same-document `pdfViewer.pagesPromise`, and two actual animation frames before restoration. Pinned PDF.js may apply its initial view twice when page dimensions differ. Restore the captured numeric view after those passes, then verify reader, sidebar, lab and focus state. For saved BODY focus, blur the current control and verify BODY became active; BODY.focus() is not a reliable restoration method. A saved element ID is valid only when it resolves to that exact light-DOM element.
 
-The pinned anonymous page text layer has a page-number focus descriptor only when it is exactly that page view's `textLayer.div`, inside its connected authoritative page root and reader. After the saved numeric view is applied, restoration waits for the new page view's actual connected text layer under the same cancellation and expiry owner. Lab handles have unique physical directions in `data-panel-resize`, so focused edge and corner controls can be reacquired exactly.
+Activation and short restoration share `reader-focus.mjs`. The pinned anonymous page text layer has a page-number focus descriptor only when it is exactly that page view's `textLayer.div`, inside its connected authoritative page root and reader. The short serializes that descriptor before changing the reader. After the saved numeric view is applied, restoration waits for the page view's current connected text layer under the same cancellation guard and restoration deadline, focuses it with `preventScroll`, and checks the semantic focus and reading coordinates. Lab handles have unique physical directions in `data-panel-resize`, so focused edge and corner controls can be reacquired exactly.
 
 Saved Lab restoration first restores the measurements disclosure, waits for its queued native toggle event, then waits for its content-height change to settle. It then restores the dock and waits for both movement markers to clear and measured geometry to settle before applying direct gestures. Use the southeast handle for a floating panel, east for a left dock and west for a right dock. Floating geometry uses one synchronous move toward the saved position, resize, then final position correction, followed by one settling wait. Moving first allows anchored growth; the final correction handles a starting panel whose larger size initially limits its position. Applying the disclosure after these gestures would replace the restored height with the new content fit.
 
 The activation deadline reserves separate time for restoration, bootstrap/guard removal and inspector cleanup. If input or navigation transfers ownership to the user, stop applying saved state. Let the temporary token expire and remove reachable bookkeeping; do not navigate the user back to a page solely to clean up a token.
+
+If a failed short has restored its coordinates and modes but failed focus restoration, use the retained owner with the exact release that produced the receipt:
+
+```sh
+"$SAFARI_PYTHON" scripts/pdf-viewer-harness/safari/safari_owner.py command \
+  --execute --work-dir "$SAFARI_WORK" --id focus-1 restore-focus \
+  --prefix focus-1 --receipt-prefix short-1
+```
+
+The command reads the short's original `focusRecovery` state. An older short that omitted this descriptor requires `--focus-receipt-prefix <original-activation-prefix>` naming its successful activation receipt; that receipt's preserved, restored and verified states must agree with the short's saved reader state. A fresh capture cannot replace the original baseline. The command verifies the executing release, document, URL, page, scale, scroll, modes, sidebar, robot/Lab settings and panel geometry, and requires all three probe globals to be absent. Trusted input, active selection/editing, changed reading state or an unavailable canonical focus target causes failure. It applies only focus with `preventScroll`, verifies again and releases its guard. It writes a separate recovery receipt and preserves the original failed result. An owner started with tooling that predates this command must close normally and restart with the corrected tooling on the same existing tab; this operation does not activate or reload the site.
 
 ## Coverage
 

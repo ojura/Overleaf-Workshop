@@ -261,6 +261,7 @@
         displayed: useful(end), missingPages: end.canvases.filter(page => !(displayed(page.preview)
           || page.state === 3 && displayed(page.native))).map(page => page.page) };
       result.readingState = probe.readState();
+      result.focusRestored = probe.focusMatches();
       const saved = result.saved, current = result.readingState;
       result.restorationExact = ['page', 'scaleValue', 'rotation', 'scrollMode', 'spreadMode', 'sidebar', 'robots', 'lab']
         .every(key => current[key] === saved[key]) && closeEnough(current.top, saved.top) && closeEnough(current.left, saved.left)
@@ -279,6 +280,7 @@
     dispose(); if (window.__spomenarSidecarProbe === probe) delete window.__spomenarSidecarProbe;
     result.finishedAt = performance.now();
     result.readingState = probe.readState();
+    result.focusRestored = probe.focusMatches();
   }
   return result;
 })

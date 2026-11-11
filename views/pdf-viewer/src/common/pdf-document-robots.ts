@@ -30,7 +30,7 @@ import { createPdfRasterProjection, resizePdfRasterProjection, projectPdfRasterC
 export const DOCUMENT_ROBOT_LIMITS = Object.freeze({
     maxActors: 4,
     maxCargoBytes: 512 * 1024,
-    maxSpriteBytes: 4 * ROBOT_ARTWORK_SIZE.width * ROBOT_ARTWORK_SIZE.height * 4,
+    maxSpriteBytes: 2 * 1024 * 1024,
     maxFragmentsPerPage: 3,
     fragmentDimension: 160,
     sampleDimension: 64,
@@ -38,7 +38,8 @@ export const DOCUMENT_ROBOT_LIMITS = Object.freeze({
     minDurationMs: 1800,
     maxDurationMs: 2900,
     trafficSettleMs: 180,
-    spriteScale: 0.64,
+    spriteScale: 0.64, // Authored cargo/formation offset reference, independent of displayed size.
+    compactSpriteScale: 1.25,
     maxDpr: 3,
     flightBankDegrees: 4,
     advance: Object.freeze({ arrivalMs: 900, coordinationMs: 550, returnMs: 650, desktopCrew: 2, mobileCrew: 1 }),
@@ -551,12 +552,13 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             maxFragmentsPerPage: desktop ? policy.maxActors : DOCUMENT_ROBOT_LIMITS.maxFragmentsPerPage,
             fragmentDimension: desktop ? policy.fragmentDimension : DOCUMENT_ROBOT_LIMITS.fragmentDimension,
             spriteScale: (desktop ? clamp(width / policy.scaleWidth, policy.minSpriteScale, policy.spriteScale)
-                : DOCUMENT_ROBOT_LIMITS.spriteScale) * screen.cssScale * document.bodyScale,
+                : DOCUMENT_ROBOT_LIMITS.compactSpriteScale) * (desktop ? screen.cssScale : 1) * document.bodyScale,
             spriteDpr: clamp(win.devicePixelRatio || 1, 1, DOCUMENT_ROBOT_LIMITS.maxDpr),
             documentScale: document.bodyScale,
             cargoEdge: document.cargoEdge,
             cleanerScale: (desktop ? DOCUMENT_ROBOT_LIMITS.cleaner.desktopScale : DOCUMENT_ROBOT_LIMITS.cleaner.compactScale)
-                * screen.cssScale * document.bodyScale,
+                * (desktop ? screen.cssScale : DOCUMENT_ROBOT_LIMITS.compactSpriteScale / DOCUMENT_ROBOT_LIMITS.spriteScale)
+                * document.bodyScale,
             minimumWidth: desktop ? 160 : 128,
             minimumHeight: desktop ? 120 : 96,
         };

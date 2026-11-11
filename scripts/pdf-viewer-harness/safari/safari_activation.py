@@ -151,7 +151,7 @@ class Activation:
 
 
 async def release_check(command, evaluate, response_methods, *, document, expected_sha, expected_bytes, source_only=False,
-                        budget=None, token=None, stop_event=None):
+                        budget=None, token=None, stop_event=None, focus_restore=None):
     budget = budget or Budget()
     run = Activation(command, evaluate, response_methods, budget, document, expected_sha, expected_bytes)
     token = token or secrets.token_hex(12)
@@ -209,10 +209,10 @@ async def release_check(command, evaluate, response_methods, *, document, expect
         receipt['before'] = await run.loaded_source()
         if not receipt['before']['ok']:
             raise RuntimeError('Loaded-source inspection failed')
-        if receipt['before']['matched']:
+        if receipt['before']['matched'] and focus_restore is None:
             receipt['status'] = 'current'
             return receipt
-        if source_only:
+        if not receipt['before']['matched'] and (source_only or focus_restore is not None):
             receipt['status'] = 'stale'
             return receipt
         if stop_event and stop_event.is_set():
@@ -231,6 +231,19 @@ async def release_check(command, evaluate, response_methods, *, document, expect
         await wait_ready()
         # A fresh quiet window belongs to this operation, not an old manual-event log.
         await budget.pause(0.3)
+        if focus_restore is not None:
+            saved = focus_restore
+            receipt['preserved'] = saved
+            if stop_event and stop_event.is_set():
+                raise RuntimeError('Owner requested stop before focus restoration')
+            receipt['restored'] = await run.value('/*release:restore*/ window[' + name + '].restoreFocus(' + json.dumps(saved) + ')')
+            if not receipt['restored'] or receipt['restored'].get('exact') is not True:
+                raise RuntimeError('The original focus was not restored exactly')
+            receipt['verified'] = await run.value('/*release:verify*/ window[' + name + '].verify(' + json.dumps(saved) + ')')
+            if not receipt['verified'] or receipt['verified'].get('exact') is not True:
+                raise RuntimeError('Reading state changed after focus restoration')
+            receipt['status'] = 'focus-restored'
+            return receipt
         saved = await run.value('/*release:capture*/ window[' + name + '].capture(true)')
         receipt['preserved'] = saved
         if stop_event and stop_event.is_set():
