@@ -10,7 +10,7 @@ The SVG robot button in the header controls deliveries on the document and start
 
 Larger fragments sometimes travel with a pair or trio sharing one payload. Aerial-ground teams can rendezvous, hand the fragment to a ground carrier and finish the delivery together. These episodes share the same actor and memory limits as solo couriers, with a single copied fragment for the whole team.
 
-When a robot speaks, the bubble and its visible speakers stay still for a text-sized reading interval of 1.8 to 4 seconds. Any carried photograph and its attachments pause with the crew, then continue from the same pose. The bubble's reading time starts when it is actually visible, and each cue gets one finite speaking beat. Scrolling, changing the page or layout, and turning the effect off end that beat immediately so the reader keeps control.
+When a robot speaks, its bubble keeps its first readable position for a text-sized interval of 1.8 to 4 seconds while the action continues. Leader lines follow the moving speakers. A line begins only when its cast has enough visible time for the complete interval; delivery pacing is set before the job starts, with a slightly brisker pace for harder work. Scrolling, changing the page or layout, and turning the effect off dismiss the current bubble so the reader keeps control.
 
 A separate measurement button opens the optional LARICS Motion Lab. Its fleet can be summoned while pages are ready, and it becomes the departure point for document deliveries while open. The lab starts closed. Search and outline remain in the PDF.js toolbar and sidebar. Download sends the same-origin PDF URL directly to the browser's download manager, so it does not assemble the full book in a JavaScript buffer first.
 

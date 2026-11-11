@@ -1,4 +1,4 @@
-import { RobotDialogueSelection, robotDialogueCatalogue, ROBOT_ENCOUNTER_DIALOGUE, type RobotIncidentDialogue as Dialogue, type RobotEncounterKind, type RobotDialogueChoice, type RobotDialogueOpportunity, type RobotDialogueSpeaker, type RobotDialogueFact } from './robot-dialogue';
+import { RobotDialogueSelection, robotDialogueCatalogue, robotCaptionReadMs, ROBOT_DIALOGUE_READ_POLICY, ROBOT_ENCOUNTER_DIALOGUE, type RobotIncidentDialogue as Dialogue, type RobotEncounterKind, type RobotDialogueChoice, type RobotDialogueOpportunity, type RobotDialogueSpeaker, type RobotDialogueFact } from './robot-dialogue';
 import { ROBOT_AIRLIFT_ATTACHMENT, ROBOT_VEHICLES, type RobotVehicle } from './prefetch-robots';
 import { planRobotRescue, ROBOT_RESCUE_CAPABILITIES, ROBOT_RESCUE_POLICY, type RobotRescuePlan } from './robot-rescue';
 import { GROUND_ROUTE_MAX_SLOPE } from './robot-cargo-routes';
@@ -25,16 +25,13 @@ export const ROBOT_ENCOUNTER_POLICY = Object.freeze({
     minDurationMs: 560,
     maxDurationMs: 1550,
     endMarginMs: 40,
-    captionBaseMs: 1200,
-    captionCharacterMs: 45,
-    captionMinMs: 1800,
-    captionMaxMs: 4000,
+    ...ROBOT_DIALOGUE_READ_POLICY,
     maxCaptionActors: 3,
     gestureSteps: 12,
 });
 
 export type { RobotEncounterKind } from './robot-dialogue';
-export { ROBOT_ENCOUNTER_DIALOGUE } from './robot-dialogue';
+export { ROBOT_ENCOUNTER_DIALOGUE, robotCaptionReadMs } from './robot-dialogue';
 export type RobotExpression = 'drowsy' | 'startled' | 'annoyed' | 'sheepish' | 'pleased';
 export const ROBOT_BOOK_CHARACTERS = Object.freeze({
     pioneer: Object.freeze({ model: 'Pioneer', names: Object.freeze(['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot']),
@@ -60,6 +57,7 @@ export interface RobotEncounterActor extends Point {
     group?: number;
     phase: 'advance' | 'return' | 'deposit' | 'cargo' | 'parked';
     remainingMs: number;
+    availableMs?: number;
     opacity: number;
     vehicle?: RobotVehicle;
     scale?: number;
@@ -108,12 +106,6 @@ interface Incident {
 }
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
 
-export function robotCaptionReadMs(lines: readonly string[]): number {
-    const policy = ROBOT_ENCOUNTER_POLICY;
-    return clamp(policy.captionBaseMs + lines.reduce((count, line) => count + line.length, 0)
-        * policy.captionCharacterMs, policy.captionMinMs, policy.captionMaxMs);
-}
-
 const traffic = (actor: RobotEncounterActor) => actor.phase === 'advance' || actor.phase === 'return' || actor.phase === 'cargo';
 const key = (a: number, b: number) => a < b ? a + ':' + b : b + ':' + a;
 const squared = (point: Point) => point.x * point.x + point.y * point.y;
@@ -150,6 +142,9 @@ export class RobotEncounters {
     reserveSpeech(key: string, opportunity: RobotDialogueOpportunity, actors: readonly RobotDialogueSpeaker[], geometry: string): RobotDialogueChoice | undefined {
         return this.speech.reserve(key, opportunity, actors, geometry);
     }
+    prospectiveSpeechReadMs(key: string, fact: RobotDialogueFact, actors: readonly RobotDialogueSpeaker[]): number | undefined {
+        return this.speech.prospectiveReadMs(key, fact, actors);
+    }
     admitSpeech(choice: RobotDialogueChoice): boolean { return this.speech.admit(choice); }
     rejectSpeechGeometry(choice: RobotDialogueChoice): void { this.speech.rejectGeometry(choice); }
     releaseSpeech(choice: RobotDialogueChoice): void { this.speech.release(choice); }
@@ -167,7 +162,8 @@ export class RobotEncounters {
                 }
                 facts.push(...(evidence?.get(actor.id) ?? []));
                 return { id: actor.id, vehicle: actor.vehicle ?? '',
-                    name: ROBOT_VEHICLES.find(vehicle => vehicle.id === actor.vehicle)?.name ?? 'Robot', facts };
+                    name: ROBOT_VEHICLES.find(vehicle => vehicle.id === actor.vehicle)?.name ?? 'Robot', facts,
+                    availableMs: actor.availableMs };
             }), this.speechGeometry, allowedIds);
         return choice ? { dialogue: { id: choice.entry.id, kind, lines: choice.lines } as Dialogue, choice } : undefined;
     }

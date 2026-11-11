@@ -51,6 +51,67 @@ describe('semantic robot dialogue admission', function () {
         const choice = model.reserve('team', 'deposit', [actor, { id: 2, vehicle: 'pioneer', name: 'Bravo' }]);
         assert.deepStrictEqual(choice.speakers, [1, 2]); assert.strictEqual(choice.lines.length, 2);
     });
+    it('requires a complete visible reading window for every speaker in an authored exchange', () => {
+        const entry = module.robotDialogueCatalogue(module.ROBOT_ENCOUNTER_DIALOGUE)
+            .find((value: any) => value.id === 'success-handoff');
+        const model = new module.RobotDialogueSelection([entry]);
+        const crew = [{ ...actor, facts: ['placing'], availableMs: 4000 },
+            { id: 2, vehicle: 'forklift', name: 'Navines', facts: ['placing'], availableMs: 50 }];
+        assert.strictEqual(model.reserve('shared-work', 'set-down', crew, 'same-layout'), undefined,
+            'the reply cannot be assigned to an actor about to disappear');
+        assert.strictEqual(model.snapshot().reserved + model.snapshot().shown + model.snapshot().blocked, 0);
+        assert.deepStrictEqual(model.snapshot().coverage, []);
+        const choice = model.reserve('shared-work', 'set-down', crew.map(value => ({ ...value, availableMs: 4000 })), 'same-layout');
+        assert.ok(choice, 'the whole exchange remains eligible when both actual speakers have time');
+        assert.deepStrictEqual(choice.lines, entry.lines);
+        assert.deepStrictEqual(choice.speakers, [1, 2]);
+        assert.strictEqual(model.admit(choice), true);
+        assert.strictEqual(model.snapshot().shown, 1);
+        assert.ok(model.snapshot().coverage.every((value: any) => value.count === 1));
+        model.release(choice);
+        assert.strictEqual(model.snapshot().reserved, 0);
+    });
+    it('assigns a full timed exchange to available speakers while a brief bystander can leave', () => {
+        const entry = module.robotDialogueCatalogue(module.ROBOT_ENCOUNTER_DIALOGUE)
+            .find((value: any) => value.id === 'success-handoff');
+        const model = new module.RobotDialogueSelection([entry]);
+        const crew = [{ ...actor, facts: ['placing'], availableMs: 50 },
+            { id: 2, vehicle: 'forklift', name: 'Navines', facts: ['placing'], availableMs: 4000 },
+            { id: 3, vehicle: 'quad', name: 'EagleRed', facts: ['placing'], availableMs: 4000 }];
+        const choice = model.reserve('three-actors', 'set-down', crew);
+        assert.ok(choice);
+        assert.deepStrictEqual([...choice.speakers].sort(), [2, 3]);
+        assert.deepStrictEqual(choice.lines, entry.lines, 'both authored lines survive the cast assignment');
+        assert.strictEqual(module.robotDialogueChoiceSupported(choice, crew), true);
+        model.release(choice);
+        assert.strictEqual(model.snapshot().reserved + model.snapshot().shown + model.snapshot().blocked, 0);
+    });
+    it('can reselect an unseen shorter line without spending or excluding the longer authored meaning', () => {
+        const catalogue = module.robotDialogueCatalogue(module.ROBOT_ENCOUNTER_DIALOGUE);
+        const entries = catalogue.filter((value: any) => ['new-leaves', 'pioneer-hold'].includes(value.id));
+        const model = new module.RobotDialogueSelection(entries, 13);
+        const crew = [actor, { id: 2, vehicle: 'forklift', name: 'Navines' }];
+        const available = (availableMs: number) => crew.map(value => ({ ...value, availableMs }));
+        const long = model.reserve('delayed', 'carrying', available(4000), 'same-layout', ['new-leaves']);
+        assert.ok(long);
+        assert.strictEqual(module.robotDialogueChoiceSupported(long, available(2000)), false,
+            'a hidden long reservation must be rechecked against its now-shorter visible opportunity');
+        const short = model.reserve('delayed', 'carrying', available(2000), 'same-layout');
+        assert.ok(short); assert.strictEqual(short.entry.id, 'pioneer-hold');
+        assert.strictEqual(model.admit(long), false, 'the replaced unseen reservation cannot later claim exposure');
+        assert.deepStrictEqual(model.snapshot().coverage, []);
+        assert.strictEqual(model.snapshot().shown + model.snapshot().blocked, 0);
+        assert.strictEqual(model.snapshot().lastRejected, undefined, 'temporal fit does not reject the text geometry');
+        model.release(short);
+        const later = model.reserve('later', 'carrying', available(4000), 'same-layout', ['new-leaves']);
+        assert.ok(later, 'the longer meaning remains available in the same layout when action provides enough time');
+        assert.deepStrictEqual(later.lines, long.lines);
+        assert.strictEqual(model.admit(later), true);
+        assert.deepStrictEqual(model.snapshot().coverage.map((value: any) => ({ id: value.id, count: value.count })),
+            [{ id: 'new-leaves-lead', count: 1 }]);
+        model.release(later);
+        assert.strictEqual(model.snapshot().reserved, 0);
+    });
     it('keeps incident-only speech ineligible during ordinary work and bounds active reservations', () => {
         const model = new module.RobotDialogueSelection([{ id: 'actual-bump', opportunities: ['bump'], lines: ['Collision.'], source: 'synthetic incident fixture' }], 0, 1);
         assert.strictEqual(model.reserve('ordinary', 'carrying', [actor]), undefined);

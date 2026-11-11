@@ -4,9 +4,9 @@ import type { PdfPagePresentationCandidate, PdfPageCoverage } from './pdf-page-p
 import { paintRobotVehicle, robotArtworkGeometry, RobotRandom, ROBOT_ARTWORK_SIZE, ROBOT_FORKLIFT_ATTACHMENT, ROBOT_AIRLIFT_ATTACHMENT, ROBOT_VEHICLES, type RobotArtworkActor, type RobotVehicle, type RobotDispatchPort, type RobotDispatchPoint } from './prefetch-robots';
 import { pdfCachePolicy } from './scroll-prefetch';
 import { installReservedText } from './reserved-text';
-import { robotDialogueChoiceSupported, type RobotDialogueChoice, type RobotDialogueFact, type RobotDialogueOpportunity, type RobotDialogueSpeaker } from './robot-dialogue';
+import { robotDialogueChoiceSupported, ROBOT_DIALOGUE_READ_POLICY, type RobotDialogueChoice, type RobotDialogueFact, type RobotDialogueOpportunity, type RobotDialogueSpeaker } from './robot-dialogue';
 import { RobotEncounters, robotCaptionReadMs, ROBOT_INTERACTION_REACTIONS, ROBOT_OPERATION_DIALOGUE, type RobotEncounterActor, type RobotEncounterReaction } from './robot-encounters';
-import { LabelPlacementSolver, LABEL_PLACEMENT_LIMITS, type LabelPlacement, type LabelPlacementInput, type PlacementRect } from './label-placement';
+import { LabelPlacementSolver, labelPlacementLeaders, LABEL_PLACEMENT_LIMITS, type LabelPlacement, type LabelPlacementInput, type PlacementRect } from './label-placement';
 import { ASAP_CLEANER_ARTWORK_SIZE, paintAsapCleaner } from './robot-cleaner-artwork';
 import { computeCargoRoute, needsCargoAirlift, cargoAirliftReason, groundRouteDirection, clampGroundRoutePoint,
     CARGO_ROUTE_POLICY, type CargoRouteState, type CargoAirliftReason, type GroundRouteDirection } from './robot-cargo-routes';
@@ -35,15 +35,16 @@ export const DOCUMENT_ROBOT_LIMITS = Object.freeze({
     fragmentDimension: 160,
     sampleDimension: 64,
     maxFps: 30,
-    minDurationMs: 1800,
-    maxDurationMs: 2900,
+    minDurationMs: 4400,
+    maxDurationMs: 6200,
     trafficSettleMs: 180,
+    speech: Object.freeze({ minOpacity: 0.75, minVisibleFraction: 2 / 3 }),
     spriteScale: 0.64, // Authored cargo/formation offset reference, independent of displayed size.
     compactSpriteScale: 1.25,
     maxDpr: 3,
     flightBankDegrees: 4,
     advance: Object.freeze({ arrivalMs: 900, coordinationMs: 550, returnMs: 650, desktopCrew: 2, mobileCrew: 1 }),
-    replacement: Object.freeze({ durationMs: 2100, pickupEnd: 0.22, lowerEnd: 0.38, fragmentsPerDesktopPage: 3 }),
+    replacement: Object.freeze({ durationMs: 4200, pickupEnd: 0.22, lowerEnd: 0.38, fragmentsPerDesktopPage: 3 }),
     cleaner: Object.freeze({ durationMs: 600, desktopScale: 0.85, compactScale: 0.55 }),
     cooperative: Object.freeze({ rasterScale: 1.5, cropScale: 1.8, durationScale: 1.25 }),
     forklift: Object.freeze({ approachEnd: 0.16, liftStart: 0.44, baseInset: 14 }),
@@ -160,6 +161,10 @@ interface Payload {
     started: number;
     delay: number;
     duration: number;
+    /** The loaded leg and short handling interval keep their original pace. */
+    returnStartMs?: number;
+    /** Read budget selected from this crew's actual completed-work repertoire before launch. */
+    completedReadMs?: number;
     canvas?: HTMLCanvasElement;
     mast?: HTMLDivElement;
     sling?: HTMLDivElement;
@@ -189,6 +194,7 @@ interface Payload {
     phaseCommitments?: readonly ReadonlyMap<number, readonly RobotCommitment[]>[];
     commitmentTimelines?: ReadonlyMap<number, readonly { until: number; commitments: readonly RobotCommitment[] }[]>;
     activity?: { key: string; until: number };
+    speechWindow?: { key: string; until: ReadonlyMap<number, number> };
 }
 interface QualityScene {
     id: number; actorId: number; source: object; sourceDocument: object; appearance: string; sourcePage: number; pageNumber: number;
@@ -250,6 +256,7 @@ interface AdvanceActor {
     point: Point & { scale: number };
     formationOffset?: Point;
 }
+interface ReturnPacing { duration: number; readUntil?: number; visibleProgress?: number }
 interface AdvanceWork {
     key: string;
     pages: readonly DocumentRobotWorkPage[];
@@ -263,6 +270,7 @@ interface AdvanceWork {
     started: number;
     gestureAt?: number;
     returnAt?: number;
+    returnPacing?: ReturnPacing;
     returnPlanned?: boolean;
     returnCarry?: GroundCarry;
     sling?: HTMLDivElement;
@@ -312,6 +320,7 @@ interface ColumnPull {
     phase: 'approach' | 'pull' | 'waiting' | 'return';
     returnAt?: number;
     returnFrom?: Point & { scale: number };
+    returnPacing?: ReturnPacing;
 }
 interface Presentation {
     kind: 'compact' | 'desktop';
@@ -347,6 +356,8 @@ interface BodyPlacement {
     pullDirection?: -1 | 1;
     payload?: Payload;
     fixed?: boolean;
+    visibleUntil?: number;
+    speechMs?: number;
 }
 interface CaptionGroup {
     choice?: RobotDialogueChoice;
@@ -387,6 +398,8 @@ const HANDOFF_START = ROBOT_DELIVERY_PHASES.handoffStart;
 const HANDOFF_END = ROBOT_DELIVERY_PHASES.handoffEnd;
 const DEPOSIT_START = ROBOT_DELIVERY_PHASES.deposit;
 const RETURN_START = ROBOT_DELIVERY_PHASES.return;
+const SPEECH_ADMISSION_MS = 2 * 1000 / DOCUMENT_ROBOT_LIMITS.maxFps;
+const SPEECH_FORECAST_STEP_MS = 64;
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
 const ease = (value: number) => value * value * (3 - 2 * value);
 const straight = (from: Point, to: Point, amount: number): Point => ({ x: from.x + (to.x - from.x) * amount,
@@ -396,6 +409,17 @@ const curve = (start: Point, control: Point, end: Point, amount: number): Point 
     return { x: left * left * start.x + 2 * left * amount * control.x + amount * amount * end.x,
         y: left * left * start.y + 2 * left * amount * control.y + amount * amount * end.y };
 };
+function payloadTimeAt(payload: Payload, progress: number): number {
+    const phase = clamp(progress, 0, 1), returning = payload.returnStartMs ?? payload.duration * RETURN_START;
+    const elapsed = phase <= RETURN_START ? returning * phase / RETURN_START
+        : returning + (payload.duration - returning) * (phase - RETURN_START) / (1 - RETURN_START);
+    return payload.started + payload.delay + elapsed;
+}
+function payloadProgressAt(payload: Payload, at: number): number {
+    const elapsed = at - payload.started - payload.delay, returning = payload.returnStartMs ?? payload.duration * RETURN_START;
+    return clamp(elapsed <= returning ? elapsed / Math.max(1, returning) * RETURN_START
+        : RETURN_START + (elapsed - returning) / Math.max(1, payload.duration - returning) * (1 - RETURN_START), 0, 1);
+}
 const release = (canvas: HTMLCanvasElement) => { canvas.remove(); canvas.width = canvas.height = 0; };
 const counters = () => ({ episodes: 0, deliveredFragments: 0, removedFragments: 0, refinements: 0, cancelledEpisodes: 0, rejected: 0, skipped: 0,
     operationAdmissions: 0, operationCandidates: 0, operationCommitChecks: 0, operationNarrativeRecords: 0,
@@ -417,14 +441,8 @@ const PAGE_ARRIVAL_LAYER = 4;
 export function installPdfDocumentRobots(container: HTMLElement, options: Options = {}) {
     const doc = container.ownerDocument;
     const win = doc.defaultView!;
-    const wallNow = options.now ?? (() => win.performance.now());
-    let pausedMs = 0;
-    let speakingPause: { started: number; until: number; sceneAt: number } | undefined;
-    const now = () => {
-        const wall = wallNow();
-        return speakingPause ? speakingPause.sceneAt + Math.max(0, wall - speakingPause.until) : wall - pausedMs;
-    };
-    const speaking = () => !!speakingPause && wallNow() < speakingPause.until;
+    const now = options.now ?? (() => win.performance.now());
+    const wallNow = now;
     const requestFrame = options.requestFrame ?? (callback => win.requestAnimationFrame(callback));
     const cancelFrame = options.cancelFrame ?? (id => win.cancelAnimationFrame(id));
     const createCanvas = options.createCanvas ?? (() => doc.createElement('canvas'));
@@ -486,7 +504,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     let dispatchOrigin: RobotDispatchPort | undefined;
     let activePresentation: Presentation['kind'] | undefined;
     let capacityBlocked = false;
-    let speakingAdmissionBlocked = false;
+    let castAdmissionBlocked = false;
     let capacityFreed = false;
     let capacityOnMotionResume = false;
     let captionGroup: CaptionGroup | undefined;
@@ -583,20 +601,44 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     }
 
     function notifyCapacity(): void {
-        if (speaking()) { return; }
         const freed = capacityFreed;
         capacityFreed = false;
-        const speakingReleased = speakingAdmissionBlocked;
-        speakingAdmissionBlocked = false;
+        const speakingReleased = castAdmissionBlocked && !captionGroup;
+        if (speakingReleased) { castAdmissionBlocked = false; }
         if ((!freed && !speakingReleased) || !capacityBlocked || disposed || !enabled || hidden() || media.matches
             || !speakingReleased && actorCount() >= presentation().maxActors) { return; }
         capacityBlocked = false;
         options.onCapacityAvailable?.();
     }
 
-    function waitingForSpeech(): boolean {
-        if (!speaking()) { return false; }
-        speakingAdmissionBlocked = true; capacityBlocked = true;
+    function ownsReadableCast(body: RobotBody): boolean {
+        return captionGroup?.shownAt !== undefined && now() < captionGroup.until && captionGroup.lines.has(body.id);
+    }
+
+    function reusableAdvanceActors(): AdvanceActor[] {
+        return [...advance.values()].filter(work => !work.actors.some(actor => ownsReadableCast(actor.body))).flatMap(work => work.actors);
+    }
+
+    function waitingForCast(readyPage: HTMLElement): boolean {
+        const held = [...advance.values()].filter(work => work.actors.some(actor => ownsReadableCast(actor.body)));
+        for (const work of held) {
+            if (work.pages.some(page => page.pageElement === readyPage) && work.phase !== 'returning') {
+                beginAdvanceReturn(work); dirty = true; schedule();
+            }
+        }
+        const columnHeld = !!columnPull && ownsReadableCast(columnPull.body);
+        const heldRetiring = retiring?.pieces.filter(piece => piece.payload.helpers.some(ownsReadableCast)) ?? [];
+        if (!held.length && !columnHeld && !heldRetiring.length) { return false; }
+        const reclaimable = retiring?.pieces.filter(piece => !heldRetiring.includes(piece)) ?? [];
+        const occupied = actorCount() - reusableAdvanceActors().length - Number(!!columnPull && !columnHeld)
+            - reclaimable.reduce((total, piece) => total + piece.payload.helpers.length, 0);
+        const policy = presentation();
+        const retainedBytes = cargoBytes - reclaimable.reduce((total, piece) => total + (piece.payload.canvas ? piece.payload.bytes : 0), 0);
+        const nextBytes = Math.min(policy.maxCargoBytes, policy.fragmentDimension ** 2 * RGBA_BYTES);
+        const retainedRaster = heldRetiring.some(piece => !!piece.payload.canvas)
+            && retainedBytes + nextBytes > policy.maxCargoBytes;
+        if (occupied < policy.maxActors && !retainedRaster) { return false; }
+        castAdmissionBlocked = true; capacityBlocked = true;
         return true;
     }
 
@@ -804,24 +846,19 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
 
     function clearCaption(): void {
         if (captionTimer !== undefined) { win.clearTimeout(captionTimer); captionTimer = undefined; }
-        const paused = speakingPause;
-        if (paused) {
-            pausedMs += Math.max(0, Math.min(wallNow(), paused.until) - paused.started);
-            speakingPause = undefined;
-        }
         if (captionGroup?.choice && ![...speechCues.values()].some(cue => cue.choice === captionGroup!.choice)) { encounters.releaseSpeech(captionGroup.choice); }
         captionGroup?.node.remove();
         for (const leader of captionGroup?.leaders ?? []) { leader.remove(); }
         captionGroup = undefined;
         captionPlacement.reset();
         if (!episodes.size && !advance.size && !retiring && !columnPull && !qualityScenes.size) { transit.remove(); }
-        // Resume on the existing scheduler after the caller finishes any ownership changes.
-        if (paused) { dirty = true; schedule(); }
+        // A completed cast lease can make staged actors available to queued work.
+        if (castAdmissionBlocked) { dirty = true; schedule(); }
     }
 
     function expireCaption(group: CaptionGroup): void {
         if (captionTimer !== undefined) { win.clearTimeout(captionTimer); }
-        // One wall timeout completes the speaking beat; routes retain their scene-time ownership.
+        // Text owns one finite timeout while all action continues on the same clock.
         captionTimer = win.setTimeout(() => {
             if (captionGroup !== group) { return; }
             captionTimer = undefined; clearCaption();
@@ -834,12 +871,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             container.scrollTop || 0, documentOffset(), win.devicePixelRatio, size?.width, size?.height].join(':');
     }
 
-    function holdForReading(group: CaptionGroup, sourceUntil: number): void {
-        const wall = wallNow(), sceneAt = now();
+    function admitCaption(group: CaptionGroup, sourceUntil: number): void {
+        const wall = wallNow();
         group.shownAt = wall; group.until = wall + group.readMs; group.layoutKey = readingLayoutKey();
-        readCaptions.set(group.id, sourceUntil);
-        speakingPause = { started: wall, until: group.until, sceneAt };
-        if (frame) { cancelFrame(frame.id); frame = undefined; }
+        readCaptions.set(group.id, Math.max(sourceUntil, group.until));
         expireCaption(group);
     }
 
@@ -848,9 +883,6 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (!group) { return; }
         if (group.shownAt === undefined) { clearCaption(); return; }
         group.detached = true;
-        for (const leader of group.leaders) { leader.remove(); }
-        group.leaders = [];
-        if (group.placement) { group.placement = { ...group.placement, leaders: [] }; }
     }
 
     function detachActorCaption(id: number): void {
@@ -1100,7 +1132,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             // Final native pixels remain behind this already-connected coarse crop until commit.
             return { effect: { commit() {
                 const committedAt = now(); qualityPreparedActors--; scene.committed = true;
-                scene.deadline = Math.max(committedAt, scene.payload ? scene.payload.started + scene.payload.delay + scene.payload.duration : committedAt) + scene.duration;
+                scene.deadline = Math.max(committedAt, scene.payload ? payloadTimeAt(scene.payload, 1) : committedAt) + scene.duration;
                 qualityScenes.set(id, scene); paintQualityScene(scene, committedAt); requestPaint();
             },
                 abort() { releaseQualityScene(scene, 'cancelled', 'publication-aborted'); },
@@ -1127,7 +1159,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         for (const payload of episode.payloads) {
             retireUncovered(payload, episode.element);
             const previous = payload.canvas;
-            if (!previous || !previous.parentNode || now() >= payload.started + payload.delay + payload.duration * RETURN_START) { continue; }
+            if (!previous || !previous.parentNode || now() >= payloadTimeAt(payload, RETURN_START)) { continue; }
             const size = rasterSize(value.canvas, payload.crop, payload.mode, policy, value.rasterProjection);
             if (!size) { continue; }
             const key = size.width + 'x' + size.height + ':' + revision;
@@ -1333,7 +1365,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (existing) { return { ...existing, adopted: false }; }
         if (!allowNew) { return; }
         for (const work of advance.values()) {
-            if (work.phase === 'returning') { continue; }
+            if (work.phase === 'returning' || work.actors.some(actor => ownsReadableCast(actor.body))) { continue; }
             const index = work.actors.findIndex(actor => accepts(actor.body.vehicle));
             if (index < 0) { continue; }
             const actor = work.actors.splice(index, 1)[0];
@@ -1407,8 +1439,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (columnPull?.motion.id === motion.id) {
             const active = columnPull;
             active.motion = { ...active.motion, bounds: { ...area }, holdAtEnd: motion.holdAtEnd };
-            if (motion.holdAtEnd) { active.returnAt = undefined; active.returnFrom = undefined; }
-            else if (active.phase === 'waiting') { active.returnAt = now(); active.returnFrom = undefined; }
+            if (motion.holdAtEnd) { active.returnAt = undefined; active.returnFrom = undefined; active.returnPacing = undefined; }
+            else if (active.phase === 'waiting') { active.returnAt = now(); active.returnFrom = undefined; active.returnPacing = undefined; }
             // Geometry and continuation intent do not restart the committed leg.
             dirty = true; schedule();
             return;
@@ -1447,7 +1479,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 Object.assign(layer.style, { position: 'absolute', inset: '0', pointerEvents: 'none' });
                 layer.append(body.sprite); container.append(transit); transit.append(layer);
             }
-            columnPull = { motion: { ...motion, startedAt: motion.startedAt - pausedMs, bounds: { ...area } }, documentSize: { ...documentSize }, body, layer, start,
+            columnPull = { motion: { ...motion, bounds: { ...area } }, documentSize: { ...documentSize }, body, layer, start,
                 point: { ...start }, offsetX, startOpacity: opacity, opacity, laneY, side, phase: 'approach' };
             activePresentation = policy.kind;
             requestPaint();
@@ -1458,6 +1490,16 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         }
     }
 
+    function columnReturnPlacement(active: ColumnPull, from: Point & { scale: number }, progress: number,
+        dock: RobotDispatchPoint | undefined, viewport: ReturnType<typeof viewportBounds>) {
+        const destination = dock && !needsCargoAirlift(from, dock) ? dock
+            : { x: active.side === 1 ? viewport.left - 140 : viewport.right + 140, y: from.y, scale: active.body.spriteScale };
+        const amount = ease(progress);
+        return { body: active.body, point: straight(from, destination, amount),
+            scale: from.scale + ((destination.scale ?? active.body.spriteScale) - from.scale) * amount,
+            opacity: destination === dock ? 1 : 1 - amount, tilt: 0 };
+    }
+
     function paintColumnPull(at: number, viewport: ReturnType<typeof viewportBounds>, policy: Presentation,
         destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, placements: BodyPlacement[]): void {
         const active = columnPull;
@@ -1465,14 +1507,17 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         policy = pagePresentation(policy, active.documentSize);
         const { body, motion, side } = active;
         const end = motion.startedAt + motion.durationMs;
-        if (!motion.holdAtEnd && at >= (active.returnAt ?? end) + DOCUMENT_ROBOT_LIMITS.advance.returnMs
-            || actorCount() > policy.maxActors || !resizeSprite(body, policy)) {
+        if (actorCount() > policy.maxActors || !resizeSprite(body, policy)) {
             clearColumnPull(); return;
         }
         const pull = ROBOT_FORKLIFT_ATTACHMENT.pull[side === 1 ? 'right' : 'left'];
         const offsetX = documentOffset();
         const edgeX = motion.bounds!.x + (side === 1 ? 0 : motion.bounds!.width) + offsetX;
         const target = { x: edgeX - pull.x * ROBOT_FORKLIFT_ATTACHMENT.scale * policy.spriteScale, y: active.laneY };
+        let dock = destinations.get(body);
+        if (!dock && body.port === dispatchOrigin) {
+            try { dock = body.port?.destination(body.vehicle); } catch { /* The normal viewport exit remains available. */ }
+        }
         const progress = clamp((at - motion.startedAt) / motion.durationMs, 0, 1);
         const elapsed = motionLabColumnElapsed(at - motion.startedAt, motion.durationMs);
         const approach = motionLabEase(elapsed / MOTION_LAB_CHOREOGRAPHY.approachMs);
@@ -1486,18 +1531,19 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             active.returnAt ??= end;
             active.returnFrom ??= { ...target, scale: policy.spriteScale };
             active.phase = 'return';
-            const amount = ease(clamp((at - active.returnAt) / DOCUMENT_ROBOT_LIMITS.advance.returnMs, 0, 1));
-            const dock = destinations.get(body);
-            const destination = dock && !needsCargoAirlift(active.returnFrom, dock) ? dock
-                : { x: side === 1 ? viewport.left - 140 : viewport.right + 140, y: active.returnFrom.y, scale: policy.spriteScale };
-            point = straight(active.returnFrom, destination, amount);
-            scale = active.returnFrom.scale + ((destination.scale ?? policy.spriteScale) - active.returnFrom.scale) * amount;
-            opacity = destination === dock ? 1 : 1 - amount;
+            active.returnPacing ??= speakingReturnPacing(active.returnAt, [body],
+                (_body, progress) => columnReturnPlacement(active, active.returnFrom!, progress, dock, viewport), viewport);
+            if (at >= active.returnAt + active.returnPacing.duration) { clearColumnPull(); return; }
+            const placement = columnReturnPlacement(active, active.returnFrom,
+                pacedReturnProgress(at, active.returnAt, active.returnPacing), dock, viewport);
+            point = placement.point; scale = placement.scale; opacity = placement.opacity;
         }
         active.point = { ...point, scale }; active.offsetX = offsetX; active.opacity = opacity;
         placements.push({ body, point, scale, opacity, tilt: 0, activity: active.phase === 'pull' ? 'assist' : 'navigate',
             carrying: false, progress: Math.round(progress * 12) / 12, look: side, phase: 'parked', fixed: true,
-            remainingMs: active.phase === 'waiting' ? 0 : (active.returnAt ?? end) + DOCUMENT_ROBOT_LIMITS.advance.returnMs - at,
+            remainingMs: active.phase === 'waiting' ? 0 : (active.returnAt ?? end) + (active.returnPacing?.duration ?? DOCUMENT_ROBOT_LIMITS.advance.returnMs) - at,
+            speechMs: active.phase === 'waiting' ? movingSpeechBudget(body,
+                (_body, progress) => columnReturnPlacement(active, { ...point, scale }, progress, dock, viewport), viewport) : 0,
             pages: [...visible],
             pullDirection: active.phase === 'pull' ? side : undefined });
     }
@@ -1569,7 +1615,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         releasePayload(payload);
         // Keep only the shadow during the existing settle interval. The native photo is
         // already uncovered and no copied bitmap or independent animation clock survives.
-        const elapsed = now() - payload.started - payload.delay - payload.duration * DEPOSIT_START;
+        const elapsed = now() - payloadTimeAt(payload, DEPOSIT_START);
         if (!parent?.isConnected || !shown || elapsed >= MOTION_LAB_CHOREOGRAPHY.settleMs) { return; }
         let shadow: HTMLDivElement | undefined;
         try {
@@ -1593,7 +1639,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     function paintLandingShadow(payload: Payload, area: Geometry, at: number): void {
         const shadow = payload.landingShadow;
         if (!shadow) { return; }
-        const elapsed = at - payload.started - payload.delay - payload.duration * DEPOSIT_START;
+        const elapsed = at - payloadTimeAt(payload, DEPOSIT_START);
         if (elapsed >= MOTION_LAB_CHOREOGRAPHY.settleMs) { releaseLandingShadow(payload); return; }
         const opacity = 1 - ease(clamp(elapsed / MOTION_LAB_CHOREOGRAPHY.settleMs, 0, 1));
         Object.assign(shadow.style, {
@@ -1607,7 +1653,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (!payload.canvas) { return; }
         if (!payload.cover?.isConnected || payload.cover.parentNode !== pageElement) {
             releasePayload(payload);
-        } else if (now() >= payload.started + payload.delay + payload.duration * DEPOSIT_START) {
+        } else if (now() >= payloadTimeAt(payload, DEPOSIT_START)) {
             depositPayload(payload);
         }
     }
@@ -1627,7 +1673,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             if (!payload.canvas || !cover) { continue; }
             if (!pageElement.isConnected || payload.deposited
                 || cover.parentNode && cover.parentNode !== pageElement) { releasePayload(payload); continue; }
-            if (now() >= payload.started + payload.delay + payload.duration * DEPOSIT_START) { depositPayload(payload); continue; }
+            if (now() >= payloadTimeAt(payload, DEPOSIT_START)) { depositPayload(payload); continue; }
             try { if (cover.parentNode !== pageElement) { pageElement.append(cover); } }
             catch { releasePayload(payload); }
         }
@@ -1667,11 +1713,14 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const wanted = Math.min(2, policy.maxActors), bytes = Math.min(policy.maxCargoBytes, policy.fragmentDimension ** 2 * RGBA_BYTES);
         const usedVehicles = () => new Set([...episodes.values()].flatMap(actorsOf)
             .concat(retiring?.pieces.flatMap(piece => piece.payload.helpers) ?? []).map(actor => actor.vehicle)).size;
-        // Useful new delivery takes capacity from old teardown before it can be reported busy.
-        while (retiring && (actorCount() - advanceActors().length + wanted > policy.maxActors
+        // Useful new delivery reclaims old teardown while an admitted speaking cast
+        // keeps its existing finite route and readable interval.
+        while (retiring && (actorCount() - reusableAdvanceActors().length + wanted > policy.maxActors
             || cargoBytes + bytes > policy.maxCargoBytes
             || dispatchOrigin && usedVehicles() + wanted > ROBOT_VEHICLES.length)) {
-            dropRetiringPiece(retiring, 0);
+            const index = retiring.pieces.findIndex(piece => !piece.payload.helpers.some(ownsReadableCast));
+            if (index < 0) { return; }
+            dropRetiringPiece(retiring, index);
         }
     }
 
@@ -1755,7 +1804,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         interaction?.setEnabled(enabled && !hidden() && !media.matches);
         clearCaption();
         capacityBlocked = false;
-        speakingAdmissionBlocked = false;
+        castAdmissionBlocked = false;
         capacityOnMotionResume = false;
         dirty = false;
         if (frame) { cancelFrame(frame.id); frame = undefined; }
@@ -1863,6 +1912,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (!work.actors.length) { dropAdvance(work); return; }
         if (work.phase !== 'returning') {
             work.phase = 'returning'; work.returnAt = now();
+            work.returnPacing = undefined;
             for (const actor of work.actors) {
                 encounters.forget(actor.body.id, now()); detachActorCaption(actor.body.id);
                 actor.start = { ...actor.point };
@@ -1913,7 +1963,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const target = destinations.get(actor.body) ?? { x: viewport.right + 140, y: actor.start.y };
         const reason = cargoAirliftReason(actor.start, target, actor.body.vehicle, actor.body.drivingDirection);
         if (!reason) { commitGroundDrive(actor.body, actor.start, target); return; }
-        const early = (at - work.returnAt!) / DOCUMENT_ROBOT_LIMITS.advance.returnMs < CARGO_ROUTE_POLICY.recruitEnd;
+        const early = (at - work.returnAt!) / (work.returnPacing?.duration ?? DOCUMENT_ROBOT_LIMITS.advance.returnMs) < CARGO_ROUTE_POLICY.recruitEnd;
         const claim = recruitAircraft(actor.body, work.actors.map(value => ({ body: value.body, point: value.start })), policy, early);
         if (!claim) { commitGroundDrive(actor.body, actor.start, clampGroundRoutePoint(actor.start, target)); return; }
         if (claim.adopted && !resizeSprite(claim.body, policy)) { releaseActor(claim.body); return; }
@@ -1937,6 +1987,81 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         }
     }
 
+    function advanceReturnPlacement(work: AdvanceWork, actor: AdvanceActor, progress: number,
+        destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, viewport: ReturnType<typeof viewportBounds>) {
+        const body = actor.body, air = ROBOT_VEHICLES.find(spec => spec.id === body.vehicle)!.air;
+        const destination = destinations.get(body);
+        const end = destination && (air || !needsCargoAirlift(actor.start, destination)) ? destination
+            : { x: viewport.right + 140, y: actor.start.y, scale: body.spriteScale };
+        const amount = ease(progress);
+        let point = air ? curve(actor.start, { x: end.x, y: actor.start.y }, end, amount) : straight(actor.start, end, amount);
+        let scale = actor.start.scale + ((end.scale ?? body.spriteScale) - actor.start.scale) * amount;
+        let opacity = end === destination ? 1 : 1 - amount, carried = false;
+        const carry = work.returnCarry;
+        if (carry && (body === carry.ground || body === carry.air)) {
+            const target = destinations.get(carry.ground) ?? { x: viewport.right + 140, y: carry.from.y };
+            const route = computeCargoRoute({ progress, from: carry.from, to: target, airFrom: carry.airFrom,
+                cargoOffset: { x: 0, y: 0 }, airOffset: airliftOffset(carry.ground, carry.air),
+                groundRun: CARGO_ROUTE_POLICY.defaultGroundRun * carry.ground.spriteScale, carryReason: carry.reason });
+            carried = body === carry.ground && route.groundCarried;
+            point = body === carry.ground ? route.ground : route.air;
+            const released = ease(clamp((progress - CARGO_ROUTE_POLICY.setDownEnd) / (1 - CARGO_ROUTE_POLICY.setDownEnd), 0, 1));
+            const incomingScale = body === carry.ground ? carry.groundScale : carry.airScale;
+            const grownScale = incomingScale + (body.spriteScale - incomingScale) * ease(clamp(progress / CARGO_ROUTE_POLICY.driveEnd, 0, 1));
+            scale = grownScale + ((destination?.scale ?? body.spriteScale) - grownScale) * released;
+            if (body === carry.air && destination && !route.groundCarried && progress >= CARGO_ROUTE_POLICY.setDownEnd) {
+                point = straight(route.air, destination, released);
+            }
+            opacity = destination ? 1 : 1 - amount;
+        }
+        return { body, point, scale, opacity, tilt: 0, carried };
+    }
+
+    function visibleReturnProgress(actors: readonly RobotBody[],
+        projection: (body: RobotBody, progress: number) => Pick<BodyPlacement, 'body' | 'point' | 'scale' | 'opacity' | 'tilt'>,
+        viewport: ReturnType<typeof viewportBounds>): number {
+        let visible = 0;
+        for (let step = 1; step <= 32; step++) {
+            const progress = step / 32;
+            if (actors.some(body => !readableSpeakerInViewport(projection(body, progress), viewport))) { break; }
+            visible = progress;
+        }
+        return visible * 0.9;
+    }
+
+    function movingSpeechBudget(body: RobotBody,
+        projection: (body: RobotBody, progress: number) => Pick<BodyPlacement, 'body' | 'point' | 'scale' | 'opacity' | 'tilt'>,
+        viewport: ReturnType<typeof viewportBounds>): number {
+        const visible = visibleReturnProgress([body], projection, viewport), start = projection(body, 0), end = projection(body, visible);
+        const distance = Math.hypot(end.point.x - start.point.x, end.point.y - start.point.y);
+        const radius = robotArtworkGeometry(body.vehicle, start.scale).radius;
+        return ROBOT_DIALOGUE_READ_POLICY.captionMaxMs * Math.min(1, distance / Math.max(1, radius));
+    }
+
+    function speakingReturnPacing(started: number, actors: readonly RobotBody[],
+        projection: (body: RobotBody, progress: number) => Pick<BodyPlacement, 'body' | 'point' | 'scale' | 'opacity' | 'tilt'>,
+        viewport: ReturnType<typeof viewportBounds>): ReturnPacing {
+        const duration = DOCUMENT_ROBOT_LIMITS.advance.returnMs;
+        const group = captionGroup;
+        if (group?.shownAt === undefined || group.until <= now() || !actors.some(body => group.lines.has(body.id))) { return { duration }; }
+        const visible = visibleReturnProgress(actors.filter(body => group.lines.has(body.id)), projection, viewport);
+        const reading = Math.max(0, group.until - started);
+        return { duration: reading + duration,
+            readUntil: group.until, visibleProgress: Math.min(visible, reading / (duration + reading)) };
+    }
+
+    function pacedReturnProgress(at: number, started: number, pacing: ReturnPacing): number {
+        if (pacing.readUntil === undefined) { return clamp((at - started) / pacing.duration, 0, 1); }
+        const visible = pacing.visibleProgress ?? 0;
+        const reading = Math.max(1, pacing.readUntil - started);
+        if (at <= pacing.readUntil) { return visible * clamp((at - started) / reading, 0, 1); }
+        const t = clamp((at - pacing.readUntil) / DOCUMENT_ROBOT_LIMITS.advance.returnMs, 0, 1);
+        const slope = visible / reading * DOCUMENT_ROBOT_LIMITS.advance.returnMs / Math.max(1e-6, 1 - visible);
+        // Hermite interpolation keeps the same positive route velocity at the join.
+        const amount = (t * t * t - 2 * t * t + t) * slope + (-2 * t * t * t + 3 * t * t) + (t * t * t - t * t);
+        return visible + (1 - visible) * amount;
+    }
+
     function paintAdvance(work: AdvanceWork, at: number, viewport: ReturnType<typeof viewportBounds>, policy: Presentation,
         area: ReturnType<typeof advanceGeometry>, destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, placements: BodyPlacement[]): void {
         work.labelAnchor = undefined;
@@ -1950,10 +2075,14 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         policy = area.policy;
         const timing = DOCUMENT_ROBOT_LIMITS.advance;
         const elapsed = at - work.started;
-        if (work.phase === 'returning' && at - work.returnAt! >= timing.returnMs) { dropAdvance(work); return; }
         if (work.phase === 'returning') { planAdvanceReturn(work, viewport, policy, destinations, at); }
+        if (work.phase === 'returning') {
+            work.returnPacing ??= speakingReturnPacing(work.returnAt!, work.actors.map(actor => actor.body),
+                (body, progress) => advanceReturnPlacement(work, work.actors.find(actor => actor.body === body)!, progress, destinations, viewport), viewport);
+            if (at - work.returnAt! >= work.returnPacing.duration) { dropAdvance(work); return; }
+        }
         const carry = work.returnCarry;
-        const returnProgress = work.phase === 'returning' ? clamp((at - work.returnAt!) / timing.returnMs, 0, 1) : 0;
+        const returnProgress = work.phase === 'returning' ? pacedReturnProgress(at, work.returnAt!, work.returnPacing!) : 0;
         const route = carry && carryRoute(carry, destinations.get(carry.ground)
             ?? { x: viewport.right + 140, y: carry.from.y }, returnProgress);
         if (carry && route && work.sling) { paintSling(work.sling, carry.ground, carry.air, route); }
@@ -1975,6 +2104,13 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         work.text.setText(work.message);
         if (!resizeSprites(work.actors.map(actor => actor.body), policy)) { dropAdvance(work); return; }
         const targets = advanceTargets(work, area);
+        const returnDestinations = new Map(destinations);
+        if (work.phase !== 'returning') {
+            for (const actor of work.actors) {
+                try { if (actor.body.port === dispatchOrigin) { returnDestinations.set(actor.body, actor.body.port?.destination(actor.body.vehicle)); } }
+                catch { returnDestinations.set(actor.body, undefined); }
+            }
+        }
         for (let index = work.actors.length - 1; index >= 0; index--) {
             const actor = work.actors[index], body = actor.body;
             const target = targets[index];
@@ -1991,25 +2127,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 tilt = signal * (index % 2 ? -4 : 4);
             } else if (work.phase === 'parked') { point = target; scale = body.spriteScale; opacity = 1; }
             else if (work.phase === 'returning') {
-                const progress = ease(clamp((at - work.returnAt!) / timing.returnMs, 0, 1));
-                const destination = destinations.get(body);
-                const end = destination && (air || !needsCargoAirlift(actor.start, destination)) ? destination
-                    : { x: viewport.right + 140, y: actor.start.y, scale: body.spriteScale };
-                point = air ? curve(actor.start, { x: end.x, y: actor.start.y }, end, progress) : straight(actor.start, end, progress);
-                scale = actor.start.scale + ((end.scale ?? body.spriteScale) - actor.start.scale) * progress;
-                opacity = end === destination ? 1 : 1 - progress;
-                if (carry && route && (body === carry.ground || body === carry.air)) {
-                    body.carried = body === carry.ground && route.groundCarried;
-                    point = body === carry.ground ? route.ground : route.air;
-                    const released = ease(clamp((returnProgress - CARGO_ROUTE_POLICY.setDownEnd) / (1 - CARGO_ROUTE_POLICY.setDownEnd), 0, 1));
-                    const incomingScale = body === carry.ground ? carry.groundScale : carry.airScale;
-                    const grownScale = incomingScale + (body.spriteScale - incomingScale) * ease(clamp(returnProgress / CARGO_ROUTE_POLICY.driveEnd, 0, 1));
-                    scale = grownScale + ((destination?.scale ?? body.spriteScale) - grownScale) * released;
-                    if (body === carry.air && destination && !route.groundCarried && returnProgress >= CARGO_ROUTE_POLICY.setDownEnd) {
-                        point = straight(route.air, destination, released);
-                    }
-                    opacity = destination ? 1 : 1 - progress;
-                }
+                const placement = advanceReturnPlacement(work, actor, returnProgress, destinations, viewport);
+                point = placement.point; scale = placement.scale; opacity = placement.opacity; body.carried = placement.carried;
             }
             const paired = !!carry && !!route && (body === carry.ground || body === carry.air);
             const carrying = paired && body === carry!.air && route!.groundCarried;
@@ -2019,10 +2138,15 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 : work.phase === 'arriving' || work.phase === 'returning' ? 'navigate'
                 : work.phase === 'coordinating' ? 'assist' : 'park';
             const look = work.actors.length > 1 ? index ? -1 : 1 : 1;
-            const remainingMs = work.phase === 'returning' ? timing.returnMs - (at - work.returnAt!)
+            const remainingMs = work.phase === 'returning' ? work.returnPacing!.duration - (at - work.returnAt!)
                 : work.phase === 'parked' ? 0 : (work.gestureAt ?? work.started + timing.arrivalMs) + timing.coordinationMs - at;
+            const from = { ...actor, start: { ...point, scale } };
+            const futureWork = { ...work, returnCarry: undefined };
+            const speechMs = work.phase === 'returning' ? 0 : movingSpeechBudget(body,
+                (_body, progress) => advanceReturnPlacement(futureWork, from, progress, returnDestinations, viewport), viewport);
             placements.push({ body, point, scale, opacity, tilt, activity, carrying, progress: 0, look,
                 phase: paired || work.phase === 'parked' ? 'parked' : work.phase === 'returning' ? 'return' : 'advance', remainingMs,
+                speechMs,
                 group: paired ? -(carry!.ground.id + 1) : undefined,
                 pages: work.pages.map(page => page.pageNumber), advance: actor });
         }
@@ -2176,6 +2300,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const works = [...advance.values()].sort((a, b) => Number(b.pages.some(page => page.pageNumber === pageNumber))
             - Number(a.pages.some(page => page.pageNumber === pageNumber)));
         return works.flatMap(work => {
+            if (work.actors.some(actor => ownsReadableCast(actor.body))) { return []; }
             const actors = work.actors.splice(0);
             clearAdvanceCarry(work);
             for (const actor of actors) { actor.body.carried = false; }
@@ -2329,9 +2454,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             resolution: payload.resolution ?? 'pending' };
     }
 
-    function paintActor(actor: Courier, pageNumber: number, area: Geometry, path: ReturnType<typeof payloadPath>,
-        destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, viewport: ReturnType<typeof viewportBounds>, placements: BodyPlacement[], bank: number): void {
-        const payload = actor.payload;
+    function courierPlacement(actor: Courier, pageNumber: number, area: Geometry, path: ReturnType<typeof payloadPath>,
+        destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, viewport: ReturnType<typeof viewportBounds>, bank: number,
+        payload = actor.payload): BodyPlacement & { carried: boolean; routePhase?: string; recoveryOrigin?: Point & { scale: number; tilt: number } } {
         const progress = workMotionProgress(payload), returning = payload.progress >= RETURN_START;
         const limited = progress < payload.progress;
         const air = ROBOT_VEHICLES.find(vehicle => vehicle.id === actor.vehicle)!.air;
@@ -2345,11 +2470,11 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const growthEnd = payload.mode === 'airlift' ? CARGO_ROUTE_POLICY.driveEnd * DEPOSIT_START : 0.20;
         let spriteScale = launch ? originScale + (normalScale - originScale) * ease(clamp(progress / growthEnd, 0, 1)) : normalScale;
         let robot = { x: path.point.x + offset.x, y: path.point.y + offset.y };
-        actor.carried = false; actor.routePhase = undefined;
+        let carried = false, routePhase: string | undefined;
         if (paired && path.route) {
             robot = air ? path.route.air : path.route.ground;
-            actor.carried = !air && path.route.groundCarried;
-            actor.routePhase = path.route.phase;
+            carried = !air && path.route.groundCarried;
+            routePhase = path.route.phase;
         } else if (payload.mode === 'solo') {
             const offsetScale = air ? spriteScale / normalScale : 1;
             robot = { x: path.point.x + offset.x * offsetScale, y: path.point.y + offset.y * offsetScale };
@@ -2372,20 +2497,17 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         robot = bankPoint(robot, path.point, bank);
         let recoveryTilt = bank;
         let returningToLab = false;
+        let recoveryOrigin: Point & { scale: number; tilt: number } | undefined;
         if (returning) {
-            actor.departing = true;
             if (limited) {
-                payload.recoveryOrigins ??= new Map();
-                let origin = payload.recoveryOrigins.get(actor.id);
-                if (!origin) {
-                    origin = { x: (robot.x - area.pageLeft) / area.width, y: (robot.y - area.pageTop) / area.height,
-                        scale: spriteScale, tilt: bank };
-                    payload.recoveryOrigins.set(actor.id, origin);
-                }
+                const origin = payload.recoveryOrigins?.get(actor.id) ?? {
+                    x: (robot.x - area.pageLeft) / area.width, y: (robot.y - area.pageTop) / area.height,
+                    scale: spriteScale, tilt: bank };
+                recoveryOrigin = origin;
                 robot = { x: area.pageLeft + origin.x * area.width, y: area.pageTop + origin.y * area.height };
                 spriteScale = origin.scale;
                 recoveryTilt = origin.tilt;
-                paired = false; actor.carried = false; actor.routePhase = 'recovery';
+                paired = false; carried = false; routePhase = 'recovery';
             }
             const destination = destinations.get(actor);
             returningToLab = !!destination;
@@ -2433,23 +2555,65 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             ? !air ? path.route.phase === 'recruit' || path.route.phase === 'rendezvous' ? 'signal'
                 : path.route.groundCarried ? 'park' : 'navigate'
                 : path.route.groundCarried ? 'assist' : path.route.phase === 'rendezvous' ? 'load' : 'navigate'
-            : actor.departing || !photoLoaded && !payload.deposited ? 'navigate' : payload.deposited || lifting ? 'unload'
+            : returning || !photoLoaded && !payload.deposited ? 'navigate' : payload.deposited || lifting ? 'unload'
             : payload.mode === 'handoff' ? air ? payload.handedOff ? 'park' : 'deliver'
                 : payload.handedOff ? 'deliver' : progress >= RENDEZVOUS_END ? 'load' : 'navigate'
                 : payload.mode === 'formation' ? 'assist' : 'deliver';
         const opacity = Math.min(1, launch ? 1 : progress / 0.08, returningToLab ? 1 : (1 - payload.progress) / 0.12);
-        const independentTilt = air && !paired && !(limited && payload.mode === 'airlift') && !(payload.mode === 'handoff' && payload.handedOff && !actor.departing)
+        const independentTilt = air && !paired && !(limited && payload.mode === 'airlift') && !(payload.mode === 'handoff' && payload.handedOff && !returning)
             ? clamp((path.target.x - path.start.x) / area.width * 9, -8, 8) * (carrying ? 1 : -0.5) : 0;
         const tilt = payload.aerial ? !returning ? bank : limited ? recoveryTilt
             : independentTilt * ease(clamp((payload.progress - RETURN_START) / 0.08, 0, 1)) : independentTilt;
-        placements.push({ body: actor, point: robot, scale: spriteScale, opacity, tilt, activity, carrying,
+        return { body: actor, point: robot, scale: spriteScale, opacity, tilt, activity, carrying, carried, routePhase, recoveryOrigin,
             progress: lifting ? liftProgress : payload.deposited ? 1 : 0, look: payload.start.x < payload.crop.x + payload.crop.width / 2 ? 1 : -1,
-            phase: paired && actor.departing ? 'parked' : actor.departing ? 'return'
+            phase: paired && returning ? 'parked' : returning ? 'return'
                 : payload.deposited ? 'deposit' : photoLoaded ? 'cargo' : 'return',
-            remainingMs: !photoLoaded ? (1 - payload.progress) * payload.duration
-                : Math.max(0, (payload.ground ? DOCUMENT_ROBOT_LIMITS.forklift.liftStart : DEPOSIT_START) - payload.progress) * payload.duration,
+            remainingMs: Math.max(0, payloadTimeAt(payload, !photoLoaded ? 1
+                : payload.ground ? DOCUMENT_ROBOT_LIMITS.forklift.liftStart : DEPOSIT_START) - payloadTimeAt(payload, payload.progress)),
             group: payload.id, pages: [pageNumber], payload,
-            fixed: payload.deposited && !actor.departing || payload.ground && lifting || payload.stage === 'handoff' });
+            fixed: payload.deposited && !returning || payload.ground && lifting || payload.stage === 'handoff' };
+    }
+
+    function courierVisibilityDeadline(payload: Payload, actor: Courier, pageNumber: number, area: Geometry,
+        viewport: ReturnType<typeof viewportBounds>, at: number): number {
+        const key = [area.pageLeft, area.pageTop, area.width, area.height, viewport.left, viewport.top, viewport.right, viewport.bottom,
+            payload.returnPlanned, payload.returnCarry?.air.id, ...payload.helpers.map(body => body.spriteScale)].join(':');
+        if (payload.speechWindow?.key !== key) { payload.speechWindow = { key, until: new Map() }; }
+        const cached = payload.speechWindow.until.get(actor.id);
+        if (cached !== undefined && cached > at) { return cached; }
+        const destinations = new Map<RobotBody, RobotDispatchPoint | undefined>();
+        for (const body of payload.helpers) {
+            try { if (body.port === dispatchOrigin) { destinations.set(body, body.port?.destination(body.vehicle)); } }
+            catch { return at; }
+        }
+        // An unplanned carried return can recruit a different aircraft. Its actual route
+        // becomes forecastable after that ownership decision, not before it.
+        const unplannedCarry = !payload.returnPlanned && payload.helpers.some(body => body.vehicle === 'lugv')
+            || !payload.returnPlanned && payload.mode === 'airlift';
+        const end = payloadTimeAt(payload, unplannedCarry ? RETURN_START : 1);
+        let until = at;
+        const steps = Math.max(1, Math.ceil((end - at) / SPEECH_FORECAST_STEP_MS));
+        for (let step = 1; step <= steps; step++) {
+            const futureAt = at + (end - at) * step / steps;
+            const progress = payloadProgressAt(payload, futureAt);
+            const future = { ...payload, progress, deposited: payload.deposited || progress >= DEPOSIT_START,
+                canvas: progress >= DEPOSIT_START ? undefined : payload.canvas,
+                handedOff: payload.mode === 'handoff' && progress >= HANDOFF_END };
+            const motion = workMotionProgress(future), path = payloadPath(future, area, motion);
+            if (payload.returnCarry && progress >= RETURN_START) {
+                const carry = payload.returnCarry;
+                path.route = computeCargoRoute({ progress: (progress - RETURN_START) / (1 - RETURN_START),
+                    from: carry.from, to: destinations.get(carry.ground) ?? { x: payload.route < 2 ? viewport.left - 140 : viewport.right + 140,
+                        y: payload.mode === 'airlift' ? path.groundY : carry.from.y }, airFrom: carry.airFrom,
+                    cargoOffset: { x: 0, y: 0 }, airOffset: airliftOffset(carry.ground, carry.air),
+                    groundRun: CARGO_ROUTE_POLICY.defaultGroundRun * carry.ground.spriteScale, carryReason: carry.reason });
+            }
+            const placement = courierPlacement(actor, pageNumber, area, path, destinations, viewport, cargoBank(future, path, motion), future);
+            if (!readableSpeakerInViewport(placement, viewport)) { break; }
+            until = futureAt;
+        }
+        (payload.speechWindow.until as Map<number, number>).set(actor.id, until);
+        return until;
     }
 
     function planPayloadReturn(payload: Payload, area: Geometry, path: ReturnType<typeof payloadPath>, layer: HTMLElement,
@@ -2502,7 +2666,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             if (payload.canvas) { payload.canvas.style.opacity = '0'; }
             return true;
         }
-        const progress = payload.progress = clamp(elapsed / payload.duration, 0, 1);
+        const progress = payload.progress = payloadProgressAt(payload, at);
         if (progress >= 1) { return false; }
         const motionProgress = workMotionProgress(payload);
         payload.handedOff = payload.mode === 'handoff' && motionProgress >= HANDOFF_END;
@@ -2539,7 +2703,18 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             }
             else if (limited && payload.sling) { payload.sling.style.opacity = '0'; }
         }
-        for (const actor of payload.helpers) { paintActor(actor, pageNumber, area, path, destinations, viewport, placements, bank); }
+        for (const actor of payload.helpers) {
+            const placement = courierPlacement(actor, pageNumber, area, path, destinations, viewport, bank);
+            actor.carried = placement.carried; actor.routePhase = placement.routePhase; actor.departing = progress >= RETURN_START;
+            if (placement.recoveryOrigin) {
+                payload.recoveryOrigins ??= new Map();
+                payload.recoveryOrigins.set(actor.id, placement.recoveryOrigin);
+            }
+            if (readableSpeakerInViewport(placement, viewport)) {
+                placement.visibleUntil = courierVisibilityDeadline(payload, actor, pageNumber, area, viewport, at);
+            }
+            placements.push(placement);
+        }
         if (payload.canvas) {
             const leader = payload.helpers[0];
             const initialScale = ((leader.launch ?? leader.origin)?.scale ?? leader.spriteScale) / leader.spriteScale;
@@ -2585,6 +2760,71 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             top: top - sceneOrigin.y + 'px', width: width + 'px', height: Math.max(1, bottom - top) + 'px', opacity: '1' });
     }
 
+    function retiringPath(payload: Payload, captured: Geometry, progress: number, viewport: ReturnType<typeof viewportBounds>) {
+        const timing = DOCUMENT_ROBOT_LIMITS.replacement;
+        const area = { ...captured, pageLeft: viewport.left + captured.pageLeft, pageTop: viewport.top + captured.pageTop };
+        const width = payload.crop.width * area.width, height = payload.crop.height * area.height;
+        const target = { x: area.pageLeft + (payload.crop.x + payload.crop.width / 2) * area.width,
+            y: area.pageTop + (payload.crop.y + payload.crop.height / 2) * area.height };
+        const leader = payload.helpers[0];
+        const groundBody = payload.helpers.some(actor => !ROBOT_VEHICLES.find(spec => spec.id === actor.vehicle)!.air);
+        const groundY = area.pageTop + area.height - DOCUMENT_ROBOT_LIMITS.forklift.baseInset * leader.spriteScale;
+        const carryY = groundY + FORKLIFT_ATTACHMENT_PX.carryY * leader.spriteScale - height / 2;
+        let exit = { x: payload.route === 0 ? viewport.left - width - 100 : payload.route === 2 ? viewport.right + width + 100 : target.x,
+            y: payload.ground ? carryY : groundBody ? target.y
+                : payload.route === 1 ? viewport.top - height - 100 : payload.route === 3 ? viewport.bottom + height + 100 : target.y };
+        if (groundBody && !payload.ground) {
+            exit = clampGroundRoutePoint(target, { x: payload.route < 2 ? viewport.left - width - 100 : viewport.right + width + 100,
+                y: area.pageTop + payload.start.y * area.height });
+        }
+        let point = target;
+        const begin = payload.ground ? timing.lowerEnd : timing.pickupEnd;
+        const outcome = payload.operation?.outcome;
+        const motionProgress = outcome && outcome.completion !== 'fulfilled'
+            ? Math.min(progress, begin + (RETURN_START - begin) * outcome.progress) : progress;
+        if (payload.ground && motionProgress >= timing.pickupEnd && motionProgress < begin) {
+            point = { x: target.x, y: target.y + (carryY - target.y) * ease((motionProgress - timing.pickupEnd) / (begin - timing.pickupEnd)) };
+        } else if (motionProgress >= begin) {
+            const from = { x: target.x, y: payload.ground ? carryY : target.y };
+            point = curve(from, { x: (from.x + exit.x) / 2, y: groundBody ? (from.y + exit.y) / 2 : Math.min(from.y, exit.y) - 45 }, exit,
+                ease(clamp((motionProgress - begin) / (RETURN_START - begin), 0, 1)));
+        }
+        return { area, width, height, target, groundY, point, exit };
+    }
+
+    function retiringActorPlacement(piece: RetiringPiece, actor: Courier, progress: number, path: ReturnType<typeof retiringPath>,
+        destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>): BodyPlacement & { departing: boolean } {
+        const payload = piece.payload, timing = DOCUMENT_ROBOT_LIMITS.replacement;
+        const { area, point, target, exit, groundY } = path;
+        const actorGround = !ROBOT_VEHICLES.find(spec => spec.id === actor.vehicle)!.air;
+        const offset = helperOffset(actor, area, 0), normalScale = actor.spriteScale;
+        const pickup = { x: target.x + offset.x, y: payload.ground ? groundY : target.y + offset.y };
+        const origin = actor.origin ?? { x: exit.x + offset.x, y: payload.ground ? groundY : exit.y + offset.y, scale: normalScale };
+        let robot = { x: point.x + offset.x, y: payload.ground ? groundY : point.y + offset.y };
+        let scale = normalScale, returningToLab = false, departing = false;
+        if (progress < timing.pickupEnd) {
+            const amount = ease(progress / timing.pickupEnd);
+            robot = actorGround ? straight(origin, pickup, amount) : curve(origin, { x: pickup.x, y: origin.y }, pickup, amount);
+            scale = (origin.scale ?? normalScale) + (normalScale - (origin.scale ?? normalScale)) * amount;
+        } else if (progress >= (payload.operation ? payloadProgressAt(payload, payload.operation.timing.aftermathEnd) : RETURN_START)) {
+            departing = true;
+            const destination = destinations.get(actor);
+            returningToLab = !!destination && (!actorGround || !needsCargoAirlift(robot, destination));
+            if (destination && returningToLab) {
+                const start = payload.operation ? payloadProgressAt(payload, payload.operation.timing.aftermathEnd) : RETURN_START;
+                const amount = ease((progress - start) / (1 - start));
+                robot = actorGround ? straight(robot, destination, amount) : curve(robot, { x: robot.x, y: destination.y }, destination, amount);
+                scale = normalScale + ((destination.scale ?? normalScale) - normalScale) * amount;
+            }
+        }
+        return { body: actor, point: robot, scale, departing,
+            opacity: Math.min(1, actor.origin ? 1 : progress / 0.08, returningToLab ? 1 : (1 - progress) / 0.12),
+            tilt: 0, activity: !payload.canvas ? 'navigate' : progress < timing.pickupEnd ? 'load' : 'deliver',
+            carrying: progress >= timing.pickupEnd && !!payload.canvas, progress: 0,
+            look: exit.x < target.x ? -1 : 1, phase: 'parked', fixed: true, remainingMs: payloadTimeAt(payload, 1) - payloadTimeAt(payload, progress),
+            group: payload.id, pages: [piece.page], payload };
+    }
+
     function paintRetiring(scene: RetiringScene, at: number, viewport: ReturnType<typeof viewportBounds>, policy: Presentation,
         destinations: ReadonlyMap<RobotBody, RobotDispatchPoint | undefined>, placements: BodyPlacement[], captionObstacles: SceneObstacle[]): void {
         const timing = DOCUMENT_ROBOT_LIMITS.replacement;
@@ -2595,7 +2835,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             try {
                 const elapsed = at - payload.started - payload.delay;
                 if (elapsed < 0) { continue; }
-                const progress = payload.progress = clamp(elapsed / payload.duration, 0, 1);
+                const progress = payload.progress = payloadProgressAt(payload, at);
                 if (progress >= RETURN_START) { resolveRemovalPayload(payload); }
                 if (progress >= 1 || actorCount() > policy.maxActors || !resizeSprites(payload.helpers, pagePolicy)) {
                     const position = scene.pieces.indexOf(piece);
@@ -2604,33 +2844,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 }
                 // PDF.js resets scrollTop before restoring its initial view. Only this short
                 // retired scene stays in captured viewport coordinates; normal cargo is page-local.
-                const area = { ...piece.area, pageLeft: viewport.left + piece.area.pageLeft, pageTop: viewport.top + piece.area.pageTop };
-                const width = payload.crop.width * area.width, height = payload.crop.height * area.height;
-                const target = { x: area.pageLeft + (payload.crop.x + payload.crop.width / 2) * area.width,
-                    y: area.pageTop + (payload.crop.y + payload.crop.height / 2) * area.height };
-                const leader = payload.helpers[0];
-                const groundBody = payload.helpers.some(actor => !ROBOT_VEHICLES.find(spec => spec.id === actor.vehicle)!.air);
-                const groundY = area.pageTop + area.height - DOCUMENT_ROBOT_LIMITS.forklift.baseInset * leader.spriteScale;
-                const carryY = groundY + FORKLIFT_ATTACHMENT_PX.carryY * leader.spriteScale - height / 2;
-                let exit = { x: payload.route === 0 ? viewport.left - width - 100 : payload.route === 2 ? viewport.right + width + 100 : target.x,
-                    y: payload.ground ? carryY : groundBody ? target.y
-                        : payload.route === 1 ? viewport.top - height - 100 : payload.route === 3 ? viewport.bottom + height + 100 : target.y };
-                if (groundBody && !payload.ground) {
-                    exit = clampGroundRoutePoint(target, { x: payload.route < 2 ? viewport.left - width - 100 : viewport.right + width + 100,
-                        y: area.pageTop + payload.start.y * area.height });
-                }
-                let point = target;
-                const begin = payload.ground ? timing.lowerEnd : timing.pickupEnd;
-                const outcome = payload.operation?.outcome;
-                const motionProgress = outcome && outcome.completion !== 'fulfilled'
-                    ? Math.min(progress, begin + (RETURN_START - begin) * outcome.progress) : progress;
-                if (payload.ground && motionProgress >= timing.pickupEnd && motionProgress < begin) {
-                    point = { x: target.x, y: target.y + (carryY - target.y) * ease((motionProgress - timing.pickupEnd) / (begin - timing.pickupEnd)) };
-                } else if (motionProgress >= begin) {
-                    const from = { x: target.x, y: payload.ground ? carryY : target.y };
-                    point = curve(from, { x: (from.x + exit.x) / 2, y: groundBody ? (from.y + exit.y) / 2 : Math.min(from.y, exit.y) - 45 }, exit,
-                        ease(clamp((motionProgress - begin) / (RETURN_START - begin), 0, 1)));
-                }
+                const path = retiringPath(payload, piece.area, progress, viewport);
+                const { width, height, point, groundY } = path;
                 payload.stage = progress < timing.pickupEnd ? 'rendezvous' : progress >= RETURN_START ? 'return' : 'carry';
                 if (payload.canvas) {
                     const opacity = clamp(progress / 0.08, 0, 1);
@@ -2641,33 +2856,30 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                     paintMast(payload, groundY, point, height, progress < timing.pickupEnd ? '0' : String(opacity));
                 }
                 for (const actor of payload.helpers) {
-                    const actorGround = !ROBOT_VEHICLES.find(spec => spec.id === actor.vehicle)!.air;
-                    const offset = helperOffset(actor, area, 0), normalScale = actor.spriteScale;
-                    const pickup = { x: target.x + offset.x, y: payload.ground ? groundY : target.y + offset.y };
-                    const origin = actor.origin ?? { x: exit.x + offset.x, y: payload.ground ? groundY : exit.y + offset.y, scale: normalScale };
-                    let robot = { x: point.x + offset.x, y: payload.ground ? groundY : point.y + offset.y };
-                    let scale = normalScale, returningToLab = false;
-                    if (progress < timing.pickupEnd) {
-                        const amount = ease(progress / timing.pickupEnd);
-                        robot = actorGround ? straight(origin, pickup, amount) : curve(origin, { x: pickup.x, y: origin.y }, pickup, amount);
-                        scale = (origin.scale ?? normalScale) + (normalScale - (origin.scale ?? normalScale)) * amount;
-                    } else if (progress >= (payload.operation ? (payload.operation.timing.aftermathEnd - payload.started - payload.delay) / payload.duration : RETURN_START)) {
-                        actor.departing = true;
-                        const destination = destinations.get(actor);
-                        returningToLab = !!destination && (!actorGround || !needsCargoAirlift(robot, destination));
-                        if (destination && returningToLab) {
-                            const start = payload.operation ? (payload.operation.timing.aftermathEnd - payload.started - payload.delay) / payload.duration : RETURN_START;
-                            const amount = ease((progress - start) / (1 - start));
-                            robot = actorGround ? straight(robot, destination, amount) : curve(robot, { x: robot.x, y: destination.y }, destination, amount);
-                            scale = normalScale + ((destination.scale ?? normalScale) - normalScale) * amount;
+                    const placement = retiringActorPlacement(piece, actor, progress, path, destinations);
+                    actor.departing = placement.departing;
+                    if (readableSpeakerInViewport(placement, viewport)) {
+                        const key = ['retiring', viewport.left, viewport.top, viewport.right, viewport.bottom,
+                            ...payload.helpers.map(body => body.spriteScale)].join(':');
+                        if (payload.speechWindow?.key !== key) { payload.speechWindow = { key, until: new Map() }; }
+                        let until = payload.speechWindow.until.get(actor.id);
+                        if (until === undefined || until <= at) {
+                            until = at;
+                            const end = payloadTimeAt(payload, 1);
+                            const steps = Math.max(1, Math.ceil((end - at) / SPEECH_FORECAST_STEP_MS));
+                            for (let step = 1; step <= steps; step++) {
+                                const futureAt = at + (end - at) * step / steps;
+                                const futureProgress = payloadProgressAt(payload, futureAt);
+                                const future = retiringActorPlacement(piece, actor, futureProgress,
+                                    retiringPath(payload, piece.area, futureProgress, viewport), destinations);
+                                if (!readableSpeakerInViewport(future, viewport)) { break; }
+                                until = futureAt;
+                            }
+                            (payload.speechWindow.until as Map<number, number>).set(actor.id, until);
                         }
+                        placement.visibleUntil = until;
                     }
-                    placements.push({ body: actor, point: robot, scale,
-                        opacity: Math.min(1, actor.origin ? 1 : progress / 0.08, returningToLab ? 1 : (1 - progress) / 0.12),
-                        tilt: 0, activity: !payload.canvas ? 'navigate' : progress < timing.pickupEnd ? 'load' : 'deliver',
-                        carrying: progress >= timing.pickupEnd && !!payload.canvas, progress: 0,
-                        look: exit.x < target.x ? -1 : 1, phase: 'parked', fixed: true, remainingMs: (1 - progress) * payload.duration,
-                        group: payload.id, pages: [piece.page], payload });
+                    placements.push(placement);
                 }
             } catch {
                 stats.rejected++; const position = scene.pieces.indexOf(piece);
@@ -2740,17 +2952,32 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         clearCaption(); requestPaint();
     }
 
-    function bodyVisibleInViewport(value: BodyPlacement, viewport: ReturnType<typeof viewportBounds>): boolean {
-        const sprite = value.body.sprite;
-        if (value.opacity <= .2 || !sprite.isConnected || !(sprite.width > 0 && sprite.height > 0)) { return false; }
+    function bodyInkBounds(value: Pick<BodyPlacement, 'body' | 'point' | 'scale' | 'tilt'>): PlacementRect {
         const ink = robotArtworkGeometry(value.body.vehicle, value.scale);
         const angle = value.tilt * Math.PI / 180, cosine = Math.cos(angle), sine = Math.sin(angle);
         const corners = [[ink.left, ink.top], [ink.right, ink.top], [ink.right, ink.bottom], [ink.left, ink.bottom]]
             .map(([x, y]) => ({ x: value.point.x + x * cosine - y * sine, y: value.point.y + x * sine + y * cosine }));
-        return Math.max(...corners.map(point => point.x)) > viewport.left
-            && Math.min(...corners.map(point => point.x)) < viewport.right
-            && Math.max(...corners.map(point => point.y)) > viewport.top
-            && Math.min(...corners.map(point => point.y)) < viewport.bottom;
+        const x = Math.min(...corners.map(point => point.x)), y = Math.min(...corners.map(point => point.y));
+        return { x, y, width: Math.max(...corners.map(point => point.x)) - x, height: Math.max(...corners.map(point => point.y)) - y };
+    }
+
+    function bodyVisibleInViewport(value: Pick<BodyPlacement, 'body' | 'point' | 'scale' | 'opacity' | 'tilt'>, viewport: ReturnType<typeof viewportBounds>): boolean {
+        const sprite = value.body.sprite;
+        if (value.opacity <= .2 || !sprite.isConnected || !(sprite.width > 0 && sprite.height > 0)) { return false; }
+        const ink = bodyInkBounds(value);
+        return ink.x + ink.width > viewport.left && ink.x < viewport.right
+            && ink.y + ink.height > viewport.top && ink.y < viewport.bottom;
+    }
+
+    function readableSpeakerInViewport(value: Pick<BodyPlacement, 'body' | 'point' | 'scale' | 'opacity' | 'tilt'>, viewport: ReturnType<typeof viewportBounds>): boolean {
+        const sprite = value.body.sprite;
+        if (value.opacity < DOCUMENT_ROBOT_LIMITS.speech.minOpacity || !sprite.isConnected || !(sprite.width > 0 && sprite.height > 0)
+            || value.point.x < viewport.left || value.point.x > viewport.right
+            || value.point.y < viewport.top || value.point.y > viewport.bottom) { return false; }
+        const ink = bodyInkBounds(value);
+        const width = Math.max(0, Math.min(ink.x + ink.width, viewport.right) - Math.max(ink.x, viewport.left));
+        const height = Math.max(0, Math.min(ink.y + ink.height, viewport.bottom) - Math.max(ink.y, viewport.top));
+        return width * height >= ink.width * ink.height * DOCUMENT_ROBOT_LIMITS.speech.minVisibleFraction;
     }
 
     function dialogueSpeaker(value: BodyPlacement, cast: readonly BodyPlacement[], reactions: ReadonlyMap<number, RobotEncounterReaction>): RobotDialogueSpeaker {
@@ -2770,7 +2997,25 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (incident?.kind === 'bump' && incident.confirmed === true && incident.ids.includes(value.body.id)) { facts.push('collision'); }
         if (reaction?.malfunction === 'smoke') { facts.push('smoke'); }
         if (reaction?.carried || value.body.carried) { facts.push('carried'); }
-        return { id: value.body.id, vehicle: value.body.vehicle, name: ROBOT_VEHICLES.find(spec => spec.id === value.body.vehicle)!.name, facts };
+        return { id: value.body.id, vehicle: value.body.vehicle, name: ROBOT_VEHICLES.find(spec => spec.id === value.body.vehicle)!.name, facts,
+            availableMs: value.speechMs ?? Math.max(0, (value.visibleUntil ?? now()) - now()) };
+    }
+
+    function paintCaptionLeaders(group: CaptionGroup, placement: LabelPlacement, opacity: number): void {
+        for (let index = 0; index < Math.max(group.leaders.length, placement.leaders.length); index++) {
+            const line = placement.leaders[index];
+            let leader = group.leaders[index];
+            if (!line) { if (leader) { leader.style.opacity = '0'; } continue; }
+            if (!leader) {
+                leader = doc.createElement('div');
+                initializeSceneNode(leader, 'pdfDocumentRobotCaptionLeader', DOCUMENT_ROBOT_SCENE_LAYERS.annotation);
+                Object.assign(leader.style, { height: '1.5px', background: ROBOT_CAPTION_STYLE.borderColor, transformOrigin: '0 50%' });
+                group.leaders.push(leader); transit.append(leader);
+            }
+            const dx = line.to.x - line.from.x, dy = line.to.y - line.from.y;
+            Object.assign(leader.style, { left: line.from.x + 'px', top: line.from.y + 'px',
+                width: Math.hypot(dx, dy) + 'px', transform: 'rotate(' + Math.atan2(dy, dx) + 'rad)', opacity: String(opacity) });
+        }
     }
 
     function paintCaption(placements: readonly BodyPlacement[], reactions: ReadonlyMap<number, RobotEncounterReaction>,
@@ -2789,6 +3034,20 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (captionGroup?.shownAt !== undefined && captionGroup.measurementKey !== measurementKey) {
             // A changed layout invalidates even a detached caption's last readable box.
             clearCaption(); return;
+        }
+        const attention = placements.map(value => reactions.get(value.body.id)).find(reaction => reaction?.caption
+            && (reaction.captionId.startsWith('greet:') && captionGroup?.id.startsWith('hover:')
+                || reaction.captionId.startsWith('hover:') && captionGroup?.id.startsWith('work:')));
+        if (attention) { clearCaption(); }
+        if (captionGroup?.shownAt !== undefined && captionGroup.placement) {
+            const group = captionGroup;
+            const anchors = placements.filter(value => group.lines.has(value.body.id)).map(value => ({
+                x: value.point.x - sceneOrigin.x,
+                y: value.point.y - sceneOrigin.y + robotArtworkGeometry(value.body.vehicle, value.scale).top - 3,
+            }));
+            group.placement = { ...group.placement!, leaders: labelPlacementLeaders(group.placement!, anchors) };
+            paintCaptionLeaders(group, group.placement, 1);
+            return;
         }
         const selected = placements.find(value => reactions.get(value.body.id)?.caption
             && reactions.get(value.body.id)!.captionId === captionGroup?.id)
@@ -2833,8 +3092,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 measurementKey: '', width: 0, height: 0, leaders: [] };
             captionGroup = group;
             transit.append(node);
-            // An unseen cue keeps its source expiry. Readable admission owns one finite
-            // wall interval while the coupled scene remains at this actual visible pose.
+            // An unseen cue keeps its source expiry. Readable text gets its full interval
+            // beside the continuous action, with its first admitted rectangle retained.
             expireCaption(group);
         }
         const group = captionGroup!, caption = group.node;
@@ -2885,6 +3144,12 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (!placement.blocked && opacity > 0 && group.shownAt === undefined) {
             const owners = speechCues.get(group.id)?.owners ?? group.actors;
             const cast = placements.filter(value => owners.includes(value.body.id));
+            if (speakers.some(value => (value.speechMs ?? (value.visibleUntil ?? at) - at) < group.readMs)) {
+                if (group.choice) { encounters.releaseSpeech(group.choice); }
+                speechCues.delete(group.id);
+                clearCaption();
+                return;
+            }
             if (group.choice && !robotDialogueChoiceSupported(group.choice, cast.map(value => dialogueSpeaker(value, cast, reactions)))) {
                 // A hidden reservation can cross a real cargo/phase boundary. Release it
                 // without counting exposure; a readable interval has already earned its hold.
@@ -2897,26 +3162,13 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 if (retry) { requestPaint(); }
                 return;
             }
-            holdForReading(group, first.captionUntil);
+            admitCaption(group, first.captionUntil);
             if (group.choice && group.choice.lines.length === speakers.length
                 && group.choice.speakers.every(id => speakers.some(value => value.body.id === id))) { encounters.admitSpeech(group.choice); }
         }
         group.placement = placement;
         Object.assign(caption.style, { left: placement.x + 'px', top: placement.y + 'px', opacity: opacity > 0 ? '1' : '0' });
-        for (let index = 0; index < Math.max(group.leaders.length, placement.leaders.length); index++) {
-            const line = placement.leaders[index];
-            let leader = group.leaders[index];
-            if (!line) { if (leader) { leader.style.opacity = '0'; } continue; }
-            if (!leader) {
-                leader = doc.createElement('div');
-                initializeSceneNode(leader, 'pdfDocumentRobotCaptionLeader', DOCUMENT_ROBOT_SCENE_LAYERS.annotation);
-                Object.assign(leader.style, { height: '1.5px', background: ROBOT_CAPTION_STYLE.borderColor, transformOrigin: '0 50%' });
-                group.leaders.push(leader); transit.append(leader);
-            }
-            const dx = line.to.x - line.from.x, dy = line.to.y - line.from.y;
-            Object.assign(leader.style, { left: line.from.x + 'px', top: line.from.y + 'px',
-                width: Math.hypot(dx, dy) + 'px', transform: 'rotate(' + Math.atan2(dy, dx) + 'rad)', opacity: String(opacity) });
-        }
+        paintCaptionLeaders(group, placement, opacity);
     }
 
     function paintBodies(placements: readonly BodyPlacement[], successfulDeposits: readonly number[][], at: number,
@@ -2936,7 +3188,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const phase = work === undefined ? -1 : plan!.phases.findIndex(phase => work <= phase.until);
             return { id: value.body.id, x: value.point.x - sceneOrigin.x, y: value.point.y - sceneOrigin.y, radius,
                 opacity: visible ? value.opacity : 0, phase: value.fixed && value.phase === 'cargo' ? 'parked' : value.phase,
-                group: value.group, remainingMs: value.remainingMs, vehicle: value.body.vehicle, scale: value.scale,
+                group: value.group, remainingMs: value.remainingMs, availableMs: value.speechMs ?? Math.max(0, (value.visibleUntil ?? at) - at),
+                vehicle: value.body.vehicle, scale: value.scale,
                 carrying: !!(value.carrying && payload?.canvas && !payload.deposited),
                 operationKey: plan?.key ?? documentGeneration + ':advance:' + value.pages.join(',') + ':' + value.body.vehicle,
                 commitments: phase >= 0 ? payload?.phaseCommitments?.[phase]?.get(value.body.id) : undefined,
@@ -2947,11 +3200,6 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const liveIds = new Set(live.map(value => value.body.id));
         const payloadIds = new Set([...episodes.values()].flatMap(episode => episode.payloads.map(payload => payload.id)).concat(retiring?.pieces.map(piece => piece.payload.id) ?? []));
         for (const id of automaticSpeechPhases.keys()) { if (!payloadIds.has(id)) { automaticSpeechPhases.delete(id); } }
-        for (const value of live) {
-            if (value.payload && !automaticSpeechPhases.has(value.payload.id)) {
-                automaticSpeechPhases.set(value.payload.id, (['carrying', 'deposit', 'set-down'] as const)[automaticSpeechSerial++ % 3]);
-            }
-        }
         for (const [key, cue] of speechCues) {
             if (cue.until <= at && !cue.released) { encounters.releaseSpeech(cue.choice); cue.released = true; }
             if (cue.released && (key.startsWith('hover:') || key.startsWith('greet:'))) { speechCues.delete(key); continue; }
@@ -3053,7 +3301,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const remainingMs = Math.max(0, Math.min(...members.map(value => value.remainingMs)));
             return { id, x, y, radius, ground: members.some(value => !ROBOT_VEHICLES.find(spec => spec.id === value.body.vehicle)!.air
                     && !reactions.get(value.body.id)?.carried && !(value.body as Courier).carried),
-                fixed, canFade: !fixed || members.every(value => !!value.payload),
+                fixed, canFade: !members.some(value => ownsReadableCast(value.body))
+                    && (!fixed || members.every(value => !!value.payload)),
                 offsetScale: fixed ? 0 : ease(clamp(remainingMs / DOCUMENT_ROBOT_LIMITS.trafficSettleMs, 0, 1)),
                 weight: members.some(value => value.carrying) ? 2 : 1,
                 remainingMs };
@@ -3077,7 +3326,19 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             return { ...value, point: { x: value.point.x + total.x, y: value.point.y + total.y },
                 opacity: value.opacity * shown, tilt: value.tilt + (value.carrying ? 0 : reactions.get(value.body.id)?.tilt ?? 0) };
         });
-        const visibleSpeakers = projected.filter(value => bodyVisibleInViewport(value, viewport));
+        const visibleSpeakers = projected.filter(value => readableSpeakerInViewport(value, viewport));
+        for (const value of visibleSpeakers) {
+            const payload = value.payload;
+            if (!payload || automaticSpeechPhases.has(payload.id)) { continue; }
+            const preferred = (['carrying', 'deposit', 'set-down'] as const)[automaticSpeechSerial++ % 3];
+            const opening = payloadTimeAt(payload, preferred === 'deposit' ? DEPOSIT_START : HANDOFF_END);
+            const cast = visibleSpeakers.filter(member => member.payload === payload);
+            const later = Math.max(0, Math.min(...cast.map(member => (member.visibleUntil ?? at) - Math.max(at, opening))));
+            const readMs = preferred === 'deposit' ? payload.completedReadMs ?? ROBOT_DIALOGUE_READ_POLICY.captionMinMs
+                : ROBOT_DIALOGUE_READ_POLICY.captionMinMs;
+            automaticSpeechPhases.set(payload.id, preferred !== 'carrying' && later < readMs + SPEECH_ADMISSION_MS
+                ? 'carrying' : preferred);
+        }
         const speechAvailable = () => !attention && ![...reactions.values()].some(value => value.caption);
         // Already readable text keeps its original owner even after the passing or work phase ends.
         const continuing = captionGroup?.shownAt !== undefined && speechCues.get(captionGroup.id);
@@ -3175,7 +3436,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             return { x: obstacle.x + (offset?.x ?? 0), y: obstacle.y + (offset?.y ?? 0), width: obstacle.width, height: obstacle.height };
         });
         if (failed.size) { retireFailedBodies(failed); }
-        paintCaption(displayed.filter(value => bodyVisibleInViewport(value, viewport)), reactions, viewport, policy, displayedObstacles);
+        paintCaption(displayed.filter(value => readableSpeakerInViewport(value, viewport)), reactions, viewport, policy, displayedObstacles);
         paintWorkLabels(displayed.filter(value => value.body.sprite.isConnected), viewport, displayedObstacles);
     }
 
@@ -3210,7 +3471,6 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     }
 
     function paint(at: number, scheduled = false): void {
-        if (speaking()) { return; }
         const began = win.performance.now();
         painting = true; dirty = false;
         const period = 1000 / DOCUMENT_ROBOT_LIMITS.maxFps;
@@ -3241,7 +3501,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             };
             for (const episode of episodes.values()) {
                 for (const payload of episode.payloads) {
-                    if (at >= payload.started + payload.delay + payload.duration * RETURN_START) { payload.helpers.forEach(destination); }
+                    if (at >= payloadTimeAt(payload, RETURN_START)) { payload.helpers.forEach(destination); }
                 }
             }
             for (const work of advance.values()) {
@@ -3249,7 +3509,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             }
             for (const piece of retiring?.pieces ?? []) {
                 const payload = piece.payload;
-                if (at >= payload.started + payload.delay + payload.duration * RETURN_START) { payload.helpers.forEach(destination); }
+                if (at >= payloadTimeAt(payload, RETURN_START)) { payload.helpers.forEach(destination); }
             }
             if (columnPull && !columnPull.motion.holdAtEnd
                 && at >= columnPull.motion.startedAt + columnPull.motion.durationMs) { destination(columnPull.body); }
@@ -3298,8 +3558,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     function requestPaint(): void {
         if (disposed || !enabled || hidden()) { return; }
         dirty = true;
-        if (speaking() && captionGroup?.layoutKey !== readingLayoutKey()) { clearCaption(); }
-        if (speaking()) { return; }
+        if (captionGroup?.shownAt !== undefined && captionGroup.layoutKey !== readingLayoutKey()) { clearCaption(); }
         const at = now();
         if (!painting && (media.matches || at - lastPaint + 0.01 >= 1000 / DOCUMENT_ROBOT_LIMITS.maxFps)) {
             paint(at, !media.matches);
@@ -3308,7 +3567,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     }
 
     function schedule(): void {
-        if (frame || speaking() || !moving() && !dirty || disposed || !enabled || hidden() || media.matches) { return; }
+        if (frame || !moving() && !dirty || disposed || !enabled || hidden() || media.matches) { return; }
         const pending = { id: 0 };
         frame = pending;
         pending.id = requestFrame(() => {
@@ -3372,6 +3631,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const attempt = (candidate: RobotCargoCandidate, shortage: boolean): Payload | undefined => {
             if (!eligible(candidate) || copyFailed) { return; }
             const payload = preparePayload(crop, area, index, candidate.mode, policy, candidate.ground, goal);
+            // Commit a light tempo difference before any operation timestamps exist.
+            // Greater physical effort gets a brisker performance without another random draw.
+            payload.duration *= 1.08 - 0.2 * clamp(candidate.assessment.peakStrain / 2, 0, 1);
             const waiting = new Map(staged.map(actor => [actor.body.id, actor]));
             const prepared: CourierPreparation[] = [];
             const capacityWasFreed = capacityFreed;
@@ -3388,12 +3650,26 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 if (position >= 0) { damagedWaiting = true; staged.splice(position, 1); releaseActor(actor.body); }
             };
             payload.workload = Object.freeze({ ...workload });
-            const clock = () => ({ startedAt: payload.started + payload.delay,
-                workEnd: payload.started + payload.delay + payload.duration * (goal === 'removal' ? RETURN_START : DEPOSIT_START),
-                aftermathEnd: payload.started + payload.delay + payload.duration * (goal === 'removal' && !candidate.assessment.normalAdmissible
-                    ? ROBOT_DELIVERY_PHASES.removalAftermathEnd : RETURN_START),
-                deadline: payload.started + payload.delay + payload.duration });
             const proposed = candidate.vehicles.map((vehicle, member) => ({ id: member + 1, vehicle }));
+            if (goal === 'delivery') {
+                const readMs = encounters.prospectiveSpeechReadMs(job.key, 'completed', proposed.map(actor => ({ ...actor,
+                    name: ROBOT_VEHICLES.find(value => value.id === actor.vehicle)!.name })));
+                if (readMs !== undefined) {
+                    payload.completedReadMs = readMs;
+                    const base = payload.duration;
+                    const handling = base * (RETURN_START - DEPOSIT_START);
+                    const visibleReturn = (1 - 0.12 * DOCUMENT_ROBOT_LIMITS.speech.minOpacity - RETURN_START) / (1 - RETURN_START);
+                    payload.returnStartMs = base * RETURN_START;
+                    // The visibility forecast conservatively ends at its last readable sample.
+                    payload.duration = payload.returnStartMs + Math.max(base * (1 - RETURN_START),
+                        (readMs + SPEECH_ADMISSION_MS + SPEECH_FORECAST_STEP_MS - handling) / visibleReturn);
+                }
+            }
+            const clock = () => ({ startedAt: payloadTimeAt(payload, 0),
+                workEnd: payloadTimeAt(payload, goal === 'removal' ? RETURN_START : DEPOSIT_START),
+                aftermathEnd: payloadTimeAt(payload, goal === 'removal' && !candidate.assessment.normalAdmissible
+                    ? ROBOT_DELIVERY_PHASES.removalAftermathEnd : RETURN_START),
+                deadline: payloadTimeAt(payload, 1) });
             stats.operationCommitChecks++;
             if (!commitRobotOperation(candidate.spec, proposed,
                 { seed: sceneSeed, shortage, timing: clock(), decision: narrative }).accepted) { return; }
@@ -3524,9 +3800,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             || !Number.isSafeInteger(value.pageNumber) || value.pageNumber < 1 || !planned && seen.has(value.pageNumber)) { return 'skipped'; }
         if (media.matches) { seen.add(value.pageNumber); stats.skipped++; return 'skipped'; }
         if (!value.canvas.width || !value.canvas.height) { return 'deferred'; }
-        // Pixel readiness may reuse a waiting crew after its current reading beat.
-        // Keep that visible cast intact until the ordinary capacity wake reopens admission.
-        if (waitingForSpeech()) { return 'busy'; }
+        if (waitingForCast(value.pageElement)) { return 'busy'; }
         const viewport = viewportBounds();
         let policy = presentation(viewport);
         const area = geometry(value.pageElement, viewport, value.pageProjection);
@@ -3544,11 +3818,11 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         policy = pagePresentation(policy, area);
         if (!policy.maxActors || !policy.maxCargoBytes) { seen.add(value.pageNumber); stats.skipped++; return 'skipped'; }
 
-        clearColumnPull();
+        if (!columnPull || !ownsReadableCast(columnPull.body)) { clearColumnPull(); }
         reclaimRetiring(policy);
         const used = new Set([...episodes.values()].flatMap(actorsOf)
             .concat(retiring?.pieces.flatMap(piece => piece.payload.helpers) ?? []).map(actor => actor.vehicle));
-        if (actorCount() - advanceActors().length >= policy.maxActors || episodes.size && activePresentation !== policy.kind
+        if (actorCount() - reusableAdvanceActors().length >= policy.maxActors || episodes.size && activePresentation !== policy.kind
             || dispatchOrigin && used.size >= ROBOT_VEHICLES.length) {
             capacityBlocked = true; return 'busy';
         }
@@ -3774,7 +4048,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 const low = horizontal ? viewport.left : viewport.top, high = horizontal ? viewport.right : viewport.bottom;
                 if (!(start <= (low + high) / 2 && end >= (low + high) / 2) && !(start >= low && end <= high)) { return 'waiting'; }
             }
-            if (waitingForSpeech()) { return 'waiting'; }
+            if (waitingForCast(encounter.pageElement)) { return 'waiting'; }
             return 'ready';
         },
         admit(planId, crop, candidate, encounter) {
@@ -3973,8 +4247,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const policy = presentation();
             return {
                 enabled, reducedMotion: media.matches, scheduled: frame !== undefined, frames, paintTotalMs, paintMaxMs, paintLastMs,
-                clock: { wallNow: wallNow(), sceneNow: now(), paused: speaking(),
-                    holdRemainingMs: speakingPause ? Math.max(0, speakingPause.until - wallNow()) : 0 },
+                clock: { wallNow: wallNow(), sceneNow: now(), paused: false, holdRemainingMs: 0 },
                 qualityReactions: [...qualityScenes.values()].map(scene => ({ id: scene.id, sourcePage: scene.sourcePage,
                     pageNumber: scene.pageNumber, planId: scene.planId, cropId: scene.cropId, imageId: scene.crop.imageId,
                     imageIds: scene.crop.imageIds ?? [], target: scene.crop, actorId: scene.actorId, associatedPayloadId: scene.payload?.id,
@@ -4034,7 +4307,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                     payloads: episode.payloads.map(payload => ({ id: payload.id, mode: payload.mode, ground: payload.ground, imageId: payload.crop.imageId,
                         operation: operationSnapshot(payload),
                         cropKind: payload.crop.kind ?? 'fragment', imageIds: payload.crop.imageIds,
-                        deadline: payload.started + payload.delay + payload.duration, refinements: payload.refinements, contentRevision: payload.contentRevision,
+                        deadline: payloadTimeAt(payload, 1), refinements: payload.refinements, contentRevision: payload.contentRevision,
                         arrivalCovered: !!payload.cover?.parentNode, refinementPending: false,
                         refinementProgress: 1,
                         rasterWidth: payload.canvas?.width ?? 0, rasterHeight: payload.canvas?.height ?? 0,

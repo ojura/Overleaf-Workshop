@@ -242,10 +242,17 @@ class Fixture {
         }
     }
     finish() {
-        for (let step = 0; step < 150 && (this.callbacks.size || this.api.snapshot().clock.paused); step++) {
+        const policy = this.module.DOCUMENT_ROBOT_LIMITS.advance;
+        let deadline = this.now + policy.arrivalMs + policy.coordinationMs + policy.returnMs;
+        while (this.callbacks.size && this.now <= deadline + 34) {
             const state = this.api.snapshot();
-            if (state.clock.paused) { this.tick(Math.max(0, state.caption.until - this.now) + 1); }
-            else { this.frame(); }
+            const payloads = state.pages.flatMap((page: any) => page.payloads).concat(state.replacement?.payloads ?? []);
+            const owned = payloads.map((payload: any) => payload.deadline ?? payload.operation?.timing.deadline ?? this.now)
+                .concat(state.qualityReactions.map((scene: any) => scene.deadline));
+            if (state.caption) { owned.push(state.caption.until + policy.returnMs); }
+            if (state.columnPull) { owned.push(state.columnPull.startedAt + state.columnPull.durationMs + policy.returnMs); }
+            deadline = Math.max(deadline, ...owned.filter(Number.isFinite));
+            this.frame();
         }
     }
     openLab() {
@@ -292,10 +299,10 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     afterEach(() => { for (const fixture of fixtures.splice(0)) { fixture.dispose(); } });
     after(() => { if (directory) { fs.rmSync(directory, { recursive: true, force: true }); } });
     function finishSpeakingRoutes(f: Fixture): void {
-        // Unlike finish(), this explicitly completes finite reading holds as well as route frames.
-        for (let step = 0; step < 150 && (f.callbacks.size || f.timers.size); step++) {
-            if (f.callbacks.size) { f.frame(); }
-            else { f.tick(Math.max(0, Math.min(...[...f.timers.values()].map(timer => timer.at)) - f.now) + 1); }
+        f.finish();
+        while (f.timers.size) {
+            f.tick(Math.max(0, Math.min(...[...f.timers.values()].map(timer => timer.at)) - f.now) + 1);
+            f.finish();
         }
     }
     function fixture(options: Record<string, unknown> = {}) {
@@ -304,6 +311,35 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         return result;
     }
 
+    function admitLoadedSpeech(f: Fixture, pageNumber: number) {
+        const deadline = Math.max(...f.api.snapshot().pages.flatMap((page: any) => page.payloads.map((payload: any) => payload.deadline)));
+        while (f.now <= deadline) {
+            const page = f.api.snapshot().pages.find((value: any) => value.page === pageNumber);
+            const actor = page?.actors.find((value: any) => value.carrying && visibleSpeaker(f, value.id));
+            if (actor) {
+                const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
+                pointer(f, 'pointermove', point(sprite)); f.frame();
+                const snapshot = f.api.snapshot(), bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
+                if (bubble && snapshot.caption?.shownAt !== undefined && snapshot.caption.actors.includes(actor.id)) {
+                    return { snapshot, bubble, actor, sprite };
+                }
+            } else { f.frame(); }
+        }
+        assert.fail('the actual loaded route must expose a supported readable speaker window');
+    }
+    function admitParkedSpeech(f: Fixture) {
+        const end = f.now + module.ROBOT_ENCOUNTER_POLICY.captionMaxMs;
+        while (f.now <= end) {
+            const actor = f.api.snapshot().advance.flatMap((group: any) => group.actors).find((value: any) => readableSpeaker(f, value.id));
+            if (actor) {
+                const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
+                pointer(f, 'pointermove', point(sprite)); f.frame();
+                const snapshot = f.api.snapshot(), bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
+                if (bubble && snapshot.caption?.shownAt !== undefined && snapshot.caption.actors.includes(actor.id)) { return { snapshot, bubble, actor, sprite }; }
+            } else { f.frame(); }
+        }
+        assert.fail('the actual parked cast must expose a supported readable speaker window');
+    }
     function publication(f: Fixture, page = f.page()) {
         const candidate: any = { document: {}, page: {}, pageNumber: page.pageNumber, appearance: 'plain', attempt: {}, successful: true,
             canvas: page.canvas, revision: 1, coverage: { kind: 'complete-page' },
@@ -430,11 +466,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         p.candidate.projection = { width: 135, height: 192, pageToRaster: [135, 0, 0, 192, 0, 0] };
         f.api.setVisiblePages([p.page.pageNumber]); f.api.preparePublication(p.candidate, p.encounter).commit();
         const before = f.api.snapshot().pages[0].payloads[0];
-        f.tick(before.deadline * 0.55);
+        f.advanceToScene(before.operation.timing.workEnd - 200);
         const sharp = finalPublication(p); f.api.preparePublication(sharp, p.encounter, p.candidate).commit();
         const first = f.api.snapshot().qualityReactions[0]; assert.ok(first && first.location === 'cargo');
         assert.strictEqual(f.api.snapshot().pages[0].payloads[0].deadline, before.deadline);
-        f.tick(before.deadline * 0.1);
+        f.advanceToScene(before.operation.timing.workEnd + 34);
         const handed = f.api.snapshot().qualityReactions[0]; assert.ok(handed && handed.location === 'page');
         for (const key of ['id', 'actorId', 'sourcePage', 'planId', 'cropId', 'associatedPayloadId', 'deadline', 'startedAt']) {
             assert.strictEqual(handed[key], first[key], key + ' survives the handoff');
@@ -764,6 +800,25 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             && center.y > Math.max(0, bounds.top) && center.y < Math.min(f.window.innerHeight, bounds.bottom);
     }
 
+    function readableSpeaker(f: Fixture, id: number): boolean {
+        if (!visibleSpeaker(f, id)) { return false; }
+        const state = f.api.snapshot(), sprite = f.owned.find(canvas => canvas.dataset.courier === String(id) && canvas.className === 'pdfDocumentRobotVehicle')!;
+        if (Number(sprite.style.opacity) < module.DOCUMENT_ROBOT_LIMITS.speech.minOpacity) { return false; }
+        const actors = state.pages.flatMap((page: any) => page.actors).concat(state.advance.flatMap((group: any) => group.actors), state.replacement?.actors ?? []);
+        const vehicle = actors.find((actor: any) => actor.id === id)?.vehicle ?? (state.columnPull?.actor === id ? 'forklift' : undefined);
+        if (!vehicle) { return false; }
+        const shape = module.robotArtworkGeometry(vehicle, parseFloat(sprite.style.width) / module.ROBOT_ARTWORK_SIZE.width), center = point(sprite);
+        const angle = Number(sprite.style.transform.match(/rotate\(([-\d.]+)deg\)/)?.[1] ?? 0) * Math.PI / 180;
+        const corners = [[shape.left, shape.top], [shape.right, shape.top], [shape.right, shape.bottom], [shape.left, shape.bottom]]
+            .map(([x, y]) => ({ x: center.x + x * Math.cos(angle) - y * Math.sin(angle), y: center.y + x * Math.sin(angle) + y * Math.cos(angle) }));
+        const left = Math.min(...corners.map(value => value.x)), right = Math.max(...corners.map(value => value.x));
+        const top = Math.min(...corners.map(value => value.y)), bottom = Math.max(...corners.map(value => value.y));
+        const bounds = f.container.getBoundingClientRect();
+        const width = Math.max(0, Math.min(right, f.window.innerWidth, bounds.right) - Math.max(left, 0, bounds.left));
+        const height = Math.max(0, Math.min(bottom, f.window.innerHeight, bounds.bottom) - Math.max(top, 0, bounds.top));
+        return width * height >= (right - left) * (bottom - top) * module.DOCUMENT_ROBOT_LIMITS.speech.minVisibleFraction;
+    }
+
     function work(pages: ReturnType<Fixture['page']>[], states = pages.map(() => 'waiting'), key = pages.map(page => page.pageNumber).join(':')) {
         return { key, pages: pages.map((page, index) => ({ pageNumber: page.pageNumber, pageElement: page.pageElement,
             label: String(page.pageNumber - 11), state: states[index] })) };
@@ -878,23 +933,23 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     it('keeps MORUS document size and its ordinary character cue under the same finite cargo owner', () => {
         const { f, delivery, leased } = morusCrew();
         assert.strictEqual(f.api.offer(delivery), 'started');
-        f.sceneTick(600);
         const before = f.api.snapshot().pages[0].payloads[0];
-        const actor = f.api.snapshot().pages[0].actors[0];
+        const timing = before.operation.timing;
+        f.tick(timing.startedAt + (timing.workEnd - timing.startedAt) / 2 - f.now);
+        const { actor, sprite, bubble, snapshot } = admitLoadedSpeech(f, delivery.pageNumber);
         assert.strictEqual(actor.vehicle, 'heavyquad');
+        assert.ok(actor.carrying && readableSpeaker(f, actor.id), 'the full-size cue belongs to actual visible loaded work');
         assert.ok(Math.abs(actor.spriteScale - 1.92 * 2.5) < 1e-10, 'document scale includes the authored MORUS factor once');
-        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
         assert.ok(Math.abs(parseFloat(sprite.style.width) - 128 * actor.spriteScale) < 0.02);
-        pointer(f, 'pointermove', point(sprite)); f.sceneFrame();
-        assert.strictEqual(f.api.snapshot().interaction.hovered, actor.id);
-        assert.match(f.api.snapshot().caption?.text ?? '', /benzinska motora/i);
+        assert.strictEqual(snapshot.interaction.hovered, actor.id);
+        assert.match(bubble.textContent, /benzinska motora/i);
         const after = f.api.snapshot().pages[0].payloads[0];
         for (const key of ['id', 'helpers', 'target', 'deadline']) { assert.deepStrictEqual(after[key], before[key]); }
         assert.deepStrictEqual(after.operation.decision, before.operation.decision);
-        f.sceneTick(before.deadline - f.sceneNow + 4000);
+        f.finish();
         assert.strictEqual(leased.size, 0);
         assert.strictEqual(f.api.snapshot().retainedBytes, 0);
-        assert.strictEqual(f.callbacks.size, 0);
+        assert.strictEqual(f.callbacks.size + f.timers.size, 0);
     });
 
     it('funds the complete enlarged MORUS crew at compact DPR1 and DPR3 without changing logical jobs', () => {
@@ -1084,12 +1139,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     }
 
     it('acknowledges hover and a click during a loaded delivery without changing its cargo or deadline', () => {
-        const { f } = coarsePhoto({ encounterRandom: () => 0.99 }); f.tick(200);
-        const before = f.api.snapshot().pages[0].payloads[0];
-        const actor = f.api.snapshot().pages[0].actors.find((value: any) => value.payloadId === before.id && visibleSpeaker(f, value.id));
-        assert.ok(actor, 'pointer input targets an actual on-screen member of the loaded crew');
-        const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.dataset.courier === String(actor.id))!;
+        const { f, page } = coarsePhoto({ encounterRandom: () => 0.99 });
         const copies = f.owned.reduce((sum, canvas) => sum + canvas.copies.filter(args => args.length === 9).length, 0);
+        const { snapshot, actor, sprite } = admitLoadedSpeech(f, page.pageNumber);
+        const before = snapshot.pages[0].payloads.find((value: any) => value.id === actor.payloadId);
+        assert.ok(before && actor.carrying && readableSpeaker(f, actor.id), 'pointer input targets the actual readable member of the loaded crew');
         pointer(f, 'pointermove', point(sprite)); f.tick(34);
         assert.strictEqual(f.api.snapshot().interaction.hovered, actor.id);
         assert.strictEqual(f.api.snapshot().caption.opportunity, 'carrying', 'the moving courier reports its actual loaded work');
@@ -1109,15 +1163,13 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('keeps a readable hover caption when the moving courier leaves a stationary pointer', () => {
-        const { f } = coarsePhoto({ maxActors: 1, encounterRandom: () => 0.99 }); f.tick(200);
-        const actor = f.api.snapshot().pages[0].actors[0];
-        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
-        pointer(f, 'pointermove', point(sprite)); f.frame();
-        const bubble = captions(f)[0], before = f.api.snapshot().caption;
+        const { f, page } = coarsePhoto({ maxActors: 1, encounterRandom: () => 0.99 });
+        const { actor, sprite, bubble, snapshot } = admitLoadedSpeech(f, page.pageNumber), before = snapshot.caption;
         assert.strictEqual(bubble.style.opacity, '1');
-        const heldTransform = sprite.style.transform;
-        while (f.now + 34 < before.until) { f.frame(); assert.strictEqual(sprite.style.transform, heldTransform); }
-        assert.strictEqual(f.api.snapshot().interaction.hovered, actor.id, 'the settled visible speaker remains under the stationary pointer');
+        const initialTransform = sprite.style.transform;
+        while (f.now + 34 < before.until) { f.frame(); assert.ok(bubble.isConnected && bubble.style.opacity === '1'); }
+        assert.notStrictEqual(sprite.style.transform, initialTransform, 'the actual speaker moves naturally during its line');
+        assert.strictEqual(f.api.snapshot().interaction.hovered, undefined, 'actual motion recomputes the stationary-pointer hit');
         assert.ok(f.now < before.until);
         assert.ok(bubble.isConnected && bubble.style.opacity === '1', 'hover ownership ends without shortening readable text');
         assert.strictEqual(f.api.snapshot().caption.until, before.until);
@@ -1141,7 +1193,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const bubble = captions(f)[0], text = bubble.textContent, until = f.api.snapshot().caption.until;
         assert.ok(f.api.snapshot().interaction.greeting !== undefined && !text.includes('Čekam novu stranicu.'));
         f.tick(900);
-        assert.strictEqual(f.api.snapshot().interaction.greeting, actor.id, 'the gesture shares the paused scene pose');
+        assert.strictEqual(f.api.snapshot().interaction.greeting, undefined, 'the finite gesture ends while its naturally visible speaker keeps readable text');
         assert.ok(bubble.isConnected && bubble.style.opacity === '1', 'the 850 ms gesture does not own the longer greeting caption');
         assert.strictEqual(bubble.textContent, text); assert.strictEqual(f.api.snapshot().caption.until, until);
         assert.strictEqual(f.callbacks.size, 0);
@@ -1211,7 +1263,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             createTraffic: () => ({
                 update: (_at: number, input: any[]) => {
                     groups = input;
-                    return new Map(input.map(group => [group.id, { x: projection.x, y: 0, visibility: projection.visibility }]));
+                    return new Map(input.map(group => [group.id, { x: projection.x, y: 0, visibility: group.canFade === false ? 1 : projection.visibility }]));
                 },
                 passages: () => groups.length === 2 ? [{ id: projection.passage, winner: groups[0].id, yielding: groups[1].id }] : [],
                 hasPassage: (id: number) => id === projection.passage,
@@ -1249,61 +1301,55 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(state.encounters.dialogue.shown, 0, 'edge clamping cannot turn unseen speakers into readable dialogue');
         assert.ok(captions(f).every(node => !node.isConnected || node.style.opacity === '0'));
         projection.x = 0;
-        for (let step = 0; step < 8 && f.api.snapshot().caption?.shownAt === undefined; step++) { f.frame(); }
-        assert.ok(f.api.snapshot().caption?.shownAt !== undefined, 'the same real work can speak once its owners enter view');
+        admitLoadedSpeech(f, 99);
+        assert.ok(f.api.snapshot().caption?.shownAt !== undefined, 'the same real work can speak once its owners have a recognizable visible window');
     });
 
     for (const hiddenBy of ['viewport exit', 'traffic fade'] as const) {
-        it('holds admitted speaker geometry before applying a later traffic change through ' + hiddenBy, () => {
+        it('preserves readable traffic ownership or cancels explicit navigation through ' + hiddenBy, () => {
             const { f, projection } = projectedPassing();
-            for (let step = 0; step < 8 && f.api.snapshot().caption?.shownAt === undefined; step++) { f.frame(); }
-            const before = f.api.snapshot().caption;
-            const bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
-            assert.ok(before?.shownAt !== undefined && bubble, 'a real passing caption was readable before the visibility change');
-            if (hiddenBy === 'viewport exit') { projection.x = 2000; }
-            else { projection.visibility = 0; }
-            f.frame();
-            assert.ok(f.now < before.until, 'the traffic change occurs before the ordinary reading deadline');
-            assert.strictEqual(f.api.snapshot().activeActors, 2);
-            assert.ok(bubble.isConnected && bubble.style.opacity === '1', 'the speaking pose is frozen before new traffic projection');
-            assert.ok(before.actors.every((id: number) => visibleSpeaker(f, id)));
-            f.tick(before.until - f.now + 1); f.frame();
-            assert.strictEqual(bubble.isConnected, false, 'after the earned interval, resumed traffic may hide the speakers');
+            const { snapshot: admitted, bubble } = admitLoadedSpeech(f, 99);
+            const before = admitted.caption;
+            assert.ok(before?.shownAt !== undefined && bubble, 'a real caption was readable before the visibility change');
+            if (hiddenBy === 'viewport exit') {
+                projection.x = 2000; f.container.emit('scroll');
+                assert.strictEqual(bubble.isConnected, false, 'actual navigation invalidates the old readable location promptly');
+            } else {
+                projection.visibility = 0;
+                while (f.now + 34 < before.until) {
+                    f.frame();
+                    assert.ok(bubble.isConnected && bubble.style.opacity === '1', 'traffic honors the admitted cast canFade constraint');
+                    assert.ok(before.actors.every((id: number) => visibleSpeaker(f, id)));
+                }
+                f.tick(before.until - f.now + 1); f.frame();
+                assert.strictEqual(bubble.isConnected, false);
+            }
             assert.strictEqual(f.api.snapshot().caption, undefined);
             assert.strictEqual(f.timers.size, 0);
         });
     }
 
-    it('finishes the visible speaking beat before the original speaker return resumes', () => {
-        const f = fixture({ seed: 10, maxActors: 1, encounterRandom: () => 0.99 }); f.desktop();
-        const dock = { x: 180, y: 240, scale: 1 };
-        let leased = false;
+    it('does not extend the actual final return to force an unreadable late speaking beat', () => {
+        const f = fixture({ seed: 10, maxActors: 1, encounterRandom: () => .99 }); f.desktop();
+        const dock = { x: 180, y: 240, scale: 1 }; let leased = false;
         f.api.setDispatchOrigin({ reserve(vehicle: string) {
-            if (vehicle !== 'quad' || leased) { return; }
-            leased = true; return dock;
-        }, destination: () => dock, release() { leased = false; } });
-        const page = f.page(99);
-        f.api.setVisiblePages([99]);
+            if (vehicle !== 'quad' || leased) { return; } leased = true; return dock;
+        }, destination: () => dock, release() { assert.ok(leased); leased = false; } });
+        const page = f.page(99); f.api.setVisiblePages([99]);
         assert.strictEqual(f.api.offer({ ...page, imageRegions: [{ id: 'returning-photo', x: .2, y: .2, width: .2, height: .2 }] }), 'started');
         const payload = f.api.snapshot().pages[0].payloads[0];
         f.advanceToScene(payload.deadline - 300);
-        const actor = f.api.snapshot().pages[0].actors[0];
-        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
-        assert.ok(actor.opacity > .2);
+        const before = f.api.snapshot(), actor = before.pages[0].actors[0], coverage = before.encounters.dialogue.coverage;
+        assert.ok(visibleSpeaker(f, actor.id));
+        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
         pointer(f, 'pointermove', point(sprite)); f.frame();
-        const bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
-        const before = f.api.snapshot().caption;
-        assert.ok(bubble && before?.shownAt !== undefined && before.until > f.now + payload.deadline - f.sceneNow);
-        const scene = f.sceneNow;
-        f.tick(payload.deadline + 1 - scene);
-        assert.ok(bubble.isConnected && visibleSpeaker(f, actor.id));
-        assert.strictEqual(f.sceneNow, scene);
-        f.tick(before.until - f.now + 1);
-        f.advanceToScene(payload.deadline + 1);
-        assert.strictEqual(f.api.snapshot().activeActors, 0);
+        const after = f.api.snapshot();
+        assert.ok(after.caption?.shownAt === undefined, 'an insufficient late window cannot create a short flash or an added hold');
+        assert.deepStrictEqual(after.encounters.dialogue.coverage, coverage);
+        assert.strictEqual(after.pages[0].payloads[0].deadline, payload.deadline);
+        f.advanceToScene(payload.deadline + 34);
         assert.strictEqual(leased, false);
-        assert.strictEqual(bubble.isConnected, false, 'canonical actor release also releases its speech');
-        assert.strictEqual(f.timers.size + f.callbacks.size, 0);
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size + f.timers.size, 0);
     });
 
     it('defers other visible speakers during external column motion even when capacity denies its helper', () => {
@@ -1320,22 +1366,23 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             assert.ok(state.caption?.shownAt === undefined, 'another visible body cannot start a reading hold during the independent column leg');
         }
         f.tick(end - f.now + 1);
-        for (let step = 0; step < 8 && !f.api.snapshot().clock.paused; step++) { f.frame(); }
-        assert.ok(f.api.snapshot().clock.paused, 'the same actual speakers may speak after external motion completes');
+        const deadline = Math.max(...f.api.snapshot().pages.flatMap((page: any) => page.payloads.map((payload: any) => payload.deadline)));
+        while (f.now < deadline && f.api.snapshot().caption?.shownAt === undefined) { f.frame(); }
+        assert.ok(f.api.snapshot().caption?.shownAt !== undefined, 'the same actual speakers may speak after external motion completes');
+        assert.strictEqual(f.api.snapshot().clock.paused, false);
         finishSpeakingRoutes(f);
         assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size + f.timers.size, 0);
     });
 
     for (const event of ['scroll', 'resize'] as const) {
-        it('cancels an admitted speaking pause through the actual native ' + event + ' hook', () => {
-            const { f } = projectedPassing();
-            for (let step = 0; step < 8 && !f.api.snapshot().clock.paused; step++) { f.frame(); }
-            const before = f.api.snapshot(), bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
-            assert.ok(before.clock.paused && bubble && f.now < before.caption.until);
+        it('cancels admitted speech through the actual native ' + event + ' hook without stopping scene time', () => {
+            const { f, page } = coarsePhoto({ maxActors: 1, encounterRandom: () => .99 });
+            const { snapshot: before, bubble } = admitLoadedSpeech(f, page.pageNumber);
+            assert.ok(f.now < before.caption.until);
             if (event === 'scroll') { f.container.scrollTop += 40; f.container.emit('scroll'); }
             else { f.window.innerWidth -= 40; f.window.emit('resize'); }
             const after = f.api.snapshot();
-            assert.strictEqual(after.clock.paused, false, 'native navigation releases the scene clock immediately');
+            assert.strictEqual(after.clock.paused, false, 'native navigation leaves the normal scene clock advancing');
             assert.strictEqual(bubble.isConnected, false);
             assert.strictEqual(after.caption, undefined);
             assert.strictEqual(f.timers.size, 0, 'the cancelled reading expiry is cleared');
@@ -1354,10 +1401,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             const page = f.page(); f.api.setVisiblePages([1]);
             assert.strictEqual(f.api.offer({ ...page, imageRegions: [{ id: 'first-readable', x: .2, y: .2, width: .2, height: .15 }] }), 'started');
             let actor: any;
-            for (let frame = 0; frame < 30; frame++) {
+            const end = f.api.snapshot().pages[0].payloads[0].operation.timing.workEnd;
+            for (; f.now < end;) {
                 f.sceneFrame();
                 const state = f.api.snapshot(), payload = state.pages[0]?.payloads[0];
-                actor = state.pages[0]?.actors.find((value: any) => value.carrying && visibleSpeaker(f, value.id));
+                actor = state.pages[0]?.actors.find((value: any) => value.carrying && readableSpeaker(f, value.id));
                 if (actor && payload.progress > .2 && payload.progress < .5) { break; }
                 actor = undefined;
             }
@@ -1365,7 +1413,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
             pointer(f, 'pointermove', point(sprite)); f.sceneFrame();
             const position = point(sprite);
-            pointer(f, 'pointerdown', position); pointer(f, 'pointerup', position); pointer(f, 'click', position); f.sceneFrame();
+            pointer(f, 'pointerdown', position); pointer(f, 'pointerup', position); pointer(f, 'click', position); f.frame();
             const before = f.api.snapshot(), caption = before.caption;
             const entry = catalogue.find((value: any) => value.id === caption?.choiceId);
             const speaker = { id: actor.id, vehicle: actor.vehicle, name: module.ROBOT_VEHICLES.find((value: any) => value.id === actor.vehicle).name };
@@ -1475,9 +1523,10 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         }
         const initial = f.api.snapshot().pages.map((page: any) => page.payloads[0]);
         assert.ok(initial.every((payload: any) => payload.helpers.length === 1));
+        const deadline = Math.max(...initial.map((payload: any) => payload.deadline));
         let seen = false, carried = false, smoke = false;
-        for (let step = 0; step < 120 && (f.callbacks.size || f.api.snapshot().clock.paused); step++) {
-            f.sceneFrame(); const state = f.api.snapshot();
+        while (f.callbacks.size && f.now <= deadline) {
+            f.frame(); const state = f.api.snapshot();
             if (state.encounters.active?.kind !== 'rescue') { continue; }
             seen = true;
             assert.strictEqual(state.encounters.active.rescue.kind, 'airlift');
@@ -1579,7 +1628,8 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(original.length, 2);
         assert.ok(original.every((payload: any) => payload.helpers.length === 1));
         let faded = false, fixedYield = false, passing = false;
-        for (let frame = 0; frame < 150 && (f.callbacks.size || f.api.snapshot().clock.paused); frame++) {
+        const end = Math.max(...f.api.snapshot().pages.flatMap((page: any) => page.payloads.map((payload: any) => payload.deadline)));
+        for (let frame = 0; f.callbacks.size && f.now <= end + 34; frame++) {
             f.sceneFrame(); const state = f.api.snapshot(), current = state.pages[0];
             if (!current) { continue; }
             const visible: Array<{ point: { x: number; y: number }; radius: number }> = [];
@@ -1641,7 +1691,8 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             ] }), 'started');
             const originals = f.api.snapshot().pages[0].payloads;
             assert.strictEqual(originals.length, 2);
-            for (let frame = 0; frame < 150 && (f.callbacks.size || f.api.snapshot().clock.paused); frame++) {
+            const end = Math.max(...f.api.snapshot().pages.flatMap((page: any) => page.payloads.map((payload: any) => payload.deadline)));
+        for (; f.callbacks.size && f.now <= end + 34;) {
                 f.sceneFrame(); const state = f.api.snapshot();
                 for (const payload of state.pages.flatMap((value: any) => value.payloads)) {
                     const original = originals.find((value: any) => value.id === payload.id);
@@ -2148,6 +2199,8 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const actor = quality.find(canvas => canvas.className === 'pdfDocumentRobotQualityCleaner')!;
         const cargo = f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width > 0);
         assert.strictEqual(began.cargoBytes, [...cargo, old, sharp].reduce((sum, canvas) => sum + canvas.width * canvas.height * 4, 0));
+        while (f.now < scene.deadline && f.api.snapshot().qualityReactions[0]?.startedAt === undefined) { f.frame(); }
+        assert.ok(f.api.snapshot().qualityReactions[0]?.startedAt !== undefined, 'the actual incoming photo becomes readable before its finite wipe deadline');
         f.tick(120); assert.ok(Number(actor.style.opacity) > 0);
         assert.ok(f.api.snapshot().qualityReactions[0].phase > 0);
         assert.ok(sharp.style.clipPath.startsWith('inset('));
@@ -2246,8 +2299,13 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
         page.pageElement.replaceChildren(page.canvas, page.text);
         assert.strictEqual(f.api.refine(source()), 0, 'losing the authorized cover is a real terminal cancellation');
-        f.frame(); pointer(f, 'pointermove', point(sprite)); f.frame();
-        assert.ok(f.api.snapshot().caption && !f.api.snapshot().caption.text.includes('Nosim fotografiju.'),
+        let caption: any;
+        while (f.callbacks.size && f.now < before.deadline && !caption) {
+            f.frame(); pointer(f, 'pointermove', point(sprite)); f.frame();
+            const current = f.api.snapshot().caption;
+            if (current?.shownAt !== undefined && current.actors.includes(actor.id)) { caption = current; }
+        }
+        assert.ok(caption && !caption.text.includes('Nosim fotografiju.'),
             'the empty helper must not claim to carry the released photo');
         const state = f.api.snapshot().pages[0];
         assert.strictEqual(state.actors[0].carrying, false);
@@ -2267,13 +2325,18 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const state = f.api.snapshot().pages[0], ground = state.actors.find((actor: any) => actor.role === 'ground');
         const air = state.actors.find((actor: any) => actor.role === 'aerial');
         const sprite = f.owned.find(canvas => canvas.dataset.courier === String(air.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
-        pointer(f, 'pointermove', point(sprite)); f.frame();
-        assert.ok(f.api.snapshot().caption && !f.api.snapshot().caption.text.includes('Nosim fotografiju.'),
-            'carrying another robot is independent from owning photo pixels');
         assert.strictEqual(ground.carried, true); assert.strictEqual(ground.carrying, false);
         assert.strictEqual(air.carrying, true); assert.strictEqual(air.activity, 'assist');
         assert.strictEqual(state.payloads[0].deadline, payload.deadline);
         assert.deepStrictEqual(state.payloads[0].helpers, payload.helpers);
+        let caption: any;
+        while (f.callbacks.size && f.now < payload.deadline && !caption) {
+            pointer(f, 'pointermove', point(sprite)); f.frame();
+            const current = f.api.snapshot().caption;
+            if (current?.shownAt !== undefined && current.actors.includes(air.id)) { caption = current; }
+        }
+        assert.ok(caption && !caption.text.includes('Nosim fotografiju.'),
+            'carrying another robot is independent from owning photo pixels');
         f.finish(); assert.strictEqual(f.callbacks.size + f.api.snapshot().retainedBytes, 0);
     });
 
@@ -2395,7 +2458,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.ok(Math.abs(top - (Math.floor(image.y * logicalHeight * 1.2) - 2) / 1.2) < 1e-9);
         assert.ok(Math.abs(right - (Math.ceil((image.x + image.width) * logicalWidth * 1.2) + 2) / 1.2) < 1e-9);
         assert.ok(Math.abs(bottom - (Math.ceil((image.y + image.height) * logicalHeight * 1.2) + 2) / 1.2) < 1e-9);
-        f.tick(payload.deadline * 0.6199);
+        f.tick(payload.operation.timing.workEnd - 0.001 - f.now);
         const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
         assert.ok(Math.abs(parseFloat(cargo.style.width) - image.width * logicalWidth) < 0.01);
         assert.ok(Math.abs(parseFloat(cargo.style.height) - image.height * logicalHeight) < 0.01);
@@ -2656,8 +2719,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(cover.style.borderRadius, '0');
         assert.strictEqual(f.api.snapshot().activeArrivalCovers, 1);
         assert.strictEqual(f.api.snapshot().pages[0].payloads[0].arrivalCovered, true);
+        const depositAt = f.api.snapshot().pages[0].payloads[0].operation.timing.workEnd;
         let deposited = false;
-        for (let step = 0; step < 120; step++) {
+        while (f.now <= depositAt) {
             f.frame();
             const payload = f.api.snapshot().pages[0]?.payloads[0];
             if (payload?.deposited) { deposited = true; break; }
@@ -2677,7 +2741,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const before = f.api.snapshot().pages[0].payloads[0];
         const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
         const allocated = f.owned.length;
-        const landedAt = before.deadline * 0.62, fadeMs = module.MOTION_LAB_CHOREOGRAPHY.settleMs;
+        const landedAt = before.operation.timing.workEnd, fadeMs = module.MOTION_LAB_CHOREOGRAPHY.settleMs;
         f.scroll(70, 200);
         f.tick(landedAt + 1 - f.now);
         const shadow = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotLandingShadow')!;
@@ -2715,7 +2779,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             const { f, page, source } = coarsePhoto({ maxActors: 1, encounterRandom: () => 0.99 });
             f.tick(200);
             const before = f.api.snapshot().pages[0].payloads[0];
-            f.tick(before.deadline * 0.62 + 1 - f.now);
+            f.tick(before.operation.timing.workEnd + 1 - f.now);
             const shadow = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotLandingShadow')!;
             assert.ok(shadow, ending + ' starts with a landed shadow');
             if (ending === 'input') { f.api.revealArrivals(); }
@@ -2736,7 +2800,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         for (const lateMs of [100, 201]) {
             const { f, source } = coarsePhoto({ maxActors: 1, encounterRandom: () => 0.99 });
             f.tick(200);
-            const before = f.api.snapshot().pages[0].payloads[0], landedAt = before.deadline * 0.62;
+            const before = f.api.snapshot().pages[0].payloads[0], landedAt = before.operation.timing.workEnd;
             f.now = landedAt + lateMs;
             assert.strictEqual(f.api.refine(source()), 0);
             const shadow = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotLandingShadow');
@@ -2918,23 +2982,31 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         }
     });
 
+    function readableRemoval(existing?: Fixture) {
+        const f = existing ?? fixture({ seed: 10, maxActors: 1, encounterRandom: () => .99 }); f.desktop(1, 2400, 1800);
+        let leased = false; const dock = { x: 850, y: 650, scale: 1.54 };
+        f.api.setDispatchOrigin({ reserve() { if (leased) { return; } leased = true; return dock; },
+            destination: () => dock, release() { assert.ok(leased); leased = false; } });
+        const page = f.page(99); page.pageElement.rect.left = 1000; page.pageElement.rect.top = 600;
+        const delivery = { ...page, imageRegions: [{ id: 'retiring-portrait', x: .2, y: .65, width: .4, height: .3 }] };
+        f.api.retireDocument([delivery], 'edition-b');
+        const deadline = f.api.snapshot().replacement.payloads[0].operation.timing.deadline;
+        while (f.now < deadline) {
+            f.frame(); const state = f.api.snapshot();
+            const bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
+            if (bubble && state.caption?.shownAt !== undefined) {
+                const actor = state.replacement.actors.find((value: any) => state.caption.actors.includes(value.id));
+                const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.dataset.courier === String(actor.id))!;
+                assert.ok(state.caption.actors.every((id: number) => readableSpeaker(f, id)));
+                return { f, page, delivery, actor, sprite, bubble, until: state.caption.until };
+            }
+        }
+        assert.fail('the centered bottom-photo removal provides a complete actual readable solo opportunity');
+    }
+
     for (const ending of ['cancel', 'preempt', 'failed-piece', 'finish']) {
         it('gives a retiring caption an explicit ' + ending + ' outcome with its speaker release', () => {
-            const f = fixture({ maxActors: 1, encounterRandom: () => 0.99 });
-            const page = f.page(99); f.api.retireDocument([page], 'edition-b'); f.tick(450);
-            const actor = f.api.snapshot().replacement.actors[0];
-            const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle'
-                && canvas.dataset.courier === String(actor.id))!;
-            const position = point(sprite);
-            pointer(f, 'pointermove', position);
-            assert.strictEqual(f.api.snapshot().interaction.hovered, actor.id, 'the retiring actor has a live hit at its displayed center');
-            pointer(f, 'pointerdown', position); pointer(f, 'pointerup', position); pointer(f, 'click', position);
-            for (let step = 0; step < 12 && captions(f)[0]?.style.opacity !== '1'; step++) {
-                f.frame();
-            }
-            const bubble = captions(f)[0], until = f.api.snapshot().caption?.until;
-            assert.ok(bubble?.isConnected && bubble.style.opacity === '1', JSON.stringify({ point: point(sprite),
-                interaction: f.api.snapshot().interaction, caption: f.api.snapshot().caption, style: sprite.style }));
+            const { f, page, actor, sprite, bubble, until } = readableRemoval();
             if (ending === 'cancel') { f.api.cancelReplacement('edition-b'); }
             else if (ending === 'preempt') {
                 const current = f.page(99); f.api.setVisiblePages([99]);
@@ -2979,22 +3051,38 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('keeps the longest exact Croatian success line with its visible speaker and releases it on departure', () => {
-        const f = fixture({ ...successOptions(), seed: 73 }); const page = f.page();
-        f.api.setVisiblePages([1]); f.api.offer(page);
+        const f = fixture({ ...successOptions(), seed: 73 });
         const line = 'ovako fino ne bi ni Marić izbrusio';
+        const catalogue = module.robotDialogueCatalogue(module.ROBOT_ENCOUNTER_DIALOGUE);
         let bubble: Element | undefined;
-        for (let step = 0; step < 100 && !bubble; step++) {
-            f.frame(); bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1' && node.textContent.includes(line));
+        for (let number = 1; number <= catalogue.length && !bubble; number++) {
+            const page = f.page(number); f.api.setVisiblePages([number]);
+            assert.strictEqual(f.api.offer(page), 'started');
+            const deadline = Math.max(...f.api.snapshot().pages.flatMap((value: any) => value.payloads.map((payload: any) => payload.deadline)));
+            while (f.callbacks.size && f.now <= deadline && !bubble) {
+                f.frame(); bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1' && node.textContent.includes(line));
+            }
+            if (!bubble) { f.finish(); }
         }
-        assert.ok(bubble, 'the seeded real deposit selects the exact requested long line');
-        const writes = bubble.textWrites;
-        for (let step = 0; step < 100 && bubble.isConnected; step++) {
+        assert.ok(bubble, 'ordinary eligible catalogue coverage reaches the exact requested long line');
+        const evidence = f.api.snapshot(), until = evidence.caption.until;
+        assert.strictEqual(until - evidence.caption.shownAt, module.robotCaptionReadMs([line]));
+        assert.ok(['carrying', 'deposit', 'success'].includes(evidence.caption.opportunity), 'generic long praise uses its actual supported work opportunity');
+        const writes = bubble.textWrites, position = [bubble.style.left, bubble.style.top], motion = new Set<string>();
+        while (f.now + 34 < until) {
             const state = f.api.snapshot();
-            const speakers = state.pages.flatMap((value: any) => value.actors).filter((actor: any) => state.caption?.actors.includes(actor.id));
-            assert.ok(speakers.length > 0 && speakers.every((actor: any) => actor.opacity > .2), 'readable text keeps an actual visible speaker');
+            const speakers = state.pages.flatMap((value: any) => value.actors).filter((actor: any) => evidence.caption.actors.includes(actor.id));
+            assert.strictEqual(speakers.length, evidence.caption.actors.length);
+            assert.ok(speakers.every((actor: any) => readableSpeaker(f, actor.id)), 'the long late sentence retains actual naturally visible speakers');
+            assert.ok(bubble.isConnected && bubble.style.opacity === '1');
+            assert.deepStrictEqual([bubble.style.left, bubble.style.top], position);
             assert.strictEqual(bubble.textWrites, writes, 'ordinary paints do not replace unchanged caption text');
+            motion.add(JSON.stringify(speakers.map((actor: any) => f.owned.find(canvas => canvas.dataset.courier === String(actor.id) && canvas.className === 'pdfDocumentRobotVehicle')!.style.transform)));
             f.frame();
         }
+        assert.ok(motion.size > 1, 'the fulfilled-deposit cast continues its visible choreography while the long text is readable');
+        f.tick(until - f.now + 1);
+        assert.strictEqual(bubble.isConnected, false);
         f.finish();
         assert.strictEqual(f.api.snapshot().activeActors, 0);
         assert.strictEqual(f.callbacks.size, 0);
@@ -3005,6 +3093,62 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(bubble.isConnected, false);
         assert.strictEqual(f.api.snapshot().frames, frames);
         assert.strictEqual(f.timers.size + f.callbacks.size, 0);
+    });
+
+    it('gives genuinely completed-photo wording a full readable interval with actual fulfilled pixels', () => {
+        const f = fixture({ seed: 73, maxActors: 4, encounterRandom: () => .99 }); f.desktop();
+        const catalogue = module.robotDialogueCatalogue(module.ROBOT_ENCOUNTER_DIALOGUE);
+        const completed = new Set(Object.entries(module.ROBOT_AUTHORED_UTTERANCES)
+            .filter(([, value]: [string, any]) => value.requiresAny?.length === 1 && value.requiresAny[0] === 'completed').map(([id]) => id));
+        let evidence: any, bubble: Element | undefined;
+        for (let number = 1; number <= catalogue.length && !evidence; number++) {
+            const page = f.page(number); f.api.setVisiblePages([number]);
+            assert.strictEqual(f.api.offer({ ...page, imageRegions: [{ id: 'completed-words-' + number, x: .2, y: .2, width: .2, height: .15 }] }), 'started');
+            const deadline = Math.max(...f.api.snapshot().pages.flatMap((value: any) => value.payloads.map((payload: any) => payload.deadline)));
+            while (f.callbacks.size && f.now <= deadline && !evidence) {
+                f.frame(); const state = f.api.snapshot(), caption = state.caption;
+                if (caption?.shownAt === undefined || !caption.meaningIds.some((id: string) => completed.has(id))) { continue; }
+                bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
+                if (bubble) { evidence = state; }
+            }
+            if (!evidence) { f.finish(); }
+        }
+        assert.ok(evidence && bubble, 'ordinary successful work reaches a truthful completed-only authored meaning');
+        assert.ok(evidence.caption.actors.some((id: number) => evidence.pages.some((page: any) => page.payloads.some((payload: any) => payload.helpers.includes(id) && payload.deposited && payload.operation.resolution === 'fulfilled'))),
+            'completion wording belongs to an actually fulfilled photo owner');
+        const until = evidence.caption.until, position = [bubble.style.left, bubble.style.top], text = bubble.textContent;
+        const lines = text.split('\n').map((line: string) => line.slice(line.indexOf(': ') + 2));
+        assert.strictEqual(until - evidence.caption.shownAt, module.robotCaptionReadMs(lines));
+        while (f.now + 34 < until) {
+            f.frame(); assert.ok(bubble.isConnected && bubble.style.opacity === '1');
+            assert.deepStrictEqual([bubble.style.left, bubble.style.top], position); assert.strictEqual(bubble.textContent, text);
+            assert.ok(evidence.caption.actors.every((id: number) => readableSpeaker(f, id)), 'the actual fulfilled cast supports the entire completion sentence');
+        }
+        f.tick(until - f.now + 1); f.finish();
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size + f.timers.size, 0);
+    });
+
+    it('does not spend readable coverage on a late line that cannot fit the actual visible return window', () => {
+        const f = fixture({ seed: 10, maxActors: 1, encounterRandom: () => .99 }); f.desktop();
+        const dock = { x: 180, y: 240, scale: 1 }; let leased = false;
+        f.api.setDispatchOrigin({ reserve(vehicle: string) {
+            if (vehicle !== 'quad' || leased) { return; } leased = true; return dock;
+        }, destination: () => dock, release() { leased = false; } });
+        const page = f.page(99); f.api.setVisiblePages([99]);
+        assert.strictEqual(f.api.offer({ ...page, imageRegions: [{ id: 'late-visible-return', x: .2, y: .2, width: .2, height: .15 }] }), 'started');
+        const deadline = f.api.snapshot().pages[0].payloads[0].deadline;
+        f.advanceToScene(deadline - 100);
+        const before = f.api.snapshot(), actor = before.pages[0].actors[0];
+        assert.ok(visibleSpeaker(f, actor.id) && !before.caption, 'the real returning speaker has no prior unread cue');
+        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
+        const coverage = before.encounters.dialogue.coverage;
+        pointer(f, 'pointermove', point(sprite)); f.frame();
+        const after = f.api.snapshot();
+        assert.ok(!after.caption || after.caption.shownAt === undefined, 'a long new line cannot flash during the final visible fraction');
+        assert.deepStrictEqual(after.encounters.dialogue.coverage, coverage, 'unread reservations consume no authored exposure');
+        f.finish();
+        assert.strictEqual(leased, false);
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size + f.timers.size, 0);
     });
 
     it('does not describe an armed approach as a collision before actual contact', () => {
@@ -3030,7 +3174,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('groups a close top-edge exchange into one bounded bubble without repeated text writes', () => {
-        const f = fixture({ ...nearMissOptions(), seed: 1 }); f.desktop();
+        const f = fixture({ ...nearMissOptions(), seed: 31 }); f.desktop();
         const page = f.page(); page.pageElement.rect.top = 32;
         let reserved = 0;
         f.api.setDispatchOrigin({ reserve: () => ({ x: reserved++ ? 80 : 600, y: 50, scale: 1.92 }),
@@ -3043,7 +3187,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(captions(f).length, 1, 'close partners cannot cover one another with opaque bubbles');
         const bubble = captions(f)[0], bounds = f.container.getBoundingClientRect();
         assert.strictEqual(bubble.style.opacity, '1', 'the complete exchange is actually readable');
-        assert.ok(f.api.snapshot().caption.actors.every((id: number) => visibleSpeaker(f, id)));
+        assert.ok(f.api.snapshot().caption.actors.every((id: number) => readableSpeaker(f, id)));
         assert.strictEqual(bubble.textContent.split('\n').length, 2, 'each speaker has its own labeled line');
         const width = parseFloat(bubble.style.width), height = parseFloat(bubble.style.height);
         const left = parseFloat(bubble.style.left) + bounds.left;
@@ -3064,7 +3208,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     });
 
     it('places the measured multiline caption and reuses its dimensions while the exchange moves', () => {
-        const f = fixture({ ...nearMissOptions(), seed: 1 }); f.desktop();
+        const f = fixture({ ...nearMissOptions(), seed: 31 }); f.desktop();
         f.document.captionHeight = 142;
         const page = f.page(); let reserved = 0;
         f.api.setDispatchOrigin({ reserve: () => ({ x: reserved++ ? 80 : 600, y: 220, scale: 1.92 }),
@@ -3077,7 +3221,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.ok(bubble);
         assert.strictEqual(bubble.style.opacity, '1');
         assert.strictEqual(bubble.textContent.split('\n').length, 2, 'the measured fixture contains a complete two-speaker exchange');
-        assert.ok(f.api.snapshot().caption.actors.every((id: number) => visibleSpeaker(f, id)));
+        assert.ok(f.api.snapshot().caption.actors.every((id: number) => readableSpeaker(f, id)));
         assert.strictEqual(parseFloat(bubble.style.height), 142, 'placement uses the actual wrapped DOM height');
         assert.strictEqual(bubble.layoutReads, 1, 'the first geometry pass measures the multiline bubble once');
         const placement = f.api.snapshot().caption.placement;
@@ -3136,7 +3280,8 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.api.offer(page), 'started');
         let observed = false, visibleDialogue = false;
         const nodes = (node: Element): Element[] => [node, ...node.children.flatMap(nodes)];
-        for (let step = 0; step < 115 && (f.callbacks.size || f.api.snapshot().clock.paused); step++) {
+        const end = Math.max(...f.api.snapshot().pages.flatMap((page: any) => page.payloads.map((payload: any) => payload.deadline)));
+        for (; f.callbacks.size && f.now <= end + 34;) {
             f.sceneFrame();
             const state = f.api.snapshot();
             if (state.encounters?.active?.kind !== 'success') { continue; }
@@ -3165,86 +3310,59 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(page.canvas.width, 4320, 'the original rendered page remains owned by PDF.js');
     });
 
-    it('keeps a real publication queued and protected through speaking instead of terminally skipping its crop', () => {
-        let f: Fixture, p: ReturnType<typeof publication>, wakes = 0;
-        f = fixture({ ...nearMissOptions(), maxActors: 4, onCapacityAvailable() {
-            wakes++; f.api.reconcileEncounter(p.candidate.page, p.encounter, p.candidate);
-        } });
-        f.desktop(); let reserved = 0;
-        f.api.setDispatchOrigin({ reserve: () => ({ x: reserved++ ? 80 : 600, y: 220, scale: 1.92 }),
-            destination: () => ({ x: 600, y: 220, scale: 1.92 }), release() {} });
-        p = publication(f, f.page(99));
-        f.api.setVisiblePages([99]); f.api.setVisibleWork([work([p.page])]);
-        for (let step = 0; step < 40 && !f.api.snapshot().clock.paused; step++) { f.frame(); }
-        const before = f.api.snapshot();
-        assert.ok(before.clock.paused && before.caption.shownAt !== undefined);
+    it('admits independent protected pixels without interrupting an existing advance cast sentence', () => {
+        const f = fixture({ ...nearMissOptions(), maxActors: 4 }); f.desktop();
+        const waiting = f.page(99), incoming = f.page(100); incoming.pageElement.rect.left = 540;
+        const p = publication(f, incoming);
+        f.api.setVisiblePages([99, 100]); f.api.setVisibleWork([work([waiting, incoming], ['waiting', 'ready'])]); f.finish();
+        const { snapshot: before, bubble } = admitParkedSpeech(f);
         f.api.preparePublication(p.candidate, p.encounter).commit();
-        const queued = f.api.snapshot(), plan = queued.deliveryPlans[0], crop = plan.crops[0];
-        assert.strictEqual(crop.state, 'queued', 'temporary speech ownership is waiting, not failed admission');
-        assert.strictEqual(crop.protected, true);
-        assert.strictEqual(queued.activePayloads, 0);
-        const cover = sceneNodes(p.page.pageElement).find(node => node.dataset.deliveryPlan === String(plan.id) && node.dataset.deliveryCrop === String(crop.id));
-        assert.ok(cover?.isConnected);
+        const current = f.api.snapshot(), plan = current.deliveryPlans[0];
+        assert.ok(plan.crops.some((crop: any) => crop.state === 'active'), 'spare cast capacity may serve independent protected pixels immediately');
+        assert.strictEqual(current.caption.id, before.caption.id); assert.strictEqual(current.caption.until, before.caption.until);
+        assert.ok(bubble.isConnected && bubble.style.opacity === '1');
         f.api.reconcileEncounter(p.candidate.page, p.encounter, p.candidate);
-        assert.strictEqual(f.api.snapshot().deliveryPlans[0].crops[0].state, 'queued');
-        assert.strictEqual(f.api.snapshot().caption.id, before.caption.id);
-        f.tick(before.caption.until - f.now + 1); f.frame();
-        const admitted = f.api.snapshot().deliveryPlans[0];
-        assert.strictEqual(wakes, 1);
-        assert.strictEqual(admitted.id, plan.id);
-        assert.strictEqual(admitted.crops[0].id, crop.id);
-        assert.ok(['active', 'delivered'].includes(admitted.crops[0].state), 'expiry retries the same protected crop through its normal plan owner');
-        f.finish();
+        assert.strictEqual(f.api.snapshot().deliveryPlans[0].id, plan.id);
+        while (f.now + 34 < before.caption.until) { f.frame(); assert.ok(bubble.isConnected && bubble.style.opacity === '1'); }
+        f.tick(before.caption.until - f.now + 1); f.api.setVisibleWork([work([waiting, incoming], ['ready', 'ready'])]); f.finish();
         const final = f.api.snapshot();
         assert.strictEqual(final.deliveryPlans[0].crops[0].state, 'delivered');
         assert.strictEqual(final.deliveredFragments, 1);
         assert.strictEqual(final.activeActors + final.retainedBytes + f.callbacks.size + f.timers.size, 0);
     });
 
-    it('defers ready pixels without stealing a speaking crew and wakes capable promotion once after expiry', () => {
-        let f: Fixture, ready: any, wakes = 0, admitted: string | undefined;
-        f = fixture({ ...nearMissOptions(), maxActors: 4, onCapacityAvailable() { wakes++; admitted = f.api.offer(ready); } });
-        f.desktop(); let reserved = 0;
-        f.api.setDispatchOrigin({ reserve: () => ({ x: reserved++ ? 80 : 600, y: 220, scale: 1.92 }),
-            destination: () => ({ x: 600, y: 220, scale: 1.92 }), release() {} });
-        const page = f.page(99); page.canvas.width = 135; page.canvas.height = 192;
-        ready = { ...page, kind: 'preview', imageRegions: [{ id: 'ready-during-speech', x: .1, y: .2, width: .6, height: .4 }] };
-        f.api.setVisiblePages([99]); f.api.setVisibleWork([work([page])]);
-        for (let step = 0; step < 40 && !f.api.snapshot().clock.paused; step++) { f.frame(); }
-        const before = f.api.snapshot(), bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
-        assert.ok(before.clock.paused && bubble);
-        assert.strictEqual(before.activeActors, 2, 'the actual paired staging crew is present');
+    it('serves ordinary independent ready work while preserving the actual staged speaking bodies', () => {
+        const f = fixture({ ...nearMissOptions(), maxActors: 4 }); f.desktop();
+        const waiting = f.page(99), ready = f.page(100); ready.pageElement.rect.left = 540;
+        f.api.setVisiblePages([99, 100]); f.api.setVisibleWork([work([waiting, ready], ['waiting', 'ready'])]); f.finish();
+        const { snapshot: before, bubble } = admitParkedSpeech(f);
         const ids = before.advance.flatMap((group: any) => group.actors.map((actor: any) => actor.id));
-        const sprites = ids.map((id: number) => f.owned.find(canvas => canvas.dataset.courier === String(id) && canvas.className === 'pdfDocumentRobotVehicle')!);
-        const transforms = sprites.map((sprite: Canvas) => sprite.style.transform), text = bubble.textContent;
-        assert.strictEqual(f.api.offer(ready), 'busy');
-        assert.strictEqual(wakes, 0);
-        for (let index = 0; index < sprites.length; index++) {
-            assert.ok(sprites[index].isConnected && visibleSpeaker(f, ids[index]));
-            assert.strictEqual(sprites[index].style.transform, transforms[index]);
+        assert.strictEqual(ids.length, 2);
+        assert.strictEqual(f.api.offer({ ...ready, imageRegions: [{ id: 'independent-ready', x: .1, y: .2, width: .6, height: .4 }] }), 'started');
+        while (f.now + 34 < before.caption.until) {
+            f.frame(); const state = f.api.snapshot();
+            assert.ok(bubble.isConnected && bubble.style.opacity === '1'); assert.strictEqual(state.caption.id, before.caption.id);
+            assert.ok(before.caption.actors.every((id: number) => readableSpeaker(f, id)), 'independent pixels cannot reclaim an admitted speaker');
+            assert.ok(state.activeActors <= state.maxActors);
         }
-        assert.strictEqual(bubble.textContent, text);
-        assert.strictEqual(f.api.snapshot().activeActors, 2);
-        f.tick(before.caption.until - f.now + 1); f.frame();
-        assert.strictEqual(wakes, 1, 'one expiry reopens speech-blocked admission for the reusable crew');
-        assert.strictEqual(admitted, 'started');
-        const promoted = f.api.snapshot().pages.flatMap((value: any) => value.actors).map((actor: any) => actor.id);
-        assert.ok(promoted.length > 0, 'ready pixels receive a capable crew after the speaking ownership ends');
-        f.finish();
-        assert.strictEqual(wakes, 1, 'ordinary completion does not replay the blocked opportunity');
+        f.tick(before.caption.until - f.now + 1); f.api.setVisibleWork([work([waiting, ready], ['ready', 'ready'])]); f.finish();
         assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size + f.timers.size, 0);
     });
 
-    it('wakes ready admission after speech when one staged actor and a settled column helper fill the two-slot cap', () => {
-        let f: Fixture, ready: any, wakes = 0, admitted: string | undefined;
-        f = fixture({ seed: 10, maxActors: 2, encounterRandom: () => .99,
-            onCapacityAvailable() { wakes++; admitted = f.api.offer(ready); } });
+    it('retries genuinely leased compatible capacity after a continuous speaking departure at the two-slot cap', () => {
+        let f: Fixture, ready: any, admitted: string | undefined;
+        let releases = 0;
+        const wakes: Array<{ at: number; result: string; releases: number; actors: number; caption?: string; held: string[] }> = [];
+        f = fixture({ seed: 10, maxActors: 2, encounterRandom: () => .99, onCapacityAvailable() {
+            const before = f.api.snapshot(), released = releases, leases = [...held];
+            admitted = f.api.offer(ready); wakes.push({ at: f.now, result: admitted!, releases: released, actors: before.activeActors, caption: before.caption?.id, held: leases });
+        } });
         f.desktop();
         const held = new Set<string>(), dock = { x: 350, y: 220, scale: 1 }; let columnAvailable = false;
         f.api.setDispatchOrigin({ reserve(vehicle: string) {
             if (!['quad', 'forklift'].includes(vehicle) || vehicle === 'forklift' && !columnAvailable || held.has(vehicle)) { return; }
             held.add(vehicle); return dock;
-        }, destination: () => dock, release(vehicle: string) { assert.ok(held.delete(vehicle)); } });
+        }, destination: () => dock, release(vehicle: string) { assert.ok(held.delete(vehicle)); releases++; } });
         const page = f.page(99); page.pageElement.rect.left = 250;
         ready = { ...page, imageRegions: [{ id: 'full-cap-ready', x: .2, y: .2, width: .2, height: .15 }] };
         f.api.setVisiblePages([99]); f.api.setVisibleWork([work([page])]); f.finish();
@@ -3257,22 +3375,63 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.ok(f.api.snapshot().columnPull, 'the actual helper remains settled at the completed column destination');
         assert.strictEqual(f.api.snapshot().activeActors, 2);
         const sprite = f.owned.find(canvas => canvas.dataset.courier === String(staged.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
-        pointer(f, 'pointermove', point(sprite)); f.frame();
-        const speaking = f.api.snapshot(), bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
-        assert.ok(speaking.clock.paused && bubble);
-        assert.strictEqual(f.api.offer(ready), 'busy');
-        assert.strictEqual(f.api.snapshot().activeActors, 2);
+        const { snapshot: speaking, bubble } = admitParkedSpeech(f);
+        assert.strictEqual(f.api.offer(ready), 'busy', 'the only compatible lab body still owns its actual speaking departure');
+        assert.ok(f.api.snapshot().activeActors <= 2, 'reclaim and reuse stay inside the actual two-slot cap');
         assert.ok(sprite.isConnected && visibleSpeaker(f, staged.id));
+        const motion = new Set<string>();
+        while (f.now + 34 < speaking.caption.until) {
+            f.frame(); assert.ok(bubble.isConnected && bubble.style.opacity === '1');
+            assert.ok(readableSpeaker(f, staged.id)); motion.add(sprite.style.transform);
+        }
+        assert.ok(motion.size > 1, 'the protected cast continues its visible return instead of freezing ready work');
         f.tick(speaking.caption.until - f.now + 1); f.frame();
-        assert.strictEqual(wakes, 1, 'the speech cause wakes despite no numerical actor capacity having been freed');
-        assert.strictEqual(admitted, 'started');
-        assert.ok(f.api.snapshot().pages[0].actors.some((actor: any) => actor.id === staged.id), 'the compatible real lab crew reuses its staged speaker');
         f.finish();
-        assert.strictEqual(wakes, 1);
+        assert.strictEqual(admitted, 'started', 'actual port-lease release wakes the waiting compatible job');
+        assert.ok(wakes.some(wake => wake.result === 'started'));
+        assert.ok(wakes.every((wake, index) => {
+            if (!index) { return wake.releases > 0; }
+            const prior = wakes[index - 1];
+            return wake.at > prior.at && (wake.releases > prior.releases || wake.actors !== prior.actors
+                || wake.caption !== prior.caption || JSON.stringify(wake.held) !== JSON.stringify(prior.held));
+        }), 'every retry follows an actual port, cast or actor ownership transition, not repeated polling of the same leased state');
+        assert.strictEqual(f.api.snapshot().deliveredFragments, 1);
+        assert.strictEqual(held.size, 0);
         assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size + f.timers.size, 0);
     });
 
-    it('holds visible advance speakers through their readable interval before the ordinary ready return', () => {
+    it('keeps a near-edge ready departure continuous and bounds it by the admitted read time plus one normal exit', () => {
+        const f = fixture({ seed: 10, maxActors: 2, encounterRandom: () => .99 }); f.desktop(1, 400, 400);
+        const page = f.page(99); page.pageElement.rect = { left: 250, top: 32, width: 400, height: 360 };
+        f.api.setVisibleWork([work([page])]); f.finish();
+        const actor = f.api.snapshot().advance[0].actors[0];
+        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
+        assert.ok(readableSpeaker(f, actor.id));
+        pointer(f, 'pointermove', point(sprite)); f.frame();
+        const before = f.api.snapshot(), bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
+        assert.ok(bubble && before.caption?.shownAt !== undefined, 'a real visible near-edge speaker admitted its line');
+        const until = before.caption.until, position = [bubble.style.left, bubble.style.top], motion = new Set<string>();
+        f.api.setVisibleWork([work([page], ['ready'])]);
+        while (f.now + 34 < until) {
+            f.frame();
+            assert.ok(bubble.isConnected && bubble.style.opacity === '1');
+            assert.deepStrictEqual([bubble.style.left, bubble.style.top], position);
+            assert.ok(readableSpeaker(f, actor.id), 'departure keeps the actual admitted cast in its verified visible segment');
+            motion.add(sprite.style.transform);
+        }
+        assert.ok(motion.size > 1, 'the ready cast departs continuously instead of stopping to read');
+        f.tick(until - f.now + 1);
+        assert.strictEqual(bubble.isConnected, false);
+        const exitDeadline = until + module.DOCUMENT_ROBOT_LIMITS.advance.returnMs;
+        while (f.api.snapshot().activeActors && f.now + 34 < exitDeadline) { f.frame(); }
+        f.tick(Math.max(0, exitDeadline - f.now) + 1);
+        f.frame(); // Observe terminal cleanup at the next normal capped paint, not between paints.
+        assert.ok(f.now <= exitDeadline + 1 + 34);
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size + f.timers.size, 0,
+            'a tiny visible route cannot inflate into a long idle return after the sentence');
+    });
+
+    it('continues visible advance speakers through their readable interval during an ordinary ready return', () => {
         const f = fixture(nearMissOptions()); f.desktop();
         const page = f.page(); let reserved = 0;
         f.api.setDispatchOrigin({ reserve: () => ({ x: reserved++ ? 80 : 600, y: 220, scale: 1.92 }),
@@ -3283,19 +3442,20 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(bubble.style.opacity, '1');
         const position = [bubble.style.left, bubble.style.top], text = bubble.textContent;
         const speakers = before.caption.actors.map((id: number) => f.owned.find(canvas => canvas.dataset.courier === String(id) && canvas.className === 'pdfDocumentRobotVehicle')!);
-        const transforms = speakers.map((speaker: Canvas) => speaker.style.transform);
+        const motion = new Set<string>();
         f.api.setVisibleWork([work([page], ['ready'])]);
         while (f.now + 34 < until) {
             f.frame();
-            assert.ok(bubble.isConnected && bubble.style.opacity === '1', 'ready state cannot erase admitted speech');
+            assert.ok(bubble.isConnected && bubble.style.opacity === '1', 'ready continuation preserves admitted speech');
             assert.deepStrictEqual([bubble.style.left, bubble.style.top], position);
             assert.strictEqual(bubble.textContent, text);
             for (let index = 0; index < speakers.length; index++) {
                 assert.ok(visibleSpeaker(f, Number(speakers[index].dataset.courier)), 'the real speaker stays visible for reading');
-                assert.strictEqual(speakers[index].style.transform, transforms[index]);
+                motion.add(speakers[index].style.transform);
             }
-            assert.strictEqual(f.callbacks.size, 0, 'speaking hold uses a wall expiry rather than a RAF heartbeat');
+            assert.strictEqual(f.api.snapshot().clock.paused, false, 'ordinary ready return keeps the normal scene clock');
         }
+        assert.ok(motion.size > speakers.length, 'the actual ready cast moves through a visible departure during reading');
         f.tick(until - f.now + 1);
         assert.strictEqual(bubble.isConnected, false);
         finishSpeakingRoutes(f);
@@ -3343,7 +3503,6 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.ok(sprites.some((canvas, index) => canvas.transforms.length > redraws[index]), 'cached artwork redraws a changed finite gesture pose');
         const bubble = captions(f)[0], until = f.api.snapshot().caption.until;
         assert.strictEqual(bubble.style.opacity, '1');
-        assert.strictEqual(f.api.offer(page), 'busy', 'ready pixels cannot take the speaking cast before its read expiry');
         assert.ok(bubble.isConnected && ids.every((id: number) => visibleSpeaker(f, id)));
         f.tick(until - f.now + 1);
         const before = sprites.map(point);
@@ -3761,9 +3920,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo')!;
         const cover = page.pageElement.children.find(node => node.className === 'pdfDocumentRobotArrival'
             && node.dataset.payload === String(payload.id))!;
-        const beforeDeposit = payload.deadline * 0.62 - 0.001;
+        const beforeDeposit = payload.operation.timing.workEnd - 0.001;
         const positions: Array<{ robot: { x: number; y: number }; cargo: { x: number; y: number }; stage: string }> = [];
-        for (let tick = 0; tick < 100; tick++) {
+        while (f.callbacks.size) {
             // Leave a full paint interval for the exact loaded endpoint sample.
             if (f.now + 68 >= beforeDeposit) { break; }
             f.frame();
@@ -3948,6 +4107,8 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const pages = [f.page(99), f.page(100)]; pages[1].pageElement.rect.left = 540;
         assert.strictEqual(typeof f.api.setVisibleWork, 'function');
         f.api.setVisibleWork([work(pages, ['preparing', 'preparing'])]); f.finish();
+        const reading = f.api.snapshot().caption;
+        if (reading?.shownAt !== undefined) { f.tick(reading.until - f.now + 1); }
         const stage = f.api.snapshot().advance[0];
         const stagedIds = stage.actors.map((actor: any) => actor.id);
         const sprites = f.owned.filter(canvas => stagedIds.includes(Number(canvas.dataset.courier)));
@@ -4497,10 +4658,12 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     it('keeps failed paired work roles and cargo growth at the actual capped progress', () => {
         for (const [seed, mode] of [[22, 'airlift'], [666, 'handoff']] as const) {
             const { f, payload, held } = failedPairedCargo(seed, mode);
-            f.sceneTick(payload.deadline * 0.15);
+            const { startedAt, workEnd } = payload.operation.timing;
+            const loadedDuration = (workEnd - startedAt) / 0.62;
+            f.advanceToScene(startedAt + loadedDuration * 0.15);
             const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.width)!;
             const before = { width: cargo.style.width, height: cargo.style.height, point: point(cargo) };
-            f.sceneTick(payload.deadline * 0.30);
+            f.advanceToScene(startedAt + loadedDuration * 0.45);
             assert.strictEqual(cargo.style.width, before.width, 'failed work does not grow its cargo after motion has stopped');
             assert.strictEqual(cargo.style.height, before.height); assert.deepStrictEqual(point(cargo), before.point);
             const current = f.api.snapshot().pages[0];
@@ -4518,16 +4681,18 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             const observed = failedPairedCargo(seed, mode), skipped = failedPairedCargo(seed, mode);
             const { f, payload, sprites } = observed;
             const poses = (values: Canvas[]) => values.map(sprite => ({ ...point(sprite), width: parseFloat(sprite.style.width) }));
-            f.sceneTick(payload.deadline * 0.74);
+            const timing = payload.operation.timing;
+            f.advanceToScene((timing.workEnd + timing.aftermathEnd) / 2);
             const before = poses(sprites);
-            f.sceneTick(payload.deadline * (0.76001 - 0.74));
+            f.advanceToScene(timing.aftermathEnd + 0.001);
             for (const [index, value] of poses(sprites).entries()) {
                 assert.ok(Math.hypot(value.x - before[index].x, value.y - before[index].y) < 0.06,
                     mode + ' member ' + index + ' teleported at recovery: ' + JSON.stringify({ before: before[index], after: value }));
                 assert.ok(Math.abs(value.width - before[index].width) < 0.02, 'return starts at the actual displayed scale');
             }
-            f.sceneTick(payload.deadline * (0.79 - 0.76001));
-            skipped.f.sceneTick(skipped.payload.deadline * 0.79);
+            f.advanceToScene(timing.aftermathEnd + (timing.deadline - timing.aftermathEnd) / 8);
+            const skippedTiming = skipped.payload.operation.timing;
+            skipped.f.advanceToScene(skippedTiming.aftermathEnd + (skippedTiming.deadline - skippedTiming.aftermathEnd) / 8);
             assert.deepStrictEqual(poses(sprites), poses(skipped.sprites), 'a skipped recovery boundary derives the same owned starting pose');
             const current = f.api.snapshot().pages[0].payloads[0];
             assert.deepStrictEqual(current.helpers, payload.helpers); assert.strictEqual(current.deadline, payload.deadline);
@@ -4756,17 +4921,19 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         for (const dx of [80, -80]) {
             const { f, actor, sprite, start, delivery, held, reservations } = stagedLugv();
             pointer(f, 'pointermove', { x: start.x - 10, y: start.y }); f.frame();
-            if (f.api.snapshot().clock.paused) { f.tick(f.api.snapshot().caption.until - f.now); }
+            const reading = f.api.snapshot().caption;
+            if (reading?.shownAt !== undefined) { f.tick(reading.until - f.now + 1); }
             const reserved = reservations.length;
             assert.strictEqual(f.api.offer(delivery(dx)), 'started');
-            const before = f.api.snapshot().pages[0].payloads[0], duration = before.deadline - f.sceneNow;
+            const before = f.api.snapshot().pages[0].payloads[0], timing = before.operation.timing;
+            const loadedMs = timing.workEnd - timing.startedAt;
             assert.ok(before.helpers.includes(actor.id), 'promotion keeps the actual staged body');
-            f.sceneTick(duration * 0.62 * 0.2);
+            f.advanceToScene(timing.startedAt + loadedMs * 0.2);
             if (dx > 0) {
                 const stopped = point(sprite);
                 assert.ok(Math.hypot(stopped.x - start.x, stopped.y - start.y) < 0.04, 'L-UGV does not reverse before recruitment');
             }
-            f.sceneTick(duration * 0.62 * 0.4);
+            f.advanceToScene(timing.startedAt + loadedMs * 0.6);
             const current = f.api.snapshot().pages[0].payloads[0];
             if (dx > 0) {
                 assert.strictEqual(current.mode, 'airlift');
@@ -4883,9 +5050,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const before = f.api.snapshot().pages[0].payloads[0];
         assert.strictEqual(before.mode, 'solo'); assert.strictEqual(before.helpers.length, 1);
         const copies = f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotCargo').length;
-        f.sceneTick(before.deadline * 0.70); airAvailable = true;
+        f.advanceToScene((before.operation.timing.workEnd + before.operation.timing.aftermathEnd) / 2); airAvailable = true;
         let carried = false;
-        while ((f.callbacks.size || f.api.snapshot().clock.paused) && f.sceneNow <= before.deadline) {
+        while (f.callbacks.size && f.sceneNow <= before.deadline) {
             f.sceneFrame();
             const state = f.api.snapshot(), current = state.pages[0]?.payloads[0];
             if (current?.stage !== 'return') { continue; }
@@ -4988,18 +5155,18 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         }, destination: (vehicle: string) => vehicle === 'lugv' ? groundDock : airDock,
         release(vehicle: string) { assert.ok(held.delete(vehicle)); } });
         const page = f.page(1); page.pageElement.rect = { left: 40, top: 60, width: 1000, height: 800 };
-        f.api.setVisiblePages([1]); const started = f.now;
+        f.api.setVisiblePages([1]);
         f.api.offer({ ...page, imageRegions: [{ id: 'handoff-1', x: 0.4, y: 0.15, width: 0.24, height: 0.25 }] });
         const payload = f.api.snapshot().pages[0]?.payloads.find((value: any) => value.mode === 'handoff');
         assert.ok(payload, 'the fixed canonical opportunity admits a real L-UGV handoff');
         assert.strictEqual(payload.operation.operatingMode, 'overreach');
         assert.strictEqual(payload.operation.outcome.family, 'clean-triumph');
-        const duration = payload.deadline - started;
-        f.tick(started + duration * 0.70 - f.now);
+        const timing = payload.operation.timing;
+        f.tick((timing.workEnd + timing.aftermathEnd) / 2 - f.now);
         const air = f.api.snapshot().pages[0].actors.find((value: any) => value.vehicle === 'quad');
         const sprite = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.dataset.courier === String(air.id))!;
         const before = point(sprite);
-        f.tick(started + duration * 0.76 - f.now);
+        f.tick(timing.aftermathEnd + 0.001 - f.now);
         const after = point(sprite);
         assert.ok(Math.hypot(after.x - before.x, after.y - before.y) < 0.04, 'a completed handoff cannot jump back to its initial aerial offset');
         const current = f.api.snapshot().pages[0].payloads[0];
@@ -5539,7 +5706,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.strictEqual(f.api.offer(next), 'busy');
         assert.strictEqual(f.api.hasHandled(2), false);
         assert.strictEqual(available, 0);
-        f.now += 5000; f.frame();
+        f.now = Math.max(...f.api.snapshot().pages.flatMap((page: any) => page.payloads.map((payload: any) => payload.deadline))); f.frame();
         assert.strictEqual(available, 1, 'multiple finishing couriers coalesce into one capacity notification');
         assert.strictEqual(f.callbacks.size, 0, 'the host callback, not an idle frame loop, admits the waiting page');
         assert.strictEqual(f.api.offer(next), 'started');
@@ -5619,7 +5786,11 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const sprites = f.owned.filter(canvas => canvas.className === 'pdfDocumentRobotVehicle' && canvas.width);
         const factor = (sprite: Canvas) => actors.find((actor: any) => String(actor.id) === sprite.dataset.courier).vehicle === 'heavyquad' ? 2.5 : 1;
         assert.ok(sprites.every(sprite => Math.abs(parseFloat(sprite.style.width) - 128 * 86 / 250 / Math.sqrt(2) * factor(sprite)) < 0.02));
-        f.now += 700; f.frame();
+        const growthAt = Math.max(...f.api.snapshot().pages.flatMap((page: any) => page.payloads.map((payload: any) => {
+            const timing = payload.operation.timing;
+            return timing.startedAt + (timing.workEnd - timing.startedAt) * 0.2 / 0.62;
+        })));
+        f.advanceToScene(growthAt); f.frame();
         const documentScale = (465 * 661 / (640 * 900)) ** 0.25;
         assert.ok(sprites.every(sprite => Math.abs(parseFloat(sprite.style.width) - 128 * 1.92 * documentScale / Math.sqrt(2) * factor(sprite)) < 0.02));
         f.finish();
@@ -5871,7 +6042,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.tick(100);
         page.pageElement.rect = { left: 75, top: 20, width: 500, height: 650 };
         // Inspect the loaded endpoint immediately before the atomic deposit retires its raster.
-        f.tick(payload.deadline * 0.62 - f.now - 0.001);
+        f.tick(payload.operation.timing.workEnd - f.now - 0.001);
         const cargo = f.owned.find(canvas => canvas.className === 'pdfDocumentRobotCargo' && canvas.dataset.courier === String(first.id))!;
         assert.ok(cargo.isConnected && cover.isConnected);
         assert.strictEqual(f.api.snapshot().pages[0].payloads.find((candidate: any) => candidate.id === payload.id).deposited, false);
@@ -6160,9 +6331,8 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
             'one generic carrying status must not dominate the employed work repertoire');
     });
 
-    it('finishes readable carrying speech before actual deposit and offers authored speech during retirement', () => {
+    it('keeps readable carrying speech through actual deposit and offers authored speech during retirement', () => {
         const f = fixture({ seed: 10, encounterRandom: () => 0.99 }); f.desktop();
-        const page = f.page(101);
         let completion = false, carrySeen = false, depositAfterRead = false;
         for (let number = 99; number <= 100; number++) {
             const page = number === 99 ? f.page(99) : f.page(100); f.api.setVisiblePages([number]);
@@ -6179,76 +6349,244 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                 const readableOwner = carrying && f.now < carrying.until && carrying.speakers.every(id => visibleSpeaker(f, id));
                 if (carrying && readableOwner) { assert.ok(carrying.node.isConnected && carrying.node.style.opacity === '1', 'readable carry text survives real deposit while its speaker remains visible'); }
                 deposited ||= snapshot.pages.some((value: any) => value.payloads.some((payload: any) => payload.deposited));
-                if (deposited && carrying) { assert.ok(f.now >= carrying.until, 'actual deposit follows the complete earned reading beat'); depositAfterRead = true; }
+                if (deposited && carrying && f.now >= carrying.until) { depositAfterRead = true; }
                 if (snapshot.caption?.id.endsWith(':deposit') && snapshot.caption.shownAt !== undefined) {
                     assert.ok(deposited, 'completion wording follows actual deposited pixels'); completion = true;
                 }
                 assert.ok(!snapshot.caption?.id.endsWith(':new-book'));
             }
         }
-        assert.ok(carrySeen && depositAfterRead, 'the actual deposit resumes after its complete readable carrying interval');
+        assert.ok(carrySeen && depositAfterRead, 'continuous photo delivery preserves the complete readable carrying interval');
         assert.ok(completion, 'ordinary actual deposit reaches authored completion without a rare incident');
-        f.api.retireDocument([page], 'semantic-new-edition');
-        let retirement = false;
-        for (let index = 0; index < 180; index++) {
-            f.sceneFrame(); const snapshot = f.api.snapshot();
-            if (snapshot.caption?.id.endsWith(':new-book') && snapshot.caption.shownAt !== undefined) { retirement = true; }
-        }
-        assert.ok(retirement, 'actual new-edition retirement reaches its authored repertoire');
+        const removal = readableRemoval(f);
+        assert.ok(removal.f.api.snapshot().caption?.id.endsWith(':new-book'), 'actual new-edition retirement reaches its authored repertoire');
+        f.finish();
     });
 
-    it('holds a readable caption and its coupled moving photograph for the full wall reading interval, then resumes once', () => {
-        const f = fixture({ seed: 11, maxActors: 12, encounterRandom: () => 0.99 }); f.desktop(1, 400, 400);
-        f.document.captionHeight = 300;
-        const photo = f.page(1); photo.pageElement.rect = { left: 0, top: 32, width: 400, height: 360 };
-        photo.canvas.width = 135; photo.canvas.height = 192;
-        f.api.setVisiblePages([1]);
-        assert.strictEqual(f.api.offer({ ...photo, kind: 'preview', imageRegions: [{ id: 'moving-obstacle', x: 0, y: 0, width: 1, height: 1 }] }), 'started');
-        let bubble: Element | undefined, evidence: any, payloadId: number | undefined, sprite: Canvas | undefined;
-        for (let frame = 0; frame < 65 && !bubble; frame++) {
-            f.frame(); const snapshot = f.api.snapshot();
-            const payload = snapshot.pages.flatMap((page: any) => page.payloads).find((payload: any) => payload.progress > 0.5 && payload.progress < 0.65 && !payload.deposited);
-            const actor = payload && snapshot.pages.flatMap((page: any) => page.actors).find((actor: any) => actor.payloadId === payload.id);
-            if (!actor) { continue; }
-            sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
-            pointer(f, 'pointermove', point(sprite)); f.frame();
-            bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
-            if (bubble) { evidence = f.api.snapshot(); payloadId = payload.id; }
+    it('keeps a readable fixed bubble with live leaders while its photo and an independent page continue moving', () => {
+        const f = fixture({ seed: 10, maxActors: 4, encounterRandom: () => .99 }); f.desktop();
+        const a = f.page(1), b = f.page(2); b.pageElement.rect.left = 540;
+        a.canvas.width = b.canvas.width = 135; a.canvas.height = b.canvas.height = 192;
+        f.api.setVisiblePages([1, 2]);
+        for (const page of [a, b]) {
+            assert.strictEqual(f.api.offer({ ...page, kind: 'preview', imageRegions: [{ id: 'continuous-' + page.pageNumber, x: .2, y: .2, width: .2, height: .15 }] }), 'started');
         }
-        assert.ok(bubble && sprite && evidence.caption?.shownAt !== undefined, 'actual in-flight work admits a readable authored cue');
-        const cargo = f.owned.find(canvas => canvas.dataset.payload === String(payloadId) && canvas.className === 'pdfDocumentRobotCargo')!;
-        assert.ok(cargo.isConnected && cargo.width > 0);
+        const { snapshot: before, bubble, actor, sprite } = admitLoadedSpeech(f, 1), caption = before.caption;
+        const firstA = before.pages.find((page: any) => page.page === 1).payloads[0];
+        const firstB = before.pages.find((page: any) => page.page === 2).payloads[0];
         const position = [bubble.style.left, bubble.style.top], text = bubble.textContent;
-        const cargoTransform = cargo.style.transform, bodyTransform = sprite.style.transform;
-        const initialCounts = evidence.encounters.dialogue.coverage;
-        const until = evidence.caption.until;
-        const spoken = text.split('\n').map((line: string) => line.slice(line.indexOf(': ') + 2));
-        assert.strictEqual(until - evidence.caption.shownAt, module.robotCaptionReadMs(spoken), 'first admission earns the shared full text-derived reading interval');
-        assert.ok(until > f.now + 1000, 'the scenario observes a substantive remaining wall-clock reading interval');
-        const admittedFrames = evidence.frames;
-        while (f.now + 34 < until) {
+        const bodyPositions = new Set<string>(), leaderTargets = new Set<string>();
+        let independentAdvanced = false, ownAdvanced = false;
+        while (f.now + 34 < caption.until) {
             f.frame(); const state = f.api.snapshot();
+            assert.ok(state.clock.sceneNow > before.clock.sceneNow, 'speech cannot freeze either job clock');
             assert.ok(bubble.isConnected && bubble.style.opacity === '1');
-            assert.deepStrictEqual([bubble.style.left, bubble.style.top], position, 'the admitted reading rectangle stays fixed');
+            assert.deepStrictEqual([bubble.style.left, bubble.style.top], position, 'readable text stays in its admitted rectangle');
             assert.strictEqual(bubble.textContent, text);
-            assert.strictEqual(state.caption.id, evidence.caption.id);
-            assert.strictEqual(state.caption.until, until);
-            assert.strictEqual(cargo.style.transform, cargoTransform, 'the photograph pauses with its actual speaker');
-            assert.strictEqual(sprite.style.transform, bodyTransform, 'the speaker remains in its admitted pose');
-            assert.ok(sprite.isConnected && Number(sprite.style.opacity) > .2 && visibleSpeaker(f, Number(sprite.dataset.courier)));
-            assert.strictEqual(state.frames, admittedFrames, 'a static reading interval has no RAF heartbeat');
-            assert.strictEqual(f.callbacks.size, 0);
+            assert.strictEqual(state.caption.id, caption.id); assert.strictEqual(state.caption.until, caption.until);
+            assert.ok(caption.actors.every((id: number) => readableSpeaker(f, id)), 'the moving cast remains naturally visible for its complete admitted line');
+            bodyPositions.add(sprite.style.transform);
+            leaderTargets.add(JSON.stringify(state.caption.placement.leaders.map((line: any) => line.from)));
+            const currentA = state.pages.find((page: any) => page.page === 1)?.payloads.find((value: any) => value.id === firstA.id);
+            const currentB = state.pages.find((page: any) => page.page === 2)?.payloads.find((value: any) => value.id === firstB.id);
+            if (currentA) {
+                assert.deepStrictEqual(currentA.helpers, firstA.helpers); assert.deepStrictEqual(currentA.target, firstA.target);
+                ownAdvanced ||= currentA.progress > firstA.progress;
+            }
+            independentAdvanced ||= !!currentB && currentB.progress > firstB.progress;
         }
-        f.tick(until - f.now + 1);
-        assert.strictEqual(bubble.isConnected, false, 'the finite wall expiry releases this exact cue');
-        f.frame();
-        assert.notStrictEqual(cargo.style.transform, cargoTransform, 'the original route resumes after the hold');
-        assert.deepStrictEqual(f.api.snapshot().encounters.dialogue.coverage, initialCounts, 'resuming does not readmit the same cue');
-        finishSpeakingRoutes(f);
+        assert.ok(ownAdvanced && independentAdvanced, 'both actual photo jobs advance during the same wall reading interval');
+        assert.ok(bodyPositions.size > 1, 'the speaker continues visible choreography rather than posing motionless');
+        assert.ok(leaderTargets.size > 1, 'leaders follow actual moving speakers without moving the readable box');
+        f.tick(caption.until - f.now + 1);
+        assert.strictEqual(bubble.isConnected, false);
+        f.finish();
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size + f.timers.size, 0);
+    });
+
+    it('admits an independent real publication during another cast reading interval without replacing its speech', () => {
+        const f = fixture({ seed: 10, maxActors: 8, encounterRandom: () => .99 }); f.desktop();
+        const a = f.page(1), b = f.page(2); b.pageElement.rect.left = 540;
+        a.canvas.width = 135; a.canvas.height = 192;
+        f.api.setVisiblePages([1, 2]);
+        assert.strictEqual(f.api.offer({ ...a, imageRegions: [{ id: 'speaking-page', x: .2, y: .2, width: .2, height: .15 }] }), 'started');
+        const { snapshot: before, bubble } = admitLoadedSpeech(f, 1);
+        const p = publication(f, b); f.api.preparePublication(p.candidate, p.encounter).commit();
+        const after = f.api.snapshot(), plan = after.deliveryPlans.find((value: any) => value.pageNumber === 2);
+        assert.ok(f.now < before.caption.until);
+        assert.ok(plan && plan.crops.some((crop: any) => crop.state === 'active'), 'spare capacity admits independent protected work during existing speech');
+        assert.ok(after.pages.some((page: any) => page.page === 2 && page.payloads.length > 0));
+        assert.ok(bubble.isConnected && bubble.style.opacity === '1');
+        assert.strictEqual(after.caption.id, before.caption.id);
+        assert.strictEqual(after.caption.until, before.caption.until);
+        assert.deepStrictEqual(after.caption.meaningIds, before.caption.meaningIds);
+        f.api.reconcileEncounter(p.candidate.page, p.encounter, p.candidate);
+        assert.strictEqual(f.api.snapshot().deliveryPlans.find((value: any) => value.id === plan.id).crops[0].id, plan.crops[0].id);
+        f.finish();
+        assert.strictEqual(f.api.snapshot().deliveryPlans.find((value: any) => value.id === plan.id).crops[0].state, 'delivered');
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size + f.timers.size, 0);
+    });
+
+    it('preserves an admitted retiring cast when ordinary publication needs its last actor slot', () => {
+        let f: Fixture, p: ReturnType<typeof publication>;
+        f = fixture({ seed: 10, maxActors: 1, encounterRandom: () => .99,
+            onCapacityAvailable() { f.api.reconcileEncounter(p.candidate.page, p.encounter, p.candidate); } });
+        f.desktop(1, 2400, 1800);
+        let leased = false;
+        const dock = { x: 850, y: 650, scale: 1.54 };
+        f.api.setDispatchOrigin({ reserve(_vehicle: string) {
+            if (leased) { return; } leased = true; return dock;
+        }, destination: () => dock, release() { assert.ok(leased); leased = false; } });
+        const old = f.page(1), incoming = f.page(2); old.pageElement.rect.left = 1000; old.pageElement.rect.top = 600; incoming.pageElement.rect.left = 40;
+        p = publication(f, incoming); f.api.setVisiblePages([1, 2]);
+        f.api.retireDocument([{ ...old, imageRegions: [{ id: 'retiring-portrait', x: .2, y: .65, width: .4, height: .3 }] }], 'speaking-old-edition');
+        f.api.setVisiblePages([1, 2]);
+        const original = f.api.snapshot().replacement.payloads[0];
+        const deadline = Math.max(...f.api.snapshot().replacement.payloads.map((payload: any) => payload.operation.timing.deadline));
+        let firstRecognizable: number | undefined, lastRecognizable: number | undefined, intervalStart: number | undefined;
+        const recognizableIntervals: Array<{ from: number; to: number }> = [];
+        let bubble: Element | undefined, before: any;
+        while (f.now < deadline && !bubble) {
+            f.frame();
+            const actor = f.api.snapshot().replacement?.actors.find((value: any) => readableSpeaker(f, value.id));
+            if (!actor) {
+                if (intervalStart !== undefined) { recognizableIntervals.push({ from: intervalStart, to: lastRecognizable! }); intervalStart = undefined; }
+                continue;
+            }
+            firstRecognizable ??= f.now; intervalStart ??= f.now; lastRecognizable = f.now;
+            const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
+            pointer(f, 'pointermove', point(sprite)); f.frame();
+            const state = f.api.snapshot(), node = captions(f).find(value => value.isConnected && value.style.opacity === '1');
+            if (node && state.caption?.shownAt !== undefined && state.caption.actors.includes(actor.id)) { bubble = node; before = state; }
+        }
+        if (intervalStart !== undefined) { recognizableIntervals.push({ from: intervalStart, to: lastRecognizable! }); }
+        assert.ok(bubble && before, 'the actual removal cast has admitted readable words: ' + JSON.stringify({ original, firstRecognizable, lastRecognizable, recognizableIntervals, longestRecognizableMs: Math.max(0, ...recognizableIntervals.map(interval => interval.to - interval.from)) }));
+        const ids = before.replacement.actors.map((actor: any) => actor.id), payloads = before.replacement.payloads.map((payload: any) => payload.id);
+        f.api.preparePublication(p.candidate, p.encounter).commit();
+        const queued = f.api.snapshot(), plan = queued.deliveryPlans[0];
+        assert.ok(bubble.isConnected && bubble.style.opacity === '1', 'ordinary ready pixels cannot reclaim a speaking removal body');
+        assert.strictEqual(queued.caption.id, before.caption.id);
+        assert.deepStrictEqual(queued.replacement.actors.map((actor: any) => actor.id), ids);
+        assert.deepStrictEqual(queued.replacement.payloads.map((payload: any) => payload.id), payloads);
+        assert.strictEqual(plan.crops[0].state, 'queued'); assert.strictEqual(plan.crops[0].protected, true);
+        while (f.now + 34 < before.caption.until) {
+            f.frame(); assert.ok(bubble.isConnected && bubble.style.opacity === '1');
+            assert.ok(before.caption.actors.every((id: number) => readableSpeaker(f, id)));
+        }
+        f.tick(before.caption.until - f.now + 1); f.finish();
         const final = f.api.snapshot();
-        assert.strictEqual(final.activeActors + final.retainedBytes, 0);
-        if (final.caption) { f.tick(Math.max(0, final.caption.until - f.now) + 1); }
-        assert.strictEqual(f.callbacks.size + f.timers.size, 0);
+        assert.strictEqual(final.deliveryPlans.find((value: any) => value.id === plan.id).crops[0].state, 'delivered', JSON.stringify(final.deliveryPlans));
+        assert.strictEqual(final.activeActors + final.retainedBytes + f.callbacks.size + f.timers.size, 0);
+        assert.strictEqual(leased, false);
+    });
+
+    it('keeps every admitted cast readable through real independent return traffic including the second caption', () => {
+        const f = fixture({ seed: 11, maxActors: 12, encounterRandom: () => .99 }); f.desktop(1, 1100, 813);
+        const a = f.page(1), b = f.page(2);
+        a.pageElement.rect = { left: 130, top: 32, width: 400, height: 600 };
+        b.pageElement.rect = { left: 570, top: 32, width: 400, height: 600 };
+        for (const page of [a, b]) { page.canvas.width = 400; page.canvas.height = 600; }
+        f.api.setVisiblePages([1, 2]);
+        assert.strictEqual(f.api.offer({ ...a, imageRegions: [{ id: 'crossing-a', x: .1, y: .1, width: .6, height: .3 }] }), 'started');
+        assert.strictEqual(f.api.offer({ ...b, imageRegions: [{ id: 'crossing-b', x: .2, y: .25, width: .5, height: .3 }] }), 'started');
+        const evidence = new Map<string, { until: number; node: Element; position: string[]; text: string; actors: number[] }>();
+        let deadline = Math.max(...f.api.snapshot().pages.flatMap((page: any) => page.payloads.map((payload: any) => payload.deadline)));
+        while (f.callbacks.size && f.now <= deadline + 34) {
+            f.frame(); const state = f.api.snapshot(), caption = state.caption;
+            if (caption?.shownAt !== undefined && !evidence.has(caption.id)) {
+                const node = captions(f).find(value => value.isConnected && value.style.opacity === '1');
+                assert.ok(node);
+                evidence.set(caption.id, { until: caption.until, node, position: [node.style.left, node.style.top], text: node.textContent, actors: [...caption.actors] });
+                deadline = Math.max(deadline, caption.until);
+            }
+            for (const [id, record] of evidence) {
+                if (f.now >= record.until) { continue; }
+                assert.ok(record.node.isConnected && record.node.style.opacity === '1', 'every admitted line remains readable until its own expiry: ' + id + ' at ' + f.now + '/' + record.until);
+                assert.deepStrictEqual([record.node.style.left, record.node.style.top], record.position);
+                assert.strictEqual(record.node.textContent, record.text);
+                assert.ok(record.actors.every(actor => readableSpeaker(f, actor)), 'independent return traffic cannot fade the actual speaking cast: ' + JSON.stringify({ id, text: record.text, now: f.now, until: record.until }));
+            }
+        }
+        assert.ok(evidence.size >= 2, 'the real crossing exercises later speech as well as the first line');
+        assert.ok([...evidence.values()].some(record => record.text.includes('DynaRobin:')), 'the independent second speaker actually participates');
+        f.finish();
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size + f.timers.size, 0);
+    });
+
+    for (const mobileEvidence of [false, true]) {
+    it('uses the actual solo line budget in a narrow viewport instead of an unreadable late slot with ' + (mobileEvidence ? 'real mobile evidence' : 'narrow desktop evidence'), () => {
+        const f = fixture({ seed: 11, maxActors: 12, encounterRandom: () => .99 }); f.desktop(3, 414, 896);
+        if (mobileEvidence) { f.window.navigator = { userAgent: 'iPhone', maxTouchPoints: 5 }; }
+        const page = f.page(1); page.pageElement.rect = { left: 7, top: 32, width: 400, height: 600 };
+        page.pageElement.setAttribute('id', 'page'); page.pageElement.className = 'page'; page.canvas.setAttribute('id', 'source');
+        page.canvas.width = 400; page.canvas.height = 600;
+        f.api.setVisiblePages([1]);
+        assert.strictEqual(f.api.offer({ ...page, kind: 'preview', imageRegions: [{ id: 'scene-photo', x: .1, y: .1, width: .6, height: .3 }] }), 'started');
+        const payload = f.api.snapshot().pages[0].payloads[0], records = new Map<string, { until: number; node: Element; text: string; position: string[]; actors: number[] }>();
+        let firstRecognizable: number | undefined;
+        while (f.callbacks.size && f.now <= payload.deadline + 34) {
+            f.frame(); const state = f.api.snapshot(), caption = state.caption;
+            if (state.pages.some((value: any) => value.actors.some((actor: any) => readableSpeaker(f, actor.id)))) { firstRecognizable ??= f.now; }
+            if (caption?.shownAt !== undefined && !records.has(caption.id)) {
+                const node = captions(f).find(value => value.isConnected && value.style.opacity === '1'); assert.ok(node);
+                const lines = node.textContent.split('\n').map((line: string) => line.slice(line.indexOf(': ') + 2));
+                assert.strictEqual(caption.until - caption.shownAt, module.robotCaptionReadMs(lines));
+                records.set(caption.id, { until: caption.until, node, text: node.textContent, position: [node.style.left, node.style.top], actors: [...caption.actors] });
+            }
+            for (const record of records.values()) {
+                if (f.now >= record.until) { continue; }
+                assert.ok(record.node.isConnected && record.node.style.opacity === '1');
+                assert.strictEqual(record.node.textContent, record.text); assert.deepStrictEqual([record.node.style.left, record.node.style.top], record.position);
+                assert.ok(record.actors.every(id => readableSpeaker(f, id)));
+            }
+        }
+        assert.ok(firstRecognizable !== undefined, 'the real compact walker has an observable useful window');
+        assert.ok(records.size > 0, 'actual eligible solo text must be spoken rather than stranded behind an undersized preferred late window');
+        f.finish();
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size + f.timers.size, 0);
+    });
+    }
+
+    it('advances actual moving photo work during a readable caption on raw wall frames', () => {
+        const { f, page } = coarsePhoto({ maxActors: 1, encounterRandom: () => .99 });
+        const { snapshot: before, bubble } = admitLoadedSpeech(f, page.pageNumber);
+        const payload = before.pages[0].payloads[0];
+        assert.ok(!payload.deposited && payload.progress > 0 && payload.progress < .6);
+        f.frame();
+        const after = f.api.snapshot(), next = after.pages[0].payloads.find((value: any) => value.id === payload.id);
+        assert.ok(after.clock.sceneNow > before.clock.sceneNow, 'readable words cannot stop the advancing scene clock');
+        assert.ok(next.progress > payload.progress, 'the real photograph continues its route during speech');
+        assert.ok(bubble.isConnected && bubble.style.opacity === '1');
+        f.finish();
+    });
+
+    it('keeps the admitted photo cast and real cargo continuous while its readable rectangle stays fixed', () => {
+        const { f, page } = coarsePhoto({ maxActors: 4, seed: 11, encounterRandom: () => .99 });
+        const { snapshot: before, bubble, actor, sprite } = admitLoadedSpeech(f, page.pageNumber);
+        const payload = before.pages[0].payloads.find((value: any) => value.helpers.includes(actor.id));
+        assert.ok(payload && !payload.deposited && payload.rasterWidth > 0);
+        const cargo = f.owned.find(canvas => canvas.dataset.payload === String(payload.id) && canvas.className === 'pdfDocumentRobotCargo')!;
+        const position = [bubble.style.left, bubble.style.top], text = bubble.textContent;
+        const bodyMotion = new Set<string>(), cargoMotion = new Set<string>(), until = before.caption.until;
+        const lines = text.split('\n').map((line: string) => line.slice(line.indexOf(': ') + 2));
+        assert.strictEqual(until - before.caption.shownAt, module.robotCaptionReadMs(lines));
+        while (f.now + 34 < until) {
+            f.frame(); const state = f.api.snapshot(), current = state.pages.flatMap((value: any) => value.payloads).find((value: any) => value.id === payload.id);
+            assert.ok(bubble.isConnected && bubble.style.opacity === '1');
+            assert.deepStrictEqual([bubble.style.left, bubble.style.top], position); assert.strictEqual(bubble.textContent, text);
+            assert.ok(before.caption.actors.every((id: number) => readableSpeaker(f, id)));
+            assert.strictEqual(state.clock.paused, false);
+            bodyMotion.add(sprite.style.transform);
+            if (current) {
+                assert.deepStrictEqual(current.helpers, payload.helpers); assert.deepStrictEqual(current.target, payload.target);
+                assert.strictEqual(current.deadline, payload.deadline);
+                if (current.rasterWidth > 0) { assert.ok(cargo.isConnected); cargoMotion.add(cargo.style.transform); }
+            }
+        }
+        assert.ok(bodyMotion.size > 1 && cargoMotion.size > 1, 'real speaking work continues without a hard stop');
+        f.tick(until - f.now + 1); assert.strictEqual(bubble.isConnected, false);
+        f.finish();
+        assert.strictEqual(f.api.snapshot().activeActors + f.api.snapshot().retainedBytes + f.callbacks.size + f.timers.size, 0);
     });
 
     for (const staged of [false, true]) {
@@ -6650,9 +6988,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                 if (readable && f.now < readable.until && payload && readable.speakers.every(id => visibleSpeaker(f, id))) {
                     assert.strictEqual(state.caption?.id, readable.id, 'later semantic cues preserve readable ownership');
                     assert.ok(readable.node.isConnected && readable.node.style.opacity === '1');
-                    assert.strictEqual(payload.deposited, false, 'the shared photograph stays held during its carrying sentence');
+                    assert.ok(readable.speakers.every(id => readableSpeaker(f, id)), 'the actual cast continues supporting the sentence across natural deposit');
                 }
-                if (readable && payload?.deposited) { assert.ok(f.now >= readable.until); protectedCarry = true; }
+                if (readable && payload?.deposited && f.now >= readable.until) { protectedCarry = true; }
                 if (!readable && state.caption?.opportunity === 'carrying' && state.caption.shownAt !== undefined) {
                     readable = { id: state.caption.id, until: state.caption.until, speakers: [...state.caption.actors],
                         node: captions(f).find(node => node.isConnected && node.style.opacity === '1')! };
@@ -6666,8 +7004,9 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                     countIn = true;
                 }
             }
+            f.finish();
         }
-        assert.ok(protectedCarry, 'an actual carrying reading interval finishes before the same photograph deposits');
+        assert.ok(protectedCarry, 'an actual carrying reading interval remains readable through continuous photo delivery');
         assert.ok(countIn, 'an ordinary final photo approach reaches the count-in');
         assert.strictEqual(f.api.snapshot().retainedBytes + f.api.snapshot().activeActors + f.callbacks.size + f.timers.size, 0);
     });
@@ -6687,11 +7026,12 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.ok(captions(f).some(node => node.isConnected && node.style.opacity === '1'));
         pointer(f, 'pointerleave', point(sprite));
         f.tick(Math.max(0, parked.caption.until - f.now) + 1); f.api.setVisiblePages([99]);
-        assert.strictEqual(f.api.offer({ ...page, imageRegions: [{ id: 'morus-photo', x: .2, y: .2, width: .15, height: .1 }] }), 'started');
-        f.tick(500); const loaded = f.api.snapshot().pages[0].actors[0];
-        const image = f.owned.find(canvas => canvas.dataset.courier === String(loaded.id))!;
-        pointer(f, 'pointermove', point(image)); f.frame();
-        assert.match(f.api.snapshot().caption?.text ?? '', /Četiri benzinska motora\. Jedna sličica\./);
+        // The low photograph leaves room for the enlarged carrier above its actual attachment.
+        assert.strictEqual(f.api.offer({ ...page, imageRegions: [{ id: 'morus-photo', x: .65, y: .6, width: .15, height: .1 }] }), 'started');
+        const { actor: loaded, bubble } = admitLoadedSpeech(f, 99);
+        assert.strictEqual(loaded.vehicle, 'heavyquad');
+        assert.ok(loaded.carrying && readableSpeaker(f, loaded.id), 'the petrol cue requires an actual visible photo carrier');
+        assert.match(bubble.textContent, /Četiri benzinska motora\. Jedna sličica\./);
         f.finish(); assert.strictEqual(f.api.snapshot().retainedBytes + f.callbacks.size + Number(leased), 0);
     });
 

@@ -162,7 +162,11 @@ export type RobotDialogueOpportunity = 'new-book' | 'preparing' | 'carrying' | '
     | 'success' | 'bump' | 'near-miss' | 'reunion' | 'rescue';
 /** Current physical evidence belongs to the actual speaker, independently of a speech trigger. */
 export type RobotDialogueFact = 'cargo' | 'shared-cargo' | 'placing' | 'completed' | 'replacing' | 'preparing' | 'collision' | 'smoke' | 'carried';
-export interface RobotDialogueSpeaker { id: number; vehicle: string; name: string; facts?: readonly RobotDialogueFact[] }
+export interface RobotDialogueSpeaker {
+    id: number; vehicle: string; name: string; facts?: readonly RobotDialogueFact[];
+    /** A finite, continuously visible opportunity for this actual speaker. */
+    availableMs?: number;
+}
 export interface RobotDialogueRole { vehicles?: readonly string[]; names?: readonly string[]; excludeNames?: readonly string[] }
 export interface RobotDialogueEntry {
     id: string;
@@ -184,6 +188,13 @@ export interface RobotDialogueChoice {
     readonly lines: readonly string[];
 }
 export const ROBOT_DIALOGUE_POLICY = Object.freeze({ recentAdmissions: 3 });
+export const ROBOT_DIALOGUE_READ_POLICY = Object.freeze({ captionBaseMs: 1200, captionCharacterMs: 45,
+    captionMinMs: 1800, captionMaxMs: 4000 });
+export function robotCaptionReadMs(lines: readonly string[]): number {
+    const policy = ROBOT_DIALOGUE_READ_POLICY;
+    return Math.max(policy.captionMinMs, Math.min(policy.captionMaxMs,
+        policy.captionBaseMs + lines.reduce((count, line) => count + line.length, 0) * policy.captionCharacterMs));
+}
 function hash(value: string, seed: number): number {
     let result = seed >>> 0;
     for (const character of value) { result = Math.imul(result ^ character.charCodeAt(0), 16777619); }
@@ -199,7 +210,8 @@ function supportsLine(entry: RobotDialogueEntry, index: number, actor: RobotDial
     const role = entry.roles?.[index];
     const evidence = ROBOT_AUTHORED_UTTERANCES[entry.meaningIds?.[index] ?? '']?.requiresAny;
     return (!role?.vehicles || role.vehicles.includes(actor.vehicle)) && (!role?.names || role.names.includes(actor.name))
-        && !role?.excludeNames?.includes(actor.name) && (!evidence || evidence.some(fact => actor.facts?.includes(fact)));
+        && !role?.excludeNames?.includes(actor.name) && (!evidence || evidence.some(fact => actor.facts?.includes(fact)))
+        && (actor.availableMs === undefined || actor.availableMs >= robotCaptionReadMs(entry.lines));
 }
 function assign(entry: RobotDialogueEntry, actors: readonly RobotDialogueSpeaker[]): number[] | undefined {
     if (!fitsParticipants(entry, actors)) { return; }
@@ -262,9 +274,21 @@ export class RobotDialogueSelection {
             ids.add(entry.id);
         }
     }
+    /** Plan a future factual opportunity without reserving words or advancing admission history. */
+    prospectiveReadMs(key: string, fact: RobotDialogueFact, actors: readonly RobotDialogueSpeaker[]): number | undefined {
+        const future = actors.map(actor => ({ ...actor, facts: [fact], availableMs: undefined }));
+        const durations = [...new Set(this.catalogue.filter(entry => entry.meaningIds?.some(id => {
+            const required = ROBOT_AUTHORED_UTTERANCES[id]?.requiresAny;
+            return required?.length === 1 && required[0] === fact;
+        }) && assign(entry, future)).map(entry => robotCaptionReadMs(entry.lines)))].sort((a, b) => a - b);
+        return durations.length ? durations[hash(key + ':read-budget:' + fact, this.seed) % durations.length] : undefined;
+    }
     reserve(key: string, opportunity: RobotDialogueOpportunity, actors: readonly RobotDialogueSpeaker[], geometry = 'default', allowedIds?: readonly string[]): RobotDialogueChoice | undefined {
         const existing = this.reservations.get(key);
-        if (existing) { return existing.choice; }
+        if (existing) {
+            if (existing.shown || robotDialogueChoiceSupported(existing.choice, actors)) { return existing.choice; }
+            this.reservations.delete(key);
+        }
         if (!key || this.reservations.size >= this.maxReservations || actors.length > 12
             || actors.some(actor => !Number.isSafeInteger(actor.id) || actor.id < 1)
             || new Set(actors.map(actor => actor.id)).size !== actors.length) { return; }

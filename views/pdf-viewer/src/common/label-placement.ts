@@ -131,7 +131,7 @@ function segmentInside(from: PlacementPoint, to: PlacementPoint, rect: Placement
     return (last - first) * Math.hypot(dx, dy);
 }
 
-function leaders(rect: PlacementRect, anchors: readonly PlacementPoint[]): PlacementLeader[] {
+export function labelPlacementLeaders(rect: PlacementRect, anchors: readonly PlacementPoint[]): PlacementLeader[] {
     const result: PlacementLeader[] = [];
     for (const anchor of anchors) {
         const to = { x: clamp(anchor.x, rect.x, rect.x + rect.width), y: clamp(anchor.y, rect.y, rect.y + rect.height) };
@@ -246,7 +246,7 @@ export class LabelPlacementSolver {
                     for (const other of placed) { score += overlap(room, other) * 60; }
                 }
                 for (const obstacle of frame.obstacles ?? []) { score += overlap(rect, obstacle) * 4; }
-                for (const leader of leaders(rect, anchors)) {
+                for (const leader of labelPlacementLeaders(rect, anchors)) {
                     for (const other of placed) { score += segmentInside(leader.from, leader.to, other) * 60; }
                 }
                 return score + (candidate.cost ?? 0) + movementCost * away[index];
@@ -281,7 +281,7 @@ export class LabelPlacementSolver {
             const blocked = covered(drawn, edge, placed);
             state.opacity = blocked ? Math.max(0, state.opacity - dt / fadeOut) : Math.min(1, state.opacity + dt / fadeIn);
             this.memory.set(label.id, state);
-            result.set(label.id, { id: label.id, ...drawn, opacity: state.opacity, blocked, leaders: leaders(drawn, anchors) });
+            result.set(label.id, { id: label.id, ...drawn, opacity: state.opacity, blocked, leaders: labelPlacementLeaders(drawn, anchors) });
             if (!blocked) { placed.push(drawn); }
         }
         for (const id of this.memory.keys()) { if (!result.has(id)) { this.memory.delete(id); } }
