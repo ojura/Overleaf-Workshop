@@ -171,22 +171,27 @@ class ProjectStructRecord {
         return normalizeProjectPath(this.vfs.getRootDocName());
     }
 
-    async init() {
-        const rootFileStruct = await this.refreshRecord( this.rootPath );
-        const fileQueue: TexFileStruct[] = [ rootFileStruct ];
-
-        // iteratively traverse file node tree
-        while (fileQueue.length > 0) {
-            const fileNode = fileQueue.shift()!;
-            const subFiles = fileNode.childrenPaths;
-            for (const subFile of subFiles) {
-                // Get fileStruct can be failed due to file not exist
-                try {
-                    const fileStruct = await this.refreshRecord(subFile);
-                    fileQueue.push( fileStruct );
-                } catch { continue; }
-            };
+    async init(documents: readonly vscode.TextDocument[] = [], token?: vscode.CancellationToken): Promise<boolean> {
+        const open = new Map(documents.map(document => [normalizeProjectPath(parseUri(document.uri).pathParts.join('/')), document]));
+        const queue = [this.rootPath];
+        const visited = new Set<string>();
+        while (queue.length) {
+            if (token?.isCancellationRequested) { return false; }
+            const filePath = queue.shift()!;
+            if (visited.has(filePath)) { continue; }
+            visited.add(filePath);
+            try {
+                const document = open.get(filePath);
+                const fileStruct = document
+                    ? await this.refreshRecord(document)
+                    : this.fileRecordMap.get(filePath) ?? await this.refreshRecord(filePath);
+                if (token?.isCancellationRequested) { return false; }
+                queue.push(...fileStruct.childrenPaths);
+            } catch (error) {
+                if (filePath === this.rootPath) { throw error; }
+            }
         }
+        return !token?.isCancellationRequested;
     }
 
     getTexFileStruct(document: vscode.TextDocument): TexFileStruct | undefined {
@@ -229,10 +234,13 @@ class ProjectStructRecord {
         if (rootStruct === undefined) { return []; }
 
         const queue = [rootStruct];
+        const visited = new Set<TexFileStruct>();
         const bibFilePaths = new Set<string>();
         // iteratively traverse file node tree
         while (queue.length > 0) {
             const item = queue.shift()!;
+            if (visited.has(item)) { continue; }
+            visited.add(item);
             item.bibFilePaths.forEach((path) => {
                 bibFilePaths.add(path);
             });
@@ -251,42 +259,50 @@ export class TexDocumentSymbolProvider extends IntellisenseProvider implements v
 
     private projectRecordMap = new Map<string, ProjectStructRecord>();
 
+    private projectKey(uri: vscode.Uri): string {
+        const { serverName, identifier } = parseUri(uri);
+        return JSON.stringify([serverName, identifier]);
+    }
+
+    private async projectRecordFor(document: vscode.TextDocument, token?: vscode.CancellationToken): Promise<ProjectStructRecord | undefined> {
+        if (document.uri.scheme !== ROOT_NAME || token?.isCancellationRequested) { return; }
+        const key = this.projectKey(document.uri);
+        let record = this.projectRecordMap.get(key);
+        if (!record) {
+            const vfs = await this.vfsm.prefetch(document.uri);
+            if (token?.isCancellationRequested) { return; }
+            record = new ProjectStructRecord(vfs);
+        }
+        const documents = (vscode.workspace.textDocuments ?? []).filter(other =>
+            other.uri.scheme === ROOT_NAME && this.projectKey(other.uri) === key && other.uri.toString() !== document.uri.toString());
+        documents.push(document);
+        if (!await record.init(documents, token)) { return; }
+        this.projectRecordMap.set(key, record);
+        return record;
+    }
+
     async provideFoldingRanges(document: vscode.TextDocument, context: vscode.FoldingContext, token: vscode.CancellationToken): Promise<vscode.FoldingRange[]> {
         const environmentRange = getEnvironmentFoldingRange(document);
 
         // Try get fileStruct
-        const {projectName} = parseUri(document.uri);
-        let projectRecord = this.projectRecordMap.get(projectName);
+        const projectRecord = this.projectRecordMap.get(this.projectKey(document.uri));
         const fileStruct = projectRecord?.getTexFileStruct(document);
 
         return environmentRange.concat( fileStruct ? elementsToFoldingRanges(fileStruct.texElements) : [] );
     }
 
     async provideDocumentSymbols(document: vscode.TextDocument): Promise<vscode.DocumentSymbol[]> {
-        const vfs = await this.vfsm.prefetch(document.uri);
-        const {projectName} = parseUri(document.uri);
-
-        // init project record if not exist
-        let projectRecord = this.projectRecordMap.get(projectName);
-        if (projectRecord === undefined) {
-            projectRecord = new ProjectStructRecord(vfs);
-            await projectRecord.init();
-            this.projectRecordMap.set(projectName, projectRecord);
-        }
+        const projectRecord = await this.projectRecordFor(document);
+        if (!projectRecord) { return []; }
 
         // return symbols
         const fileStruct = projectRecord.getTexFileStruct(document) ?? await projectRecord.refreshRecord(document);
         return elementsToSymbols( fileStruct.texElements );
     }
 
-    get currentBibPathArray(): string[] {
-        // check if supported vfs
-        const uri = vscode.window.activeTextEditor?.document.uri;
-        if (uri?.scheme !== ROOT_NAME) { return []; }
-        // get bib file paths
-        const {projectName} = parseUri(uri);
-        const projectRecord = this.projectRecordMap.get(projectName);
-        return projectRecord?.getAllBibFilePaths() ?? [];
+    async bibPathsFor(document: vscode.TextDocument, token?: vscode.CancellationToken): Promise<string[]> {
+        const record = await this.projectRecordFor(document, token);
+        return record?.getAllBibFilePaths() ?? [];
     }
 
     get triggers(): vscode.Disposable[] {
@@ -300,8 +316,8 @@ export class TexDocumentSymbolProvider extends IntellisenseProvider implements v
             vscode.languages.registerFoldingRangeProvider(latexSelector, this),
             // register file change listener
             vscode.workspace.onDidChangeTextDocument(async (e) => {
-                const {projectName} = parseUri(e.document.uri);
-                const projectRecord = this.projectRecordMap.get(projectName);
+                if (e.document.uri.scheme !== ROOT_NAME) { return; }
+                const projectRecord = this.projectRecordMap.get(this.projectKey(e.document.uri));
                 projectRecord?.refreshRecord(e.document);
             }),
         ];

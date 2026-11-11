@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import { ROOT_NAME } from '../consts';
 import { RemoteFileSystemProvider } from '../core/remoteFileSystemProvider';
 
-import { IntellisenseProvider } from '.';
+import { CitationHoverProvider } from './citationHoverProvider';
+import { ReferenceDefinitionProvider } from './referenceDefinitionProvider';
 import { TexDocumentSymbolProvider } from './texDocumentSymbolProvider';
 import { TexDocumentFormatProvider } from './texDocumentFormatProvider';
 import { MisspellingCheckProvider } from './langMisspellingCheckProvider';
@@ -10,7 +11,7 @@ import { CommandCompletionProvider, ConstantCompletionProvider, FilePathCompleti
 
 export class LangIntellisenseProvider {
     private status: vscode.StatusBarItem;
-    private providers: IntellisenseProvider[];
+    private providers: Array<{ readonly triggers: vscode.Disposable[] }>;
 
     constructor(context: vscode.ExtensionContext, private readonly vfsm: RemoteFileSystemProvider) {
         const texSymbolProvider = new TexDocumentSymbolProvider(vfsm);
@@ -24,6 +25,8 @@ export class LangIntellisenseProvider {
             new ConstantCompletionProvider(vfsm, context.extensionUri),
             new FilePathCompletionProvider(vfsm),
             new ReferenceCompletionProvider(vfsm, texSymbolProvider),
+            new CitationHoverProvider(vfsm, texSymbolProvider),
+            new ReferenceDefinitionProvider(vfsm),
             // misspelling check provider
             new MisspellingCheckProvider(vfsm),
         ];

@@ -27,6 +27,10 @@ export class EmitTimeoutError extends Error {
     }
 }
 
+function handshakeError(error: unknown): Error {
+    return new Error(`the connection was rejected: ${errorMessage(error)}`);
+}
+
 /**
  * Whether `error` is real-time's refusal 'doc updater could not load requested ops'
  * (ClientRequestedMissingOpsError, services/real-time/app/js/Errors.js). Real-time sends it when
@@ -140,6 +144,9 @@ export class SocketIOAPI {
     private emit: any;
     /** Track the scheme used when the socket was last initialized */
     private _socketInitScheme?: ConnectionScheme;
+    /** The current socket can be rejected before the owner first asks to join. */
+    private connectionRejected?: Error;
+    private readonly rejectedSchemes = new Set<ConnectionScheme>();
 
     constructor(private url:string,
                 private readonly api:BaseAPI,
@@ -152,6 +159,7 @@ export class SocketIOAPI {
     init() {
         if (this.disposed) { throw new Error('The project connection is disposed.'); }
         for (const registration of this.registrations) { registration.cleanups.splice(0).forEach(cleanup => cleanup()); }
+        this.connectionRejected = undefined;
 
         // CRITICAL: Properly disconnect old socket before creating a new one.
         // Without this, the old TCP connection is abandoned but still alive. When the
@@ -194,16 +202,19 @@ export class SocketIOAPI {
             // out from under an in-flight call, and that call can never be acknowledged.
             const socket = this.socket;
             if (this.disposed) { return Promise.reject(new Error('The project connection is closed.')); }
+            if (this.connectionRejected) { return Promise.reject(this.connectionRejected); }
             return new Promise((resolve, reject) => {
                 let settled = false;
                 const finish = (error?: unknown, data?: any[]) => {
                     if (settled) { return; }
                     settled = true;
                     clearTimeout(timer);
+                    socket.removeListener?.('connectionRejected', rejected);
                     this.pending.delete(cancel);
                     if (error) { reject(error); } else { resolve(data); }
                 };
                 const cancel = () => finish(new Error('The project connection is closed.'));
+                const rejected = (error: unknown) => finish(handshakeError(error));
                 const timer = setTimeout(() => {
                     if (settled) { return; }
                     finish(new EmitTimeoutError(event, SocketIOAPI.emitTimeoutMs));
@@ -212,6 +223,7 @@ export class SocketIOAPI {
                     }
                 }, SocketIOAPI.emitTimeoutMs);
                 this.pending.add(cancel);
+                socket.on?.('connectionRejected', rejected);
                 try {
                     socket.emit(event, ...args, (err:any, ...data:any[]) => finish(err ? new EmitRefusedError(event, err) : undefined, data));
                 } catch (error) { finish(error); }
@@ -226,12 +238,14 @@ export class SocketIOAPI {
         this._socketInitScheme = this.scheme;
     }
 
-    /** Returns true if the socket needs re-initialization (scheme changed, or socket was never init'd) */
+    /** A changed scheme or a rejected handshake needs a new socket. */
     get needsReinit(): boolean {
-        return this._socketInitScheme !== this.scheme || !this.socket;
+        return this._socketInitScheme !== this.scheme || !this.socket || this.connectionRejected!==undefined;
     }
 
     private initInternalHandlers() {
+        const socket = this.socket;
+        const scheme = this.scheme;
         this.socket.on('connect', () => {
             console.log('SocketIOAPI: connected');
         });
@@ -248,18 +262,27 @@ export class SocketIOAPI {
             console.log('SocketIOAPI: forceDisconnect', message);
         });
         this.socket.on('connectionRejected', (err:any) => {
+            if (this.disposed || socket!==this.socket) { return; }
             console.log('SocketIOAPI: connectionRejected.', err?.message || err);
-            // If v2 also gets rejected, fall back to v1 rather than staying stuck
-            if (this.scheme === 'v2') {
+            this.connectionRejected = handshakeError(err);
+            this.rejectedSchemes.add(scheme);
+            // Select an untried handshake for the owner's next attempt. Once both have
+            // been rejected, its existing retry/backoff keeps using the current scheme.
+            if (scheme==='v1' && !this.rejectedSchemes.has('v2')) {
+                console.log('SocketIOAPI: v1 rejected, retrying with v2');
+                this.scheme = 'v2';
+            } else if (scheme==='v2' && !this.rejectedSchemes.has('v1')) {
                 console.log('SocketIOAPI: v2 rejected, falling back to v1');
                 this.scheme = 'v1';
             }
             // Disable auto-reconnect on this socket: the server explicitly rejected
             // our connection parameters. Reconnecting would just get rejected again,
             // creating unnecessary TCP connection churn (and RST packets).
-            if (this.socket.io && typeof this.socket.io.reconnect === 'function') {
-                this.socket.io.reconnect(false);
-            }
+            try {
+                // The bundled 0.9 client returns a namespace around the actual socket.
+                if (socket.socket?.options) { socket.socket.options.reconnect = false; }
+                if (typeof socket.io?.reconnect === 'function') { socket.io.reconnect(false); }
+            } catch { /* a rejected connection still fails the owned calls */ }
         });
         this.socket.on('error', (err:any) => {
             // Log error instead of throwing to avoid crashing the extension
@@ -412,6 +435,8 @@ export class SocketIOAPI {
      */
     async joinProject(project_id:string): Promise<ProjectEntity> {
         if (this.disposed) { throw new Error('The project connection is closed.'); }
+        if (this.connectionRejected) { throw this.connectionRejected; }
+        const socket = this.socket;
         let timer: NodeJS.Timeout | undefined;
         let cancel!: () => void;
         const timeoutPromise: Promise<ProjectEntity> = new Promise((_, reject) => {
@@ -422,7 +447,9 @@ export class SocketIOAPI {
             }, SocketIOAPI.joinTimeoutMs);
         });
         try {
-            return await this.joinProjectOnce(project_id, timeoutPromise);
+            const project = await this.joinProjectOnce(project_id, timeoutPromise);
+            if (socket===this.socket && !this.connectionRejected) { this.rejectedSchemes.clear(); }
+            return project;
         } finally {
             clearTimeout(timer);
             this.pending.delete(cancel);
@@ -437,6 +464,9 @@ export class SocketIOAPI {
             cleanups.push(() => socket.removeListener?.(event, handler));
         };
         const raced = (promises: Promise<any>[]) => Promise.race(promises).finally(() => cleanups.forEach(cleanup => cleanup()));
+        const rejected = new Promise<ProjectEntity>((_, reject) => {
+            listen('connectionRejected', (error: unknown) => reject(handshakeError(error)));
+        });
         switch(this.scheme) {
             case 'Alt':
             case 'v1':
@@ -447,23 +477,14 @@ export class SocketIOAPI {
                     this.record = Promise.resolve(project);
                     return project;
                 });
-                const rejectPromise = new Promise((_, reject) => {
-                    listen('connectionRejected', (err:any) => {
-                        // Only fall back to v2 if we haven't already tried it;
-                        // otherwise let the outer retry logic handle backoff
-                        this.scheme = 'v2';
-                        reject(err.message);
-                    });
-                });
-                return raced([joinPromise, rejectPromise, timeoutPromise]);
+                return raced([joinPromise, rejected, timeoutPromise]);
             case 'v2': {
                 // fail at once when this connection cannot be made, instead of at the timeout
                 const failed = new Promise<ProjectEntity>((_, reject) => {
-                    listen('connectionRejected', (err:any) => reject(new Error(`the connection was rejected: ${errorMessage(err)}`)));
                     listen('connect_failed', () => reject(new Error('the connection could not be made')));
                     listen('error', (err:any) => reject(new Error(`socket error: ${errorMessage(err)}`)));
                 });
-                return raced([this.record!, timeoutPromise, failed]);
+                return raced([this.record!, timeoutPromise, rejected, failed]);
             }
         }
     }

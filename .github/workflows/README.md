@@ -1,9 +1,10 @@
-# Github Actions Overview
+# GitHub Actions Overview
 
-We use Github Actions to automate various tasks in this repository. The following workflows are currently enabled:
-
-- **lock-threads.yml**: Locks closed issues and pull requests after a period of inactivity.
+These workflows define the repository's automated tasks. Their availability also depends on
+the repository's Actions settings and configured credentials.
 
 - **vsce-package.yml**: Call `vsce package` to create a temporary VSCode extension package when a Pull Request is created/updated on the `master` branch.
 
-- **vsce-publish.yml**: Call `vsce publish` to publish the VSCode extension to the VSCode Marketplace when version tag is pushed on the `master` branch.
+- **vsce-publish.yml**: Runs daily and on manual dispatch against `master`. When `package.json`
+  has changed in the previous 24 hours, it packages the extension and publishes to the VS Code
+  Marketplace and Open VSX using the repository's `VSCE_PAT` and `OVSX_TOKEN` secrets.

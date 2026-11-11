@@ -64,4 +64,40 @@ describe('a local replica that watches its folder itself', () => {
         assert.deepStrictEqual(answer.summary.uploaded, ['/main.tex']);
         assert.strictEqual(t.w.remote.get('/main.tex'), 'v2, written by another program\n');
     });
+
+    it('ignores saved documents from another file system even when their path matches the replica', async () => {
+        cleanup.privateRuntime();
+        folder = cleanup.tempDir('ow-replica-save-');
+        const t = world(folder, false);
+        t.w.remote.set('/main.tex', 'v1\n');
+        let saved: ((doc: {uri: Uri}) => void) | undefined;
+        t.mock.workspace.onDidSaveTextDocument = (listener: typeof saved) => {
+            saved = listener;
+            return {dispose: () => { saved = undefined; }};
+        };
+        const {LocalReplicaSCMProvider} = load(t.mock);
+        const scm = new LocalReplicaSCMProvider(t.vfs, Uri.file(folder));
+        await cleanup.start(scm);
+        await scm.syncNow();
+        assert.ok(saved, 'the actual editor-save listener is registered');
+        const tracked: Array<{path: string, work: Promise<unknown>}> = [];
+        const track = (scm as any).track.bind(scm);
+        (scm as any).track = (direction: string, file: string, work: Promise<unknown>) => {
+            tracked.push({path: file, work});
+            return track(direction, file, work);
+        };
+        const file = Uri.file(path.join(folder, 'main.tex'));
+        fs.writeFileSync(file.fsPath, 'v2, saved locally\n');
+        for (const scheme of ['overleaf-workshop', 'untitled', 'vscode-remote']) {
+            saved({uri: file.with({scheme})});
+        }
+        saved({uri: file.with({authority: 'another-server'})});
+        saved({uri: Uri.file(path.join(`${folder}-other`, 'main.tex'))});
+        assert.deepStrictEqual([...tracked], [], 'foreign documents must not enqueue local sync work');
+        saved({uri: file});
+        assert.strictEqual(tracked.length, 1, 'a real file save still enqueues the replica change');
+        assert.strictEqual(tracked[0].path, '/main.tex');
+        await Promise.all(tracked.map(entry => entry.work));
+        assert.strictEqual(t.w.remote.get('/main.tex'), 'v2, saved locally\n');
+    });
 });

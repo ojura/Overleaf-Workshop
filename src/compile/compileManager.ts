@@ -49,7 +49,7 @@ function failureOf(record: CompileRecord | undefined): string {
     return status === 'success' ? NO_OUTPUT_PDF : `Overleaf's status is "${status}"`;
 }
 
-class CompileDiagnosticProvider {
+export class CompileDiagnosticProvider {
     private diagnosticCollection = vscode.languages.createDiagnosticCollection(ROOT_NAME);
     constructor(private readonly vfsm: RemoteFileSystemProvider) {};
 
@@ -96,8 +96,14 @@ class CompileDiagnosticProvider {
         const vfs = await this.vfsm.prefetch(uri);
         const logPath = `${OUTPUT_FOLDER_NAME}/output.log`;
         const _uri = vfs.pathToUri(logPath);
-        let content ='';
-        content = new TextDecoder().decode(await vfs.openFile(_uri));
+        let content: string;
+        try {
+            content = new TextDecoder().decode(await vfs.openFile(_uri));
+        } catch (error) {
+            // A build can have no output log. Its compile response still owns the outcome.
+            if (error instanceof vscode.FileSystemError && error.code === 'FileNotFound') { return false; }
+            throw error;
+        }
         const logs = new LatexParser(content).parse();
         if (logs === undefined) {
             return content === ''? true :false;

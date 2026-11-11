@@ -41,8 +41,9 @@ const created = { scm: 0 };
 class FakeSCMCollection { triggers = []; constructor() { created.scm += 1; } }
 class FakeClientManager { triggers = []; }
 
-const { VirtualFileSystem, SocketIOAPI, BaseAPI } = loadWithVscode(vscodeMock, () => ({
+const { VirtualFileSystem, RemoteFileSystemProvider, SocketIOAPI, BaseAPI } = loadWithVscode(vscodeMock, () => ({
     VirtualFileSystem: require('../core/remoteFileSystemProvider').VirtualFileSystem,
+    RemoteFileSystemProvider: require('../core/remoteFileSystemProvider').RemoteFileSystemProvider,
     SocketIOAPI: require('../api/socketio').SocketIOAPI,
     BaseAPI: require('../api/base').BaseAPI,
 }), {
@@ -58,8 +59,11 @@ class FakeConnection {
     /** answers emits; false once the connection is dead */
     alive = true;
     closed = false;
+    disconnects = 0;
     /** the server accepted the connection; socket.io holds emits back until then */
     connected = false;
+    readonly socket = {options: {reconnect: true}};
+    readonly emitted: string[] = [];
     private held: Array<[string, any[], ((...a: any[]) => void) | undefined]> = [];
     constructor(readonly query: string | undefined, private readonly server: FakeServer) {}
     on(event: string, fn: (...args: any[]) => void) {
@@ -71,8 +75,9 @@ class FakeConnection {
     removeListener(event: string, fn: (...args: any[]) => void) {
         this.handlers.set(event, (this.handlers.get(event) ?? []).filter(listener => listener !== fn));
     }
-    disconnect() { this.closed = true; }
+    disconnect() { this.disconnects++; this.closed = true; }
     emit = (event: string, ...args: any[]) => {
+        this.emitted.push(event);
         const ack = typeof args[args.length - 1] === 'function' ? args.pop() : undefined;
         if (!this.connected) { this.held.push([event, args, ack]); return; }
         if (this.alive && !this.closed) { this.server.answer(event, args, ack); }
@@ -350,6 +355,76 @@ describe('a lost connection to Overleaf', () => {
     });
 });
 
+describe('RemoteFileSystemProvider project identity', () => {
+    function manager() {
+        server = new FakeServer();
+        server.connect = () => {};
+        const knownServers = {...servers, 'other.example': {
+            ...servers['www.overleaf.com'], name: 'other.example', url: 'https://other.example/',
+        }};
+        const provider = new RemoteFileSystemProvider({
+            ...context,
+            globalState: {
+                get: (key: string, value: unknown) => key === 'overleaf-servers' ? knownServers : value,
+                update: async () => {},
+            },
+        });
+        const triggers = provider.triggers;
+        return {provider, dispose: () => triggers.forEach((trigger: any) => trigger.dispose())};
+    }
+
+    it('separates actual server, account and project owners and disposes each cached file system once', async () => {
+        const owner = manager();
+        try {
+            const sources = [
+                vfsUri,
+                new FakeUri('overleaf-workshop', 'other.example', '/Book', 'user=u1&project=p1'),
+                new FakeUri('overleaf-workshop', 'www.overleaf.com', '/Book', 'user=u2&project=p1'),
+                new FakeUri('overleaf-workshop', 'www.overleaf.com', '/Book', 'user=u1&project=p2'),
+            ];
+            const projects = await Promise.all(sources.map(uri => owner.provider.prefetch(uri)));
+            assert.strictEqual(new Set(projects).size, 4, 'each server/account/project owns a distinct real VFS');
+            for (let index = 0; index < sources.length; index++) {
+                const file = projects[index].pathToUri('main.tex');
+                assert.strictEqual(file.authority, sources[index].authority);
+                assert.strictEqual(file.query, sources[index].query);
+            }
+            const disposed = new Map<any, number>();
+            for (const project of projects) {
+                const dispose = project.dispose.bind(project);
+                project.dispose = () => {
+                    disposed.set(project, (disposed.get(project) ?? 0) + 1);
+                    dispose();
+                };
+            }
+            owner.dispose();
+            assert.deepStrictEqual(projects.map(project => disposed.get(project)), [1, 1, 1, 1]);
+            assert.strictEqual(server.connections.length, 4);
+            assert.ok(server.connections.every(connection => connection.closed && connection.disconnects === 1 && connection.handlers.size === 0));
+            owner.dispose();
+            assert.deepStrictEqual(projects.map(project => disposed.get(project)), [1, 1, 1, 1], 'cleared cache owners are not disposed twice');
+        } finally {
+            owner.dispose();
+            await tick();
+        }
+    });
+
+    it('reuses one actual project file system across document paths and query ordering', async () => {
+        const owner = manager();
+        try {
+            const first = await owner.provider.prefetch(vfsUri);
+            const anotherFile = vfsUri.with({path: '/Book/chapters/second.tex'});
+            const reordered = new FakeUri('overleaf-workshop', 'www.overleaf.com', '/Book/main.tex', 'project=p1&user=u1');
+            assert.strictEqual(await owner.provider.prefetch(anotherFile), first);
+            assert.strictEqual(await owner.provider.prefetch(reordered), first, 'query ordering does not create another project owner');
+            assert.strictEqual(server.connections.length, 1);
+        } finally {
+            owner.dispose();
+            await tick();
+        }
+    });
+});
+
 describe('SocketIOAPI', () => {
     const saved = { emit: SocketIOAPI.emitTimeoutMs, join: SocketIOAPI.joinTimeoutMs };
     before(() => { SocketIOAPI.emitTimeoutMs = 100; SocketIOAPI.joinTimeoutMs = 200; });
@@ -363,6 +438,81 @@ describe('SocketIOAPI', () => {
         const project = await socket.joinProject('p1');
         return { socket, project };
     }
+
+    it('remembers a handshake rejected before joinProject and retries with the other scheme', async () => {
+        server = new FakeServer();
+        const socket = new SocketIOAPI('https://www.overleaf.com/', new BaseAPI('https://www.overleaf.com/'), identity, 'p1');
+        try {
+            await tick(); // the constructor's connection was rejected before any join call
+            const rejected = server.current;
+            assert.strictEqual(socket.needsReinit, true, 'an already-rejected socket needs replacement');
+            await assert.rejects(socket.joinProject('p1'), /rejected.*missing\/bad/);
+            assert.deepStrictEqual(rejected.emitted, [], 'a rejected handshake cannot receive a later join emit');
+            assert.strictEqual(rejected.socket.options.reconnect, false);
+            socket.init();
+            assert.strictEqual((await socket.joinProject('p1')).name, 'Book');
+            assert.strictEqual(rejected.closed, true);
+            assert.strictEqual(rejected.handlers.size, 0);
+        } finally {
+            socket.dispose();
+        }
+    });
+
+    it('settles a handshake rejected during joinProject and releases both owned waits', async () => {
+        server = new FakeServer();
+        server.connect = () => {};
+        const socket = new SocketIOAPI('https://www.overleaf.com/', new BaseAPI('https://www.overleaf.com/'), identity, 'p1');
+        try {
+            await tick();
+            const connection = server.current;
+            const reconnects: boolean[] = [];
+            (connection as any).io = {reconnect: (enabled: boolean) => reconnects.push(enabled)};
+            const joining = socket.joinProject('p1').catch((error: unknown) => error);
+            assert.deepStrictEqual(connection.emitted, ['joinProject']);
+            connection.fire('connectionRejected', {message: 'handshake denied'});
+            assert.match(String(await joining), /handshake denied/);
+            assert.strictEqual(connection.socket.options.reconnect, false, 'stop the bundled legacy reconnect loop');
+            assert.deepStrictEqual(reconnects, [false], 'retain manager-style reconnect shutdown');
+            assert.strictEqual((socket as any).pending.size, 0, 'neither the join nor its emit keeps a timer');
+            assert.strictEqual(connection.handlers.get('connectionRejected')?.length, 1, 'only the permanent rejection handler remains');
+        } finally {
+            socket.dispose();
+        }
+    });
+
+    it('does not alternate already-rejected handshake schemes and resets that history after a successful join', async () => {
+        server = new FakeServer();
+        server.connect = () => {};
+        const socket = new SocketIOAPI('https://www.overleaf.com/', new BaseAPI('https://www.overleaf.com/'), identity, 'p1');
+        const rejectJoin = async () => {
+            const joining = socket.joinProject('p1').catch((error: unknown) => error);
+            server.current.fire('connectionRejected', {message: 'handshake denied'});
+            assert.match(String(await joining), /handshake denied/);
+        };
+        try {
+            await tick();
+            await rejectJoin(); // v1
+            socket.init();
+            await tick();
+            assert.match(server.current.query ?? '', /projectId=p1/);
+            await rejectJoin(); // v2
+            socket.init();
+            await tick();
+            assert.match(server.current.query ?? '', /projectId=p1/, 'do not select the rejected v1 scheme again');
+            const joining = socket.joinProject('p1');
+            server.current.accepted();
+            server.current.fire('joinProjectResponse', {publicId: 'joined', project: server.tree()});
+            assert.strictEqual((await joining).name, 'Book');
+            socket.init();
+            await tick();
+            await rejectJoin(); // a new rejection cycle after success may fall back to v1
+            socket.init();
+            await tick();
+            assert.strictEqual(server.current.query, undefined);
+        } finally {
+            socket.dispose();
+        }
+    });
 
     it('answers a join after a disconnect with the next connection\'s project, not the first one\'s', async () => {
         const { socket, project } = await joined();

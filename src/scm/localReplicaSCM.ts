@@ -406,6 +406,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     /** The path of `uri` inside the local folder, like '/dir/name.ext'; undefined when outside. */
     private localPath(uri: vscode.Uri): string | undefined {
+        if (uri.scheme!=='file' || this.baseUri.scheme!=='file') { return undefined; }
+        if (uri.authority.toLowerCase()!==this.baseUri.authority.toLowerCase()) { return undefined; }
         const base = this.baseUri.path.replace(/\/+$/, '');
         const path = uri.path;
         const inside = process.platform==='win32'

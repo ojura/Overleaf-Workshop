@@ -2520,12 +2520,14 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     private getVFS(uri: vscode.Uri): Promise<VirtualFileSystem> {
-        const vfs = this.vfss[ uri.query ];
+        const { serverName, userId, projectId } = parseUri(uri);
+        const key = JSON.stringify([serverName, userId, projectId]);
+        const vfs = this.vfss[key];
         if (vfs) {
             return Promise.resolve(vfs);
         } else {
             const vfs = new VirtualFileSystem(this.context, uri, this.notify.bind(this));
-            this.vfss[ uri.query ] = vfs;
+            this.vfss[key] = vfs;
             return Promise.resolve(vfs);
         }
     }

@@ -1,7 +1,8 @@
 # Working in this repository
 
-This is a fork of the VS Code extension Overleaf Workshop; the work happens on the branch
-`feat/sandbox-compile`. docs/replica-workflows.md describes the local replica, its git repository
+This is a fork of the VS Code extension Overleaf Workshop; the maintained branch is `master`,
+which tracks `ojura/master`. `origin` is the upstream repository; pushes go to `ojura`.
+docs/replica-workflows.md describes the local replica, its git repository
 and the command-line tools in out/sandbox/cli.js, and `node out/sandbox/cli.js --help` lists their
 commands. Steps that belong to one machine (its IDE, its projects, installing into the user's
 window) are in CLAUDE.local.md, which git leaves out.
@@ -11,15 +12,16 @@ window) are in CLAUDE.local.md, which git leaves out.
 - Before starting a task, inspect `git worktree list --porcelain` and the existing lane handoffs.
   Git's registered worktrees are the central lane inventory. Continue an existing lane when it
   already owns the task instead of creating an unregistered copy or a second competing checkout.
-- Work on each task in its own named-branch worktree (`git worktree add -b work/<task> <path>`),
-  commit there, and land on the branch with `git merge --ff-only <commit>` in the main checkout,
-  which other sessions use at the same time. Handoffs name the branch, worktree, owner, validation
-  result and remaining work in the transcript.
-- After landing, confirm the worktree's HEAD is an ancestor of main, its tracked and untracked
+- Work on each task in its own detached worktree (`git worktree add --detach <path> master`),
+  commit there, and fast-forward `master` with `git merge --ff-only <commit>` in the main checkout,
+  which other sessions use at the same time. Handoffs name the commit, worktree, owner, validation
+  result and remaining work in the transcript. Reconcile concurrent landings before fast-forwarding.
+- After landing, confirm the worktree's HEAD is an ancestor of `master`, its tracked and untracked
   changes are clean, and no agent or process still uses it. Remove it with `git worktree remove`
   as part of completing the lane. Preserve and reconcile unmerged commits or dirty work before
   calling the workstream complete; do not force removal to hide unfinished work. Inspect the
-  registered worktree list again at handoff so abandoned lanes remain visible.
+  registered worktree list again at handoff so abandoned lanes remain visible. Keep only `master`
+  as a completed local and fork branch; remove any temporary branch once its work is in `master`.
 - The command-line tools run from the main checkout's out/. After a landing, build out/ again
   while no tool runs.
 - Set up a new checkout with `npm ci --ignore-scripts`, then `npm run postinstall` and

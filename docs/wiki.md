@@ -181,7 +181,9 @@ You can also right click on a folder to import a linked file via **"Overleaf: Im
 
 ### Compile the Project
 
-Different from the Overleaf web editor with an eye-catching `Recompile` button, the compile in Overleaf Workshop extension is triggered via shortcut <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd>.
+Open a project's `.tex` file and choose **Compile Project** in the editor title bar. The action is available in remote Overleaf workspaces and recognized local replicas. You can also run **Compile Project** from the Command Palette or press <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd> (<kbd>Cmd</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd> on macOS).
+
+If a title-bar action has been hidden, use the editor title bar's context menu to restore **Compile Project** or **View Compiled PDF**. Keep a project source file active so the corresponding actions are available.
 
 The compile status is displayed in the status bar, which is located at the bottom of the VS Code window.
 
@@ -191,7 +193,7 @@ The default output folder is `.output` in the project root directory, which hold
 
 ![screenshot-compile-output](assets/screenshot-compile-output.png)
 
-The compiled PDF `output.pdf` is also located in the output folder. You can double click the PDF file to open it, or use the shortcut <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> to open the compiled PDF directly on the right side of the editor.
+The compiled PDF `output.pdf` is also located in the output folder. Choose **View Compiled PDF** from the editor title bar or Command Palette, double click the PDF file, or press <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> (<kbd>Cmd</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> on macOS) to open it on the right side of the editor.
 
 `overleaf-workshop.compileOnSave.enabled` controls automatic compilation on save. In a remote workspace, document edits from other sessions and source-file additions, removals, moves and renames mark the project as changed, including documents that have not been opened here. The next automatic compile check includes those changes. Output-file refreshes do not mark source work as changed. Following an existing server build remains separate from requesting a new compile.
 
@@ -461,18 +463,16 @@ The project-irrelevant configurations of the extension can be found in the VS Co
 
 #### Q1: How to compile and show the compiled PDF?
 
-**A1**: Different from the Overleaf web editor with an eye-catching `Recompile` button, the compile in Overleaf Workshop extension is triggered via shortcut <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd>.
+**A1**: Open a project's `.tex` file and choose **Compile Project** or **View Compiled PDF** in the editor title bar. Both commands are also available from the Command Palette and through <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd> / <kbd>V</kbd> (<kbd>Cmd</kbd> on macOS). See [Compile the Project](#compile-the-project) for output locations and restoring hidden actions.
 
-The compiled PDF `output.pdf` is located in the output folder, which is `.output` by default. You can also use the shortcut <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> to open the compiled PDF directly.
-
-P.S. The compile is also automatically triggered when you save a `.tex` file. This feature is enabled by default, and can be disabled in the vscode settings.
+Automatic compilation on save is enabled by default and controlled by `overleaf-workshop.compileOnSave.enabled`.
 
 
 #### Q2: Why my VS Code plugin (e.g., `vscode-texlint`, `latex-utilities`) does not work?
 
-**A2**: Due to the [limitation of the virtual workspace](https://github.com/microsoft/vscode/wiki/Virtual-Workspaces#signal-whether-your-extension-can-handle-virtual-workspaces), most of the existing VS Code extensions does not work in the virtual workspace. In this case, you can choose to [open the project locally](#open-project-locally) as a workaround.
+**A2**: Extensions that require ordinary files may have [limited support for virtual workspaces](https://github.com/microsoft/vscode/wiki/Virtual-Workspaces#signal-whether-your-extension-can-handle-virtual-workspaces). [Work in a local replica](#work-in-a-local-replica) to use them with the project's files.
 
-Please notice that not all Overleaf features enabled in a local folder. More specifically, the [compile](#compile-project), [PDF preview](#preview-document), [intellisense](#intellisense) and [project history](#history-of-changes) features are disabled by default. You need to refer to [LaTeX Workshop Extension](https://github.com/James-Yu/LaTeX-Workshop) as a complement.
+Overleaf compilation, PDF preview and source/PDF navigation are available automatically in a recognized local replica. The extension's built-in language providers operate in remote project workspaces; use [LaTeX Workshop](https://github.com/James-Yu/LaTeX-Workshop) for additional local LaTeX language support. See [Local replica settings and synchronization](#local-replica-settings-and-synchronization) for the local workflow.
 
 
 #### Q3: Why the extension loses connection to the server frequently or loading indefinitely?

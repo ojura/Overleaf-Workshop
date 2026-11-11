@@ -4,6 +4,7 @@ import { SnippetItemSchema } from '../api/base';
 import { fuzzyFilter, IntellisenseProvider } from '.';
 import { RemoteFileSystemProvider, VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import { TexDocumentSymbolProvider } from './texDocumentSymbolProvider';
+import { citationDetail, citationMarkdown, readCitationEntries } from './citationMetadata';
 import { EventBus } from '../utils/eventBus';
 
 type SnippetItemMap = {[K:string]: SnippetItemSchema};
@@ -402,18 +403,22 @@ export class ReferenceCompletionProvider extends IntellisenseProvider implements
         return {index, partial};
     }
 
-    private async getCompletionItems(uri:vscode.Uri, idx: number, partial:string): Promise<vscode.CompletionItem[]> {
+    private async getCompletionItems(document: vscode.TextDocument, idx: number, partial:string, token: vscode.CancellationToken): Promise<vscode.CompletionItem[]> {
+        if (token.isCancellationRequested) { return []; }
+        const uri = document.uri;
         const vfs = await this.vfsm.prefetch(uri);
+        if (token.isCancellationRequested) { return []; }
         switch (idx) {
             case 0: // group 0: reference
                 const res = await vfs.metadata();
-                if (res===undefined) { return []; };
+                if (res===undefined || token.isCancellationRequested) { return []; };
                 const labels = Object.values(res).map(({labels}) => labels).flat();
                 const uniqueLabels = [...new Set(labels)];
                 return uniqueLabels.map(label => new vscode.CompletionItem(label, vscode.CompletionItemKind.Reference));
             case 1: // group 1: citation
-                let items = await this.getReferenceCompletionItemsFromBib(vfs);
-                items = items.length!==0 ? items : await this.getReferenceCompletionItemsFromBbl(vfs); //fallback option
+                let items = await this.getReferenceCompletionItemsFromBib(vfs, document, token);
+                if (token.isCancellationRequested) { return []; }
+                items = items.length!==0 ? items : await this.getReferenceCompletionItemsFromBbl(vfs, token); //fallback option
                 items = fuzzyFilter(items, partial, ['label']);
                 items.forEach(item => item.filterText = `${partial} ${item.label}`);
                 return items;
@@ -422,28 +427,23 @@ export class ReferenceCompletionProvider extends IntellisenseProvider implements
         }
     }
 
-    private async getReferenceCompletionItemsFromBib(vfs: VirtualFileSystem): Promise<vscode.CompletionItem[]> {
-        const bibRegex = /@(?:(?!STRING\b)[^{])+\{\s*([^},]+)/gm;
-        const items = new Array<vscode.CompletionItem>();
-        for (const path of this.texSymbolProvider.currentBibPathArray) {
-            try{
-                const rawContent = await vfs.openFile( vfs.pathToUri(path) );
-                const content = new TextDecoder().decode(rawContent);
-                let match: RegExpExecArray | null;
-                while (match = bibRegex.exec(content)) {
-                    const item = new vscode.CompletionItem(match[1], vscode.CompletionItemKind.Reference);
-                    items.push(item);
-                }
-            } catch{}
-        };
-        return items;
+    private async getReferenceCompletionItemsFromBib(vfs: VirtualFileSystem, document: vscode.TextDocument, token: vscode.CancellationToken): Promise<vscode.CompletionItem[]> {
+        const paths = await this.texSymbolProvider.bibPathsFor(document, token);
+        const entries = await readCitationEntries(vfs, paths, token);
+        return entries.map(entry => {
+            const item = new vscode.CompletionItem(entry.key, vscode.CompletionItemKind.Reference);
+            item.detail = citationDetail(entry);
+            item.documentation = citationMarkdown(entry);
+            return item;
+        });
     }
 
-    private async getReferenceCompletionItemsFromBbl(vfs: VirtualFileSystem): Promise<vscode.CompletionItem[]>{
+    private async getReferenceCompletionItemsFromBbl(vfs: VirtualFileSystem, token: vscode.CancellationToken): Promise<vscode.CompletionItem[]>{
         const regex = /\\bibitem\{([^\}]*)\}/g;
         const bibUri = vfs.pathToUri(`${OUTPUT_FOLDER_NAME}/output.bbl`);
         try {
             const content = new TextDecoder().decode( await vfs.openFile(bibUri) );
+            if (token.isCancellationRequested) { return []; }
             const items = new Array<vscode.CompletionItem>();
             let match: RegExpExecArray | null;
             while (match = regex.exec(content)) {
@@ -457,11 +457,12 @@ export class ReferenceCompletionProvider extends IntellisenseProvider implements
     }
 
     provideCompletionItems(document: vscode.TextDocument, position: vscode.Position, token: vscode.CancellationToken, context: vscode.CompletionContext): vscode.ProviderResult<vscode.CompletionItem[] | vscode.CompletionList<vscode.CompletionItem>> {
+        if (token.isCancellationRequested) { return Promise.resolve([]); }
         const wordRange = document.getWordRangeAtPosition(position, this.contextRegex);
         if (wordRange) {
             const match = document.getText(wordRange).match(this.contextRegex);
             const {index, partial} = this.parseMatch(match as RegExpMatchArray);
-            return this.getCompletionItems(document.uri, index, partial);
+            return this.getCompletionItems(document, index, partial, token);
         }
         return Promise.resolve([]);
     }
