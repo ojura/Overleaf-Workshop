@@ -1057,4 +1057,35 @@ describe('the procedural PDF robot fleet', function () {
         assert.strictEqual(frame.stats.acceptedCargo, 1);
         assert.strictEqual(frame.stats.fetchBytes, 2048);
     });
+    it('does not name an unavailable Lab character when the actual scene uses a substitute', () => {
+        const fleet = new robots.RobotChoreographer(42, { sceneOrder: ['rescue'] });
+        fleet.step(0, outage); assert.ok(fleet.reserveVehicle('heavyquad', 0));
+        const frame = fleet.step(robots.ROBOT_LIMITS.outageConfirmMs + 1, outage);
+        assert.strictEqual(frame.scene, 'rescue');
+        assert.ok(frame.actors.some((actor: any) => actor.vehicle !== 'heavyquad' && !actor.outside && actor.job === 'scene'));
+        assert.ok(!frame.caption.includes('MORUS'), 'caption follows real cast rather than the unavailable requested model');
+        assert.ok(robots.ROBOT_CAPTION_VARIANTS.includes(frame.caption), 'the substitute title is in the finite reserved domain');
+        const exact = new robots.RobotChoreographer(42, { sceneOrder: ['rescue'] }); const original = startOutage(exact);
+        assert.ok(original.caption.includes('MORUS'), 'a correctly cast named scene keeps its authored title');
+        assert.deepStrictEqual(frame.actors.filter((actor: any) => actor.outside).map((actor: any) => actor.vehicle), ['heavyquad']);
+        const reassigned = new robots.RobotChoreographer(42, { sceneOrder: ['rescue'] });
+        const cast = startOutage(reassigned);
+        for (const actor of cast.actors) { if (actor.vehicle !== 'heavyquad') { reassigned.reserveVehicle(actor.vehicle, cast.at); } }
+        const dispatch = reassigned.step(cast.at + 1, { ...outage, performance: { events: [
+            { sequence: 1, at: cast.at + 1, type: 'fetch', data: { bytes: 2048, durationMs: 1 } },
+        ] } });
+        const courier = dispatch.actors.find((actor: any) => actor.vehicle === 'heavyquad');
+        assert.strictEqual(courier.job, 'delivery'); assert.strictEqual(courier.outside, false);
+        assert.strictEqual(dispatch.stats.acceptedCargo, 1, 'a real completed-fetch event reassigns the original cast member');
+        assert.ok(!dispatch.caption.includes('MORUS'), 'a scene actor reassigned to delivery has left the current cast');
+        reassigned.release(reassigned.actors.find((actor: any) => actor.vehicle === 'heavyquad'));
+        assert.ok(!reassigned.snapshot().caption.includes('MORUS'), 'ending unrelated delivery cannot resume the discarded scene role');
+        const borrowed = exact.reserveVehicle('heavyquad', original.at); assert.ok(borrowed);
+        assert.ok(!exact.snapshot().caption.includes('MORUS'), 'borrowing the named actor also changes current narration');
+        for (const actor of exact.snapshot().actors) { if (!actor.outside) { exact.reserveVehicle(actor.vehicle, original.at); } }
+        const unavailable = exact.snapshot();
+        assert.ok(robots.ROBOT_CAPTION_VARIANTS.includes(unavailable.caption));
+        assert.ok(unavailable.caption.includes('busy elsewhere'), 'an empty scene cannot name or impersonate an absent crew');
+    });
+
 });

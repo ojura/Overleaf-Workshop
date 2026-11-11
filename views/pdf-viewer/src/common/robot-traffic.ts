@@ -23,6 +23,13 @@ export interface RobotTrafficOffset {
     visibility?: number;
 }
 
+/** A real moving-peer constraint, independent of its residual eased translation. */
+export interface RobotTrafficPassage {
+    readonly id: number;
+    readonly winner: number;
+    readonly yielding: number;
+}
+
 const LIMITS = Object.freeze({ groups: 12, offset: 96, clearance: 12, lookaheadMs: 240,
     sampleGapMs: 200, stepMs: 64, easingMs: 120, offsetSpeed: 0.8, measuredSpeed: 3, passes: 3,
     fadeOutMs: 160, fadeInMs: 240, recoveryClearance: 12, overlapTolerance: 0.5 });
@@ -57,6 +64,15 @@ export class RobotTraffic {
     private readonly previous = new Map<number, Sample>();
     private readonly axes = new Map<string, Axis>();
     private at?: number;
+    private passageSerial = 0;
+    private readonly passageContexts = new Map<string, RobotTrafficPassage>();
+    private currentPassages: readonly RobotTrafficPassage[] = [];
+
+    passages(): readonly RobotTrafficPassage[] { return this.currentPassages; }
+    hasPassage(id: number): boolean {
+        for (const passage of this.passageContexts.values()) { if (passage.id === id) { return true; } }
+        return false;
+    }
 
     update(now: number, input: readonly RobotTrafficGroup[]): Map<number, RobotTrafficOffset> {
         const groups: Group[] = [];
@@ -96,7 +112,7 @@ export class RobotTraffic {
                 ? bounded({ x: (group.x - sample.x) / Math.max(1, elapsed), y: (group.y - sample.y) / Math.max(1, elapsed) }, LIMITS.measuredSpeed)
                 : zero());
         }
-        const used = new Set<string>();
+        const used = new Set<string>(), context = new Set<string>(), passing = new Set<string>();
         for (let pass = 0; pass < LIMITS.passes; pass++) {
             for (let i = 0; i < groups.length; i++) {
                 const winner = groups[i], a = targets.get(winner.id)!, va = velocities.get(winner.id)!;
@@ -105,6 +121,7 @@ export class RobotTraffic {
                     if (yielding.fixed) { continue; }
                     const b = targets.get(yielding.id)!, vb = velocities.get(yielding.id)!;
                     const key = winner.id + ':' + yielding.id;
+                    const peerKey = Math.min(winner.id, yielding.id) + ':' + Math.max(winner.id, yielding.id);
                     const radius = winner.radius + yielding.radius + LIMITS.clearance;
                     const dx = yielding.x + b.x - winner.x - a.x, dy = yielding.y + b.y - winner.y - a.y;
                     const vx = vb.x - va.x, vy = vb.y - va.y, speedSquared = vx * vx + vy * vy;
@@ -112,9 +129,16 @@ export class RobotTraffic {
                         winner.fixed ? LIMITS.lookaheadMs : winner.remainingMs);
                     const ahead = speedSquared > 1e-8 ? clamp(-(dx * vx + dy * vy) / speedSquared, 0, horizon) : 0;
                     const x = dx + vx * ahead, y = dy + vy * ahead;
-                    if (Math.hypot(dx, dy) < radius + LIMITS.offset * 2) { used.add(key); }
+                    if (Math.hypot(dx, dy) < radius + LIMITS.offset * 2) { used.add(key); context.add(peerKey); }
                     if (Math.hypot(x, y) >= radius) { continue; }
-                    used.add(key);
+                    used.add(key); context.add(peerKey);
+                    if (!winner.fixed && Math.hypot(va.x, va.y) > 1e-4 && Math.hypot(vb.x, vb.y) > 1e-4
+                        && speedSquared > 1e-8) {
+                        passing.add(peerKey);
+                        if (!this.passageContexts.has(peerKey)) {
+                            this.passageContexts.set(peerKey, Object.freeze({ id: ++this.passageSerial, winner: winner.id, yielding: yielding.id }));
+                        }
+                    }
                     let axis = this.axes.get(key);
                     if (!axis || axis.ground !== yielding.ground) {
                         const sign = (winner.id ^ yielding.id) & 1 ? 1 : -1;
@@ -148,6 +172,8 @@ export class RobotTraffic {
             }
         }
         for (const key of this.axes.keys()) { if (!used.has(key)) { this.axes.delete(key); } }
+        for (const key of this.passageContexts.keys()) { if (!context.has(key)) { this.passageContexts.delete(key); } }
+        this.currentPassages = [...passing].map(key => this.passageContexts.get(key)!);
         const displayed = (group: Group, offset: RobotTrafficOffset): RobotTrafficOffset => group.fixed || !group.offsetScale
             ? zero() : { x: offset.x * group.offsetScale, y: offset.y * group.offsetScale };
         const result = new Map<number, RobotTrafficOffset>();
@@ -196,5 +222,7 @@ export class RobotTraffic {
         return result;
     }
 
-    reset(): void { this.previous.clear(); this.axes.clear(); this.at = undefined; }
+    reset(): void {
+        this.previous.clear(); this.axes.clear(); this.passageContexts.clear(); this.currentPassages = []; this.at = undefined;
+    }
 }

@@ -89,17 +89,17 @@ const ROTOR_LAYOUT: Partial<Record<RobotVehicle, readonly (readonly [number, num
 export const ROBOT_SCENES = [
     { id: 'covariance', title: 'The covariance ellipse has become a lifestyle.', durationMs: 7200 },
     { id: 'replan', title: 'Plan B has requested a Plan C.', durationMs: 6800 },
-    { id: 'rescue', title: 'MORUS airlift. Ground crew: remain approximately calm.', durationMs: 9500 },
-    { id: 'traffic', title: 'Navines dispatch invokes the Banker’s algorithm.', durationMs: 8000 },
-    { id: 'repair', title: 'XENA has selected the large diagnostic spanner.', durationMs: 7800 },
+    { id: 'rescue', title: 'MORUS airlift. Ground crew: remain approximately calm.', subject: 'heavyquad', alternateTitle: 'Airlift. Ground crew: remain approximately calm.', durationMs: 9500 },
+    { id: 'traffic', title: 'Navines dispatch invokes the Banker’s algorithm.', subject: 'forklift', alternateTitle: 'Dispatch invokes the Banker’s algorithm.', durationMs: 8000 },
+    { id: 'repair', title: 'XENA has selected the large diagnostic spanner.', subject: 'mecanum', alternateTitle: 'The large diagnostic spanner has been selected.', durationMs: 7800 },
     { id: 'calibration', title: 'X-UFO gyro calibration. Again, with feeling.', durationMs: 7300 },
     { id: 'deadlock', title: 'Three robots have reserved the same loading dock.', durationMs: 7600 },
     { id: 'battery', title: 'AERIAL-CORE pit stop. Emergency electrons inbound.', durationMs: 8000 },
     { id: 'antenna', title: 'Raising the antenna improves crew morale.', durationMs: 7000 },
-    { id: 'traction', title: 'VIV requests one more floor of traction.', durationMs: 7500 },
+    { id: 'traction', title: 'VIV requests one more floor of traction.', subject: 'rover', alternateTitle: 'One more floor of traction, please.', durationMs: 7500 },
     { id: 'juggle', title: 'Page stacking: underactuated edition.', durationMs: 7200 },
-    { id: 'bridge', title: 'ALKA has found a route with five useful legs.', durationMs: 8500 },
-    { id: 'frame', title: 'MetaMorpher would like to clarify the coordinate frame.', durationMs: 7400 },
+    { id: 'bridge', title: 'ALKA has found a route with five useful legs.', subject: 'hexapod', alternateTitle: 'The crew has found a route across the gap.', durationMs: 8500 },
+    { id: 'frame', title: 'MetaMorpher would like to clarify the coordinate frame.', subject: 'tiltwing', alternateTitle: 'The coordinate frame would like a word.', durationMs: 7400 },
     { id: 'cable', title: 'The spare cable was filed under “future work”.', durationMs: 7500 },
 ] as const;
 
@@ -122,9 +122,10 @@ const ROBOT_CAPTION_DEFAULTS = Object.freeze({
     quiet: 'The crew is standing by. The rescue repertoire is resting.',
     recovery: 'Buffer restored. Everybody act like that was planned.',
     dispatch: 'LARICS dispatch; every parcel is a completed fetch or page.',
+    unavailable: 'The scene crew is busy elsewhere.',
 });
 export const ROBOT_CAPTION_VARIANTS = Object.freeze([
-    ...ROBOT_SCENES.map(scene => scene.title), ...ROBOT_QUIET_DETAILS, ...Object.values(ROBOT_CAPTION_DEFAULTS),
+    ...ROBOT_SCENES.flatMap(scene => 'alternateTitle' in scene ? [scene.title, scene.alternateTitle] : [scene.title]), ...ROBOT_QUIET_DETAILS, ...Object.values(ROBOT_CAPTION_DEFAULTS),
 ]);
 const ROBOT_ACTIVITY_WAITING = 'Waiting tableau; the outage repertoire has finished';
 
@@ -286,6 +287,7 @@ export class RobotChoreographer {
     private sceneIndex = 0;
     private sceneOrder: typeof ROBOT_SCENES[number][] = [];
     private sceneId = 'dispatch';
+    private readonly sceneCast = new Map<RobotVehicle, number>();
     private previousFirst = '';
     private episode = 0;
     private opening = 0;
@@ -360,7 +362,7 @@ export class RobotChoreographer {
     open(now: number, input: RobotTelemetry): void {
         this.opening++;
         this.mode = 'dispatch';
-        this.sceneId = 'dispatch';
+        this.sceneId = 'dispatch'; this.sceneCast.clear();
         this.nextTransitionAt = Infinity;
         this.lastAt = null;
         this.riskSince = this.readySince = null;
@@ -462,12 +464,21 @@ export class RobotChoreographer {
 
     snapshot() {
         const scene = ROBOT_SCENES.find(entry => entry.id === this.sceneId);
+        const present = (id: number | undefined) => id === undefined ? undefined : this.actors.find(actor => actor.id === id && actor.reservedAt === null && actor.task?.kind !== 'delivery');
+        let sceneTitle = scene?.title as string | undefined;
+        if (scene) {
+            if (![...this.sceneCast.values()].some(id => present(id))) { sceneTitle = ROBOT_CAPTION_DEFAULTS.unavailable; }
+            else if ('subject' in scene) {
+                const actor = present(this.sceneCast.get(scene.subject));
+                if (actor?.vehicle !== scene.subject) { sceneTitle = scene.alternateTitle; }
+            }
+        }
         return {
             at: this.now, mode: this.mode, scene: this.sceneId,
             caption: this.mode === 'quiet'
                 ? this.quietDetails.length ? ROBOT_QUIET_DETAILS[this.quietDetails.at(-1)!] : ROBOT_CAPTION_DEFAULTS.quiet
                 : this.mode === 'recovery' ? ROBOT_CAPTION_DEFAULTS.recovery
-                    : scene?.title ?? ROBOT_CAPTION_DEFAULTS.dispatch,
+                    : sceneTitle ?? ROBOT_CAPTION_DEFAULTS.dispatch,
             episode: this.episode, opening: this.opening, sceneIndex: this.sceneIndex,
             nextTransitionAt: this.nextTransitionAt, sceneStartedAt: this.sceneStartedAt,
             missingPage: this.input.visibleMissing?.[0] ?? null,
@@ -551,7 +562,7 @@ export class RobotChoreographer {
 
     private enterScene(): void {
         const scene = this.sceneOrder[this.sceneIndex];
-        this.sceneId = scene.id;
+        this.sceneId = scene.id; this.sceneCast.clear();
         this.nextTransitionAt = this.sceneStartedAt + scene.durationMs;
         this.props = [];
         for (const actor of this.actors) {
@@ -571,7 +582,7 @@ export class RobotChoreographer {
         const task = (vehicle: RobotVehicle, steps: TaskStep[], stranded = false) => {
             const actor = actorFor(vehicle);
             if (actor) {
-                this.assign(actor, 'scene', steps);
+                this.assign(actor, 'scene', steps); this.sceneCast.set(vehicle, actor.id);
                 actor.needsHelp = stranded;
             }
             return actor;
@@ -763,6 +774,9 @@ export class RobotChoreographer {
     }
 
     private assign(actor: Actor, kind: Task['kind'], steps: TaskStep[], partner?: number): void {
+        if (kind === 'delivery') {
+            for (const [role, id] of this.sceneCast) { if (id === actor.id) { this.sceneCast.delete(role); } }
+        }
         steps = steps.map(value => ({ ...value, ...this.contain(actor, value) }));
         actor.task = { kind, steps, index: 0, arrivedAt: null, partner };
         actor.goal = { x: steps[0].x, y: steps[0].y };

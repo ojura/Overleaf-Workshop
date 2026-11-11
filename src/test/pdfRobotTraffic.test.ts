@@ -344,4 +344,30 @@ describe('Payload-level robot traffic spacing', function () {
         const prohibited = settle(new api.RobotTraffic(), [anchor, { ...moving, offsetScale: 0, canFade: false }]).get(2)!;
         assert.deepStrictEqual(prohibited, { x: 0, y: 0 });
     });
+    it('reports one stable moving-peer passage and excludes stationary, fixed and residual spacing', () => {
+        const traffic = new api.RobotTraffic(); const ids = new Set<number>();
+        for (let at = 0; at <= 480; at += 16) {
+            traffic.update(at, [group(1, -120 + at * .5, 0), group(2, 120 - at * .5, 0)]);
+            for (const passage of traffic.passages()) {
+                assert.deepStrictEqual([passage.winner, passage.yielding], [1, 2]); ids.add(passage.id);
+            }
+        }
+        assert.strictEqual(ids.size, 1, 'the actual coordinated crossing has one logical identity');
+        const id = [...ids][0]; assert.ok(traffic.hasPassage(id));
+        traffic.update(496, [group(1, 120, 0), group(2, -120, 0)]);
+        traffic.update(512, [group(1, 120, 0), group(2, -120, 0)]);
+        assert.deepStrictEqual(traffic.passages(), [], 'residual easing is not another passage');
+        assert.ok(traffic.hasPassage(id), 'temporary constraint absence retains the same separation context');
+        traffic.update(528, [group(1, 1000, 0), group(2, -1000, 0)]);
+        assert.strictEqual(traffic.hasPassage(id), false, 'real separation retires its speech identity');
+        traffic.reset(); settle(traffic, [group(1), group(2)]);
+        assert.deepStrictEqual(traffic.passages(), [], 'stationary destination crowding is not passing');
+        traffic.reset();
+        for (let at = 0; at <= 160; at += 16) {
+            traffic.update(at, [group(1, 0, 0, { fixed: true }), group(2, 80 - at * .5, 0)]);
+            assert.deepStrictEqual(traffic.passages(), [], 'fixed obstacles do not speak as coordinated peers');
+        }
+        traffic.reset(); assert.deepStrictEqual(traffic.passages(), []);
+    });
+
 });

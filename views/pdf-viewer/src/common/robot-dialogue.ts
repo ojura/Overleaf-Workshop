@@ -11,7 +11,7 @@ export const ROBOT_AUTHORED_UTTERANCES: Readonly<Record<string, { text: string; 
     "bump-brothers-reply": { text: "Bez branika, molim.", source: "Existing authored encounter: bump-brothers" },
     "bump-frkalica-lead": { text: "Oprosti, nisam znao da igramo Frkalicu.", source: "Book-inspired dialogue: Frkalica, main.tex:1858–1874" },
     "bump-frkalica-reply": { text: "Bez revanša, molim.", source: "Book-inspired dialogue: Frkalica, main.tex:1858–1874" },
-    "bump-scout-lead": { text: "Scout Mini kaže: „Samo sam pet centimetara širi.“", source: "30 godina LARICS-a/main.tex:9336–9350; Scout Mini procurement story, book-inspired satire" },
+    "bump-scout-lead": { text: "Samo sam pet centimetara širi.", source: "30 godina LARICS-a/main.tex:9336–9350; Scout Mini procurement story, book-inspired satire" },
     "bump-scout-reply": { text: "Ne mjeri me, nisam u javnoj nabavi.", source: "30 godina LARICS-a/main.tex:9336–9350; Scout Mini procurement story, book-inspired satire" },
     "miss-watch-lead": { text: "Pazi kuda ideš!", source: "Existing authored encounter: miss-watch" },
     "miss-watch-reply": { text: "Samo sam razmišljao…", source: "Existing authored encounter: miss-watch" },
@@ -21,6 +21,7 @@ export const ROBOT_AUTHORED_UTTERANCES: Readonly<Record<string, { text: string; 
     "miss-thread-reply": { text: "Misli su mi odlutale.", source: "Existing authored encounter: miss-thread" },
     "miss-coffee-lead": { text: "Kava. Odmah.", source: "Existing authored encounter: miss-coffee" },
     "miss-coffee-reply": { text: "Prihvaćam korekciju.", source: "Existing authored encounter: miss-coffee" },
+    "private-zone-lead": { text: "Ulaziš mi u privatnu zonu!", source: "User-supplied dialogue; Ivica Draganjac PhD private-zone reference" },
     "miss-fuzzy-lead": { text: "Mir, kolega. Danas nema Fightboticsa.", source: "Book-inspired dialogue: Erić main.tex:2781; Kovačić main.tex:2589" },
     "miss-fuzzy-reply": { text: "Budnost mi je malo neizrazita…", source: "Book-inspired dialogue: Erić main.tex:2781; Kovačić main.tex:2589" },
     "miss-kalman-lead": { text: "Origami manevar, bez gužvanja fotke.", source: "Book-inspired dialogue: Car main.tex:2709; Petrinec main.tex:3112" },
@@ -45,7 +46,7 @@ export const ROBOT_AUTHORED_UTTERANCES: Readonly<Record<string, { text: string; 
     "reunion-lift-reply": { text: "Zrak i zemlja. Najbolji frendovi.", source: "Book-inspired dialogue: main.tex:1737, 8908" },
     "reunion-break-lead": { text: "Još ova fotka, pa treće poluvrijeme.", source: "Book-inspired dialogue: football and Jolly Rogers, main.tex:1737-1756, 6635-6644" },
     "reunion-break-reply": { text: "Još ova fotka, pa na Robijevu svirku.", source: "Book-inspired dialogue: football and Jolly Rogers, main.tex:1737-1756, 6635-6644" },
-    "pioneer-viv-team": { text: "Pioneeri bi rekli: „Still got it. Barem nismo završili kao VIV.“", source: "User-supplied Pioneer/VIV callback; the current vehicle keeps its own identity" },
+    "pioneer-viv-team": { text: "Still got it. Barem nismo završili kao VIV.", source: "User-supplied Pioneer/VIV callback; the current vehicle keeps its own identity" },
     "success-nailed-lead": { text: "Nailed it.", source: "Existing authored encounter: success-nailed" },
     "success-nailed-reply": { text: "Like a glove.", source: "Existing authored encounter: success-nailed" },
     "success-fit-lead": { text: "Na milimetar.", source: "Existing authored encounter: success-fit" },
@@ -53,6 +54,7 @@ export const ROBOT_AUTHORED_UTTERANCES: Readonly<Record<string, { text: string; 
     "success-maric-lead": { text: "ovako fino ne bi ni Marić izbrusio", source: "User-supplied dialogue; ENDORSE grinding by demonstration, main.tex:4583–4589" },
     "success-sofia-lead": { text: "zgrabio sam ga kao SofIA", source: "User-supplied dialogue; SofIA main.tex:6862–6871" },
     "success-mbzirc-lead": { text: "bolje prošlo nego MBZIRC", source: "User-supplied dialogue; mixed MBZIRC 2020 story main.tex:6774, distinct from the 2023 victory at 6813–6815" },
+    "set-down-count-lead": { text: "Na tri!", source: "User-supplied set-down count-in" },
     "success-handoff-lead": { text: "Držiš?", source: "Book-inspired dialogue: Marić main.tex:2927" },
     "success-handoff-reply": { text: "Držim. Sad možeš pustiti.", source: "Book-inspired dialogue: Marić main.tex:2927" },
     "success-map-lead": { text: "Ti mapiraj. Ja čuvam leđa.", source: "Book-inspired dialogue: Milas main.tex:2987; Griparić main.tex:2833" },
@@ -86,22 +88,23 @@ export const ROBOT_AUTHORED_UTTERANCES: Readonly<Record<string, { text: string; 
     "work-trio-lead": { text: "Trio biciklistikus, drž’ se!", source: "Recovered whole-book curation, main.tex9283–9294" },
     "work-knots-lead": { text: "Punih šest čvorova. Držite se!", source: "Recovered whole-book curation, main.tex2078–2096" },
     "success-barbara-lead": { text: "Barbara javlja: prvi smo!", source: "Recovered whole-book curation, main.tex6813–6815" },
-    "success-solo-pioneer-lead": { text: "Pioneer bi rekao: „Still got it. Barem nisam završio kao VIV.“", source: "Recovered whole-book curation, user-supplied Pioneer/VIV lore; explicitly attributed historical single-robot story" },
+    "success-solo-pioneer-lead": { text: "Still got it. Barem nisam završio kao VIV.", source: "Recovered whole-book curation, user-supplied Pioneer/VIV callback" },
     "eagle-pride-lead": { text: "EagleRed. Mit, legenda, dostava.", source: "Recovered whole-book curation, user-supplied EagleRed lore" },
-    "scout-var-story-lead": { text: "Scout Mini bi rekao: „Pet centimetara? Zovi VAR.“", source: "Recovered whole-book curation, main.tex9345; explicit attributed story" },
-    "scout-mug-story-lead": { text: "Scout Mini bi rekao: „Šalicu imam. Toleranciju tražim.“", source: "Recovered whole-book curation, main.tex9345; explicit attributed story" },
-    "pioneer-hold-lead": { text: "Pioneeri bi rekli: „Alpha drži. Bravo preuzima zasluge.“", source: "Pioneer Alpha/Bravo reference, user names;main.tex8084; authored hypothetical credit-taking joke" },
+    "scout-var-story-lead": { text: "Pet centimetara? Zovi VAR.", source: "Recovered whole-book curation, main.tex9345; direct book callback" },
+    "scout-mug-story-lead": { text: "Šalicu imam. Toleranciju tražim.", source: "Recovered whole-book curation, main.tex9345; direct book callback" },
+    "scout-predecessors-lead": { text: "Nakon Foxtrota ide Golf. Vi ste uzeli Mini.", source: "User-requested Scout Mini quip about his six phonetic-alphabet predecessors" },
+    "pioneer-hold-lead": { text: "Ne, MOJE lijevo.", source: "User-selected standalone coordination joke" },
     "pioneer-roll-lead": { text: "Charlie, Delta, Echo, Foxtrot!", source: "Recovered whole-book curation, user-authorized roll call" },
     "aircraft-roll-lead": { text: "Eagle, Hawk, Falcon, Duck, Tukan: pokret!", source: "Recovered whole-book curation, user-authorized drone families" },
-    "pioneer-share-lead": { text: "Alpha bi rekao: „Ti jednu stranu, ja drugu.“", source: "Recovered whole-book curation, main.tex8084; two current speakers quote the historical pair" },
-    "pioneer-share-reply": { text: "Bravo bi odgovorio: „Fotka na mjestu. Petica, brate!“", source: "Recovered whole-book curation, main.tex8084; two current speakers quote the historical pair" },
-    "echo-sonar-lead": { text: "Echo iz Pioneer priče: „Sonar kaže: stari prijatelj!“", source: "Recovered whole-book curation, main.tex7983; explicitly attributed historical character" },
-    "foxtrot-path-lead": { text: "Foxtrot iz Pioneer priče: „Putanju znam. Do tebe idem napamet.“", source: "Recovered whole-book curation, main.tex7674; explicitly attributed historical character" },
-    "bravo-lasers-lead": { text: "Bravo iz Pioneer priče: „Dva lasera. Petica ravno u metu.“", source: "Recovered whole-book curation, main.tex7980; explicitly attributed historical character" },
-    "charlie-qr-lead": { text: "Charlie iz Pioneer priče: „QR potvrđen. Prijatelj prepoznat.“", source: "Recovered whole-book curation, main.tex8087; explicitly attributed historical character" },
-    "delta-route-lead": { text: "Delta iz Pioneer priče: „Optimiziram put do tvoje petice.“", source: "Recovered whole-book curation, main.tex7632; explicitly attributed historical character" },
-    "eagle-alpha-five-lead": { text: "EagleRed je u priči rekao: „Iz zraka šaljem peticu!“", source: "Recovered whole-book curation, user EagleRed/Alpha assignments; explicitly attributed historical exchange" },
-    "eagle-alpha-five-reply": { text: "Alpha je odgovorio: „Spremna! Bravo čuva fotku.“", source: "Recovered whole-book curation, user EagleRed/Alpha assignments; explicitly attributed historical exchange" },
+    "pioneer-share-lead": { text: "Ti jednu stranu, ja drugu.", source: "Recovered whole-book curation, main.tex8084; shared carrying" },
+    "pioneer-share-reply": { text: "Fotka na mjestu. Petica, brate!", source: "Recovered whole-book curation, main.tex8084; completed shared deposit" },
+    "echo-sonar-lead": { text: "Sonar kaže: stari prijatelj!", source: "Recovered whole-book curation, main.tex7983; direct robotics joke" },
+    "foxtrot-path-lead": { text: "Putanju znam. Do tebe idem napamet.", source: "Recovered whole-book curation, main.tex7674; direct book callback" },
+    "bravo-lasers-lead": { text: "Dva lasera. Petica ravno u metu.", source: "Recovered whole-book curation, main.tex7980; direct robotics joke" },
+    "charlie-qr-lead": { text: "QR potvrđen. Prijatelj prepoznat.", source: "Recovered whole-book curation, main.tex8087; direct robotics joke" },
+    "delta-route-lead": { text: "Optimiziram put do tvoje petice.", source: "Recovered whole-book curation, main.tex7632; direct book callback" },
+    "eagle-alpha-five-lead": { text: "Iz zraka šaljem peticu!", source: "Recovered whole-book curation, user EagleRed/Alpha assignments; actual EagleRed speaker" },
+    "eagle-alpha-five-reply": { text: "Spremna!", source: "Recovered whole-book curation, user EagleRed/Alpha assignments; actual responding partner" },
     "buddy-consensus-lead": { text: "Konsenzus?", source: "Recovered whole-book curation, main.tex3092" },
 });
 const utteranceLines = (ids: readonly string[]): readonly string[] => ids.map(id => {
@@ -136,13 +139,11 @@ export const ROBOT_ENCOUNTER_DIALOGUE: readonly RobotIncidentDialogue[] = Object
     incident("reunion-resource", "reunion", ["reunion-resource-lead","reunion-resource-reply"], "Book-inspired dialogue: Petrović main.tex:3122; ROBOBAND main.tex:6412"),
     incident("reunion-lift", "reunion", ["reunion-lift-lead","reunion-lift-reply"], "Book-inspired dialogue: main.tex:1737, 8908"),
     incident("reunion-break", "reunion", ["reunion-break-lead","reunion-break-reply"], "Book-inspired dialogue: football and Jolly Rogers, main.tex:1737-1756, 6635-6644"),
-    incident("reunion-pioneers", "reunion", ["pioneer-viv-team"], "User-supplied Pioneer/VIV callback; the current vehicle keeps its own identity"),
     incident("success-nailed", "success", ["success-nailed-lead","success-nailed-reply"]),
     incident("success-fit", "success", ["success-fit-lead","success-fit-reply"]),
     incident("success-maric", "success", ["success-maric-lead"], "User-supplied dialogue; ENDORSE grinding by demonstration, main.tex:4583–4589"),
     incident("success-sofia", "success", ["success-sofia-lead"], "User-supplied dialogue; SofIA main.tex:6862–6871"),
     incident("success-mbzirc", "success", ["success-mbzirc-lead"], "User-supplied dialogue; mixed MBZIRC 2020 story main.tex:6774, distinct from the 2023 victory at 6813–6815"),
-    incident("success-handoff", "success", ["success-handoff-lead","success-handoff-reply"], "Book-inspired dialogue: Marić main.tex:2927"),
     incident("success-map", "success", ["success-map-lead","success-map-reply"], "Book-inspired dialogue: Milas main.tex:2987; Griparić main.tex:2833"),
     incident("success-gentle", "success", ["success-gentle-lead","success-gentle-reply"], "Book-inspired dialogue: Pevec main.tex:3132; Wachtler main.tex:3288"),
     incident("success-memories", "success", ["success-memories-lead","success-memories-reply"], "Book-inspired dialogue: Kovačević main.tex:2886; Križmančić main.tex:2907"),
@@ -157,10 +158,10 @@ export const ROBOT_ENCOUNTER_DIALOGUE: readonly RobotIncidentDialogue[] = Object
 ]);
 
 /** Semantic speech opportunities are independent of optional motion/incident admission. */
-export type RobotDialogueOpportunity = 'new-book' | 'preparing' | 'carrying' | 'deposit' | 'returning' | 'waiting' | 'greeting'
+export type RobotDialogueOpportunity = 'new-book' | 'preparing' | 'carrying' | 'passing' | 'set-down' | 'deposit' | 'returning' | 'waiting' | 'greeting'
     | 'success' | 'bump' | 'near-miss' | 'reunion' | 'rescue';
 export interface RobotDialogueSpeaker { id: number; vehicle: string; name: string }
-export interface RobotDialogueRole { vehicles?: readonly string[]; names?: readonly string[] }
+export interface RobotDialogueRole { vehicles?: readonly string[]; names?: readonly string[]; excludeNames?: readonly string[] }
 export interface RobotDialogueEntry {
     id: string;
     opportunities: readonly RobotDialogueOpportunity[];
@@ -194,7 +195,7 @@ function assign(entry: RobotDialogueEntry, actors: readonly RobotDialogueSpeaker
         const role = entry.roles?.[index];
         for (const actor of actors) {
             if (selected.includes(actor.id) || role?.vehicles && !role.vehicles.includes(actor.vehicle)
-                || role?.names && !role.names.includes(actor.name)) { continue; }
+                || role?.names && !role.names.includes(actor.name) || role?.excludeNames?.includes(actor.name)) { continue; }
             selected.push(actor.id);
             if (match(index + 1)) { return true; }
             selected.pop();
@@ -219,7 +220,8 @@ export class RobotDialogueSelection {
             meaningIds: Object.freeze(entry.meaningIds ? [...entry.meaningIds] : entry.lines.map((_line, index) => entry.lines.length === 1 ? entry.id : entry.id + ':' + index)),
             opportunities: Object.freeze([...entry.opportunities]), lines: Object.freeze([...entry.lines]),
             roles: entry.roles && Object.freeze(entry.roles.map(role => Object.freeze({ ...role,
-                vehicles: role.vehicles && Object.freeze([...role.vehicles]), names: role.names && Object.freeze([...role.names]) }))) })));
+                vehicles: role.vehicles && Object.freeze([...role.vehicles]), names: role.names && Object.freeze([...role.names]),
+                excludeNames: role.excludeNames && Object.freeze([...role.excludeNames]) }))) })));
         const ids = new Set<string>();
         const meanings = new Map<string, string>();
         for (const entry of this.catalogue) {
@@ -299,7 +301,7 @@ export class RobotDialogueSelection {
     }
 }
 
-/** Every recovered motif has an explicit truthful opportunity; historical names are attributed lore. */
+/** Authored words belong to current speakers, with eligibility tied to their work or encounter. */
 function work(id: string, opportunities: readonly RobotDialogueOpportunity[], meaningIds: readonly string[], source: string, constraints: Partial<Pick<RobotDialogueEntry, "roles" | "minParticipants" | "maxParticipants">> = {}): RobotDialogueEntry {
     return { id, opportunities, meaningIds, lines: utteranceLines(meaningIds), source, ...constraints };
 }
@@ -326,22 +328,28 @@ export const ROBOT_CURATED_WORK_DIALOGUE: readonly RobotDialogueEntry[] = [
     work("work-trio", ["carrying"], ["work-trio-lead"], "Recovered whole-book curation, main.tex9283–9294", {"minParticipants":3}),
     work("work-knots", ["carrying"], ["work-knots-lead"], "Recovered whole-book curation, main.tex2078–2096", {"minParticipants":2}),
     work("success-barbara", ["deposit"], ["success-barbara-lead"], "Recovered whole-book curation, main.tex6813–6815"),
-    work("success-solo-pioneer", ["deposit"], ["success-solo-pioneer-lead"], "Recovered whole-book curation, user-supplied Pioneer/VIV lore; explicitly attributed historical single-robot story", {"maxParticipants":1}),
+    work("success-solo-pioneer", ["deposit"], ["success-solo-pioneer-lead"], "Recovered whole-book curation, user-supplied Pioneer/VIV callback", {"maxParticipants":1,"roles":[{"excludeNames":["VIV"]}]}),
     work("eagle-pride", ["carrying","deposit"], ["eagle-pride-lead"], "Recovered whole-book curation, user-supplied EagleRed lore", {"roles":[{"names":["EagleRed"]}]}),
-    work("scout-var-story", ["greeting","carrying"], ["scout-var-story-lead"], "Recovered whole-book curation, main.tex9345; explicit attributed story"),
-    work("scout-mug-story", ["greeting","carrying"], ["scout-mug-story-lead"], "Recovered whole-book curation, main.tex9345; explicit attributed story"),
-    work("pioneer-hold", ["carrying"], ["pioneer-hold-lead"], "Pioneer Alpha/Bravo reference, user names;main.tex8084; authored hypothetical credit-taking joke"),
+    work("scout-var-story", ["greeting","carrying"], ["scout-var-story-lead"], "Recovered whole-book curation, main.tex9345; direct book callback"),
+    work("scout-mug-story", ["greeting","carrying"], ["scout-mug-story-lead"], "Recovered whole-book curation, main.tex9345; direct book callback"),
+    work("scout-predecessors", ["greeting","carrying"], ["scout-predecessors-lead"], "User-requested Scout Mini quip; requires the actual named speaker", {"roles":[{"names":["Scout Mini"]}]}),
+    work("pioneer-hold", ["carrying","passing"], ["pioneer-hold-lead"], "User-selected standalone coordination joke"),
+    work("private-zone", ["passing","near-miss","bump"], ["private-zone-lead"], "User-supplied dialogue; Ivica Draganjac PhD private-zone reference", {"minParticipants":2}),
+    work("set-down-count", ["set-down"], ["set-down-count-lead"], "User-supplied set-down count-in"),
+    work("success-handoff", ["set-down"], ["success-handoff-lead","success-handoff-reply"], "Book-inspired dialogue: Marić main.tex:2927; before actual deposit"),
     work("pioneer-roll", ["greeting"], ["pioneer-roll-lead"], "Recovered whole-book curation, user-authorized roll call"),
     work("aircraft-roll", ["greeting"], ["aircraft-roll-lead"], "Recovered whole-book curation, user-authorized drone families"),
-    work("pioneer-share", ["carrying"], ["pioneer-share-lead","pioneer-share-reply"], "Recovered whole-book curation, main.tex8084; two current speakers quote the historical pair"),
-    work("echo-sonar", ["reunion"], ["echo-sonar-lead"], "Recovered whole-book curation, main.tex7983; explicitly attributed historical character"),
-    work("foxtrot-path", ["reunion"], ["foxtrot-path-lead"], "Recovered whole-book curation, main.tex7674; explicitly attributed historical character"),
-    work("bravo-lasers", ["reunion"], ["bravo-lasers-lead"], "Recovered whole-book curation, main.tex7980; explicitly attributed historical character"),
-    work("charlie-qr", ["reunion"], ["charlie-qr-lead"], "Recovered whole-book curation, main.tex8087; explicitly attributed historical character"),
-    work("delta-route", ["reunion"], ["delta-route-lead"], "Recovered whole-book curation, main.tex7632; explicitly attributed historical character"),
-    work("eagle-alpha-five", ["reunion"], ["eagle-alpha-five-lead","eagle-alpha-five-reply"], "Recovered whole-book curation, user EagleRed/Alpha assignments; explicitly attributed historical exchange"),
+    work("pioneer-share", ["carrying"], ["pioneer-share-lead"], "Recovered whole-book curation, main.tex8084; shared carrying", {"minParticipants":2}),
+    work("pioneer-share-deposit", ["deposit"], ["pioneer-share-reply"], "Recovered whole-book curation, main.tex8084; completed shared deposit", {"minParticipants":2}),
+    work("echo-sonar", ["reunion"], ["echo-sonar-lead"], "Recovered whole-book curation, main.tex7983; direct robotics joke"),
+    work("foxtrot-path", ["reunion"], ["foxtrot-path-lead"], "Recovered whole-book curation, main.tex7674; direct book callback"),
+    work("bravo-lasers", ["reunion"], ["bravo-lasers-lead"], "Recovered whole-book curation, main.tex7980; direct robotics joke"),
+    work("charlie-qr", ["reunion"], ["charlie-qr-lead"], "Recovered whole-book curation, main.tex8087; direct robotics joke"),
+    work("delta-route", ["reunion"], ["delta-route-lead"], "Recovered whole-book curation, main.tex7632; direct book callback"),
+    work("eagle-alpha-five", ["reunion"], ["eagle-alpha-five-lead","eagle-alpha-five-reply"], "Recovered whole-book curation, user EagleRed/Alpha assignments; actual speakers", {"roles":[{"names":["EagleRed"]},{}]}),
     work("buddy-consensus", ["reunion"], ["buddy-consensus-lead"], "Recovered whole-book curation, main.tex3092"),
-    work("success-team-pioneer", ["deposit"], ["pioneer-viv-team"], "User-supplied Pioneer/VIV lore; explicitly attributed historical team story", {"minParticipants":2}),
+    work("reunion-pioneers", ["reunion"], ["pioneer-viv-team"], "User-supplied Pioneer/VIV callback", {"minParticipants":2,"roles":[{"excludeNames":["VIV"]}]}),
+    work("success-team-pioneer", ["deposit"], ["pioneer-viv-team"], "User-supplied Pioneer/VIV callback", {"minParticipants":2,"roles":[{"excludeNames":["VIV"]}]}),
 ];
 
 /** Incidents and ordinary opportunities reference the same authored meanings and exposure ledger. */

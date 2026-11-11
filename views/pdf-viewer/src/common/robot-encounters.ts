@@ -49,7 +49,7 @@ export const ROBOT_BOOK_CHARACTERS = Object.freeze({
 });
 export const ROBOT_INTERACTION_REACTIONS = Object.freeze({
     gestureMs: 850, captionMs: 2800, hoverMs: 2200,
-    greetings: Object.freeze(['Bok, kolega!', 'Vidim te. Fotka stiže.', 'Radimo, radimo!', 'Daj pet, čim spustim ovo.']),
+    greetings: Object.freeze(['Bok, kolega!', 'Vidim te.', 'Radimo, radimo!', 'Daj pet!']),
     carrying: 'Nosim fotografiju.', preparing: 'Pripremam dostavu.', returning: 'Vraćam se ekipi.', waiting: 'Čekam novu stranicu.',
 });
 

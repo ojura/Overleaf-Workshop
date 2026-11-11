@@ -78,7 +78,7 @@ interface Options {
     documentSize?: () => RobotDocumentSize | undefined;
     registerDocumentLayer?: (layer: HTMLElement) => () => void;
     encounterRandom?: () => number;
-    createTraffic?: () => Pick<RobotTraffic, 'update' | 'reset'>;
+    createTraffic?: () => Pick<RobotTraffic, 'update' | 'reset'> & Partial<Pick<RobotTraffic, 'passages' | 'hasPassage'>>;
 }
 
 export type DocumentRobotOffer = 'started' | 'busy' | 'deferred' | 'skipped';
@@ -481,8 +481,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
     let capacityOnMotionResume = false;
     let captionGroup: CaptionGroup | undefined;
     let automaticSpeechSerial = Math.abs(options.seed ?? 0) % 2;
-    const automaticSpeechPhases = new Map<number, 'carrying' | 'deposit'>();
-    const speechCues = new Map<string, { choice: RobotDialogueChoice; until: number; owners: readonly number[]; released?: boolean }>();
+    const automaticSpeechPhases = new Map<number, 'carrying' | 'deposit' | 'set-down'>();
+    const speechCues = new Map<string, { choice: RobotDialogueChoice; until: number; owners: readonly number[]; passageId?: number; released?: boolean }>();
     let captionTimer: number | undefined;
     let interaction: ReturnType<typeof installRobotInteraction> | undefined;
     let hovered: { id: number; point: RobotInteractionPoint; started: number } | undefined;
@@ -2848,7 +2848,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         for (const id of automaticSpeechPhases.keys()) { if (!payloadIds.has(id)) { automaticSpeechPhases.delete(id); } }
         for (const value of live) {
             if (value.payload && !automaticSpeechPhases.has(value.payload.id)) {
-                automaticSpeechPhases.set(value.payload.id, automaticSpeechSerial++ % 2 ? 'deposit' : 'carrying');
+                automaticSpeechPhases.set(value.payload.id, (['carrying', 'deposit', 'set-down'] as const)[automaticSpeechSerial++ % 3]);
             }
         }
         for (const [key, cue] of speechCues) {
@@ -2856,13 +2856,13 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             if (cue.released && (key.startsWith('hover:') || key.startsWith('greet:'))) { speechCues.delete(key); continue; }
             if (!cue.owners.some(id => liveIds.has(id))) { encounters.releaseSpeech(cue.choice); speechCues.delete(key); }
         }
-        const speech = (key: string, opportunity: RobotDialogueOpportunity, participants: readonly BodyPlacement[], until: number) => {
+        const speech = (key: string, opportunity: RobotDialogueOpportunity, participants: readonly BodyPlacement[], until: number, passageId?: number) => {
             let cue = speechCues.get(key);
             if (!cue) {
                 const choice = encounters.reserveSpeech(key, opportunity, participants.map(value => ({ id: value.body.id,
                     vehicle: value.body.vehicle, name: ROBOT_VEHICLES.find(spec => spec.id === value.body.vehicle)!.name })), layoutDomain);
                 if (!choice) { return; }
-                cue = { choice, until, owners: participants.map(value => value.body.id) }; speechCues.set(key, cue);
+                cue = { choice, until, owners: participants.map(value => value.body.id), passageId }; speechCues.set(key, cue);
             }
             if (cue.released || cue.until <= at) { return; }
             cue.choice.speakers.forEach((id, index) => {
@@ -2878,7 +2878,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const existing = reactions.get(focus.body.id);
             const isGreeting = !!greeting;
             const captionUntil = attention.started + (isGreeting ? ROBOT_INTERACTION_REACTIONS.captionMs : ROBOT_INTERACTION_REACTIONS.hoverMs);
-            const line = robotStructure(focus.body.vehicle)?.interactionCue ?? greeting?.line ?? (focus.carrying && focus.payload?.canvas ? ROBOT_INTERACTION_REACTIONS.carrying
+            const characterCue = focus.carrying && focus.payload?.canvas && !focus.payload.deposited
+                ? robotStructure(focus.body.vehicle)?.interactionCue : undefined;
+            const line = characterCue ?? greeting?.line ?? (focus.carrying && focus.payload?.canvas ? ROBOT_INTERACTION_REACTIONS.carrying
                 : focus.phase === 'return' ? ROBOT_INTERACTION_REACTIONS.returning
                     : focus.phase === 'parked' ? ROBOT_INTERACTION_REACTIONS.waiting : ROBOT_INTERACTION_REACTIONS.preparing);
             if (isGreeting) {
@@ -2890,22 +2892,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 gesturePhase: isGreeting ? Math.floor((at - attention.started) / ROBOT_INTERACTION_REACTIONS.gestureMs * 12) : existing?.gesturePhase ?? 0,
                 caption: captionUntil > at ? line : '', captionId: (isGreeting ? 'greet:' : 'hover:') + focus.body.id + ':' + attention.started,
                 captionUntil });
-            if (!robotStructure(focus.body.vehicle)?.interactionCue && captionUntil > at) {
+            if (!characterCue && captionUntil > at) {
                 speech((isGreeting ? 'greet:' : 'hover:') + focus.body.id + ':' + attention.started,
                     isGreeting ? 'greeting' : focus.carrying && focus.payload?.canvas ? 'carrying'
                         : focus.phase === 'return' ? 'returning' : focus.phase === 'parked' ? 'waiting' : 'preparing', [focus], captionUntil);
-            }
-        }
-        if (!attention && ![...reactions.values()].some(value => value.caption)) {
-            const focus = live.find(value => value.payload && value.opacity > 0.2
-                && (retiring?.pieces.some(piece => piece.payload === value.payload)
-                    || automaticSpeechPhases.get(value.payload.id) === 'carrying' && value.payload.canvas && value.carrying && value.remainingMs > 600
-                    || automaticSpeechPhases.get(value.payload.id) === 'deposit' && value.payload.deposited && value.payload.resolution === 'fulfilled'));
-            if (focus?.payload) {
-                const opportunity = retiring?.pieces.some(piece => piece.payload === focus.payload) ? 'new-book'
-                    : focus.payload.deposited ? 'deposit' : 'carrying';
-                speech('work:' + documentGeneration + ':' + focus.payload.id + ':' + opportunity, opportunity,
-                    live.filter(value => value.payload === focus.payload && value.opacity > 0.2), at + ROBOT_INTERACTION_REACTIONS.captionMs);
             }
         }
         const key = (value: BodyPlacement) => value.payload?.id ?? value.group ?? -(value.body.id + 1);
@@ -2969,6 +2959,52 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 remainingMs };
         });
         const spacing = traffic.update(at, spacingGroups);
+        for (const [key, cue] of speechCues) {
+            if (cue.passageId !== undefined && !traffic.hasPassage?.(cue.passageId)) {
+                encounters.releaseSpeech(cue.choice); speechCues.delete(key);
+            }
+        }
+        const speechAvailable = () => !attention && ![...reactions.values()].some(value => value.caption);
+        // Already readable text keeps its original owner even after the passing or work phase ends.
+        const continuing = captionGroup?.shownAt !== undefined && speechCues.get(captionGroup.id);
+        if (continuing && !continuing.released && continuing.until > at && speechAvailable()) {
+            speech(captionGroup!.id, continuing.choice.opportunity,
+                live.filter(value => continuing.owners.includes(value.body.id)), continuing.until);
+        }
+        if (speechAvailable()) {
+            for (const passage of traffic.passages?.() ?? []) {
+                const peers = [...(groups.get(passage.winner) ?? []), ...(groups.get(passage.yielding) ?? [])]
+                    .filter(value => value.opacity > .2);
+                if (!peers.some(value => spacingKey(value) === passage.winner)
+                    || !peers.some(value => spacingKey(value) === passage.yielding)) { continue; }
+                speech('passing:' + documentGeneration + ':' + passage.id, 'passing', peers, at + ROBOT_INTERACTION_REACTIONS.captionMs, passage.id);
+                if (!speechAvailable()) { break; }
+            }
+        }
+        if (speechAvailable()) {
+            const focus = live.find(value => value.payload && value.opacity > .2 && value.carrying
+                && automaticSpeechPhases.get(value.payload.id) === 'set-down'
+                && value.payload.canvas && !value.payload.deposited && !value.payload.resolution
+                && value.payload.progress >= HANDOFF_END && value.payload.progress < DEPOSIT_START
+                && value.payload.operation?.goal === 'delivery' && value.payload.operation.outcome.completion === 'fulfilled');
+            if (focus?.payload) {
+                speech('work:' + documentGeneration + ':' + focus.payload.id + ':set-down', 'set-down',
+                    live.filter(value => value.payload === focus.payload && value.opacity > .2), at + ROBOT_INTERACTION_REACTIONS.captionMs);
+            }
+        }
+        if (!attention && ![...reactions.values()].some(value => value.caption)) {
+            const focus = live.find(value => value.payload && value.opacity > 0.2
+                && (retiring?.pieces.some(piece => piece.payload === value.payload)
+                    || automaticSpeechPhases.get(value.payload.id) === 'carrying' && value.payload.canvas && value.carrying && value.remainingMs > 600
+                    || automaticSpeechPhases.get(value.payload.id) === 'deposit' && value.payload.deposited && value.payload.resolution === 'fulfilled'));
+            if (focus?.payload) {
+                const opportunity = retiring?.pieces.some(piece => piece.payload === focus.payload) ? 'new-book'
+                    : focus.payload.deposited ? 'deposit' : 'carrying';
+                speech('work:' + documentGeneration + ':' + focus.payload.id + ':' + opportunity, opportunity,
+                    live.filter(value => value.payload === focus.payload && value.opacity > 0.2), at + ROBOT_INTERACTION_REACTIONS.captionMs);
+            }
+        }
+
         // The solver checks the actual endpoint-scaled positions and owns finite yielding.
         // Every helper, crop and hardware layer then receives that same group result.
         const finalMotion = new Map<number, Point>();

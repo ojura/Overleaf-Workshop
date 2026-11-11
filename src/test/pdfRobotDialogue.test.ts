@@ -81,7 +81,77 @@ describe('semantic robot dialogue admission', function () {
         assert.deepStrictEqual(entry.opportunities, ['success', 'deposit']);
         assert.ok(module.ROBOT_CURATED_WORK_DIALOGUE.some((value: any) => value.id === 'work-origami' && value.opportunities.includes('carrying')));
         assert.ok(module.ROBOT_CURATED_WORK_DIALOGUE.some((value: any) => value.id === 'new-rjet' && !value.opportunities.includes('carrying')));
-        assert.ok(module.ROBOT_CURATED_WORK_DIALOGUE.filter((value: any) => value.id.startsWith('scout-')).every((value: any) => value.lines[0].includes('Scout Mini bi rekao')));
+    });
+
+    it('gives book callbacks directly to current actors instead of retelling absent speakers', () => {
+        const retelling = /bi rekao|bi rekli|bi odgovorio|iz Pioneer priče|je u priči rekao|je odgovorio|Scout Mini kaže:/;
+        for (const [id, value] of Object.entries(module.ROBOT_AUTHORED_UTTERANCES) as [string, any][]) {
+            assert.ok(!retelling.test(value.text), id + ' is direct speech');
+        }
+        const entries = module.robotDialogueCatalogue(module.ROBOT_ENCOUNTER_DIALOGUE);
+        const current = [{ id: 11, vehicle: 'hexapod', name: 'ALKA' }, { id: 12, vehicle: 'mecanum', name: 'XENA' }];
+        for (const id of ['bump-scout', 'scout-var-story', 'scout-mug-story', 'echo-sonar', 'foxtrot-path', 'bravo-lasers', 'charlie-qr', 'delta-route']) {
+            const entry = entries.find((value: any) => value.id === id); assert.ok(entry);
+            const choice = new module.RobotDialogueSelection([entry]).reserve(id, entry.opportunities[0], current);
+            assert.ok(choice, id + ' has actual current speakers');
+            assert.ok(choice.speakers.every((speaker: number) => current.some(value => value.id === speaker)));
+            assert.strictEqual(new Set(choice.speakers).size, choice.lines.length);
+        }
+    });
+
+    it('keeps shared carrying, handoff and completion words in their actual work phases', () => {
+        const entries = module.robotDialogueCatalogue(module.ROBOT_ENCOUNTER_DIALOGUE);
+        const current = [{ id: 11, vehicle: 'hexapod', name: 'ALKA' }, { id: 12, vehicle: 'mecanum', name: 'XENA' }];
+        const reserve = (id: string, opportunity: string, actors = current) => {
+            const entry = entries.find((value: any) => value.id === id); assert.ok(entry);
+            return new module.RobotDialogueSelection([entry]).reserve('work', opportunity, actors);
+        };
+        assert.strictEqual(reserve('pioneer-share', 'carrying', current.slice(0, 1)), undefined);
+        assert.deepStrictEqual(reserve('pioneer-share', 'carrying').entry.meaningIds, ['pioneer-share-lead']);
+        assert.strictEqual(reserve('pioneer-share-deposit', 'carrying'), undefined);
+        assert.strictEqual(reserve('pioneer-share-deposit', 'deposit', current.slice(0, 1)), undefined);
+        assert.deepStrictEqual(reserve('pioneer-share-deposit', 'deposit').entry.meaningIds, ['pioneer-share-reply']);
+        assert.strictEqual(reserve('success-handoff', 'success'), undefined);
+        assert.strictEqual(reserve('success-handoff', 'deposit'), undefined);
+        assert.strictEqual(reserve('success-handoff', 'set-down', current.slice(0, 1)), undefined);
+        assert.deepStrictEqual(reserve('success-handoff', 'set-down').speakers, [11, 12]);
+    });
+
+    it('keeps named first-person jokes with the actual named speaker and complete exchange', () => {
+        const entries = module.robotDialogueCatalogue(module.ROBOT_ENCOUNTER_DIALOGUE);
+        const ground = [{ id: 11, vehicle: 'hexapod', name: 'ALKA' }, { id: 12, vehicle: 'mecanum', name: 'XENA' }];
+        const eagle = { id: 13, vehicle: 'quad', name: 'EagleRed' };
+        const highFive = new module.RobotDialogueSelection([entries.find((value: any) => value.id === 'eagle-alpha-five')]);
+        assert.strictEqual(highFive.reserve('ground', 'reunion', ground), undefined);
+        assert.strictEqual(highFive.reserve('solo', 'reunion', [eagle]), undefined);
+        const exchange = highFive.reserve('pair', 'reunion', [...ground, eagle]);
+        assert.deepStrictEqual(exchange.speakers, [13, 11]);
+        assert.deepStrictEqual(exchange.lines, ['Iz zraka šaljem peticu!', 'Spremna!']);
+        const scout = new module.RobotDialogueSelection([entries.find((value: any) => value.id === 'scout-predecessors')]);
+        assert.strictEqual(scout.reserve('other-robots', 'greeting', [...ground, eagle]), undefined);
+        const actualScout = { id: 14, vehicle: 'scout-mini-fixture', name: 'Scout Mini' };
+        assert.deepStrictEqual(scout.reserve('scout-present', 'greeting', [...ground, actualScout]).speakers, [14]);
+    });
+
+    it('keeps VIV as a participant without making it speak the comparison with itself', () => {
+        const entries = module.robotDialogueCatalogue(module.ROBOT_ENCOUNTER_DIALOGUE);
+        const viv = { id: 21, vehicle: 'rover', name: 'VIV' }, colleague = { id: 22, vehicle: 'hexapod', name: 'ALKA' };
+        const reserve = (id: string, actors: typeof viv[]) => {
+            const entry = entries.find((value: any) => value.id === id); assert.ok(entry);
+            return new module.RobotDialogueSelection([entry]).reserve('event', entry.opportunities[0], actors);
+        };
+        assert.strictEqual(reserve('success-solo-pioneer', [viv]), undefined);
+        assert.deepStrictEqual(reserve('success-solo-pioneer', [colleague]).speakers, [22]);
+        for (const id of ['reunion-pioneers', 'success-team-pioneer']) {
+            assert.strictEqual(reserve(id, [colleague]), undefined, 'the plural callback still requires a partner');
+            assert.strictEqual(reserve(id, [viv, { ...viv, id: 23 }]), undefined);
+            assert.deepStrictEqual(reserve(id, [viv, colleague]).speakers, [22], 'VIV counts as a partner while the colleague speaks');
+        }
+        const excludeNames = ['VIV'];
+        const entry = entries.find((value: any) => value.id === 'success-solo-pioneer');
+        const model = new module.RobotDialogueSelection([{ ...entry, roles: [{ excludeNames }] }]);
+        excludeNames.length = 0;
+        assert.strictEqual(model.reserve('caller-mutated-role', 'deposit', [viv]), undefined, 'the selector owns an immutable role copy');
     });
 
     it('shares exposure and pending reservations across explicit utterance aliases', () => {

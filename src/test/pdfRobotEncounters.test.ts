@@ -183,7 +183,7 @@ describe('finite document robot encounters', function () {
         assert.strictEqual(module.ROBOT_BOOK_CHARACTERS.aircraft.veteran, 'EagleRed');
         assert.deepStrictEqual(module.ROBOT_BOOK_CHARACTERS.aircraft.colors, ['Red', 'Yellow', 'Blue', 'Green', 'Orange', 'Purple']);
         const scout = module.ROBOT_ENCOUNTER_DIALOGUE.find((dialogue: any) => dialogue.id === 'bump-scout');
-        assert.ok(scout.lines[0].includes('Scout Mini') && scout.source.includes('9336'));
+        assert.ok(scout.lines[0] === 'Samo sam pet centimetara širi.' && scout.source.includes('9336'));
         assert.ok(module.ROBOT_ENCOUNTER_DIALOGUE.every((dialogue: any) => dialogue.lines.every((line: string) => line.length <= 120)));
         assert.ok(lines.includes('Pivo poslije smjene?'));
     });

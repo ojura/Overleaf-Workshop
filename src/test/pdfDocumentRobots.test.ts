@@ -1132,11 +1132,13 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     it('starts readable caption time at its first visible placement and bounds an unseen caption', () => {
         const f = fixture({ encounterRandom: () => 0.99 }); f.desktop();
         const page = f.page(99); f.api.setVisibleWork([work([page])]); f.finish();
+        const arrivalSpeech = f.api.snapshot().caption;
+        if (arrivalSpeech) { f.tick(Math.max(0, arrivalSpeech.until - f.now) + 1); }
         const actor = f.api.snapshot().advance[0].actors[0];
         const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
-        const at = point(sprite); pointer(f, 'pointerdown', at); pointer(f, 'pointerup', at); pointer(f, 'click', at); f.frame();
+        const at = point(sprite); pointer(f, 'pointerdown', at); pointer(f, 'pointerup', at); pointer(f, 'click', at); f.tick(0);
         const bubble = captions(f)[0], pending = f.api.snapshot().caption, remaining = pending.until - f.now;
-        assert.strictEqual(bubble.style.opacity, '0', 'the real placement solver has not admitted the first paint');
+        assert.strictEqual(bubble.style.opacity, '0', 'the real placement solver has not admitted the first paint: ' + JSON.stringify({ text: bubble.textContent, caption: pending, now: f.now }));
         f.tick(200);
         assert.strictEqual(bubble.style.opacity, '1');
         assert.ok(Math.abs(f.api.snapshot().caption.until - f.now - remaining) < 0.01,
@@ -1145,8 +1147,8 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         f.finish(); f.tick(4001); assert.strictEqual(f.timers.size + f.callbacks.size, 0);
 
         const blocked = fixture({ encounterRandom: () => 0.99 }); blocked.desktop();
-        const other = blocked.page(99); blocked.api.setVisibleWork([work([other])]); blocked.finish();
         blocked.document.captionHeight = 10000;
+        const other = blocked.page(99); blocked.api.setVisibleWork([work([other])]); blocked.finish();
         const body = blocked.api.snapshot().advance[0].actors[0];
         const image = blocked.owned.find(canvas => canvas.dataset.courier === String(body.id) && canvas.className === 'pdfDocumentRobotVehicle')!;
         pointer(blocked, 'pointermove', point(image)); blocked.frame();
@@ -1346,7 +1348,7 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const original = f.api.snapshot().pages[0].payloads;
         assert.strictEqual(original.length, 2);
         assert.ok(original.every((payload: any) => payload.helpers.length === 1));
-        let faded = false, fixedYield = false;
+        let faded = false, fixedYield = false, passing = false;
         for (let frame = 0; frame < 150 && f.callbacks.size; frame++) {
             f.frame(); const state = f.api.snapshot(), current = state.pages[0];
             if (!current) { continue; }
@@ -1377,8 +1379,15 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
                 assert.ok(Math.hypot(a.point.x - b.point.x, a.point.y - b.point.y) >= a.radius + b.radius - 0.1,
                     'visible ground couriers do not pass through each other: ' + JSON.stringify({ frame, actors: current.actors, payloads: current.payloads }));
             }
+            if (state.caption?.opportunity === 'passing' && state.caption.shownAt !== undefined) {
+                passing = true;
+                const bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
+                assert.ok(bubble, 'the actual coordinated passage has readable shared-selector text');
+                assert.ok(state.caption.meaningIds.every((id: string) => state.encounters.dialogue.coverage.some((entry: any) => entry.id === id && entry.count > 0)));
+            }
             assert.strictEqual(state.encounters.active, undefined, 'spacing does not require a comic event');
         }
+        assert.ok(passing, 'normal moving-peer avoidance reaches passing speech without a comic lottery');
         assert.ok(faded && fixedYield, 'the yielding owner persists through the positional deposit constraint');
         assert.strictEqual(f.api.snapshot().deliveredFragments, 2);
         assert.strictEqual(f.api.snapshot().activeArrivalCovers + f.api.snapshot().retainedBytes + f.callbacks.size + leased.size, 0);
@@ -6174,6 +6183,61 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         const id = began.qualityReactions[0].id; f.finish(); const done = f.api.snapshot();
         assert.strictEqual(done.qualityOutcomes.find((value: any) => value.id === id).outcome, 'completed');
         assert.strictEqual(done.retainedBytes + done.activeActors + held.size + f.callbacks.size, 0);
+    });
+
+    it('admits a finite set-down count before actual photo deposit without preempting readable work', () => {
+        const f = fixture({ seed: 10, maxActors: 1, encounterRandom: () => .99 }); f.desktop();
+        let countIn = false, protectedCarry = false;
+        for (let number = 1; number <= 3; number++) {
+            const page = f.page(number); f.api.setVisiblePages([number]);
+            assert.strictEqual(f.api.offer({ ...page, imageRegions: [{ id: 'set-down-photo-' + number,
+                x: .2, y: .2, width: .2, height: .15 }] }), 'started');
+            let readable: { id: string; until: number; node: Element } | undefined;
+            for (let frame = 0; frame < 180; frame++) {
+                f.frame(); const state = f.api.snapshot();
+                const payload = state.pages.flatMap((value: any) => value.payloads)[0];
+                if (readable && f.now < readable.until && payload) {
+                    assert.strictEqual(state.caption?.id, readable.id, 'later semantic cues preserve readable ownership');
+                    assert.ok(readable.node.isConnected && readable.node.style.opacity === '1');
+                    protectedCarry ||= payload.deposited;
+                }
+                if (!readable && state.caption?.opportunity === 'carrying' && state.caption.shownAt !== undefined) {
+                    readable = { id: state.caption.id, until: state.caption.until,
+                        node: captions(f).find(node => node.isConnected && node.style.opacity === '1')! };
+                }
+                if (!countIn && state.caption?.opportunity === 'set-down' && state.caption.shownAt !== undefined) {
+                    assert.ok(payload && !payload.deposited && payload.progress < .62, 'count-in precedes deposited pixels');
+                    assert.ok(payload.rasterWidth > 0 && payload.rasterHeight > 0);
+                    countIn = true;
+                }
+            }
+        }
+        assert.ok(protectedCarry, 'an actual carrying reading interval crosses deposit unchanged');
+        assert.ok(countIn, 'an ordinary final photo approach reaches the count-in');
+        assert.strictEqual(f.api.snapshot().retainedBytes + f.api.snapshot().activeActors + f.callbacks.size + f.timers.size, 0);
+    });
+
+    it('gives an empty parked MORUS truthful state speech and keeps its character cue for actual photo handling', () => {
+        const f = fixture({ maxActors: 2, encounterRandom: () => .99 }); f.desktop();
+        let leased = false; const dock = { x: 350, y: 100, scale: .625 };
+        f.api.setDispatchOrigin({ reserve(vehicle: string) {
+            if (vehicle !== 'heavyquad' || leased) { return; } leased = true; return dock;
+        }, destination: () => dock, release() { assert.ok(leased); leased = false; } });
+        const page = f.page(99); f.api.setVisibleWork([work([page])]); f.finish();
+        const actor = f.api.snapshot().advance[0].actors[0]; assert.strictEqual(actor.vehicle, 'heavyquad');
+        const sprite = f.owned.find(canvas => canvas.dataset.courier === String(actor.id))!;
+        pointer(f, 'pointermove', point(sprite)); f.frame();
+        const parked = f.api.snapshot();
+        assert.strictEqual(parked.caption?.opportunity, 'waiting', 'empty MORUS uses the same truthful parked selector as the fleet');
+        assert.ok(captions(f).some(node => node.isConnected && node.style.opacity === '1'));
+        pointer(f, 'pointerleave', point(sprite));
+        f.tick(Math.max(0, parked.caption.until - f.now) + 1); f.api.setVisiblePages([99]);
+        assert.strictEqual(f.api.offer({ ...page, imageRegions: [{ id: 'morus-photo', x: .2, y: .2, width: .15, height: .1 }] }), 'started');
+        f.tick(500); const loaded = f.api.snapshot().pages[0].actors[0];
+        const image = f.owned.find(canvas => canvas.dataset.courier === String(loaded.id))!;
+        pointer(f, 'pointermove', point(image)); f.frame();
+        assert.match(f.api.snapshot().caption?.text ?? '', /Četiri benzinska motora\. Jedna sličica\./);
+        f.finish(); assert.strictEqual(f.api.snapshot().retainedBytes + f.callbacks.size + Number(leased), 0);
     });
 
 });
