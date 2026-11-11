@@ -76,6 +76,53 @@ describe('PDF delivery plan ownership', function () {
         assert.strictEqual(quality(), 'unknown', 'zeroed backing has no final pixels to reveal');
     });
 
+    it('requires every mapped crop instance to be painted before recognizing coarse quality', () => {
+        const f = fixture(), crop = f.encounter.imageRegions[0];
+        f.candidate.canvas = { width: 800, height: 1200 };
+        const resources = [
+            { objectId: 'a', imageId: 'x5', covered: true, final: false, failed: false },
+            { objectId: 'alias', imageId: 'x5', covered: false, final: false, failed: false },
+            { objectId: 'other', imageId: 'x6', covered: false, final: false, failed: false },
+        ];
+        f.candidate.coverage = { kind: 'native', intent: {}, discovered: true, resources, untrackedImageOperations: false };
+        f.encounter.imageRegions.push({ id: 'p1-i1', resourceId: 'x6', x: .7, y: .7, width: .2, height: .2 });
+        const quality = () => api.pdfDeliveryCropQuality(f.candidate, crop, f.encounter);
+        assert.strictEqual(quality(), 'unknown', 'one painted alias cannot stand in for another missing occurrence');
+        resources[1].covered = true;
+        assert.strictEqual(quality(), 'partial', 'all selected occurrences now have coarse pixels');
+        resources[0].final = resources[1].final = true;
+        assert.strictEqual(quality(), 'final', 'an unrelated missing image does not delay this fully painted crop');
+        Object.assign(f.encounter.imageRegions[1], { x: .2, y: .2 });
+        assert.strictEqual(quality(), 'unknown', 'an intersecting missing image makes the copied crop incomplete');
+        resources[2].covered = true;
+        assert.strictEqual(quality(), 'partial');
+        resources[2].final = true;
+        assert.strictEqual(quality(), 'final');
+    });
+
+    for (const linkage of ['incomplete', 'unmapped']) {
+        it('does not infer a coarse photograph from unrelated page pixels with ' + linkage + ' linkage', () => {
+            const f = fixture(), crop = f.encounter.imageRegions[0];
+            f.candidate.canvas = { width: 800, height: 1200 };
+            if (linkage === 'incomplete') { f.encounter.imageRegionsComplete = false; }
+            else { delete f.encounter.imageRegions[0].resourceId; }
+            f.encounter.imageRegions.push({ id: 'p1-i1', resourceId: 'x6', x: .7, y: .7, width: .2, height: .2 });
+            const resources = [
+                { objectId: 'selected', imageId: 'x5', covered: false, final: false, failed: false },
+                { objectId: 'unrelated', imageId: 'x6', covered: true, final: true, failed: false },
+            ];
+            f.candidate.coverage = { kind: 'native', intent: {}, discovered: true, resources, untrackedImageOperations: false };
+            const quality = () => api.pdfDeliveryCropQuality(f.candidate, crop, f.encounter);
+            assert.strictEqual(quality(), 'unknown', 'the selected crop can still be white while another image is painted');
+            resources[0].covered = true;
+            assert.strictEqual(quality(), 'partial', 'a complete coarse inventory makes the crop available');
+            resources[0].final = true;
+            assert.strictEqual(quality(), 'final');
+            delete f.candidate.coverage.untrackedImageOperations;
+            assert.strictEqual(quality(), 'unknown', 'the complete inventory proof remains required without a resource link');
+        });
+    }
+
     it('requires a complete final native inventory when crop linkage is incomplete', () => {
         const f = fixture(), crop = f.encounter.imageRegions[0];
         f.candidate.canvas = { width: 800, height: 1200 };

@@ -72,9 +72,10 @@ export function pdfDeliveryCropQuality(candidate: PdfPagePresentationCandidate, 
     if (coverage.kind === 'complete-page') { return 'partial'; }
     if (coverage.kind !== 'native' || !coverage.discovered) { return 'unknown'; }
     const { mapped, resources } = cropResources(coverage, crop, encounter.imageRegions, encounter.imageRegionsComplete === true);
-    if (!resources.length || resources.some(resource => resource.failed) || !mapped && coverage.untrackedImageOperations !== false) { return 'unknown'; }
-    if (resources.every(resource => resource.covered && resource.final)) { return 'final'; }
-    return resources.some(resource => resource.covered) ? 'partial' : 'unknown';
+    // Every required image must be present before this raster can be the coarse side of a wipe.
+    if (!resources.length || resources.some(resource => resource.failed || !resource.covered)
+        || !mapped && coverage.untrackedImageOperations !== false) { return 'unknown'; }
+    return resources.every(resource => resource.final) ? 'final' : 'partial';
 }
 
 /** Metadata and protection only: raster references are borrowed during synchronous admission. */

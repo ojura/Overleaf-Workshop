@@ -399,6 +399,14 @@ const counters = () => ({ episodes: 0, deliveredFragments: 0, removedFragments: 
     operationAdmissions: 0, operationCandidates: 0, operationCommitChecks: 0, operationNarrativeRecords: 0,
     operationAdmissionTotalMs: 0, operationAdmissionMaxMs: 0 });
 
+/** Shared transit planes preserve ownership order when a photo backing is replaced. */
+export const DOCUMENT_ROBOT_SCENE_LAYERS = Object.freeze({
+    backdrop: 0, photo: 1, attachment: 2, courier: 3, annotation: 4, speech: 5,
+});
+const QUALITY_CONTENT_LAYERS = Object.freeze({ photo: 0, cleaner: 1 });
+// Arrival protection belongs to the page, outside the transit stacking context.
+const PAGE_ARRIVAL_LAYER = 4;
+
 /**
  * Finished PDF pixels become short, one-shot deliveries on their own page. The original PDF
  * canvas and text layer remain untouched. Only small cargo and vehicle canvases are retained;
@@ -760,14 +768,14 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         return resizeSprites([actor], policy);
     }
 
-    function initializeSceneNode(node: HTMLElement, className: string, zIndex: string): void {
+    function initializeSceneNode(node: HTMLElement, className: string, zIndex: number): void {
         node.className = className;
         node.setAttribute('aria-hidden', 'true');
         // Admission can precede the next paint; reveal only after geometry is written.
-        Object.assign(node.style, { position: 'absolute', left: '0', top: '0', pointerEvents: 'none', opacity: '0', zIndex });
+        Object.assign(node.style, { position: 'absolute', left: '0', top: '0', pointerEvents: 'none', opacity: '0', zIndex: String(zIndex) });
     }
 
-    function decorate(canvas: HTMLCanvasElement, className: string, zIndex: string): void {
+    function decorate(canvas: HTMLCanvasElement, className: string, zIndex: number): void {
         initializeSceneNode(canvas, className, zIndex);
         Object.assign(canvas.style, { transformOrigin: '50% 50%', willChange: 'transform, opacity' });
     }
@@ -877,7 +885,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             context.setTransform(...transform);
             context.drawImage(source, sourceX, sourceY, sourceWidth, sourceHeight, sourceX, sourceY, sourceWidth, sourceHeight);
             context.setTransform(1, 0, 0, 1, 0, 0);
-            decorate(canvas, 'pdfDocumentRobotCargo', '1');
+            decorate(canvas, 'pdfDocumentRobotCargo', DOCUMENT_ROBOT_SCENE_LAYERS.photo);
             canvas.dataset.payload = String(payload.id);
             Object.assign(canvas.style, { boxShadow: '0 2px 7px #0003', borderRadius: '0' });
             cargoBytes += bytes;
@@ -1007,7 +1015,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         let coarse: HTMLCanvasElement | undefined, sharp: HTMLCanvasElement | undefined, sprite: HTMLCanvasElement | undefined;
         let preparedScene: QualityScene | undefined;
         const layer = doc.createElement('div'); layer.className = 'pdfDocumentRobotQuality'; layer.setAttribute('aria-hidden', 'true');
-        Object.assign(layer.style, { position: 'absolute', inset: '0', pointerEvents: 'none', overflow: 'visible' });
+        Object.assign(layer.style, { position: 'absolute', inset: '0', pointerEvents: 'none', overflow: 'visible',
+            zIndex: String(DOCUMENT_ROBOT_SCENE_LAYERS.photo) });
         const copy = (source: HTMLCanvasElement, size: NonNullable<ReturnType<typeof rasterSize>>, className: string) => {
             const canvas = createCanvas(); canvas.width = size.width; canvas.height = size.height;
             try {
@@ -1015,7 +1024,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 context.setTransform(...size.transform);
                 context.drawImage(source, size.sourceX, size.sourceY, size.sourceWidth, size.sourceHeight,
                     size.sourceX, size.sourceY, size.sourceWidth, size.sourceHeight);
-                context.setTransform(1, 0, 0, 1, 0, 0); decorate(canvas, className, '5');
+                context.setTransform(1, 0, 0, 1, 0, 0); decorate(canvas, className, QUALITY_CONTENT_LAYERS.photo);
                 canvas.dataset.quality = String(id); canvas.dataset.page = String(candidate.pageNumber);
                 canvas.dataset.imageId = planned.geometry.imageId ?? ''; return canvas;
             } catch (error) { release(canvas); throw error; }
@@ -1026,7 +1035,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             sprite = createCanvas();
             if (!sprite.getContext('2d') || !applyBodySprites(allocation, policy)) { throw new Error('Quality sprite allocation unavailable'); }
             sprite.width = sw; sprite.height = sh;
-            decorate(sprite, 'pdfDocumentRobotQualityCleaner', '6'); sprite.dataset.quality = String(id);
+            decorate(sprite, 'pdfDocumentRobotQualityCleaner', QUALITY_CONTENT_LAYERS.cleaner); sprite.dataset.quality = String(id);
             sprite.dataset.page = String(candidate.pageNumber); sprite.dataset.imageId = planned.geometry.imageId ?? '';
             const actorId = ++serial;
             let sourcePage = qualityPageIds.get(candidate.page);
@@ -1093,7 +1102,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 context.drawImage(value.canvas, size.sourceX, size.sourceY, size.sourceWidth, size.sourceHeight,
                     size.sourceX, size.sourceY, size.sourceWidth, size.sourceHeight);
                 context.setTransform(1, 0, 0, 1, 0, 0);
-                decorate(next, 'pdfDocumentRobotCargo', '1');
+                decorate(next, 'pdfDocumentRobotCargo', DOCUMENT_ROBOT_SCENE_LAYERS.photo);
                 next.dataset.payload = String(payload.id); next.dataset.courier = String(payload.helpers[0].id);
                 for (const property of ['width', 'height', 'opacity', 'transform', 'translate', 'boxShadow', 'borderRadius', 'clipPath'] as const) {
                     next.style[property] = previous.style[property];
@@ -1170,7 +1179,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                     carrying: false, cargo: null, progress: 0, look: 1, notice: null },
             };
             drawVehicle(actor);
-            decorate(sprite, 'pdfDocumentRobotVehicle', '2');
+            decorate(sprite, 'pdfDocumentRobotVehicle', DOCUMENT_ROBOT_SCENE_LAYERS.courier);
             sprite.dataset.courier = String(actor.id);
             if (origin) {
                 // Replace the borrowed lab body at its current pose immediately. Animation
@@ -1295,7 +1304,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
 
     function makeSling(): HTMLDivElement {
         const sling = doc.createElement('div');
-        initializeSceneNode(sling, 'pdfDocumentRobotSling', '1');
+        initializeSceneNode(sling, 'pdfDocumentRobotSling', DOCUMENT_ROBOT_SCENE_LAYERS.attachment);
         Object.assign(sling.style, { borderStyle: 'solid', borderWidth: '0 1.5px', borderColor: '#bdcdd1', boxSizing: 'border-box' });
         return sling;
     }
@@ -1517,7 +1526,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         let shadow: HTMLDivElement | undefined;
         try {
             shadow = doc.createElement('div');
-            initializeSceneNode(shadow, 'pdfDocumentRobotLandingShadow', '1');
+            initializeSceneNode(shadow, 'pdfDocumentRobotLandingShadow', DOCUMENT_ROBOT_SCENE_LAYERS.photo);
             shadow.dataset.payload = String(payload.id);
             Object.assign(shadow.style, { boxShadow, borderRadius: '0' });
             parent.appendChild(shadow);
@@ -2017,7 +2026,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 const layer = doc.createElement('div'), label = doc.createElement('div');
                 layer.className = 'pdfDocumentRobotAdvance';
                 Object.assign(layer.style, { position: 'absolute', inset: '0', pointerEvents: 'none' });
-                initializeSceneNode(label, 'pdfDocumentRobotWorkStatus', '3');
+                initializeSceneNode(label, 'pdfDocumentRobotWorkStatus', DOCUMENT_ROBOT_SCENE_LAYERS.annotation);
                 Object.assign(label.style, { boxSizing: 'border-box',
                     borderRadius: '5px', border: '1px solid ' + ROBOT_CAPTION_STYLE.borderColor, background: ROBOT_CAPTION_STYLE.background,
                     color: ROBOT_CAPTION_STYLE.color, fontFamily: 'system-ui, sans-serif', fontWeight: String(ROBOT_CAPTION_STYLE.fontWeight),
@@ -2721,7 +2730,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         if (captionGroup?.id !== first.captionId) {
             clearCaption();
             const node = doc.createElement('div');
-            initializeSceneNode(node, 'pdfDocumentRobotCaption', '4');
+            initializeSceneNode(node, 'pdfDocumentRobotCaption', DOCUMENT_ROBOT_SCENE_LAYERS.speech);
             Object.assign(node.style, { boxSizing: 'border-box',
                 padding: paddingY + 'px ' + paddingX + 'px', borderRadius: '5px', border: '1px solid ' + ROBOT_CAPTION_STYLE.borderColor,
                 background: ROBOT_CAPTION_STYLE.background, color: ROBOT_CAPTION_STYLE.color,
@@ -2798,7 +2807,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             if (!line) { if (leader) { leader.style.opacity = '0'; } continue; }
             if (!leader) {
                 leader = doc.createElement('div');
-                initializeSceneNode(leader, 'pdfDocumentRobotCaptionLeader', '3');
+                initializeSceneNode(leader, 'pdfDocumentRobotCaptionLeader', DOCUMENT_ROBOT_SCENE_LAYERS.annotation);
                 Object.assign(leader.style, { height: '1.5px', background: ROBOT_CAPTION_STYLE.borderColor, transformOrigin: '0 50%' });
                 group.leaders.push(leader); transit.append(leader);
             }
@@ -3304,7 +3313,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             try {
                 if (payload.ground) {
                     const mast = doc.createElement('div'), fork = doc.createElement('div');
-                    initializeSceneNode(mast, 'pdfDocumentRobotMast', '0');
+                    initializeSceneNode(mast, 'pdfDocumentRobotMast', DOCUMENT_ROBOT_SCENE_LAYERS.backdrop);
                     Object.assign(mast.style, { borderStyle: 'solid', borderColor: '#a9bccb', boxSizing: 'border-box' });
                     Object.assign(fork.style, { position: 'absolute', left: '0', pointerEvents: 'none', background: '#7ea7df' });
                     mast.append(fork); payload.mast = mast;
@@ -3503,7 +3512,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             episodes.set(value.pageNumber, episode);
             for (const payload of payloads) {
                 const cover = planned?.cover ?? doc.createElement('div');
-                initializeSceneNode(cover, 'pdfDocumentRobotArrival', '4');
+                initializeSceneNode(cover, 'pdfDocumentRobotArrival', PAGE_ARRIVAL_LAYER);
                 delete cover.dataset.deliveryPlan; delete cover.dataset.deliveryCrop;
                 cover.dataset.payload = String(payload.id);
                 if (payload.crop.imageId) { cover.dataset.imageId = payload.crop.imageId; }
@@ -3588,7 +3597,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         },
         protect(planId, crop, encounter) {
             const element = doc.createElement('div');
-            initializeSceneNode(element, 'pdfDocumentRobotArrival', '4');
+            initializeSceneNode(element, 'pdfDocumentRobotArrival', PAGE_ARRIVAL_LAYER);
             Object.assign(element.style, { background: 'var(--page-bg-color, #fff)', opacity: '1', border: '0', borderRadius: '0', boxShadow: 'none' });
             element.dataset.deliveryPlan = String(planId); element.dataset.deliveryCrop = String(crop.id);
             paintProtection(element, crop.geometry, projectionFor(encounter), displayProjections.get(encounter.pageElement));

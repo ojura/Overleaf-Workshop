@@ -732,6 +732,30 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
     }
 
     const sceneNodes = (node: Element): Element[] => [node, ...node.children.flatMap(sceneNodes)];
+    // Models the renderer's positioned inline z-index, transform and opacity contexts.
+    function scenePaintOrder(first: Element, second: Element): number {
+        const positionedDepth = (node: Element) => node.style.position && node.style.position !== 'static'
+            && node.style.zIndex && node.style.zIndex !== 'auto' ? Number(node.style.zIndex) : 0;
+        const chain = (element: Element) => {
+            const ancestors: Element[] = [];
+            for (let current: Element | null = element; current; current = current.parentNode) { ancestors.unshift(current); }
+            return ancestors.filter(node => node === element || node.style.position && node.style.position !== 'static'
+                && node.style.zIndex && node.style.zIndex !== 'auto' || node.style.transform && node.style.transform !== 'none' || node.style.opacity && Number(node.style.opacity) < 1);
+        };
+        const a = chain(first), b = chain(second); let index = 0;
+        while (a[index] && a[index] === b[index]) { index++; }
+        if (!a[index]) { return -1; } if (!b[index]) { return 1; }
+        const depth = positionedDepth(a[index]) - positionedDepth(b[index]);
+        if (depth) { return depth; }
+        const nodes = sceneNodes(first.ownerDocument.body);
+        return nodes.indexOf(a[index]) - nodes.indexOf(b[index]);
+    }
+
+    function sceneTranslation(node: Element) {
+        const values = node.style.translate?.match(/[-\d.]+/g)?.map(Number) ?? [];
+        return { x: values[0] ?? 0, y: values[1] ?? 0 };
+    }
+
     const captions = (f: Fixture) => sceneNodes(f.container).filter(node => node.className === 'pdfDocumentRobotCaption');
     const exclusiveRegions = (payloads: any[], context: string) => {
         for (let first = 0; first < payloads.length; first++) {
@@ -5866,5 +5890,200 @@ describe('actual PDF fragments delivered by the document robot fleet', function 
         assert.ok(after.qualityDecisions.history.some((decision: any) => decision.reason === 'allocation-failed'));
         f.finish(); assert.strictEqual(f.api.snapshot().retainedBytes, 0); assert.strictEqual(held.size, 0);
     });
+
+    it('keeps actual ALKA carrier ink above its overlapping replacement photo and cleaner throughout quality publication', async () => {
+        const { createCanvas } = await importModule(path.join(repo, 'node_modules/@napi-rs/canvas/index.js'));
+        const pixels = new Map<Canvas, any>(); const nativeErrors: string[] = [];
+        const backing = (image: Canvas) => {
+            let canvas = pixels.get(image);
+            if (!canvas) { canvas = createCanvas(Math.max(1, image.width), Math.max(1, image.height)); pixels.set(image, canvas); }
+            if (canvas.width !== Math.max(1, image.width)) { canvas.width = Math.max(1, image.width); }
+            if (canvas.height !== Math.max(1, image.height)) { canvas.height = Math.max(1, image.height); }
+            return canvas;
+        };
+        const photo = (image: Canvas) => {
+            const canvas = backing(image), context = canvas.getContext('2d');
+            context.fillStyle = '#a86f49'; context.fillRect(0, 0, canvas.width, canvas.height);
+            context.fillStyle = '#e3c8a1'; context.fillRect(canvas.width / 2, 0, canvas.width / 2, canvas.height);
+        };
+        const native = (image: Canvas) => {
+            image.getContext = () => new Proxy(backing(image).getContext('2d'), {
+                get(context, key) {
+                    if (key === 'drawImage') { return (source: any, ...args: any[]) => {
+                        if (source instanceof Canvas && !pixels.has(source)) { photo(source); }
+                        try { context.drawImage(source instanceof Canvas ? backing(source) : source, ...args); }
+                        catch (error) { nativeErrors.push('drawImage: ' + String(error)); throw error; }
+                    }; }
+                    const value = Reflect.get(context, key, context);
+                    return typeof value === 'function' ? (...args: any[]) => {
+                        try { return value.apply(context, args); }
+                        catch (error) { nativeErrors.push(String(key) + ': ' + String(error)); throw error; }
+                    } : value;
+                },
+                set(context, key, value) { return Reflect.set(context, key, value, context); },
+            });
+            return image;
+        };
+        let f: Fixture;
+        f = fixture({ device: 'mobile', maxActors: 4, encounterRandom: () => .99, createCanvas() {
+            const image = native(new Canvas(f.document)); f.owned.push(image); return image;
+        } });
+        Object.assign(f.window, { devicePixelRatio: 3, innerWidth: 414, innerHeight: 896 });
+        f.container.rect = { left: 0, top: 32, width: 414, height: 864 };
+        const origin = { x: 350, y: 275, scale: .3 }, held = new Set<string>();
+        f.api.setDispatchOrigin({ reserve(vehicle: string) {
+            if (vehicle !== 'hexapod' || held.has(vehicle)) { return; }
+            held.add(vehicle); return origin;
+        }, destination: () => origin, release(vehicle: string) { assert.ok(held.delete(vehicle)); } });
+        const p = publication(f); p.page.pageElement.rect = { left: 7.5, top: 100, width: 399, height: 566 };
+        p.encounter.pageProjection = { content: { x: 0, y: 0, width: 399, height: 566 }, clip: { x: 0, y: 0, width: 399, height: 566 } };
+        p.encounter.imageRegions = [{ id: 'portrait', resourceId: 'x5', x: .2, y: .2, width: .2, height: .15 }];
+        p.candidate.canvas.width = 135; p.candidate.canvas.height = 192;
+        p.candidate.projection = { width: 135, height: 192, pageToRaster: [135, 0, 0, 192, 0, 0] };
+        photo(p.candidate.canvas);
+        const transform = (image: Canvas) => {
+            const move = image.style.transform?.match(/translate\(([-\d.]+)px,\s*([-\d.]+)px\)/);
+            const angle = Number(image.style.transform?.match(/rotate\(([-\d.]+)deg\)/)?.[1] ?? 0) * Math.PI / 180;
+            const translate = sceneTranslation(image);
+            return { x: Number(move?.[1] ?? 0) + translate.x, y: Number(move?.[2] ?? 0) + translate.y, angle,
+                width: parseFloat(image.style.width), height: parseFloat(image.style.height) };
+        };
+        const overlap = (body: Canvas, image: Canvas) => {
+            const a = transform(body), b = transform(image), bitmap = backing(body), replacement = backing(image);
+            const photoPixels = replacement.getContext('2d').getImageData(0, 0, replacement.width, replacement.height).data;
+            const clips = image.style.clipPath?.match(/^inset\((.+)\)$/)?.[1].split(/\s+/);
+            const clip = (index: number, dimension: number) => clips ? parseFloat(clips[index]) * (clips[index].endsWith('%') ? dimension / 100 : 1) : 0;
+            const ink = bitmap.getContext('2d').getImageData(0, 0, bitmap.width, bitmap.height).data;
+            for (let index = 0; index < bitmap.width * bitmap.height; index++) {
+                const x = index % bitmap.width, y = Math.floor(index / bitmap.width);
+                if (ink[index * 4 + 3] < 250) { continue; }
+                const bx = (x + .5) / bitmap.width * a.width - a.width / 2, by = (y + .5) / bitmap.height * a.height - a.height / 2;
+                const wx = a.x + a.width / 2 + bx * Math.cos(a.angle) - by * Math.sin(a.angle);
+                const wy = a.y + a.height / 2 + bx * Math.sin(a.angle) + by * Math.cos(a.angle);
+                const dx = wx - b.x - b.width / 2, dy = wy - b.y - b.height / 2;
+                const ix = dx * Math.cos(b.angle) + dy * Math.sin(b.angle) + b.width / 2;
+                const iy = -dx * Math.sin(b.angle) + dy * Math.cos(b.angle) + b.height / 2;
+                if (ix < clip(3, b.width) || iy < clip(0, b.height) || ix >= b.width - clip(1, b.width) || iy >= b.height - clip(2, b.height)) { continue; }
+                const px = Math.floor(ix / b.width * replacement.width), py = Math.floor(iy / b.height * replacement.height);
+                const photoAlpha = photoPixels[(py * replacement.width + px) * 4 + 3];
+                if (photoAlpha >= 250) { return { x: wx, y: wy, bodyAlpha: ink[index * 4 + 3], photoAlpha }; }
+            }
+        };
+        try {
+            f.api.setVisiblePages([1]); f.api.preparePublication(p.candidate, p.encounter).commit();
+            const admission = f.api.snapshot();
+            assert.ok(admission.pages.length, 'actual ALKA delivery admission: ' + JSON.stringify({ errors: nativeErrors, plans: admission.deliveryPlans, lastDecision: admission.lastOperationDecision }));
+            const initial = admission.pages[0].payloads[0];
+            f.tick(initial.deadline * .28);
+            const before = f.api.snapshot(), actor = before.pages[0].actors[0];
+            assert.strictEqual(actor.vehicle, 'hexapod');
+            const body = f.owned.find(image => image.dataset.courier === String(actor.id))!;
+            const cargo = f.owned.find(image => image.dataset.payload === String(initial.id) && image.className === 'pdfDocumentRobotCargo')!;
+            assert.ok(overlap(body, cargo), 'actual painted ALKA pixels overlap the carried photo before the quality upgrade');
+            assert.ok(scenePaintOrder(body, cargo) > 0, 'the original photo is below its actual carrier');
+            pointer(f, 'pointermove', point(body)); f.frame();
+            const readable = captions(f).find(node => node.isConnected && node.style.opacity === '1');
+            assert.ok(readable, 'a real readable hover caption is present before the wipe');
+            const readUntil = f.api.snapshot().caption.until;
+            const bodyPose = { point: point(body), width: body.style.width, height: body.style.height };
+            const next = finalPublication(p); photo(next.canvas);
+            const transaction = f.api.preparePublication(next, p.encounter, p.candidate);
+            p.candidate.canvas.replaceWith(next.canvas); transaction.commit();
+            assert.deepStrictEqual({ point: point(body), width: body.style.width, height: body.style.height }, bodyPose, 'quality publication cannot relocate or resize the carrier');
+            const first = f.api.snapshot().qualityReactions[0]; assert.ok(first && first.location === 'cargo');
+            let samples = 0, labelSamples = 0, pageHandoff = false;
+            while (f.callbacks.size && f.now <= first.deadline + 34) {
+                f.frame(); const snapshot = f.api.snapshot();
+                const scene = snapshot.qualityReactions.find((value: any) => value.id === first.id);
+                if (!scene) { break; }
+                const replacements = f.owned.filter(image => image.isConnected && image.dataset.quality === String(first.id)
+                    && ['pdfDocumentRobotQualityCoarse', 'pdfDocumentRobotQualitySharp'].includes(image.className));
+                const cleaner = f.owned.find(image => image.isConnected && image.dataset.quality === String(first.id) && image.className === 'pdfDocumentRobotQualityCleaner')!;
+                if (scene.location === 'cargo' && body.isConnected) {
+                    assert.ok(Number(body.style.opacity) >= .99, 'the continuing loaded carrier is actually opaque');
+                    const current = snapshot.pages[0].actors.find((value: any) => value.id === actor.id);
+                    assert.ok(current); assert.strictEqual(current.vehicle, actor.vehicle);
+                    assert.strictEqual(f.owned.find(image => image.dataset.courier === String(actor.id)), body);
+                    for (const replacement of replacements) {
+                        const point = overlap(body, replacement);
+                        if (!point) { continue; }
+                        assert.ok(point.bodyAlpha >= 250 && point.photoAlpha >= 250, 'both actual artwork and replacement pixels are opaque at the overlap');
+                        let alpha = 1;
+                        for (let node: Element | null = replacement; node; node = node.parentNode) {
+                            alpha *= Number(node.style.opacity || 1);
+                            assert.ok(node.style.display !== 'none' && node.style.visibility !== 'hidden');
+                        }
+                        assert.ok(alpha >= .99, 'the replacement is actually opaque through its inline ancestor styles');
+                        samples++;
+                        assert.ok(scenePaintOrder(body, replacement) > 0, 'opaque replacement photo must preserve the actual overlapping carrier ink above it');
+                        const depth = replacement.style.zIndex; replacement.style.zIndex = '999999';
+                        assert.ok(scenePaintOrder(body, replacement) > 0, 'a quality child cannot escape its photo stacking context');
+                        replacement.style.zIndex = depth;
+                    }
+                    assert.ok(scenePaintOrder(body, cleaner) > 0, 'the carrier stays above the cleaner rather than appearing only when the cleaner leaves');
+                    const retained = snapshot.pages[0].payloads.find((value: any) => value.id === initial.id);
+                    assert.strictEqual(retained.deadline, initial.deadline); assert.deepStrictEqual(retained.helpers, initial.helpers);
+                }
+                if (scene.location === 'page') {
+                    pageHandoff = true;
+                    assert.ok(scenePaintOrder(replacements[0], next.canvas) > 0, 'the coarse page mask remains above accepted native pixels');
+                }
+                const bubble = captions(f).find(node => node.isConnected && node.style.opacity === '1');
+                if (bubble) { labelSamples++; assert.ok(scenePaintOrder(bubble, cleaner) > 0, 'readable dialogue stays above quality artwork'); }
+            }
+            assert.ok(samples >= 2, 'the real wipe overlaps visible courier ink across multiple frames');
+            assert.ok(pageHandoff, 'the independent quality owner survives actual cargo deposit');
+            assert.ok(labelSamples > 0, 'readable label composition was observed during the actual wipe');
+            f.finish(); const done = f.api.snapshot();
+            assert.strictEqual(done.qualityOutcomes.find((value: any) => value.id === first.id).outcome, 'completed');
+            assert.strictEqual(done.retainedBytes + done.activeActors, 0); assert.strictEqual(held.size, 0);
+            assert.strictEqual(next.canvas.isConnected, true);
+            f.tick(Math.max(0, readUntil - f.now) + 1);
+            assert.strictEqual(f.callbacks.size + f.timers.size, 0);
+            assert.strictEqual(readable.isConnected, false);
+        } finally { for (const canvas of pixels.values()) { canvas.width = canvas.height = 0; } }
+    });
+
+    it('keeps a real airlift sling above quality replacement pixels at an overlapping wire point', () => {
+        const { f, page, delivery, held } = stagedLugv();
+        page.canvas.width = 135; page.canvas.height = 192;
+        const value = delivery(80), p = publication(f, page);
+        p.candidate.projection = { width: 135, height: 192, pageToRaster: [135, 0, 0, 192, 0, 0] };
+        p.encounter.pageProjection = { content: { x: 0, y: 0, width: 1000, height: 800 }, clip: { x: 0, y: 0, width: 1000, height: 800 } };
+        p.encounter.imageRegions = value.imageRegions.map(region => ({ ...region, resourceId: 'x5' }));
+        f.api.preparePublication(p.candidate, p.encounter).commit();
+        const initial = f.api.snapshot().pages[0]?.payloads[0]; assert.ok(initial && initial.mode === 'airlift');
+        while (f.callbacks.size && f.now < initial.deadline) {
+            f.frame(); const current = f.api.snapshot().pages[0]?.payloads.find((payload: any) => payload.id === initial.id);
+            if (current?.routeState?.groundCarried && !current.deposited) { break; }
+        }
+        const next = finalPublication(p), transaction = f.api.preparePublication(next, p.encounter, p.candidate);
+        p.candidate.canvas.replaceWith(next.canvas); transaction.commit(); f.frame();
+        const first = f.api.snapshot().qualityReactions[0]; assert.ok(first && first.location === 'cargo');
+        let overlapSeen = false;
+        while (f.callbacks.size && f.now <= first.deadline + 34) {
+            const state = f.api.snapshot(), scene = state.qualityReactions.find((value: any) => value.id === first.id);
+            if (!scene) { break; }
+            const sling = sceneNodes(f.container).find(node => node.className === 'pdfDocumentRobotSling' && node.style.opacity === '1');
+            const coarse = f.owned.find(canvas => canvas.dataset.quality === String(first.id) && canvas.className === 'pdfDocumentRobotQualityCoarse')!;
+            if (sling && scene.location === 'cargo') {
+                const move = coarse.style.transform.match(/translate\(([-\d.]+)px,\s*([-\d.]+)px\)/)!;
+                const photoTranslate = sceneTranslation(coarse), wireTranslate = sceneTranslation(sling);
+                const photo = { x: Number(move[1]) + photoTranslate.x, y: Number(move[2]) + photoTranslate.y, width: parseFloat(coarse.style.width), height: parseFloat(coarse.style.height) };
+                const wire = { x: parseFloat(sling.style.left) + wireTranslate.x, y: parseFloat(sling.style.top) + wireTranslate.y, width: parseFloat(sling.style.width), height: parseFloat(sling.style.height) };
+                const verticalOverlap = Math.min(wire.y + wire.height, photo.y + photo.height) - Math.max(wire.y, photo.y);
+                if (verticalOverlap > 1 && [wire.x, wire.x + wire.width].some(x => x > photo.x && x < photo.x + photo.width)) {
+                    overlapSeen = true;
+                    assert.ok(scenePaintOrder(sling, coarse) > 0, 'the actual vertical sling wire stays above the replacement image it crosses');
+                    const depth = coarse.style.zIndex; coarse.style.zIndex = '999999';
+                    assert.ok(scenePaintOrder(sling, coarse) > 0, 'the photo subtree cannot cover its required sling'); coarse.style.zIndex = depth;
+                }
+            }
+            f.frame();
+        }
+        assert.ok(overlapSeen, 'a real carried sling wire crosses opaque quality pixels');
+        f.finish(); assert.strictEqual(f.api.snapshot().retainedBytes, 0); assert.strictEqual(held.size, 0);
+    });
+
 
 });
