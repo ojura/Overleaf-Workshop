@@ -4,7 +4,7 @@
  * (HostMessage, ViewerMessage).
  */
 import type { HostMessage, SavedState, ViewerMessage } from './protocol';
-import type { MotionLabMeasurementsPreference } from './prefetch-performance';
+import type { ViewerBooleanPreference } from './prefetch-performance';
 import { config } from './config';
 
 /** the host's answer to 'ready' */
@@ -87,12 +87,13 @@ export function disposeHost() {
     early.clear();
 }
 
-/** Both extension viewers read disclosure state after initialization and preserve the full saved reader state on writes. */
-export const hostMeasurementsPreference: MotionLabMeasurementsPreference = Object.freeze({
-    async whenReady() { await ready(); },
-    read: () => typeof state.motionLabMeasurementsOpen === 'boolean' ? state.motionLabMeasurementsOpen : undefined,
-    async write(open: boolean) {
-        await ready();
-        saveState({ motionLabMeasurementsOpen: open });
-    },
-});
+/** Both viewers wait for the host merge and save only a partial boolean preference. */
+function hostBooleanPreference(key: 'motionLabMeasurementsOpen' | 'documentRobotsEnabled'): ViewerBooleanPreference {
+    return Object.freeze({
+        async whenReady() { await ready(); },
+        read: () => typeof state[key] === 'boolean' ? state[key] : undefined,
+        async write(value: boolean) { await ready(); saveState({ [key]: value }); },
+    });
+}
+export const hostMeasurementsPreference = hostBooleanPreference('motionLabMeasurementsOpen');
+export const hostRobotsPreference = hostBooleanPreference('documentRobotsEnabled');

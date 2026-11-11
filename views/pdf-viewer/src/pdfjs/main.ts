@@ -17,7 +17,7 @@ import { bridgeOutputsOf, readReadingImage } from '../common/bridge';
 import { config } from '../common/config';
 import { documentShown, showBuildState, showLoadError, showState } from '../common/banner';
 import { errorMessage } from '../common/errorMessage';
-import { onMessage, post, ready, savedState, saveState, hostMeasurementsPreference, disposeHost } from '../common/host';
+import { onMessage, post, ready, savedState, saveState, hostMeasurementsPreference, hostRobotsPreference, disposeHost } from '../common/host';
 import type { InitState } from '../common/host';
 import { toPdfFile } from '../common/output';
 import type { PdfOutput, PdfPreviewDescriptor, PdfReadingDescriptor, Position, SyncBox } from '../common/protocol';
@@ -522,6 +522,7 @@ async function start() {
         diagnosticsToolbarBefore: document.getElementById('secondaryToolbarToggle')!,
         diagnosticsMenu: document.getElementById('secondaryToolbarButtonContainer')!,
         measurementsPreference: hostMeasurementsPreference,
+        robotsPreference: hostRobotsPreference,
         onDiagnosticsOpen: () => a.secondaryToolbar.close(),
         onIdleChange: idle => { if (shownBuild) { post({ type: 'cacheActivity', page: config.page, build: shownBuild, idle }); } },
     });

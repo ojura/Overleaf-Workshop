@@ -600,7 +600,7 @@ describe('PDF prefetch performance measurements', function () {
         }
         const buttons: Button[] = [];
         const listeners = new Map<string, unknown>();
-        let enabled = true;
+        let enabled = true; const applied: boolean[] = [];
         let timers = 0;
         let samples = 0;
         const document = {
@@ -619,11 +619,15 @@ describe('PDF prefetch performance measurements', function () {
             () => { samples++; }, {
                 enabled: false,
                 toolbar: { append(button: Button) { buttons.push(button); } },
-                robots: { get enabled() { return enabled; }, setEnabled(value: boolean) { enabled = value; } },
+                robots: { get enabled() { return enabled; }, setEnabled(value: boolean) { applied.push(value); enabled = value; } },
             });
         const robot = buttons.find(button => button.id === 'pdf-prefetch-toggle')!;
         const measurements = buttons.find(button => button.id === 'pdf-prefetch-measurements')!;
         assert.strictEqual(robot.attributes.get('aria-pressed'), 'true');
+        enabled = false; controls.refreshRobotsEnabled();
+        assert.strictEqual(robot.attributes.get('aria-pressed'), 'false');
+        assert.deepStrictEqual(applied, [], 'late preference reflection does not dispatch another toggle or write');
+        enabled = true; controls.refreshRobotsEnabled();
         assert.ok(measurements, 'numeric measurements have their own header control');
         assert.strictEqual(measurements.attributes.get('aria-expanded'), 'false');
         assert.strictEqual(controls.enabled, false);

@@ -3590,4 +3590,83 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.strictEqual(f.listenerCount, 0);
         assert.strictEqual(render.parameters.canvasContext.canvas.width * render.parameters.canvasContext.canvas.height, 0);
     });
+    function visibilityFixture(options: { storage?: Map<string, string>; preference?: any; initial?: boolean; failRenderer?: boolean; storageFails?: boolean } = {}) {
+        const f = new Fixture({ pages: 1, startPage: 1 }); fixtures.push(f);
+        const storage = options.storage ?? new Map<string, string>(), writes: Array<[string, string]> = [];
+        Object.defineProperty(f.owner.defaultView, 'localStorage', { get() {
+            if (options.storageFails) { throw new Error('storage denied'); }
+            return { getItem: (key: string) => storage.get(key) ?? null,
+                setItem(key: string, value: string) { writes.push([key, value]); storage.set(key, value); } };
+        } });
+        const robots = new DocumentRobots(), factories: Element[] = [];
+        f.install(module, { robotsEnabled: options.initial, robotsPreference: options.preference,
+            createDocumentRobots: (container: Element) => {
+                factories.push(container); if (options.failRenderer) { throw new Error('renderer unavailable'); } return robots;
+            } });
+        return { f, robots, factories, storage, writes };
+    }
+
+    it('persists document visibility OFF and ON through standalone controller recreation without opening the Lab', () => {
+        const first = visibilityFixture(); assert.strictEqual(first.f.controller.robotsEnabled, true);
+        assert.deepStrictEqual(first.writes, [], 'default initialization is not a preference write');
+        first.f.controller.setRobotsEnabled(false); first.f.dispose();
+        const second = visibilityFixture({ storage: first.storage });
+        assert.strictEqual(second.factories.length, 0, 'saved OFF prevents robot construction on reload');
+        assert.strictEqual(second.f.controller.robotsEnabled, false);
+        second.f.controller.setRobotsEnabled(true); second.f.dispose();
+        const third = visibilityFixture({ storage: first.storage });
+        assert.strictEqual(third.f.controller.robotsEnabled, true);
+        assert.strictEqual(third.f.controller.diagnosticsEnabled, false);
+        assert.deepStrictEqual(third.writes, [], 'restoring ON does not rewrite it');
+    });
+
+    it('waits for visibility preference readiness before construction and fences newer toggles and disposal', async () => {
+        for (const action of ['restore', 'off', 'on', 'dispose'] as const) {
+            let finish!: () => void, stored = action === 'off'; const writes: boolean[] = [];
+            const ready = new Promise<void>(resolve => { finish = resolve; });
+            const fixture = visibilityFixture({ preference: { whenReady: () => ready, read: () => stored,
+                write(value: boolean) { writes.push(value); stored = value; } } });
+            assert.strictEqual(fixture.factories.length, 0, 'no startup before saved OFF is known');
+            if (action === 'off') { fixture.f.controller.setRobotsEnabled(false); }
+            if (action === 'on') { fixture.f.controller.setRobotsEnabled(true); }
+            if (action === 'dispose') { fixture.f.dispose(); }
+            assert.deepStrictEqual(writes, [], 'pending host writes wait for state merge');
+            finish(); await ready; await promisesSettled();
+            assert.strictEqual(fixture.factories.length, action === 'on' ? 1 : 0, 'late readiness cannot override a newer action or disposal');
+            assert.deepStrictEqual(writes, action === 'off' ? [false] : action === 'on' ? [true] : []);
+            if (action !== 'dispose') { assert.strictEqual(fixture.f.controller.robotsEnabled, action === 'on'); }
+        }
+    });
+
+    it('keeps visibility overrides and storage failures usable and persists requested ON even if allocation fails', () => {
+        const saved = new Map([['pdf-document-robots-enabled', 'true']]);
+        const override = visibilityFixture({ storage: saved, initial: false });
+        assert.strictEqual(override.factories.length, 0); assert.deepStrictEqual(override.writes, []);
+        const denied = visibilityFixture({ storageFails: true });
+        denied.f.controller.setRobotsEnabled(false); assert.strictEqual(denied.f.controller.robotsEnabled, false);
+        denied.f.controller.setRobotsEnabled(true); assert.strictEqual(denied.f.controller.robotsEnabled, true);
+        const storage = new Map([['pdf-document-robots-enabled', 'false']]);
+        const failed = visibilityFixture({ storage, failRenderer: true });
+        failed.f.controller.setRobotsEnabled(true);
+        assert.strictEqual(failed.f.controller.robotsEnabled, false);
+        assert.strictEqual(storage.get('pdf-document-robots-enabled'), 'true', 'persist the request, not failed effective allocation');
+        failed.f.dispose();
+        const next = visibilityFixture({ storage });
+        assert.strictEqual(next.f.controller.robotsEnabled, true, 'requested ON survives transient allocation failure');
+    });
+
+    it('strictly decodes visibility storage and defaults safely when asynchronous preference loading fails', async () => {
+        for (const value of ['false', 'true', 'FALSE', '0', 'null', '']) {
+            const f = visibilityFixture({ storage: new Map([['pdf-document-robots-enabled', value]]) });
+            assert.strictEqual(f.f.controller.robotsEnabled, value !== 'false');
+            assert.deepStrictEqual(f.writes, [], 'malformed and missing preferences do not create writes');
+        }
+        const f = visibilityFixture({ preference: { whenReady: () => Promise.reject(new Error('host unavailable')),
+            read() { throw new Error('read unavailable'); }, write() { throw new Error('write unavailable'); } } });
+        assert.strictEqual(f.factories.length, 0);
+        await promisesSettled(); assert.strictEqual(f.f.controller.robotsEnabled, true);
+        f.f.controller.setRobotsEnabled(false); await promisesSettled();
+        assert.strictEqual(f.f.controller.robotsEnabled, false, 'failed persistence cannot disable the current control');
+    });
+
 });

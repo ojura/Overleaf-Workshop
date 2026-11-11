@@ -97,4 +97,31 @@ describe('PDF viewer host disclosure preference', function () {
             const ready = f.preference.whenReady(); f.initialize({}); await ready;
         }
     });
+    it('shares robot visibility across host reopen while preserving the complete reader state', async () => {
+        for (const enabled of [false, true]) {
+            const f = fixture(), preference = f.host.hostRobotsPreference;
+            assert.ok(preference, 'both extension engines have a host-backed visibility adapter');
+            const ready = preference.whenReady();
+            const position = { page: 8, offset: { top: 21, left: 5 }, pageSize: { width: 600, height: 800 } };
+            f.initialize({ documentRobotsEnabled: enabled, scale: '2', position, motionLabMeasurementsOpen: true }); await ready;
+            assert.strictEqual(preference.read(), enabled); assert.deepStrictEqual(f.writes, []);
+            await preference.write(!enabled);
+            assert.deepStrictEqual(f.writes.at(-1), { documentRobotsEnabled: !enabled, scale: '2', position, motionLabMeasurementsOpen: true });
+            const reopened = fixture(f.state()); const settled = reopened.host.hostRobotsPreference.whenReady();
+            reopened.initialize({ scale: '1', documentRobotsEnabled: enabled }); await settled;
+            assert.strictEqual(reopened.host.hostRobotsPreference.read(), !enabled);
+            assert.strictEqual(reopened.state().scale, '2');
+        }
+    });
+
+    it('merges an early robot toggle after host readiness and drops a disposed host write', async () => {
+        const f = fixture(); const pending = f.host.hostRobotsPreference.write(false);
+        assert.deepStrictEqual(f.writes, []);
+        f.initialize({ documentRobotsEnabled: true, scale: '2', sidebarView: 2 }); await pending;
+        assert.deepStrictEqual(f.writes, [{ documentRobotsEnabled: false, scale: '2', sidebarView: 2 }]);
+        const closed = fixture(); const late = closed.host.hostRobotsPreference.write(true);
+        closed.initialize({ documentRobotsEnabled: false, scale: '3' }); closed.host.disposeHost(); await late;
+        assert.deepStrictEqual(closed.writes, [], 'late readiness has no disposed host message owner');
+    });
+
 });

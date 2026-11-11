@@ -280,12 +280,14 @@ interface TraceSample {
     delay: number;
 }
 
-export interface MotionLabMeasurementsPreference {
+export interface ViewerBooleanPreference {
     /** Extension host state may arrive after the viewer controls become available. */
     whenReady?(): Promise<void>;
     read(): boolean | undefined;
-    write(open: boolean): void | Promise<void>;
+    write(value: boolean): void | Promise<void>;
 }
+
+export type MotionLabMeasurementsPreference = ViewerBooleanPreference;
 
 interface DiagnosticsOptions {
     toolbar?: HTMLElement;
@@ -748,6 +750,11 @@ ${resizeDirections.map(direction => `<button type="button" class="panel-resize" 
     function setRobotsEnabled(enabled: boolean): void {
         if (disposed) { return; }
         options.robots?.setEnabled(enabled);
+        refreshRobotsEnabled();
+    }
+
+    function refreshRobotsEnabled(): void {
+        if (disposed) { return; }
         const active = options.robots?.enabled ?? false;
         button?.setAttribute('aria-pressed', String(active));
         if (button) { button.title = active ? 'Turn off document robots' : 'Turn on document robots'; }
@@ -810,6 +817,7 @@ ${resizeDirections.map(direction => `<button type="button" class="panel-resize" 
                 && (event.target === host || event.composedPath?.().includes(host) === true);
         },
         setRobotsEnabled,
+        refreshRobotsEnabled,
         get robotsEnabled() { return options.robots?.enabled ?? false; },
         labSnapshot: () => robots?.snapshot(),
         dispose(): void {

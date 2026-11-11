@@ -1,5 +1,5 @@
 import { pdfCachePolicy, pdfSidecarDecodeOptions, ScrollPrefetchDynamics, type PdfCachePolicy } from './scroll-prefetch';
-import { installPrefetchDiagnostics, pdfPerformance, type DecodedImageSnapshot, type MotionLabMeasurementsPreference } from './prefetch-performance';
+import { installPrefetchDiagnostics, pdfPerformance, type DecodedImageSnapshot, type MotionLabMeasurementsPreference, type ViewerBooleanPreference } from './prefetch-performance';
 import { PdfPreviewCache } from './pdf-preview-cache';
 import { PdfPagePresentation, type PdfPagePresentationCandidate } from './pdf-page-presentation';
 import { installPdfDocumentRobots, documentRobotWorkMembers, type DocumentRobotDelivery, type DocumentRobotWorkGroup } from './pdf-document-robots';
@@ -21,6 +21,7 @@ const RGBA_BYTES = 4;
 const RANGE_SAMPLE_MS = 1000;
 const RANGE_PRESSURE_CHECK_MS = 250;
 const MAX_IMAGE_SCAN_ITEMS = 512;
+const ROBOTS_PREFERENCE_KEY = 'pdf-document-robots-enabled';
 
 interface Options {
     cachePolicy?: PdfCachePolicy;
@@ -32,6 +33,7 @@ interface Options {
     onDiagnosticsOpen?: () => void;
     diagnosticsEnabled?: boolean;
     robotsEnabled?: boolean;
+    robotsPreference?: ViewerBooleanPreference;
     createDocumentRobots?: typeof installPdfDocumentRobots;
     createDocumentColumn?: typeof installPdfDocumentColumn;
     now?: () => number;
@@ -249,6 +251,14 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     let generation = 0;
     let document: any;
     let disposed = false;
+    let robotPreferenceRevision = 0;
+    const robotsPreference: ViewerBooleanPreference = options.robotsPreference ?? {
+        read() {
+            const value = win?.localStorage.getItem(ROBOTS_PREFERENCE_KEY);
+            return value === 'true' ? true : value === 'false' ? false : undefined;
+        },
+        write(value) { win?.localStorage.setItem(ROBOTS_PREFERENCE_KEY, String(value)); },
+    };
     let refreshing = false;
     let layoutPending = false;
     let frame: number | undefined;
@@ -499,6 +509,34 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             updateRobotPages();
             if (document) { schedule(); }
         }
+    }
+
+    function restoreDocumentRobotsPreference(): void {
+        const revision = robotPreferenceRevision;
+        const apply = () => {
+            if (disposed || revision !== robotPreferenceRevision) { return; }
+            let stored: boolean | undefined;
+            try { stored = robotsPreference.read(); } catch { /* Storage may be unavailable. */ }
+            setDocumentRobotsEnabled(options.robotsEnabled ?? (typeof stored === 'boolean' ? stored : true));
+            diagnostics?.refreshRobotsEnabled?.();
+        };
+        if (robotsPreference.whenReady) {
+            void Promise.resolve().then(() => robotsPreference.whenReady!()).then(apply, apply);
+        } else { apply(); }
+    }
+
+    function setRequestedRobotsEnabled(enabled: boolean): void {
+        if (disposed) { return; }
+        const revision = ++robotPreferenceRevision;
+        setDocumentRobotsEnabled(enabled);
+        const write = () => {
+            if (disposed || revision !== robotPreferenceRevision) { return; }
+            try { void Promise.resolve(robotsPreference.write(enabled)).catch(() => {}); }
+            catch { /* The current control remains usable without persistent storage. */ }
+        };
+        if (robotsPreference.whenReady) {
+            void Promise.resolve().then(() => robotsPreference.whenReady!()).then(write, () => {});
+        } else { write(); }
     }
 
     function captureNativeRaster(view: any): void {
@@ -1700,7 +1738,6 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         pages: () => visible.map(id => pageView(id)?.div).filter((page): page is HTMLElement => !!page),
         onTransition: columnTransition, now, requestFrame, cancelFrame,
     });
-    setDocumentRobotsEnabled(options.robotsEnabled !== false);
     diagnostics = installPrefetchDiagnostics(container, snapshot, {
         toolbar: options.diagnosticsToolbar,
         toolbarBefore: options.diagnosticsToolbarBefore,
@@ -1721,10 +1758,11 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
         enabled: options.diagnosticsEnabled,
         robots: {
             get enabled() { return documentRobots?.enabled ?? false; },
-            setEnabled: setDocumentRobotsEnabled,
+            setEnabled: setRequestedRobotsEnabled,
             setDispatchOrigin(port) { dispatchOrigin = port; documentRobots?.setDispatchOrigin(port); },
         },
     });
+    restoreDocumentRobotsPreference();
     if (viewer.pdfDocument) { activate(); }
     if (options.previewSource && viewer.pdfDocument) { setPreviewSource(options.previewSource, viewer.pdfDocument); }
 

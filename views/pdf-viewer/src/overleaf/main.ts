@@ -1,7 +1,7 @@
 // Overleaf's caching flags must be set before its loader modules run: keep this import first.
 import '../common/transport';
 import PDFJSWrapper from '@/features/pdf-preview/util/pdf-js-wrapper';
-import { onMessage, post, ready, savedState, saveState, hostMeasurementsPreference, disposeHost } from '../common/host';
+import { onMessage, post, ready, savedState, saveState, hostMeasurementsPreference, hostRobotsPreference, disposeHost } from '../common/host';
 import type { Position, SyncBox } from '../common/protocol';
 import { documentShown, showBuildState, showLoadError } from '../common/banner';
 import { goToCode, listenForDoubleClick, showHighlights } from '../common/synctex';
@@ -36,6 +36,7 @@ let shownBuild: string | undefined;
 const prefetch = installPdfPrefetch(wrapper.viewer, {
     diagnosticsToolbar: document.getElementById('toolbar')!,
     measurementsPreference: hostMeasurementsPreference,
+    robotsPreference: hostRobotsPreference,
     onIdleChange: idle => { if (shownBuild) { post({ type: 'cacheActivity', page: config.page, build: shownBuild, idle }); } },
 });
 const previewBinding = createPdfPreviewBinding(wrapper.viewer, (source, doc) => prefetch.setPreviewSource(source, doc));

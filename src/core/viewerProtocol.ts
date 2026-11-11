@@ -173,6 +173,7 @@ export interface SavedState {
     spreadMode?: number;
     sidebarView?: number;
     motionLabMeasurementsOpen?: boolean;
+    documentRobotsEnabled?: boolean;
     [other: string]: unknown;
 }
 
