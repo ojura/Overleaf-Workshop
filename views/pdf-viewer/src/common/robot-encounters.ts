@@ -1,4 +1,4 @@
-import { RobotDialogueSelection, robotDialogueCatalogue, ROBOT_ENCOUNTER_DIALOGUE, type RobotIncidentDialogue as Dialogue, type RobotEncounterKind, type RobotDialogueChoice, type RobotDialogueOpportunity, type RobotDialogueSpeaker } from './robot-dialogue';
+import { RobotDialogueSelection, robotDialogueCatalogue, ROBOT_ENCOUNTER_DIALOGUE, type RobotIncidentDialogue as Dialogue, type RobotEncounterKind, type RobotDialogueChoice, type RobotDialogueOpportunity, type RobotDialogueSpeaker, type RobotDialogueFact } from './robot-dialogue';
 import { ROBOT_AIRLIFT_ATTACHMENT, ROBOT_VEHICLES, type RobotVehicle } from './prefetch-robots';
 import { planRobotRescue, ROBOT_RESCUE_CAPABILITIES, ROBOT_RESCUE_POLICY, type RobotRescuePlan } from './robot-rescue';
 import { GROUND_ROUTE_MAX_SLOPE } from './robot-cargo-routes';
@@ -67,6 +67,8 @@ export interface RobotEncounterActor extends Point {
     commitments?: readonly RobotCommitment[];
     commitmentTimeline?: readonly { until: number; commitments: readonly RobotCommitment[] }[];
     cargo?: { key: string; mass: number };
+    /** Current artwork attachment, separate from current and future load commitments. */
+    carrying?: boolean;
     /** A committed participant has this interval available again after its owned activity completes. */
     activity?: { key: string; until: number };
 }
@@ -95,8 +97,9 @@ interface Incident {
     started: number;
     ends: number;
     armedUntil?: number;
-    dialogue: Dialogue;
+    dialogue?: Dialogue;
     dialogueChoice?: RobotDialogueChoice;
+    speechAttempted?: boolean;
     captionId: string;
     captionUntil: number;
     rescue?: RobotRescuePlan;
@@ -145,12 +148,20 @@ export class RobotEncounters {
     releaseSpeech(choice: RobotDialogueChoice): void { this.speech.release(choice); }
 
 
-    private dialogue(kind: RobotEncounterKind, actors: readonly RobotEncounterActor[], at: number, allowedIds?: readonly string[], consumeRandom = true) {
+    private dialogue(kind: RobotEncounterKind, actors: readonly RobotEncounterActor[], at: number, allowedIds?: readonly string[], consumeRandom = true,
+        evidence?: ReadonlyMap<number, readonly RobotDialogueFact[]>, captionKey?: string) {
         // Preserve incident-decision RNG consumption; text choice itself is coverage-owned.
         if (consumeRandom) { this.random(); }
-        const choice = this.speech.reserve('incident:' + ++this.incidentSerial, kind,
-            actors.map(actor => ({ id: actor.id, vehicle: actor.vehicle ?? '',
-                name: ROBOT_VEHICLES.find(vehicle => vehicle.id === actor.vehicle)?.name ?? 'Robot' })), this.speechGeometry, allowedIds);
+        const choice = this.speech.reserve(captionKey ?? 'incident:' + ++this.incidentSerial, kind,
+            actors.map(actor => {
+                const facts: RobotDialogueFact[] = actor.carrying ? ['cargo'] : [];
+                if (actor.carrying && actor.cargo && actors.some(other => other.id !== actor.id && other.carrying && other.cargo?.key === actor.cargo!.key)) {
+                    facts.push('shared-cargo');
+                }
+                facts.push(...(evidence?.get(actor.id) ?? []));
+                return { id: actor.id, vehicle: actor.vehicle ?? '',
+                    name: ROBOT_VEHICLES.find(vehicle => vehicle.id === actor.vehicle)?.name ?? 'Robot', facts };
+            }), this.speechGeometry, allowedIds);
         return choice ? { dialogue: { id: choice.entry.id, kind, lines: choice.lines } as Dialogue, choice } : undefined;
     }
 
@@ -164,13 +175,12 @@ export class RobotEncounters {
         const duration = Math.min(ROBOT_ENCOUNTER_POLICY.maxDurationMs,
             ...actors.map(actor => actor.remainingMs - ROBOT_ENCOUNTER_POLICY.endMarginMs));
         if (duration < ROBOT_ENCOUNTER_POLICY.minDurationMs) { return; }
-        const selected = this.dialogue(kind, actors, at);
-        if (!selected) { return; }
-        const { dialogue, choice } = selected;
+        const evidence: RobotDialogueFact[] = kind === 'success' ? ['completed'] : kind === 'bump' && !armed ? ['collision'] : [];
+        const selected = this.dialogue(kind, actors, at, undefined, true, new Map(actors.map(actor => [actor.id, evidence])));
         this.incident = { kind, ids: actors.map(actor => actor.id), origins: actors.map(({ x, y }) => ({ x, y })),
-            normal, started: at, ends: at + duration, dialogue, dialogueChoice: choice,
-            captionId: choice.key,
-            captionUntil: at + this.captionDuration(dialogue),
+            normal, started: at, ends: at + duration, dialogue: selected?.dialogue, dialogueChoice: selected?.choice,
+            captionId: selected?.choice.key ?? 'incident:' + this.incidentSerial,
+            captionUntil: selected ? at + this.captionDuration(selected.dialogue) : at,
             armedUntil: armed ? at + ROBOT_ENCOUNTER_POLICY.lookaheadMs + 50 : undefined };
         if (!armed) { this.counts[kind === 'near-miss' ? 'nearMiss' : kind]++; }
         this.cooldownUntil = at + ROBOT_ENCOUNTER_POLICY.cooldownMs;
@@ -211,13 +221,11 @@ export class RobotEncounters {
         if (plan.operation?.operatingMode !== 'overreach' && this.random() >= policy.rescueChance) { return; }
         const participantIds = [...plan.participantIds, ...carriedGroup.filter(actor => actor.id !== disabled.id).map(actor => actor.id)];
         const selected = participantIds.map(id => actors.find(actor => actor.id === id)!);
-        const spoken = this.dialogue('rescue', selected, at, plan.enjoysAirlift ? ['rescue-lugv'] : ['rescue-smoke', 'rescue-field'], !plan.enjoysAirlift);
-        if (!spoken) { return; }
-        const { dialogue, choice } = spoken;
+        // Keep the original decision draw here; literal rescue words wait for their actual visible phase.
+        if (!plan.enjoysAirlift) { this.random(); }
         this.incident = { kind: 'rescue', ids: participantIds, origins: selected.map(({ x, y }) => ({ x, y })),
-            normal: { x: 0, y: 0 }, started: at, ends: at + plan.durationMs, rescue: { ...plan, participantIds }, dialogue, dialogueChoice: choice,
-            captionId: choice.key,
-            captionUntil: at + this.captionDuration(dialogue) };
+            normal: { x: 0, y: 0 }, started: at, ends: at + plan.durationMs, rescue: { ...plan, participantIds },
+            captionId: 'incident:' + ++this.incidentSerial, captionUntil: at };
         this.rescues++; this.cooldownUntil = at + policy.cooldownMs;
     }
 
@@ -284,7 +292,7 @@ export class RobotEncounters {
             if (at > active.armedUntil) { if (active.dialogueChoice) { this.speech.release(active.dialogueChoice); } this.incident = active = undefined; }
             else if (contact(a, b) && active.ends - at >= policy.minDurationMs) {
                 active.started = at; active.armedUntil = undefined; this.counts.bump++;
-                active.captionUntil = at + this.captionDuration(active.dialogue);
+                active.captionUntil = active.dialogue ? at + this.captionDuration(active.dialogue) : at;
             }
         }
         if (!active && at >= this.cooldownUntil && at >= this.successAfter && successfulDeposits.length) {
@@ -425,6 +433,18 @@ export class RobotEncounters {
                 // A satisfied face may accompany the deposit; its handling pose stays intact until return.
                 if (actor.phase !== 'deposit') { activity = 'celebrate'; }
             }
+            if (index === 0 && active.rescue && !active.speechAttempted
+                && (active.rescue.enjoysAirlift ? carried : malfunction === 'smoke')) {
+                active.speechAttempted = true;
+                const evidence: RobotDialogueFact[] = carried ? ['carried'] : ['smoke'];
+                const spoken = this.dialogue('rescue', active.ids.map(id => current.get(id)!), at,
+                    active.rescue.enjoysAirlift ? ['rescue-lugv'] : ['rescue-smoke', 'rescue-field'], false,
+                    new Map([[actor.id, evidence]]), active.captionId);
+                if (spoken) {
+                    active.dialogue = spoken.dialogue; active.dialogueChoice = spoken.choice;
+                    active.captionUntil = at + this.captionDuration(spoken.dialogue);
+                }
+            }
             const heroic = active.rescue?.operation?.operatingMode === 'overreach' && active.rescue.helpers[0] === actor.id;
             const operation = active.rescue?.operation;
             const heroicLine = operation && at >= operation.timing.workEnd
@@ -432,7 +452,7 @@ export class RobotEncounters {
                     : operation.outcome.family === 'expensive-success' ? ROBOT_OPERATION_DIALOGUE.expensive : ROBOT_OPERATION_DIALOGUE.triumph
                 : ROBOT_OPERATION_DIALOGUE.effort;
             result.set(actor.id, { x, y, tilt, expression, activity, badge, carried, malfunction,
-                caption: heroic ? heroicLine : active.dialogue.lines[active.dialogueChoice ? active.dialogueChoice.speakers.indexOf(actor.id) : index] ?? '',
+                caption: heroic ? heroicLine : active.dialogue?.lines[active.dialogueChoice ? active.dialogueChoice.speakers.indexOf(actor.id) : index] ?? '',
                 dialogueChoice: heroic ? undefined : active.dialogueChoice,
                 captionId: heroic ? active.captionId + ':' + (at >= operation!.timing.workEnd ? 'result' : 'effort') : active.captionId,
                 captionUntil: heroic ? operation!.timing.deadline : active.captionUntil,
@@ -466,7 +486,7 @@ export class RobotEncounters {
         return { dialogue: this.speech.snapshot(), attempts: this.attempts, counts: { ...this.counts }, rescueAttempts: this.rescueAttempts, rescues: this.rescues,
             lastRescue: this.lastRescue ? { ...this.lastRescue, position: { ...this.lastRescue.position }, target: { ...this.lastRescue.target } } : undefined,
             trackedRescueActors: this.rescueTried.size, trackedActors: this.previous.size, trackedPairs: this.approaches.size,
-            active: active ? { kind: active.kind, ids: [...active.ids], dialogue: active.dialogue.id,
+            active: active ? { kind: active.kind, ids: [...active.ids], dialogue: active.dialogue?.id,
                 started: active.started, ends: active.ends, confirmed: active.armedUntil === undefined,
                 rescue: active.rescue ? { ...active.rescue, helpers: [...active.rescue.helpers], participantIds: [...active.rescue.participantIds],
                     state: active.activityPhase ?? 'work', resolution: active.resolution ? { ...active.resolution, position: { ...active.resolution.position } } : undefined } : undefined } : undefined };

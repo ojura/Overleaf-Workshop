@@ -4,7 +4,7 @@ import type { PdfPagePresentationCandidate, PdfPageCoverage } from './pdf-page-p
 import { paintRobotVehicle, robotArtworkGeometry, RobotRandom, ROBOT_ARTWORK_SIZE, ROBOT_FORKLIFT_ATTACHMENT, ROBOT_AIRLIFT_ATTACHMENT, ROBOT_VEHICLES, type RobotArtworkActor, type RobotVehicle, type RobotDispatchPort, type RobotDispatchPoint } from './prefetch-robots';
 import { pdfCachePolicy } from './scroll-prefetch';
 import { installReservedText } from './reserved-text';
-import type { RobotDialogueChoice, RobotDialogueOpportunity } from './robot-dialogue';
+import { robotDialogueChoiceSupported, type RobotDialogueChoice, type RobotDialogueFact, type RobotDialogueOpportunity, type RobotDialogueSpeaker } from './robot-dialogue';
 import { RobotEncounters, ROBOT_INTERACTION_REACTIONS, ROBOT_OPERATION_DIALOGUE, type RobotEncounterActor, type RobotEncounterReaction } from './robot-encounters';
 import { LabelPlacementSolver, LABEL_PLACEMENT_LIMITS, type LabelPlacement, type LabelPlacementInput, type PlacementRect } from './label-placement';
 import { ASAP_CLEANER_ARTWORK_SIZE, paintAsapCleaner } from './robot-cleaner-artwork';
@@ -1322,7 +1322,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         hitBoxes.delete(actor.id);
         if (hovered?.id === actor.id) { hovered = undefined; }
         if (greeting?.id === actor.id) { greeting = undefined; }
-        detachActorCaption(actor.id);
+        if (captionGroup?.lines.has(actor.id)) { clearCaption(); }
         release(actor.sprite);
         spriteBytes -= actor.spriteBytes;
         capacityFreed = true;
@@ -2656,8 +2656,8 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 priority: work.pages.some(page => page.state === 'preparing') ? 2 : 1, leaderAnchors: [] });
         }
         if (bounds.width <= 0 || bounds.height <= 0) { workLabelPlacement.reset(); return; }
-        // Reserve the visible speech rectangle first, including a static bubble whose robots
-        // already returned. Clip it to the viewport so it always consumes exactly one slot.
+        // Reserve readable speech first, including a finished gesture whose speaker remains
+        // visible. Clip it to the viewport so it always consumes exactly one slot.
         const speech = captionGroup?.node.style.opacity === '1' ? captionGroup.placement : undefined;
         let reserved = false;
         if (speech) {
@@ -2693,10 +2693,46 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         clearCaption(); requestPaint();
     }
 
+    function bodyVisibleInViewport(value: BodyPlacement, viewport: ReturnType<typeof viewportBounds>): boolean {
+        const sprite = value.body.sprite;
+        if (value.opacity <= .2 || !sprite.isConnected || !(sprite.width > 0 && sprite.height > 0)) { return false; }
+        const ink = robotArtworkGeometry(value.body.vehicle, value.scale);
+        const angle = value.tilt * Math.PI / 180, cosine = Math.cos(angle), sine = Math.sin(angle);
+        const corners = [[ink.left, ink.top], [ink.right, ink.top], [ink.right, ink.bottom], [ink.left, ink.bottom]]
+            .map(([x, y]) => ({ x: value.point.x + x * cosine - y * sine, y: value.point.y + x * sine + y * cosine }));
+        return Math.max(...corners.map(point => point.x)) > viewport.left
+            && Math.min(...corners.map(point => point.x)) < viewport.right
+            && Math.max(...corners.map(point => point.y)) > viewport.top
+            && Math.min(...corners.map(point => point.y)) < viewport.bottom;
+    }
+
+    function dialogueSpeaker(value: BodyPlacement, cast: readonly BodyPlacement[], reactions: ReadonlyMap<number, RobotEncounterReaction>): RobotDialogueSpeaker {
+        const payload = value.payload, facts: RobotDialogueFact[] = [];
+        const cargo = !!(value.carrying && payload?.canvas && !payload.deposited);
+        if (cargo) {
+            facts.push('cargo');
+            if (cast.some(other => other.body.id !== value.body.id && other.payload === payload && other.carrying)) { facts.push('shared-cargo'); }
+            if (!payload!.resolution && payload!.progress >= HANDOFF_END && payload!.progress < DEPOSIT_START
+                && payload!.operation?.goal === 'delivery' && payload!.operation.outcome.completion === 'fulfilled') { facts.push('placing'); }
+        }
+        if (payload?.deposited && payload.resolution === 'fulfilled' && payload.operation?.goal === 'delivery') { facts.push('completed'); }
+        if (payload && retiring?.pieces.some(piece => piece.payload === payload)) { facts.push('replacing'); }
+        if (value.advance && [...advance.values()].some(work => work.phase !== 'returning'
+            && work.actors.includes(value.advance!) && work.pages.some(page => page.state === 'preparing'))) { facts.push('preparing'); }
+        const reaction = reactions.get(value.body.id), incident = encounters.snapshot().active;
+        if (incident?.kind === 'bump' && incident.confirmed === true && incident.ids.includes(value.body.id)) { facts.push('collision'); }
+        if (reaction?.malfunction === 'smoke') { facts.push('smoke'); }
+        if (reaction?.carried || value.body.carried) { facts.push('carried'); }
+        return { id: value.body.id, vehicle: value.body.vehicle, name: ROBOT_VEHICLES.find(spec => spec.id === value.body.vehicle)!.name, facts };
+    }
+
     function paintCaption(placements: readonly BodyPlacement[], reactions: ReadonlyMap<number, RobotEncounterReaction>,
         viewport: ReturnType<typeof viewportBounds>, policy: Presentation, obstacles: readonly PlacementRect[]): void {
         const at = now();
         if (captionGroup && at >= captionGroup.until) { clearCaption(); }
+        // The caller supplies final painted, visible bodies. A reading interval can outlive
+        // its gesture, but never the actual speakers that make the text part of this scene.
+        if (captionGroup && [...captionGroup.lines.keys()].some(id => !placements.some(value => value.body.id === id))) { clearCaption(); }
         const { fontSize, lineHeight, paddingX, paddingY } = robotCaptionMetrics({ devicePixelRatio: win.devicePixelRatio });
         const width = Math.min(policy.kind === 'desktop' ? 256 : 224, viewport.right - viewport.left - 20);
         const measurementKey = [width, fontSize, lineHeight].join(',');
@@ -2797,6 +2833,20 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const opacity = first.captionId.startsWith('hover:') ? placement.blocked ? 0 : 1 : placement.opacity;
         if (group.shownAt !== undefined && (placement.blocked || opacity <= 0)) { detachCaption(); return; }
         if (!placement.blocked && opacity > 0 && group.shownAt === undefined) {
+            const owners = speechCues.get(group.id)?.owners ?? group.actors;
+            const cast = placements.filter(value => owners.includes(value.body.id));
+            if (group.choice && !robotDialogueChoiceSupported(group.choice, cast.map(value => dialogueSpeaker(value, cast, reactions)))) {
+                // A hidden reservation can cross a real cargo/phase boundary. Release it
+                // without counting exposure; a readable interval has already earned its hold.
+                encounters.releaseSpeech(group.choice);
+                let retry = false;
+                for (const [key, cue] of speechCues) {
+                    if (cue.choice === group.choice) { speechCues.delete(key); retry = true; }
+                }
+                clearCaption();
+                if (retry) { requestPaint(); }
+                return;
+            }
             group.shownAt = at; group.until = at + group.readMs; expireCaption(group);
             if (group.choice && group.choice.lines.length === speakers.length
                 && group.choice.speakers.every(id => speakers.some(value => value.body.id === id))) { encounters.admitSpeech(group.choice); }
@@ -2837,6 +2887,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             return { id: value.body.id, x: value.point.x - sceneOrigin.x, y: value.point.y - sceneOrigin.y, radius,
                 opacity: visible ? value.opacity : 0, phase: value.fixed && value.phase === 'cargo' ? 'parked' : value.phase,
                 group: value.group, remainingMs: value.remainingMs, vehicle: value.body.vehicle, scale: value.scale,
+                carrying: !!(value.carrying && payload?.canvas && !payload.deposited),
                 operationKey: plan?.key ?? documentGeneration + ':advance:' + value.pages.join(',') + ':' + value.body.vehicle,
                 commitments: phase >= 0 ? payload?.phaseCommitments?.[phase]?.get(value.body.id) : undefined,
                 commitmentTimeline: payload?.canvas ? payload.commitmentTimelines?.get(value.body.id) : undefined,
@@ -2859,8 +2910,7 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const speech = (key: string, opportunity: RobotDialogueOpportunity, participants: readonly BodyPlacement[], until: number, passageId?: number) => {
             let cue = speechCues.get(key);
             if (!cue) {
-                const choice = encounters.reserveSpeech(key, opportunity, participants.map(value => ({ id: value.body.id,
-                    vehicle: value.body.vehicle, name: ROBOT_VEHICLES.find(spec => spec.id === value.body.vehicle)!.name })), layoutDomain);
+                const choice = encounters.reserveSpeech(key, opportunity, participants.map(value => dialogueSpeaker(value, participants, reactions)), layoutDomain);
                 if (!choice) { return; }
                 cue = { choice, until, owners: participants.map(value => value.body.id), passageId }; speechCues.set(key, cue);
             }
@@ -2964,17 +3014,31 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 encounters.releaseSpeech(cue.choice); speechCues.delete(key);
             }
         }
+        // One final projection owns cargo, bodies and speech eligibility after traffic.
+        const finalMotion = new Map<number, Point>();
+        const visibility = new Map<number, number>();
+        const projected = live.map(value => {
+            const motion = motions.get(key(value))!, avoid = spacing.get(spacingKey(value));
+            const total = { x: motion.x + (avoid?.x ?? 0), y: motion.y + (avoid?.y ?? 0) };
+            const shown = clamp(avoid?.visibility ?? 1, 0, 1);
+            finalMotion.set(key(value), total);
+            visibility.set(key(value), shown);
+            if (value.payload) { value.payload.motion = total; value.payload.visibility = shown; }
+            return { ...value, point: { x: value.point.x + total.x, y: value.point.y + total.y },
+                opacity: value.opacity * shown, tilt: value.tilt + (value.carrying ? 0 : reactions.get(value.body.id)?.tilt ?? 0) };
+        });
+        const visibleSpeakers = projected.filter(value => bodyVisibleInViewport(value, viewport));
         const speechAvailable = () => !attention && ![...reactions.values()].some(value => value.caption);
         // Already readable text keeps its original owner even after the passing or work phase ends.
         const continuing = captionGroup?.shownAt !== undefined && speechCues.get(captionGroup.id);
-        if (continuing && !continuing.released && continuing.until > at && speechAvailable()) {
+        if (continuing && !continuing.released && continuing.until > at && speechAvailable()
+            && !captionGroup!.id.startsWith('hover:') && !captionGroup!.id.startsWith('greet:')) {
             speech(captionGroup!.id, continuing.choice.opportunity,
-                live.filter(value => continuing.owners.includes(value.body.id)), continuing.until);
+                visibleSpeakers.filter(value => continuing.owners.includes(value.body.id)), continuing.until);
         }
         if (speechAvailable()) {
             for (const passage of traffic.passages?.() ?? []) {
-                const peers = [...(groups.get(passage.winner) ?? []), ...(groups.get(passage.yielding) ?? [])]
-                    .filter(value => value.opacity > .2);
+                const peers = visibleSpeakers.filter(value => spacingKey(value) === passage.winner || spacingKey(value) === passage.yielding);
                 if (!peers.some(value => spacingKey(value) === passage.winner)
                     || !peers.some(value => spacingKey(value) === passage.yielding)) { continue; }
                 speech('passing:' + documentGeneration + ':' + passage.id, 'passing', peers, at + ROBOT_INTERACTION_REACTIONS.captionMs, passage.id);
@@ -2982,18 +3046,18 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             }
         }
         if (speechAvailable()) {
-            const focus = live.find(value => value.payload && value.opacity > .2 && value.carrying
+            const focus = visibleSpeakers.find(value => value.payload && value.carrying
                 && automaticSpeechPhases.get(value.payload.id) === 'set-down'
                 && value.payload.canvas && !value.payload.deposited && !value.payload.resolution
                 && value.payload.progress >= HANDOFF_END && value.payload.progress < DEPOSIT_START
                 && value.payload.operation?.goal === 'delivery' && value.payload.operation.outcome.completion === 'fulfilled');
             if (focus?.payload) {
                 speech('work:' + documentGeneration + ':' + focus.payload.id + ':set-down', 'set-down',
-                    live.filter(value => value.payload === focus.payload && value.opacity > .2), at + ROBOT_INTERACTION_REACTIONS.captionMs);
+                    visibleSpeakers.filter(value => value.payload === focus.payload), at + ROBOT_INTERACTION_REACTIONS.captionMs);
             }
         }
         if (!attention && ![...reactions.values()].some(value => value.caption)) {
-            const focus = live.find(value => value.payload && value.opacity > 0.2
+            const focus = visibleSpeakers.find(value => value.payload
                 && (retiring?.pieces.some(piece => piece.payload === value.payload)
                     || automaticSpeechPhases.get(value.payload.id) === 'carrying' && value.payload.canvas && value.carrying && value.remainingMs > 600
                     || automaticSpeechPhases.get(value.payload.id) === 'deposit' && value.payload.deposited && value.payload.resolution === 'fulfilled'));
@@ -3001,22 +3065,12 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 const opportunity = retiring?.pieces.some(piece => piece.payload === focus.payload) ? 'new-book'
                     : focus.payload.deposited ? 'deposit' : 'carrying';
                 speech('work:' + documentGeneration + ':' + focus.payload.id + ':' + opportunity, opportunity,
-                    live.filter(value => value.payload === focus.payload && value.opacity > 0.2), at + ROBOT_INTERACTION_REACTIONS.captionMs);
+                    visibleSpeakers.filter(value => value.payload === focus.payload), at + ROBOT_INTERACTION_REACTIONS.captionMs);
             }
         }
 
         // The solver checks the actual endpoint-scaled positions and owns finite yielding.
         // Every helper, crop and hardware layer then receives that same group result.
-        const finalMotion = new Map<number, Point>();
-        const visibility = new Map<number, number>();
-        for (const value of live) {
-            const motion = motions.get(key(value))!, avoid = spacing.get(spacingKey(value));
-            const total = { x: motion.x + (avoid?.x ?? 0), y: motion.y + (avoid?.y ?? 0) };
-            const shown = clamp(avoid?.visibility ?? 1, 0, 1);
-            finalMotion.set(key(value), total);
-            visibility.set(key(value), shown);
-            if (value.payload) { value.payload.motion = total; value.payload.visibility = shown; }
-        }
         for (const episode of episodes.values()) {
             for (const payload of episode.payloads) {
                 const motion = finalMotion.get(payload.id) ?? { x: 0, y: 0 };
@@ -3036,13 +3090,10 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
         const displayed: BodyPlacement[] = [];
         hitBoxes.clear(); hitScrollLeft = container.scrollLeft || 0; hitScrollTop = container.scrollTop || 0; hitColumn = documentOffset();
         const failed = new Set<RobotBody>();
-        for (const value of live) {
-            const { body, scale } = value;
-            const opacity = value.opacity * (visibility.get(key(value)) ?? 1);
+        for (const value of projected) {
+            const { body, scale, point, opacity } = value;
             try {
                 const reaction = reactions.get(body.id);
-                const motion = finalMotion.get(key(value))!;
-                const point = { x: value.point.x + motion.x, y: value.point.y + motion.y };
                 body.reactionCarried = !!reaction?.carried;
                 const activity = reaction?.activity ?? value.activity, look = reaction?.look ?? value.look;
                 const expression = reaction?.expression, gesturePhase = reaction?.gesturePhase, notice = reaction?.badge ?? null;
@@ -3059,9 +3110,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
                 const width = ROBOT_ARTWORK_SIZE.width * scale, height = ROBOT_ARTWORK_SIZE.height * scale;
                 Object.assign(body.sprite.style, { width: width.toFixed(2) + 'px', height: height.toFixed(2) + 'px', opacity: String(opacity),
                     transform: 'translate(' + (point.x - sceneOrigin.x - width / 2).toFixed(2) + 'px,'
-                        + (point.y - sceneOrigin.y - height / 2).toFixed(2) + 'px) rotate(' + (value.tilt + (value.carrying ? 0 : reaction?.tilt ?? 0)).toFixed(2) + 'deg)' });
-                displayed.push({ ...value, point, opacity });
-                if (opacity > 0.2) {
+                        + (point.y - sceneOrigin.y - height / 2).toFixed(2) + 'px) rotate(' + value.tilt.toFixed(2) + 'deg)' });
+                displayed.push(value);
+                if (bodyVisibleInViewport(value, viewport)) {
                     const radius = robotArtworkGeometry(body.vehicle, scale).radius;
                     hitBoxes.set(body.id, { x: point.x, y: point.y, radius, placement: { ...value, point } });
                 }
@@ -3073,14 +3124,9 @@ export function installPdfDocumentRobots(container: HTMLElement, options: Option
             const offset = obstacle.group === undefined ? undefined : finalMotion.get(obstacle.group);
             return { x: obstacle.x + (offset?.x ?? 0), y: obstacle.y + (offset?.y ?? 0), width: obstacle.width, height: obstacle.height };
         });
-        if (!failed.size) {
-            const captionActors = displayed.filter(value => captionGroup?.actors.includes(value.body.id));
-            if (captionActors.length && captionActors.every(value => (visibility.get(key(value)) ?? 1) <= 0.2)) { detachCaption(); }
-            paintCaption(displayed.filter(value => value.opacity > 0.2), reactions, viewport, policy, displayedObstacles);
-            paintWorkLabels(displayed, viewport, displayedObstacles); return;
-        }
-        retireFailedBodies(failed);
-        paintWorkLabels(displayed.filter(value => !failed.has(value.body)), viewport, displayedObstacles);
+        if (failed.size) { retireFailedBodies(failed); }
+        paintCaption(displayed.filter(value => bodyVisibleInViewport(value, viewport)), reactions, viewport, policy, displayedObstacles);
+        paintWorkLabels(displayed.filter(value => value.body.sprite.isConnected), viewport, displayedObstacles);
     }
 
     function retireFailedBodies(failed: ReadonlySet<RobotBody>): void {

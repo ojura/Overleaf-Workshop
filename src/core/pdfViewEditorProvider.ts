@@ -124,8 +124,14 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
     private readonly previews: PdfPreviewStore;
     private readonly viewState: PdfViewState;
     /** the open viewers, which a change of overleaf-workshop.pdfViewer.engine reloads */
-    private readonly editors = new Set<{ doc: PdfDocument, panel: vscode.WebviewPanel, render: () => Promise<void>, dispose: () => void }>();
+    private readonly editors = new Set<{ doc: PdfDocument, panel: vscode.WebviewPanel, render: () => Promise<void>, robotsChanged: () => void, dispose: () => void }>();
     private engineGeneration = 0;
+    /** Global configuration updates must commit in the order the user requested them. */
+    private robotPreferenceWrites: Promise<void> = Promise.resolve();
+
+    private robotsEnabled(): boolean {
+        return vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer').get<boolean>('robotsEnabled', true);
+    }
     /** the folder of pdf.js's release in views/pdf-viewer/, from the extension's package.json */
     private readonly pdfjsRelease: string;
 
@@ -328,6 +334,9 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         const editor = {
             doc,
             panel: webviewPanel,
+            robotsChanged: () => {
+                if (!panelDisposed) { post({ type: 'robotsEnabledChanged', page: bridge.page, enabled: this.robotsEnabled() }); }
+            },
             render: async () => {
                 if (panelDisposed) { return; }
                 const generation = ++renderGeneration, page = randomUUID();
@@ -378,6 +387,16 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                 case 'syncPdf':
                     if (doc.isProjectFile) {
                         vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.syncPdf`, e.content);
+                    }
+                    break;
+                case 'setRobotsEnabled':
+                    if (e.page === bridge.page && typeof e.enabled === 'boolean') {
+                        const page = bridge.page, enabled = e.enabled;
+                        this.robotPreferenceWrites = this.robotPreferenceWrites.then(async () => {
+                            if (panelDisposed || page !== bridge.page) { return; }
+                            await vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer')
+                                .update('robotsEnabled', enabled, vscode.ConfigurationTarget.Global);
+                        }).catch(error => console.warn('Robot visibility could not be saved:', error));
                     }
                     break;
                 case 'saveState':
@@ -442,7 +461,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                         scrollMode: config.get<string>('defaultScrollMode'),
                         spreadMode: config.get<string>('defaultSpreadMode'),
                     };
-                    post({type:'initState', content:state, colorThemes, defaults});
+                    post({type:'initState', content:state, robotsEnabled:this.robotsEnabled(), colorThemes, defaults});
                     updateWebview();
                     postStatus();
                     reportCache();
@@ -473,6 +492,9 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             } },
             vscode.commands.registerCommand(`${ROOT_NAME}.pdfViewer.exportPreviewSource`, (uri?: vscode.Uri) => this.exportPreviewSource(uri)),
             vscode.workspace.onDidChangeConfiguration((e) => {
+                if (e.affectsConfiguration('overleaf-workshop.pdfViewer.robotsEnabled')) {
+                    for (const editor of this.editors) { editor.robotsChanged(); }
+                }
                 if (e.affectsConfiguration('overleaf-workshop.pdfViewer.engine')) {
                     this.applyEngine().catch((error) => console.error('overleaf-workshop: switching the PDF viewer:', error));
                 }

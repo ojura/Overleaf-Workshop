@@ -590,6 +590,12 @@
           "scope": "machine",
           "markdownDescription": "%configuration.pdfViewer.engine.markdownDescription%"
         },
+        "overleaf-workshop.pdfViewer.robotsEnabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "markdownDescription": "%configuration.pdfViewer.robotsEnabled.markdownDescription%"
+        },
         "overleaf-workshop.pdfViewer.pieceCacheSizeMB": {
           "type": "number",
           "default": 4096,

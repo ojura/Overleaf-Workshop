@@ -252,6 +252,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     let document: any;
     let disposed = false;
     let robotPreferenceRevision = 0;
+    let robotRestoreRevision = 0;
     const robotsPreference: ViewerBooleanPreference = options.robotsPreference ?? {
         read() {
             const value = win?.localStorage.getItem(ROBOTS_PREFERENCE_KEY);
@@ -512,9 +513,9 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
     }
 
     function restoreDocumentRobotsPreference(): void {
-        const revision = robotPreferenceRevision;
+        const revision = robotRestoreRevision;
         const apply = () => {
-            if (disposed || revision !== robotPreferenceRevision) { return; }
+            if (disposed || revision !== robotRestoreRevision) { return; }
             let stored: boolean | undefined;
             try { stored = robotsPreference.read(); } catch { /* Storage may be unavailable. */ }
             setDocumentRobotsEnabled(options.robotsEnabled ?? (typeof stored === 'boolean' ? stored : true));
@@ -527,6 +528,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
 
     function setRequestedRobotsEnabled(enabled: boolean): void {
         if (disposed) { return; }
+        ++robotRestoreRevision;
         const revision = ++robotPreferenceRevision;
         setDocumentRobotsEnabled(enabled);
         const write = () => {
@@ -1762,6 +1764,12 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             setDispatchOrigin(port) { dispatchOrigin = port; documentRobots?.setDispatchOrigin(port); },
         },
     });
+    const stopRobotPreference = robotsPreference.onDidChange?.(enabled => {
+        if (disposed) { return; }
+        ++robotRestoreRevision;
+        setDocumentRobotsEnabled(enabled);
+        diagnostics?.refreshRobotsEnabled?.();
+    });
     restoreDocumentRobotsPreference();
     if (viewer.pdfDocument) { activate(); }
     if (options.previewSource && viewer.pdfDocument) { setPreviewSource(options.previewSource, viewer.pdfDocument); }
@@ -1784,6 +1792,7 @@ export function installPdfPrefetch(viewer: any, options: Options = {}) {
             else { viewer.getPageLoadingState = previousLoadingHook; }
         }
             disposed = true;
+            stopRobotPreference?.();
             clearDocument();
             renderTimings.dispose();
             if (frame !== undefined) { cancelFrame(frame); }

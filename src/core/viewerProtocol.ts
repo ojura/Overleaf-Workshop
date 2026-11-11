@@ -173,7 +173,6 @@ export interface SavedState {
     spreadMode?: number;
     sidebarView?: number;
     motionLabMeasurementsOpen?: boolean;
-    documentRobotsEnabled?: boolean;
     [other: string]: unknown;
 }
 
@@ -224,7 +223,8 @@ export interface ReadingImageRequest {
  *   fetchResponse, fetchError   answers to the page's requests, for the page that `page` names
  */
 export type HostMessage =
-    | { type: 'initState', content?: SavedState, colorThemes?: Record<string, ThemeColors>, defaults?: { scrollMode?: string, spreadMode?: string } }
+    | { type: 'initState', content?: SavedState, robotsEnabled?: boolean, colorThemes?: Record<string, ThemeColors>, defaults?: { scrollMode?: string, spreadMode?: string } }
+    | { type: 'robotsEnabledChanged', page: string, enabled: boolean }
     | { type: 'load', output: PdfOutput, preview?: PdfPreviewDescriptor, reading?: PdfReadingDescriptor }
     | { type: 'previewChanged', page: string, key: string }
     | { type: 'update', content: ArrayBuffer }
@@ -253,6 +253,7 @@ export type HostMessage =
 export type ViewerMessage =
     | { type: 'ready', page: string }
     | { type: 'saveState', page: string, content: SavedState }
+    | { type: 'setRobotsEnabled', page: string, enabled: boolean }
     | { type: 'syncPdf', content: { page: number, h: number, v: number, identifier: string } }
     | { type: 'recompile' }
     | { type: 'buildGone', build: string }

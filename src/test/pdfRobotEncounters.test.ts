@@ -32,6 +32,13 @@ describe('finite document robot encounters', function () {
         model.update(0, [actor(1, 0), actor(2, 110)]);
         return model.update(40, [actor(1, 30), actor(2, 80)]);
     }
+    function assertCompleteSpeech(reactions: Map<number, any>) {
+        const choice = [...reactions.values()].find(value => value.dialogueChoice)?.dialogueChoice;
+        assert.ok(choice, 'the authored choice belongs to actual reacting speakers');
+        assert.strictEqual([...reactions.values()].filter(value => value.caption).length, choice.lines.length);
+        choice.speakers.forEach((id: number, index: number) => assert.strictEqual(reactions.get(id).caption, choice.lines[index]));
+        return choice;
+    }
 
     it('plays a finite doze, evasive correction and startled apology from a real approaching pair', () => {
         const { model } = owner();
@@ -43,7 +50,7 @@ describe('finite document robot encounters', function () {
         assert.ok(Math.abs(midway.get(1).y) > 10, 'the correction is larger than the vehicle radius');
         const startled = model.update(520, [actor(1, 68), actor(2, 48)]);
         assert.strictEqual(startled.get(2).expression, 'startled');
-        assert.ok(startled.get(1).caption && startled.get(2).caption, 'both sides have distinct reactions');
+        assertCompleteSpeech(startled);
         assert.ok(Math.abs(model.update(800, [actor(1, 80), actor(2, 35)]).get(1).y) > 20, 'the full evasive arc exceeds two body radii');
         const end = model.snapshot().active.ends;
         assert.ok(end < 1540, 'the scene fits the supplied existing motion lifetime');
@@ -82,7 +89,7 @@ describe('finite document robot encounters', function () {
         assert.strictEqual(model.snapshot().active.kind, 'reunion');
         assert.strictEqual(first.get(1).activity, 'celebrate');
         assert.strictEqual(first.get(1).expression, 'pleased');
-        assert.ok(first.get(1).caption && first.get(2).caption, 'recognition has two distinct lines');
+        assertCompleteSpeech(first);
         const next = model.update(200, [actor(1, 48), actor(2, 64)]);
         assert.strictEqual(next.get(1).gesturePhase, next.get(2).gesturePhase, 'their finite gestures share one phase');
         assert.strictEqual(next.get(1).y, -next.get(2).y, 'formation offsets are complementary');
@@ -141,10 +148,9 @@ describe('finite document robot encounters', function () {
         assert.strictEqual(model.snapshot().counts.success, 1);
         assert.strictEqual(success.get(1).activity, undefined, 'the mast/unload pose is unchanged');
         assert.strictEqual(success.get(1).x + success.get(1).y, 0, 'the cargo attachment does not move');
-        const spoken = module.ROBOT_ENCOUNTER_DIALOGUE.find((value: any) => value.id === model.snapshot().active.dialogue);
-        assert.ok(spoken && spoken.kind === 'success');
-        assert.strictEqual(success.get(1).caption, spoken.lines[0]);
-        assert.strictEqual(success.get(1).dialogueChoice.entry.id, spoken.id);
+        const spoken = assertCompleteSpeech(success);
+        assert.strictEqual(spoken.opportunity, 'success', 'the real deposit remains the diagnostic speech trigger');
+        assert.strictEqual(model.snapshot().active.dialogue, spoken.entry.id);
         assert.strictEqual(model.snapshot().dialogue.shown, 0, 'selected speech has not yet been admitted as readable');
         const held = model.update(160, group);
         assert.strictEqual(held.get(1).tilt, 0, 'satisfaction does not tilt a mast away from its deposited cargo');
@@ -186,6 +192,56 @@ describe('finite document robot encounters', function () {
         assert.ok(scout.lines[0] === 'Samo sam pet centimetara širi.' && scout.source.includes('9336'));
         assert.ok(module.ROBOT_ENCOUNTER_DIALOGUE.every((dialogue: any) => dialogue.lines.every((line: string) => line.length <= 120)));
         assert.ok(lines.includes('Pivo poslije smjene?'));
+    });
+
+    it('keeps accepted physical incidents independent of unavailable dialogue', () => {
+        for (const kind of ['near-miss', 'bump']) {
+            const { model, calls } = owner(kind === 'bump' ? [0.1, 0.1, 0] : [0.1, 0.5, 0]);
+            const speakers = [{ id: 1, vehicle: '', name: 'Robot' }, { id: 2, vehicle: '', name: 'Robot' }];
+            model.setSpeechGeometry('blocked');
+            let blocked = 0;
+            for (;;) {
+                const choice = model.reserveSpeech('non-fitting-' + blocked, kind, speakers, 'blocked');
+                if (!choice) { break; }
+                model.rejectSpeechGeometry(choice); blocked++;
+            }
+            assert.ok(blocked > 0); assert.strictEqual(model.snapshot().dialogue.shown, 0);
+            let reaction = approach(model);
+            assert.strictEqual(model.snapshot().active?.kind, kind, 'the existing physical admission still owns its action');
+            if (kind === 'bump') {
+                assert.strictEqual(reaction.size, 0, 'an armed approach has no collision reaction before contact');
+                assert.strictEqual(model.snapshot().active.confirmed, false);
+                assert.strictEqual(model.snapshot().active.dialogue, undefined);
+                reaction = model.update(70, [actor(1, 50), actor(2, 60)]);
+                assert.strictEqual(model.snapshot().active.confirmed, true, 'real contact can confirm a physical incident without dialogue');
+                assert.strictEqual(reaction.get(1).expression, 'annoyed');
+            } else { assert.strictEqual(reaction.get(2).activity, 'sleep'); }
+            assert.strictEqual(calls(), 3, 'speech availability preserves the incident decision RNG sequence');
+            assert.ok([...reaction.values()].every((value: any) => value.caption === ''));
+            assert.strictEqual(model.snapshot().counts[kind === 'bump' ? 'bump' : 'nearMiss'], 1);
+            const end = model.snapshot().active.ends;
+            assert.ok(end < 1540);
+            assert.strictEqual(model.update(end, [actor(1, 95), actor(2, 20)]).size, 0);
+        }
+    });
+
+    it('reserves body-carry speech only when the actual carried reaction begins', () => {
+        const { model, calls } = owner([0, 0]);
+        const crew = [actor(1, 0, 100, { vehicle: 'lugv', scale: 1, remainingMs: 1450 }),
+            actor(2, 180, 40, { vehicle: 'quad', scale: 1, remainingMs: 1450 })];
+        model.update(0, crew);
+        const before = model.update(40, crew.map(value => ({ ...value, x: value.x + 2, remainingMs: 1410 })));
+        const incident = model.snapshot().active;
+        assert.strictEqual(incident?.rescue.kind, 'airlift');
+        assert.strictEqual(before.get(1).carried, false);
+        assert.strictEqual(before.get(1).caption, '', 'the future physical plan is not a present-tense body-carry fact');
+        const rngAtAdmission = calls();
+        const at = incident.started + (incident.ends - incident.started) * 0.6;
+        const carried = model.update(at, crew);
+        assert.strictEqual(carried.get(1).carried, true);
+        assert.strictEqual(carried.get(1).dialogueChoice.entry.id, 'rescue-lugv');
+        assert.ok(carried.get(1).caption.includes('Opet me nosiš?'));
+        assert.strictEqual(calls(), rngAtAdmission, 'the existing phase supplies speech facts without another incident draw');
     });
 
     it('rescues a light advance robot within its existing deadline and keeps the aircraft attached', () => {

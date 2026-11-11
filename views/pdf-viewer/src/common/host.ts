@@ -54,12 +54,22 @@ export function onMessage<T extends Handled>(type: T, handler: (message: Extract
 
 let state: SavedState = vscode.getState() ?? {};
 let readyPromise: Promise<InitState> | undefined;
+let robotsEnabled: boolean | undefined;
+let robotsChanged = false;
+const robotListeners = new Set<(enabled: boolean) => void>();
+onMessage('robotsEnabledChanged', message => {
+    if (message.page !== config.page || typeof message.enabled !== 'boolean') { return; }
+    robotsChanged = true;
+    robotsEnabled = message.enabled;
+    for (const listener of robotListeners) { listener(message.enabled); }
+});
 
 /** Tell the host that the page can take the document; resolves with the host's 'initState'. */
 export function ready(): Promise<InitState> {
     readyPromise ??= new Promise<InitState>((resolve) => {
         onMessage('initState', (message: InitState) => {
             state = { ...message.content, ...state };
+            if (!robotsChanged) { robotsEnabled = message.robotsEnabled; }
             resolve(message);
         });
         post({ type: 'ready', page: config.page });
@@ -83,12 +93,13 @@ export function saveState(partial: Partial<SavedState>) {
 /** Called after the page's final synchronous capture; late callbacks have no message owner. */
 export function disposeHost() {
     disposed = true;
+    robotListeners.clear();
     handlers.clear();
     early.clear();
 }
 
 /** Both viewers wait for the host merge and save only a partial boolean preference. */
-function hostBooleanPreference(key: 'motionLabMeasurementsOpen' | 'documentRobotsEnabled'): ViewerBooleanPreference {
+function hostBooleanPreference(key: 'motionLabMeasurementsOpen'): ViewerBooleanPreference {
     return Object.freeze({
         async whenReady() { await ready(); },
         read: () => typeof state[key] === 'boolean' ? state[key] : undefined,
@@ -96,4 +107,16 @@ function hostBooleanPreference(key: 'motionLabMeasurementsOpen' | 'documentRobot
     });
 }
 export const hostMeasurementsPreference = hostBooleanPreference('motionLabMeasurementsOpen');
-export const hostRobotsPreference = hostBooleanPreference('documentRobotsEnabled');
+/** Global robot visibility is separate from either copy of per-document reader state. */
+export const hostRobotsPreference: ViewerBooleanPreference = Object.freeze({
+    async whenReady() { await ready(); },
+    read: () => robotsEnabled,
+    async write(enabled: boolean) {
+        await ready();
+        post({ type: 'setRobotsEnabled', page: config.page, enabled });
+    },
+    onDidChange(listener: (enabled: boolean) => void) {
+        if (!disposed) { robotListeners.add(listener); }
+        return () => { robotListeners.delete(listener); };
+    },
+});

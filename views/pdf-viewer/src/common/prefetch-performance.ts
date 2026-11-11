@@ -285,6 +285,7 @@ export interface ViewerBooleanPreference {
     whenReady?(): Promise<void>;
     read(): boolean | undefined;
     write(value: boolean): void | Promise<void>;
+    onDidChange?(listener: (value: boolean) => void): () => void;
 }
 
 export type MotionLabMeasurementsPreference = ViewerBooleanPreference;

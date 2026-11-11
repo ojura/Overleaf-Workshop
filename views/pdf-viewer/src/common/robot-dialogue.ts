@@ -2,14 +2,14 @@ export type RobotEncounterKind = 'bump' | 'near-miss' | 'reunion' | 'success' | 
 export interface RobotIncidentDialogue { id: string; kind: RobotEncounterKind; meaningIds: readonly string[]; lines: readonly string[]; source?: string }
 
 /** Stable authored utterance IDs are explicit; text is never used as identity. */
-export const ROBOT_AUTHORED_UTTERANCES: Readonly<Record<string, { text: string; source: string }>> = Object.freeze({
+export const ROBOT_AUTHORED_UTTERANCES: Readonly<Record<string, { text: string; source: string; requiresAny?: readonly RobotDialogueFact[] }>> = Object.freeze({
     "bump-sorry-lead": { text: "Opa!", source: "Existing authored encounter: bump-sorry" },
     "bump-sorry-reply": { text: "Moja greška.", source: "Existing authored encounter: bump-sorry" },
-    "bump-collision-lead": { text: "Kolizije su uključene?!", source: "Existing authored encounter: bump-collision" },
+    "bump-collision-lead": { text: "Kolizije su uključene?!", source: "Existing authored encounter: bump-collision", requiresAny: ["collision"] },
     "bump-collision-reply": { text: "Sad znamo.", source: "Existing authored encounter: bump-collision" },
     "bump-brothers-lead": { text: "Bratski zagrljaj?", source: "Existing authored encounter: bump-brothers" },
     "bump-brothers-reply": { text: "Bez branika, molim.", source: "Existing authored encounter: bump-brothers" },
-    "bump-frkalica-lead": { text: "Oprosti, nisam znao da igramo Frkalicu.", source: "Book-inspired dialogue: Frkalica, main.tex:1858–1874" },
+    "bump-frkalica-lead": { text: "Oprosti, nisam znao da igramo Frkalicu.", source: "Book-inspired dialogue: Frkalica, main.tex:1858–1874", requiresAny: ["collision"] },
     "bump-frkalica-reply": { text: "Bez revanša, molim.", source: "Book-inspired dialogue: Frkalica, main.tex:1858–1874" },
     "bump-scout-lead": { text: "Samo sam pet centimetara širi.", source: "30 godina LARICS-a/main.tex:9336–9350; Scout Mini procurement story, book-inspired satire" },
     "bump-scout-reply": { text: "Ne mjeri me, nisam u javnoj nabavi.", source: "30 godina LARICS-a/main.tex:9336–9350; Scout Mini procurement story, book-inspired satire" },
@@ -42,7 +42,7 @@ export const ROBOT_AUTHORED_UTTERANCES: Readonly<Record<string, { text: string; 
     "reunion-round-reply": { text: "Prvo fotka, onda pivo.", source: "Book-inspired dialogue: Oršulić main.tex:3049; Peti main.tex:3092" },
     "reunion-resource-lead": { text: "Resurs 'zagrljaj' dodijeljen.", source: "Book-inspired dialogue: Petrović main.tex:3122; ROBOBAND main.tex:6412" },
     "reunion-resource-reply": { text: "Uštimani. Kao ROBOBAND.", source: "Book-inspired dialogue: Petrović main.tex:3122; ROBOBAND main.tex:6412" },
-    "reunion-lift-lead": { text: "Vidi koga nosi lift!", source: "Book-inspired dialogue: main.tex:1737, 8908" },
+    "reunion-lift-lead": { text: "Vidi koga nosi lift!", source: "Book-inspired dialogue: main.tex:1737, 8908", requiresAny: ["carried"] },
     "reunion-lift-reply": { text: "Zrak i zemlja. Najbolji frendovi.", source: "Book-inspired dialogue: main.tex:1737, 8908" },
     "reunion-break-lead": { text: "Još ova fotka, pa treće poluvrijeme.", source: "Book-inspired dialogue: football and Jolly Rogers, main.tex:1737-1756, 6635-6644" },
     "reunion-break-reply": { text: "Još ova fotka, pa na Robijevu svirku.", source: "Book-inspired dialogue: football and Jolly Rogers, main.tex:1737-1756, 6635-6644" },
@@ -52,39 +52,39 @@ export const ROBOT_AUTHORED_UTTERANCES: Readonly<Record<string, { text: string; 
     "success-fit-lead": { text: "Na milimetar.", source: "Existing authored encounter: success-fit" },
     "success-fit-reply": { text: "Timski rad.", source: "Existing authored encounter: success-fit" },
     "success-maric-lead": { text: "ovako fino ne bi ni Marić izbrusio", source: "User-supplied dialogue; ENDORSE grinding by demonstration, main.tex:4583–4589" },
-    "success-sofia-lead": { text: "zgrabio sam ga kao SofIA", source: "User-supplied dialogue; SofIA main.tex:6862–6871" },
+    "success-sofia-lead": { text: "zgrabio sam ga kao SofIA", source: "User-supplied dialogue; SofIA main.tex:6862–6871", requiresAny: ["cargo","completed"] },
     "success-mbzirc-lead": { text: "bolje prošlo nego MBZIRC", source: "User-supplied dialogue; mixed MBZIRC 2020 story main.tex:6774, distinct from the 2023 victory at 6813–6815" },
-    "set-down-count-lead": { text: "Na tri!", source: "User-supplied set-down count-in" },
-    "success-handoff-lead": { text: "Držiš?", source: "Book-inspired dialogue: Marić main.tex:2927" },
-    "success-handoff-reply": { text: "Držim. Sad možeš pustiti.", source: "Book-inspired dialogue: Marić main.tex:2927" },
+    "set-down-count-lead": { text: "Na tri!", source: "User-supplied set-down count-in", requiresAny: ["placing"] },
+    "success-handoff-lead": { text: "Držiš?", source: "Book-inspired dialogue: Marić main.tex:2927", requiresAny: ["placing"] },
+    "success-handoff-reply": { text: "Držim. Sad možeš pustiti.", source: "Book-inspired dialogue: Marić main.tex:2927", requiresAny: ["placing"] },
     "success-map-lead": { text: "Ti mapiraj. Ja čuvam leđa.", source: "Book-inspired dialogue: Milas main.tex:2987; Griparić main.tex:2833" },
     "success-map-reply": { text: "Bzz… imamo konsenzus!", source: "Book-inspired dialogue: Milas main.tex:2987; Griparić main.tex:2833" },
     "success-gentle-lead": { text: "Nježno, kao s malinom.", source: "Book-inspired dialogue: Pevec main.tex:3132; Wachtler main.tex:3288" },
-    "success-gentle-reply": { text: "Gripsters petica! Ni piksel ogreben.", source: "Book-inspired dialogue: Pevec main.tex:3132; Wachtler main.tex:3288" },
-    "success-memories-lead": { text: "Radionica sreće: dostava uspjela!", source: "Book-inspired dialogue: Kovačević main.tex:2886; Križmančić main.tex:2907" },
+    "success-gentle-reply": { text: "Gripsters petica! Ni piksel ogreben.", source: "Book-inspired dialogue: Pevec main.tex:3132; Wachtler main.tex:3288", requiresAny: ["completed"] },
+    "success-memories-lead": { text: "Radionica sreće: dostava uspjela!", source: "Book-inspired dialogue: Kovačević main.tex:2886; Križmančić main.tex:2907", requiresAny: ["completed"] },
     "success-memories-reply": { text: "Fotka po fotka, zid uspomena.", source: "Book-inspired dialogue: Kovačević main.tex:2886; Križmančić main.tex:2907" },
     "success-precision-lead": { text: "U sridu!", source: "Book-inspired dialogue: main.tex:4041–4046, 965–967" },
     "success-precision-reply": { text: "Prvo precizno. Onda Guinness.", source: "Book-inspired dialogue: main.tex:4041–4046, 965–967" },
     "success-care-lead": { text: "Precizno: parizer na 0,7 milimetara.", source: "Book-inspired dialogue: mock menu and compliant manipulation, main.tex:2357, 3272-3278" },
     "success-care-reply": { text: "Nježno, po Jeleninoj školi.", source: "Book-inspired dialogue: mock menu and compliant manipulation, main.tex:2357, 3272-3278" },
-    "success-guitar-lead": { text: "Predaja u ritmu. Sad jedan akord!", source: "Book-inspired dialogue: Spudić guitar school, main.tex:3182" },
+    "success-guitar-lead": { text: "Predaja u ritmu. Sad jedan akord!", source: "Book-inspired dialogue: Spudić guitar school, main.tex:3182", requiresAny: ["completed"] },
     "success-matko-lead": { text: "možda mi Matko nešto fino skuha", source: "Exact user-supplied reward line and cooking lore" },
     "success-caca-lead": { text: "možda mi Ćaća nešto fino skuha", source: "User-supplied occasional nickname for Matko and cooking lore" },
-    "rescue-smoke-lead": { text: "Pobjegao mi je čarobni dim.", source: "Existing authored encounter: rescue-smoke" },
+    "rescue-smoke-lead": { text: "Pobjegao mi je čarobni dim.", source: "Existing authored encounter: rescue-smoke", requiresAny: ["smoke"] },
     "rescue-smoke-reply": { text: "Drži se. Imamo ekipu.", source: "Existing authored encounter: rescue-smoke" },
     "rescue-field-lead": { text: "Terenski rad. Doslovno.", source: "Existing authored encounter: rescue-field" },
     "rescue-field-reply": { text: "Prvo kolega, onda procedura.", source: "Existing authored encounter: rescue-field" },
-    "rescue-lugv-lead": { text: "Opet me nosiš? Kakav divan kvar!", source: "Existing authored encounter: rescue-lugv" },
+    "rescue-lugv-lead": { text: "Opet me nosiš? Kakav divan kvar!", source: "Existing authored encounter: rescue-lugv", requiresAny: ["carried"] },
     "rescue-lugv-reply": { text: "Samo ovaj put, kolega.", source: "Existing authored encounter: rescue-lugv" },
     "new-leaves-lead": { text: "Novi listovi? Pa nije prošlo 20 godina!", source: "Recovered whole-book curation, main.tex9484–9487" },
-    "new-rjet-lead": { text: "R-JET ekipa, skidamo stari sloj!", source: "Recovered whole-book curation, main.tex1111–1124;4873–4877" },
+    "new-rjet-lead": { text: "R-JET ekipa, skidamo stari sloj!", source: "Recovered whole-book curation, main.tex1111–1124;4873–4877", requiresAny: ["replacing"] },
     "new-clean-lead": { text: "EKO-KOMVOZ, počisti za nama!", source: "Recovered whole-book curation, main.tex4996–5004" },
     "new-orange-lead": { text: "Svi u garažu. Narančastu na gotovs!", source: "Recovered whole-book curation, main.tex9421–9423" },
     "wall-memories-lead": { text: "Zid znamo. Sad slažemo uspomene.", source: "Recovered whole-book curation, main.tex7705;8628" },
     "transport-juraj-lead": { text: "Treba kombi? Zovi Jurja!", source: "Recovered whole-book curation, main.tex9395" },
-    "buffer-dough-lead": { text: "Buffer se diže. Kao tijesto.", source: "Recovered whole-book curation, main.tex746–750" },
-    "work-found-lead": { text: "Iskopao sam još jednu dobru fotku.", source: "Recovered whole-book curation, main.tex2801" },
-    "work-robo-band-lead": { text: "Matko, daj ritam. Mi nosimo!", source: "Recovered whole-book curation, main.tex6412" },
+    "buffer-dough-lead": { text: "Buffer se diže. Kao tijesto.", source: "Recovered whole-book curation, main.tex746–750", requiresAny: ["preparing"] },
+    "work-found-lead": { text: "Iskopao sam još jednu dobru fotku.", source: "Recovered whole-book curation, main.tex2801", requiresAny: ["cargo","completed"] },
+    "work-robo-band-lead": { text: "Matko, daj ritam. Mi nosimo!", source: "Recovered whole-book curation, main.tex6412", requiresAny: ["shared-cargo"] },
     "work-trio-lead": { text: "Trio biciklistikus, drž’ se!", source: "Recovered whole-book curation, main.tex9283–9294" },
     "work-knots-lead": { text: "Punih šest čvorova. Držite se!", source: "Recovered whole-book curation, main.tex2078–2096" },
     "success-barbara-lead": { text: "Barbara javlja: prvi smo!", source: "Recovered whole-book curation, main.tex6813–6815" },
@@ -96,8 +96,8 @@ export const ROBOT_AUTHORED_UTTERANCES: Readonly<Record<string, { text: string; 
     "pioneer-hold-lead": { text: "Ne, MOJE lijevo.", source: "User-selected standalone coordination joke" },
     "pioneer-roll-lead": { text: "Charlie, Delta, Echo, Foxtrot!", source: "Recovered whole-book curation, user-authorized roll call" },
     "aircraft-roll-lead": { text: "Eagle, Hawk, Falcon, Duck, Tukan: pokret!", source: "Recovered whole-book curation, user-authorized drone families" },
-    "pioneer-share-lead": { text: "Ti jednu stranu, ja drugu.", source: "Recovered whole-book curation, main.tex8084; shared carrying" },
-    "pioneer-share-reply": { text: "Fotka na mjestu. Petica, brate!", source: "Recovered whole-book curation, main.tex8084; completed shared deposit" },
+    "pioneer-share-lead": { text: "Ti jednu stranu, ja drugu.", source: "Recovered whole-book curation, main.tex8084; shared carrying", requiresAny: ["shared-cargo"] },
+    "pioneer-share-reply": { text: "Fotka na mjestu. Petica, brate!", source: "Recovered whole-book curation, main.tex8084; completed shared deposit", requiresAny: ["completed"] },
     "echo-sonar-lead": { text: "Sonar kaže: stari prijatelj!", source: "Recovered whole-book curation, main.tex7983; direct robotics joke" },
     "foxtrot-path-lead": { text: "Putanju znam. Do tebe idem napamet.", source: "Recovered whole-book curation, main.tex7674; direct book callback" },
     "bravo-lasers-lead": { text: "Dva lasera. Petica ravno u metu.", source: "Recovered whole-book curation, main.tex7980; direct robotics joke" },
@@ -160,7 +160,9 @@ export const ROBOT_ENCOUNTER_DIALOGUE: readonly RobotIncidentDialogue[] = Object
 /** Semantic speech opportunities are independent of optional motion/incident admission. */
 export type RobotDialogueOpportunity = 'new-book' | 'preparing' | 'carrying' | 'passing' | 'set-down' | 'deposit' | 'returning' | 'waiting' | 'greeting'
     | 'success' | 'bump' | 'near-miss' | 'reunion' | 'rescue';
-export interface RobotDialogueSpeaker { id: number; vehicle: string; name: string }
+/** Current physical evidence belongs to the actual speaker, independently of a speech trigger. */
+export type RobotDialogueFact = 'cargo' | 'shared-cargo' | 'placing' | 'completed' | 'replacing' | 'preparing' | 'collision' | 'smoke' | 'carried';
+export interface RobotDialogueSpeaker { id: number; vehicle: string; name: string; facts?: readonly RobotDialogueFact[] }
 export interface RobotDialogueRole { vehicles?: readonly string[]; names?: readonly string[]; excludeNames?: readonly string[] }
 export interface RobotDialogueEntry {
     id: string;
@@ -181,21 +183,31 @@ export interface RobotDialogueChoice {
     readonly speakers: readonly number[];
     readonly lines: readonly string[];
 }
+export const ROBOT_DIALOGUE_POLICY = Object.freeze({ recentAdmissions: 3 });
 function hash(value: string, seed: number): number {
     let result = seed >>> 0;
     for (const character of value) { result = Math.imul(result ^ character.charCodeAt(0), 16777619); }
-    return result >>> 0;
+    result ^= result >>> 16; result = Math.imul(result, 0x7feb352d);
+    result ^= result >>> 15; result = Math.imul(result, 0x846ca68b);
+    return (result ^ result >>> 16) >>> 0;
+}
+function fitsParticipants(entry: RobotDialogueEntry, actors: readonly RobotDialogueSpeaker[]): boolean {
+    return actors.length >= (entry.minParticipants ?? entry.lines.length) && actors.length <= (entry.maxParticipants ?? 12)
+        && entry.lines.length > 0 && entry.lines.length <= 3 && (!entry.roles || entry.roles.length === entry.lines.length);
+}
+function supportsLine(entry: RobotDialogueEntry, index: number, actor: RobotDialogueSpeaker): boolean {
+    const role = entry.roles?.[index];
+    const evidence = ROBOT_AUTHORED_UTTERANCES[entry.meaningIds?.[index] ?? '']?.requiresAny;
+    return (!role?.vehicles || role.vehicles.includes(actor.vehicle)) && (!role?.names || role.names.includes(actor.name))
+        && !role?.excludeNames?.includes(actor.name) && (!evidence || evidence.some(fact => actor.facts?.includes(fact)));
 }
 function assign(entry: RobotDialogueEntry, actors: readonly RobotDialogueSpeaker[]): number[] | undefined {
-    if (actors.length < (entry.minParticipants ?? entry.lines.length) || actors.length > (entry.maxParticipants ?? 12)) { return; }
-    if (!entry.lines.length || entry.lines.length > 3 || entry.roles && entry.roles.length !== entry.lines.length) { return; }
+    if (!fitsParticipants(entry, actors)) { return; }
     const selected: number[] = [];
     const match = (index: number): boolean => {
         if (index === entry.lines.length) { return true; }
-        const role = entry.roles?.[index];
         for (const actor of actors) {
-            if (selected.includes(actor.id) || role?.vehicles && !role.vehicles.includes(actor.vehicle)
-                || role?.names && !role.names.includes(actor.name) || role?.excludeNames?.includes(actor.name)) { continue; }
+            if (selected.includes(actor.id) || !supportsLine(entry, index, actor)) { continue; }
             selected.push(actor.id);
             if (match(index + 1)) { return true; }
             selected.pop();
@@ -203,6 +215,15 @@ function assign(entry: RobotDialogueEntry, actors: readonly RobotDialogueSpeaker
         return false;
     };
     return match(0) ? selected : undefined;
+}
+/** Recheck an unread choice at first visible admission without changing its reserved cast or history. */
+export function robotDialogueChoiceSupported(choice: RobotDialogueChoice, actors: readonly RobotDialogueSpeaker[]): boolean {
+    return fitsParticipants(choice.entry, actors) && choice.speakers.length === choice.lines.length
+        && new Set(actors.map(actor => actor.id)).size === actors.length
+        && choice.speakers.every((id, index) => {
+            const actor = actors.find(value => value.id === id);
+            return !!actor && supportsLine(choice.entry, index, actor);
+        });
 }
 /** A reservation is immutable. Only first readable display commits catalogue coverage. */
 export class RobotDialogueSelection {
@@ -232,7 +253,8 @@ export class RobotDialogueSelection {
                 throw new Error('Each dialogue line requires a distinct authored meaning ID.');
             }
             entry.meaningIds!.forEach((id, index) => {
-                if (!id || meanings.has(id) && meanings.get(id) !== entry.lines[index]) {
+                if (!id || meanings.has(id) && meanings.get(id) !== entry.lines[index]
+                    || ROBOT_AUTHORED_UTTERANCES[id] && ROBOT_AUTHORED_UTTERANCES[id].text !== entry.lines[index]) {
                     throw new Error('A shared authored meaning ID must reference the same text.');
                 }
                 meanings.set(id, entry.lines[index]);
@@ -246,21 +268,28 @@ export class RobotDialogueSelection {
         if (!key || this.reservations.size >= this.maxReservations || actors.length > 12
             || actors.some(actor => !Number.isSafeInteger(actor.id) || actor.id < 1)
             || new Set(actors.map(actor => actor.id)).size !== actors.length) { return; }
+        const held = new Set([...this.reservations.values()].flatMap(value => value.choice.entry.meaningIds!));
         const candidates = this.catalogue.flatMap(entry => {
-            const speakers = entry.opportunities.includes(opportunity) && (!allowedIds || allowedIds.includes(entry.id)) && this.blocked.get(entry.id) !== geometry ? assign(entry, actors) : undefined;
+            const shared = entry.meaningIds!.every(id => !!ROBOT_AUTHORED_UTTERANCES[id]);
+            const speakers = (shared || entry.opportunities.includes(opportunity)) && (!allowedIds || allowedIds.includes(entry.id))
+                && !entry.meaningIds!.some(id => held.has(id)) && this.blocked.get(entry.id) !== geometry ? assign(entry, actors) : undefined;
             return speakers ? [{ entry, speakers }] : [];
         });
         this.eligible += candidates.length;
-        const reserved = (entry: RobotDialogueEntry) => [...this.reservations.values()].filter(value => !value.shown
-            && value.choice.entry.meaningIds!.some(id => entry.meaningIds!.includes(id))).length;
         const exposure = (entry: RobotDialogueEntry) => entry.meaningIds!.reduce((sum, id) => sum + (this.coverage.get(id)?.count ?? 0), 0) / entry.meaningIds!.length;
         const recency = (entry: RobotDialogueEntry) => Math.max(...entry.meaningIds!.map(id => this.coverage.get(id)?.last ?? -1));
-        candidates.sort((a, b) => Number(!!a.entry.fallback) - Number(!!b.entry.fallback)
-            || exposure(a.entry) - exposure(b.entry)
-            || reserved(a.entry) - reserved(b.entry)
-            || recency(a.entry) - recency(b.entry)
-            || hash(key + ':' + a.entry.id, this.seed) - hash(key + ':' + b.entry.id, this.seed));
-        const selected = candidates[0];
+        const authored = candidates.filter(value => !value.entry.fallback);
+        const pool = authored.length ? authored : candidates;
+        // Only readable admissions advance spacing. Active aliases hold their sentence
+        // until release; an exhausted repertoire can leave the scene quiet.
+        const fresh = pool.filter(value => {
+            const last = recency(value.entry);
+            return last < 0 || this.shown - last >= ROBOT_DIALOGUE_POLICY.recentAdmissions;
+        });
+        fresh.sort((a, b) => exposure(a.entry) - exposure(b.entry)
+            || hash(key + ':' + this.shown + ':' + a.entry.id, this.seed) - hash(key + ':' + this.shown + ':' + b.entry.id, this.seed)
+            || (a.entry.id < b.entry.id ? -1 : a.entry.id > b.entry.id ? 1 : 0));
+        const selected = fresh[0];
         if (!selected) { return; }
         const choice = Object.freeze({ opportunity, token: ++this.serial, key, entry: selected.entry,
             speakers: Object.freeze(selected.speakers), lines: Object.freeze([...selected.entry.lines]) });
@@ -301,7 +330,7 @@ export class RobotDialogueSelection {
     }
 }
 
-/** Authored words belong to current speakers, with eligibility tied to their work or encounter. */
+/** Original opportunity labels document provenance; canonical words share a fact-grounded repertoire. */
 function work(id: string, opportunities: readonly RobotDialogueOpportunity[], meaningIds: readonly string[], source: string, constraints: Partial<Pick<RobotDialogueEntry, "roles" | "minParticipants" | "maxParticipants">> = {}): RobotDialogueEntry {
     return { id, opportunities, meaningIds, lines: utteranceLines(meaningIds), source, ...constraints };
 }
@@ -333,7 +362,7 @@ export const ROBOT_CURATED_WORK_DIALOGUE: readonly RobotDialogueEntry[] = [
     work("scout-var-story", ["greeting","carrying"], ["scout-var-story-lead"], "Recovered whole-book curation, main.tex9345; direct book callback"),
     work("scout-mug-story", ["greeting","carrying"], ["scout-mug-story-lead"], "Recovered whole-book curation, main.tex9345; direct book callback"),
     work("scout-predecessors", ["greeting","carrying"], ["scout-predecessors-lead"], "User-requested Scout Mini quip; requires the actual named speaker", {"roles":[{"names":["Scout Mini"]}]}),
-    work("pioneer-hold", ["carrying","passing"], ["pioneer-hold-lead"], "User-selected standalone coordination joke"),
+    work("pioneer-hold", ["carrying","passing"], ["pioneer-hold-lead"], "User-selected standalone coordination joke", {"minParticipants":2}),
     work("private-zone", ["passing","near-miss","bump"], ["private-zone-lead"], "User-supplied dialogue; Ivica Draganjac PhD private-zone reference", {"minParticipants":2}),
     work("set-down-count", ["set-down"], ["set-down-count-lead"], "User-supplied set-down count-in"),
     work("success-handoff", ["set-down"], ["success-handoff-lead","success-handoff-reply"], "Book-inspired dialogue: Marić main.tex:2927; before actual deposit"),
@@ -341,13 +370,13 @@ export const ROBOT_CURATED_WORK_DIALOGUE: readonly RobotDialogueEntry[] = [
     work("aircraft-roll", ["greeting"], ["aircraft-roll-lead"], "Recovered whole-book curation, user-authorized drone families"),
     work("pioneer-share", ["carrying"], ["pioneer-share-lead"], "Recovered whole-book curation, main.tex8084; shared carrying", {"minParticipants":2}),
     work("pioneer-share-deposit", ["deposit"], ["pioneer-share-reply"], "Recovered whole-book curation, main.tex8084; completed shared deposit", {"minParticipants":2}),
-    work("echo-sonar", ["reunion"], ["echo-sonar-lead"], "Recovered whole-book curation, main.tex7983; direct robotics joke"),
-    work("foxtrot-path", ["reunion"], ["foxtrot-path-lead"], "Recovered whole-book curation, main.tex7674; direct book callback"),
-    work("bravo-lasers", ["reunion"], ["bravo-lasers-lead"], "Recovered whole-book curation, main.tex7980; direct robotics joke"),
-    work("charlie-qr", ["reunion"], ["charlie-qr-lead"], "Recovered whole-book curation, main.tex8087; direct robotics joke"),
-    work("delta-route", ["reunion"], ["delta-route-lead"], "Recovered whole-book curation, main.tex7632; direct book callback"),
+    work("echo-sonar", ["reunion"], ["echo-sonar-lead"], "Recovered whole-book curation, main.tex7983; direct robotics joke", {"minParticipants":2}),
+    work("foxtrot-path", ["reunion"], ["foxtrot-path-lead"], "Recovered whole-book curation, main.tex7674; direct book callback", {"minParticipants":2}),
+    work("bravo-lasers", ["reunion"], ["bravo-lasers-lead"], "Recovered whole-book curation, main.tex7980; direct robotics joke", {"minParticipants":2}),
+    work("charlie-qr", ["reunion"], ["charlie-qr-lead"], "Recovered whole-book curation, main.tex8087; direct robotics joke", {"minParticipants":2}),
+    work("delta-route", ["reunion"], ["delta-route-lead"], "Recovered whole-book curation, main.tex7632; direct book callback", {"minParticipants":2}),
     work("eagle-alpha-five", ["reunion"], ["eagle-alpha-five-lead","eagle-alpha-five-reply"], "Recovered whole-book curation, user EagleRed/Alpha assignments; actual speakers", {"roles":[{"names":["EagleRed"]},{}]}),
-    work("buddy-consensus", ["reunion"], ["buddy-consensus-lead"], "Recovered whole-book curation, main.tex3092"),
+    work("buddy-consensus", ["reunion"], ["buddy-consensus-lead"], "Recovered whole-book curation, main.tex3092", {"minParticipants":2}),
     work("reunion-pioneers", ["reunion"], ["pioneer-viv-team"], "User-supplied Pioneer/VIV callback", {"minParticipants":2,"roles":[{"excludeNames":["VIV"]}]}),
     work("success-team-pioneer", ["deposit"], ["pioneer-viv-team"], "User-supplied Pioneer/VIV callback", {"minParticipants":2,"roles":[{"excludeNames":["VIV"]}]}),
 ];

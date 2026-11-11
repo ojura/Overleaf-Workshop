@@ -60,7 +60,8 @@ describe('semantic robot dialogue admission', function () {
     });
     it('does not let a persistently non-fitting unseen entry starve fitting speech', () => {
         const model = new module.RobotDialogueSelection([
-            { id: 'short', opportunities: ['carrying'], lines: ['Fits.'], source: 'synthetic geometry fixture' },
+            ...Array.from({ length: 4 }, (_, index) => ({ id: 'short-' + index, opportunities: ['carrying'],
+                lines: ['Fits ' + index + '.'], source: 'synthetic geometry fixture' })),
             { id: 'long', opportunities: ['carrying'], lines: ['A longer authored meaning.'], source: 'synthetic geometry fixture' },
         ], 3);
         let readable = 0;
@@ -102,19 +103,19 @@ describe('semantic robot dialogue admission', function () {
     it('keeps shared carrying, handoff and completion words in their actual work phases', () => {
         const entries = module.robotDialogueCatalogue(module.ROBOT_ENCOUNTER_DIALOGUE);
         const current = [{ id: 11, vehicle: 'hexapod', name: 'ALKA' }, { id: 12, vehicle: 'mecanum', name: 'XENA' }];
-        const reserve = (id: string, opportunity: string, actors = current) => {
+        const reserve = (id: string, opportunity: string, actors = current, facts: string[] = []) => {
             const entry = entries.find((value: any) => value.id === id); assert.ok(entry);
-            return new module.RobotDialogueSelection([entry]).reserve('work', opportunity, actors);
+            return new module.RobotDialogueSelection([entry]).reserve('work', opportunity, actors.map(actor => ({ ...actor, facts })));
         };
-        assert.strictEqual(reserve('pioneer-share', 'carrying', current.slice(0, 1)), undefined);
-        assert.deepStrictEqual(reserve('pioneer-share', 'carrying').entry.meaningIds, ['pioneer-share-lead']);
+        assert.strictEqual(reserve('pioneer-share', 'carrying', current.slice(0, 1), ['shared-cargo']), undefined);
+        assert.deepStrictEqual(reserve('pioneer-share', 'carrying', current, ['shared-cargo']).entry.meaningIds, ['pioneer-share-lead']);
         assert.strictEqual(reserve('pioneer-share-deposit', 'carrying'), undefined);
-        assert.strictEqual(reserve('pioneer-share-deposit', 'deposit', current.slice(0, 1)), undefined);
-        assert.deepStrictEqual(reserve('pioneer-share-deposit', 'deposit').entry.meaningIds, ['pioneer-share-reply']);
+        assert.strictEqual(reserve('pioneer-share-deposit', 'deposit', current.slice(0, 1), ['completed']), undefined);
+        assert.deepStrictEqual(reserve('pioneer-share-deposit', 'deposit', current, ['completed']).entry.meaningIds, ['pioneer-share-reply']);
         assert.strictEqual(reserve('success-handoff', 'success'), undefined);
         assert.strictEqual(reserve('success-handoff', 'deposit'), undefined);
-        assert.strictEqual(reserve('success-handoff', 'set-down', current.slice(0, 1)), undefined);
-        assert.deepStrictEqual(reserve('success-handoff', 'set-down').speakers, [11, 12]);
+        assert.strictEqual(reserve('success-handoff', 'set-down', current.slice(0, 1), ['placing']), undefined);
+        assert.deepStrictEqual(reserve('success-handoff', 'set-down', current, ['placing']).speakers, [11, 12]);
     });
 
     it('keeps named first-person jokes with the actual named speaker and complete exchange', () => {
@@ -162,8 +163,11 @@ describe('semantic robot dialogue admission', function () {
         ];
         const model = new module.RobotDialogueSelection(entries, 1);
         const incident = model.reserve('incident', 'success', [actor]);
-        assert.strictEqual(model.reserve('parallel', 'carrying', [actor]).entry.id, 'other');
+        const parallel = model.reserve('parallel', 'carrying', [actor]);
+        assert.strictEqual(parallel.entry.id, 'other');
         model.admit(incident); model.release(incident);
+        assert.strictEqual(model.reserve('while-pending', 'carrying', [actor]), undefined);
+        model.release(parallel);
         const second = model.reserve('next', 'carrying', [actor]);
         assert.strictEqual(second.entry.id, 'other');
         assert.deepStrictEqual(model.snapshot().coverage.map((value: any) => value.id), ['shared']);
@@ -185,13 +189,219 @@ describe('semantic robot dialogue admission', function () {
         const entries = module.robotDialogueCatalogue(module.ROBOT_ENCOUNTER_DIALOGUE);
         const eligible = (opportunity: string) => entries.filter((entry: any) => {
             const model = new module.RobotDialogueSelection([entry]);
-            return !!model.reserve('event', opportunity, [actor]);
+            return !!model.reserve('event', opportunity, [actor, { id: 2, vehicle: 'forklift', name: 'Navines' }]);
         });
         const preparation = eligible('preparing');
         assert.ok(preparation.length >= 5);
         assert.ok(preparation.some((entry: any) => entry.id === 'work-care'));
-        assert.deepStrictEqual(eligible('returning').map((entry: any) => entry.id).sort(), ['success-caca', 'success-matko']);
-        assert.ok(!preparation.some((entry: any) => entry.id === 'success-maric'));
+        const returning = eligible('returning').map((entry: any) => entry.id);
+        assert.ok(returning.includes('success-caca') && returning.includes('success-matko'));
+        assert.ok(returning.includes('work-care') && returning.includes('work-organism'), 'ordinary remarks remain available during return');
+        assert.ok(returning.includes('success-maric'), 'ordinary praise and comparisons remain shared conversation');
+        assert.ok(!returning.includes('success-memories'), 'a return label does not manufacture a completed-delivery fact');
+        assert.ok(!preparation.some((entry: any) => entry.id === 'success-memories'));
+    });
+
+    describe('shared authored repertoire', () => {
+        const crew = [actor, { id: 2, vehicle: 'forklift', name: 'Navines' }];
+        const authored = () => module.robotDialogueCatalogue(module.ROBOT_ENCOUNTER_DIALOGUE);
+        const entry = (id: string) => authored().find((value: any) => value.id === id);
+
+        it('offers ordinary authored conversation across activities instead of small event buckets', () => {
+            for (const opportunity of ['passing', 'carrying', 'waiting', 'preparing', 'returning']) {
+                for (const id of ['miss-coffee', 'reunion-beer', 'work-organism', 'scout-var-story',
+                    'success-matko', 'success-caca', 'buddy-consensus', 'success-care', 'work-album', 'pioneer-hold',
+                    'success-nailed', 'success-fit', 'success-maric', 'success-precision', 'success-mbzirc', 'success-barbara']) {
+                    const choice = new module.RobotDialogueSelection([entry(id)]).reserve('scene', opportunity, crew);
+                    assert.ok(choice, id + ' is ordinary conversation during ' + opportunity);
+                    assert.ok(choice.speakers.every((speaker: number) => crew.some(value => value.id === speaker)));
+                }
+            }
+        });
+
+        it('uses real speaker facts for literal work claims instead of granting facts from a label', () => {
+            const cases = [
+                ['work-found', 'cargo'], ['pioneer-share', 'shared-cargo'], ['work-robo-band', 'shared-cargo'],
+                ['set-down-count', 'placing'], ['pioneer-share-deposit', 'completed'],
+                ['new-rjet', 'replacing'], ['buffer-dough', 'preparing'],
+            ];
+            for (const [id, fact] of cases) {
+                const value = entry(id);
+                assert.strictEqual(new module.RobotDialogueSelection([value]).reserve('label', value.opportunities[0], crew), undefined,
+                    id + ' needs actual evidence even at its original event label');
+                const current = [crew[0], { ...crew[1], facts: [fact] }];
+                const choice = new module.RobotDialogueSelection([value]).reserve('actual', 'passing', current);
+                assert.ok(choice, id + ' is truthful whenever its actual speaker has ' + fact);
+                assert.deepStrictEqual(choice.speakers, [2], id + ' belongs to the participating actor with the fact');
+            }
+            for (const id of ['success-sofia', 'work-found']) {
+                for (const fact of ['cargo', 'completed']) {
+                    assert.ok(new module.RobotDialogueSelection([entry(id)]).reserve('pickup-or-result', 'passing',
+                        [{ ...actor, facts: [fact] }]), 'the acquired-object claim is true at pickup or successful delivery');
+                }
+            }
+        });
+
+        it('requires every factual line of a full exchange and keeps rescue claims with their actual speaker', () => {
+            for (const [id, fact] of [['success-handoff', 'placing']]) {
+                const value = entry(id);
+                const one = [{ ...crew[0], facts: [fact] }, crew[1]];
+                assert.strictEqual(new module.RobotDialogueSelection([value]).reserve('one', 'passing', one), undefined);
+                const both = crew.map(value => ({ ...value, facts: [fact] }));
+                assert.deepStrictEqual(new module.RobotDialogueSelection([value]).reserve('both', 'passing', both).speakers, [1, 2]);
+            }
+            for (const [id, fact] of [['rescue-smoke', 'smoke'], ['rescue-lugv', 'carried'], ['reunion-lift', 'carried'],
+                ['bump-collision', 'collision'], ['success-memories', 'completed']]) {
+                const value = entry(id);
+                assert.strictEqual(new module.RobotDialogueSelection([value]).reserve('label', value.opportunities[0], crew), undefined);
+                const actual = [crew[0], { ...crew[1], facts: [fact] }];
+                const choice = new module.RobotDialogueSelection([value]).reserve('actual', 'passing', actual);
+                assert.ok(choice, id + ' has actual supporting event evidence');
+                assert.deepStrictEqual(choice.speakers, [2, 1], 'the factual first line belongs to its real subject');
+            }
+        });
+
+        it('draws repeated actual passages from many authored meanings and former event origins', () => {
+            const model = new module.RobotDialogueSelection(authored(), 13);
+            const meanings = new Set<string>(), origins = new Set<string>(), recent: string[][] = [];
+            for (let index = 0; index < 12; index++) {
+                const choice = model.reserve('passage-' + index, 'passing', crew);
+                assert.ok(choice, 'another real passage has the shared ordinary repertoire available');
+                for (const id of choice.entry.meaningIds) {
+                    assert.ok(!recent.slice(-3).some(previous => previous.includes(id)), 'readable aliases respect recent history');
+                    meanings.add(id);
+                }
+                choice.entry.opportunities.forEach((origin: string) => origins.add(origin));
+                recent.push([...choice.entry.meaningIds]);
+                assert.strictEqual(model.admit(choice), true); model.release(choice);
+            }
+            assert.ok(meanings.size >= 12, 'passages use a broad authored repertoire');
+            assert.ok(origins.size >= 4, 'the original event labels do not partition ordinary speech');
+        });
+
+        it('holds active canonical aliases apart without charging unseen reservations as admissions', () => {
+            const model = new module.RobotDialogueSelection(authored(), 13);
+            const first = model.reserve('first', 'passing', crew, 'default', ['work-care']);
+            assert.ok(first);
+            assert.strictEqual(model.reserve('parallel-alias', 'carrying', crew, 'default', ['success-care']), undefined,
+                'a pending exchange cannot queue the same sentence as another pending cue');
+            assert.strictEqual(model.snapshot().shown, 0); assert.deepStrictEqual(model.snapshot().coverage, []);
+            model.release(first);
+            const released = model.reserve('released-alias', 'passing', crew, 'default', ['success-care']);
+            assert.ok(released, 'releasing an unshown choice immediately restores its availability');
+            model.admit(released); model.release(released);
+            assert.strictEqual(model.reserve('recent-alias', 'passing', crew, 'default', ['work-care']), undefined,
+                'the same canonical sentence has one admission history across its aliases');
+        });
+
+        it('checks original assigned speakers and facts again before an unread cue becomes visible', () => {
+            const model = new module.RobotDialogueSelection([entry('work-found')]);
+            const carrying = [{ ...actor, facts: ['cargo'] }];
+            const choice = model.reserve('hidden-pickup', 'carrying', carrying);
+            assert.ok(choice);
+            assert.strictEqual(module.robotDialogueChoiceSupported(choice, carrying), true);
+            assert.strictEqual(module.robotDialogueChoiceSupported(choice, [actor]), false,
+                'a delayed first display cannot inherit the cargo that has already left');
+            assert.strictEqual(module.robotDialogueChoiceSupported(choice, [{ ...carrying[0], id: 3 }]), false,
+                'another qualified actor cannot silently replace the reserved speaker');
+            model.release(choice);
+            assert.strictEqual(model.snapshot().shown, 0); assert.deepStrictEqual(model.snapshot().coverage, []);
+        });
+    });
+
+    describe('readable repetition spacing', () => {
+        const crew = [actor, { id: 2, vehicle: 'forklift', name: 'Navines' }];
+        const authored = () => module.robotDialogueCatalogue(module.ROBOT_ENCOUNTER_DIALOGUE);
+
+        it('lets a repeated passage yield when its alternative was already heard while carrying', () => {
+            const model = new module.RobotDialogueSelection(authored(), 13);
+            for (let index = 0; index < 3; index++) {
+                const carrying = model.reserve('carrying-' + index, 'carrying', crew, 'default', ['pioneer-hold']);
+                assert.ok(carrying); assert.strictEqual(model.admit(carrying), true); model.release(carrying);
+                if (index < 2) {
+                    for (const id of ['work-care', 'work-album', 'work-organism']) {
+                        const other = model.reserve('intervening-' + index + ':' + id, 'carrying', crew, 'default', [id]);
+                        assert.ok(other); model.admit(other); model.release(other);
+                    }
+                }
+            }
+            const passing = model.reserve('passing-1', 'passing', crew, 'default', ['private-zone', 'pioneer-hold']);
+            assert.strictEqual(passing.entry.id, 'private-zone');
+            model.admit(passing); model.release(passing);
+            assert.strictEqual(model.reserve('passing-2', 'passing', crew, 'default', ['private-zone', 'pioneer-hold']), undefined,
+                'an explicitly restricted request yields instead of repeating the lower lifetime count');
+            assert.strictEqual(model.snapshot().opportunities.passing, 1);
+        });
+
+        it('reopens passage meanings after intervening readable speech while preserving unseen coverage', () => {
+            const model = new module.RobotDialogueSelection(authored(), 13);
+            const passing = (key: string) => model.reserve(key, 'passing', crew, 'default', ['private-zone', 'pioneer-hold']);
+            const show = (key: string, opportunity: string, id: string) => {
+                const choice = model.reserve(key, opportunity, crew, 'default', [id]);
+                assert.ok(choice); assert.strictEqual(model.admit(choice), true); model.release(choice);
+            };
+            show('passage-a', 'passing', 'private-zone');
+            show('passage-b', 'passing', 'pioneer-hold');
+            assert.strictEqual(passing('passage-c'), undefined);
+            const unseen = model.reserve('unseen-work', 'carrying', crew, 'default', ['work-care']);
+            assert.ok(unseen); model.release(unseen); model.clear();
+            assert.strictEqual(passing('passage-d'), undefined,
+                'releases and cleanup preserve the last readable passage history');
+            assert.strictEqual(model.snapshot().shown, 2);
+            show('readable-work-a', 'carrying', 'work-care');
+            assert.strictEqual(passing('passage-e'), undefined);
+            show('readable-work-b', 'carrying', 'work-album');
+            const resumed = passing('passage-f');
+            assert.strictEqual(resumed.entry.id, 'private-zone', 'three intervening readable admissions reopen the meaning');
+            model.admit(resumed); model.release(resumed);
+            assert.strictEqual(model.snapshot().opportunities.passing, 3);
+            model.reset();
+            assert.ok(passing('new-scene'), 'a new document starts fresh speech history');
+        });
+
+        it('prefers older eligible speech over lifetime count catch-up', () => {
+            const model = new module.RobotDialogueSelection([
+                { id: 'frequent', opportunities: ['carrying'], meaningIds: ['frequent'], lines: ['Frequently needed.'], source: 'synthetic' },
+                { id: 'recent', opportunities: ['carrying', 'deposit'], meaningIds: ['recent'], lines: ['Just heard.'], source: 'synthetic' },
+                { id: 'fresh', opportunities: ['carrying'], meaningIds: ['fresh'], lines: ['Another task.'], source: 'synthetic' },
+                ...Array.from({ length: 3 }, (_, index) => ({ id: 'elsewhere-' + index, opportunities: ['waiting'],
+                    meaningIds: ['elsewhere-' + index], lines: ['Waiting ' + index + '.'], source: 'synthetic' })),
+            ], 13);
+            const initial = model.reserve('initial', 'carrying', crew, 'default', ['frequent']);
+            model.admit(initial); model.release(initial);
+            for (let index = 0; index < 3; index++) {
+                const waiting = model.reserve('initial-wait-' + index, 'waiting', crew, 'default', ['elsewhere-' + index]);
+                model.admit(waiting); model.release(waiting);
+            }
+            for (const [index, id] of ['frequent', 'fresh', 'recent'].entries()) {
+                const choice = model.reserve('seed-' + index, 'carrying', crew, 'default', [id]);
+                assert.ok(choice); model.admit(choice); model.release(choice);
+            }
+            const elsewhere = model.reserve('waiting-work', 'waiting', crew);
+            model.admit(elsewhere); model.release(elsewhere);
+            const choice = model.reserve('next-work', 'carrying', crew);
+            assert.strictEqual(choice.entry.id, 'frequent', 'recent speech waits while an eligible older meaning can be heard');
+        });
+
+        it('varies successive coverage rounds while reproducing the same admitted history', () => {
+            const record = () => {
+                const model = new module.RobotDialogueSelection(catalogue(), 13), rounds: string[][] = [];
+                for (let round = 0; round < 5; round++) {
+                    const ids: string[] = [];
+                    for (let index = 0; index < 8; index++) {
+                        const choice = model.reserve('work-' + index, 'carrying', [actor]);
+                        assert.ok(choice); model.admit(choice); ids.push(choice.entry.id); model.release(choice);
+                    }
+                    assert.strictEqual(new Set(ids).size, 8, 'each coverage round includes every eligible meaning');
+                    rounds.push(ids);
+                }
+                return rounds;
+            };
+            const rounds = record();
+            assert.ok(rounds.slice(1).some(round => round.join(',') !== rounds[0].join(',')),
+                'coverage rounds vary instead of replaying an oldest-first script');
+            assert.deepStrictEqual(record(), rounds, 'the same scene seed and admitted history reproduce dialogue');
+        });
     });
 
 

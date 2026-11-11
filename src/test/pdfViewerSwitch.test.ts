@@ -34,6 +34,7 @@ const world = {
     settings: {} as Record<string, unknown>,
     updates: [] as unknown[][],
     deleted: [] as string[],
+    updateGate: undefined as Promise<void> | undefined,
     configListeners: [] as ((e: { affectsConfiguration(section: string): boolean }) => void)[],
 };
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value));
@@ -73,6 +74,7 @@ const vscodeMock = withStubs({
             get: (key: string, value: unknown) => (key in world.settings ? world.settings[key] : value),
             update: async (key: string, value: unknown, target: unknown) => {
                 world.updates.push([key, value, target]);
+                await world.updateGate;
                 world.settings[key] = value;
                 const section = `overleaf-workshop.pdfViewer.${key}`;
                 world.configListeners.forEach(listener => listener({ affectsConfiguration: (s: string) => section === s || section.startsWith(`${s}.`) }));
@@ -130,6 +132,7 @@ describe('the button that switches between the pdfjs and the overleaf viewer', (
     beforeEach(() => {
         world.settings = { engine: 'pdfjs' };
         world.updates = [];
+        world.updateGate = undefined;
         world.configListeners = [];
         world.deleted = [];
         storage = new Storage();
@@ -143,6 +146,66 @@ describe('the button that switches between the pdfjs and the overleaf viewer', (
         await provider.viewState?.settled;
         await provider.previews.settled();
         await provider.pieces.dispose();
+    });
+
+    it('shares visibility across documents and engines without changing their reading state', async () => {
+        world.settings.robotsEnabled = false;
+        const first = panel(), second = panel();
+        const firstDoc = await provider.openCustomDocument(Uri.file('/home/u/one.pdf'));
+        const secondDoc = await provider.openCustomDocument(Uri.file('/home/u/two.pdf'));
+        await secondDoc.setEngine('overleaf');
+        await provider.resolveCustomEditor(firstDoc, first.webviewPanel);
+        await provider.resolveCustomEditor(secondDoc, second.webviewPanel);
+        const firstState = { scale: '2', documentRobotsEnabled: true, position: { page: 7 } };
+        const secondState = { scale: '3', documentRobotsEnabled: false, sidebarView: 2 };
+        first.send({ type: 'saveState', page: first.page(), content: firstState });
+        second.send({ type: 'saveState', page: second.page(), content: secondState });
+        for (const editor of [first, second]) {
+            editor.send({ type: 'ready', page: editor.page() });
+            assert.strictEqual(editor.received.find(message => message.type === 'initState')?.robotsEnabled, false);
+        }
+        first.send({ type: 'setRobotsEnabled', page: first.page(), enabled: true });
+        await provider.robotPreferenceWrites;
+        assert.deepStrictEqual(world.updates, [['robotsEnabled', true, 1]]);
+        for (const editor of [first, second]) {
+            assert.deepStrictEqual(editor.received.at(-1), { type: 'robotsEnabledChanged', page: editor.page(), enabled: true });
+            assert.strictEqual(editor.pages.length, 1, 'visibility does not reload the reader');
+        }
+        assert.deepStrictEqual(provider.viewState.read(firstDoc.uri.toString()), firstState);
+        assert.deepStrictEqual(provider.viewState.read(secondDoc.uri.toString()), secondState);
+        const retired = first.page(); await [...provider.editors][0].render();
+        first.send({ type: 'setRobotsEnabled', page: retired, enabled: false });
+        second.dispose(); second.send({ type: 'setRobotsEnabled', page: second.page(), enabled: false });
+        await provider.robotPreferenceWrites;
+        assert.strictEqual(world.updates.length, 1);
+        world.settings.robotsEnabled = false;
+        world.configListeners.forEach(listener => listener({ affectsConfiguration: section => section === 'overleaf-workshop.pdfViewer.robotsEnabled' }));
+        assert.strictEqual(first.received.at(-1).enabled, false);
+        assert.strictEqual(second.received.at(-1).enabled, true, 'closed panels receive no notification');
+    });
+
+    it('serializes rapid global toggles and drops a queued retired-page request', async () => {
+        const editor = panel(), doc = await provider.openCustomDocument(Uri.file('/home/u/ordered-robots.pdf'));
+        await provider.resolveCustomEditor(doc, editor.webviewPanel);
+        let release!: () => void;
+        world.updateGate = new Promise<void>(resolve => { release = resolve; });
+        editor.send({ type: 'setRobotsEnabled', page: editor.page(), enabled: false });
+        await Promise.resolve();
+        editor.send({ type: 'setRobotsEnabled', page: editor.page(), enabled: true });
+        assert.deepStrictEqual(world.updates, [['robotsEnabled', false, 1]]);
+        release(); await provider.robotPreferenceWrites;
+        assert.deepStrictEqual(world.updates, [['robotsEnabled', false, 1], ['robotsEnabled', true, 1]]);
+        assert.strictEqual(world.settings.robotsEnabled, true);
+        world.updateGate = new Promise<void>(resolve => { release = resolve; });
+        editor.send({ type: 'setRobotsEnabled', page: editor.page(), enabled: false });
+        await Promise.resolve();
+        editor.send({ type: 'setRobotsEnabled', page: editor.page(), enabled: true });
+        await [...provider.editors][0].render();
+        release(); await provider.robotPreferenceWrites;
+        assert.strictEqual(world.updates.length, 3, 'queued requests lose authority when their page retires');
+        assert.strictEqual(world.settings.robotsEnabled, false);
+        const setting = packageJSON.contributes.configuration.properties['overleaf-workshop.pdfViewer.robotsEnabled'];
+        assert.strictEqual(setting.scope, 'application'); assert.strictEqual(setting.default, true);
     });
 
     it('flushes the already-received final reading state when the panel closes', async () => {

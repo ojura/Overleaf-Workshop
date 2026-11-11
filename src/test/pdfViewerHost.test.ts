@@ -38,7 +38,8 @@ describe('PDF viewer host disclosure preference', function () {
         const host = module.exports, preference = host.hostMeasurementsPreference;
         assert.ok(preference, 'the shared host adapter must be available to both extension engines');
         return { host, preference, posts, writes, acquired: () => acquired,
-            initialize(content: Record<string, unknown>) { receiver({ data: { type: 'initState', content } }); },
+            initialize(content: Record<string, unknown>, robotsEnabled = true) { receiver({ data: { type: 'initState', content, robotsEnabled } }); },
+            receive(data: unknown) { receiver({ data }); },
             state: () => copy(host.savedState()),
         };
     }
@@ -97,31 +98,36 @@ describe('PDF viewer host disclosure preference', function () {
             const ready = f.preference.whenReady(); f.initialize({}); await ready;
         }
     });
-    it('shares robot visibility across host reopen while preserving the complete reader state', async () => {
-        for (const enabled of [false, true]) {
-            const f = fixture(), preference = f.host.hostRobotsPreference;
-            assert.ok(preference, 'both extension engines have a host-backed visibility adapter');
-            const ready = preference.whenReady();
-            const position = { page: 8, offset: { top: 21, left: 5 }, pageSize: { width: 600, height: 800 } };
-            f.initialize({ documentRobotsEnabled: enabled, scale: '2', position, motionLabMeasurementsOpen: true }); await ready;
-            assert.strictEqual(preference.read(), enabled); assert.deepStrictEqual(f.writes, []);
-            await preference.write(!enabled);
-            assert.deepStrictEqual(f.writes.at(-1), { documentRobotsEnabled: !enabled, scale: '2', position, motionLabMeasurementsOpen: true });
-            const reopened = fixture(f.state()); const settled = reopened.host.hostRobotsPreference.whenReady();
-            reopened.initialize({ scale: '1', documentRobotsEnabled: enabled }); await settled;
-            assert.strictEqual(reopened.host.hostRobotsPreference.read(), !enabled);
-            assert.strictEqual(reopened.state().scale, '2');
-        }
+    it('uses global robot visibility instead of either document-state copy and follows live changes', async () => {
+        const f = fixture({ documentRobotsEnabled: true, scale: '3' });
+        const preference = f.host.hostRobotsPreference, changes: boolean[] = [];
+        const stop = preference.onDidChange((value: boolean) => changes.push(value));
+        const ready = preference.whenReady();
+        f.initialize({ documentRobotsEnabled: true, sidebarView: 2 }, false); await ready;
+        assert.strictEqual(preference.read(), false);
+        f.receive({ type: 'robotsEnabledChanged', page: 'retired-page', enabled: true });
+        assert.deepStrictEqual(changes, []);
+        f.receive({ type: 'robotsEnabledChanged', page: 'host-test-page', enabled: true });
+        assert.strictEqual(preference.read(), true); assert.deepStrictEqual(changes, [true]);
+        await preference.write(false);
+        assert.deepStrictEqual(f.posts.at(-1), { type: 'setRobotsEnabled', page: 'host-test-page', enabled: false });
+        assert.deepStrictEqual(f.writes, [], 'the global control does not replace document state');
+        assert.strictEqual(f.state().scale, '3');
+        stop(); f.host.disposeHost();
+        f.receive({ type: 'robotsEnabledChanged', page: 'host-test-page', enabled: false });
+        assert.deepStrictEqual(changes, [true]);
     });
 
-    it('merges an early robot toggle after host readiness and drops a disposed host write', async () => {
-        const f = fixture(); const pending = f.host.hostRobotsPreference.write(false);
+    it('keeps a newer global notification across pending init and drops disposed preference writes', async () => {
+        const f = fixture(), preference = f.host.hostRobotsPreference;
+        const pending = preference.write(false);
+        f.receive({ type: 'robotsEnabledChanged', page: 'host-test-page', enabled: true });
+        f.initialize({ documentRobotsEnabled: false, scale: '2' }, false); await pending;
+        assert.strictEqual(preference.read(), true);
+        assert.deepStrictEqual(f.posts.at(-1), { type: 'setRobotsEnabled', page: 'host-test-page', enabled: false });
         assert.deepStrictEqual(f.writes, []);
-        f.initialize({ documentRobotsEnabled: true, scale: '2', sidebarView: 2 }); await pending;
-        assert.deepStrictEqual(f.writes, [{ documentRobotsEnabled: false, scale: '2', sidebarView: 2 }]);
         const closed = fixture(); const late = closed.host.hostRobotsPreference.write(true);
-        closed.initialize({ documentRobotsEnabled: false, scale: '3' }); closed.host.disposeHost(); await late;
-        assert.deepStrictEqual(closed.writes, [], 'late readiness has no disposed host message owner');
+        closed.initialize({}, false); closed.host.disposeHost(); await late;
+        assert.deepStrictEqual(closed.posts, [{ type: 'ready', page: 'host-test-page' }]);
     });
-
 });

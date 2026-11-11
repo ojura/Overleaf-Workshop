@@ -3620,6 +3620,26 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.deepStrictEqual(third.writes, [], 'restoring ON does not rewrite it');
     });
 
+    it('follows live global visibility without echo writes and releases its subscription', async () => {
+        let finish!: () => void, notify!: (enabled: boolean) => void, stored = false, stops = 0;
+        const writes: boolean[] = [], ready = new Promise<void>(resolve => { finish = resolve; });
+        const f = visibilityFixture({ preference: { whenReady: () => ready, read: () => stored,
+            write(enabled: boolean) { writes.push(enabled); stored = enabled; },
+            onDidChange(listener: typeof notify) { notify = listener; return () => { stops++; }; } } });
+        assert.strictEqual(f.factories.length, 0);
+        f.f.controller.setRobotsEnabled(true);
+        notify(false);
+        finish(); await promisesSettled();
+        assert.deepStrictEqual(writes, [true], 'an older notification cannot cancel the newer queued explicit write');
+        notify(true); assert.strictEqual(f.f.controller.robotsEnabled, true);
+        notify(false); assert.strictEqual(f.f.controller.robotsEnabled, false);
+        assert.deepStrictEqual(writes, [true], 'remote restoration is never echoed as a user write');
+        assert.strictEqual(f.f.controller.diagnosticsEnabled, false);
+        f.f.dispose(); assert.strictEqual(stops, 1);
+        const count = f.factories.length; notify(true);
+        assert.strictEqual(f.factories.length, count, 'a disposed callback cannot allocate a renderer');
+    });
+
     it('waits for visibility preference readiness before construction and fences newer toggles and disposal', async () => {
         for (const action of ['restore', 'off', 'on', 'dispose'] as const) {
             let finish!: () => void, stored = action === 'off'; const writes: boolean[] = [];

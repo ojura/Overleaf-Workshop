@@ -73,6 +73,7 @@
     "configuration.pdfViewer.themes.backgroundColor.description": "The background color of the theme.",
     "configuration.pdfViewer.defaultScrollMode.markdownDescription": "Configure the default scroll mode used by the PDF viewer for new state. Existing saved viewer state takes precedence.",
     "configuration.pdfViewer.defaultSpreadMode.markdownDescription": "Configure the default spread mode used by the PDF viewer for new state. Existing saved viewer state takes precedence.",
+    "configuration.pdfViewer.robotsEnabled.markdownDescription": "Show document robots in every PDF viewer. The header robot button changes this application-wide preference; open PDFs follow it without reloading. The standalone website keeps its own preference.",
     "configuration.pdfViewer.engine.markdownDescription": "The PDF viewer. Both viewers load the project's compiled PDF in ranges with Overleaf's own loader, as Overleaf's web editor does, so a large PDF shows its first pages without being downloaded whole. A change applies to the open PDFs too: their viewers reload. Each viewer has a button that switches to the other one by changing this setting.",
     "configuration.pdfViewer.engine.pdfjs": "pdf.js's viewer, with its sidebar, find and page modes, on Overleaf's loader.",
     "configuration.pdfViewer.engine.overleaf": "Overleaf's viewer (its PDFJSWrapper on pdf.js) with a small toolbar and an outline, on Overleaf's loader.",
