@@ -4,6 +4,7 @@ import { cpSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { pdfjsRelease, repo, viewerRoot } from './viewer-protocol.mjs';
+import { installImageRevisions } from './pdfjs-image-revisions.mjs';
 
 const source = path.join(viewerRoot, 'src', 'standalone');
 export const defaultOutput = path.join(repo, 'dist', 'spomenar');
@@ -26,6 +27,7 @@ export function standalonePage() {
 }
 
 export async function buildSpomenar(outdir = defaultOutput) {
+    installImageRevisions(pdfjsRelease);
     const assets = path.join(outdir, 'assets');
     mkdirSync(assets, { recursive: true });
     await esbuild.build({

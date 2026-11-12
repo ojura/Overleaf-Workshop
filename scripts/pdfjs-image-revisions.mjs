@@ -1,6 +1,6 @@
 // Apply the same native image-pass behavior to the full viewer and the component viewer.
 // Each replacement is checked against the pinned release before either build is published.
-import { readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { repo } from './viewer-protocol.mjs';
 
@@ -169,6 +169,24 @@ export function installImageRevisions(release) {
     const worker = path.join(release, 'build/pdf.worker.mjs');
     const viewer = path.join(release, 'web/viewer.mjs');
     const format = JSON.parse(readFileSync(path.join(repo, 'src/core/pdfReadingFormat.json'), 'utf8'));
-    writeFileSync(worker, imageRevisionFormat(readFileSync(worker, 'utf8'), format));
-    writeFileSync(viewer, imageRevisionViewer(readFileSync(viewer, 'utf8'), viewer));
+    // Validate both inputs before changing either generated file or starting a build.
+    const changes = [
+        [worker, source => imageRevisionFormat(source, format)],
+        [viewer, source => imageRevisionViewer(source, viewer)],
+    ].map(([file, transform]) => {
+        const source = readFileSync(file, 'utf8');
+        return { file, source, prepared: transform(source) };
+    }).filter(({ source, prepared }) => source !== prepared);
+    if (!changes.length) { return; }
+    // Stage outside the release copied by standalone builds. Each rename keeps existing
+    // readers on their complete file while new readers receive the complete replacement.
+    const staging = mkdtempSync(path.join(path.dirname(release), `.${path.basename(release)}.prepare-`));
+    try {
+        for (const change of changes) {
+            change.temporary = path.join(staging, path.basename(change.file));
+            writeFileSync(change.temporary, change.prepared);
+            chmodSync(change.temporary, statSync(change.file).mode & 0o7777);
+        }
+        for (const { temporary, file } of changes) { renameSync(temporary, file); }
+    } finally { rmSync(staging, { recursive: true, force: true }); }
 }

@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, w
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { pdfjsRelease, pdfjsReleaseFolder, protocol, repo, viewerRoot } from './viewer-protocol.mjs';
-import { imageRevisionViewer } from './pdfjs-image-revisions.mjs';
+import { imageRevisionViewer, installImageRevisions } from './pdfjs-image-revisions.mjs';
 
 export { viewerRoot };
 const src = path.join(viewerRoot, 'src');
@@ -259,6 +259,7 @@ function removeLeftovers(outdir) {
  * which then replaces it. Fails when a viewer does not build, also when its files are missing.
  */
 export async function buildViewers(outdir = path.join(viewerRoot, 'dist')) {
+    installImageRevisions(pdfjsRelease);
     removeLeftovers(outdir);
     const fresh = `${outdir}.new-${process.pid}`;
     rmSync(fresh, { recursive: true, force: true });
