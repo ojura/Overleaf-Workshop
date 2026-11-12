@@ -981,6 +981,111 @@ describe('the PDF viewers\' shared prefetch controller', function () {
         assert.strictEqual(images.view.canvas, canvas);
     });
 
+    for (const engine of ['pdfjs', 'overleaf']) {
+        it(`${engine} image cancellation resumes a visible native pass through the existing controller and queue`, async () => {
+            const { pdfjsRelease } = await importModule(path.join(repo, 'scripts/viewer-protocol.mjs'));
+            const { imageRevisionViewer } = await importModule(path.join(repo, 'scripts/pdfjs-image-revisions.mjs'));
+            const file = engine === 'pdfjs' ? path.join(pdfjsRelease, 'web/viewer.mjs') : path.join(repo, 'node_modules/pdfjs-dist/web/pdf_viewer.mjs');
+            const parsed = ts.createSourceFile(file, imageRevisionViewer(fs.readFileSync(file, 'utf8'), file), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+            const base = parsed.statements.find(statement => ts.isClassDeclaration(statement) && statement.name?.text === 'BasePDFPageView')!;
+            const queueClass = parsed.statements.find(statement => ts.isClassDeclaration(statement) && statement.name?.text === 'PDFRenderingQueue') as ts.ClassDeclaration;
+            const renderView = queueClass.members.find(member => ts.isMethodDeclaration(member) && member.name.getText(parsed) === 'renderView')!;
+            const states = Object.fromEntries([['INITIAL', 0], ['RUNNING', 1], ['PAUSED', 2], ['FINISHED', 3]]);
+            class Cancelled extends Error {}
+            const nativeConstructor = new Function('RenderingStates', 'RenderingCancelledException', 'document', base.getText(parsed) + '\nreturn BasePDFPageView;')(
+                states, Cancelled, { createElement: () => new Canvas() });
+            const f = new Fixture({ startPage: 1, pages: 1, initialNative: false, autoPages: false });
+            fixtures.push(f);
+            const view = f.pages[0] as any, page = f.pdf.page(1) as any;
+            const native = new nativeConstructor({ id: 1, eventBus: f.eventBus, renderingQueue: f.queue });
+            native.div = view.div; native.div.classList = { add() {}, remove() {} }; native.pdfPage = page;
+            for (const key of ['renderingState', 'canvas', 'renderTask', 'paintedImageStatus', 'paintedImageRevision', 'imagePassStatus', 'imagePassRevision']) {
+                Object.defineProperty(view, key, { configurable: true, get: () => native[key], set: value => { native[key] = value; } });
+            }
+            const tasks: Array<{ task: any; completion: Deferred<void> }> = [], passes: Promise<unknown>[] = [];
+            const rendered: any[] = [];
+            f.eventBus.on('pagerendered', event => rendered.push(event));
+            (f.pdf as any).hasExternalImages = true;
+            page.imageRevision = 0;
+            page.imageStatus = { revision: 0, covered: 0, total: 0, pending: 0, completed: 0, failed: 0,
+                discovered: false, final: false, untrackedImageOperations: true, resources: [] };
+            page.onImageRevision = () => () => {};
+            page.render = () => {
+                const completion = new Deferred<void>(), intent = {};
+                const task: any = {
+                    promise: completion.promise, imageIntent: intent,
+                    get imageRevision() { return page.imageRevision; }, get imageStatus() { return page.imageStatus; },
+                    cancel() {
+                        if (completion.settled) { return; }
+                        const error = new Cancelled('external image intent cancelled');
+                        completion.reject(error); task.onError?.(error);
+                    },
+                };
+                tasks.push({ task, completion }); page._intentStates.set('display', intent);
+                return task;
+            };
+            page.cancelImageRefinement = () => {
+                native.renderTask?.cancel(); page._intentStates.clear();
+                return Promise.resolve();
+            };
+            view.draw = () => {
+                native.renderingState = states.RUNNING;
+                const { ctx } = native._createCanvas((canvas: Canvas) => view.div.prepend(canvas));
+                native.canvas.width = 800; native.canvas.height = 1000; view.outputScale = { sx: 1, sy: 1 };
+                const result = native._drawCanvas({ canvasContext: ctx, viewport: view.viewport }, () => native._resetCanvas(), () => {
+                    f.cached.add(view);
+                    f.eventBus.emit('pagerendered', { pageNumber: 1, source: view, error: null });
+                });
+                passes.push(result);
+                f.eventBus.emit('pagerender', { pageNumber: 1, source: view });
+                return result;
+            };
+            native.publishImageCandidate = (pass: any, commit: () => void) => view.publishImageCandidate({ ...pass, appearance: view.imageAppearance }, commit);
+            f.queue.renderView = new Function('RenderingStates', 'RenderingCancelledException', `return ({${renderView.getText(parsed)}}).renderView;`)(states, Cancelled);
+            f.queue.isHighestPriority = () => true;
+            f.queue.renderHighestPriority = () => {
+                f.renderRequests++;
+                const next = f.choose();
+                if (next) { f.queue.renderView(next); }
+            };
+            f.install(module);
+            try {
+                await f.frame();
+                assert.strictEqual(tasks.length, 1);
+                assert.strictEqual(view.renderingState, states.RUNNING);
+                assert.ok(view.canvas);
+                const resume = await f.controller.pauseImageRefinement();
+                await promisesSettled();
+                assert.strictEqual(view.canvas, null);
+                assert.strictEqual(view.renderTask, null);
+                assert.strictEqual(page._intentStates.size, 0);
+                assert.strictEqual(tasks.length, 1, 'the suspension owns the retry until it is released');
+                assert.strictEqual(f.choose(), null);
+                assert.strictEqual(rendered.length, 0, 'cancelled work does not publish a failure or a finished page');
+                resume(); resume(); await f.frame();
+                assert.strictEqual(tasks.length, 2, 'the existing controller wake must draw the cancelled visible page again');
+                page.imageRevision = 1;
+                page.imageStatus = { revision: 1, covered: 1, total: 1, pending: 0, completed: 1, failed: 0,
+                    discovered: true, final: true, untrackedImageOperations: false,
+                    resources: [{ objectId: 'x5', imageId: 'x5', covered: true, final: true, failed: false }] };
+                tasks[1].completion.resolve(); await passes[1]; await promisesSettled(); await f.frame();
+                assert.strictEqual(view.renderingState, states.FINISHED);
+                assert.strictEqual(view.canvas.isConnected, true);
+                assert.strictEqual(view.paintedImageStatus.final, true);
+                assert.strictEqual(f.viewer.getPageLoadingState(1), false);
+                assert.deepStrictEqual(f.controller.snapshot().visibleMissing, []);
+                assert.deepStrictEqual(f.controller.snapshot().failed, []);
+                assert.strictEqual(rendered.length, 1);
+                assert.strictEqual(tasks.length, 2, 'successful publication leaves no repeated native retry');
+                assert.strictEqual(f.callbacks.size, 0);
+            } finally {
+                native.cancelRendering(); await Promise.allSettled(passes);
+                native.renderingState = states.INITIAL;
+                f.dispose(); await promisesSettled();
+            }
+        });
+    }
+
     it('cancels offscreen image work and rejects obsolete subscriptions after document replacement', async () => {
         const f = fixture({ startPage: 1, pages: 2, initialNative: false });
         const images = externalImages(f);

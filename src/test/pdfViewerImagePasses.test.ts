@@ -16,13 +16,35 @@ class Canvas {
     setAttribute() {}
 }
 
+class NativeTask {
+    private resolve!: () => void;
+    private reject!: (error: Error) => void;
+    readonly promise = new Promise<void>((resolve, reject) => { this.resolve = resolve; this.reject = reject; });
+    onContinue?: (resume: () => void) => void;
+    onError?: (error: Error) => void;
+    readonly imageIntent = {};
+    readonly imageRevision = 1;
+    readonly imageStatus = { revision: 1, covered: 1, total: 1, pending: 0, completed: 1, failed: 0, discovered: true, final: true };
+    settled = false;
+    cancel() {
+        if (this.settled) { return; }
+        this.settled = true;
+        const error = new Cancelled('native pass cancelled');
+        this.reject(error);
+        this.onError?.(error);
+    }
+    finish() { this.settled = true; this.resolve(); }
+}
+
 describe('native image-pass presentation in both viewers', function () {
     const sources = new Map<string, { base: string; draw: string; redraw: string }>();
     before(async () => {
         const { pdfjsRelease } = await importModule(path.join(repo, 'scripts/viewer-protocol.mjs'));
         const { imageRevisionViewer } = await importModule(path.join(repo, 'scripts/pdfjs-image-revisions.mjs'));
         for (const [name, file] of [['pdfjs', path.join(pdfjsRelease, 'web/viewer.mjs')], ['overleaf', path.join(repo, 'node_modules/pdfjs-dist/web/pdf_viewer.mjs')]]) {
-            const source = ts.createSourceFile(file, imageRevisionViewer(fs.readFileSync(file, 'utf8'), file), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+            const transformed = imageRevisionViewer(fs.readFileSync(file, 'utf8'), file);
+            assert.strictEqual(imageRevisionViewer(transformed, file), transformed, `${name} transforms an already prepared viewer once`);
+            const source = ts.createSourceFile(file, transformed, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
             let base = '', draw = '', redraw = '';
             for (const statement of source.statements) {
                 if (!ts.isClassDeclaration(statement)) { continue; }
@@ -40,7 +62,128 @@ describe('native image-pass presentation in both viewers', function () {
         }
     });
 
+    function nativePage(engine: string) {
+        const source = sources.get(engine)!;
+        const created: Canvas[] = [], tasks: NativeTask[] = [], passes: Promise<unknown>[] = [], events: any[] = [];
+        const Constructor = new Function('RenderingStates', 'RenderingCancelledException', 'document', source.base + '\nreturn BasePDFPageView;')(
+            states, Cancelled, { createElement() { const canvas = new Canvas(); created.push(canvas); return canvas; } });
+        const page = new Constructor({ id: 1, eventBus: { dispatch: (name: string, value: any) => events.push({ name, ...value }) } });
+        const viewport = { width: 100, height: 100, transform: [1, 0, 0, -1, 0, 100], rawDims: {} };
+        Object.assign(page, {
+            div: { classList: { add() {}, remove() {} }, style: { setProperty() {} }, setAttribute() {} },
+            l10n: {}, viewport, textLayer: {}, annotationLayer: null,
+            _annotationMode: 0, _textLayerMode: 1, _layerProperties: {}, _useThumbnailCanvas: {},
+            _ensureCanvasWrapper: () => ({ prepend(canvas: Canvas) { canvas.attached = true; } }),
+            _renderTextLayer: () => Promise.resolve(),
+            outputScale: { sx: 1, sy: 1, scaled: false },
+            _getRenderingContext: (canvasContext: unknown) => ({ canvasContext, viewport: page.viewport }),
+            pdfPage: { _externalImages: {}, isPureXfa: false, render() { const task = new NativeTask(); tasks.push(task); return task; } },
+        });
+        const draw = new Function('RenderingStates', 'TextLayerMode', 'AnnotationMode', 'StructTreeLayerBuilder',
+            'approximateFraction', 'floorToDivide', 'calcRound', `return ({${source.draw}}).draw;`)(states, { DISABLE: 0 }, { DISABLE: 0 }, class {},
+            () => [1, 1], (n: number) => Math.floor(n), Math.round);
+        return { page, created, tasks, events,
+            start() { const result = draw.call(page); passes.push(result); return result; },
+            async dispose() {
+                for (const task of tasks) { task.cancel(); }
+                await Promise.allSettled(passes);
+                page.cancelRendering(); page.renderingState = states.INITIAL; page._resetCanvas();
+            },
+        };
+    }
+
     for (const engine of ['pdfjs', 'overleaf']) {
+        it(`${engine} returns a cancelled native RUNNING pass to the rendering queue`, async () => {
+            const f = nativePage(engine), { page } = f;
+            try {
+                const first = f.start();
+                assert.strictEqual(page.renderingState, states.RUNNING);
+                assert.strictEqual(page.renderTask, f.tasks[0]);
+                assert.ok(page.canvas);
+                f.tasks[0].cancel(); await first;
+                assert.strictEqual(page.renderingState, states.INITIAL, 'a cancelled current pass must be drawable again');
+                assert.strictEqual(page.renderTask, null);
+                assert.strictEqual(page.canvas, null);
+                assert.strictEqual(page.resume, null);
+                assert.strictEqual(f.events.filter(event => event.name === 'pagerendered').length, 0,
+                    'cancellation is retryable work, not a completed or failed page');
+                const next = f.start(); f.tasks[1].finish(); await next;
+                assert.strictEqual(page.renderingState, states.FINISHED);
+                assert.strictEqual(page.canvas.attached, true);
+                assert.strictEqual(f.events.filter(event => event.name === 'pagerendered').length, 1);
+            } finally { await f.dispose(); }
+        });
+
+        it(`${engine} releases a cancelled native PAUSED continuation before retry`, async () => {
+            const f = nativePage(engine), { page } = f;
+            try {
+                page.renderingQueue = { isHighestPriority: () => false };
+                const pending = f.start();
+                let continued = 0;
+                f.tasks[0].onContinue!(() => continued++);
+                assert.strictEqual(page.renderingState, states.PAUSED);
+                assert.strictEqual(typeof page.resume, 'function');
+                f.tasks[0].cancel(); await pending;
+                assert.strictEqual(page.renderingState, states.INITIAL, 'a cancelled paused task cannot retain queue priority');
+                assert.strictEqual(page.resume, null, 'the queue must not resume the cancelled task');
+                assert.strictEqual(page.renderTask, null);
+                assert.strictEqual(continued, 0);
+                assert.strictEqual(f.events.filter(event => event.name === 'pagerendered').length, 0);
+            } finally { await f.dispose(); }
+        });
+
+        it(`${engine} keeps accepted pixels and their viewport through a cancelled native replacement`, async () => {
+            const f = nativePage(engine), { page } = f;
+            const prior = new Canvas(); prior.attached = true;
+            const oldViewport = { width: 80, height: 80 };
+            const oldStatus = { revision: 7, covered: 1, total: 1, discovered: true, final: true };
+            page.canvas = prior; page._originalViewport = oldViewport;
+            page.paintedImageStatus = oldStatus; page.paintedImageRevision = 7;
+            try {
+                const pending = f.start(), candidate = page.canvas;
+                assert.notStrictEqual(candidate, prior);
+                f.tasks[0].cancel(); await pending;
+                assert.strictEqual(page.renderingState, states.INITIAL);
+                assert.strictEqual(page.canvas, prior, 'the actual PDFPageView cancellation callback restores its predecessor');
+                assert.strictEqual(prior.attached, true);
+                assert.strictEqual(prior.width, 100);
+                assert.strictEqual(candidate.width, 0);
+                assert.strictEqual(page._originalViewport, oldViewport);
+                assert.strictEqual(page.paintedImageStatus, oldStatus);
+                assert.strictEqual(page.paintedImageRevision, 7);
+                assert.strictEqual(f.events.filter(event => event.name === 'pagerendered').length, 0);
+            } finally { await f.dispose(); }
+        });
+
+        it(`${engine} leaves newer task, canvas and continuation ownership intact after superseded cancellation`, async () => {
+            const f = nativePage(engine), { page } = f;
+            try {
+                const oldPass = f.start(), oldTask = f.tasks[0], oldError = oldTask.onError!;
+                oldTask.cancel();
+                // reset() can start the next pass before the old rejected promise settles.
+                page.renderingState = states.INITIAL;
+                const newPass = f.start(), newTask = f.tasks[1], canvas = page.canvas;
+                page.renderingQueue = { isHighestPriority: () => false };
+                let continued = 0;
+                newTask.onContinue!(() => continued++);
+                const resume = page.resume;
+                // A callback still held by the former task has no authority over this pass.
+                oldError(new Cancelled('late old cancellation'));
+                await oldPass;
+                assert.strictEqual(page.renderTask, newTask);
+                assert.strictEqual(page.canvas, canvas, 'old onError must not clear the current canvas');
+                assert.strictEqual(page.renderingState, states.PAUSED);
+                assert.strictEqual(page.resume, resume);
+                assert.strictEqual(canvas.width, 100);
+                assert.strictEqual(continued, 0);
+                resume(); newTask.finish(); await newPass;
+                assert.strictEqual(continued, 1);
+                assert.strictEqual(page.renderingState, states.FINISHED);
+                assert.strictEqual(page.canvas.attached, true);
+                assert.strictEqual(f.events.filter(event => event.name === 'pagerendered').length, 1);
+            } finally { await f.dispose(); }
+        });
+
         it(`${engine} derives page loading-icon suppression from the live displayed owner after reset`, () => {
             const source = sources.get(engine)!;
             const Constructor = new Function('RenderingStates', 'RenderingCancelledException', 'document', source.base + '\nreturn BasePDFPageView;')(states, Cancelled, {});

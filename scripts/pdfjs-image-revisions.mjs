@@ -5,6 +5,7 @@ import path from 'node:path';
 import { repo } from './viewer-protocol.mjs';
 
 export function imageRevisionViewer(source, file = 'PDF.js viewer') {
+    source = cancellationHooks(source, file);
     if (source.includes('// Verified external image passes')) { return publicationHooks(source); }
     const changes = [
         ['    const prevCanvas = this.canvas;\n    const updateOnFirstShow',
@@ -95,6 +96,34 @@ export function imageRevisionViewer(source, file = 'PDF.js viewer') {
         source = source.replace(from, to);
     }
     return publicationHooks(source);
+}
+
+function cancellationHooks(source, file) {
+    const marker = '// A cancelled native pass returns its owned view to the rendering queue.';
+    if (source.includes(marker)) { return source; }
+    const changes = [
+        ['      if (error instanceof RenderingCancelledException) {\n        onCancel();',
+            '      if (error instanceof RenderingCancelledException && renderTask === this.renderTask) {\n        onCancel();'],
+        ['      if (e instanceof RenderingCancelledException) {\n        return;\n      }\n      error = e;',
+            `      if (e instanceof RenderingCancelledException) {
+        ${marker}
+        if (renderTask === this.renderTask) {
+          this.resume = null;
+          this.renderingState = RenderingStates.INITIAL;
+        }
+        return;
+      }
+      error = e;`],
+        ['      this.#renderError = error;\n      if (renderTask === this.renderTask) {\n        this.renderTask = null;',
+            '      if (renderTask === this.renderTask) {\n        this.#renderError = error;\n        this.renderTask = null;'],
+    ];
+    for (const [from, to] of changes) {
+        if (source.split(from).length !== 2) {
+            throw new Error(`${file}: the pinned cancellation hook expects ${JSON.stringify(from)} once`);
+        }
+        source = source.replace(from, to);
+    }
+    return source;
 }
 
 function publicationHooks(source) {
